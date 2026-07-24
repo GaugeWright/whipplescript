@@ -43,8 +43,7 @@ struct AuthoredAgentPackageManifest {
     agent: String,
     system_prompt: String,
     capabilities: Vec<String>,
-    #[serde(default)]
-    agent_abilities: Option<Vec<String>>,
+    agent_abilities: Vec<String>,
     max_steps: usize,
 }
 
@@ -105,7 +104,7 @@ impl AuthoredAgentPackage {
         for capability in &capabilities {
             if !matches!(
                 capability.as_str(),
-                "workspace.read" | "workspace.write" | "command.run" | "human.ask"
+                "workspace.read" | "workspace.write" | "command.run"
             ) {
                 return Err(format!(
                     "agent package declares unsupported capability `{capability}`"
@@ -117,9 +116,7 @@ impl AuthoredAgentPackage {
         {
             return Err("workspace.write requires workspace.read".to_owned());
         }
-        let mut agent_abilities = manifest
-            .agent_abilities
-            .unwrap_or_else(|| capabilities.clone());
+        let mut agent_abilities = manifest.agent_abilities;
         agent_abilities.sort();
         agent_abilities.dedup();
         for ability in &agent_abilities {
@@ -141,7 +138,9 @@ impl AuthoredAgentPackage {
         if agent_abilities.iter().any(|item| item == "command.run")
             && !agent_abilities.iter().any(|item| item == "workspace.write")
         {
-            return Err("command.run ability is write-capable and requires workspace.write".to_owned());
+            return Err(
+                "command.run ability is write-capable and requires workspace.write".to_owned(),
+            );
         }
 
         let compiled = whipplescript_parser::compile_program_with_root(
@@ -232,15 +231,17 @@ impl AuthoredAgentPackage {
             .agent_abilities
             .iter()
             .any(|item| item == "workspace.write");
-        let command = self.agent_abilities.iter().any(|item| item == "command.run");
-        let human = self.agent_abilities.iter().any(|item| item == "human.ask");
+        let command = self
+            .agent_abilities
+            .iter()
+            .any(|item| item == "command.run");
         ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
             Some(&self.workflow),
             self.agent.clone(),
             self.system_prompt.clone(),
-            workspace_tool_specs_from_registry(readable, writable, command, human),
+            workspace_tool_specs_from_registry(readable, writable, command, false),
             self.max_steps,
             self.agent_abilities.clone(),
         )
@@ -472,6 +473,7 @@ workflow Chat {
             "agent": "assistant",
             "system_prompt": "persona.md",
             "capabilities": ["workspace.read", "workspace.write", "command.run"],
+            "agent_abilities": ["workspace.read", "workspace.write", "command.run"],
             "max_steps": 12
         });
         let package =

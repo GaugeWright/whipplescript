@@ -506,6 +506,7 @@ mod tests {
                 "agent": "assistant",
                 "system_prompt": "persona.md",
                 "capabilities": [],
+                "agent_abilities": [],
                 "max_steps": 4,
             })
             .to_string(),
