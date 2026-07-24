@@ -30,6 +30,7 @@ pub struct AuthoredAgentPackage {
     agent: String,
     system_prompt: String,
     capabilities: Vec<String>,
+    agent_abilities: Vec<String>,
     max_steps: usize,
 }
 
@@ -42,6 +43,8 @@ struct AuthoredAgentPackageManifest {
     agent: String,
     system_prompt: String,
     capabilities: Vec<String>,
+    #[serde(default)]
+    agent_abilities: Option<Vec<String>>,
     max_steps: usize,
 }
 
@@ -114,6 +117,32 @@ impl AuthoredAgentPackage {
         {
             return Err("workspace.write requires workspace.read".to_owned());
         }
+        let mut agent_abilities = manifest
+            .agent_abilities
+            .unwrap_or_else(|| capabilities.clone());
+        agent_abilities.sort();
+        agent_abilities.dedup();
+        for ability in &agent_abilities {
+            if !capabilities.contains(ability) {
+                return Err(format!(
+                    "agent ability `{ability}` is absent from the package capability registry"
+                ));
+            }
+        }
+        if agent_abilities
+            .iter()
+            .any(|item| item == "workspace.write" || item == "command.run")
+            && !agent_abilities.iter().any(|item| item == "workspace.read")
+        {
+            return Err(
+                "workspace.write and command.run abilities require workspace.read".to_owned(),
+            );
+        }
+        if agent_abilities.iter().any(|item| item == "command.run")
+            && !agent_abilities.iter().any(|item| item == "workspace.write")
+        {
+            return Err("command.run ability is write-capable and requires workspace.write".to_owned());
+        }
 
         let compiled = whipplescript_parser::compile_program_with_root(
             &source,
@@ -159,6 +188,7 @@ impl AuthoredAgentPackage {
             agent: manifest.agent,
             system_prompt,
             capabilities,
+            agent_abilities,
             max_steps: manifest.max_steps,
         })
     }
@@ -169,6 +199,10 @@ impl AuthoredAgentPackage {
 
     pub fn capabilities(&self) -> &[String] {
         &self.capabilities
+    }
+
+    pub fn agent_abilities(&self) -> &[String] {
+        &self.agent_abilities
     }
 
     /// Exact authored documents whose content hash produced [`Self::version_ref`].
@@ -191,15 +225,15 @@ impl AuthoredAgentPackage {
             return Err("agent package bytes do not match the pinned version ref".to_owned());
         }
         let readable = self
-            .capabilities
+            .agent_abilities
             .iter()
             .any(|item| item == "workspace.read");
         let writable = self
-            .capabilities
+            .agent_abilities
             .iter()
             .any(|item| item == "workspace.write");
-        let command = self.capabilities.iter().any(|item| item == "command.run");
-        let human = self.capabilities.iter().any(|item| item == "human.ask");
+        let command = self.agent_abilities.iter().any(|item| item == "command.run");
+        let human = self.agent_abilities.iter().any(|item| item == "human.ask");
         ResolvedPackage::compile_with_capabilities(
             self.version_ref.clone(),
             &self.source,
@@ -208,7 +242,7 @@ impl AuthoredAgentPackage {
             self.system_prompt.clone(),
             workspace_tool_specs_from_registry(readable, writable, command, human),
             self.max_steps,
-            self.capabilities.clone(),
+            self.agent_abilities.clone(),
         )
     }
 }

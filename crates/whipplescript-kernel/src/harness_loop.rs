@@ -370,6 +370,20 @@ pub struct BrokeredTurnInput {
     pub pinned_skills: Vec<String>,
 }
 
+fn execute_offered_tool<E: ToolExecutor + ?Sized>(
+    executor: &E,
+    offered: &[ToolSpec],
+    call: &ToolCall,
+) -> ToolOutcome {
+    if !offered.iter().any(|tool| tool.name == call.name) {
+        return ToolOutcome {
+            status: ToolStatus::Error,
+            content: format!("tool `{}` was not offered for this model round", call.name),
+        };
+    }
+    executor.execute(call)
+}
+
 /// Drive a brokered tool-use loop to a single terminal.
 ///
 /// The loop is the model's control flow (I2/I3): each iteration makes one model
@@ -474,7 +488,7 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
-            let outcome = executor.execute(call);
+            let outcome = execute_offered_tool(executor, &input.tools, call);
             observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -922,7 +936,7 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
-            let outcome = self.executor.execute(call);
+            let outcome = execute_offered_tool(self.executor, &self.input.tools, call);
             self.observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -2229,7 +2243,13 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
+        let mut turn = input(8);
+        turn.tools.push(ToolSpec {
+            name: "ls".to_owned(),
+            description: "list files".to_owned(),
+            input_schema: json!({"type": "object"}),
+        });
+        let outcome = run_brokered_loop(&client, &exec, &turn, &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::Completed);
         assert_eq!(exec.calls.borrow().len(), 2);
 
