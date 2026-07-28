@@ -1,0 +1,39 @@
+/* WhippleScript docs — the GaugeWright colour scheme (navy ground, blue
+   accent, STIX Two Text serif voice). */
+
+@import url('https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@400;500;600;700&display=swap');
+
+:root {
+  --ws-navy: #0e2d50;
+  --ws-blue: #1f61c4;
+  --ws-serif: "STIX Two Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+}
+
+/* Match material's own two-attribute selector (scheme + primary=black) so our
+   link colour beats its neutral-primary default (#5e8bde). */
+body[data-md-color-scheme="default"][data-md-color-primary="black"] {
+  --md-primary-fg-color: var(--ws-navy);
+  --md-accent-fg-color: var(--ws-blue);
+  --md-typeset-a-color: var(--ws-blue);
+}
+/* Dark (default) scheme: deep navy + lightened blue for contrast. */
+body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
+  --md-primary-fg-color: #0c1a2e;
+  --md-accent-fg-color: #4f8fe6;
+  --md-typeset-a-color: #6aa3ff;
+}
+
+/* Serif carries the voice: headings + chrome titles. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-header__title,
+.md-nav__title {
+  font-family: var(--ws-serif);
+}
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}

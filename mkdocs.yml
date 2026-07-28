@@ -1,0 +1,125 @@
+site_name: WhippleScript
+site_description: Durable coordination language for multi-agent workflows.
+site_url: https://docs.whipplescript.com/
+repo_url: https://github.com/jamesjscully/whipplescript
+repo_name: jamesjscully/whipplescript
+docs_dir: docs
+site_dir: site
+strict: true
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
+  font:
+    text: Figtree
+    code: Inconsolata
+  palette:
+    # Navy-led by default (ecosystem-aligned); light is a toggle.
+    - scheme: slate
+      primary: black
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: black
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  icon:
+    repo: fontawesome/brands/github
+
+extra:
+  # Clicking the logo / site title goes to the marketing landing, not the docs home.
+  homepage: https://whipplescript.com/
+
+extra_css:
+  - assets/brand.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+
+nav:
+  - Home: README.md
+  - Start here:
+      - Build your own automations: for-builders.md
+      - For IT and data owners: for-it.md
+      - How WhippleScript works: for-developers.md
+  - Learn:
+      - Quickstart: quickstart.md
+      - Tutorials: tutorials/index.md
+      - 1. Run a root agent: tutorials/root-agent.md
+      - 2. Build a workflow: tutorials/build-a-workflow.md
+      - 3. Govern a workflow: tutorials/governance.md
+      - Examples: examples.md
+  - Manual:
+      - Overview: manual.md
+      - 1. The smallest workflow: manual/01-smallest-workflow.md
+      - 2. Facts and types: manual/02-facts-and-types.md
+      - 3. Expressions and assertions: manual/03-expressions.md
+      - 4. Rules: manual/04-rules.md
+      - 5. Effects and durability: manual/05-effects.md
+      - 6. Error handling: manual/06-error-handling.md
+      - 7. Branching with case: manual/07-case.md
+      - 8. Prompts, coerce, and decide: manual/08-coerce.md
+      - 9. then: manual/09-then.md
+      - 10. Time: manual/10-time.md
+      - 11. Agents: manual/11-agents.md
+      - 12. Readiness patterns: manual/12-readiness.md
+      - 13. Agent patterns: manual/13-agent-patterns.md
+      - 14. Coordination: manual/14-coordination.md
+      - 15. Trackers: manual/15-trackers.md
+      - 16. Progressions: manual/16-progressions.md
+      - 17. Messaging and ingress: manual/17-messaging.md
+      - 18. Composition: manual/18-composition.md
+      - 19. Exec validation and hosted scripts: manual/19-exec.md
+      - 20. Files and file stores: manual/20-files.md
+      - 21. Checkpoints, restore, and forking: manual/21-checkpoints.md
+      - 22. Information flow I: manual/22-infoflow-labels.md
+      - 23. Information flow II: manual/23-infoflow-egress.md
+      - 24. Governance envelopes: manual/24-governance.md
+      - 25. Testing workflows: manual/25-testing.md
+      - 26. Gauges and evidence: manual/26-gauges.md
+      - 27. Marks, pin, suppose, and settle: manual/27-marks.md
+      - 28. Campaigns and improve: manual/28-campaigns.md
+      - 29. Precedents, spend, and estimators: manual/29-precedents.md
+      - 30. Observability and tracing: manual/30-observability.md
+      - 31. Authoring packages: manual/31-packages.md
+      - 32. Providers and harness configuration: manual/32-providers.md
+      - 33. Script capabilities and the bash tool: manual/33-script-capabilities.md
+      - 34. Runtimes, native and the edge: manual/34-runtimes.md
+      - 35. Memory, recall, learn and curate: manual/35-memory.md
+  - Reference:
+      - Guarantees: guarantees.md
+      - Language Reference: language-reference.md
+      - CLI Reference: api-reference.md
+      - JSON Reference: json-reference.md
+      - Rust API Reference: rust-api.md
+      - Runtime & Operations: runtime-operations.md
+      - Providers & packages: providers.md
+  - Help:
+      - Install: install.md
+      - Diagnostics Guide: diagnostics.md
+      - Troubleshooting: troubleshooting.md
+      - Current State: current-state.md

@@ -1,0 +1,53 @@
+name: Deploy docs to Cloudflare Pages
+
+# Builds the mkdocs-material site and deploys it to the Cloudflare Pages
+# project "whipplescript-docs" (custom domain: docs.whipplescript.com).
+#
+# One-time setup (see docs-site notes):
+#   1. Cloudflare → Workers & Pages → create a Pages project named
+#      "whipplescript-docs" (Direct Upload).
+#   2. Add repo secrets: CLOUDFLARE_API_TOKEN (Pages:Edit) and
+#      CLOUDFLARE_ACCOUNT_ID.
+#   3. Attach docs.whipplescript.com as a custom domain on that project.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - '.github/workflows/docs-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install mkdocs-material
+        run: pip install mkdocs-material
+
+      - name: Build docs (strict)
+        run: mkdocs build --strict
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=whipplescript-docs
