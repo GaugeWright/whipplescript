@@ -4,78 +4,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderKind {
-    Codex,
-    Claude,
-    Pi,
-    Fixture,
-    Command,
-    SchemaCoerce,
-}
+// Provider-kind and adapter-surface identifiers. The registry is OPEN
+// (DR-0024, provider-crate split): the kernel names only its own builtins as
+// string constants here; external providers (codex, claude, and any third
+// party) live in their own crates, own their identifier strings, and register a
+// `ProviderCapability` into the effective catalog at the composition root. The
+// kernel therefore has zero compile-time knowledge of any external provider —
+// `provider_kind` / `surface` are opaque strings validated against whatever
+// capability set the host assembles, not a closed enum.
+pub const PROVIDER_FIXTURE: &str = "fixture";
+pub const PROVIDER_COMMAND: &str = "command";
+pub const PROVIDER_SCHEMA_COERCE: &str = "schema_coercer";
 
-impl ProviderKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Pi => "pi",
-            Self::Fixture => "fixture",
-            Self::Command => "command",
-            Self::SchemaCoerce => "schema_coercer",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "codex" => Some(Self::Codex),
-            "claude" => Some(Self::Claude),
-            "pi" => Some(Self::Pi),
-            "fixture" => Some(Self::Fixture),
-            "command" => Some(Self::Command),
-            "schema_coercer" => Some(Self::SchemaCoerce),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdapterSurface {
-    CodexAppServer,
-    ClaudeAgentSdk,
-    PiSdk,
-    PiRpc,
-    Fixture,
-    Command,
-    CoerceHttp,
-}
-
-impl AdapterSurface {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CodexAppServer => "codex_app_server",
-            Self::ClaudeAgentSdk => "claude_agent_sdk",
-            Self::PiSdk => "pi_sdk",
-            Self::PiRpc => "pi_rpc",
-            Self::Fixture => "fixture",
-            Self::Command => "command",
-            Self::CoerceHttp => "coerce_http",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "codex_app_server" => Some(Self::CodexAppServer),
-            "claude_agent_sdk" => Some(Self::ClaudeAgentSdk),
-            "pi_sdk" => Some(Self::PiSdk),
-            "pi_rpc" => Some(Self::PiRpc),
-            "fixture" => Some(Self::Fixture),
-            "command" => Some(Self::Command),
-            "coerce_http" => Some(Self::CoerceHttp),
-            _ => None,
-        }
-    }
-}
+pub const SURFACE_FIXTURE: &str = "fixture";
+pub const SURFACE_COMMAND: &str = "command";
+pub const SURFACE_COERCE_HTTP: &str = "coerce_http";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CancellationDepth {
@@ -142,8 +85,8 @@ impl ProviderValidationStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderCapability {
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub protocol_version: Option<String>,
     pub session_identity_fields: Vec<String>,
     pub stream_event_kinds: Vec<String>,
@@ -182,8 +125,8 @@ impl ProviderCapability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderBindingConfig {
     pub provider_id: String,
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub credentials_ref: Option<String>,
     pub profile_ids: Vec<String>,
     pub default_model: Option<String>,
@@ -226,8 +169,11 @@ impl ProviderBindingConfig {
             }
         };
         let provider_id = required_string(object, "provider_id");
-        let provider_kind = enum_string(object, "provider_kind", ProviderKind::from_str);
-        let surface = enum_string(object, "surface", AdapterSurface::from_str);
+        // Open registry: provider_kind / surface are free identifiers; an
+        // unrecognized pair is rejected later by `validate_provider_binding`
+        // against the assembled capability catalog, not here.
+        let provider_kind = required_string(object, "provider_kind");
+        let surface = required_string(object, "surface");
         let workspace_policy = optional_workspace_policy(object, "workspace_policy")
             .unwrap_or_else(|| Ok("shared".to_owned()));
         let artifact_policy =
@@ -251,14 +197,14 @@ impl ProviderBindingConfig {
             Ok(provider_kind) => provider_kind,
             Err(error) => {
                 errors.push(*error);
-                ProviderKind::Command
+                String::new()
             }
         };
         let surface = match surface {
             Ok(surface) => surface,
             Err(error) => {
                 errors.push(*error);
-                AdapterSurface::Command
+                String::new()
             }
         };
         let timeout_ms = match timeout_ms {
@@ -428,8 +374,8 @@ impl ProviderValidationResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeProviderTurnRequest {
     pub provider_id: String,
-    pub provider_kind: ProviderKind,
-    pub surface: AdapterSurface,
+    pub provider_kind: String,
+    pub surface: String,
     pub run_id: String,
     pub effect_id: String,
     pub agent: String,
@@ -598,7 +544,7 @@ pub struct NativeProviderCancellation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeProviderBoundaryError {
     pub provider_id: String,
-    pub surface: AdapterSurface,
+    pub surface: String,
     pub code: String,
     pub message: String,
     pub recoverable: bool,
@@ -618,6 +564,11 @@ impl NativeProviderBoundaryError {
     }
 }
 
+// `NativeProviderBoundaryError` is a deliberately rich boundary-error value
+// (provider id, surface, code, message, evidence) crossing the provider seam;
+// boxing every `Result` here would churn every adapter impl for a micro-size
+// win, so allow the large-Err variant on this trait and the validator below.
+#[allow(clippy::result_large_err)]
 pub trait NativeProviderAdapter {
     fn provider_id(&self) -> &str;
     fn capability(&self) -> &ProviderCapability;
@@ -635,6 +586,7 @@ pub trait NativeProviderAdapter {
     ) -> Result<NativeProviderEvent, NativeProviderBoundaryError>;
 }
 
+#[allow(clippy::result_large_err)]
 pub fn validate_native_cancellation_depth(
     config: &ProviderBindingConfig,
     capabilities: &[ProviderCapability],
@@ -698,7 +650,7 @@ fn native_boundary_error(
 ) -> NativeProviderBoundaryError {
     NativeProviderBoundaryError {
         provider_id: config.provider_id.clone(),
-        surface: config.surface,
+        surface: config.surface.clone(),
         code: code.into(),
         message: message.into(),
         recoverable,
@@ -707,64 +659,15 @@ fn native_boundary_error(
 }
 
 pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
-    // Codex/Claude are optional providers (DR-0024): their capability entries are
-    // present only when the corresponding feature is built. Pi, Fixture, Command,
-    // and the owned harness are always available.
-    let mut caps: Vec<ProviderCapability> = Vec::new();
-    #[cfg(feature = "codex")]
-    caps.push(ProviderCapability {
-        provider_kind: ProviderKind::Codex,
-        surface: AdapterSurface::CodexAppServer,
-        protocol_version: Some("codex-app-server-local-schema".to_owned()),
-        session_identity_fields: strings(&["thread_id", "turn_id", "item_id"]),
-        stream_event_kinds: strings(&[
-            "turn/started",
-            "turn/completed",
-            "turn/diff/updated",
-            "approval/requested",
-        ]),
-        tool_policy: "codex_approvals".to_owned(),
-        cancellation_depths: vec![CancellationDepth::NativeStop],
-        artifact_manifest: true,
-        health_checks: strings(&["codex_cli", "app_server_schema", "auth_status"]),
-        auth_requirements: strings(&["codex_login_or_openai_api_key"]),
-    });
-    #[cfg(feature = "claude")]
-    caps.push(ProviderCapability {
-        provider_kind: ProviderKind::Claude,
-        surface: AdapterSurface::ClaudeAgentSdk,
-        protocol_version: Some("anthropic-agent-sdk".to_owned()),
-        session_identity_fields: strings(&["session_id"]),
-        stream_event_kinds: strings(&["message", "tool_event", "hook_event", "result"]),
-        tool_policy: "claude_tools_permissions_hooks".to_owned(),
-        cancellation_depths: vec![CancellationDepth::CooperativeRequest],
-        artifact_manifest: true,
-        health_checks: strings(&["claude_sdk", "api_key", "tool_policy"]),
-        auth_requirements: strings(&["anthropic_api_key_or_provider_config_ref"]),
-    });
-    caps.extend([
+    // Open registry (DR-0024): this returns only the kernel's OWN builtins
+    // (the fixture and command surfaces). External providers — codex lives in
+    // `whipplescript-provider-codex`, claude in `whipplescript-provider-claude`,
+    // and any third party in its own crate — own their `ProviderCapability` and
+    // the host extends this catalog with `capability()` from each crate it built.
+    let caps: Vec<ProviderCapability> = vec![
         ProviderCapability {
-            provider_kind: ProviderKind::Pi,
-            surface: AdapterSurface::PiRpc,
-            protocol_version: Some("pi-rpc-0.73.0".to_owned()),
-            session_identity_fields: strings(&["session_id", "parent_session_id"]),
-            stream_event_kinds: strings(&[
-                "agent_start",
-                "turn_start",
-                "message_start",
-                "message_end",
-                "turn_end",
-                "agent_end",
-            ]),
-            tool_policy: "pi_tools_extensions_resources".to_owned(),
-            cancellation_depths: vec![CancellationDepth::NativeStop],
-            artifact_manifest: true,
-            health_checks: strings(&["pi_cli", "rpc_mode", "provider_model", "extensions"]),
-            auth_requirements: strings(&["pi_provider_api_key_or_auth_storage"]),
-        },
-        ProviderCapability {
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             protocol_version: Some("fixture".to_owned()),
             session_identity_fields: Vec::new(),
             stream_event_kinds: strings(&["completed", "failed", "timed_out", "cancelled"]),
@@ -775,8 +678,8 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             auth_requirements: Vec::new(),
         },
         ProviderCapability {
-            provider_kind: ProviderKind::Command,
-            surface: AdapterSurface::Command,
+            provider_kind: "command".to_owned(),
+            surface: "command".to_owned(),
             protocol_version: Some("command-agent-harness".to_owned()),
             session_identity_fields: Vec::new(),
             stream_event_kinds: strings(&["completed", "failed", "timed_out"]),
@@ -786,7 +689,7 @@ pub fn builtin_provider_capabilities() -> Vec<ProviderCapability> {
             health_checks: strings(&["executable"]),
             auth_requirements: Vec::new(),
         },
-    ]);
+    ];
     caps
 }
 
@@ -885,11 +788,10 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-pub(crate) fn redact_sensitive_metadata(value: &str) -> String {
+pub fn redact_sensitive_metadata(value: &str) -> String {
     if value.contains("sk-")
         || value.contains("ANTHROPIC_API_KEY")
         || value.contains("OPENAI_API_KEY")
-        || value.contains("PI_API_KEY")
         || value.contains("token")
         || value.contains("secret")
     {
@@ -947,23 +849,6 @@ fn optional_workspace_policy(
             "unsupported_workspace_policy",
             format!("provider config `{key}` has unsupported value `{value}`"),
         ))),
-    })
-}
-
-fn enum_string<T>(
-    object: &serde_json::Map<String, Value>,
-    key: &str,
-    parse: impl FnOnce(&str) -> Option<T>,
-) -> Result<T, Box<ProviderValidationResult>> {
-    let value = required_string(object, key)?;
-    parse(&value).ok_or_else(|| {
-        Box::new(ProviderValidationResult::fail(
-            "",
-            "",
-            "provider.config.invalid",
-            "unknown_enum_value",
-            format!("provider config `{key}` has unknown value `{value}`"),
-        ))
     })
 }
 
@@ -1041,30 +926,21 @@ mod tests {
 
     #[test]
     fn builtin_capabilities_capture_distinct_native_surfaces() {
+        // Open registry (DR-0024): the kernel builtin catalog holds ONLY the
+        // kernel's own surfaces (fixture, command). Codex and claude moved to
+        // their own crates; the host appends their `capability()`.
         let capabilities = builtin_provider_capabilities();
 
+        assert!(capabilities
+            .iter()
+            .all(|capability| capability.provider_kind != "codex"
+                && capability.provider_kind != "claude"));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Codex
-                && capability.surface == AdapterSurface::CodexAppServer
-                && capability
-                    .stream_event_kinds
-                    .contains(&"turn/diff/updated".to_owned())
+            capability.provider_kind == "fixture" && capability.surface == "fixture"
         }));
         assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Claude
-                && capability.surface == AdapterSurface::ClaudeAgentSdk
-                && capability.tool_policy == "claude_tools_permissions_hooks"
-        }));
-        assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Pi
-                && capability.surface == AdapterSurface::PiRpc
-                && capability
-                    .session_identity_fields
-                    .contains(&"session_id".to_owned())
-        }));
-        assert!(capabilities.iter().any(|capability| {
-            capability.provider_kind == ProviderKind::Command
-                && capability.surface == AdapterSurface::Command
+            capability.provider_kind == "command"
+                && capability.surface == "command"
                 && capability.cancellation_depths == vec![CancellationDepth::None]
         }));
     }
@@ -1090,8 +966,8 @@ mod tests {
         .expect("config parses");
 
         assert_eq!(config.provider_id, "codex-main");
-        assert_eq!(config.provider_kind, ProviderKind::Codex);
-        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.provider_kind, "codex".to_owned());
+        assert_eq!(config.surface, "codex_app_server".to_owned());
         assert_eq!(config.cancellation_depth, CancellationDepth::NativeStop);
         assert_eq!(
             config.to_json_redacted()["extra_keys"],
@@ -1141,36 +1017,32 @@ mod tests {
     }
 
     #[test]
-    fn accepts_validated_pi_native_stop_cancellation_depth() {
-        let config = ProviderBindingConfig::from_json_str(
-            r#"{
-              "provider_id": "pi-main",
-              "provider_kind": "pi",
-              "surface": "pi_rpc",
-              "credentials_ref": "secret:pi",
-              "cancellation_depth": "native_stop"
-            }"#,
-        )
-        .expect("config shape parses");
-
-        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
-
-        assert!(results.iter().any(|result| {
-            result.status == ProviderValidationStatus::Pass
-                && result.code == "cancellation_supported"
-        }));
-    }
-
-    #[test]
     fn reports_missing_credentials_without_secret_values() {
-        let results = validate_provider_binding_json(
+        // No kernel builtin requires credentials, so validate against a
+        // synthetic auth-requiring capability (open registry): the guard must
+        // report the missing reference without echoing any secret value.
+        let config = ProviderBindingConfig::from_json_str(
             r#"{
               "provider_id": "claude-main",
               "provider_kind": "claude",
               "surface": "claude_agent_sdk"
             }"#,
-        );
+        )
+        .expect("config parses");
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "claude".to_owned(),
+            surface: "claude_agent_sdk".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::None],
+            artifact_manifest: true,
+            health_checks: Vec::new(),
+            auth_requirements: vec!["anthropic_api_key_or_provider_config_ref".to_owned()],
+        }];
 
+        let results = validate_provider_binding(&config, &capabilities);
         let missing = results
             .iter()
             .find(|result| result.code == "missing_credentials_ref")
@@ -1180,18 +1052,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_required_enum_values() {
-        let results = ProviderBindingConfig::from_json_str(
+    fn rejects_unrecognized_provider_surface_at_validation() {
+        // Open registry (DR-0024): provider_kind / surface are free strings, so
+        // an unrecognized surface now PARSES cleanly and is rejected by
+        // `validate_provider_binding` against the assembled capability catalog —
+        // no more parse-time `unknown_enum_value`.
+        let config = ProviderBindingConfig::from_json_str(
             r#"{
               "provider_id": "codex-main",
               "provider_kind": "codex",
               "surface": "plain_command"
             }"#,
         )
-        .expect_err("unknown surface fails");
+        .expect("free-string surface parses under the open registry");
 
+        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
         assert!(results.iter().any(|result| {
-            result.status == ProviderValidationStatus::Fail && result.code == "unknown_enum_value"
+            result.status == ProviderValidationStatus::Fail && result.code == "unsupported_surface"
         }));
     }
 
@@ -1201,8 +1078,8 @@ mod tests {
         provider_options.insert("api_token".to_owned(), json!("sk-never-print"));
         let request = NativeProviderTurnRequest {
             provider_id: "codex-main".to_owned(),
-            provider_kind: ProviderKind::Codex,
-            surface: AdapterSurface::CodexAppServer,
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -1236,7 +1113,7 @@ mod tests {
     #[test]
     fn native_provider_event_preserves_shape_without_raw_payload() {
         let event = NativeProviderEvent {
-            provider_id: "pi-main".to_owned(),
+            provider_id: "codex-main".to_owned(),
             run_id: "run-1".to_owned(),
             event_kind: NativeProviderEventKind::Cancelled,
             provider_event_type: "turn_end".to_owned(),
@@ -1251,7 +1128,7 @@ mod tests {
             artifacts: vec![NativeProviderArtifactRef {
                 artifact_id: Some("artifact-1".to_owned()),
                 kind: "transcript".to_owned(),
-                uri: "provider://pi/runs/run-1/secret/transcript".to_owned(),
+                uri: "provider://codex/runs/run-1/secret/transcript".to_owned(),
                 content_hash: Some("sha256:secret-token".to_owned()),
                 mime_type: Some("text/plain".to_owned()),
                 required: true,
@@ -1287,7 +1164,7 @@ mod tests {
     fn native_provider_boundary_error_redacts_message_and_evidence() {
         let error = NativeProviderBoundaryError {
             provider_id: "claude-main".to_owned(),
-            surface: AdapterSurface::ClaudeAgentSdk,
+            surface: "claude_agent_sdk".to_owned(),
             code: "auth_failed".to_owned(),
             message: "ANTHROPIC_API_KEY sk-never-print failed".to_owned(),
             recoverable: true,
@@ -1318,7 +1195,7 @@ mod tests {
 
         impl NativeProviderAdapter for FakeNativeAdapter {
             fn provider_id(&self) -> &str {
-                "fake-pi"
+                "fake-codex"
             }
 
             fn capability(&self) -> &ProviderCapability {
@@ -1338,7 +1215,7 @@ mod tests {
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: None,
                     sequence: Some(1),
-                    evidence: json!({"pi_shape": "turn_start"}),
+                    evidence: json!({"codex_shape": "turn_start"}),
                     artifacts: Vec::new(),
                 })
             }
@@ -1349,14 +1226,14 @@ mod tests {
             ) -> Result<Option<NativeProviderEvent>, NativeProviderBoundaryError> {
                 assert!(self.started);
                 Ok(Some(NativeProviderEvent {
-                    provider_id: "fake-pi".to_owned(),
+                    provider_id: "fake-codex".to_owned(),
                     run_id: run_id.to_owned(),
                     event_kind: NativeProviderEventKind::Streamed,
                     provider_event_type: "message_end".to_owned(),
                     provider_session_id: Some("session-1".to_owned()),
                     provider_turn_id: None,
                     sequence: Some(2),
-                    evidence: json!({"pi_shape": "message_end"}),
+                    evidence: json!({"codex_shape": "message_end"}),
                     artifacts: Vec::new(),
                 }))
             }
@@ -1366,7 +1243,7 @@ mod tests {
                 cancellation: NativeProviderCancellation,
             ) -> Result<NativeProviderEvent, NativeProviderBoundaryError> {
                 Ok(NativeProviderEvent {
-                    provider_id: "fake-pi".to_owned(),
+                    provider_id: "fake-codex".to_owned(),
                     run_id: cancellation.run_id,
                     event_kind: NativeProviderEventKind::Cancelled,
                     provider_event_type: "turn_end".to_owned(),
@@ -1379,18 +1256,29 @@ mod tests {
             }
         }
 
-        let capability = builtin_provider_capabilities()
-            .into_iter()
-            .find(|capability| capability.provider_kind == ProviderKind::Pi)
-            .expect("pi capability exists");
+        // Self-contained synthetic capability — this test exercises the
+        // NativeProviderAdapter trait mechanics (start/stream/cancel), not the
+        // catalog, so it does not depend on any provider being registered.
+        let capability = ProviderCapability {
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: false,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        };
         let mut adapter = FakeNativeAdapter {
             capability,
             started: false,
         };
         let request = NativeProviderTurnRequest {
-            provider_id: "fake-pi".to_owned(),
-            provider_kind: ProviderKind::Pi,
-            surface: AdapterSurface::PiRpc,
+            provider_id: "fake-codex".to_owned(),
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -1400,7 +1288,7 @@ mod tests {
             required_capabilities: vec!["repo.read".to_owned()],
             cancellation_depth: CancellationDepth::NativeStop,
             artifact_policy: "optional".to_owned(),
-            credential_ref: Some("secret:pi".to_owned()),
+            credential_ref: Some("secret:codex".to_owned()),
             provider_options: BTreeMap::new(),
         };
 
@@ -1419,8 +1307,8 @@ mod tests {
             })
             .expect("cancel event");
 
-        assert_eq!(adapter.provider_id(), "fake-pi");
-        assert_eq!(adapter.capability().surface, AdapterSurface::PiRpc);
+        assert_eq!(adapter.provider_id(), "fake-codex");
+        assert_eq!(adapter.capability().surface, "codex_app_server".to_owned());
         assert_eq!(started.event_kind, NativeProviderEventKind::Started);
         assert_eq!(streamed.provider_event_type, "message_end");
         assert_eq!(cancelled.event_kind, NativeProviderEventKind::Cancelled);
@@ -1431,37 +1319,53 @@ mod tests {
     fn cancellation_depth_guard_allows_requests_within_configured_depth() {
         let config = ProviderBindingConfig::from_json_str(
             r#"{
-              "provider_id": "pi-main",
-              "provider_kind": "pi",
-              "surface": "pi_rpc",
-              "credentials_ref": "secret:pi",
+              "provider_id": "codex-main",
+              "provider_kind": "codex",
+              "surface": "codex_app_server",
+              "credentials_ref": "secret:codex",
               "cancellation_depth": "native_stop"
             }"#,
         )
         .expect("config parses");
 
+        // Synthetic catalog: a native_stop-capable surface. No kernel builtin
+        // advertises native_stop anymore (codex moved to its own crate,
+        // DR-0024), so the depth-guard logic is exercised against an assembled
+        // capability rather than the builtin set.
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "codex".to_owned(),
+            surface: "codex_app_server".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::NativeStop],
+            artifact_manifest: false,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        }];
+
         validate_native_cancellation_depth(
             &config,
-            &builtin_provider_capabilities(),
+            &capabilities,
             CancellationDepth::CooperativeRequest,
         )
         .expect("cooperative request is within native-stop depth");
-        validate_native_cancellation_depth(
-            &config,
-            &builtin_provider_capabilities(),
-            CancellationDepth::NativeStop,
-        )
-        .expect("native stop request matches configured depth");
+        validate_native_cancellation_depth(&config, &capabilities, CancellationDepth::NativeStop)
+            .expect("native stop request matches configured depth");
     }
 
     #[test]
     fn cancellation_depth_guard_rejects_requests_deeper_than_configured_depth() {
+        // Fixture advertises cooperative_request, so the configured depth is
+        // capability-supported and the failure isolates requested > configured.
+        // (Claude can no longer serve this case: its catalog depth is None per
+        // DR-0017 — see claude_advertises_no_cancellation_depth_per_dr0017.)
         let config = ProviderBindingConfig::from_json_str(
             r#"{
-              "provider_id": "claude-main",
-              "provider_kind": "claude",
-              "surface": "claude_agent_sdk",
-              "credentials_ref": "secret:claude",
+              "provider_id": "fixture-main",
+              "provider_kind": "fixture",
+              "surface": "fixture",
               "cancellation_depth": "cooperative_request"
             }"#,
         )
@@ -1475,7 +1379,7 @@ mod tests {
         .expect_err("native stop exceeds configured depth");
 
         assert_eq!(error.code, "cancellation_depth_denied");
-        assert_eq!(error.provider_id, "claude-main");
+        assert_eq!(error.provider_id, "fixture-main");
         assert_eq!(
             error
                 .to_json_redacted()
@@ -1483,6 +1387,53 @@ mod tests {
                 .and_then(Value::as_str),
             Some("object")
         );
+    }
+
+    /// DR-0017 conformance (std-agent slice 2), validation-plane half: when a
+    /// capability advertises NO cancellation depth, both validation planes must
+    /// refuse a binding that claims `cooperative_request`. (The claude
+    /// capability's own `None` advertisement is asserted in
+    /// whipplescript-provider-claude.) Uses a synthetic no-depth capability so
+    /// the kernel test is provider-agnostic.
+    #[test]
+    fn no_depth_capability_refuses_cooperative_request_per_dr0017() {
+        let capabilities = vec![ProviderCapability {
+            provider_kind: "claude".to_owned(),
+            surface: "claude_agent_sdk".to_owned(),
+            protocol_version: None,
+            session_identity_fields: Vec::new(),
+            stream_event_kinds: Vec::new(),
+            tool_policy: "none".to_owned(),
+            cancellation_depths: vec![CancellationDepth::None],
+            artifact_manifest: true,
+            health_checks: Vec::new(),
+            auth_requirements: Vec::new(),
+        }];
+
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "claude-main",
+              "provider_kind": "claude",
+              "surface": "claude_agent_sdk",
+              "credentials_ref": "secret:claude",
+              "cancellation_depth": "cooperative_request"
+            }"#,
+        )
+        .expect("config parses");
+
+        let results = validate_provider_binding(&config, &capabilities);
+        assert!(results.iter().any(|result| {
+            result.status == ProviderValidationStatus::Fail
+                && result.code == "unsupported_cancellation_depth"
+        }));
+
+        let error = validate_native_cancellation_depth(
+            &config,
+            &capabilities,
+            CancellationDepth::CooperativeRequest,
+        )
+        .expect_err("configured cooperative_request is not capability-supported");
+        assert_eq!(error.code, "unsupported_configured_cancellation_depth");
     }
 
     #[test]

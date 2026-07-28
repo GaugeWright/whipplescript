@@ -22,20 +22,145 @@
 // module's single import namespace is the generated `_bg.js` glue itself.
 import wasmModule from "../pkg/whipplescript_host_do_bg.wasm";
 import * as bindings from "../pkg/whipplescript_host_do_bg.js";
-import { WasmDurableInstance, __wbg_set_wasm } from "../pkg/whipplescript_host_do_bg.js";
+import {
+  WasmDurableInstance,
+  __wbg_set_wasm,
+} from "../pkg/whipplescript_host_do_bg.js";
 import { Container, getRandom } from "@cloudflare/containers";
+import {
+  canonicalArtifact,
+  sealArtifact,
+  selectWorkspace,
+  type CollectionPolicy,
+} from "./session-collection";
+import {
+  deadlineAt,
+  decide as decideLifecycle,
+  evolve as evolveLifecycle,
+  fold as foldLifecycle,
+  isRejection as isLifecycleRejection,
+  type LifecycleCommand,
+  type LifecycleEvent,
+  type LifecycleState,
+} from "./session-lifecycle";
+import {
+  performDirectProviderFetch,
+  performModelBrokerFetch,
+  type ProviderUsage,
+} from "./model-broker";
+import {
+  bindExactPublicCredential,
+  type HostTurnAdmission,
+  type ResolvedHostProviderBinding,
+  resolveAdmittedProvider as resolveHostedProvider,
+} from "./provider-realization";
 
 const wasmInstance = new WebAssembly.Instance(wasmModule, {
   "./whipplescript_host_do_bg.js": bindings,
 });
 __wbg_set_wasm(wasmInstance.exports);
 (wasmInstance.exports as { __wbindgen_start?: () => void }).__wbindgen_start?.();
+// wasm-bindgen's bundler `_bg.d.ts` currently omits free-function exports even
+// though `_bg.js` carries them. Keep the manual Workers instantiation and type
+// the generated function at this one boundary.
+const verifyHostPolicy = (
+  bindings as unknown as {
+    verify_host_policy: (
+      epoch: bigint,
+      signedEnvelope: string,
+      expectedSigner: string,
+      publicKeyHex: string,
+    ) => string;
+  }
+).verify_host_policy;
+const hostFunctions = bindings as unknown as {
+  host_open_instance: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_validate_turn: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_begin_turn: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+    provider: string,
+    model: string,
+    baseUrl: string,
+  ) => boolean;
+  host_cancel_turn: (
+    bridge: unknown,
+    instanceId: string,
+    commandId: string,
+    requestedBy: string,
+  ) => string;
+  host_project_turn: (
+    bridge: unknown,
+    instanceId: string,
+    commandId: string,
+  ) => string;
+  host_current_position: (
+    bridge: unknown,
+    instanceId: string,
+  ) => string;
+  host_export_thread: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    sourcePositionJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+  host_import_fork: (
+    bridge: unknown,
+    epoch: bigint,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+    exportJson: string,
+    packageManifest: string,
+    packageSource: string,
+    systemPrompt: string,
+  ) => string;
+};
+
+function publicCommandId(sessionId: string, requestId: string): string {
+  return `public:${sessionId}:${requestId}`;
+}
+
+function publicRequestId(commandId: string): string {
+  return commandId.split(":").slice(2).join(":");
+}
 
 export interface Env {
   WORKFLOW_INSTANCE: DurableObjectNamespace;
-  // Secrets injected as DO bindings -- the coerce/agent provider credentials the
-  // sans-IO core asks for via `needs_http`. Wired into DurableEffectPorts in a
-  // follow-on once the Rust `create` accepts them (see README "Effect creds").
+  // Private/legacy workflow credentials. Public sessions never consult these.
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
   // Dev/test override for the provider endpoint (e.g. a local mock in
@@ -45,6 +170,26 @@ export interface Env {
   // carry `Authorization: Bearer <token>` (or `x-whip-control-token` for local
   // clients that cannot set auth headers).
   WHIP_CONTROL_TOKEN?: string;
+  // Dedicated edge-ingress credential for `/public/session/*`. Keeping this
+  // separate means publication cannot acquire the private host control plane.
+  WHIP_SESSION_TOKEN?: string;
+  // Pinned GaugeDesk governance authority for `whipplescript.host.v1` policy
+  // epochs. Both are deployment configuration; a request may supply neither.
+  GAUGEDESK_GOVERNANCE_SIGNER?: string;
+  GAUGEDESK_GOVERNANCE_KEY?: string;
+  // Secret-free provider egress (DR-0042). The URL is authenticated with this
+  // broker-only token after WhippleScript admits the opaque credential ref.
+  // Provider credential bytes never enter this Worker realization.
+  WHIP_MODEL_BROKER_URL?: string;
+  WHIP_MODEL_BROKER_TOKEN?: string;
+  // Session DO -> embedder admission/settlement object. The token authenticates
+  // only admission and settlement metadata; model bytes never cross it, and the
+  // runtime does not interpret what the embedder meters (DR-0049 §1).
+  SESSION_ADMISSION?: DurableObjectNamespace;
+  // Embedder-provisioned credentials live encrypted in its registry object.
+  // Only this final-fetch boundary may resolve one.
+  PUBLIC_CREDENTIALS?: DurableObjectNamespace;
+  WHIP_PUBLIC_CONTROL_TOKEN?: string;
   // Secret shared with the executor/turn container sidecar. The DO sends it as
   // a bearer token on in-cluster calls; the sidecar rejects non-loopback calls
   // without it.
@@ -100,7 +245,7 @@ const BUILTIN_SEEDS = [
   `INSERT INTO capability_schemas (capability, description, schema_json) VALUES ('agent.tell', 'Run an agent turn.', '{}')`,
   `INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')`,
   `INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')`,
-  `INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","schema.coerce","event.emit","workflow.invoke"]', '{}')`,
+  `INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","schema.coerce","event.emit","workflow.invoke"]', '{}')`,
 ];
 
 // Idempotent first-touch bootstrap: a fresh DO has an empty SQLite; apply the
@@ -109,13 +254,77 @@ function ensureSchema(sql: SqlStorage): void {
   const marker = sql
     .exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`)
     .toArray();
-  if (marker.length > 0) {
-    return;
+  if (marker.length === 0) {
+    sql.exec(DO_SCHEMA);
+    for (const seed of BUILTIN_SEEDS) {
+      sql.exec(seed);
+    }
   }
-  sql.exec(DO_SCHEMA);
-  for (const seed of BUILTIN_SEEDS) {
-    sql.exec(seed);
+  // Existing placement objects predate GaugeDesk's writer profile. Keep
+  // additive runtime policy seeds outside the first-touch branch so a deploy
+  // upgrades those objects lazily without rewriting operator-owned rows.
+  sql.exec(`INSERT OR IGNORE INTO profiles
+    (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json)
+    VALUES (
+      'profile_repo_writer',
+      'repo-writer',
+      'Allow governed workspace reads, writes, Bashkit commands, and agent turns.',
+      'enforce',
+      '["agent.tell","workspace.read","workspace.write","command.run"]',
+      '{}'
+    )`);
+  // Issue assignment (0.2.2) is additive: an object created before it has a
+  // `tracker_issues` without the column, and `CREATE TABLE` in the first-touch
+  // branch above never alters an existing table. Add it lazily so a deploy
+  // upgrades those objects instead of failing every tracker read.
+  const hasAssignedTo = sql
+    .exec(`SELECT name FROM pragma_table_info('tracker_issues') WHERE name = 'assigned_to'`)
+    .toArray();
+  if (hasAssignedTo.length === 0) {
+    sql.exec(`ALTER TABLE tracker_issues ADD COLUMN assigned_to TEXT`);
   }
+  // Message-scoped image bodies are a broker cache, not part of the admitted
+  // command. Existing objects acquire this additive table lazily.
+  sql.exec(`CREATE TABLE IF NOT EXISTS host_turn_images (
+    instance_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    selector TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    data_base64 TEXT NOT NULL,
+    PRIMARY KEY (instance_id, command_id, selector)
+  )`);
+  // Live text is a repairable operational projection. Terminal transcript and
+  // receipt events remain authority; these rows only let an SSE consumer catch
+  // up after a transient disconnect during the active turn.
+  sql.exec(`CREATE TABLE IF NOT EXISTS host_turn_deltas (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    delta TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS idx_host_turn_deltas
+    ON host_turn_deltas(instance_id, command_id, sequence)`);
+  // A public session object pins exactly one release/engagement and the
+  // GaugeDesk governance root authenticated by that signed release. It is the
+  // session's home; no placement/Home callback participates after bootstrap.
+  sql.exec(`CREATE TABLE IF NOT EXISTS public_session_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    release_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    instance_ref TEXT NOT NULL,
+    governance_signer TEXT NOT NULL,
+    governance_key TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  // The session's lifecycle event log (DR-0049 §3). Phase is the fold of these
+  // rows; nothing stores a phase. Append-only, and deliberately preserved by
+  // teardown so the audit trail survives payload tombstoning.
+  sql.exec(`CREATE TABLE IF NOT EXISTS session_lifecycle_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
 }
 
 // Row objects from `sql.exec` are column-name keyed; the Rust `DoSql` contract
@@ -170,9 +379,11 @@ function requestBearerToken(request: Request): string | undefined {
 }
 
 function controlAuthError(request: Request, env: Env): Response | undefined {
-  const expected = env.WHIP_CONTROL_TOKEN?.trim();
+  const expected = new URL(request.url).pathname.startsWith("/public/session/")
+    ? env.WHIP_SESSION_TOKEN?.trim()
+    : env.WHIP_CONTROL_TOKEN?.trim();
   if (!expected) {
-    return Response.json({ error: "WHIP_CONTROL_TOKEN is required" }, { status: 503 });
+    return Response.json({ error: "required control credential is unavailable" }, { status: 503 });
   }
   const actual = requestBearerToken(request) ?? "";
   if (!constantTimeEqual(actual, expected)) {
@@ -318,7 +529,119 @@ interface Bootstrap {
   principal: string;
 }
 
+interface HostPolicyBootstrap {
+  epoch: number;
+  signed_envelope: string;
+  policy: {
+    epoch: number;
+    envelope_hash: string;
+    signer: string;
+    key_id?: string;
+  };
+}
+
+interface HostPackageDocuments {
+  manifest: string;
+  source: string;
+  system_prompt: string;
+}
+
+interface HostCommandRequest {
+  command: Record<string, unknown>;
+  package: HostPackageDocuments;
+  image_bodies: unknown[];
+}
+
+interface PublicSessionBootstrap {
+  /**
+   * Opaque embedder scope addressing this session's admission and settlement
+   * object. The runtime routes to it and never interprets it (DR-0049 §1); it
+   * carries no deployment, tenant, audience, or funding meaning here.
+   */
+  admission_scope: string;
+  release_id: string;
+  session_id: string;
+  /**
+   * Exact non-secret credential reference supplied by the embedder. The runtime
+   * carries it uninterpreted; only the privileged final-fetch boundary resolves
+   * it (DR-0047 §5).
+   */
+  credential_ref: string;
+  package_version_ref: string;
+  package: HostPackageDocuments;
+  capabilities: string[];
+  host_policy: {
+    epoch: number;
+    signed_envelope: string;
+    expected_signer: string;
+    signer_public_key_hex: string;
+    provider_binding_ref: string;
+    /** Author-approved class contained in the signed release policy. */
+    credential_class: string;
+    placement_ref: string;
+  };
+  initial_workspace: {
+    path: string;
+    media_type: string;
+    sha256: string;
+    base64: string;
+  }[];
+  retention: {
+    idle_ttl_seconds: number;
+    absolute_ttl_seconds: number;
+  };
+  /**
+   * Release-declared terminal artifact, plus the exact recipient public keys the
+   * embedder admitted for this session. Absent means the session emits nothing.
+   */
+  collection?: CollectionPolicy & { recipient_public_keys: string[] };
+  principal: {
+    /**
+     * Opaque embedder principal label. The runtime compares it for identity and
+     * carries it in events; it attaches no meaning to any particular value, so
+     * product principal modes stay with the embedder (DR-0049 §1).
+     */
+    label: string;
+    subject_hash?: string;
+  };
+}
+
+interface PublicSessionState extends PublicSessionBootstrap {
+  instance_ref: string;
+  envelope_hash: string;
+  policy_key_id?: string;
+  created_at_unix_ms: number;
+  last_activity_unix_ms: number;
+}
+
+interface PublicSessionEvent {
+  sequence: number;
+  type: string;
+  request_id?: string;
+  command_id?: string;
+  [key: string]: unknown;
+}
+
+type PublicSessionEventInput = Omit<PublicSessionEvent, "sequence"> & {
+  type: string;
+};
+
 export class WorkflowInstance implements DurableObject {
+  private readonly turnStreams = new Map<
+    string,
+    Set<ReadableStreamDefaultController<Uint8Array>>
+  >();
+  // Same-isolate command coalescing only. Durable command identity and recovery
+  // remain in WhippleScript effects/runs/receipts; this map disappears freely
+  // on hibernation and is never a second turn lifecycle.
+  private readonly publicTurns = new Map<
+    string,
+    Promise<PublicSessionEvent | null>
+  >();
+  private readonly publicTraceStarts = new Map<string, number>();
+  private readonly publicFirstWebSocketDeltas = new Set<string>();
+  private readonly textEncoder = new TextEncoder();
+
   constructor(
     private ctx: DurableObjectState,
     private env: Env,
@@ -328,16 +651,118 @@ export class WorkflowInstance implements DurableObject {
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
   async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") {
-      return Response.json({ error: "method not allowed" }, { status: 405 });
-    }
     const authError = controlAuthError(request, this.env);
     if (authError) {
       return authError;
     }
+    const url = new URL(request.url);
+    if (request.method === "GET") {
+      if (url.pathname === "/public/session/state") {
+        return this.publicSessionState();
+      }
+      if (url.pathname === "/public/session/files") {
+        return this.publicSessionFiles(url);
+      }
+      if (url.pathname === "/public/session/socket") {
+        const session = await this.ctx.storage.get<PublicSessionState>(
+          "public-session-state",
+        );
+        if (!session) {
+          return Response.json(
+            { error: "public session is not bootstrapped" },
+            { status: 409 },
+          );
+        }
+        if (this.publicSessionExpired(session)) {
+          return Response.json({ error: "public session has expired" }, { status: 410 });
+        }
+        return this.openPublicSessionSocket(request, session, url);
+      }
+      const eventStream = url.pathname.match(/^\/host\/instances\/([^/]+)\/events\/stream$/);
+      if (eventStream) {
+        return this.hostEventStream(decodeURIComponent(eventStream[1]), url);
+      }
+      const eventSocket = url.pathname.match(/^\/host\/instances\/([^/]+)\/events\/live$/);
+      if (eventSocket) {
+        return this.openHostEventSocket(
+          request,
+          decodeURIComponent(eventSocket[1]),
+          url,
+        );
+      }
+      const turnStream = url.pathname.match(
+        /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/stream$/,
+      );
+      if (turnStream) {
+        return this.openHostTurnStream(
+          decodeURIComponent(turnStream[1]),
+          decodeURIComponent(turnStream[2]),
+          url,
+        );
+      }
+      const forkExport = url.pathname.match(/^\/host\/instances\/([^/]+)\/fork-export$/);
+      if (forkExport) {
+        return this.exportHostFork(decodeURIComponent(forkExport[1]), url);
+      }
+      return this.hostProjection(url);
+    }
+    if (request.method !== "POST") {
+      return Response.json({ error: "method not allowed" }, { status: 405 });
+    }
     const parsed = await readJsonBody(request);
     if (parsed instanceof Response) {
       return parsed;
+    }
+    if (url.pathname === "/public/session/bootstrap") {
+      return this.bootstrapPublicSession(parsed);
+    }
+    if (url.pathname === "/public/session/claim") {
+      return this.claimPublicSession(parsed);
+    }
+    if (url.pathname === "/public/session/erase") {
+      return this.erasePublicSession();
+    }
+    const cancel = url.pathname.match(/^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/cancel$/);
+    if (cancel) {
+      try {
+        const receipt = JSON.parse(
+          hostFunctions.host_cancel_turn(
+            makeBridge(this.ctx.storage.sql),
+            decodeURIComponent(cancel[1]),
+            decodeURIComponent(cancel[2]),
+            "gaugedesk-control-plane",
+          ),
+        );
+        return Response.json(receipt, { status: 202 });
+      } catch (error) {
+        return Response.json({ error: `cancellation rejected: ${String(error)}` }, { status: 400 });
+      }
+    }
+    const fileSync = url.pathname.match(/^\/host\/instances\/([^/]+)\/files\/sync$/);
+    if (fileSync) {
+      return this.syncHostFiles(decodeURIComponent(fileSync[1]), parsed);
+    }
+    const checkpoint = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/(checkpoint|restore)$/,
+    );
+    if (checkpoint) {
+      return this.hostCheckpoint(
+        decodeURIComponent(checkpoint[1]),
+        checkpoint[2] as "checkpoint" | "restore",
+        parsed,
+      );
+    }
+    if (url.pathname === "/host/policy") {
+      return this.bootstrapHostPolicy(parsed);
+    }
+    if (url.pathname === "/host/instances/open") {
+      return this.openHostInstance(parsed);
+    }
+    if (url.pathname === "/host/turns") {
+      return this.beginHostTurn(parsed);
+    }
+    if (url.pathname === "/host/forks/import") {
+      return this.importHostFork(parsed);
     }
     const body = parsed as Partial<Bootstrap> & { command?: string; cut_id?: string };
     // Operator commands (P3): checkpoint / restore an existing instance. The
@@ -390,10 +815,2408 @@ export class WorkflowInstance implements DurableObject {
     return Response.json(result);
   }
 
+  private async publicSessionState(): Promise<Response> {
+    const session = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (!session) {
+      return Response.json(
+        { error: "public session is not bootstrapped" },
+        { status: 409 },
+      );
+    }
+    if (this.publicSessionExpired(session)) {
+      return Response.json({ error: "public session has expired" }, { status: 410 });
+    }
+    ensureSchema(this.ctx.storage.sql);
+    const snapshot = await this.publicSessionSnapshot(session);
+    return Response.json(snapshot);
+  }
+
+  private async claimPublicSession(
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const session = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    const subjectHash =
+      typeof parsed.subject_hash === "string" ? parsed.subject_hash : "";
+    if (!session) {
+      return Response.json({ error: "public session is not bootstrapped" }, { status: 409 });
+    }
+    if (!/^[0-9a-f]{64}$/.test(subjectHash)) {
+      return Response.json({ error: "principal subject is invalid" }, { status: 422 });
+    }
+    // Binding a subject is idempotent for the same subject and refused for a
+    // different one. Whether an unbound session is "anonymous" is the embedder's
+    // product distinction, not the runtime's (DR-0049 §1).
+    if (
+      typeof session.principal.subject_hash === "string" &&
+      session.principal.subject_hash !== subjectHash
+    ) {
+      return Response.json({ error: "session belongs to another subject" }, { status: 409 });
+    }
+    session.principal = { label: session.principal.label, subject_hash: subjectHash };
+    await this.ctx.storage.put("public-session-state", session);
+    this.appendPublicEvent({ type: "session_claimed" });
+    return Response.json({ claimed: true });
+  }
+
+  private async erasePublicSession(): Promise<Response> {
+    for (const socket of this.ctx.getWebSockets()) {
+      socket.close(1008, "session erased");
+    }
+    await this.ctx.storage.deleteAll();
+    return Response.json({ erased: true });
+  }
+
+  private ensurePublicEventSchema(): void {
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS public_session_events (
+         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+         event_key TEXT,
+         event_json TEXT NOT NULL
+       )`,
+    );
+    const columns = this.ctx.storage.sql
+      .exec("PRAGMA table_info(public_session_events)")
+      .toArray() as { name: string }[];
+    if (!columns.some((column) => column.name === "event_key")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE public_session_events ADD COLUMN event_key TEXT",
+      );
+    }
+    this.ctx.storage.sql.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS public_session_events_event_key
+         ON public_session_events(event_key) WHERE event_key IS NOT NULL`,
+    );
+  }
+
+  private publicEventCursor(): number {
+    this.ensurePublicEventSchema();
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM public_session_events",
+      )
+      .toArray() as { sequence: number }[];
+    return Number(rows[0]?.sequence ?? 0);
+  }
+
+  private publicEvents(after: number): PublicSessionEvent[] {
+    this.ensurePublicEventSchema();
+    return (
+      this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, event_json FROM public_session_events
+            WHERE sequence > ?1 ORDER BY sequence LIMIT 2000`,
+          after,
+        )
+        .toArray() as { sequence: number; event_json: string }[]
+    ).map((row) => ({
+          ...(JSON.parse(row.event_json) as PublicSessionEventInput),
+      sequence: row.sequence,
+    }));
+  }
+
+  private appendPublicEvent(
+    event: PublicSessionEventInput,
+    eventKey?: string,
+  ): PublicSessionEvent {
+    this.ensurePublicEventSchema();
+    if (eventKey) {
+      const existing = this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, event_json FROM public_session_events
+            WHERE event_key = ?1 LIMIT 1`,
+          eventKey,
+        )
+        .toArray() as { sequence: number; event_json: string }[];
+      if (existing.length) {
+        return {
+          ...(JSON.parse(existing[0].event_json) as PublicSessionEventInput),
+          sequence: Number(existing[0].sequence),
+        };
+      }
+    }
+    const rows = this.ctx.storage.sql
+      .exec(
+        `INSERT INTO public_session_events (event_key, event_json)
+         VALUES (?1, ?2) RETURNING sequence`,
+        eventKey ?? null,
+        JSON.stringify(event),
+      )
+      .toArray() as { sequence: number }[];
+    const persisted: PublicSessionEvent = {
+      ...event,
+      sequence: Number(rows[0]?.sequence ?? 0),
+    };
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as
+        | { publicSession?: boolean }
+        | null;
+      if (attachment?.publicSession) socket.send(JSON.stringify(persisted));
+    }
+    return persisted;
+  }
+
+  private sendPublicLatency(
+    traceId: string,
+    span: "public_turn" | "runtime",
+    phase: string,
+    elapsedMs: number,
+  ): void {
+    if (!traceId.startsWith("public:")) return;
+    const requestId = traceId.split(":").at(-1);
+    if (!requestId) return;
+    const frame = JSON.stringify({
+      type: "latency",
+      source: "session",
+      span,
+      phase,
+      request_id: requestId,
+      elapsed_ms: Math.round(elapsedMs * 10) / 10,
+    });
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as
+        | { publicSession?: boolean }
+        | null;
+      if (attachment?.publicSession) socket.send(frame);
+    }
+  }
+
+  private async publicSessionSnapshot(
+    session: PublicSessionState,
+  ): Promise<Record<string, unknown>> {
+    const transcript =
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+        "public-transcript",
+      )) ?? [];
+    const prefix = `${session.instance_ref}/`;
+    const files = this.ctx.storage.sql
+      .exec(
+        `SELECT substr(key, length(?1) + 1) AS path
+           FROM files WHERE key LIKE ?1 || '%' ORDER BY key LIMIT 5000`,
+        prefix,
+      )
+      .toArray();
+    return {
+      session_id: session.session_id,
+      release_id: session.release_id,
+      cursor: this.publicEventCursor(),
+      transcript,
+      files,
+    };
+  }
+
+  private async publicSessionFiles(url: URL): Promise<Response> {
+    const session = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (!session) {
+      return Response.json(
+        { error: "public session is not bootstrapped" },
+        { status: 409 },
+      );
+    }
+    if (this.publicSessionExpired(session)) {
+      return Response.json({ error: "public session has expired" }, { status: 410 });
+    }
+    const path = url.searchParams.get("path");
+    if (!path) return this.publicSessionState();
+    if (
+      path.startsWith("/") ||
+      path.includes("\\") ||
+      path.split("/").some((part) => !part || part === "." || part === "..")
+    ) {
+      return Response.json({ error: "invalid file path" }, { status: 400 });
+    }
+    ensureSchema(this.ctx.storage.sql);
+    const rows = this.ctx.storage.sql
+      .exec(
+        "SELECT content FROM files WHERE key = ?1",
+        `${session.instance_ref}/${path}`,
+      )
+      .toArray() as { content: string }[];
+    return rows.length
+      ? new Response(rows[0].content, {
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        })
+      : Response.json({ error: "file not found" }, { status: 404 });
+  }
+
+  private instanceExists(instanceId: string): boolean {
+    ensureSchema(this.ctx.storage.sql);
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT 1 AS present FROM instances WHERE instance_id = ?1", instanceId)
+        .toArray().length > 0
+    );
+  }
+
+  private hostProjection(url: URL): Response {
+    ensureSchema(this.ctx.storage.sql);
+    // DR-0050: `ask_human` is removed, so no turn ever parks awaiting a person
+    // and nothing is ever pending. The route stays so an older client gets a
+    // well-formed answer rather than a 404 during the cutover.
+    if (url.pathname.match(/^\/host\/instances\/([^/]+)\/pending$/)) {
+      return Response.json({ pending: null });
+    }
+    const result = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/result$/,
+    );
+    if (result) {
+      const instanceId = decodeURIComponent(result[1]);
+      const commandId = decodeURIComponent(result[2]);
+      const turns = this.ctx.storage.sql
+        .exec(
+          `SELECT e.status, e.policy_block_reason, r.status AS run_status, r.summary
+             FROM effects e LEFT JOIN runs r ON r.effect_id = e.effect_id
+            WHERE e.instance_id = ?1 AND e.effect_id = ?2
+            ORDER BY r.started_at DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      if (!turns.length) return Response.json({ error: "turn not found" }, { status: 404 });
+      const transcripts = this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, payload_json FROM events
+            WHERE instance_id = ?1 AND event_type = 'agent.turn.brokered.transcript'
+              AND (correlation_id = ?2 OR causation_id = ?2)
+            ORDER BY sequence DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray() as { sequence: number; payload_json: string }[];
+      const transcript = transcripts.length
+        ? JSON.parse(transcripts[0].payload_json) as { messages?: unknown[] }
+        : { messages: [] };
+      const evidence = this.ctx.storage.sql
+        .exec(
+          `SELECT evidence_id AS evidence_ref, kind, subject_type, subject_id,
+                  correlation_id AS command_id, created_at
+             FROM evidence WHERE instance_id = ?1 AND correlation_id = ?2
+            ORDER BY created_at, evidence_id`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      let runtimeProjection: Record<string, unknown>;
+      try {
+        runtimeProjection = JSON.parse(
+          hostFunctions.host_project_turn(
+            makeBridge(this.ctx.storage.sql),
+            instanceId,
+            commandId,
+          ),
+        ) as Record<string, unknown>;
+      } catch (error) {
+        return Response.json(
+          { error: `turn projection failed: ${String(error)}` },
+          { status: 409 },
+        );
+      }
+      return Response.json({
+        ...turns[0],
+        ...runtimeProjection,
+        transcript_sequence: transcripts[0]?.sequence ?? 0,
+        messages: transcript.messages ?? [],
+        evidence,
+      });
+    }
+    const position = url.pathname.match(/^\/host\/instances\/([^/]+)\/position$/);
+    if (position) {
+      const instanceId = decodeURIComponent(position[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      try {
+        return Response.json(JSON.parse(hostFunctions.host_current_position(
+          makeBridge(this.ctx.storage.sql),
+          instanceId,
+        )));
+      } catch (error) {
+        return Response.json({ error: `position projection failed: ${String(error)}` }, { status: 409 });
+      }
+    }
+    const turn = url.pathname.match(/^\/host\/instances\/([^/]+)\/turns\/([^/]+)$/);
+    if (turn) {
+      const instanceId = decodeURIComponent(turn[1]);
+      const commandId = decodeURIComponent(turn[2]);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT e.effect_id AS command_id, e.instance_id AS instance_ref,
+                  e.status, e.policy_block_reason, e.updated_at,
+                  r.run_id, r.status AS run_status, r.summary
+             FROM effects e LEFT JOIN runs r ON r.effect_id = e.effect_id
+            WHERE e.instance_id = ?1 AND e.effect_id = ?2
+            ORDER BY r.started_at DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      return rows.length
+        ? Response.json(rows[0])
+        : Response.json({ error: "turn not found" }, { status: 404 });
+    }
+    const transcript = url.pathname.match(
+      /^\/host\/instances\/([^/]+)\/turns\/([^/]+)\/transcript$/,
+    );
+    if (transcript) {
+      const instanceId = decodeURIComponent(transcript[1]);
+      const commandId = decodeURIComponent(transcript[2]);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT sequence, payload_json FROM events
+            WHERE instance_id = ?1
+              AND event_type = 'agent.turn.brokered.transcript'
+              AND (correlation_id = ?2 OR causation_id = ?2)
+            ORDER BY sequence DESC LIMIT 1`,
+          instanceId,
+          commandId,
+        )
+        .toArray() as { sequence: number; payload_json: string }[];
+      if (!rows.length) return Response.json({ sequence: 0, messages: [] });
+      const payload = JSON.parse(rows[0].payload_json) as { messages?: unknown[] };
+      return Response.json({ sequence: rows[0].sequence, messages: payload.messages ?? [] });
+    }
+    const events = url.pathname.match(/^\/host\/instances\/([^/]+)\/events$/);
+    if (events) {
+      const instanceId = decodeURIComponent(events[1]);
+      const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT event_id AS evidence_ref, sequence, event_type AS kind,
+                  occurred_at, correlation_id AS command_id
+             FROM events WHERE instance_id = ?1 AND sequence > ?2
+            ORDER BY sequence LIMIT 500`,
+          instanceId,
+          after,
+        )
+        .toArray();
+      return Response.json({ events: rows });
+    }
+    const evidence = url.pathname.match(/^\/host\/instances\/([^/]+)\/evidence$/);
+    if (evidence) {
+      const instanceId = decodeURIComponent(evidence[1]);
+      const commandId = url.searchParams.get("command_id");
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT evidence_id AS evidence_ref, kind, subject_type, subject_id,
+                  correlation_id AS command_id, summary, created_at
+             FROM evidence WHERE instance_id = ?1
+              AND (?2 IS NULL OR correlation_id = ?2)
+            ORDER BY created_at, evidence_id LIMIT 500`,
+          instanceId,
+          commandId,
+        )
+        .toArray();
+      return Response.json({ evidence: rows });
+    }
+    const files = url.pathname.match(/^\/host\/instances\/([^/]+)\/files$/);
+    if (files) {
+      const instanceId = decodeURIComponent(files[1]);
+      if (!this.instanceExists(instanceId)) {
+        return Response.json({ error: "instance not found" }, { status: 404 });
+      }
+      const prefix = `${instanceId}/`;
+      const path = url.searchParams.get("path");
+      if (path != null) {
+        const rows = this.ctx.storage.sql
+          .exec("SELECT content FROM files WHERE key = ?1", `${prefix}${path}`)
+          .toArray() as { content: string }[];
+        return rows.length
+          ? new Response(rows[0].content, { headers: { "content-type": "text/plain; charset=utf-8" } })
+          : Response.json({ error: "file not found" }, { status: 404 });
+      }
+      const rows = this.ctx.storage.sql
+        .exec(
+          "SELECT substr(key, length(?1) + 1) AS path FROM files WHERE key LIKE ?1 || '%' ORDER BY key LIMIT 5000",
+          prefix,
+        )
+        .toArray();
+      return Response.json({ files: rows });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+
+  private hostEvents(instanceId: string, after: number): Record<string, unknown>[] {
+    ensureSchema(this.ctx.storage.sql);
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT event_id AS evidence_ref, sequence, event_type AS kind,
+                occurred_at, correlation_id AS command_id
+           FROM events WHERE instance_id = ?1 AND sequence > ?2
+          ORDER BY sequence LIMIT 500`,
+        instanceId,
+        after,
+      )
+      .toArray();
+  }
+
+  private hostEventStream(instanceId: string, url: URL): Response {
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const events = this.hostEvents(instanceId, after);
+    const body = events
+      .map((event) => `id: ${String(event.sequence)}\nevent: runtime\ndata: ${JSON.stringify(event)}\n\n`)
+      .join("") + ": caught-up\n\n";
+    return new Response(body, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+
+  private openHostEventSocket(request: Request, instanceId: string, url: URL): Response {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return Response.json({ error: "websocket upgrade required" }, { status: 426 });
+    }
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [instanceId]);
+    server.serializeAttachment({ instanceId, after });
+    this.sendHostProgress(server, instanceId, after);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async openPublicSessionSocket(
+    request: Request,
+    session: PublicSessionState,
+    url: URL,
+  ): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return Response.json({ error: "websocket upgrade required" }, { status: 426 });
+    }
+    if (!this.instanceExists(session.instance_ref)) {
+      return Response.json(
+        { error: "public session runtime is not recoverable" },
+        { status: 503 },
+      );
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, [session.instance_ref]);
+    server.serializeAttachment({
+      instanceId: session.instance_ref,
+      after,
+      publicSession: true,
+    });
+    const snapshot = await this.publicSessionSnapshot(session);
+    if (after > 0) {
+      for (const event of this.publicEvents(after)) {
+        server.send(JSON.stringify(event));
+      }
+    }
+    server.send(
+      JSON.stringify({
+        type: "session_ready",
+        sequence: snapshot.cursor,
+        snapshot,
+      }),
+    );
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private sendHostProgress(socket: WebSocket, instanceId: string, after: number): void {
+    const events = this.hostEvents(instanceId, after);
+    if (!events.length) return;
+    socket.send(JSON.stringify({ type: "runtime_events", events }));
+    const next = Number(events.at(-1)?.sequence ?? after);
+    socket.serializeAttachment({ instanceId, after: next });
+  }
+
+  private broadcastHostProgress(instanceId: string): void {
+    for (const socket of this.ctx.getWebSockets(instanceId)) {
+      const attachment = socket.deserializeAttachment() as
+        | { instanceId?: string; after?: number; publicSession?: boolean }
+        | null;
+      if (attachment?.publicSession) continue;
+      this.sendHostProgress(
+        socket,
+        attachment?.instanceId ?? instanceId,
+        attachment?.after ?? 0,
+      );
+    }
+  }
+
+  private turnStreamKey(instanceId: string, commandId: string): string {
+    return `${instanceId}\0${commandId}`;
+  }
+
+  private hostTurnDeltas(
+    instanceId: string,
+    commandId: string,
+    after: number,
+  ): { sequence: number; delta: string }[] {
+    ensureSchema(this.ctx.storage.sql);
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT sequence, delta FROM host_turn_deltas
+          WHERE instance_id = ?1 AND command_id = ?2 AND sequence > ?3
+          ORDER BY sequence LIMIT 1000`,
+        instanceId,
+        commandId,
+        after,
+      )
+      .toArray() as { sequence: number; delta: string }[];
+  }
+
+  /** Reconcile a retried provider stream against chunks already published for
+   * this exact stable model-round idempotency key. Matching replay is
+   * suppressed; segmentation/content drift fails closed instead of duplicating
+   * or rewriting browser output. */
+  private publicProviderRoundReplay(
+    instanceId: string,
+    commandId: string,
+    request: { headers: [string, string][] },
+  ): {
+    accept(delta: string): boolean;
+    complete(): void;
+  } {
+    if (!instanceId || !commandId) {
+      throw new Error("public provider round has no durable command identity");
+    }
+    const roundKey = request.headers.find(
+      ([name]) => name.toLowerCase() === "idempotency-key",
+    )?.[1];
+    if (!roundKey) {
+      throw new Error("public provider round has no stable idempotency key");
+    }
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS public_provider_chunks (
+         instance_id TEXT NOT NULL,
+         command_id TEXT NOT NULL,
+         round_key TEXT NOT NULL,
+         chunk_index INTEGER NOT NULL,
+         delta TEXT NOT NULL,
+         PRIMARY KEY (instance_id, command_id, round_key, chunk_index)
+       )`,
+    );
+    const existing = this.ctx.storage.sql
+      .exec(
+        `SELECT chunk_index, delta FROM public_provider_chunks
+          WHERE instance_id = ?1 AND command_id = ?2 AND round_key = ?3
+          ORDER BY chunk_index`,
+        instanceId,
+        commandId,
+        roundKey,
+      )
+      .toArray() as { chunk_index: number; delta: string }[];
+    const priorCount = existing.length;
+    let index = 0;
+    return {
+      accept: (delta: string): boolean => {
+        const prior = existing[index];
+        if (prior) {
+          if (prior.chunk_index !== index || prior.delta !== delta) {
+            throw new Error("retried public provider stream diverged from durable output");
+          }
+          index += 1;
+          return false;
+        }
+        this.ctx.storage.sql.exec(
+          `INSERT INTO public_provider_chunks
+             (instance_id, command_id, round_key, chunk_index, delta)
+           VALUES (?1, ?2, ?3, ?4, ?5)`,
+          instanceId,
+          commandId,
+          roundKey,
+          index,
+          delta,
+        );
+        existing.push({ chunk_index: index, delta });
+        index += 1;
+        return true;
+      },
+      complete: (): void => {
+        if (index < priorCount) {
+          throw new Error("retried public provider stream ended before durable output");
+        }
+      },
+    };
+  }
+
+  private encodeTurnDelta(sequence: number, delta: string): Uint8Array {
+    return this.textEncoder.encode(
+      `id: ${sequence}\nevent: text_delta\ndata: ${JSON.stringify({
+        type: "text_delta",
+        sequence,
+        delta,
+      })}\n\n`,
+    );
+  }
+
+  private turnIsTerminal(instanceId: string, commandId: string): boolean {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT status FROM effects
+          WHERE instance_id = ?1 AND effect_id = ?2 LIMIT 1`,
+        instanceId,
+        commandId,
+      )
+      .toArray() as { status: string }[];
+    return rows.length > 0
+      && ["completed", "failed", "timed_out", "cancelled", "blocked"].includes(rows[0].status);
+  }
+
+  private openHostTurnStream(instanceId: string, commandId: string, url: URL): Response {
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+    const key = this.turnStreamKey(instanceId, commandId);
+    const owner = this;
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controllerRef = controller;
+        controller.enqueue(owner.textEncoder.encode(": connected\n\n"));
+        for (const event of owner.hostTurnDeltas(instanceId, commandId, after)) {
+          controller.enqueue(owner.encodeTurnDelta(event.sequence, event.delta));
+        }
+        if (owner.turnIsTerminal(instanceId, commandId)) {
+          controller.enqueue(owner.textEncoder.encode("event: terminal\ndata: {}\n\n"));
+          controller.close();
+          return;
+        }
+        const streams = owner.turnStreams.get(key) ?? new Set();
+        streams.add(controller);
+        owner.turnStreams.set(key, streams);
+      },
+      cancel() {
+        if (!controllerRef) return;
+        const streams = owner.turnStreams.get(key);
+        streams?.delete(controllerRef);
+        if (streams?.size === 0) owner.turnStreams.delete(key);
+      },
+    });
+    return new Response(body, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+
+  private publishHostTurnDelta(instanceId: string, commandId: string, delta: string): void {
+    if (!delta) return;
+    const rows = this.ctx.storage.sql
+      .exec(
+        `INSERT INTO host_turn_deltas (instance_id, command_id, delta)
+         VALUES (?1, ?2, ?3) RETURNING sequence`,
+        instanceId,
+        commandId,
+        delta,
+      )
+      .toArray() as { sequence: number }[];
+    const sequence = rows[0]?.sequence;
+    if (!Number.isSafeInteger(sequence)) return;
+    if (commandId.startsWith("public:")) {
+      const requestId = publicRequestId(commandId);
+      this.appendPublicEvent({
+        type: "text_delta",
+        command_id: commandId,
+        ...(requestId ? { request_id: requestId } : {}),
+        delta,
+      });
+      if (!this.publicFirstWebSocketDeltas.has(commandId)) {
+        this.publicFirstWebSocketDeltas.add(commandId);
+        const startedAt = this.publicTraceStarts.get(commandId);
+        if (startedAt !== undefined) {
+          this.sendPublicLatency(
+            commandId,
+            "public_turn",
+            "websocket_first_delta_sent",
+            performance.now() - startedAt,
+          );
+        }
+      }
+    }
+    const encoded = this.encodeTurnDelta(sequence, delta);
+    for (const controller of this.turnStreams.get(
+      this.turnStreamKey(instanceId, commandId),
+    ) ?? []) {
+      controller.enqueue(encoded);
+    }
+    for (const socket of this.ctx.getWebSockets(instanceId)) {
+      const attachment = socket.deserializeAttachment() as
+        | { publicSession?: boolean }
+        | null;
+      if (attachment?.publicSession) continue;
+      socket.send(
+        JSON.stringify({
+          type: "text_delta",
+          command_id: commandId,
+          sequence,
+          delta,
+        }),
+      );
+    }
+  }
+
+  private finishHostTurnStream(instanceId: string, commandId: string): void {
+    const key = this.turnStreamKey(instanceId, commandId);
+    for (const controller of this.turnStreams.get(key) ?? []) {
+      controller.enqueue(this.textEncoder.encode("event: terminal\ndata: {}\n\n"));
+      controller.close();
+    }
+    this.turnStreams.delete(key);
+    if (commandId.startsWith("public:")) return;
+    for (const socket of this.ctx.getWebSockets(instanceId)) {
+      socket.send(
+        JSON.stringify({ type: "turn_terminal", command_id: commandId }),
+      );
+    }
+  }
+
+  async webSocketMessage(
+    socket: WebSocket,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
+    try {
+      const parsed = JSON.parse(
+        typeof message === "string" ? message : new TextDecoder().decode(message),
+      ) as {
+        after?: unknown;
+        type?: unknown;
+        request_id?: unknown;
+        text?: unknown;
+        command_id?: unknown;
+        ask_ref?: unknown;
+        answer?: unknown;
+      };
+      const attachment = socket.deserializeAttachment() as
+        | { instanceId?: string; after?: number; publicSession?: boolean }
+        | null;
+      const instanceId = attachment?.instanceId;
+      if (!instanceId) throw new Error("socket has no instance attachment");
+      if (attachment?.publicSession && parsed.type === "send_message") {
+        const requestId =
+          typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
+        const completed = requestId
+          ? await this.ctx.storage.get<PublicSessionEvent>(
+              `public-turn-result:${requestId}`,
+            )
+          : undefined;
+        if (completed) {
+          socket.send(JSON.stringify(completed));
+          return;
+        }
+        const inProcess = requestId
+          ? this.publicTurns.get(requestId)
+          : undefined;
+        if (inProcess) {
+          const event = await inProcess;
+          if (event) socket.send(JSON.stringify(event));
+          return;
+        }
+        const run = (async () => {
+          const result = await this.beginPublicTurn(parsed);
+          return this.publishPublicTurnResult(instanceId, requestId, result);
+        })();
+        if (requestId) this.publicTurns.set(requestId, run);
+        try {
+          await run;
+        } finally {
+          if (requestId && this.publicTurns.get(requestId) === run) {
+            this.publicTurns.delete(requestId);
+          }
+          if (requestId) {
+            for (const traceId of this.publicTraceStarts.keys()) {
+              if (!traceId.endsWith(`:${requestId}`)) continue;
+              this.publicTraceStarts.delete(traceId);
+              this.publicFirstWebSocketDeltas.delete(traceId);
+            }
+          }
+        }
+        return;
+      }
+      if (attachment?.publicSession && parsed.type === "resume") {
+        const after = Number.isSafeInteger(parsed.after)
+          ? Math.max(0, Number(parsed.after))
+          : 0;
+        for (const event of this.publicEvents(after)) {
+          socket.send(JSON.stringify(event));
+        }
+        return;
+      }
+      if (attachment?.publicSession && parsed.type === "stop") {
+        const requestId =
+          typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
+        const publicSession = await this.ctx.storage.get<PublicSessionState>(
+          "public-session-state",
+        );
+        if (
+          !publicSession ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)
+        ) {
+          throw new Error("stop requires a valid public request_id");
+        }
+        const commandId = publicCommandId(publicSession.session_id, requestId);
+        const receipt = JSON.parse(
+          hostFunctions.host_cancel_turn(
+            makeBridge(this.ctx.storage.sql),
+            instanceId,
+            commandId,
+            "public-audience",
+          ),
+        );
+        this.appendPublicEvent({
+          type: "turn_stopped",
+          request_id: requestId,
+          command_id: commandId,
+          receipt,
+        }, `turn-stop:${commandId}`);
+        return;
+      }
+      if (attachment?.publicSession) {
+        throw new Error("unsupported public session command");
+      }
+      const after = Number.isSafeInteger(parsed.after)
+        ? Number(parsed.after)
+        : attachment?.after ?? 0;
+      this.sendHostProgress(socket, instanceId, Math.max(0, after));
+    } catch (error) {
+      socket.send(JSON.stringify({ type: "error", error: String(error) }));
+    }
+  }
+
+  private async publishPublicTurnResult(
+    instanceId: string,
+    requestId: string,
+    result: Response,
+  ): Promise<PublicSessionEvent | null> {
+    const body = await result.json();
+    const publicSession = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (!publicSession) {
+      throw new Error("public turn lost its durable session");
+    }
+    const commandId = publicCommandId(publicSession.session_id, requestId);
+    const terminal = this.appendPublicEvent({
+      type: result.ok ? "turn_terminal" : "error",
+      request_id: requestId,
+      command_id: commandId,
+      status: result.status,
+      body,
+    });
+    await this.ctx.storage.put(`public-turn-result:${requestId}`, terminal);
+    return terminal;
+  }
+
+  private async beginPublicTurn(parsed: {
+    request_id?: unknown;
+    text?: unknown;
+  }): Promise<Response> {
+    const session = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (!session) {
+      return Response.json(
+        { error: "public session is not bootstrapped" },
+        { status: 409 },
+      );
+    }
+    if (this.publicSessionExpired(session)) {
+      return Response.json({ error: "public session has expired" }, { status: 410 });
+    }
+    const requestId =
+      typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
+    const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId) ||
+      !text ||
+      new TextEncoder().encode(text).length > 256 * 1024
+    ) {
+      return Response.json(
+        { error: "turn requires a valid request_id and non-empty text" },
+        { status: 422 },
+      );
+    }
+    // Activity is an admitted observation stamped here, not a field assignment.
+    // It also returns an expiring session to active inside the grace window.
+    const activityAt = Date.now();
+    this.admitLifecycle({ kind: "observeActivity", atMs: activityAt });
+    session.last_activity_unix_ms = activityAt;
+    await this.ctx.storage.put("public-session-state", session);
+    await this.schedulePublicSessionExpiry(session);
+    const capabilities = new Set(session.capabilities ?? []);
+    const resources: {
+      handle: string;
+      kind: string;
+      selector: null;
+    }[] = [];
+    if (
+      capabilities.has("workspace.read") ||
+      capabilities.has("workspace.write")
+    ) {
+      resources.push({ handle: "project", kind: "file_store", selector: null });
+    }
+    if (capabilities.has("command.run")) {
+      resources.push({ handle: "command", kind: "command", selector: null });
+    }
+    const commandId = publicCommandId(session.session_id, requestId);
+    const turnStartedAt = performance.now();
+    this.publicTraceStarts.set(commandId, turnStartedAt);
+    const traceBoundary = (boundary: string) => {
+      const elapsedMs = performance.now() - turnStartedAt;
+      console.log(JSON.stringify({
+        event: "gaugewright_public_turn_boundary",
+        trace_id: commandId,
+        boundary,
+        elapsed_ms: Math.round(elapsedMs * 10) / 10,
+      }));
+      this.sendPublicLatency(commandId, "public_turn", boundary, elapsedMs);
+    };
+    traceBoundary("command_received");
+    traceBoundary("reservation_start");
+    const reservation = await this.sessionAdmissionCommand(
+      session,
+      "admit",
+      { request_id: requestId },
+    );
+    if (reservation instanceof Response) return reservation;
+    traceBoundary("reservation_complete");
+    const transcript =
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+        "public-transcript",
+      )) ?? [];
+    const userProjectionKey = `public-transcript-user:${requestId}`;
+    if (!(await this.ctx.storage.get<boolean>(userProjectionKey))) {
+      transcript.push({ type: "user", text });
+      await this.ctx.storage.put({
+        "public-transcript": transcript,
+        [userProjectionKey]: true,
+      });
+      this.appendPublicEvent({
+        type: "message_accepted",
+        request_id: requestId,
+        command_id: commandId,
+        role: "user",
+        text,
+      });
+    }
+    const reservationRef =
+      typeof reservation.reservation_ref === "string"
+        ? reservation.reservation_ref
+        : "";
+    traceBoundary("runtime_turn_start");
+    const turn = await this.beginHostTurn({
+      command: {
+        protocol: "whipplescript.host.v1",
+        command_id: commandId,
+        run_ref: `public:run:${session.session_id}:${requestId}`,
+        instance_ref: session.instance_ref,
+        package_version_ref: session.package_version_ref,
+        policy: {
+          epoch: session.host_policy.epoch,
+          envelope_hash: session.envelope_hash,
+          signer: session.host_policy.expected_signer,
+          ...(session.policy_key_id ? { key_id: session.policy_key_id } : {}),
+        },
+        // The signed public host policy maps this stable runtime principal to
+        // the `audience` IFC role. Per-visitor identity remains attributable in
+        // the session-owned principal record and command/session correlation;
+        // putting a session-specific string here would be unmapped by the
+        // immutable policy and silently demote the agent to `public`.
+        actor_ref: "audience",
+        input: { text, images: [] },
+        resources,
+        provider_binding: {
+          binding_id: session.host_policy.provider_binding_ref,
+          credential: {
+            credential_id: session.host_policy.credential_class,
+          },
+        },
+        placement_ceiling_ref: session.host_policy.placement_ref,
+      },
+      package: session.package,
+      image_bodies: [],
+    }, session.credential_ref);
+    const assistantText = this.hostTurnDeltas(
+      session.instance_ref,
+      commandId,
+      0,
+    )
+      .map((event) => event.delta)
+      .join("");
+    const assistantProjectionKey = `public-transcript-assistant:${requestId}`;
+    if (
+      assistantText &&
+      !(await this.ctx.storage.get<boolean>(assistantProjectionKey))
+    ) {
+      transcript.push({ type: "assistant", text: assistantText });
+      await this.ctx.storage.put({
+        "public-transcript": transcript,
+        [assistantProjectionKey]: true,
+      });
+    }
+    traceBoundary("runtime_turn_complete");
+    const turnBody = (await turn.clone().json()) as {
+      outcome?: unknown;
+      receipt?: {
+        status?: unknown;
+      };
+      usage?: {
+        usage_ref?: unknown;
+        input_tokens?: unknown;
+        cached_input_tokens?: unknown;
+        output_tokens?: unknown;
+      };
+      output?: {
+        label_ref?: unknown;
+        tool_calls?: {
+          call_id?: unknown;
+          name?: unknown;
+          arguments?: unknown;
+          result?: unknown;
+          ok?: unknown;
+        }[];
+      };
+    };
+    const receiptStatus =
+      typeof turnBody.receipt?.status === "string"
+        ? turnBody.receipt.status
+        : "";
+    const turnSucceeded = turn.ok && receiptStatus === "completed";
+    if (turn.ok && turnBody.outcome === "parked" && !receiptStatus) {
+      // The reservation remains held by the original request id while the same
+      // durable turn waits. Human continuation replays `reserve` idempotently
+      // and settles that exact reservation only after the resumed turn ends.
+      return turn;
+    }
+    const usage = turnBody.usage;
+    const hasExactUsage =
+      typeof usage?.usage_ref === "string" &&
+      Number.isSafeInteger(usage.input_tokens) &&
+      Number(usage.input_tokens) >= 0 &&
+      Number.isSafeInteger(usage.cached_input_tokens) &&
+      Number(usage.cached_input_tokens) >= 0 &&
+      Number(usage.cached_input_tokens) <= Number(usage.input_tokens) &&
+      Number.isSafeInteger(usage.output_tokens) &&
+      Number(usage.output_tokens) >= 0;
+    if (turnSucceeded && !hasExactUsage) {
+      traceBoundary("settlement_start");
+      await this.sessionAdmissionCommand(
+        session,
+        "release",
+        { reservation_ref: reservationRef },
+      );
+      traceBoundary("settlement_complete");
+      return Response.json(
+        { error: "provider completed without exact usage evidence" },
+        { status: 502 },
+      );
+    }
+    traceBoundary("settlement_start");
+    const settlement = await this.sessionAdmissionCommand(
+      session,
+      turnSucceeded ? "settle" : "release",
+      {
+        reservation_ref: reservationRef,
+        ...(turnSucceeded && hasExactUsage ? { usage } : {}),
+      },
+    );
+    if (settlement instanceof Response) return settlement;
+    traceBoundary("settlement_complete");
+    if (turnSucceeded) {
+      for (const tool of turnBody.output?.tool_calls ?? []) {
+        if (
+          typeof tool.call_id !== "string" ||
+          typeof tool.name !== "string"
+        ) {
+          continue;
+        }
+        this.appendPublicEvent(
+          {
+            type: "tool_call",
+            request_id: requestId,
+            command_id: commandId,
+            call_id: tool.call_id,
+            tool: tool.name,
+            arguments: tool.arguments ?? null,
+            label_ref: turnBody.output?.label_ref ?? null,
+          },
+          `turn:${requestId}:tool:${tool.call_id}:call`,
+        );
+        if (typeof tool.ok === "boolean") {
+          this.appendPublicEvent(
+            {
+              type: "tool_result",
+              request_id: requestId,
+              command_id: commandId,
+              call_id: tool.call_id,
+              ok: tool.ok,
+              ...(typeof tool.result === "string"
+                ? { result: tool.result }
+                : {}),
+            },
+            `turn:${requestId}:tool:${tool.call_id}:result`,
+          );
+        }
+      }
+      const snapshot = await this.publicSessionSnapshot(session);
+      this.appendPublicEvent(
+        {
+          type: "workspace_snapshot",
+          request_id: requestId,
+          command_id: commandId,
+          files: snapshot.files,
+        },
+        `turn:${requestId}:workspace`,
+      );
+      this.appendPublicEvent(
+        {
+          type: "usage",
+          request_id: requestId,
+          command_id: commandId,
+          usage,
+          settlement,
+        },
+        `turn:${requestId}:usage`,
+      );
+    }
+    return Response.json(
+      {
+        ...turnBody,
+        runtime_outcome: turnBody.outcome,
+        outcome: turnSucceeded ? "terminal" : "failed",
+      },
+      { status: turnSucceeded ? 200 : 502 },
+    );
+  }
+
+  private async settlePublicContinuation(
+    commandId: string,
+    body: Record<string, unknown>,
+    succeeded: boolean,
+  ): Promise<void> {
+    const session = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (!session) throw new Error("public session is not bootstrapped");
+    const requestId = publicRequestId(commandId);
+    const reservation = await this.sessionAdmissionCommand(
+      session,
+      "admit",
+      { request_id: requestId },
+    );
+    if (reservation instanceof Response) {
+      throw new Error(`cannot recover public reservation (${reservation.status})`);
+    }
+    const reservationRef =
+      typeof reservation.reservation_ref === "string"
+        ? reservation.reservation_ref
+        : "";
+    const usage = body.usage as {
+      usage_ref?: unknown;
+      input_tokens?: unknown;
+      cached_input_tokens?: unknown;
+      output_tokens?: unknown;
+    } | undefined;
+    const exactUsage =
+      typeof usage?.usage_ref === "string" &&
+      Number.isSafeInteger(usage.input_tokens) &&
+      Number.isSafeInteger(usage.cached_input_tokens) &&
+      Number.isSafeInteger(usage.output_tokens);
+    const settlement = await this.sessionAdmissionCommand(
+      session,
+      succeeded && exactUsage ? "settle" : "release",
+      {
+        reservation_ref: reservationRef,
+        ...(succeeded && exactUsage ? { usage } : {}),
+      },
+    );
+    if (settlement instanceof Response) {
+      throw new Error(`public continuation settlement failed (${settlement.status})`);
+    }
+    if (succeeded && exactUsage) {
+      const transcript =
+        (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+          "public-transcript",
+        )) ?? [];
+      const assistantText = this.hostTurnDeltas(
+        session.instance_ref,
+        commandId,
+        0,
+      ).map((event) => event.delta).join("");
+      const projectionKey = `public-transcript-assistant:${requestId}`;
+      if (
+        assistantText &&
+        !(await this.ctx.storage.get<boolean>(projectionKey))
+      ) {
+        transcript.push({ type: "assistant", text: assistantText });
+        await this.ctx.storage.put({
+          "public-transcript": transcript,
+          [projectionKey]: true,
+        });
+      }
+      const output = body.output as {
+        label_ref?: unknown;
+        tool_calls?: {
+          call_id?: unknown;
+          name?: unknown;
+          arguments?: unknown;
+          result?: unknown;
+          ok?: unknown;
+        }[];
+      } | undefined;
+      for (const tool of output?.tool_calls ?? []) {
+        if (typeof tool.call_id !== "string" || typeof tool.name !== "string") continue;
+        this.appendPublicEvent({
+          type: "tool_call",
+          request_id: requestId,
+          command_id: commandId,
+          call_id: tool.call_id,
+          tool: tool.name,
+          arguments: tool.arguments ?? null,
+          label_ref: output?.label_ref ?? null,
+        }, `turn:${requestId}:tool:${tool.call_id}:call`);
+        if (typeof tool.ok === "boolean") {
+          this.appendPublicEvent({
+            type: "tool_result",
+            request_id: requestId,
+            command_id: commandId,
+            call_id: tool.call_id,
+            ok: tool.ok,
+            ...(typeof tool.result === "string" ? { result: tool.result } : {}),
+          }, `turn:${requestId}:tool:${tool.call_id}:result`);
+        }
+      }
+      const snapshot = await this.publicSessionSnapshot(session);
+      this.appendPublicEvent({
+        type: "workspace_snapshot",
+        request_id: requestId,
+        command_id: commandId,
+        files: snapshot.files,
+      }, `turn:${requestId}:workspace`);
+      this.appendPublicEvent({
+        type: "usage",
+        request_id: requestId,
+        command_id: commandId,
+        usage,
+        settlement,
+      }, `turn:${requestId}:usage`);
+    }
+    const terminal = this.appendPublicEvent({
+      type: succeeded && exactUsage ? "turn_terminal" : "error",
+      request_id: requestId,
+      command_id: commandId,
+      status: succeeded && exactUsage ? 200 : 502,
+      body,
+    }, `turn:${requestId}:terminal`);
+    await this.ctx.storage.put(`public-turn-result:${requestId}`, terminal);
+  }
+
+  /**
+   * The generic admission and settlement port (DR-0049 §1). The runtime calls
+   * it before a metered operation and after a terminal one; it does not know
+   * what is being metered, who funds it, or what the embedder scope denotes.
+   */
+  private async sessionAdmissionCommand(
+    session: PublicSessionState,
+    command: "admit" | "settle" | "release" | "expire" | "deposit",
+    body: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | Response> {
+    const namespace = this.env.SESSION_ADMISSION;
+    const token = this.env.WHIP_PUBLIC_CONTROL_TOKEN?.trim();
+    if (!namespace || !token) {
+      return Response.json(
+        { error: "session admission channel is unavailable" },
+        { status: 503 },
+      );
+    }
+    const stub = namespace.get(namespace.idFromName(session.admission_scope));
+    const response = await stub.fetch(
+      new Request(
+        `https://admission.internal/internal/sessions/${session.session_id}/${command}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        },
+      ),
+    );
+    const value = (await response.json()) as Record<string, unknown>;
+    return response.ok
+      ? value
+      : Response.json(value, { status: response.status });
+  }
+
+  // ---- Session lifecycle (DR-0049 §3/§4) -----------------------------------
+  // Phase is the fold of these events. Nothing stores a phase, and no predicate
+  // inside the fold reads a clock: every time is stamped here, at the host
+  // boundary, and presented to the reducer as an observation.
+
+  private lifecycleEvents(): LifecycleEvent[] {
+    ensureSchema(this.ctx.storage.sql);
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT event_json FROM session_lifecycle_events ORDER BY sequence")
+        .toArray() as { event_json: string }[]
+    ).map((row) => JSON.parse(row.event_json) as LifecycleEvent);
+  }
+
+  private lifecycleState(): LifecycleState {
+    return foldLifecycle(this.lifecycleEvents());
+  }
+
+  /** Admit one command. Returns the folded state, or null when refused. */
+  private admitLifecycle(command: LifecycleCommand): LifecycleState | null {
+    const state = this.lifecycleState();
+    const outcome = decideLifecycle(state, command);
+    if (isLifecycleRejection(outcome)) return null;
+    for (const event of outcome) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO session_lifecycle_events (event_json) VALUES (?1)",
+        JSON.stringify(event),
+      );
+    }
+    return outcome.reduce(evolveLifecycle, state);
+  }
+
+  private leaseBounds(session: PublicSessionState): {
+    idleTtlMs: number;
+    absoluteTtlMs: number;
+  } {
+    return {
+      idleTtlMs: session.retention.idle_ttl_seconds * 1000,
+      absoluteTtlMs: session.retention.absolute_ttl_seconds * 1000,
+    };
+  }
+
+  private publicSessionExpiryAt(session: PublicSessionState): number {
+    const bounds = this.leaseBounds(session);
+    return deadlineAt(
+      this.lifecycleState(),
+      bounds.idleTtlMs,
+      bounds.absoluteTtlMs,
+    );
+  }
+
+  /**
+   * Present the current time as a deadline observation and report whether the
+   * folded phase now refuses traffic. A refused command (for example a session
+   * that has not activated) leaves the fold untouched.
+   */
+  private publicSessionExpired(session: PublicSessionState): boolean {
+    const bounds = this.leaseBounds(session);
+    const admitted = this.admitLifecycle({
+      kind: "observeDeadline",
+      atMs: Date.now(),
+      ...bounds,
+    });
+    const state = admitted ?? this.lifecycleState();
+    return state.phase === "expiring" || state.phase === "tornDown";
+  }
+
+  private async schedulePublicSessionExpiry(
+    session: PublicSessionState,
+  ): Promise<void> {
+    await this.ctx.storage.setAlarm(this.publicSessionExpiryAt(session));
+  }
+
+  /**
+   * Terminal teardown: remove payload resolution, preserve the lifecycle event
+   * log and session metadata (DR-0049 §7). Storage-wide deletion is retired
+   * from this path — it destroyed audit metadata alongside payload.
+   */
+  /**
+   * The terminal artifact effect (DR-0049 §5). Driven by host and release
+   * structure, never by an agent tool call, and settled through the reducer so
+   * retry and exactly-once come from the machine rather than a catch block.
+   *
+   * A transient refusal leaves the collection pending, which keeps the session
+   * out of a terminal phase; only a definitive refusal marks it failed.
+   */
+  private async emitCollection(session: PublicSessionState): Promise<void> {
+    const policy = session.collection;
+    if (!policy) return;
+    if (this.lifecycleState().collection !== "pending") return;
+    ensureSchema(this.ctx.storage.sql);
+
+    const prefix = `${session.instance_ref}/`;
+    const rows = this.ctx.storage.sql
+      .exec("SELECT key, content FROM files WHERE key LIKE ?1 || '%'", prefix)
+      .toArray() as { key: string; content: string }[];
+    const files = new Map(
+      rows.map(({ key, content }) => [key.slice(prefix.length), content]),
+    );
+    const workspace = selectWorkspace(files, policy);
+    const transcript = policy.transcript_eligible
+      ? (
+          this.ctx.storage.sql
+            .exec("SELECT event_json FROM public_session_events ORDER BY sequence")
+            .toArray() as { event_json: string }[]
+        ).map((row) => JSON.parse(row.event_json) as unknown)
+      : null;
+
+    const revision =
+      (await this.ctx.storage.get<number>("collection-revision")) ?? 1;
+    const envelope = {
+      schema_ref: policy.schema_ref,
+      session_id: session.session_id,
+      release_id: session.release_id,
+      revision,
+      produced_at_unix_ms: Date.now(),
+    };
+    const plaintext = canonicalArtifact(envelope, workspace, transcript);
+    if (plaintext.byteLength > policy.max_artifact_bytes) {
+      // Definitive: a larger artifact will not become smaller on retry.
+      this.admitLifecycle({ kind: "failCollection" });
+      this.appendPublicEvent({
+        type: "collection_failed",
+        reason: "artifact exceeds the declared bound",
+      });
+      return;
+    }
+
+    let sealed;
+    try {
+      sealed = await sealArtifact(
+        envelope,
+        plaintext,
+        policy.recipient_public_keys,
+        session.admission_scope,
+      );
+    } catch (error) {
+      // No admitted recipient, or unusable recipient material: definitive.
+      this.admitLifecycle({ kind: "failCollection" });
+      this.appendPublicEvent({
+        type: "collection_failed",
+        reason: String(error),
+      });
+      return;
+    }
+
+    const deposited = await this.sessionAdmissionCommand(session, "deposit", {
+      idempotency_key: `${session.session_id}:${revision}`,
+      artifact: sealed,
+    });
+    if (deposited instanceof Response) {
+      // 4xx is the embedder refusing this artifact; 5xx is transient and stays
+      // pending so the lease alarm brings us back.
+      if (deposited.status >= 400 && deposited.status < 500) {
+        this.admitLifecycle({ kind: "failCollection" });
+        this.appendPublicEvent({
+          type: "collection_failed",
+          reason: `admission refused the deposit: ${deposited.status}`,
+        });
+      }
+      return;
+    }
+    this.admitLifecycle({ kind: "settleCollection" });
+    this.appendPublicEvent({ type: "collection_settled", revision });
+  }
+
+  private async tombstonePublicSession(): Promise<void> {
+    ensureSchema(this.ctx.storage.sql);
+    for (const table of [
+      "files",
+      "host_turn_images",
+      "host_turn_deltas",
+      "public_provider_chunks",
+      "public_session_events",
+      "events",
+      "facts",
+      "artifacts",
+      "workspaces",
+      "content_blobs",
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(`DELETE FROM ${table}`);
+      } catch {
+        // A table absent on this object has nothing to tombstone.
+      }
+    }
+    const keys = [...(await this.ctx.storage.list()).keys()].filter(
+      (key) =>
+        key === "public-session-state" ||
+        key.startsWith("host-package:") ||
+        key.startsWith("host-policy:") ||
+        key.startsWith("public-turn-result:"),
+    );
+    if (keys.length) await this.ctx.storage.delete(keys);
+  }
+
+  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    socket.close(code, reason);
+  }
+
+  private syncHostFiles(instanceId: string, parsed: Record<string, unknown>): Response {
+    ensureSchema(this.ctx.storage.sql);
+    if (!this.instanceExists(instanceId)) {
+      return Response.json({ error: "instance not found" }, { status: 404 });
+    }
+    const files = parsed.files;
+    if (!Array.isArray(files) || files.length > 5000) {
+      return Response.json({ error: "files must be an array of at most 5000 entries" }, { status: 400 });
+    }
+    const normalized = new Map<string, string>();
+    for (const value of files) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return Response.json({ error: "each file must be an object" }, { status: 400 });
+      }
+      const candidate = value as { path?: unknown; content?: unknown };
+      if (typeof candidate.path !== "string" || typeof candidate.content !== "string") {
+        return Response.json({ error: "each file requires path and content strings" }, { status: 400 });
+      }
+      const path = candidate.path.replaceAll("\\", "/");
+      if (
+        !path || path.startsWith("/") || path.includes("\0") ||
+        path.split("/").some((part) => !part || part === "." || part === "..")
+      ) {
+        return Response.json({ error: `invalid workspace path: ${candidate.path}` }, { status: 400 });
+      }
+      if (new TextEncoder().encode(candidate.content).length > 8 * 1024 * 1024) {
+        return Response.json({ error: `workspace file is too large: ${path}` }, { status: 413 });
+      }
+      normalized.set(path, candidate.content);
+    }
+    const prefix = `${instanceId}/`;
+    const retainPaths = parsed.retain_paths;
+    if (retainPaths !== undefined) {
+      if (!Array.isArray(retainPaths) || retainPaths.some((path) => typeof path !== "string")) {
+        return Response.json({ error: "retain_paths must be an array of strings" }, { status: 400 });
+      }
+      const retained = new Set(retainPaths as string[]);
+      const current = this.ctx.storage.sql
+        .exec("SELECT key FROM files WHERE key LIKE ?1 || '%'", prefix)
+        .toArray() as { key: string }[];
+      for (const row of current) {
+        if (!retained.has(row.key.slice(prefix.length))) {
+          this.ctx.storage.sql.exec("DELETE FROM files WHERE key = ?1", row.key);
+        }
+      }
+    }
+    if (parsed.delete_missing === true) {
+      const current = this.ctx.storage.sql
+        .exec("SELECT key FROM files WHERE key LIKE ?1 || '%'", prefix)
+        .toArray() as { key: string }[];
+      for (const row of current) {
+        const path = row.key.slice(prefix.length);
+        if (!normalized.has(path)) this.ctx.storage.sql.exec("DELETE FROM files WHERE key = ?1", row.key);
+      }
+    }
+    for (const [path, content] of normalized) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO files (key, content) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET content = excluded.content`,
+        `${prefix}${path}`,
+        content,
+      );
+    }
+    return Response.json({ synced: normalized.size });
+  }
+
+  private async hostCheckpoint(
+    instanceId: string,
+    command: "checkpoint" | "restore",
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const cutId = typeof parsed.cut_id === "string" ? parsed.cut_id.trim() : "";
+    if (!cutId) return Response.json({ error: `${command} requires cut_id` }, { status: 400 });
+    const packageDocs = await this.ctx.storage.get<HostPackageDocuments>(
+      `host-package:${instanceId}`,
+    );
+    if (!packageDocs) return Response.json({ error: "host package not found" }, { status: 404 });
+    try {
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage.sql),
+        instanceId,
+        packageDocs.manifest,
+        packageDocs.source,
+        packageDocs.system_prompt,
+        undefined,
+      );
+      const report = command === "checkpoint" ? instance.checkpoint(cutId) : instance.restore(cutId);
+      return new Response(report, { headers: { "content-type": "application/json" } });
+    } catch (error) {
+      return Response.json({ error: `${command} rejected: ${String(error)}` }, { status: 400 });
+    }
+  }
+
+  private pinnedGovernanceRoot(): { signer: string; key: string } | Response {
+    ensureSchema(this.ctx.storage.sql);
+    const publicRoot = this.ctx.storage.sql
+      .exec(
+        `SELECT governance_signer AS signer, governance_key AS key
+           FROM public_session_metadata WHERE singleton = 1`,
+      )
+      .toArray() as { signer: string; key: string }[];
+    if (publicRoot.length === 1) {
+      return publicRoot[0];
+    }
+    const signer = this.env.GAUGEDESK_GOVERNANCE_SIGNER?.trim();
+    const key = this.env.GAUGEDESK_GOVERNANCE_KEY?.trim();
+    if (!signer || !key) {
+      return Response.json(
+        { error: "hosted placement has no pinned GaugeDesk governance root" },
+        { status: 503 },
+      );
+    }
+    return { signer, key };
+  }
+
+  private async bootstrapPublicSession(
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const candidate = parsed as unknown as Partial<PublicSessionBootstrap>;
+    const releaseId =
+      typeof candidate.release_id === "string" ? candidate.release_id : "";
+    const admissionScope =
+      typeof candidate.admission_scope === "string" ? candidate.admission_scope : "";
+    const sessionId =
+      typeof candidate.session_id === "string" ? candidate.session_id : "";
+    const packageVersionRef =
+      typeof candidate.package_version_ref === "string"
+        ? candidate.package_version_ref
+        : "";
+    const packageDocs = candidate.package;
+    const policy = candidate.host_policy;
+    const retention = candidate.retention;
+    if (
+      !/^sha256:[0-9a-f]{64}$/.test(releaseId) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(admissionScope) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId) ||
+      !packageVersionRef ||
+      !packageDocs ||
+      typeof packageDocs.manifest !== "string" ||
+      typeof packageDocs.source !== "string" ||
+      typeof packageDocs.system_prompt !== "string" ||
+      !policy ||
+      !Number.isSafeInteger(policy.epoch) ||
+      Number(policy.epoch) <= 0 ||
+      typeof policy.signed_envelope !== "string" ||
+      typeof policy.expected_signer !== "string" ||
+      typeof policy.signer_public_key_hex !== "string" ||
+      typeof policy.provider_binding_ref !== "string" ||
+      typeof policy.credential_class !== "string" ||
+      typeof policy.placement_ref !== "string" ||
+      typeof candidate.credential_ref !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate.credential_ref) ||
+      !Array.isArray(candidate.capabilities) ||
+      !candidate.principal ||
+      typeof candidate.principal.label !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(candidate.principal.label) ||
+      (
+        candidate.principal.subject_hash !== undefined &&
+        (
+          typeof candidate.principal.subject_hash !== "string" ||
+          !/^[0-9a-f]{64}$/.test(candidate.principal.subject_hash)
+        )
+      ) ||
+      !retention ||
+      !Number.isSafeInteger(retention.idle_ttl_seconds) ||
+      retention.idle_ttl_seconds <= 0 ||
+      !Number.isSafeInteger(retention.absolute_ttl_seconds) ||
+      retention.absolute_ttl_seconds < retention.idle_ttl_seconds
+    ) {
+      return Response.json(
+        { error: "public session bootstrap is incomplete" },
+        { status: 400 },
+      );
+    }
+    const initialWorkspace = candidate.initial_workspace;
+    if (!Array.isArray(initialWorkspace) || initialWorkspace.length > 5000) {
+      return Response.json(
+        { error: "public initial workspace is invalid" },
+        { status: 400 },
+      );
+    }
+    const workspaceFiles: { path: string; content: string }[] = [];
+    try {
+      for (const file of initialWorkspace) {
+        if (
+          !file ||
+          typeof file.path !== "string" ||
+          typeof file.base64 !== "string" ||
+          typeof file.sha256 !== "string"
+        ) {
+          throw new Error("initial workspace file is incomplete");
+        }
+        const binary = atob(file.base64);
+        const bytes = Uint8Array.from(binary, (character) =>
+          character.charCodeAt(0),
+        );
+        workspaceFiles.push({
+          path: file.path.replace(/^workspace\//, ""),
+          content: new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: false,
+          }).decode(bytes),
+        });
+      }
+    } catch (error) {
+      return Response.json(
+        { error: `initial workspace rejected: ${String(error)}` },
+        { status: 400 },
+      );
+    }
+
+    ensureSchema(this.ctx.storage.sql);
+    const existing = this.ctx.storage.sql
+      .exec(
+        `SELECT release_id, session_id, instance_ref
+           FROM public_session_metadata WHERE singleton = 1`,
+      )
+      .toArray() as {
+      release_id: string;
+      session_id: string;
+      instance_ref: string;
+    }[];
+    if (existing.length === 1) {
+      if (
+        existing[0].release_id === releaseId &&
+        existing[0].session_id === sessionId
+      ) {
+        return Response.json({
+          release_id: releaseId,
+          session_id: sessionId,
+          created: false,
+        });
+      }
+      return Response.json(
+        { error: "session object is already pinned to another engagement" },
+        { status: 409 },
+      );
+    }
+
+    let verifiedPolicy: HostPolicyBootstrap["policy"];
+    try {
+      verifiedPolicy = JSON.parse(
+        verifyHostPolicy(
+          BigInt(policy.epoch),
+          policy.signed_envelope,
+          policy.expected_signer,
+          policy.signer_public_key_hex,
+        ),
+      ) as HostPolicyBootstrap["policy"];
+    } catch (error) {
+      return Response.json(
+        { error: `public host policy rejected: ${String(error)}` },
+        { status: 403 },
+      );
+    }
+    const openCommand = {
+      protocol: "whipplescript.host.v1",
+      request_id: `public:${sessionId}:open`,
+      package_version_ref: packageVersionRef,
+      policy: {
+        epoch: policy.epoch,
+        envelope_hash: verifiedPolicy.envelope_hash,
+        signer: verifiedPolicy.signer,
+        ...(verifiedPolicy.key_id
+          ? { key_id: verifiedPolicy.key_id }
+          : {}),
+      },
+    };
+    let opened: { instance_ref?: unknown };
+    try {
+      opened = JSON.parse(
+        hostFunctions.host_open_instance(
+          makeBridge(this.ctx.storage.sql),
+          BigInt(policy.epoch),
+          policy.signed_envelope,
+          policy.expected_signer,
+          policy.signer_public_key_hex,
+          JSON.stringify(openCommand),
+          packageDocs.manifest,
+          packageDocs.source,
+          packageDocs.system_prompt,
+        ),
+      ) as { instance_ref?: unknown };
+    } catch (error) {
+      return Response.json(
+        { error: `public instance rejected: ${String(error)}` },
+        { status: 400 },
+      );
+    }
+    const instanceRef =
+      typeof opened.instance_ref === "string" ? opened.instance_ref : "";
+    if (!instanceRef) {
+      return Response.json(
+        { error: "public runtime returned no instance reference" },
+        { status: 500 },
+      );
+    }
+    const synced = this.syncHostFiles(instanceRef, {
+      files: workspaceFiles,
+      delete_missing: true,
+    });
+    if (!synced.ok) return synced;
+
+    await this.ctx.storage.put(
+      `host-policy:${policy.epoch}:${verifiedPolicy.envelope_hash}`,
+      {
+        epoch: policy.epoch,
+        signed_envelope: policy.signed_envelope,
+        policy: verifiedPolicy,
+      } satisfies HostPolicyBootstrap,
+    );
+    await this.ctx.storage.put(`host-package:${instanceRef}`, packageDocs);
+    const now = Date.now();
+    const sessionState = {
+      ...(candidate as PublicSessionBootstrap),
+      instance_ref: instanceRef,
+      envelope_hash: verifiedPolicy.envelope_hash,
+      policy_key_id: verifiedPolicy.key_id,
+      created_at_unix_ms: now,
+      last_activity_unix_ms: now,
+    } satisfies PublicSessionState;
+    await this.ctx.storage.put("public-session-state", sessionState);
+    // Open and activate through the reducer so phase exists as a fold from the
+    // first moment. `created_at_unix_ms`/`last_activity_unix_ms` remain on the
+    // record as bootstrap facts; they are no longer the phase authority.
+    this.admitLifecycle({
+      kind: "open",
+      atMs: now,
+      collectionDeclared: Boolean(candidate.collection),
+    });
+    this.admitLifecycle({ kind: "activate" });
+    await this.schedulePublicSessionExpiry(sessionState);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO public_session_metadata
+        (singleton, release_id, session_id, instance_ref, governance_signer, governance_key)
+       VALUES (1, ?1, ?2, ?3, ?4, ?5)`,
+      releaseId,
+      sessionId,
+      instanceRef,
+      policy.expected_signer,
+      policy.signer_public_key_hex,
+    );
+    return Response.json(
+      {
+        release_id: releaseId,
+        session_id: sessionId,
+        created: true,
+      },
+      { status: 201 },
+    );
+  }
+
+  private async hostPolicy(command: Record<string, unknown>): Promise<HostPolicyBootstrap | Response> {
+    const cited = command.policy;
+    if (!cited || typeof cited !== "object" || Array.isArray(cited)) {
+      return Response.json({ error: "host command does not cite a policy epoch" }, { status: 400 });
+    }
+    const policyRef = cited as { epoch?: unknown; envelope_hash?: unknown };
+    if (!Number.isSafeInteger(policyRef.epoch) || typeof policyRef.envelope_hash !== "string") {
+      return Response.json({ error: "host command has an invalid policy reference" }, { status: 400 });
+    }
+    const key = `host-policy:${String(policyRef.epoch)}:${policyRef.envelope_hash}`;
+    const policy = await this.ctx.storage.get<HostPolicyBootstrap>(key);
+    return (
+      policy ??
+      Response.json(
+        { error: "placement policy has not been bootstrapped" },
+        { status: 409 },
+      )
+    );
+  }
+
+  private hostCommandRequest(
+    parsed: Record<string, unknown>,
+  ): HostCommandRequest | Response {
+    const command = parsed.command;
+    const packageValue = parsed.package;
+    if (!command || typeof command !== "object" || Array.isArray(command)) {
+      return Response.json({ error: "host request requires command" }, { status: 400 });
+    }
+    if (!packageValue || typeof packageValue !== "object" || Array.isArray(packageValue)) {
+      return Response.json({ error: "host request requires package documents" }, { status: 400 });
+    }
+    const candidate = packageValue as Partial<HostPackageDocuments>;
+    if (
+      typeof candidate.manifest !== "string" ||
+      typeof candidate.source !== "string" ||
+      typeof candidate.system_prompt !== "string"
+    ) {
+      return Response.json(
+        { error: "package requires manifest, source, and system_prompt strings" },
+        { status: 400 },
+      );
+    }
+    return {
+      command: command as Record<string, unknown>,
+      package: candidate as HostPackageDocuments,
+      image_bodies: Array.isArray(parsed.image_bodies) ? parsed.image_bodies : [],
+    };
+  }
+
+  private storeAdmittedImages(request: HostCommandRequest): Response | undefined {
+    const command = request.command;
+    const instanceId = typeof command.instance_ref === "string" ? command.instance_ref : "";
+    const commandId = typeof command.command_id === "string" ? command.command_id : "";
+    const input = command.input;
+    const refs = input && typeof input === "object" && !Array.isArray(input)
+      ? (input as { images?: unknown }).images
+      : undefined;
+    const imageRefs = Array.isArray(refs) ? refs : [];
+    if (imageRefs.length !== request.image_bodies.length || imageRefs.length > 16) {
+      return Response.json(
+        { error: "image bodies must exactly match at most 16 admitted image refs" },
+        { status: 400 },
+      );
+    }
+    let totalBytes = 0;
+    const normalized: { selector: string; mediaType: string; data: string }[] = [];
+    for (let index = 0; index < imageRefs.length; index += 1) {
+      const ref = imageRefs[index];
+      const body = request.image_bodies[index];
+      if (!ref || typeof ref !== "object" || Array.isArray(ref)
+        || !body || typeof body !== "object" || Array.isArray(body)) {
+        return Response.json({ error: "invalid admitted image broker entry" }, { status: 400 });
+      }
+      const admitted = ref as { handle?: unknown; kind?: unknown; selector?: unknown };
+      const candidate = body as { media_type?: unknown; data_base64?: unknown };
+      if (admitted.handle !== "turn_images" || admitted.kind !== "image"
+        || admitted.selector !== String(index)
+        || typeof candidate.media_type !== "string"
+        || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(candidate.media_type)
+        || typeof candidate.data_base64 !== "string"
+        || !/^[A-Za-z0-9+/]*={0,2}$/.test(candidate.data_base64)) {
+        return Response.json(
+          { error: "image body does not match its admitted ref or supported media type" },
+          { status: 400 },
+        );
+      }
+      let bytes: number;
+      try {
+        bytes = atob(candidate.data_base64).length;
+      } catch {
+        return Response.json({ error: "image body is not valid base64" }, { status: 400 });
+      }
+      totalBytes += bytes;
+      if (bytes > 16 * 1024 * 1024 || totalBytes > 32 * 1024 * 1024) {
+        return Response.json({ error: "admitted image body limit exceeded" }, { status: 413 });
+      }
+      normalized.push({
+        selector: String(index),
+        mediaType: candidate.media_type,
+        data: candidate.data_base64,
+      });
+    }
+    this.ctx.storage.sql.exec(
+      "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+      instanceId,
+      commandId,
+    );
+    for (const image of normalized) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO host_turn_images
+          (instance_id, command_id, selector, media_type, data_base64)
+         VALUES (?1, ?2, ?3, ?4, ?5)`,
+        instanceId,
+        commandId,
+        image.selector,
+        image.mediaType,
+        image.data,
+      );
+    }
+    return undefined;
+  }
+
+  private async openHostInstance(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const opened = JSON.parse(
+        hostFunctions.host_open_instance(
+          makeBridge(this.ctx.storage.sql),
+          BigInt(policy.epoch),
+          policy.signed_envelope,
+          root.signer,
+          root.key,
+          JSON.stringify(request.command),
+          request.package.manifest,
+          request.package.source,
+          request.package.system_prompt,
+        ),
+      );
+      await this.ctx.storage.put(
+        `host-package:${String(opened.instance_ref)}`,
+        request.package,
+      );
+      return Response.json(opened, { status: 201 });
+    } catch (error) {
+      return Response.json(
+        { error: `instance rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 400 },
+      );
+    }
+  }
+
+  private resolveAdmittedProvider(
+    admission: HostTurnAdmission,
+  ): ResolvedHostProviderBinding | Response {
+    try {
+      return resolveHostedProvider(
+        admission,
+        this.env,
+        this.isPublicSession() ? "direct" : "model-broker",
+      );
+    } catch (error) {
+      return Response.json(
+        { error: error instanceof Error ? error.message : String(error) },
+        { status: 503 },
+      );
+    }
+  }
+
+  private isPublicSession(): boolean {
+    ensureSchema(this.ctx.storage.sql);
+    return (
+      this.ctx.storage.sql
+        .exec(
+          "SELECT 1 AS present FROM public_session_metadata WHERE singleton = 1",
+        )
+        .toArray().length === 1
+    );
+  }
+
+  private async beginHostTurn(
+    parsed: Record<string, unknown>,
+    exactPublicCredentialRef?: string,
+  ): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    const common = [
+      BigInt(policy.epoch),
+      policy.signed_envelope,
+      root.signer,
+      root.key,
+      JSON.stringify(request.command),
+      request.package.manifest,
+      request.package.source,
+      request.package.system_prompt,
+    ] as const;
+    try {
+      // Phase 1 crosses no credential boundary. Only after WhippleScript has
+      // returned these exact opaque ids may this Worker invoke the broker.
+      const admission = JSON.parse(
+        hostFunctions.host_validate_turn(makeBridge(this.ctx.storage.sql), ...common),
+      ) as HostTurnAdmission;
+      const admittedBinding = this.resolveAdmittedProvider(admission);
+      if (admittedBinding instanceof Response) return admittedBinding;
+      const binding = exactPublicCredentialRef
+        ? bindExactPublicCredential(admittedBinding, exactPublicCredentialRef)
+        : admittedBinding;
+      // Resolve image bodies only after WhippleScript admits their opaque refs
+      // and the corresponding provider capability is available.
+      const imageError = this.storeAdmittedImages(request);
+      if (imageError) return imageError;
+      const created = hostFunctions.host_begin_turn(
+        makeBridge(this.ctx.storage.sql),
+        ...common,
+        binding.provider,
+        binding.model,
+        binding.base_url,
+      );
+      const instanceId = String(request.command.instance_ref ?? "");
+      if (!instanceId) {
+        return Response.json({ error: "admitted host turn is missing its runtime binding" }, { status: 503 });
+      }
+      const instance = WasmDurableInstance.attach_host(
+        makeBridge(this.ctx.storage.sql),
+        instanceId,
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+        JSON.stringify({
+          provider: binding.provider,
+          base_url: binding.base_url,
+          api_key: binding.api_key,
+          model: binding.model,
+          max_tokens: 4096,
+          session_id: instanceId,
+          cache_key: String(request.command.command_id ?? ""),
+        }),
+      );
+      const commandId = String(request.command.command_id ?? "");
+      const driven = await this.driveInstance(
+        instance,
+        instanceId,
+        binding,
+        (delta) => this.publishHostTurnDelta(instanceId, commandId, delta),
+        commandId,
+      );
+      const runtimeProjection = JSON.parse(
+        hostFunctions.host_project_turn(
+          makeBridge(this.ctx.storage.sql),
+          instanceId,
+          commandId,
+        ),
+      ) as {
+        receipt?: {
+          status?: unknown;
+        };
+        usage_observation?: {
+          usage_ref?: unknown;
+          input_tokens?: unknown;
+          cached_input_tokens?: unknown;
+          output_tokens?: unknown;
+        };
+        output_observation?: {
+          label_ref: string;
+          assistant_text: string;
+          tool_calls: {
+            call_id: string;
+            name: string;
+            arguments: unknown;
+            result?: string | null;
+            ok?: boolean | null;
+          }[];
+        };
+      };
+      const durableUsage = runtimeProjection.usage_observation;
+      const durableOutput = runtimeProjection.output_observation;
+      this.ctx.storage.sql.exec(
+        "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+        instanceId,
+        commandId,
+      );
+      if (driven.outcome !== "parked") {
+        this.finishHostTurnStream(instanceId, commandId);
+      }
+      console.log(JSON.stringify({
+        event: "gaugewright_turn_timing",
+        trace_id: commandId,
+        component: "durable_object",
+        timing_ms: driven.timing,
+      }));
+      return Response.json(
+        {
+          admitted: true,
+          created,
+          command_id: request.command.command_id,
+          status: driven.status,
+          outcome: driven.outcome,
+          timing_ms: driven.timing,
+          ...(runtimeProjection.receipt
+            ? { receipt: runtimeProjection.receipt }
+            : {}),
+          ...(durableUsage
+            ? {
+                usage: {
+                  usage_ref: durableUsage.usage_ref,
+                  input_tokens: durableUsage.input_tokens,
+                  cached_input_tokens:
+                    durableUsage.cached_input_tokens,
+                  output_tokens: durableUsage.output_tokens,
+                },
+              }
+            : {}),
+          ...(durableOutput ? { output: durableOutput } : {}),
+        },
+        { status: driven.outcome === "failed" ? 502 : 200 },
+      );
+    } catch (error) {
+      const instanceId = typeof request.command.instance_ref === "string"
+        ? request.command.instance_ref
+        : "";
+      const commandId = typeof request.command.command_id === "string"
+        ? request.command.command_id
+        : "";
+      if (instanceId && commandId) {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM host_turn_images WHERE instance_id = ?1 AND command_id = ?2",
+          instanceId,
+          commandId,
+        );
+        this.finishHostTurnStream(instanceId, commandId);
+      }
+      return Response.json(
+        { error: `turn rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 400 },
+      );
+    }
+  }
+
+
+  private async exportHostFork(instanceId: string, url: URL): Promise<Response> {
+    ensureSchema(this.ctx.storage.sql);
+    const sequence = Number(url.searchParams.get("sequence"));
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+      return Response.json({ error: "fork export requires a positive exact sequence" }, { status: 400 });
+    }
+    const packageDocs = await this.ctx.storage.get<HostPackageDocuments>(
+      `host-package:${instanceId}`,
+    );
+    if (!packageDocs) return Response.json({ error: "host package not found" }, { status: 404 });
+    const rows = this.ctx.storage.sql
+      .exec("SELECT input_json FROM instances WHERE instance_id = ?1", instanceId)
+      .toArray() as { input_json: string }[];
+    if (!rows.length) return Response.json({ error: "instance not found" }, { status: 404 });
+    const metadata = JSON.parse(rows[0].input_json) as { policy?: { epoch?: number; envelope_hash?: string } };
+    const epoch = metadata.policy?.epoch;
+    const envelopeHash = metadata.policy?.envelope_hash;
+    if (!Number.isSafeInteger(epoch) || typeof envelopeHash !== "string") {
+      return Response.json({ error: "source instance has no host policy binding" }, { status: 409 });
+    }
+    const policy = await this.ctx.storage.get<HostPolicyBootstrap>(
+      `host-policy:${String(epoch)}:${envelopeHash}`,
+    );
+    if (!policy) return Response.json({ error: "source policy bootstrap not found" }, { status: 409 });
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    try {
+      return Response.json(JSON.parse(hostFunctions.host_export_thread(
+        makeBridge(this.ctx.storage.sql),
+        BigInt(epoch as number),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify({ instance_ref: instanceId, sequence }),
+        packageDocs.manifest,
+        packageDocs.source,
+        packageDocs.system_prompt,
+      )));
+    } catch (error) {
+      return Response.json({ error: `fork export rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
+  private async importHostFork(parsed: Record<string, unknown>): Promise<Response> {
+    const request = this.hostCommandRequest(parsed);
+    if (request instanceof Response) return request;
+    const exported = parsed.export;
+    if (!exported || typeof exported !== "object" || Array.isArray(exported)) {
+      return Response.json({ error: "fork import requires a source export" }, { status: 400 });
+    }
+    const policy = await this.hostPolicy(request.command);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const forked = JSON.parse(hostFunctions.host_import_fork(
+        makeBridge(this.ctx.storage.sql),
+        BigInt(policy.epoch),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify(request.command),
+        JSON.stringify(exported),
+        request.package.manifest,
+        request.package.source,
+        request.package.system_prompt,
+      ));
+      await this.ctx.storage.put(
+        `host-package:${String(forked.target?.instance_ref ?? "")}`,
+        request.package,
+      );
+      return Response.json(forked, { status: 201 });
+    } catch (error) {
+      return Response.json({ error: `fork import rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
+  private async bootstrapHostPolicy(
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const epoch = typeof parsed.epoch === "number" ? parsed.epoch : Number.NaN;
+    const signedEnvelope =
+      typeof parsed.signed_envelope === "string" ? parsed.signed_envelope : undefined;
+    const root = this.pinnedGovernanceRoot();
+    if (!Number.isSafeInteger(epoch) || epoch <= 0 || !signedEnvelope) {
+      return Response.json(
+        { error: "host policy requires a positive epoch and signed_envelope" },
+        { status: 400 },
+      );
+    }
+    if (root instanceof Response) return root;
+    let policy: HostPolicyBootstrap["policy"];
+    try {
+      policy = JSON.parse(
+        verifyHostPolicy(BigInt(epoch), signedEnvelope, root.signer, root.key),
+      ) as HostPolicyBootstrap["policy"];
+    } catch (error) {
+      return Response.json(
+        { error: `policy rejected: ${error instanceof Error ? error.message : String(error)}` },
+        { status: 403 },
+      );
+    }
+    const key = `host-policy:${epoch}:${policy.envelope_hash}`;
+    const existing = await this.ctx.storage.get<HostPolicyBootstrap>(key);
+    if (existing) {
+      return Response.json(existing.policy);
+    }
+    const bootstrap: HostPolicyBootstrap = {
+      epoch,
+      signed_envelope: signedEnvelope,
+      policy,
+    };
+    await this.ctx.storage.put(key, bootstrap);
+    return Response.json(policy, { status: 201 });
+  }
+
   // The DO's single wake-up (DR-0033 Phase 6): a parked instance with pending
   // timers/deadlines scheduled this; re-enter and drive — the due-time pass
   // fires the timers, the rule pass sees the facts, and the run continues.
   async alarm(): Promise<void> {
+    const publicSession = await this.ctx.storage.get<PublicSessionState>(
+      "public-session-state",
+    );
+    if (publicSession) {
+      // The lease is evaluated by folding a stamped observation, and this branch
+      // no longer returns before the DR-0033 drive path below (DR-0049 §4).
+      if (!this.publicSessionExpired(publicSession)) {
+        await this.schedulePublicSessionExpiry(publicSession);
+      } else if (this.lifecycleState().phase !== "tornDown") {
+        // Emit before attempting teardown; the reducer refuses a terminal phase
+        // while the collection is still pending.
+        await this.emitCollection(publicSession);
+        // TERMINAL_REQUIRES_COLLECTION_SETTLED: teardown is refused while a
+        // declared collection is still pending, so an undeliverable artifact is
+        // never erased by the path that failed to deliver it. The alarm is
+        // rescheduled and the session stays recoverable.
+        const torn = this.admitLifecycle({ kind: "tearDown" });
+        if (!torn) {
+          await this.schedulePublicSessionExpiry(publicSession);
+        } else {
+          const expired = await this.sessionAdmissionCommand(
+            publicSession,
+            "expire",
+            {},
+          );
+          if (expired instanceof Response) {
+            throw new Error(
+              `session admission refused expiry: ${expired.status} ${await expired.text()}`,
+            );
+          }
+          for (const socket of this.ctx.getWebSockets()) {
+            socket.close(1001, "session expired");
+          }
+          await this.tombstonePublicSession();
+        }
+      }
+    }
     const bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
     if (bootstrap) {
       const result = await this.drive(bootstrap);
@@ -467,7 +3290,39 @@ export class WorkflowInstance implements DurableObject {
   }
 
   private async drive(bootstrap: Bootstrap): Promise<{ status: string; outcome: string }> {
-    const instance = this.makeInstance(bootstrap);
+    return this.driveInstance(this.makeInstance(bootstrap));
+  }
+
+  private async driveInstance(
+    instance: WasmDurableInstance,
+    hostedInstanceId?: string,
+    providerBinding?: ResolvedHostProviderBinding,
+    onTextDelta?: (delta: string) => void,
+    traceId?: string,
+  ): Promise<{
+    status: string;
+    outcome: string;
+    timing: Record<string, number>;
+    usage?: ProviderUsage;
+  }> {
+    const startedAt = performance.now();
+    const timing: Record<string, number> = {};
+    const mark = (event: string) => {
+      if (timing[event] !== undefined) return;
+      timing[event] = Math.round((performance.now() - startedAt) * 10) / 10;
+      console.log(JSON.stringify({
+        event: "gaugewright_turn_boundary",
+        trace_id: traceId ?? hostedInstanceId ?? "unscoped",
+        boundary: event,
+        elapsed_ms: timing[event],
+      }));
+      this.sendPublicLatency(
+        traceId ?? "",
+        "runtime",
+        event,
+        timing[event],
+      );
+    };
 
     // The sans-IO loop: step -> maybe fetch -> step, until a terminal or a park.
     // Each `fetch` is one provider round; the core parses the response and
@@ -475,19 +3330,138 @@ export class WorkflowInstance implements DurableObject {
     // after each round so the object can hibernate; here we run the loop within
     // one request for clarity.
     let responseJson: string | undefined = undefined;
+    let step = 0;
+    let transportFailures = 0;
+    let usage: ProviderUsage | undefined;
     for (;;) {
+      const stepStartedAt = performance.now();
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
+      timing[`wasm_step_${step}_ms`] =
+        Math.round((performance.now() - stepStartedAt) * 10) / 10;
+      step += 1;
+      if (hostedInstanceId) this.broadcastHostProgress(hostedInstanceId);
       if (outcome.kind === "needs_http") {
-        responseJson = await performFetch(outcome.request, this.env);
+        mark("model_round_start");
+        if (providerBinding?.execution === "model-broker") {
+          try {
+            responseJson = await performModelBrokerFetch(
+              outcome.request,
+              providerBinding,
+              {
+                url: this.env.WHIP_MODEL_BROKER_URL,
+                token: this.env.WHIP_MODEL_BROKER_TOKEN,
+              },
+              fetch,
+              (delta) => {
+                mark("runtime_first_delta");
+                onTextDelta?.(delta);
+              },
+              traceId,
+              (event, _elapsedMs) => mark(event),
+            );
+            transportFailures = 0;
+            mark("model_round_complete");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.log(`model broker transport failed: ${message}`);
+            transportFailures += 1;
+            if (transportFailures >= 3) {
+              throw new Error(`model broker failed repeatedly: ${message}`);
+            }
+            responseJson = JSON.stringify({ error: message });
+          }
+        } else if (providerBinding?.execution === "direct") {
+          try {
+            const replay = providerBinding.credential_class
+              ? this.publicProviderRoundReplay(
+                  hostedInstanceId ?? "",
+                  traceId ?? "",
+                  outcome.request,
+                )
+              : undefined;
+            responseJson = await performDirectProviderFetch(
+              outcome.request,
+              providerBinding,
+              {
+                resolve: (credentialRef) =>
+                  this.resolveOwnerPublicCredential(credentialRef),
+              },
+              fetch,
+              (delta) => {
+                if (replay && !replay.accept(delta)) return;
+                mark("runtime_first_delta");
+                onTextDelta?.(delta);
+              },
+              (event, _elapsedMs) => mark(event),
+              (observed) => {
+                usage = observed;
+              },
+            );
+            replay?.complete();
+            transportFailures = 0;
+            mark("model_round_complete");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.log(`direct provider transport failed: ${message}`);
+            transportFailures += 1;
+            if (transportFailures >= 3) {
+              throw new Error(`direct provider failed repeatedly: ${message}`);
+            }
+            responseJson = JSON.stringify({ error: message });
+          }
+        } else {
+          responseJson = await performFetch(outcome.request, this.env);
+        }
         continue;
       }
       if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {
         // The instance holds pending timers/deadlines: schedule the DO's
-        // single alarm at the earliest one (the Alarms seam, live).
-        await this.ctx.storage.setAlarm(outcome.next_due_unix_ms);
+        // single alarm at the earliest one (the Alarms seam, live). Clamp to
+        // strictly-future so a due already in the past cannot make Cloudflare
+        // run the alarm instantly and re-drive in a tight loop — defense in
+        // depth atop the kernel dep guard that keeps reported dues fireable.
+        const at = Math.max(outcome.next_due_unix_ms, Date.now() + 1);
+        await this.ctx.storage.setAlarm(at);
+      } else {
+        // Parked with nothing due, or terminal: clear any alarm a prior park
+        // scheduled, so a settled or now-unblocked instance is not woken into
+        // a pointless re-drive (deleteAlarm is a no-op when none is set).
+        await this.ctx.storage.deleteAlarm();
       }
-      return { status: instance.status(), outcome: outcome.kind };
+      mark("drive_complete");
+      return {
+        status: instance.status(),
+        outcome: outcome.kind,
+        timing,
+        ...(usage ? { usage } : {}),
+      };
     }
+  }
+
+  private async resolveOwnerPublicCredential(
+    credentialRef: string,
+  ): Promise<unknown> {
+    const ownerId =
+      /^credential:public:([0-9a-f]{64}):(?:openai|anthropic):[0-9a-f]{32}$/
+        .exec(credentialRef)?.[1];
+    const token = this.env.WHIP_PUBLIC_CONTROL_TOKEN?.trim();
+    if (!ownerId || !this.env.PUBLIC_CREDENTIALS || !token) {
+      throw new Error(`direct provider credential ${credentialRef} is unavailable`);
+    }
+    const response = await this.env.PUBLIC_CREDENTIALS
+      .get(this.env.PUBLIC_CREDENTIALS.idFromName(ownerId))
+      .fetch("https://credential.internal/resolve", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ credential_ref: credentialRef }),
+      });
+    if (!response.ok) {
+      throw new Error(`direct provider credential ${credentialRef} is unavailable`);
+    }
+    return response.json();
   }
 }
 
@@ -498,18 +3472,48 @@ export default {
     if (url.pathname === "/healthz") {
       return Response.json({ ok: true });
     }
-    if (url.pathname !== "/start") {
-      return Response.json({ error: "not found" }, { status: 404 });
-    }
-    if (request.method !== "POST") {
-      return Response.json({ error: "method not allowed" }, { status: 405 });
-    }
     const authError = controlAuthError(request, env) ?? requestBodyTooLarge(request);
     if (authError) {
       return authError;
     }
-    const id = url.searchParams.get("id") ?? "default";
+    // Canonical hosted route: the authenticated tenant + placement tuple is
+    // the DO identity, giving exactly one Durable Object per placement. The
+    // inner object sees only the placement-local `/host/...` protocol surface.
+    const placement = url.pathname.match(
+      /^\/v1\/tenants\/([^/]+)\/placements\/([^/]+)(\/host(?:\/.*)?)$/,
+    );
+    let id: string;
+    let forwarded = request;
+    if (placement) {
+      const tenantId = decodeURIComponent(placement[1]);
+      const placementId = decodeURIComponent(placement[2]);
+      const validId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+      if (!validId.test(tenantId) || !validId.test(placementId)) {
+        return Response.json({ error: "invalid tenant or placement id" }, { status: 400 });
+      }
+      id = `tenant:${tenantId}:placement:${placementId}`;
+      const inner = new URL(request.url);
+      inner.pathname = placement[3];
+      forwarded = new Request(inner, request);
+    } else {
+      const legacy =
+        url.pathname === "/start" ||
+        url.pathname === "/host/policy" ||
+        url.pathname === "/host/instances/open" ||
+        url.pathname === "/host/turns" ||
+        url.pathname === "/host/forks/import" ||
+        /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/fork-export$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/files\/sync$/.test(url.pathname) ||
+        /^\/host\/instances\/[^/]+\/turns\/[^/]+(?:\/transcript|\/result|\/cancel|\/stream)?$/.test(url.pathname);
+      if (!legacy) return Response.json({ error: "not found" }, { status: 404 });
+      // Kept for local conformance and migration only. Managed composition uses
+      // the tenant/placement route above.
+      id = url.searchParams.get("id") ?? "default";
+    }
     const stub = env.WORKFLOW_INSTANCE.get(env.WORKFLOW_INSTANCE.idFromName(id));
-    return stub.fetch(request);
+    return stub.fetch(forwarded);
   },
 } satisfies ExportedHandler<Env>;

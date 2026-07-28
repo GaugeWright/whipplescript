@@ -1,0 +1,59 @@
+load ../tracker-merge.maude
+
+--- Coverage: a linear chain (e0 before e1, both set f1) converges to the LATEST
+--- head's value; the superseded ancestor does not conflict with it.
+search [1] in TRACKER-MERGE :
+  t(ev(e0, f1, v1) ev(e1, f1, v2) bef(e0, e1))
+  =>* t(val(f1, v2) C:Cfg) .
+
+--- Coverage: two AGREEING concurrent heads (same value, no order between them)
+--- converge to that value -- no false conflict, one `val`.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f1, v1))
+  =>* t(val(f1, v1) C:Cfg) .
+
+--- Coverage: two DISAGREEING concurrent heads make the field conflicted.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f1, v2))
+  =>* t(conflict(f1) C:Cfg) .
+
+--- Coverage: concurrent heads on DIFFERENT fields both converge (no cross-field
+--- interference).
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f2, v2))
+  =>* t(val(f1, v1) val(f2, v2) C:Cfg) .
+
+--- Coverage of resolution: a resolve event `er` appended AFTER both conflicting
+--- heads (they are its ancestors) is the unique head, so the field converges to
+--- the resolved value.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f1, v2) ev(er, f1, v1) bef(e1, er) bef(e2, er))
+  =>* t(val(f1, v1) C:Cfg) .
+
+--- Bite (no false conflict): concurrent heads on DIFFERENT fields never reach a
+--- conflict.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f2, v2))
+  =>* t(conflict(F:Field) C:Cfg) .
+
+--- Bite (conflict soundness): a genuinely forked field NEVER converges to a
+--- single value -- the good fold surfaces `conflict`, never a value that hides
+--- the divergence. No reachable state carries `val(f1, _)` from a disagreeing
+--- fork.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f1, v2))
+  =>* t(val(f1, V:Val) C:Cfg) .
+
+--- Bite (resolution clears the conflict): once `er` supersedes both heads there
+--- is only one head, so `conflict(f1)` is unreachable.
+search [1] in TRACKER-MERGE :
+  t(ev(e1, f1, v1) ev(e2, f1, v2) ev(er, f1, v1) bef(e1, er) bef(e2, er))
+  =>* t(conflict(f1) C:Cfg) .
+
+--- Bite teeth: the SLOPPY tiebreak fold DOES converge a forked field to a value
+--- with no conflict -- the exact silent-pick the good fold's soundness bite
+--- above makes unreachable. This is the negative fixture proving the good
+--- fold's `val(f1,_)` No-solution has real content.
+search [1] in TRACKER-MERGE-TIEBREAK :
+  t(ev(e1, f1, v1) ev(e2, f1, v2))
+  =>* t(val(f1, V:Val) C:Cfg) .

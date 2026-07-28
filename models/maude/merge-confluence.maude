@@ -1,0 +1,98 @@
+--- Confluence of certified merge folding, per
+--- spec/versioned-workspace-research-note.md 6.2 and the untie-substrate
+--- readiness tracker Phase 0: pairwise-disjoint edits commute, so the
+--- mediator folds N branches in ANY order to the same cut; only the
+--- connected components of the overlap graph escalate, and they escalate
+--- JOINTLY -- a component member is never folded just because the edits it
+--- directly overlaps happened to escalate first.
+---
+--- The mediator state is mediator(pending edit set, accumulated manifest)
+--- plus a conflictGroup accumulating one overlap component. An edit folds
+--- only while slice-disjoint from every other pending edit AND from the
+--- escalated component; two overlapping pendings seed the component; a
+--- pending overlapping the component joins it. Overlap is the merge-slice
+--- anti-dependence test: write-or-consume meets read-or-write-or-consume.
+mod WHIPPLESCRIPT-MERGE-CONFLUENCE is
+  protecting BOOL .
+
+  sorts Decl DeclSet EId Entry MSet Edit EditSet Cfg .
+  subsort Decl < DeclSet .
+  subsort Entry < MSet .
+  subsort Edit < EditSet .
+
+  ops d1 d2 d3 d4 : -> Decl [ctor] .
+  ops e0 eA eB eC eD : -> EId [ctor] .   --- e0 = the base author
+
+  op mtD : -> DeclSet [ctor] .
+  op _;_ : DeclSet DeclSet -> DeclSet [ctor assoc comm id: mtD] .
+  eq [dset-idem] : D:Decl ; D:Decl = D:Decl .
+
+  op member : Decl DeclSet -> Bool .
+  eq member(D:Decl, (D:Decl ; DS:DeclSet)) = true .
+  eq member(D:Decl, DS:DeclSet) = false [owise] .
+
+  op inter : DeclSet DeclSet -> Bool .
+  eq inter((D:Decl ; DS1:DeclSet), (D:Decl ; DS2:DeclSet)) = true .
+  eq inter(DS1:DeclSet, DS2:DeclSet) = false [owise] .
+
+  op at : Decl EId -> Entry [ctor] .
+  op mtM : -> MSet [ctor] .
+  op _;_ : MSet MSet -> MSet [ctor assoc comm id: mtM] .
+
+  op edit : EId DeclSet DeclSet DeclSet -> Edit [ctor] .
+  op mtE : -> EditSet [ctor] .
+  op _;_ : EditSet EditSet -> EditSet [ctor assoc comm id: mtE] .
+
+  op sel : Decl DeclSet EId EId -> EId .
+  eq sel(D:Decl, DS:DeclSet, I:EId, J:EId) =
+    if member(D:Decl, DS:DeclSet) then I:EId else J:EId fi .
+  op upd : MSet DeclSet EId -> MSet .
+  eq upd(mtM, DS:DeclSet, I:EId) = mtM .
+  eq upd((at(D:Decl, J:EId) ; M:MSet), DS:DeclSet, I:EId) =
+    at(D:Decl, sel(D:Decl, DS:DeclSet, I:EId, J:EId)) ;
+    upd(M:MSet, DS:DeclSet, I:EId) .
+
+  vars I1 I2 : EId .
+  vars W1 C1 R1 W2 C2 R2 : DeclSet .
+  vars E E1 E2 : Edit .
+  vars ES GS : EditSet .
+  var M : MSet .
+
+  op overlap : Edit Edit -> Bool .
+  eq overlap(edit(I1, W1, C1, R1), edit(I2, W2, C2, R2)) =
+    inter((W1 ; C1), (W2 ; C2 ; R2)) or inter((W2 ; C2), (W1 ; C1 ; R1)) .
+
+  op disjointFromAll : Edit EditSet -> Bool .
+  eq disjointFromAll(E, mtE) = true .
+  eq disjointFromAll(E, (E2 ; ES)) =
+    not overlap(E, E2) and disjointFromAll(E, ES) .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op mediator : EditSet MSet -> Cfg [ctor] .      --- pending edits + the cut
+  op conflictGroup : EditSet -> Cfg [ctor] .      --- the escalated component
+
+  --- Fold: an edit lands in the cut only while slice-disjoint from every
+  --- other pending edit and from the escalated component. The fold order
+  --- among such edits is deliberately nondeterministic -- confluence is the
+  --- claim under test, not an assumption.
+  crl [fold] :
+      mediator((edit(I1, W1, C1, R1) ; ES), M) conflictGroup(GS)
+      => mediator(ES, upd(M, W1, I1)) conflictGroup(GS)
+      if disjointFromAll(edit(I1, W1, C1, R1), ES) = true /\
+         disjointFromAll(edit(I1, W1, C1, R1), GS) = true .
+
+  --- Two overlapping pendings seed the conflict component.
+  crl [escalate-seed] :
+      mediator((E1 ; E2 ; ES), M) conflictGroup(mtE)
+      => mediator(ES, M) conflictGroup(E1 ; E2)
+      if overlap(E1, E2) = true .
+
+  --- A pending edit overlapping the component joins it JOINTLY -- even if
+  --- it is pairwise disjoint from some members, connectivity through the
+  --- overlap graph pulls it in.
+  crl [escalate-join] :
+      mediator((E ; ES), M) conflictGroup((E2 ; GS))
+      => mediator(ES, M) conflictGroup(E ; E2 ; GS)
+      if disjointFromAll(E, (E2 ; GS)) = false .
+endm

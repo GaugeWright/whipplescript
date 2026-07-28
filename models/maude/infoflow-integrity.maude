@@ -1,0 +1,105 @@
+--- Information-flow control, the integrity lattice, PARTY-RELATIVE. The anti-
+--- prompt-injection direction. Upgrades the earlier single-owner chain to the
+--- decentralized / asymmetric-delegation model (DR-0027 I-IFC1): integrity is
+--- "who may influence / who vouches", principals are ordered by an ACTS-FOR
+--- relation given as the delegation context (theta), and the order is a general
+--- partial order, not a fixed chain.
+---
+--- A control sink requires an authority R. Data influenced by principal W is
+--- acceptable iff W acts-for R -- W has at least R's authority, so a
+--- higher-or-equal authority's influence is trusted. Injection is W influencing
+--- an R-sink without acting-for R. acts-for is reflexive and transitive over the
+--- delegation edges, computed by canAct.
+---
+--- THE DENY-PROPERTY (R8 framing): data influenced by any principal below R is
+--- DENIED influence over every R-sink -- universally. The acts-for comparison is
+--- the enforcing algorithm; the sanctioned exception is the source-marked
+--- endorsed crossing, itself guarded by NMIF (untrusted data can never steer its
+--- own release).
+---
+--- Grounding in whipplescript constructs:
+---   intSource(B, W)      B originates influenced by principal W: an inbound
+---                        message at 'stranger', a known party at its role.
+---   flow                 a binding use / payload field / agent join box.
+---   endorse(B1, B2, R)   the explicit, authority-scoped integrity raise (the
+---                        'endorsed' marker over a structural coerce): B2 is
+---                        vouched by authority R, carrying only R's influence.
+---   controlSink(B, R)    a control point requiring authority R: workflow-spawn,
+---                        record, instance advance.
+---   deleg(REL)           the delegation context theta as acts-for edges P > Q.
+mod WHIPPLESCRIPT-INFOFLOW-INTEGRITY is
+  protecting BOOL .
+  sorts Prin PSet Edge Rel Binding Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
+
+  ops operator manager clerk stranger : -> Prin [ctor] .
+  ops b1 b2 b3 b4 : -> Binding [ctor] .
+
+  --- principal sets, for the closure's frontier and visited accumulators
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
+
+  --- the delegation relation: edges P > Q meaning P acts-for Q
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  --- acts-for closure, reflexive-transitive, with a visited set so cycles end
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  --- the configuration soup
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deleg : Rel -> Cfg [ctor] .                  --- the delegation context theta
+  op intSource : Binding Prin -> Cfg [ctor] .     --- origin influenced by W
+  op influencedBy : Binding Prin -> Cfg [ctor] .  --- derived influence token
+  op flow : Binding Binding -> Cfg [ctor] .
+  op endorse : Binding Binding Prin -> Cfg [ctor] . --- authority-scoped integrity raise to R
+  op controlSink : Binding Prin -> Cfg [ctor] .   --- control point requiring authority R
+  op injection : -> Cfg [ctor] .                  --- violation
+
+  vars B B1 B2 : Binding .  vars W R : Prin .  var REL : Rel .
+
+  eq influencedBy(B, W) influencedBy(B, W) = influencedBy(B, W) .
+  eq injection injection = injection .
+
+  --- seed influence at sources
+  rl [seed] : intSource(B, W) => intSource(B, W) influencedBy(B, W) .
+
+  --- influence propagates along every flow edge (the agent join box is the same:
+  --- an output binding has a flow edge from each of its inputs)
+  rl [prop] : influencedBy(B1, W) flow(B1, B2) => influencedBy(B1, W) flow(B1, B2) influencedBy(B2, W) .
+
+  --- endorse yields a binding influenced ONLY by the vouching authority R; the
+  --- low source taint does not cross, which is what makes the endorsed-path bite
+  --- hold. (Grant-authorization of the endorse is the NMIF increment, modeled next.)
+  rl [endorse-seed] : endorse(B1, B2, R) => endorse(B1, B2, R) influencedBy(B2, R) .
+
+  --- violation: a control sink requiring R is influenced by W where W does not
+  --- act-for R, so W lacks R's authority and its influence taints the decision.
+  crl [inject] : influencedBy(B, W) controlSink(B, R) deleg(REL)
+    => influencedBy(B, W) controlSink(B, R) deleg(REL) injection
+    if canAct(REL, W, R) =/= true .
+endm

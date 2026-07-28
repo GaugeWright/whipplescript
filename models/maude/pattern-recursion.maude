@@ -1,0 +1,71 @@
+--- Pattern-application recursion rejection, per spec/static-analysis.md
+--- "pattern expansion is non-recursive only" and spec/language.md "Patterns".
+--- Companion to validate_pattern_recursion in the parser.
+---
+--- The compiler must elaborate every pattern apply into a finite first-order
+--- program before runtime. v0 forbids recursion: if any apply reaches, directly
+--- or transitively, another apply of a pattern already on the active expansion
+--- stack, the program is rejected with graph.unbounded_pattern_recursion.
+--- This model abstracts pattern bodies to their apply edges -- applies P Q means
+--- pattern P's body applies pattern Q -- and checks by reachability search that:
+---   * a self-applying pattern is rejected as recursion;
+---   * a mutual application cycle is rejected as recursion;
+---   * a transitively reachable but acyclic application chain elaborates and is
+---     NEVER rejected, so non-recursive nesting is not wrongly flagged.
+mod WHIPPLESCRIPT-PATTERN-RECURSION is
+  protecting BOOL .
+
+  sorts Pat Pair PairSet PatSet Cfg .
+  subsort Pair < PairSet .
+  subsort Pat < PatSet .
+
+  ops pa pb pc : -> Pat [ctor] .   --- pattern names
+
+  --- A directed reachability pair P -> Q in the application graph.
+  op pair : Pat Pat -> Pair [ctor] .
+  op mtPairs : -> PairSet [ctor] .
+  op _;_ : PairSet PairSet -> PairSet [ctor assoc comm id: mtPairs] .
+  eq [pair-idem] : PR:Pair ; PR:Pair = PR:Pair .
+
+  op memberPair : Pair PairSet -> Bool .
+  eq memberPair(PR:Pair, (PR:Pair ; PS:PairSet)) = true .
+  eq memberPair(PR:Pair, PS:PairSet) = false [owise] .
+
+  --- The set of patterns rejected for unbounded recursion.
+  op mtPats : -> PatSet [ctor] .
+  op _&_ : PatSet PatSet -> PatSet [ctor assoc comm id: mtPats] .
+  eq [pat-idem] : PT:Pat & PT:Pat = PT:Pat .
+
+  op memberPat : Pat PatSet -> Bool .
+  eq memberPat(PT:Pat, (PT:Pat & QS:PatSet)) = true .
+  eq memberPat(PT:Pat, QS:PatSet) = false [owise] .
+
+  --- Configuration is an ACU soup of tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op applies : Pat Pat -> Cfg [ctor] .   --- pattern P body applies pattern Q
+  op reaches : PairSet -> Cfg [ctor] .    --- transitive application reachability
+  op rejected : PatSet -> Cfg [ctor] .    --- patterns flagged as recursive
+
+  vars P Q R : Pat .
+  var PS : PairSet .
+  var QS : PatSet .
+
+  --- Seed reachability from every direct application edge.
+  crl [seed] : applies(P, Q) reaches(PS)
+      => applies(P, Q) reaches(pair(P, Q) ; PS)
+      if memberPair(pair(P, Q), PS) = false .
+
+  --- Transitive closure: if P reaches Q and Q applies R, then P reaches R.
+  --- Matching pair(P, Q) in the reach set binds P, so the new pair is grounded.
+  crl [close] : applies(Q, R) reaches(pair(P, Q) ; PS)
+      => applies(Q, R) reaches(pair(P, R) ; pair(P, Q) ; PS)
+      if memberPair(pair(P, R), (pair(P, Q) ; PS)) = false .
+
+  --- A pattern that reaches itself is unbounded recursion. Guarded on the
+  --- rejected set so each recursive pattern is flagged at most once.
+  crl [reject] : reaches(pair(P, P) ; PS) rejected(QS)
+      => reaches(pair(P, P) ; PS) rejected(P & QS)
+      if memberPat(P, QS) = false .
+endm

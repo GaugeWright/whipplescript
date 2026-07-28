@@ -1,0 +1,36 @@
+load ../resolution-memory.maude
+
+--- Coverage: an authored resolution closes the conflict, stores the
+--- content-addressed memory, and ONLY THEN does adoption fire.
+search [1] in WHIPPLESCRIPT-RESOLUTION-MEMORY :
+  conflict(k1, b1, triple(c0, c1, c2)) open(b1, s z)
+  resolveReq(k1, r1) adoptReq(b1)
+  =>* adopted(b1) memory(triple(c0, c1, c2), r1) resolved(k1, r1)
+      RESIDUAL:Cfg .
+
+--- Bite: with the conflict open and no resolution, adoption is
+--- unreachable -- a conflict-bearing cut is never adoptable.
+search [1] in WHIPPLESCRIPT-RESOLUTION-MEMORY :
+  conflict(k1, b1, triple(c0, c1, c2)) open(b1, s z) adoptReq(b1)
+  =>* adopted(b1) RESIDUAL:Cfg .
+
+--- Coverage: conflicts do not block -- work proceeds atop the tagged
+--- state while the conflict stays open.
+search [1] in WHIPPLESCRIPT-RESOLUTION-MEMORY :
+  conflict(k1, b1, triple(c0, c1, c2)) open(b1, s z) writeReq(b1, w1)
+  =>* wrote(b1, w1) conflict(k1, b1, triple(c0, c1, c2)) RESIDUAL:Cfg .
+
+--- Coverage: the daemon propagates a stored resolution to a descendant's
+--- IDENTICAL conflict pair, unblocking its adoption without any authored
+--- input.
+search [1] in WHIPPLESCRIPT-RESOLUTION-MEMORY :
+  conflict(k2, b2, triple(c0, c1, c2)) open(b2, s z)
+  memory(triple(c0, c1, c2), r1) adoptReq(b2)
+  =>* adopted(b2) resolved(k2, r1) RESIDUAL:Cfg .
+
+--- Bite: a DIFFERENT base with the same sides never auto-applies -- the
+--- memory key is the content-addressed triple, not side similarity.
+search [1] in WHIPPLESCRIPT-RESOLUTION-MEMORY :
+  conflict(k3, b3, triple(c3, c1, c2)) open(b3, s z)
+  memory(triple(c0, c1, c2), r1)
+  =>* resolved(k3, R:Res) RESIDUAL:Cfg .

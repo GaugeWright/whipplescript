@@ -1,0 +1,91 @@
+--- Coordination outcome carriage (workflow encapsulation E-COORD).
+---
+--- Named coordination resources are bidirectional membrane operations:
+---   * inbound writes/acquires need enough integrity for the resource;
+---   * outbound outcomes (`remaining`, `holders`, and their discriminants) are
+---     read sources with the resource's reader-set label.
+---
+--- The model also captures the v1 mechanism fork: under `shared`, one workflow's
+--- coordination action reaches another workflow's observed outcome; under the
+--- default `partitioned` mode, the owner-qualified cell prevents that cross-workflow
+--- carriage entirely.
+mod WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE is
+  protecting BOOL .
+
+  sorts Workflow Resource Level Outcome Cfg .
+
+  ops wfA wfB : -> Workflow [ctor] .
+  ops counter lease : -> Resource [ctor] .
+  ops lo hi : -> Level [ctor] .
+  ops remaining holders : -> Outcome [ctor] .
+
+  --- Integrity dominance: hi satisfies any requirement; lo satisfies only lo.
+  op meets : Level Level -> Bool .
+  eq meets(hi, R:Level) = true .
+  eq meets(lo, lo) = true .
+  eq meets(lo, hi) = false .
+
+  --- Confidentiality release: public data can flow anywhere; private data only
+  --- reaches a private-cleared sink.
+  op canFlow : Level Level -> Bool .
+  eq canFlow(lo, R:Level) = true .
+  eq canFlow(hi, hi) = true .
+  eq canFlow(hi, lo) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op shared : Resource -> Cfg [ctor] .
+  op partitioned : Resource -> Cfg [ctor] .
+  op resourceIntegrity : Resource Level -> Cfg [ctor] .
+  op resourceReaders : Resource Level -> Cfg [ctor] .
+  op workflowIntegrity : Workflow Level -> Cfg [ctor] .
+  op sinkClearance : Workflow Level -> Cfg [ctor] .
+
+  op consume : Workflow Resource -> Cfg [ctor] .
+  op acquire : Workflow Resource -> Cfg [ctor] .
+  op observeRemaining : Workflow Resource -> Cfg [ctor] .
+  op observeHolders : Workflow Resource -> Cfg [ctor] .
+
+  op outcomeRead : Workflow Workflow Resource Outcome -> Cfg [ctor] .
+  op coordInjection : -> Cfg [ctor] .
+  op outcomeLeak : -> Cfg [ctor] .
+
+  vars W A B : Workflow .
+  var R : Resource .
+  var L Req Sink : Level .
+  var O : Outcome .
+
+  eq coordInjection coordInjection = coordInjection .
+  eq outcomeLeak outcomeLeak = outcomeLeak .
+  eq outcomeRead(A, B, R, O) outcomeRead(A, B, R, O) = outcomeRead(A, B, R, O) .
+
+  --- Inbound integrity gate: a workflow with too-low integrity cannot write into
+  --- or acquire a high-integrity coordination resource.
+  crl [inject-consume] :
+      resourceIntegrity(R, Req) workflowIntegrity(W, L) consume(W, R)
+    => resourceIntegrity(R, Req) workflowIntegrity(W, L) consume(W, R) coordInjection
+    if meets(L, Req) =/= true .
+
+  crl [inject-acquire] :
+      resourceIntegrity(R, Req) workflowIntegrity(W, L) acquire(W, R)
+    => resourceIntegrity(R, Req) workflowIntegrity(W, L) acquire(W, R) coordInjection
+    if meets(L, Req) =/= true .
+
+  --- Outbound carriage exists only under explicit `shared`. The default
+  --- `partitioned` mode has no rule connecting A's action to B's observed outcome.
+  rl [shared-remaining] :
+      shared(R) consume(A, R) observeRemaining(B, R)
+    => shared(R) consume(A, R) observeRemaining(B, R) outcomeRead(A, B, R, remaining) .
+
+  rl [shared-holders] :
+      shared(R) acquire(A, R) observeHolders(B, R)
+    => shared(R) acquire(A, R) observeHolders(B, R) outcomeRead(A, B, R, holders) .
+
+  --- Outbound confidentiality gate: an observed coordination outcome is a read of
+  --- the resource label, so a low-clearance sink leaks a high-reader-set resource.
+  crl [outcome-leak] :
+      resourceReaders(R, L) sinkClearance(B, Sink) outcomeRead(A, B, R, O)
+    => resourceReaders(R, L) sinkClearance(B, Sink) outcomeRead(A, B, R, O) outcomeLeak
+    if canFlow(L, Sink) =/= true .
+endm

@@ -1,3 +1,7 @@
+use std.coercion
+use std.tracker
+use std.agent
+
 @service
 description "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human"
 workflow QueueWorkerWithReview
@@ -81,10 +85,5 @@ rule work_ready_item
 
   after review fails {
     release issue
-    askHuman """markdown
-    Review failed for work item {{ issue.id }}: {{ issue.title }}
-
-    Please inspect the turn and decide whether to accept, revise, or block the issue.
-    """
   }
 }

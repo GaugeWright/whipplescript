@@ -1,3 +1,5 @@
+use std.agent
+
 workflow RevisionRepairPlanner {
   input issue RepairIssue
   output proposal PatchProposal
@@ -54,6 +56,12 @@ workflow RevisionRepairPlanner {
         proposedPath issue.sourcePath
         summary turn.summary
         dryRunCommand "whip revise <instance_id> <candidate.whip> --root RevisionTicket --dry-run"
+      }
+    }
+
+    after turn fails as f {
+      fail error {
+        reason f.reason
       }
     }
   }

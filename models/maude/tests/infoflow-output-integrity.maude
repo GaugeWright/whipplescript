@@ -1,0 +1,44 @@
+load ../infoflow-output-integrity.maude
+
+--- Effect-output integrity (DR-0046). Coverage: an unvouched executor's
+--- output denies at a vouched sink by payload and by selector, and the
+--- endorsed marker without its grant denies. Bite: a vouched executor writes
+--- freely, the granted endorsed judgment arms, and the axis lock holds --
+--- an output token never produces a confidentiality leak.
+
+--- ============================ COVERAGE, influence reachable ================
+
+--- Coverage: unvouched output as the vouched sink's payload.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  payload(lo, hi)
+  =>* C:Cfg influence .
+
+--- Coverage: unvouched output SELECTING the arm the vouched sink sits in --
+--- the implicit channel is the same influence.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  selector(lo, hi)
+  =>* C:Cfg influence .
+
+--- Coverage: the endorsed marker without its grant is a declaration, not
+--- authority.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  endorsedVia(lo, hi, false)
+  =>* C:Cfg influence .
+
+--- ============================ BITE, no influence ===========================
+
+--- Bite: a vouched executor (provided hi) shapes the vouched sink freely.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  payload(hi, hi) selector(hi, hi)
+  =>* RESIDUAL:Cfg influence .
+
+--- Bite: the granted endorsed judgment arms the unvouched executor.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  endorsedVia(lo, hi, true)
+  =>* RESIDUAL:Cfg influence .
+
+--- Bite: the axis lock -- no output constructor can ever produce a
+--- confidentiality leak, whatever its levels.
+search [1] in WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY :
+  payload(lo, hi) selector(lo, hi) endorsedVia(lo, hi, false) confAudit
+  =>* RESIDUAL:Cfg confLeak .

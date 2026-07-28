@@ -22,22 +22,23 @@
       "default_model": "sonnet",
       "workspace_policy": "read_only",
       "timeout_ms": 60000,
-      "cancellation_depth": "cooperative_request",
+      "cancellation_depth": "none",
       "artifact_policy": "required",
       "health_checks": ["claude_sdk", "api_key", "tool_policy"]
+    }
+  ],
+  "prices": [
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "input_per_mtok_usd": 3.0,
+      "output_per_mtok_usd": 15.0
     },
     {
-      "provider_id": "pi-main",
-      "provider_kind": "pi",
-      "surface": "pi_rpc",
-      "credentials_ref": "env:PI_API_KEY",
-      "profile_ids": ["repo-reader", "repo-writer"],
-      "default_model": "provider/default",
-      "workspace_policy": "read_only",
-      "timeout_ms": 60000,
-      "cancellation_depth": "native_stop",
-      "artifact_policy": "required",
-      "health_checks": ["pi_cli", "rpc_mode", "provider_model", "extensions"]
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "input_per_mtok_usd": 0.25,
+      "output_per_mtok_usd": 2.0
     }
   ]
 }

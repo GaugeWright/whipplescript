@@ -22,10 +22,10 @@ use whipplescript_store::{
 use crate::effect_config::EffectConfig;
 use crate::idempotency_key;
 use crate::rule_lowering::{
-    effect_binding_value, interpolate_prompt, json_from_str, parse_field_value, stable_hash_hex,
-    RuleContext,
+    effect_binding_value, empty_ir_program, eval_expr_value, guard_result, interpolate_prompt,
+    json_from_str, parse_field_value, stable_hash_hex, EvalScope, GuardStatus, RuleContext,
 };
-use crate::{HumanAskExecution, RuntimeKernel};
+use crate::RuntimeKernel;
 
 /// The local-workflow package name (matches the CLI's `LOCAL_WORKFLOW_PACKAGE`).
 const LOCAL_WORKFLOW_PACKAGE: &str = "local";
@@ -212,75 +212,6 @@ pub fn coordination_owner_for_instance<S: RuntimeStore>(
     Ok(format!("{LOCAL_WORKFLOW_PACKAGE}/{}", version.program_name))
 }
 
-/// Host-agnostic core (DR-0033 chunk 3): issue the human.ask + its terminal/fact
-/// over a held `RuntimeKernel<S>` (kernel methods + a read-only resolve, so
-/// `S: RuntimeStore`).
-pub fn run_human_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    config: &EffectConfig,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input_json =
-        resolve_effect_input_after_bindings_generic(kernel.store(), instance_id, effect)?;
-    let input = json_from_str(&input_json);
-    let prompt = input
-        .get("prompt")
-        .and_then(Value::as_str)
-        .unwrap_or("Human review requested");
-    let choices_json = input
-        .get("choices")
-        .cloned()
-        .unwrap_or_else(|| json!(["accept", "revise", "block"]))
-        .to_string();
-    let severity = input
-        .get("severity")
-        .and_then(Value::as_str)
-        .unwrap_or("normal");
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "human-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "human-lease"]);
-    let inbox_item_id = idempotency_key(&[instance_id, &effect.effect_id, "inbox"]);
-    let terminal = kernel.run_human_ask(HumanAskExecution {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: &config.provider,
-        worker_id: "whip-worker",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        inbox_item_id: &inbox_item_id,
-        prompt,
-        choices_json: &choices_json,
-        freeform_allowed: true,
-        severity,
-        related_effects_json: &json!([effect.effect_id]).to_string(),
-        related_artifacts_json: "[]",
-    })?;
-    // The ask is issued: a completed-status fact lets `after ask succeeds`
-    // branches fire (e.g. flow await-state records carrying the ask's
-    // effect id for answer correlation).
-    let issued_json = json!({
-        "effect_id": effect.effect_id,
-        "run_id": run_id,
-        "inbox_item_id": inbox_item_id,
-        "status": "completed",
-    })
-    .to_string();
-    kernel.derive_fact(
-        instance_id,
-        "human.ask.issued",
-        &effect.effect_id,
-        &issued_json,
-        Some(&terminal.event_id),
-        Some(&idempotency_key(&[
-            instance_id,
-            &effect.effect_id,
-            "human.ask.issued",
-        ])),
-    )?;
-    Ok(terminal)
-}
-
 /// Host-agnostic core (DR-0033 chunk 3): fold an `after`-binding into the effect
 /// input using facts read from a held store. Read-only, so `&S` suffices.
 pub fn resolve_effect_input_after_bindings_generic<S: RuntimeStore>(
@@ -320,6 +251,7 @@ pub fn resolve_effect_input_after_bindings_generic<S: RuntimeStore>(
             value_json: binding_value.to_string(),
             provenance_class: "effect".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         },
     ));
     if let Some(argument_exprs) = input.get("argument_exprs").and_then(Value::as_array) {
@@ -367,6 +299,7 @@ pub fn context_from_input_bindings(input: &Value) -> RuleContext {
                 value_json: value.to_string(),
                 provenance_class: "input".to_owned(),
                 source_span_json: None,
+                source_event_id: String::new(),
             },
         ));
     }
@@ -395,6 +328,16 @@ pub fn file_path_policy_error(
     {
         return Some(format!(
             "path `{path}` escapes the `{store_name}` store root"
+        ));
+    }
+    // S4 (language-refinement follow-on): a store is READ-ONLY by default.
+    // Reads with no declared globs are allowed anywhere inside the root (the
+    // mount was deliberate), but WRITES fail closed unless the store declares
+    // an `allow write [...]` policy — mutation is never ambient authority.
+    if operation == "write" && allow_globs.is_empty() {
+        return Some(format!(
+            "store `{store_name}` permits no writes: declare `allow write [...]` \
+             (writes are denied by default)"
         ));
     }
     if !allow_globs.is_empty() && !allow_globs.iter().any(|glob| glob_match(glob, path)) {
@@ -1014,18 +957,387 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
     }
 }
 
+/// Evaluate a `proj_query` predicate against one projection/fact row, reusing the
+/// guard expression kernel restricted to the row's fields. Returns `Err` on a
+/// predicate that cannot be parsed or does not evaluate to a boolean — never a
+/// silent false.
+pub fn evaluate_proj_predicate(predicate: &str, row: &Value) -> Result<bool, String> {
+    let expr = whipplescript_parser::parse_expression(predicate)
+        .map_err(|error| format!("could not parse predicate `{predicate}`: {error}"))?;
+    let empty_ir = empty_ir_program();
+    let scope = EvalScope {
+        context: None,
+        facts: &[],
+        effects: &[],
+        ir: &empty_ir,
+        projection: Some(row),
+        projection_schema: None,
+    };
+    match guard_result(eval_expr_value(&expr, &scope)) {
+        (GuardStatus::Matched, _, _) => Ok(true),
+        (GuardStatus::False, _, _) => Ok(false),
+        (GuardStatus::Error, _, error) => {
+            Err(error.unwrap_or_else(|| "predicate did not evaluate to a boolean".to_owned()))
+        }
+    }
+}
+
+/// CSV-escape one field (inverse of `split_csv_record`): quote when the value
+/// contains a comma, quote, or newline; double embedded quotes.
+fn csv_escape_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Serialize export rows (std.files), the inverse of `decode_import_rows`. `jsonl`
+/// = one JSON object per line; `json` = a top-level array; `csv` = a header line
+/// from `fields` then one record per row (stable column order, values stringified).
+pub fn encode_export_rows(
+    format: &str,
+    rows: &[Value],
+    fields: &[String],
+) -> Result<String, String> {
+    let cell = |row: &Value, field: &str| -> String {
+        match row.as_object().and_then(|object| object.get(field)) {
+            Some(Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        }
+    };
+    match format {
+        "jsonl" => {
+            let mut out = rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !rows.is_empty() {
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        "json" => serde_json::to_string(&Value::Array(rows.to_vec()))
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(|error| format!("json export serialize failed: {error}")),
+        "csv" => {
+            let mut out = fields
+                .iter()
+                .map(|field| csv_escape_field(field))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push('\n');
+            for row in rows {
+                let record = fields
+                    .iter()
+                    .map(|field| csv_escape_field(&cell(row, field)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&record);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        other => Err(format!("unknown export format `{other}`")),
+    }
+}
+
+/// Host-agnostic core (DR-0033 chunk 3; relocated from the CLI in std.files
+/// slice F4 — crate location, not shape): export a `<Schema>` fact collection
+/// (optionally filtered by the `where` predicate, ordered deterministically by
+/// the store's `(name, key)` ordering — DR-0022) to a file through the
+/// `FileStore` seam over a held `RuntimeKernel<S>`. A success settles
+/// `file.export.completed` with the row count and a content hash; living in
+/// the kernel, it builds for wasm32 so exports run on the DO plane too.
+pub fn run_file_export_effect_generic<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    files: &dyn FileStore,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+) -> Result<StoredEvent, StoreError> {
+    let input = json_from_str(&effect.input_json);
+    let root = input
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let format = input
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("jsonl")
+        .to_owned();
+    let schema = input
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let store_name = input
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("create")
+        .to_owned();
+    let predicate = input
+        .get("predicate")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let allow = effect_allow_globs(&input);
+    let fields = input
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let full = Path::new(root).join(path);
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
+    })?;
+    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
+    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
+
+    let outcome: Result<(usize, String), String> = (|| {
+        if let Some(reason) =
+            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
+                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
+            })
+        {
+            return Err(reason);
+        }
+        // Resolve the collection: facts of <schema> [where predicate], ordered by
+        // the store's deterministic (name, key) ordering for reproducible output.
+        let facts = kernel
+            .store()
+            .list_facts(instance_id)
+            .map_err(|error| format!("{error:?}"))?;
+        let mut rows = Vec::new();
+        for fact in facts.iter().filter(|fact| fact.name == schema) {
+            let value: Value = serde_json::from_str(&fact.value_json)
+                .map_err(|error| format!("fact value is not JSON: {error}"))?;
+            if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
+                rows.push(value);
+            }
+        }
+        let exists = files.exists(&full);
+        match mode.as_str() {
+            "create" if exists => {
+                return Err(format!(
+                    "write mode `create` requires `{path}` to not already exist"
+                ))
+            }
+            "replace" if !exists => {
+                return Err(format!(
+                    "write mode `replace` requires `{path}` to already exist"
+                ))
+            }
+            "create" | "replace" | "upsert" | "append" => {}
+            other => return Err(format!("unknown write mode `{other}`")),
+        }
+        let serialized = encode_export_rows(&format, &rows, &fields)?;
+        if let Some(parent) = full.parent() {
+            files
+                .create_dir_all(parent)
+                .map_err(|error| format!("create parent of `{path}`: {error}"))?;
+        }
+        if mode == "append" {
+            files
+                .append(&full, serialized.as_bytes())
+                .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
+        } else {
+            files
+                .write(&full, serialized.as_bytes())
+                .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
+        }
+        Ok((rows.len(), stable_hash_hex(&serialized)))
+    })();
+
+    match outcome {
+        Ok((row_count, content_hash)) => {
+            let value = json!({
+                "store": store_name,
+                "path": path,
+                "format": format,
+                "schema": schema,
+                "mode": mode,
+                "row_count": row_count,
+                "content_hash": content_hash,
+            });
+            let terminal = kernel.complete_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "completed",
+                exit_code: Some(0),
+                summary: Some(&format!("exported {row_count} rows to {}", full.display())),
+                metadata_json: &json!({ "value": value }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.export.completed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "completed",
+                    "value": value,
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+        Err(reason) => {
+            let terminal = kernel.fail_run(EffectCompletion {
+                instance_id,
+                effect_id: &effect.effect_id,
+                run_id: &run_id,
+                provider: "files",
+                worker_id: "whip-files",
+                status: "failed",
+                exit_code: None,
+                summary: Some(&reason),
+                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+                idempotency_key: Some(&terminal_key),
+            })?;
+            kernel.derive_fact(
+                instance_id,
+                "file.export.failed",
+                &effect.effect_id,
+                &json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
+                    "error": { "message": reason },
+                })
+                .to_string(),
+                Some(&terminal.event_id),
+                Some(&fact_key),
+            )?;
+            Ok(terminal)
+        }
+    }
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): the lease/ledger/counter op + its terminal
 /// over a held `RuntimeKernel<S>`; coordination is the DO's own store there, so
 /// `S: RuntimeStore + Coordination` unifies both surfaces.
+/// std.coord slice 3: the counter reset-period boundary, computed from the
+/// INJECTED `now` (never wall clock — the period an outcome resolves against
+/// is recorded on the outcome, so replay re-reads instead of re-deriving) in
+/// the counter's declared timezone, DST-correct via the same chrono-tz
+/// machinery the clock sources use. `None` = the timezone does not name an
+/// IANA zone or `now` does not parse — malformed input, failed typed.
+pub fn counter_period(reset: &str, timezone: &str, now: &str) -> Option<String> {
+    let instant = crate::time_pass::parse_clock_instant(now)?;
+    let tz: chrono_tz::Tz = timezone.parse().ok()?;
+    let local = instant.with_timezone(&tz);
+    let format = match reset {
+        "hourly" => "%Y-%m-%dT%H",
+        "weekly" => "%Y-W%W",
+        "monthly" => "%Y-%m",
+        _ => "%Y-%m-%d",
+    };
+    Some(local.format(format).to_string())
+}
+
+/// Fail a coordination effect with the DR-0032 typed base (handler honesty,
+/// spec/std-coord.md v1 slice 2): opens the run, fails it, and derives the
+/// `{kind}.failed` fact whose `value` is the uniform `EffectError` base — the
+/// same terminal shape every other failing effect kind produces, so
+/// `after <acquire> fails as f` binds a typed `f`.
+fn fail_coordination_effect<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    reason: &str,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "coord-lease"]);
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({"kind": effect.kind}).to_string(),
+    })?;
+    let terminal = kernel.fail_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: "coordination",
+        worker_id: "whip-coordination",
+        status: "failed",
+        exit_code: None,
+        summary: Some(reason),
+        metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })?;
+    kernel.derive_fact(
+        instance_id,
+        &format!("{}.failed", effect.kind),
+        &effect.effect_id,
+        &json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "status": "failed",
+            "value": effect_failure_base(&effect.kind, reason, reason, &effect.effect_id, &run_id),
+            "error": { "message": reason },
+        })
+        .to_string(),
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "coord-fact",
+        ])),
+    )?;
+    Ok(terminal)
+}
+
 pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
     now: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::coordination::{
-        AcquireOutcome, ConsumeOutcome, DEFAULT_COORDINATION_OWNER,
-    };
+    use whipplescript_store::coordination::{AcquireOutcome, ConsumeOutcome};
 
     let input = json_from_str(&effect.input_json);
     let workflow_owner = coordination_owner_for_instance(kernel.store(), instance_id)?;
@@ -1036,6 +1348,29 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             .unwrap_or_default()
             .to_owned()
     };
+    // Handler honesty (spec/std-coord.md v1 slice 2): a missing/mistyped
+    // numeric field is MALFORMED input — well-formed lowering always emits it
+    // from the declaration — and fails the effect with a typed DR-0032 error
+    // instead of running under a smuggled default (the old slots=1 / ttl=600 /
+    // retain=86400 / cap=0). Pre-release one-way break per M4 posture.
+    macro_rules! require_i64 {
+        ($source:expr, $name:literal) => {
+            match $source.get($name).and_then(Value::as_i64) {
+                Some(value) => value,
+                None => {
+                    return fail_coordination_effect(
+                        kernel,
+                        instance_id,
+                        effect,
+                        &format!(
+                            "malformed `{}` input: missing or non-integer `{}`",
+                            effect.kind, $name
+                        ),
+                    )
+                }
+            }
+        };
+    }
     let owner = {
         let declared = field("coordination_owner");
         if declared.is_empty() {
@@ -1048,15 +1383,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
         "lease.acquire" => {
             let resource = field("resource");
             let key = field("key");
+            let slots = require_i64!(input, "slots");
+            let ttl_seconds = require_i64!(input, "ttl_seconds");
             let outcome = kernel.store_mut().try_acquire_for_owner(
                 &owner,
                 &resource,
                 &key,
-                input.get("slots").and_then(Value::as_i64).unwrap_or(1),
-                input
-                    .get("ttl_seconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(600),
+                slots,
+                ttl_seconds,
                 instance_id,
             )?;
             match outcome {
@@ -1132,15 +1466,16 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                 .filter(|owner| !owner.is_empty())
                 .unwrap_or(&workflow_owner)
                 .to_owned();
-            let mut released = kernel.store_mut().release_for_owner(
+            // Handler honesty (slice 2): the pre-partitioning shared-owner
+            // fallback — retrying an owner-scoped miss as an any-owner
+            // release — is dropped; a release only ever frees its own
+            // acquire's owner-scoped lease. One-way break per M4 posture.
+            let released = kernel.store_mut().release_for_owner(
                 &acquire_owner,
                 &resource,
                 &key,
                 instance_id,
             )?;
-            if !released && acquire_owner != DEFAULT_COORDINATION_OWNER {
-                released = kernel.store_mut().release(&resource, &key, instance_id)?;
-            }
             json!({
                 "variant": "Released",
                 "resource": resource,
@@ -1177,27 +1512,33 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                 .filter(|owner| !owner.is_empty())
                 .unwrap_or(&workflow_owner)
                 .to_owned();
-            let ttl_seconds = input
+            // A renew without its own `until` duration inherits the acquire's
+            // declared TTL — that is the renew contract, not a default. Both
+            // missing is malformed input (well-formed lowering always records
+            // the acquire's TTL) and fails typed, per slice 2.
+            let ttl_seconds = match input
                 .get("ttl_seconds")
                 .and_then(Value::as_i64)
                 .or_else(|| acquire_input.get("ttl_seconds").and_then(Value::as_i64))
-                .unwrap_or(600);
-            let mut expires_at = kernel.store_mut().renew_lease_for_owner(
+            {
+                Some(ttl_seconds) => ttl_seconds,
+                None => return fail_coordination_effect(
+                    kernel,
+                    instance_id,
+                    effect,
+                    "malformed `lease.renew` input: no `ttl_seconds` on the renew or its acquire",
+                ),
+            };
+            // The pre-partitioning DEFAULT-owner retry is dropped alongside
+            // release's shared-owner fallback (slice 2): a renew only ever
+            // extends its own acquire's owner-scoped lease.
+            let expires_at = kernel.store_mut().renew_lease_for_owner(
                 &acquire_owner,
                 &resource,
                 &key,
                 ttl_seconds,
                 instance_id,
             )?;
-            if expires_at.is_none() && acquire_owner != DEFAULT_COORDINATION_OWNER {
-                expires_at = kernel.store_mut().renew_lease_for_owner(
-                    DEFAULT_COORDINATION_OWNER,
-                    &resource,
-                    &key,
-                    ttl_seconds,
-                    instance_id,
-                )?;
-            }
             match expires_at {
                 Some(expires_at) => json!({
                     "variant": "Renewed",
@@ -1216,16 +1557,15 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
             let ledger = field("ledger");
             let partition = field("partition");
             let entry = input.get("entry").cloned().unwrap_or(Value::Null);
-            let seq = kernel.store_mut().append_for_owner(
+            let retain_seconds = require_i64!(input, "retain_seconds");
+            let seq = kernel.store_mut().append_for_owner_idempotent(
                 &owner,
                 &ledger,
                 &partition,
                 &entry.to_string(),
                 instance_id,
-                input
-                    .get("retain_seconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(86400),
+                retain_seconds,
+                &effect.effect_id,
             )?;
             json!({
                 "variant": "Appended",
@@ -1237,14 +1577,38 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
         "counter.consume" => {
             let counter = field("counter");
             let key = field("key");
-            let period = kernel.store_mut().current_period(&field("reset"))?;
-            let outcome = kernel.store_mut().consume_for_owner(
+            let amount = require_i64!(input, "amount");
+            let cap = require_i64!(input, "cap");
+            // The period comes from the INJECTED `now` in the counter's
+            // declared timezone (pre-slice-3 inputs carry no timezone: UTC),
+            // and is RECORDED on the outcome below — replay re-reads the
+            // resolved period instead of re-deriving one from a later `now`.
+            let timezone = {
+                let declared = field("timezone");
+                if declared.is_empty() {
+                    "UTC".to_owned()
+                } else {
+                    declared
+                }
+            };
+            let Some(period) = counter_period(&field("reset"), &timezone, now) else {
+                return fail_coordination_effect(
+                    kernel,
+                    instance_id,
+                    effect,
+                    &format!(
+                        "malformed `counter.consume` input: `{timezone}` is not an IANA timezone (or the pass instant `{now}` does not parse)"
+                    ),
+                );
+            };
+            let outcome = kernel.store_mut().consume_for_owner_idempotent(
                 &owner,
                 &counter,
                 &key,
-                input.get("amount").and_then(Value::as_i64).unwrap_or(0),
-                input.get("cap").and_then(Value::as_i64).unwrap_or(0),
+                amount,
+                cap,
                 &period,
+                &effect.effect_id,
             )?;
             match outcome {
                 ConsumeOutcome::Ok { remaining } => json!({
@@ -1252,12 +1616,14 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                     "counter": counter,
                     "key": key,
                     "remaining": remaining,
+                    "period": period,
                 }),
                 ConsumeOutcome::Over { remaining } => json!({
                     "variant": "Over",
                     "counter": counter,
                     "key": key,
                     "remaining": remaining,
+                    "period": period,
                 }),
             }
         }
@@ -1324,13 +1690,28 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
 /// Host-agnostic core (DR-0033 chunk 3): claim/release/finish a work item + record
 /// the terminal over a held `RuntimeKernel<S>`. The queue is the DO's own store on
 /// that host, so `S: RuntimeStore + WorkItems` unifies both surfaces.
+/// Resolve an absolute claim/renew deadline from the INJECTED `now` and a TTL in
+/// seconds, formatted as SQLite's `datetime('now')` shape (`YYYY-MM-DD HH:MM:SS`)
+/// so it compares lexically against the store's own clock. `None` ttl (or an
+/// unparseable `now`) means no deadline — the untimed backstop lease.
+fn tracker_expires_from_now(now: &str, ttl_seconds: Option<i64>) -> Option<String> {
+    let ttl_seconds = ttl_seconds?;
+    let instant = crate::time_pass::parse_clock_instant(now)?;
+    Some(
+        (instant + chrono::Duration::seconds(ttl_seconds))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
 pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
     _config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::items::ClaimOutcome;
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome};
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
@@ -1381,13 +1762,40 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         }
         "tracker.claim" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match kernel.store_mut().claim_item(id, instance_id) {
-                Ok(ClaimOutcome::Claimed) => Ok(json!({"id": id, "claimed_by": instance_id})),
+            // Claim TTL (T3): `expires_at = now + ttl` from the injected clock,
+            // or `None` (untimed backstop lease) when no `ttl` clause was given.
+            let expires =
+                tracker_expires_from_now(now, input.get("ttl_seconds").and_then(Value::as_i64));
+            match kernel
+                .store_mut()
+                .claim_item(id, instance_id, expires.as_deref())
+            {
+                Ok(ClaimOutcome::Claimed) => {
+                    Ok(json!({"id": id, "claimed_by": instance_id, "expires_at": expires}))
+                }
                 Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
                     Err(format!("already claimed by `{holder}`"))
                 }
                 Ok(ClaimOutcome::NotFound) => Err(format!("item `{id}` not found")),
                 Err(error) => Err(format!("claim failed: {error:?}")),
+            }
+        }
+        "tracker.renew" => {
+            // Holder heartbeat (T3): re-affirm the holder's active claim without
+            // moving its deadline (`expires = None`). `not_held`/`not_monotonic`
+            // are typed failures; the store enforces holder-only + monotonicity.
+            let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
+            match kernel.store_mut().renew_claim(id, instance_id, None) {
+                Ok(RenewOutcome::Renewed { expires_at }) => {
+                    Ok(json!({"id": id, "renewed": true, "expires_at": expires_at}))
+                }
+                Ok(RenewOutcome::NotHeld) => Err(format!(
+                    "not held: no active claim on `{id}` by this holder"
+                )),
+                Ok(RenewOutcome::NotMonotonic) => {
+                    Err(format!("renew of `{id}` would move the deadline backward"))
+                }
+                Err(error) => Err(format!("renew failed: {error:?}")),
             }
         }
         "tracker.release" => {
@@ -1894,6 +2302,151 @@ impl CapabilityProvider for FixtureCapabilityProvider {
     }
 }
 
+/// One recall item's JSON (spec/std-memory.md): the pre-seam record shape
+/// (`message_id`/`pool`/`source`/`note`, the message id recomputed
+/// deterministically from the write-effect id) plus the MemoryContext
+/// enrichment (memory_id, text, created_at, provenance). Shared so native and
+/// the DO render an identical item.
+pub fn memory_item_json(row: &whipplescript_store::memory::MemoryEntryRow) -> Value {
+    let mut item = serde_json::Map::new();
+    if let Some(effect_id) = &row.source_effect_id {
+        item.insert(
+            "message_id".to_owned(),
+            Value::String(idempotency_key(&[effect_id, "memory-message"])),
+        );
+    }
+    item.insert("memory_id".to_owned(), json!(row.memory_id));
+    item.insert("pool".to_owned(), Value::String(row.pool.clone()));
+    item.insert("text".to_owned(), Value::String(row.text.clone()));
+    item.insert(
+        "source".to_owned(),
+        row.source.clone().map(Value::String).unwrap_or(Value::Null),
+    );
+    if let Some(note) = &row.note {
+        item.insert("note".to_owned(), Value::String(note.clone()));
+    }
+    item.insert(
+        "created_at".to_owned(),
+        Value::String(row.created_at.clone()),
+    );
+    item.insert(
+        "provenance".to_owned(),
+        json!({
+            "source_instance_id": row.source_instance_id,
+            "source_effect_id": row.source_effect_id,
+            "source_run_id": row.source_run_id,
+            "author_actor": row.author_actor,
+        }),
+    );
+    Value::Object(item)
+}
+
+/// The `std.memory` capability provider's outcome, host-agnostic over any
+/// [`MemoryStore`](whipplescript_store::memory::MemoryStore) backend: native's
+/// file-backed `SqliteMemoryStore` and the DO's `DoMemoryStore` both call this,
+/// so recall/learn/curate behave identically on either host (the only
+/// difference is FTS5 vs LIKE lexical match inside the store). `memory.write`
+/// stores one entry (effect-plane determinism: empty `created_at`, provenance
+/// from the effect id); `memory.query` returns a MemoryContext; `memory.curate`
+/// dedupes the pool by content identity.
+pub fn run_memory_capability(
+    store: &mut dyn whipplescript_store::memory::MemoryStore,
+    effect: &ClaimableEffect,
+) -> CapabilityOutcome {
+    use whipplescript_store::memory::{CurateStrategy, NewMemoryEntry};
+    let input = json_from_str(&effect.input_json);
+    let pool = input
+        .get("pool")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // Deterministic message id: derived from the effect id, never wall-clock.
+    let message_id = idempotency_key(&[&effect.effect_id, "memory-message"]);
+    match effect.target.as_deref() {
+        Some("memory.write") => {
+            // `source` is the resolved `from <source>` value; `note` the
+            // optional `{ note <expr> }` field; the matchable body carries
+            // BOTH (a recall may name the source or words from the note).
+            let source = input.get("source").and_then(Value::as_str);
+            let note = input.get("note").and_then(Value::as_str);
+            let text = match (source, note) {
+                (Some(source), Some(note)) => format!("{source}\n{note}"),
+                (Some(source), None) => source.to_owned(),
+                (None, Some(note)) => note.to_owned(),
+                (None, None) => input
+                    .get("source")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            };
+            let entry = NewMemoryEntry {
+                pool: &pool,
+                text: &text,
+                created_at: "",
+                source_instance_id: None,
+                source_effect_id: Some(&effect.effect_id),
+                source_run_id: None,
+                author_actor: None,
+                source,
+                note,
+            };
+            if let Err(error) = store.write(&entry) {
+                return CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message: format!("memory write failed: {error:?}"),
+                };
+            }
+            CapabilityOutcome::Produced(json!({
+                "pool": pool,
+                "message_id": message_id,
+                "stored": true,
+            }))
+        }
+        Some("memory.query") => {
+            let query_text = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let limit = input
+                .get("context_limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit as usize);
+            match store.query(&pool, query_text, limit) {
+                Ok(rows) => {
+                    let items: Vec<Value> = rows.iter().map(memory_item_json).collect();
+                    CapabilityOutcome::Produced(json!({
+                        "pool": pool,
+                        "count": items.len(),
+                        "items": items,
+                    }))
+                }
+                Err(error) => CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message: format!("memory query failed: {error:?}"),
+                },
+            }
+        }
+        Some("memory.curate") => match store.curate(&pool, CurateStrategy::DedupeBySourceNote) {
+            Ok(report) => CapabilityOutcome::Produced(json!({
+                "pool": pool,
+                "removed": report.removed,
+                "kept": report.kept,
+            })),
+            Err(error) => CapabilityOutcome::Failed {
+                error_kind: "memory".to_owned(),
+                message: format!("memory curate failed: {error:?}"),
+            },
+        },
+        other => CapabilityOutcome::Failed {
+            error_kind: "memory".to_owned(),
+            message: format!(
+                "memory-provider does not handle capability `{}`",
+                other.unwrap_or_default()
+            ),
+        },
+    }
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
 /// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
 pub fn run_capability_effect_generic<S: RuntimeStore>(
@@ -2084,4 +2637,29 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
         }
     };
     Ok(terminal)
+}
+
+#[cfg(test)]
+mod file_policy_tests {
+    use super::file_path_policy_error;
+
+    /// S4: stores are read-only by default — an empty write policy DENIES the
+    /// write (fail closed), while an empty read policy allows any path inside
+    /// the root. Declared write globs permit and bound writes.
+    #[test]
+    fn write_is_denied_by_default_and_read_is_not() {
+        assert!(file_path_policy_error("out.txt", "docs", &[], "write")
+            .expect("write denied")
+            .contains("permits no writes"));
+        assert_eq!(file_path_policy_error("in.txt", "docs", &[], "read"), None);
+        assert_eq!(
+            file_path_policy_error("out.txt", "docs", &["**".to_owned()], "write"),
+            None
+        );
+        assert!(
+            file_path_policy_error("other/x.txt", "docs", &["out/**".to_owned()], "write")
+                .expect("out-of-glob write denied")
+                .contains("allow write")
+        );
+    }
 }

@@ -1,0 +1,120 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.ingress",
+  "name": "std.ingress",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.ingress",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "signal.emit",
+          "effect_kind": "signal.emit",
+          "source_forms": ["emit", "signal"],
+          "input_schema": "signal.emit.input",
+          "required_capabilities": ["signal.emit"],
+          "provider_kinds": ["builtin-ingress"],
+          "validation": "none"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "ingress.signal",
+          "construct_family": "declaration_block",
+          "keyword": "signal",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "ingress.source",
+          "construct_family": "source_declaration",
+          "keyword": "source",
+          "scope": "top_level",
+          "lowering_target": "signal_source"
+        },
+        {
+          "id": "signal.emit",
+          "construct_family": "effect_operation",
+          "keyword": "emit",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Event" }],
+          "lowering_target": "signal_emit"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "signal.emit",
+      "description": "Inject a typed, declaration-validated signal into a peer instance through the admission core (`emit signal <name> to <target>`)."
+    }
+  ],
+  "providers": [
+    {
+      "id": "builtin-ingress-signal-emit",
+      "provider_kind": "builtin-ingress",
+      "capability": "signal.emit",
+      "effect_kind": "signal.emit",
+      "config": {}
+    },
+    {
+      "id": "cli",
+      "provider_kind": "cli",
+      "plane": "operator",
+      "config": {
+        "transport": "one-shot operator CLI (`whip signal`)",
+        "auth_modes": ["operator"],
+        "dedup_source": "`--delivery-id`, else H(instance, signal, payload)",
+        "correlation": "explicit instance argument",
+        "can_start_instances": false
+      }
+    },
+    {
+      "id": "stdio",
+      "provider_kind": "stdio",
+      "plane": "operator",
+      "config": {
+        "transport": "resident JSONL loop (`whip ingress serve --stdio`), envelopes {instance, signal, payload, delivery_id?}",
+        "auth_modes": ["operator"],
+        "dedup_source": "envelope `delivery_id`, else H(instance, signal, payload)",
+        "correlation": "envelope `instance` field",
+        "can_start_instances": false
+      }
+    },
+    {
+      "id": "file",
+      "provider_kind": "file",
+      "plane": "operator",
+      "config": {
+        "transport": "worker-pass poller; `path` reads one line per signal (append-only log), `watch` admits one signal per new (path, content-hash) occurrence",
+        "auth_modes": ["filesystem"],
+        "dedup_source": "`dedup <observation-path>`, else line ordinal (`path`) / content hash (`watch`)",
+        "correlation": "running instances of the declaring program",
+        "can_start_instances": false
+      }
+    },
+    {
+      "id": "http",
+      "provider_kind": "http",
+      "plane": "operator",
+      "config": {
+        "transport": "worker-pass poller; GET `url`, one signal per JSON-array element (append-only feed); the inbound listener (`whip ingress serve` HTTP) is deferred with slice I4",
+        "auth_modes": [],
+        "dedup_source": "`dedup <observation-path>`, else element ordinal",
+        "correlation": "running instances of the declaring program",
+        "can_start_instances": false
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-ingress-signal-emit",
+      "program_id": null,
+      "capability": "signal.emit",
+      "provider": "builtin-ingress",
+      "config": {}
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+--- Owned brokered agent harness, slice 4: tracker tools (shared-state participation).
+--- Companion to DR-0024 refined-I3 and spec/owned-harness-tool-surface.md. The
+--- agent may participate in durable shared state: it files/updates work-tracker
+--- items the workflow independently observes. Two invariants:
+---
+--- Gating: a tracker write requires the configured tracker capability,
+--- default-deny like bash. No capability, no write.
+---
+--- Refined I3: a tracker write produces a tracker ITEM, never a rule-matchable
+--- FACT. A fact is reachable only by the workflow OBSERVING the item via its own
+--- rule, never directly from the model. With no capability the model files
+--- nothing, so no fact arises.
+mod WHIPPLESCRIPT-OWNED-HARNESS-TRACKER is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op running : -> Cfg [ctor] .          --- turn is active
+  op trackerEnabled : -> Cfg [ctor] .   --- the configured tracker capability
+  op trackerItem : -> Cfg [ctor] .      --- a filed tracker item (shared state)
+  op fact : -> Cfg [ctor] .             --- a rule-matchable fact (control-flow substrate)
+
+  --- A tracker write requires the capability and produces a tracker ITEM. The
+  --- capability persists. Dropping trackerEnabled makes an ungated write reachable.
+  rl [file] : running trackerEnabled => running trackerEnabled trackerItem .
+
+  --- Only the workflow derives a fact, by OBSERVING a tracker item via its own
+  --- rule. The model never produces a fact directly.
+  rl [observe] : trackerItem => trackerItem fact .
+endm

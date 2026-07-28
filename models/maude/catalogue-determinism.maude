@@ -1,0 +1,49 @@
+--- Context-assembly Phase 0, invariant 4: skills-catalogue determinism.
+--- Companion to spec/context-assembly-tracker.md (Decision 2/7) and the pi
+--- `<available_skills>` catalogue. The catalogue injected into the system prompt
+--- must be a deterministic function of the discovered skill set: the same skills
+--- discovered in ANY order produce byte-identical catalogue bytes (which is also
+--- what keeps the prompt prefix cacheable). Discovery places each skill into the
+--- catalogue by canonical (name) order, so placement order does not matter. The
+--- safety property modeled here: from a given skill set the catalogue has a
+--- UNIQUE normal form (the sorted list); no mis-ordered catalogue is reachable as
+--- a terminal. An append-instead-of-ordered-insert would make placement order
+--- observable -- exactly what the bite rules out.
+mod WHIPPLESCRIPT-CATALOGUE-DETERMINISM is
+  protecting BOOL .
+
+  sorts Name NameList Cfg .
+  ops sa sb sc : -> Name [ctor] .   --- three skill names, ordered sa < sb < sc
+
+  op nil : -> NameList [ctor] .
+  op _:_ : Name NameList -> NameList [ctor] .   --- cons of a sorted list
+
+  vars N M : Name .
+  var L : NameList .
+
+  op lt : Name Name -> Bool .
+  eq lt(sa, sb) = true .
+  eq lt(sa, sc) = true .
+  eq lt(sb, sc) = true .
+  eq lt(sb, sa) = false .
+  eq lt(sc, sa) = false .
+  eq lt(sc, sb) = false .
+  eq lt(N, N) = false .
+
+  --- Ordered insert keeps the catalogue sorted regardless of insertion order,
+  --- so the list is confluent (order-independent).
+  op insert : Name NameList -> NameList .
+  eq insert(N, nil) = N : nil .
+  ceq insert(N, M : L) = N : M : L if lt(N, M) .
+  ceq insert(N, M : L) = M : insert(N, L) if lt(N, M) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op pending : Name -> Cfg [ctor] .   --- a discovered skill not yet placed
+  op cat : NameList -> Cfg [ctor] .   --- the catalogue built so far (sorted)
+
+  --- Placing a discovered skill inserts it in canonical order. Because insert is
+  --- order-independent, ALL discovery orders converge to the same catalogue.
+  rl [place] : pending(N) cat(L) => cat(insert(N, L)) .
+endm

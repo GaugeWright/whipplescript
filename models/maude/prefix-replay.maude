@@ -1,0 +1,79 @@
+--- Prefix-replay seeding for mark-pinned scenarios, per the experimentation
+--- research note section 5 (checkpoint-and-regenerate is a do-operator) and
+--- the improve note's scenario substrate: a `suppose`/campaign regeneration
+--- forks a FRESH counterfactual instance, seeds its log with the source
+--- run's events UP TO the mark's cut, and drives only the suffix live.
+--- Companion models: restore-replay.maude owns the fold-coherence of
+--- rewinding within ONE instance; branch-effect-key.maude owns key
+--- distinctness between real and counterfactual executions. This model
+--- owns the SEEDING semantics: what a replayed prefix may and may not do.
+---
+--- INV-P1 replayed effects fire nothing: a pre-cut effect seeds as SETTLED
+---   state (its recorded terminal is the outcome), never as claimable work
+---   -- a replayed send/exec must not fire again.
+--- INV-P2 the suffix is regenerated, not replayed: a source event AFTER
+---   the cut is dropped by the seeder -- its site re-executes live in the
+---   counterfactual, which is the entire point of the intervention.
+--- INV-P3 driver ordering: suffix sites become claimable only after the
+---   seed completes (the wrapped { soup || event-list } state gates
+---   suffix-create on the exhausted list).
+---
+--- The NAIVE seeder demonstrates both corruptions at once: it seeds every
+--- source event as CLAIMABLE work, so pre-cut effects re-fire (a replayed
+--- side effect hits the world twice) and post-cut recorded outcomes ride
+--- along (the "regeneration" measures the recording, not the candidate).
+mod WHIPPLESCRIPT-PREFIX-REPLAY is
+  protecting NAT .
+
+  sorts Node Event EventList Cfg State .
+
+  ops n1 n2 n3 : -> Node [ctor] .
+
+  --- A source-log event: site Node settled at sequence Seq.
+  op ev : Nat Node -> Event [ctor] .
+  op nilE : -> EventList [ctor] .
+  op _;_ : Event EventList -> EventList [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op cut : Nat -> Cfg [ctor] .      --- the mark's cut sequence (inclusive)
+  op settled : Node -> Cfg [ctor] . --- folded as already-terminal (replayed)
+  op pending : Node -> Cfg [ctor] . --- claimable by the worker
+  op fired : Node -> Cfg [ctor] .   --- the effect actually executed
+  op sfx : Node -> Cfg [ctor] .     --- a suffix site the driver will create
+  op sound : -> Cfg [ctor] .        --- the sound seeder
+  op naive : -> Cfg [ctor] .        --- the naive seeder (hazard)
+
+  --- The seeding state: projection soup on the left, remaining source
+  --- events on the right (wrapped-state discipline, as in restore-replay).
+  op {_||_} : Cfg EventList -> State [ctor] .
+
+  vars S C : Nat .
+  var N : Node .
+  var P : Cfg .
+  var L : EventList .
+
+  --- Sound seeder: a pre-cut event folds in as settled state.
+  crl [seed-pre] :
+    { sound cut(C) P || ev(S, N) ; L } => { sound cut(C) P settled(N) || L }
+    if S <= C .
+
+  --- Sound seeder: a post-cut event is DROPPED -- the suffix re-executes
+  --- that site live under the candidate program.
+  crl [seed-post] :
+    { sound cut(C) P || ev(S, N) ; L } => { sound cut(C) P || L }
+    if S > C .
+
+  --- Naive seeder: everything lands as claimable work, cut unread.
+  rl [naive-seed] :
+    { naive P || ev(S, N) ; L } => { naive P pending(N) || L } .
+
+  --- The worker fires claimable effects; settled state is never claimable.
+  rl [fire] :
+    { P pending(N) || L } => { P fired(N) || L } .
+
+  --- The driver creates suffix sites only once seeding is complete.
+  rl [suffix-create] :
+    { P sfx(N) || nilE } => { P pending(N) || nilE } .
+endm

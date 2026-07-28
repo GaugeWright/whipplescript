@@ -50,20 +50,6 @@ pub struct ToolCall {
 pub enum ToolStatus {
     Ok,
     Error,
-    /// The tool intentionally paused the brokered turn for an attributable
-    /// human answer. No tool result is fed to the model until that answer is
-    /// admitted and correlated to the call.
-    Suspended,
-}
-
-/// A runtime-owned request to cross the labeled human interface. This is a
-/// question under the current authority epoch, never an authority grant.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct HumanAskRequest {
-    pub call_id: String,
-    pub question: String,
-    pub choices: Vec<String>,
-    pub freeform_allowed: bool,
 }
 
 /// The result of executing one tool, fed back to the model.
@@ -176,7 +162,7 @@ pub trait HarnessModelClient {
 /// provider `fetch`.
 ///
 /// Non-HTTP model clients (fixtures, scripted tests, and the native-only stdio
-/// sidecars — codex/claude/pi, DR-0033 Decision 7) implement [`HarnessModelClient`]
+/// sidecars — codex/claude, DR-0033 Decision 7) implement [`HarnessModelClient`]
 /// directly and are never put on the step machine.
 pub trait HttpModelClient {
     fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest;
@@ -263,9 +249,6 @@ pub enum TurnStatus {
     /// A durable cancellation request was observed between model rounds
     /// (pi-conformance §3: cooperative abort; the partial transcript persists).
     Cancelled,
-    /// The foreground turn remains live but cannot make another model call
-    /// until its pending human tool call receives an answer.
-    Suspended,
 }
 
 /// The outcome of a brokered turn: exactly one terminal, plus the in-turn stream
@@ -279,7 +262,6 @@ pub struct BrokeredTurnOutcome {
     pub steps: usize,
     pub observations: Vec<LoopObservation>,
     pub usage: Value,
-    pub pending_human_ask: Option<HumanAskRequest>,
 }
 
 /// Project a finished [`BrokeredTurnOutcome`] onto the [`ProviderRunResult`] the
@@ -289,24 +271,23 @@ pub struct BrokeredTurnOutcome {
 pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> ProviderRunResult {
     let (status, failure) = match outcome.status {
         TurnStatus::Completed => (ProviderRunStatus::Completed, None),
-        TurnStatus::Failed
-        | TurnStatus::TimedOut
-        | TurnStatus::Cancelled
-        | TurnStatus::Suspended => {
+        TurnStatus::Failed | TurnStatus::TimedOut | TurnStatus::Cancelled => {
             let error_kind = if matches!(outcome.status, TurnStatus::Cancelled) {
                 "cancelled"
-            } else if matches!(outcome.status, TurnStatus::Suspended) {
-                "awaiting_human"
             } else if matches!(outcome.status, TurnStatus::TimedOut) {
                 "timeout"
             } else {
                 "provider_error"
             };
             (
-                if matches!(outcome.status, TurnStatus::TimedOut) {
-                    ProviderRunStatus::TimedOut
-                } else {
-                    ProviderRunStatus::Failed
+                match outcome.status {
+                    TurnStatus::TimedOut => ProviderRunStatus::TimedOut,
+                    // Was collapsed into Failed, which settled the effect
+                    // `failed` on the DO placement — firing `fails` arms and
+                    // stripping a deliberate watchdog cancel of its
+                    // auto-fail exemption.
+                    TurnStatus::Cancelled => ProviderRunStatus::Cancelled,
+                    _ => ProviderRunStatus::Failed,
                 },
                 Some(ProviderFailure {
                     provider: "brokered".to_owned(),
@@ -368,6 +349,20 @@ pub struct BrokeredTurnInput {
     /// start only), like `context_bundles`. Provenance only — the discover-all
     /// catalogue is unchanged. Empty for turns with no pin.
     pub pinned_skills: Vec<String>,
+}
+
+fn execute_offered_tool<E: ToolExecutor + ?Sized>(
+    executor: &E,
+    offered: &[ToolSpec],
+    call: &ToolCall,
+) -> ToolOutcome {
+    if !offered.iter().any(|tool| tool.name == call.name) {
+        return ToolOutcome {
+            status: ToolStatus::Error,
+            content: format!("tool `{}` was not offered for this model round", call.name),
+        };
+    }
+    executor.execute(call)
 }
 
 /// Drive a brokered tool-use loop to a single terminal.
@@ -438,7 +433,6 @@ where
                     steps: step + 1,
                     observations,
                     usage,
-                    pending_human_ask: None,
                 };
             }
         };
@@ -458,7 +452,6 @@ where
                 steps: step + 1,
                 observations,
                 usage,
-                pending_human_ask: None,
             };
         }
 
@@ -474,29 +467,12 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
-            let outcome = executor.execute(call);
+            let outcome = execute_offered_tool(executor, &input.tools, call);
             observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: outcome.status,
             });
-            if outcome.status == ToolStatus::Suspended {
-                let request = serde_json::from_str::<HumanAskRequest>(&outcome.content).ok();
-                checkpoint(&messages);
-                return BrokeredTurnOutcome {
-                    status: request
-                        .as_ref()
-                        .map_or(TurnStatus::Failed, |_| TurnStatus::Suspended),
-                    summary: request.as_ref().map_or_else(
-                        || "human ask tool returned an invalid suspension".to_owned(),
-                        |ask| ask.question.clone(),
-                    ),
-                    steps: step + 1,
-                    observations,
-                    usage,
-                    pending_human_ask: request,
-                };
-            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -517,7 +493,6 @@ where
         steps: input.max_steps,
         observations,
         usage,
-        pending_human_ask: None,
     }
 }
 
@@ -747,7 +722,6 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
-                pending_human_ask: None,
             });
         }
         self.awaiting = Awaiting::Main;
@@ -769,7 +743,6 @@ where
             steps: self.input.max_steps,
             observations: std::mem::take(&mut self.observations),
             usage: std::mem::take(&mut self.usage),
-            pending_human_ask: None,
         }
     }
 }
@@ -803,7 +776,30 @@ where
 
         let response = match incoming {
             Some(IoResult::Http(response)) => response,
-            None => unreachable!("BrokeredTurnMachine re-entered without a model response"),
+            None => {
+                // A fresh durable host handle has no transient `in_flight`
+                // request, but the snapshot identifies exactly which call is
+                // awaiting a response. Rebuild and re-emit that same request;
+                // the model client derives its idempotency key from the stable
+                // turn scope plus these exact messages/tool specs.
+                let request = match self.awaiting {
+                    Awaiting::Main => self.model.build_request(&self.messages, &self.input.tools),
+                    Awaiting::Summary => {
+                        let Some(compaction) = self.pending_compaction.as_ref() else {
+                            return Outcome::Settle(BrokeredTurnOutcome {
+                                status: TurnStatus::Failed,
+                                summary: "persisted summarization round has no compaction request"
+                                    .to_owned(),
+                                steps: self.step,
+                                observations: std::mem::take(&mut self.observations),
+                                usage: std::mem::take(&mut self.usage),
+                            });
+                        };
+                        self.model.build_request(&compaction.request_messages, &[])
+                    }
+                };
+                return Outcome::NeedsIo(IoRequest::Http(request));
+            }
         };
 
         // A summarization round (Phase 4 Layer B): fold the summary into a fresh
@@ -881,7 +877,6 @@ where
                     steps: self.step + 1,
                     observations: std::mem::take(&mut self.observations),
                     usage: std::mem::take(&mut self.usage),
-                    pending_human_ask: None,
                 });
             }
         };
@@ -905,7 +900,6 @@ where
                 steps: self.step + 1,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
-                pending_human_ask: None,
             });
         }
 
@@ -922,29 +916,12 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
-            let outcome = self.executor.execute(call);
+            let outcome = execute_offered_tool(self.executor, &self.input.tools, call);
             self.observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: outcome.status,
             });
-            if outcome.status == ToolStatus::Suspended {
-                let request = serde_json::from_str::<HumanAskRequest>(&outcome.content).ok();
-                (self.checkpoint)(&self.messages);
-                return Outcome::Settle(BrokeredTurnOutcome {
-                    status: request
-                        .as_ref()
-                        .map_or(TurnStatus::Failed, |_| TurnStatus::Suspended),
-                    summary: request.as_ref().map_or_else(
-                        || "human ask tool returned an invalid suspension".to_owned(),
-                        |ask| ask.question.clone(),
-                    ),
-                    steps: self.step + 1,
-                    observations: std::mem::take(&mut self.observations),
-                    usage: std::mem::take(&mut self.usage),
-                    pending_human_ask: request,
-                });
-            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -2018,6 +1995,31 @@ mod tests {
         assert_loops_equivalent(|| vec![Ok(final_reply("done"))], 8);
     }
 
+    #[test]
+    fn provider_cannot_dispatch_a_tool_that_was_not_offered() {
+        let replies = vec![
+            Ok(tool_reply("call-1", "write")),
+            Ok(final_reply("write refused")),
+        ];
+        let client = ScriptedClient::new(replies);
+        let executor = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "must not run".to_owned(),
+        });
+        let outcome = run_brokered_loop(&client, &executor, &input(8), &mut no_checkpoint());
+
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert!(executor.calls.borrow().is_empty());
+        assert!(outcome.observations.iter().any(|observation| matches!(
+            observation,
+            LoopObservation::ToolResult {
+                name,
+                status: ToolStatus::Error,
+                ..
+            } if name == "write"
+        )));
+    }
+
     /// The durable-object eviction test (DR-0033 Decision 3): drive a multi-round
     /// turn where the machine is snapshotted, JSON round-tripped (proving it fully
     /// serializes), and reconstructed from that snapshot before EVERY step — as if
@@ -2229,7 +2231,13 @@ mod tests {
             status: ToolStatus::Ok,
             content: String::new(),
         });
-        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
+        let mut turn = input(8);
+        turn.tools.push(ToolSpec {
+            name: "ls".to_owned(),
+            description: "list files".to_owned(),
+            input_schema: json!({"type": "object"}),
+        });
+        let outcome = run_brokered_loop(&client, &exec, &turn, &mut no_checkpoint());
         assert_eq!(outcome.status, TurnStatus::Completed);
         assert_eq!(exec.calls.borrow().len(), 2);
 

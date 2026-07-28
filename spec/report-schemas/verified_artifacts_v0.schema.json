@@ -69,7 +69,7 @@
   "$defs": {
     "stable_digest": {
       "type": "string",
-      "pattern": "^[0-9a-f]{16}$"
+      "pattern": "^[0-9a-f]{32}$"
     },
     "digest": {
       "type": "string",

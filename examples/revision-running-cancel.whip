@@ -1,3 +1,5 @@
+use std.agent
+
 workflow RevisionRunningCancel {
   input task RunningCancelTask
   output result RunningCancelResult
@@ -55,6 +57,12 @@ workflow RevisionRunningCancel {
 
       complete result {
         summary turn.summary
+      }
+    }
+
+    after turn fails as f {
+      fail error {
+        reason f.reason
       }
     }
   }

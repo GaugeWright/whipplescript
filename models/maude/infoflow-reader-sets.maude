@@ -1,0 +1,106 @@
+--- Information-flow control, READER/WRITER SETS (DR-0027 E6 / M1). The refinement
+--- the single-authority confidentiality model deferred: a real resource label is a
+--- SET of compartments, and a party may read it iff it is cleared for EVERY
+--- compartment (the intersection of up-sets). This is the per-resource set form
+--- that the checker's `Envelope` grows into, and it is the operational twin of
+--- models/lean/Whipple/ReaderSets.lean (canRead = acts-for every compartment, union
+--- is the join). infoflow-confidentiality models the orthogonal COMBINE axis (two
+--- separately-owned secrets unioned on one binding); this models the INTRINSIC set
+--- label of a single resource and the dominates relation the leak check computes.
+---
+--- The decision both axes share (E6): a flow source -> sink is safe iff the sink's
+--- label DOMINATES the source's --- every compartment required to read the source is
+--- covered by some compartment of the sink (so every party that can read the sink
+--- can read the source). On the integrity axis the same `dominates` runs with the
+--- read's provided vouchers covering the write's required ones (the dual).
+---
+--- Grounding in whipplescript constructs:
+---   label(Res, RS)    governance: resource Res is readable only by parties cleared
+---                     for every compartment in the reader set RS (RS = noP is public).
+---   flow(Src, Snk)    a binding use / payload field / agent join box: data labeled
+---                     as Src reaches the sink labeled Snk.
+---   deleg(REL)        the delegation context theta as acts-for edges P > Q.
+---   dominates         the leak decision: Snk's set covers every compartment of Src's.
+mod WHIPPLESCRIPT-INFOFLOW-READER-SETS is
+  protecting BOOL .
+  sorts Prin PSet Edge Rel Res Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
+
+  --- compartments and resources
+  ops operator bankRole emailRole auditRole public : -> Prin [ctor] .
+  ops src snk : -> Res [ctor] .
+
+  --- principal sets: the reader-set label, and the closure's frontier/visited
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
+
+  --- the delegation relation: edges P > Q meaning P acts-for Q
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  --- acts-for closure, reflexive-transitive, visited set so cycles terminate
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  --- coveredBy(REL, r, Provider): SOME provider compartment acts-for r. The
+  --- existential half of dominates; the canRead "a acts-for r" lifted over a set.
+  op coveredBy : Rel Prin PSet -> Bool .
+  eq coveredBy(REL:Rel, R:Prin, noP) = false .
+  ceq coveredBy(REL:Rel, R:Prin, (P:Prin , PS:PSet)) = true
+    if canAct(REL:Rel, P:Prin, R:Prin) .
+  ceq coveredBy(REL:Rel, R:Prin, (P:Prin , PS:PSet)) = coveredBy(REL:Rel, R:Prin, PS:PSet)
+    if canAct(REL:Rel, P:Prin, R:Prin) =/= true .
+
+  --- dominates(REL, Provider, Required): EVERY required compartment is covered by
+  --- the provider set. The universal half --- this is exactly ReaderSets.canRead
+  --- generalized from a single reader to a provider set, and the leak decision the
+  --- checker computes. Required = noP (public source) is vacuously dominated.
+  op dominates : Rel PSet PSet -> Bool .
+  eq dominates(REL:Rel, PROV:PSet, noP) = true .
+  ceq dominates(REL:Rel, PROV:PSet, (R:Prin , REQ:PSet)) = dominates(REL:Rel, PROV:PSet, REQ:PSet)
+    if coveredBy(REL:Rel, R:Prin, PROV:PSet) .
+  ceq dominates(REL:Rel, PROV:PSet, (R:Prin , REQ:PSet)) = false
+    if coveredBy(REL:Rel, R:Prin, PROV:PSet) =/= true .
+
+  --- the configuration soup
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deleg : Rel -> Cfg [ctor] .            --- the delegation context theta
+  op label : Res PSet -> Cfg [ctor] .       --- resource Res readable by every compartment in PSet
+  op flow : Res Res -> Cfg [ctor] .         --- data labeled Src reaches sink labeled Snk
+  op leak : -> Cfg [ctor] .                 --- violation
+
+  vars SRC SNK : Res .  vars RSSRC RSSNK : PSet .  var REL : Rel .
+
+  eq leak leak = leak .
+
+  --- violation: data flows from Src to Snk and the sink's reader set does NOT
+  --- dominate the source's --- some compartment required to read Src is covered by
+  --- no compartment of Snk, so a party that can read Snk could read it without
+  --- clearance for that compartment. This is canRead failing set-wise (E6).
+  crl [leak] : flow(SRC, SNK) label(SRC, RSSRC) label(SNK, RSSNK) deleg(REL)
+    => flow(SRC, SNK) label(SRC, RSSRC) label(SNK, RSSNK) deleg(REL) leak
+    if dominates(REL, RSSNK, RSSRC) =/= true .
+endm

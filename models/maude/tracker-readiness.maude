@@ -1,0 +1,81 @@
+--- Tracker readiness fold (ADR-0002 v1, A+blockers scope). Readiness is the
+--- derived predicate that gates whether an issue may be worked:
+---
+---   ready(id) iff status(id) = open
+---              AND no ACTIVE blocker -- no blocks(B, id) whose issue B is
+---                  still active, such as not closed and not canceled
+---              AND no ACTIVE lease on id.
+---
+--- `blocks` is the only readiness-affecting relation; conflicts, heads, and
+--- state-tokens are OUT of v1. status is one of open, in-progress, closed,
+--- canceled; a blocker counts only while its own issue is active (open or
+--- in-progress). A lease is active iff expiresAt > now.
+---
+--- The ready rule is a GLOBAL fold: "no active blocker anywhere" and "no
+--- active lease anywhere" are whole-state predicates, so the state is WRAPPED
+--- in { _ } and the rule captures the entire rest in C. The bites are
+--- No-solution searches: an actively-blocked, actively-leased, or
+--- closed/canceled issue is never reachable as ready.
+mod TRACKER-READINESS is
+  protecting NAT .
+
+  sorts Fact Cfg State Status .
+  subsort Fact < Cfg .
+
+  ops open inProgress closed canceled : -> Status [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- issue(id, status): durable issue status.
+  op issue : Nat Status -> Fact [ctor] .
+  --- blocks(from, to): `from` blocks `to`.
+  op blocks : Nat Nat -> Fact [ctor] .
+  --- lease(issue, actor, expiresAt): a held runtime lease.
+  op lease : Nat Nat Nat -> Fact [ctor] .
+  --- now(T): the runtime clock.
+  op now : Nat -> Fact [ctor] .
+  --- ready(id): the derived readiness fact.
+  op ready : Nat -> Fact [ctor] .
+
+  vars Id B A E T : Nat .
+  var S : Status .
+  vars C Full : Cfg .
+
+  --- An issue is active while it is open or in-progress.
+  op isActive : Status -> Bool .
+  eq isActive(open) = true .
+  eq isActive(inProgress) = true .
+  eq isActive(closed) = false .
+  eq isActive(canceled) = false .
+
+  --- Look up whether issue B is active in the full config.
+  op issueActive : Nat Cfg -> Bool .
+  eq issueActive(B, issue(B, S) C) = isActive(S) .
+  eq issueActive(B, C) = false [owise] .
+
+  --- Is Id blocked by an ACTIVE issue? Scan the blocks edges, consulting the
+  --- full config for each blocker's own status.
+  op blockedByActive : Nat Cfg Cfg -> Bool .
+  eq blockedByActive(Id, blocks(B, Id) C, Full) =
+    if issueActive(B, Full) then true else blockedByActive(Id, C, Full) fi .
+  eq blockedByActive(Id, C, Full) = false [owise] .
+
+  --- Is there an ACTIVE lease on Id anywhere, given clock T?
+  op hasActiveLeaseOn : Nat Nat Cfg -> Bool .
+  eq hasActiveLeaseOn(Id, T, lease(Id, A, E) C) =
+    if E > T then true else hasActiveLeaseOn(Id, T, C) fi .
+  eq hasActiveLeaseOn(Id, T, C) = false [owise] .
+
+  --- Has Id already been derived ready? Keeps the fold terminating.
+  op hasReady : Nat Cfg -> Bool .
+  eq hasReady(Id, ready(Id) C) = true .
+  eq hasReady(Id, C) = false [owise] .
+
+  --- Derive ready(Id): open, no active blocker, no active lease, not yet ready.
+  crl [ready] : { issue(Id, open) now(T) C } => { ready(Id) issue(Id, open) now(T) C }
+    if blockedByActive(Id, C, issue(Id, open) now(T) C) = false
+    /\ hasActiveLeaseOn(Id, T, C) = false
+    /\ hasReady(Id, C) = false .
+endm

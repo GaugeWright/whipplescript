@@ -1,3 +1,5 @@
+use std.agent
+
 # A consumer of a packaged `@tool` workflow (DR-0025 cross-package tools). The
 # `toolkit` package exports the convergence-checked `@tool` workflow `EchoText`
 # (see examples/packages/toolkit.json); this program `use`s the package and an
@@ -13,6 +15,7 @@ workflow ConsumerFlow {
   input request ConsumerRequest
 
   output result ConsumerResult
+  failure error ConsumerFailure
 
   class ConsumerRequest {
     task string
@@ -20,6 +23,10 @@ workflow ConsumerFlow {
 
   class ConsumerResult {
     summary string
+  }
+
+  class ConsumerFailure {
+    reason string
   }
 
   agent worker {
@@ -41,6 +48,12 @@ workflow ConsumerFlow {
       done request
       complete result {
         summary turn.summary
+      }
+    }
+
+    after turn fails as f {
+      fail error {
+        reason f.reason
       }
     }
   }

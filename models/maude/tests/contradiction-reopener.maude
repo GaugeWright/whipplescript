@@ -1,0 +1,33 @@
+load ../contradiction-reopener.maude
+
+--- The corruption pattern: a contradiction flag minted by a single noisy
+--- observation, or a flag that quietly revokes the human's answer.
+
+--- Bite: a spiking-but-receding posterior (up;down;up;down) never flags
+--- under the sound sustained trigger, in any interleaving.
+search [1] in WHIPPLESCRIPT-CONTRADICTION-REOPENER :
+  sound watching streak(z) stream(up ; down ; up ; down ; nilM)
+  =>* flagged RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive spike trigger flags the very same
+--- stream on the first movement.
+search [1] in WHIPPLESCRIPT-CONTRADICTION-REOPENER :
+  naive watching streak(z) stream(up ; down ; up ; down ; nilM)
+  =>* flagged RESIDUAL:Cfg .
+
+--- Coverage: three consecutive tightenings raise the advisory flag.
+search [1] in WHIPPLESCRIPT-CONTRADICTION-REOPENER :
+  sound watching streak(z) stream(up ; up ; up ; nilM)
+  =>* flagged RESIDUAL:Cfg .
+
+--- Bite: the flag is advisory only -- the reopener has no path to
+--- `revoked`, even from a fully flagged state with standing authority.
+search [1] in WHIPPLESCRIPT-CONTRADICTION-REOPENER :
+  sound watching answered streak(z) stream(up ; up ; up ; nilM)
+  =>* revoked RESIDUAL:Cfg .
+
+--- Coverage: a reset streak that re-tightens still flags -- recession
+--- delays the reopener, never disables it.
+search [1] in WHIPPLESCRIPT-CONTRADICTION-REOPENER :
+  sound watching streak(z) stream(up ; down ; up ; up ; up ; nilM)
+  =>* flagged RESIDUAL:Cfg .

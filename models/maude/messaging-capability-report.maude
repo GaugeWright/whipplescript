@@ -1,0 +1,83 @@
+--- std.messaging report-conditioned admission, per spec/std-messaging.md
+--- "Capability reports + conditioned checks" (design slice 2): provider
+--- capability reports are DATA, and the checker admits channel syntax only
+--- when the selected provider's report supports it. Companion to the parser's
+--- CHANNEL_PROVIDER_REPORTS constants + validate_send_channels /
+--- validate_message_from_channels / lower_channel checks.
+---
+--- The model abstracts a program to channel declarations (channel name ->
+--- provider), provider reports (provider -> direction), and two syntax uses:
+--- sendVia(channel) and observeFrom(channel). Every use is CONSUMED into
+--- exactly one verdict (admitted / rejected), so searches terminate. A
+--- provider without a report is tagged noReport -- Maude cannot match the
+--- absence of a report row -- and makes the channel declaration itself
+--- rejected (the unknown-provider check).
+---
+--- Properties checked by reachability (tests/messaging-capability-report.maude):
+---   * observing an outbound-only channel is REJECTED (the v1 acceptance
+---     test: send/receive-capable providers are distinguishable);
+---   * a bidirectional channel admits both directions and is NEVER rejected;
+---   * sending over an outbound-only channel is admitted and never rejected;
+---   * an unknown provider rejects the channel declaration; a reported
+---     provider never trips that check.
+mod WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT is
+  protecting BOOL .
+
+  sorts Chan Prov Dir Cfg .
+
+  ops alerts room : -> Chan [ctor] .        --- channel names
+  ops desktop local slack : -> Prov [ctor] . --- providers (slack = unreported)
+  ops outboundOnly inboundOnly both : -> Dir [ctor] .
+
+  op outboundCapable : Dir -> Bool .
+  eq outboundCapable(outboundOnly) = true .
+  eq outboundCapable(both) = true .
+  eq outboundCapable(D:Dir) = false [owise] .
+
+  op inboundCapable : Dir -> Bool .
+  eq inboundCapable(inboundOnly) = true .
+  eq inboundCapable(both) = true .
+  eq inboundCapable(D:Dir) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op chan : Chan Prov -> Cfg [ctor] .       --- channel declaration
+  op report : Prov Dir -> Cfg [ctor] .      --- provider capability report row
+  op noReport : Prov -> Cfg [ctor] .        --- provider with NO report (unknown)
+  op sendVia : Chan -> Cfg [ctor] .         --- outbound use awaiting a verdict
+  op observeFrom : Chan -> Cfg [ctor] .     --- inbound use awaiting a verdict
+  op sendAdmitted : Chan -> Cfg [ctor] .
+  op sendRejected : Chan -> Cfg [ctor] .
+  op observeAdmitted : Chan -> Cfg [ctor] .
+  op observeRejected : Chan -> Cfg [ctor] .
+  op chanRejected : Chan -> Cfg [ctor] .    --- unknown-provider check error
+
+  var C : Chan .
+  var P : Prov .
+  var D : Dir .
+
+  --- Send is admitted iff the report is outbound-capable. The use cell is
+  --- consumed into its verdict, so each use settles exactly once.
+  crl [admit-send] : sendVia(C) chan(C, P) report(P, D)
+      => sendAdmitted(C) chan(C, P) report(P, D)
+      if outboundCapable(D) .
+  crl [reject-send] : sendVia(C) chan(C, P) report(P, D)
+      => sendRejected(C) chan(C, P) report(P, D)
+      if outboundCapable(D) = false .
+
+  --- Inbound observation is admitted iff the report is inbound-capable:
+  --- desktop (outboundOnly) channels are a check error here.
+  crl [admit-observe] : observeFrom(C) chan(C, P) report(P, D)
+      => observeAdmitted(C) chan(C, P) report(P, D)
+      if inboundCapable(D) .
+  crl [reject-observe] : observeFrom(C) chan(C, P) report(P, D)
+      => observeRejected(C) chan(C, P) report(P, D)
+      if inboundCapable(D) = false .
+
+  --- A channel naming a provider with no capability report is rejected at the
+  --- declaration (the unknown-provider check): the declaration cell is
+  --- consumed, so no send/observe verdict can be minted over it afterwards.
+  rl [reject-unknown-provider] : chan(C, P) noReport(P)
+      => chanRejected(C) noReport(P) .
+endm

@@ -1,0 +1,60 @@
+--- Phase/provenance-typed turn outputs (DR-0030 Direction B). The opaque join box
+--- is opaque WITHIN a turn (an output carries the join of THAT turn's inputs) but
+--- PRECISE BETWEEN turns: when trusted whip code assembles a record from several turn
+--- outputs, each field carries its own source turn's level. So precision comes from
+--- "the model fills slots, whip assembles the record" -- NOT from labelling
+--- sub-structure of a single model output.
+---
+--- This model pins two things:
+---   * the per-turn box is a sound refinement of the per-rule box. A field fed only by
+---     a PUBLIC turn egresses to a public sink even when a SECRET turn ran in the same
+---     rule (the win), because that secret turn does not feed the field. Under a
+---     per-RULE join box the rule's whole join would taint the field and reject it.
+---   * the UNSOUND version is refused. A claim that a sub-field of a SINGLE secret turn
+---     output is public is IGNORED -- the field carries that turn's real (join) level.
+---     You cannot launder a secret by splitting the fields of one model output.
+mod WHIPPLESCRIPT-INFOFLOW-STAGING is
+  protecting BOOL .
+
+  sorts Name Level Cfg .
+  ops b1 b2 : -> Name [ctor] .   --- per-turn output bindings (b1 reads a secret, b2 is public)
+  op f1 : -> Name [ctor] .        --- a record field
+  ops lo hi : -> Level [ctor] .   --- lo = public, hi = secret
+
+  --- can data at level L be read by a sink cleared at level SL? lo flows anywhere; hi
+  --- only to a hi sink.
+  op leq : Level Level -> Bool .
+  eq leq(lo, L:Level) = true .
+  eq leq(hi, hi) = true .
+  eq leq(hi, lo) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op turnOut : Name Level -> Cfg [ctor] .       --- per-TURN box: a binding carries its turn's join level
+  op field : Name Name -> Cfg [ctor] .          --- whip assembly: field <- binding (label-preserving copy)
+  op claimSub : Name Name Level -> Cfg [ctor] . --- UNSOUND: claim a sub-field of one output at a lower level
+  op sink : Name Level -> Cfg [ctor] .          --- a field egresses to an audience cleared at this level
+
+  op accepted : -> Cfg [ctor] .
+  op rejected : -> Cfg [ctor] .
+  eq accepted accepted = accepted .
+  eq rejected rejected = rejected .
+
+  vars F B : Name .  vars L SL CL : Level .
+
+  --- sound assembly: a field carries its SOURCE binding's per-turn level; egress fits
+  --- the sink iff leq.
+  crl [egress-ok] : field(F,B) turnOut(B,L) sink(F,SL)
+                  => field(F,B) turnOut(B,L) sink(F,SL) accepted if leq(L,SL) .
+  crl [egress-bad] : field(F,B) turnOut(B,L) sink(F,SL)
+                   => field(F,B) turnOut(B,L) sink(F,SL) rejected if leq(L,SL) =/= true .
+
+  --- the UNSOUND single-output split is NOT honored: the field carries the SOURCE
+  --- turn's REAL level L, never the claimed CL. No per-field precision within one model
+  --- output -- only across whip-assembled turns.
+  crl [claim-ok] : claimSub(F,B,CL) turnOut(B,L) sink(F,SL)
+                 => claimSub(F,B,CL) turnOut(B,L) sink(F,SL) accepted if leq(L,SL) .
+  crl [claim-bad] : claimSub(F,B,CL) turnOut(B,L) sink(F,SL)
+                  => claimSub(F,B,CL) turnOut(B,L) sink(F,SL) rejected if leq(L,SL) =/= true .
+endm

@@ -17,7 +17,7 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::{
-    DiagnosticRecord, EffectCancellation, EffectCancellationRequest, RuleCommit,
+    DiagnosticRecord, EffectCancellation, EffectCancellationRequest, EventView, RuleCommit,
     RuleCommitRevisionGuard, RuntimeStore, StoreError,
 };
 
@@ -26,7 +26,8 @@ use crate::lowering::{
     BranchReport, OwnedDependency, OwnedEffect, OwnedFact, OwnedLowering, OwnedWorkflowTerminal,
 };
 use crate::rule_lowering::{
-    json_from_str, lower_rule, ready_contexts, stable_hash_hex, GuardReport,
+    context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts,
+    stable_hash_hex, GuardReport, RuleContext,
 };
 use crate::RuntimeKernel;
 
@@ -111,6 +112,8 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             restore_generation,
         );
         let facts = kernel.store().list_facts(instance_id)?;
+        let active_fact_ids: std::collections::BTreeSet<String> =
+            facts.iter().map(|fact| fact.fact_id.clone()).collect();
         let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
         let effects = kernel.store().list_effects(instance_id)?;
         let started_event_id = events
@@ -118,21 +121,298 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             .find(|event| event.event_type == "external.started")
             .map(|event| event.event_id.clone());
 
-        'rules: for rule in &ir.rules {
+        // DR-0043 slice 2 (pinned re-lowering): committed firings re-lower
+        // from their RECORDED contexts -- bindings are values; matching gates
+        // admission only, so a firing whose trigger was consumed or whose
+        // projection retracted still completes its continuations. Restore
+        // markers fold exactly as the store's replay fold does (an orphaned
+        // timeline's firings are never re-applied); firings dedupe by
+        // (rule, identity) against the live-match set below, so a
+        // still-matching trigger contributes one context, not two.
+        let pass_head_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+        let (recorded_firings, cancelled_firings): (
+            Vec<RecordedFiring>,
+            std::collections::BTreeSet<(String, Option<String>)>,
+        ) = {
+            let mut live: Vec<&EventView> = Vec::new();
+            for event in &events {
+                if event.event_type == "context.restored" {
+                    if let Some(target) = serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload.get("restored_to_sequence").and_then(Value::as_i64)
+                        })
+                    {
+                        live.retain(|kept| kept.sequence <= target);
+                    }
+                } else {
+                    live.push(event);
+                }
+            }
+            let mut seen: std::collections::BTreeSet<(String, Option<String>)> =
+                std::collections::BTreeSet::new();
+            // Operator-cancelled firings (DR-0043 Decision 8): a
+            // `progression.cancelled` closure removes the firing from the
+            // derived open set — pinned re-lowering never advances it again,
+            // and the lapse arm deliberately does not run.
+            let cancelled: std::collections::BTreeSet<(String, Option<String>)> = live
+                .iter()
+                .filter(|event| event.event_type == "progression.cancelled")
+                .filter_map(|event| {
+                    let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
+                    let rule = payload.get("rule").and_then(Value::as_str)?.to_owned();
+                    let identity = payload
+                        .get("identity")
+                        .and_then(Value::as_str)
+                        .filter(|identity| *identity != "started")
+                        .map(str::to_owned);
+                    Some((rule, identity))
+                })
+                .collect();
+            let mut recorded = Vec::new();
+            for event in live {
+                if event.event_type != "rule.committed" {
+                    continue;
+                }
+                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                    continue;
+                };
+                let Some(rule_name) = payload.get("rule").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(context) = payload.get("context").and_then(context_from_record) else {
+                    continue;
+                };
+                let version_id = payload
+                    .get("program_version_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let epoch = payload
+                    .get("revision_epoch")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let key = (rule_name.to_owned(), context.identity.clone());
+                if cancelled.contains(&key) {
+                    continue;
+                }
+                if seen.insert(key) {
+                    let fact_ids = payload
+                        .get("facts")
+                        .and_then(Value::as_array)
+                        .map(|facts| {
+                            facts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    recorded.push(RecordedFiring {
+                        rule: rule_name.to_owned(),
+                        context,
+                        version_id,
+                        epoch,
+                        fact_ids,
+                    });
+                }
+            }
+            (recorded, cancelled)
+        };
+
+        // DR-0043 slice 3 (old-body completion): a firing admitted under an
+        // earlier program version completes under THAT version's rule body,
+        // with its admission-time epoch in every derived key -- the firing
+        // owns its bindings AND its code. Sources are content-addressed
+        // (`put_content` at version-creation/drive time; blob id ==
+        // source_hash), so the old body is a store read + compile, cached per
+        // pass. A missing blob (a version never driven since the pinning
+        // surface landed) records one loud diagnostic and skips -- never a
+        // silent stall, never a wrong-body lowering.
+        let (active_recorded, old_recorded): (Vec<&RecordedFiring>, Vec<&RecordedFiring>) =
+            recorded_firings.iter().partition(|firing| {
+                firing.version_id.as_deref() == Some(active_version_id.as_str())
+                    && firing.epoch == active_revision_epoch
+                    || firing.version_id.is_none()
+            });
+        let old_identity_set: std::collections::BTreeSet<(&str, Option<&str>)> = old_recorded
+            .iter()
+            .map(|firing| (firing.rule.as_str(), firing.context.identity.as_deref()))
+            .collect();
+        let mut old_irs: std::collections::BTreeMap<String, Option<IrProgram>> =
+            std::collections::BTreeMap::new();
+        for firing in &old_recorded {
+            let Some(version_id) = firing.version_id.as_deref() else {
+                continue;
+            };
+            if old_irs.contains_key(version_id) {
+                continue;
+            }
+            let loaded = load_version_ir(kernel, instance_id, version_id)?;
+            old_irs.insert(version_id.to_owned(), loaded);
+        }
+
+        struct LoweringGroup<'g> {
+            ir: &'g IrProgram,
+            rule_name: String,
+            version_id: String,
+            epoch_key: String,
+            contexts: Vec<RuleContext>,
+        }
+        let mut groups: Vec<LoweringGroup> = Vec::new();
+        for rule in &ir.rules {
             let ready = ready_contexts(ir, rule, &facts, &effects, started_event_id.as_deref());
             report.guard_reports.extend(ready.guard_reports);
-            for context in ready.contexts {
-                let lowering = lower_rule(
+            let mut contexts: Vec<RuleContext> = ready
+                .contexts
+                .into_iter()
+                // A live match whose (rule, identity) belongs to an OLD
+                // firing is the SAME firing (fact identity is admission
+                // identity, DR-0043 Decision 4) -- it completes under its
+                // old body below, never re-admits under the new one.
+                .filter(|context| {
+                    !old_identity_set.contains(&(rule.name.as_str(), context.identity.as_deref()))
+                })
+                // A cancelled firing never re-admits: fact identity is
+                // admission identity (Decision 4), so the same (rule,
+                // identity) IS the cancelled firing, live match or not.
+                .filter(|context| {
+                    !cancelled_firings.contains(&(rule.name.clone(), context.identity.clone()))
+                })
+                .collect();
+            // Pinned firings (DR-0043 Decision 1): recorded contexts not
+            // already present via live matching re-enter lowering here. The
+            // recorded identity reproduces the admission identity, so every
+            // derived effect key is byte-identical to the original firing's.
+            for firing in &active_recorded {
+                if firing.rule != rule.name {
+                    continue;
+                }
+                // Dedup by (identity, admission): a live context with the
+                // same identity but a FRESH admitting event is a new firing
+                // (DR-0044 re-admission), not this recorded one.
+                if contexts.iter().any(|context| {
+                    context.identity == firing.context.identity
+                        && context.trigger_event_id == firing.context.trigger_event_id
+                }) {
+                    continue;
+                }
+                contexts.push(firing.context.clone());
+            }
+            groups.push(LoweringGroup {
+                ir,
+                rule_name: rule.name.clone(),
+                version_id: active_version_id.clone(),
+                epoch_key: active_revision_epoch_key.clone(),
+                contexts,
+            });
+        }
+        for firing in &old_recorded {
+            let Some(version_id) = firing.version_id.as_deref() else {
+                continue;
+            };
+            let Some(Some(old_ir)) = old_irs.get(version_id) else {
+                continue;
+            };
+            let epoch_key =
+                revision_branch_key(firing.epoch, bound_branch.as_deref(), restore_generation);
+            if let Some(group) = groups.iter_mut().find(|group| {
+                group.rule_name == firing.rule
+                    && group.version_id == version_id
+                    && group.epoch_key == epoch_key
+            }) {
+                if !group.contexts.iter().any(|context| {
+                    context.identity == firing.context.identity
+                        && context.trigger_event_id == firing.context.trigger_event_id
+                }) {
+                    group.contexts.push(firing.context.clone());
+                }
+            } else {
+                groups.push(LoweringGroup {
+                    ir: old_ir,
+                    rule_name: firing.rule.clone(),
+                    version_id: version_id.to_owned(),
+                    epoch_key,
+                    contexts: vec![firing.context.clone()],
+                });
+            }
+        }
+
+        'rules: for group in groups {
+            let ir = group.ir;
+            let Some(rule) = ir
+                .rules
+                .iter()
+                .find(|candidate| candidate.name == group.rule_name)
+            else {
+                continue;
+            };
+            for context in group.contexts {
+                let mut lowering = lower_rule_with_region(
                     instance_id,
-                    &active_version_id,
-                    &active_revision_epoch_key,
+                    &group.version_id,
+                    &group.epoch_key,
+                    kernel.coercion_config_fingerprint(),
                     ir,
                     rule,
                     &context,
+                    &facts,
                     &all_facts,
                     &effects,
                     source_path,
+                    &active_fact_ids,
                 );
+                // Consumption is idempotent under pinned re-lowering
+                // (DR-0043): a recorded firing re-lowers its own already-
+                // committed `done` (or races a sibling's); a fact no longer
+                // active is already consumed -- drop it BEFORE the emptiness
+                // check, so an otherwise-empty re-lowering commits nothing.
+                //
+                // And consumption is ADMISSION-scoped (DR-0044): a fact
+                // consumed and later re-recorded is live again under a fresh
+                // admitting event. The re-admission belongs to a NEW firing —
+                // a recorded firing re-lowering here must not consume it, so
+                // a bound fact whose CURRENT admission is not among this
+                // context's pinned admitting events is dropped too.
+                let bound_ids: std::collections::BTreeSet<&str> = context
+                    .bindings
+                    .iter()
+                    .map(|(_, fact)| fact.fact_id.as_str())
+                    .collect();
+                let admissions = context.trigger_event_id.as_deref();
+                lowering.consumed_fact_ids.retain(|fact_id| {
+                    if !active_fact_ids.contains(fact_id) {
+                        return false;
+                    }
+                    if !bound_ids.contains(fact_id.as_str()) {
+                        return true;
+                    }
+                    let Some(current) = facts
+                        .iter()
+                        .find(|fact| &fact.fact_id == fact_id)
+                        .map(|fact| fact.source_event_id.as_str())
+                        .filter(|event| !event.is_empty())
+                    else {
+                        return true;
+                    };
+                    match admissions {
+                        Some(trigger) => trigger.split('|').any(|event| event == current),
+                        None => true,
+                    }
+                });
+                // The fact-emission dual: a recorded firing's re-lowering
+                // re-derives the facts its commit already recorded
+                // (content-keyed, byte-identical ids). Suppress them so an
+                // untouched replay lowers to EMPTY and commits nothing — a
+                // since-consumed fact's revival belongs to a new firing.
+                if let Some(recorded) = recorded_firings.iter().find(|firing| {
+                    firing.rule == rule.name
+                        && firing.context.identity == context.identity
+                        && firing.context.trigger_event_id == context.trigger_event_id
+                }) {
+                    lowering
+                        .facts
+                        .retain(|fact| !recorded.fact_ids.contains(&fact.fact_id));
+                }
                 report
                     .branch_reports
                     .extend(lowering.branch_reports.iter().cloned());
@@ -145,7 +425,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     kernel.store().record_diagnostic(DiagnosticRecord {
                         instance_id: Some(instance_id),
                         program_id: None,
-                        program_version_id: Some(&active_version_id),
+                        program_version_id: Some(&group.version_id),
                         severity: Severity::Error,
                         code: Some("rule.lowering.unresolved"),
                         message: &message,
@@ -162,8 +442,8 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         correlation_id: context.identity.as_deref(),
                         idempotency_key: Some(&idempotency_key(&[
                             instance_id,
-                            &active_version_id,
-                            &active_revision_epoch_key,
+                            &group.version_id,
+                            &group.epoch_key,
                             &rule.name,
                             "lowering-error",
                             &lowering.errors.join("|"),
@@ -171,29 +451,73 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     })?;
                     return Err(StoreError::Conflict(message));
                 }
+                // Auto-fail (R1) in a `@service` workflow: the service can never
+                // auto-fail, so each unhandled effect failure the net observed is
+                // recorded as a durable diagnostic — idempotent per effect (the
+                // failure fact persists, so every later pass re-observes it) —
+                // and the service keeps running. Recording is not progress.
+                for unhandled in &lowering.unhandled_failures {
+                    // A `then`-chained effect carries a synthetic `__then_<name>`
+                    // handle; the diagnostic names the author's binding.
+                    let named = unhandled
+                        .binding
+                        .strip_prefix("__then_")
+                        .unwrap_or(&unhandled.binding);
+                    let message = format!(
+                        "unhandled failure of `{named}` in rule `{}` (effect {}): the \
+                         `@service` workflow keeps running; handle it with `after {named} \
+                         fails {{ … }}` or retry the effect",
+                        unhandled.rule, unhandled.status
+                    );
+                    kernel.store().record_diagnostic(DiagnosticRecord {
+                        instance_id: Some(instance_id),
+                        program_id: None,
+                        program_version_id: Some(&group.version_id),
+                        severity: Severity::Warning,
+                        code: Some("workflow.unhandled_failure"),
+                        message: &message,
+                        source_span_json: None,
+                        subject_type: Some("rule"),
+                        subject_id: Some(&unhandled.rule),
+                        event_id: None,
+                        effect_id: Some(&unhandled.effect_id),
+                        run_id: None,
+                        assertion_id: None,
+                        evidence_ids_json: "[]",
+                        artifact_ids_json: "[]",
+                        causation_id: context.trigger_event_id.as_deref(),
+                        correlation_id: context.identity.as_deref(),
+                        idempotency_key: Some(&idempotency_key(&[
+                            instance_id,
+                            "workflow.unhandled_failure",
+                            &unhandled.effect_id,
+                        ])),
+                    })?;
+                }
                 if lowering.facts.is_empty()
                     && lowering.consumed_fact_ids.is_empty()
                     && lowering.effects.is_empty()
                     && lowering.dependencies.is_empty()
+                    && lowering.cancels.is_empty()
                     && lowering.terminal.is_none()
                     && lowering.internal_fail.is_none()
                 {
                     continue;
                 }
-                // 503 auto-fail: an unhandled effect failure in a self-terminating
-                // flow routes to the generic kernel failed terminal (no typed
+                // Auto-fail (R1): an unhandled effect failure in a self-terminating
+                // workflow routes to the generic kernel failed terminal (no typed
                 // `failure` payload), distinct from the typed terminal commit path.
-                // The generated `flowfail` block carries nothing else, so handle it
-                // before the normal commit. fail_instance_internal transitions
+                // Set by the rule-level net in lower_rule, so handle it before
+                // the normal commit. fail_instance_internal transitions
                 // running -> failed; the loop then exits (status != running).
                 if let Some(reason) = lowering.internal_fail.clone() {
                     let fail_key = idempotency_key(&[
                         instance_id,
-                        &active_version_id,
-                        &active_revision_epoch_key,
+                        &group.version_id,
+                        &group.epoch_key,
                         &rule.name,
                         context.identity.as_deref().unwrap_or("started"),
-                        "flow-autofail",
+                        "rule-autofail",
                         &reason,
                     ]);
                     let event =
@@ -241,12 +565,36 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 let lowering_key = lowering_idempotency_key(&lowering);
                 let commit_key = idempotency_key(&[
                     instance_id,
-                    &active_version_id,
-                    &active_revision_epoch_key,
+                    &group.version_id,
+                    &group.epoch_key,
                     &rule.name,
                     context.identity.as_deref().unwrap_or("started"),
+                    // The ADMITTING event disambiguates re-admissions: a fact
+                    // consumed and later re-recorded with identical content
+                    // has the same content-keyed identity but a fresh
+                    // admission, and the rule must fire again rather than
+                    // collide with the first firing's commit. Replay-safe:
+                    // the pinned context records trigger_event_id, so
+                    // re-lowering a committed firing reproduces the same key.
+                    context.trigger_event_id.as_deref().unwrap_or("-"),
                     &lowering_key,
                 ]);
+                // Named cut points (experimentation surface): every
+                // declared `mark "<name>" after <site>` riding this rule is
+                // stamped IN the commit transaction — a durable commit can
+                // never exist without its cut coordinate. One event per
+                // firing, so a looping site marks each pass.
+                // DR-0043 slice 1: embed the firing's pinned context (identity
+                // + bound trigger values) in the commit record, making every
+                // firing self-contained for pinned re-lowering and the
+                // `whip progressions` view.
+                let context_record = context_record_json(&context);
+                let mark_names: Vec<&str> = ir
+                    .marks
+                    .iter()
+                    .filter(|mark| mark.site == rule.name)
+                    .map(|mark| mark.name.as_str())
+                    .collect();
                 let event = kernel.commit_rule_with_revision_guard(
                     RuleCommit {
                         instance_id,
@@ -258,6 +606,8 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         dependencies: &new_dependencies,
                         terminal,
                         idempotency_key: Some(&commit_key),
+                        marks: &mark_names,
+                        context_json: Some(&context_record),
                     },
                     RuleCommitRevisionGuard {
                         program_version_id: &active_version_id,
@@ -265,6 +615,25 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     },
                 );
                 let committed = event?;
+                // Cancels run on replays too: they are status-guarded no-ops
+                // once applied, and a crash between the original commit and
+                // its cancel application would otherwise lose the cancels
+                // forever (the replay used to `continue` before reaching
+                // them).
+                apply_rule_cancels(
+                    kernel,
+                    instance_id,
+                    &rule.name,
+                    &lowering.cancels,
+                    &committed.event_id,
+                )?;
+                let replayed = committed.sequence <= pass_head_sequence;
+                if replayed {
+                    // A byte-identical replay of an existing commit: durable
+                    // state unchanged, so it is not progress — counting it
+                    // would spin the step's fixpoint loop forever.
+                    continue;
+                }
                 report.committed_rules += 1;
                 report.facts_created += new_facts.len();
                 report.facts_consumed += consumed_fact_ids.len();
@@ -275,19 +644,396 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 if lowering.terminal.is_some() {
                     release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
                 }
-                apply_rule_cancels(
-                    kernel,
-                    instance_id,
-                    &rule.name,
-                    &lowering.cancels,
-                    &committed.event_id,
-                )?;
                 made_progress = true;
                 break 'rules;
             }
         }
     }
     Ok(report)
+}
+
+/// DR-0043 Decision 5: region-aware lowering. Chooses which pre-rendered body
+/// variant this firing lowers against — HOLDS (the canonical `rule.body`),
+/// REMOVED (post-lapse suppression is structural: region continuations
+/// simply do not exist), or LAPSED (region replaced by its arm) — and, on the
+/// first advancing evaluation under a broken condition, produces the LAPSE
+/// lowering: the arm's actions plus the durable `progression.region.lapsed`
+/// fact (carrying the pinned progress view) in ONE commit, plus cancellation
+/// of the region's unsettled effects. The condition is evaluated here, inside
+/// the same pass that commits — no check-then-act window.
+/// The lapse arm's progress view: the per-step SUCCESS values with the reserved
+/// `steps` status map merged in (DR-0043 Decision 6).
+///
+/// The durable fact stores the two halves separately (`got` and `steps`), so
+/// audit and `whip progressions` can read the statuses without unpacking a
+/// view. This rebuilds the author-facing shape from them, and it is the ONLY
+/// place that shape is defined — the pinned-replay path and the lapse
+/// transaction both go through here, so a re-lowered arm sees byte-identical
+/// bindings to the one that committed.
+fn progress_view_value(got: Option<Value>, steps: Option<Value>) -> Value {
+    let mut view = match got {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    view.insert(
+        "steps".to_owned(),
+        steps.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+    );
+    Value::Object(view)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_rule_with_region(
+    instance_id: &str,
+    version_id: &str,
+    epoch_key: &str,
+    coercion_fingerprint: &str,
+    ir: &IrProgram,
+    rule: &whipplescript_parser::IrRule,
+    context: &RuleContext,
+    active_facts: &[whipplescript_store::FactView],
+    all_facts: &[whipplescript_store::FactView],
+    effects: &[whipplescript_store::EffectView],
+    source_path: Option<&std::path::Path>,
+    active_fact_ids: &std::collections::BTreeSet<String>,
+) -> crate::lowering::OwnedLowering {
+    use crate::rule_lowering::{
+        effect_binding_value, eval_expr_value, guard_result, push_effect_binding, EvalScope,
+        GuardStatus,
+    };
+
+    let lower = |body_rule: &whipplescript_parser::IrRule, with: &RuleContext| {
+        lower_rule(
+            instance_id,
+            version_id,
+            epoch_key,
+            coercion_fingerprint,
+            ir,
+            body_rule,
+            with,
+            all_facts,
+            effects,
+            source_path,
+        )
+    };
+    let Some(region) = rule.metadata.region.as_ref() else {
+        return lower(rule, context);
+    };
+    let identity_key = context.identity.as_deref().unwrap_or("started");
+    let lapse_fact_id = idempotency_key(&[instance_id, &rule.name, identity_key, "region-lapse"]);
+
+    // Post-lapse: the region's continuations are structurally gone (REMOVED
+    // splice would drop the arm too, so the arm variant is the live body —
+    // its actions committed at lapse and re-lower idempotently, and any arm
+    // effect's own continuations keep progressing). The progress view is
+    // PINNED from the lapse fact, never rebuilt, so later effect settlements
+    // cannot drift it.
+    if let Some(lapse_fact) = all_facts.iter().find(|fact| fact.fact_id == lapse_fact_id) {
+        let mut swapped = rule.clone();
+        swapped.body = region.body_lapsed.clone();
+        let mut arm_context = context.clone();
+        if let Some(view) = &region.lapse_binding {
+            let payload = json_from_str(&lapse_fact.value_json);
+            let pinned =
+                progress_view_value(payload.get("got").cloned(), payload.get("steps").cloned());
+            push_effect_binding(&mut arm_context, view, &lapse_fact_id, pinned);
+        }
+        return lower(&swapped, &arm_context);
+    }
+
+    // Evaluate the condition against the CURRENT facts, in this pass.
+    let raw_holds = match whipplescript_parser::parse_expression(&region.condition) {
+        Ok(expr) => {
+            let (status, _, _) = guard_result(eval_expr_value(
+                &expr,
+                &EvalScope::rule(context, active_facts, effects, ir),
+            ));
+            status == GuardStatus::Matched
+        }
+        // The check layer validates the grammar; an unparseable condition at
+        // runtime is a kernel bug — fail toward reactivity (treat as broken)
+        // so it is loud, never a silent free pass.
+        Err(_) => region.until,
+    };
+    let holds = if region.until { !raw_holds } else { raw_holds };
+    if holds {
+        return lower(rule, context);
+    }
+
+    // Broken. Does the region still owe anything? Compare the HOLDS lowering
+    // with the REMOVED lowering: identical output means every region action
+    // already committed — the region is complete and the break is moot.
+    let normalize = |mut lowering: crate::lowering::OwnedLowering| {
+        lowering
+            .consumed_fact_ids
+            .retain(|fact_id| active_fact_ids.contains(fact_id));
+        (
+            {
+                let mut ids: Vec<String> = lowering
+                    .facts
+                    .iter()
+                    .map(|fact| fact.fact_id.clone())
+                    .collect();
+                ids.sort();
+                ids
+            },
+            {
+                let mut ids: Vec<String> = lowering
+                    .effects
+                    .iter()
+                    .map(|effect| effect.effect_id.clone())
+                    .collect();
+                ids.sort();
+                ids
+            },
+            {
+                let mut ids = lowering.consumed_fact_ids.clone();
+                ids.sort();
+                ids
+            },
+            lowering.terminal.is_some(),
+            lowering.internal_fail.clone(),
+        )
+    };
+    let lowering_holds = lower(rule, context);
+    let mut removed_rule = rule.clone();
+    removed_rule.body = region.body_removed.clone();
+    let lowering_removed = lower(&removed_rule, context);
+    // In-flight region effects count as open even when the residue diff is
+    // empty (a requested-but-unsettled step produces no NEW lowering, but the
+    // region still owes its settlement): the model's [lapse] is enabled the
+    // moment the condition breaks with the region open.
+    let region_in_flight = region.effects.iter().any(|region_effect| {
+        region_effect_id(
+            instance_id,
+            version_id,
+            epoch_key,
+            rule,
+            region_effect,
+            identity_key,
+        )
+        .and_then(|effect_id| effects.iter().find(|view| view.effect_id == effect_id))
+        .is_some_and(|view| {
+            !matches!(
+                view.status.as_str(),
+                "completed" | "failed" | "timed_out" | "cancelled"
+            )
+        })
+    });
+    if !region_in_flight && normalize(lowering_holds) == normalize(lowering_removed) {
+        // Region complete: proceed as if it never gated anything.
+        return lower(rule, context);
+    }
+
+    // LAPSE: pin the progress view now, commit the arm + the lapse fact
+    // atomically, and cancel the region's unsettled effects.
+    let mut got = serde_json::Map::new();
+    // DR-0043: the view reserves `steps` — `<view>.steps.<step>` is that
+    // step's outcome as a STRING, so an arm can branch on progress with no new
+    // machinery. A step's value field is present only when it SUCCEEDED (the
+    // field type has no inhabitant for a failure), which is exactly why the
+    // status map is needed: without it the arm cannot tell "failed" from
+    // "never ran".
+    let mut steps = serde_json::Map::new();
+    for region_effect in &region.effects {
+        // `then`-chained steps carry synthetic `__then_<name>` handles; the
+        // progress view exposes the AUTHOR's name.
+        let named = region_effect
+            .binding
+            .strip_prefix("__then_")
+            .unwrap_or(&region_effect.binding)
+            .to_owned();
+        let Some(effect_id) = region_effect_id(
+            instance_id,
+            version_id,
+            epoch_key,
+            rule,
+            region_effect,
+            identity_key,
+        ) else {
+            steps.insert(named, Value::String("not_requested".to_owned()));
+            continue;
+        };
+        if let Some(value) = effect_binding_value(all_facts, &effect_id, "succeeds") {
+            got.insert(named.clone(), value);
+        }
+        let status = match effects.iter().find(|view| view.effect_id == effect_id) {
+            None => "not_requested",
+            Some(view) => match view.status.as_str() {
+                "completed" | "failed" | "timed_out" | "cancelled" => view.status.as_str(),
+                // Unsettled at the moment of lapse: this transaction cancels it
+                // just below, so name that outcome rather than leaking a
+                // transient queued/running status into a pinned view.
+                _ => "cancelled_by_lapse",
+            },
+        };
+        steps.insert(named, Value::String(status.to_owned()));
+    }
+    let got = Value::Object(got);
+    let steps = Value::Object(steps);
+    let pinned = progress_view_value(Some(got.clone()), Some(steps.clone()));
+    let mut lapsed_rule = rule.clone();
+    lapsed_rule.body = region.body_lapsed.clone();
+    let mut arm_context = context.clone();
+    if let Some(view) = &region.lapse_binding {
+        push_effect_binding(&mut arm_context, view, &lapse_fact_id, pinned);
+    }
+    let mut lowering = lower(&lapsed_rule, &arm_context);
+    lowering.facts.push(crate::lowering::OwnedFact {
+        fact_id: lapse_fact_id,
+        name: "progression.region.lapsed".to_owned(),
+        key: format!("{}:{identity_key}", rule.name),
+        value_json: json!({
+            "rule": rule.name,
+            "condition": region.condition,
+            "until": region.until,
+            "got": got,
+            "steps": steps,
+        })
+        .to_string(),
+        schema_id: None,
+        provenance_class: "kernel".to_owned(),
+        correlation_id: context.identity.clone(),
+        source_span_json: None,
+    });
+    for region_effect in &region.effects {
+        let Some(effect_id) = region_effect_id(
+            instance_id,
+            version_id,
+            epoch_key,
+            rule,
+            region_effect,
+            identity_key,
+        ) else {
+            continue;
+        };
+        if let Some(view) = effects.iter().find(|view| view.effect_id == effect_id) {
+            if !matches!(
+                view.status.as_str(),
+                "completed" | "failed" | "timed_out" | "cancelled"
+            ) {
+                lowering.cancels.push(effect_id);
+            }
+        }
+    }
+    lowering
+}
+
+/// Recomputes a region effect's id exactly as the kernel's emission derives
+/// it: level-0 effects key on the node id; effects inside a level-1 `after`
+/// block key on that block's (binding, predicate) as well.
+fn region_effect_id(
+    instance_id: &str,
+    version_id: &str,
+    epoch_key: &str,
+    rule: &whipplescript_parser::IrRule,
+    region_effect: &whipplescript_parser::IrRegionEffect,
+    identity_key: &str,
+) -> Option<String> {
+    let node = rule
+        .metadata
+        .effects
+        .iter()
+        .find(|node| node.binding.as_deref() == Some(region_effect.binding.as_str()))?;
+    Some(match &region_effect.scope {
+        None => idempotency_key(&[
+            instance_id,
+            version_id,
+            epoch_key,
+            &rule.name,
+            &node.id,
+            identity_key,
+        ]),
+        Some((binding, predicate)) => idempotency_key(&[
+            instance_id,
+            version_id,
+            epoch_key,
+            &rule.name,
+            binding,
+            predicate,
+            &node.id,
+            identity_key,
+        ]),
+    })
+}
+
+/// A committed firing reconstructed from its `rule.committed` record
+/// (DR-0043): the rule it fired, its pinned context, and the program
+/// version + revision epoch it was ADMITTED under.
+struct RecordedFiring {
+    rule: String,
+    context: RuleContext,
+    version_id: Option<String>,
+    epoch: i64,
+    /// The fact ids this firing's commit already recorded: its re-lowering
+    /// re-emits them byte-for-byte (content-keyed), and they must be
+    /// suppressed — re-recording a since-consumed fact is a NEW firing's
+    /// act (DR-0044 re-admission), never a replay's.
+    fact_ids: Vec<String>,
+}
+
+/// Loads and compiles the rule bodies of an OLD program version for old-body
+/// completion (DR-0043 Decision 3). The source is content-addressed: version
+/// creation and every verified drive `put_content` it, so the blob id is the
+/// version's `source_hash`. A missing blob or a failed compile records ONE
+/// loud diagnostic (idempotent per version) and returns `None` -- the firing
+/// is skipped visibly, never lowered under the wrong body.
+fn load_version_ir<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    version_id: &str,
+) -> Result<Option<IrProgram>, StoreError> {
+    let unavailable = |kernel: &RuntimeKernel<S>, detail: &str| -> Result<(), StoreError> {
+        let message = format!(
+            "cannot complete progressions admitted under program version `{version_id}`: {detail}"
+        );
+        kernel.store().record_diagnostic(DiagnosticRecord {
+            instance_id: Some(instance_id),
+            program_id: None,
+            program_version_id: Some(version_id),
+            severity: Severity::Warning,
+            code: Some("progression.version_unavailable"),
+            message: &message,
+            source_span_json: None,
+            subject_type: Some("program_version"),
+            subject_id: Some(version_id),
+            event_id: None,
+            effect_id: None,
+            run_id: None,
+            assertion_id: None,
+            evidence_ids_json: "[]",
+            artifact_ids_json: "[]",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: Some(&idempotency_key(&[
+                instance_id,
+                "progression.version_unavailable",
+                version_id,
+            ])),
+        })?;
+        Ok(())
+    };
+    let Some(view) = kernel.store().get_program_version(version_id)? else {
+        unavailable(kernel, "the version record is missing")?;
+        return Ok(None);
+    };
+    let Some(source) = kernel.store().get_content(&view.source_hash)? else {
+        unavailable(
+            kernel,
+            "its source is not in the content store (the version was never driven \
+             since source pinning landed)",
+        )?;
+        return Ok(None);
+    };
+    let compiled =
+        whipplescript_parser::compile_program_with_root(&source, Some(&view.program_name));
+    match compiled.ir {
+        Some(ir) => Ok(Some(ir)),
+        None => {
+            unavailable(kernel, "its stored source no longer compiles")?;
+            Ok(None)
+        }
+    }
 }
 
 /// Holder-lifetime release on terminal (spec/coordination.md principle 3 +
@@ -352,6 +1098,20 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
             .iter()
             .map(|item| format!("{}:{}:", queue.name, item.id))
             .collect::<Vec<_>>();
+        // Retired generations (consumed rows) — needed below to revive a
+        // projection whose backing item is ready again with an UNCHANGED
+        // update generation (claim/release does not bump updated_at): the
+        // re-derive would collide with the retired predecessor's event key,
+        // which used to poison every subsequent step with a UNIQUE conflict.
+        let live_ids: std::collections::BTreeSet<&str> =
+            existing.iter().map(|fact| fact.fact_id.as_str()).collect();
+        let retired = kernel
+            .store()
+            .list_facts_including_consumed(instance_id)?
+            .into_iter()
+            .filter(|fact| fact.name == "tracker.issue.ready")
+            .filter(|fact| !live_ids.contains(fact.fact_id.as_str()))
+            .collect::<Vec<_>>();
         for item in &ready {
             let prefix = format!("{}:{}:", queue.name, item.id);
             if existing.iter().any(|fact| fact.key.starts_with(&prefix)) {
@@ -361,6 +1121,15 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
             // item re-projects as a fresh fact instead of colliding with
             // its retired predecessor.
             let key = format!("{prefix}{}", stable_hash_hex(&item.updated_at));
+            // Same generation, previously retired: revive the overlay row in
+            // place (no event — the exact mirror of retire_fact) instead of
+            // re-deriving under the identical event key.
+            if let Some(prior) = retired.iter().find(|fact| fact.key == key) {
+                kernel
+                    .store_mut()
+                    .revive_fact(instance_id, &prior.fact_id)?;
+                continue;
+            }
             let value_json = json!({
                 "queue": queue.name,
                 "id": item.id,
@@ -463,6 +1232,31 @@ pub fn apply_rule_cancels<S: RuntimeStore>(
                     });
             }
             Some("completed") | Some("failed") | Some("timed_out") | Some("cancelled") => {
+                // Crash-window heal for the cancelled case: the cancel's
+                // terminal committed but the effect.cancelled settling-fact
+                // derivation may have crashed before running (they are
+                // separate transactions). derive_fact is replay-tolerant, so
+                // this is a no-op when the fact already exists.
+                if status.as_deref() == Some("cancelled") {
+                    let value_json = serde_json::json!({
+                        "effect_id": effect_id,
+                        "status": "cancelled",
+                        "reason": "cancelled by rule",
+                    })
+                    .to_string();
+                    kernel.derive_fact(
+                        instance_id,
+                        "effect.cancelled",
+                        effect_id,
+                        &value_json,
+                        Some(causation_event_id),
+                        Some(&idempotency_key(&[
+                            instance_id,
+                            effect_id,
+                            "cancelled-fact",
+                        ])),
+                    )?;
+                }
                 // No-op with evidence: cancelling settled work is legal.
                 kernel.store().record_diagnostic(DiagnosticRecord {
                     instance_id: Some(instance_id),

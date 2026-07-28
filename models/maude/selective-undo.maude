@@ -1,0 +1,88 @@
+--- Selective-undo stranding check, per
+--- spec/versioned-workspace-research-note.md 7.3 and the untie-substrate
+--- readiness tracker Phase 0. undo <selection> constructs a proposal cut =
+--- current state minus the selected writes, never a mutation; the slicer
+--- checks the exclusion's DEPENDENCY CLOSURE: if a retained later edit read
+--- any undone write, the plan strands it -- the reader's inputs no longer
+--- exist in the proposed cut. Git's file-scoped revert manufactures the
+--- same state silently.
+---
+--- Two planners over one recorded history. The NAIVE planner is the path
+--- filter: any well-formed by-path selection becomes a proposal, reads
+--- never consulted. The CHECKED planner refuses when some edit OUTSIDE the
+--- selection read a write INSIDE it, and accepts otherwise -- in
+--- particular, a reader that is itself part of the selection strands
+--- nothing, so the check is closure-shaped, not read-shaped.
+mod WHIPPLESCRIPT-SELECTIVE-UNDO is
+  protecting BOOL .
+
+  sorts Ed ESet Path WAtom WSet RAtom RSet PlanKind Cfg .
+  subsort Ed < ESet .
+  subsort WAtom < WSet .
+  subsort RAtom < RSet .
+
+  ops e1 e2 e3 : -> Ed [ctor] .
+  ops p1 p2 : -> Path [ctor] .
+  ops naivePlan checkedPlan : -> PlanKind [ctor] .
+
+  op mtE : -> ESet [ctor] .
+  op _;_ : ESet ESet -> ESet [ctor assoc comm id: mtE] .
+  eq [eset-idem] : E:Ed ; E:Ed = E:Ed .
+  op eMember : Ed ESet -> Bool .
+  eq eMember(E:Ed, (E:Ed ; ES:ESet)) = true .
+  eq eMember(E:Ed, ES:ESet) = false [owise] .
+
+  op wrote : Ed Path -> WAtom [ctor] .   --- edit E wrote path P
+  op mtW : -> WSet [ctor] .
+  op _;_ : WSet WSet -> WSet [ctor assoc comm id: mtW] .
+
+  op readOf : Ed Ed -> RAtom [ctor] .    --- later edit E2 read E1's writes
+  op mtR : -> RSet [ctor] .
+  op _;_ : RSet RSet -> RSet [ctor assoc comm id: mtR] .
+
+  --- The file-scoped selection: every edit that wrote the path.
+  op selByPath : Path WSet -> ESet .
+  eq selByPath(P:Path, mtW) = mtE .
+  eq selByPath(P:Path, (wrote(E:Ed, P:Path) ; WS:WSet)) =
+    E:Ed ; selByPath(P:Path, WS:WSet) .
+  eq selByPath(P:Path, (wrote(E:Ed, Q:Path) ; WS:WSet)) =
+    selByPath(P:Path, WS:WSet) [owise] .
+
+  --- The stranding test: some recorded read crosses the selection boundary
+  --- outward -- the writer is selected for undo, the reader is retained.
+  op strands : ESet RSet -> Bool .
+  eq strands(ES:ESet, mtR) = false .
+  eq strands(ES:ESet, (readOf(E2:Ed, E1:Ed) ; RS:RSet)) =
+    (eMember(E1:Ed, ES:ESet) and not eMember(E2:Ed, ES:ESet))
+    or strands(ES:ESet, RS:RSet) .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op hist : WSet RSet -> Cfg [ctor] .        --- the recorded history
+  op undoReq : Path -> Cfg [ctor] .          --- a file-scoped undo request
+  op proposal : PlanKind Path -> Cfg [ctor] . --- an accepted undo plan
+  op rejected : Path -> Cfg [ctor] .         --- the honest refusal
+
+  var P : Path .
+  var WS : WSet .
+  var RS : RSet .
+
+  --- The naive path filter: accepts any by-path selection; dependency
+  --- edges are invisible to it. That blindness is the modeled hazard.
+  rl [naive-undo] :
+      undoReq(P) hist(WS, RS)
+      => proposal(naivePlan, P) hist(WS, RS) .
+
+  --- The dependency-closure planner: accept only a non-stranding
+  --- exclusion; a stranding one is refused, surfaced, never silently
+  --- narrowed or applied.
+  crl [checked-undo] :
+      undoReq(P) hist(WS, RS)
+      => proposal(checkedPlan, P) hist(WS, RS)
+      if strands(selByPath(P, WS), RS) = false .
+  crl [checked-reject] :
+      undoReq(P) hist(WS, RS)
+      => rejected(P) hist(WS, RS)
+      if strands(selByPath(P, WS), RS) = true .
+endm

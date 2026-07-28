@@ -1,0 +1,44 @@
+load ../tracker-lease.maude
+
+--- Coverage 1: a claim on an unleased issue is granted.
+search in TRACKER-LEASE :
+  { claim(1, 1, 100) now(50) }
+  =>! { lease(1, 1, 100) now(50) } .
+
+--- Coverage 2: an EXPIRED lease -- expiresAt 40 <= now 50 -- does not block a
+--- fresh claim by another actor.
+search in TRACKER-LEASE :
+  { claim(1, 2, 100) lease(1, 1, 40) now(50) }
+  =>* { lease(1, 2, 100) RESIDUAL:Cfg } .
+
+--- Coverage 3: the holder renews -- expiresAt extended from 100 to 200.
+search in TRACKER-LEASE :
+  { renewReq(1, 1, 200) lease(1, 1, 100) now(50) }
+  =>* { lease(1, 1, 200) RESIDUAL:Cfg } .
+
+--- Coverage 4 (terminal-release, across issues): a terminal for actor 1
+--- releases the leases it holds on issues 1 AND 2 at once.
+search in TRACKER-LEASE :
+  { terminal(1) lease(1, 1, 100) lease(2, 1, 100) now(50) }
+  =>! { released(1) now(50) } .
+
+--- Bite 1 (exclusivity): two claims on the SAME issue never both become
+--- active leases. This is the wrapped-state check -- with a bare soup the
+--- second grant would match a fragment and this would find a solution.
+search in TRACKER-LEASE :
+  { claim(1, 1, 100) claim(1, 2, 100) now(50) }
+  =>* { lease(1, 1, 100) lease(1, 2, 100) RESIDUAL:Cfg } .
+
+--- Bite 2 (holder-only renew): a NON-holder renew -- actor 9 on a lease held
+--- by actor 1 -- never extends the lease to the requested expiresAt 200.
+search in TRACKER-LEASE :
+  { renewReq(1, 9, 200) lease(1, 1, 100) now(50) }
+  =>* { lease(1, AA:Nat, 200) RESIDUAL:Cfg } .
+
+--- Bite 3 (terminal-release): no reachable state holds released(1) together
+--- with a lease still held by actor 1 -- the release is total and atomic.
+search in TRACKER-LEASE :
+  { terminal(1) lease(1, 1, 100) lease(2, 1, 100) lease(3, 2, 100) now(50) }
+  =>* { released(1) lease(II:Nat, 1, EE:Nat) RESIDUAL:Cfg } .
+
+quit .

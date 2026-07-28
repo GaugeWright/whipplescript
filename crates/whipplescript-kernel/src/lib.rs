@@ -1,24 +1,29 @@
 //! Deterministic runtime kernel scaffold.
 
+pub mod agent_profile;
 pub mod artifact_manifest;
-#[cfg(feature = "claude")]
-pub mod claude_agent_sdk;
-#[cfg(feature = "codex")]
-pub mod codex_app_server;
 pub mod coerce;
 pub mod coerce_native;
 pub mod context_assembly;
 pub mod effect_config;
 pub mod effect_handlers;
 pub mod exec_http;
+pub mod gov;
 pub mod harness;
 pub mod harness_loop;
 pub mod harness_model;
+pub mod host_facade;
+pub mod host_package;
+pub mod host_policy;
+pub mod host_protocol;
+pub mod ifc;
+pub mod ingress_pass;
 pub mod instance_machine;
 pub mod lowering;
+pub mod mcp;
 pub mod native_lifecycle;
 pub mod package_registry;
-pub mod pi_rpc;
+pub mod principal;
 pub mod provider;
 pub mod rule_lowering;
 pub mod rule_pass;
@@ -26,6 +31,7 @@ pub mod sansio;
 pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
+pub mod whip_shell;
 
 use artifact_manifest::{
     artifact_capture_failed_payload, provider_artifact_manifest, validate_artifact_manifest,
@@ -50,11 +56,11 @@ use whipplescript_parser::{
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
     EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
-    HumanAnswer, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact,
-    NewInboxItem, NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
-    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
-    RunStart, RuntimeStore, SkillEvidence, StoreError, StoreResult, StoredEvent,
-    TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
+    InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInstance,
+    NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation, ProgramVersionRecord,
+    RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard, RunStart, RuntimeStore,
+    SkillEvidence, StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord,
+    WorkflowInvocationView, WorkflowRevisionView,
 };
 // `SqliteStore` (the rusqlite store) is the default backend for
 // `RuntimeKernel` under the `native` feature and is used by tests; the kernel's
@@ -73,6 +79,9 @@ use whipplescript_store::SqliteStore;
 pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
     store: S,
     trace: Vec<TraceRecord>,
+    /// Folded into `schema.coerce` effect admission keys by the rule pass —
+    /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
+    coercion_config_fingerprint: String,
 }
 
 /// wasm / no-native form: no default backend (rusqlite `SqliteStore` is absent).
@@ -80,6 +89,9 @@ pub struct RuntimeKernel<S: RuntimeStore = SqliteStore> {
 pub struct RuntimeKernel<S: RuntimeStore> {
     store: S,
     trace: Vec<TraceRecord>,
+    /// Folded into `schema.coerce` effect admission keys by the rule pass —
+    /// see [`RuntimeKernel::with_coercion_config_fingerprint`].
+    coercion_config_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,24 +134,6 @@ pub struct CoerceExecution<'a> {
     pub model: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HumanAskExecution<'a> {
-    pub instance_id: &'a str,
-    pub effect_id: &'a str,
-    pub run_id: &'a str,
-    pub provider: &'a str,
-    pub worker_id: &'a str,
-    pub lease_id: &'a str,
-    pub lease_expires_at: &'a str,
-    pub inbox_item_id: &'a str,
-    pub prompt: &'a str,
-    pub choices_json: &'a str,
-    pub freeform_allowed: bool,
-    pub severity: &'a str,
-    pub related_effects_json: &'a str,
-    pub related_artifacts_json: &'a str,
-}
-
 #[derive(Debug, Default)]
 struct ProviderEvidence {
     evidence_id: Option<String>,
@@ -154,7 +148,22 @@ pub fn idempotency_key(parts: &[&str]) -> String {
         input.push_str(part);
         input.push(';');
     }
-    format!("key_{:016x}", stable_hash(&input))
+    // SHA-256 truncated to 128 bits: user- and external-controlled bytes
+    // (record payloads, ingress signal payloads, failure reasons) reach this
+    // hash, and the old 64-bit FNV-1a was offline-collidable — a crafted
+    // collision on a commit key permanently poisoned the instance with the
+    // loud-conflict guard, and on a content key silently aliased two facts.
+    // 128 bits puts a birthday search at 2^64. NOTE: changing this function
+    // changes every derived id — in-flight stores from before the swap should
+    // be retired, not resumed.
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(input.as_bytes());
+    let mut hex = String::with_capacity(36);
+    hex.push_str("key_");
+    for byte in &digest[..16] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// Identifies the effect a brokered turn settles. The owned harness runner uses
@@ -210,7 +219,6 @@ fn brokered_observation_evidence(
                 "status": match status {
                     ToolStatus::Ok => "ok",
                     ToolStatus::Error => "error",
-                    ToolStatus::Suspended => "suspended",
                 },
             }),
         ),
@@ -268,7 +276,25 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Self {
             store,
             trace: Vec::new(),
+            coercion_config_fingerprint: "fixture".to_owned(),
         }
+    }
+
+    /// Supply the coercion-config fingerprint the rule pass folds into
+    /// `schema.coerce` effect admission keys (DR-0014 amendment):
+    /// H(provider_kind, provider_id, backend, model) of the host's resolved
+    /// coercion config — native derives it from the resolved coerce config,
+    /// the durable object from `coerce_config_json`, and the fixture path
+    /// keeps the constructor's literal `"fixture"` so tests stay
+    /// deterministic. Switching backend/model re-runs future coercions
+    /// instead of replaying a stale terminal.
+    pub fn with_coercion_config_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.coercion_config_fingerprint = fingerprint.into();
+        self
+    }
+
+    pub fn coercion_config_fingerprint(&self) -> &str {
+        &self.coercion_config_fingerprint
     }
 
     /// Borrow the underlying store. The lifted rule pass holds one kernel across a
@@ -393,21 +419,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             }
         }
 
-        let (prior_steps, prior_usage) = self
-            .store
-            .list_evidence_for_subject("run", &run_id)?
-            .into_iter()
-            .filter(|evidence| evidence.kind == "human.ask")
-            .filter_map(|evidence| serde_json::from_str::<Value>(&evidence.metadata_json).ok())
-            .fold((0_usize, Value::Null), |(steps, usage), metadata| {
-                (
-                    steps + metadata.get("steps").and_then(Value::as_u64).unwrap_or(0) as usize,
-                    merge_numeric_json(
-                        usage,
-                        metadata.get("usage").cloned().unwrap_or(Value::Null),
-                    ),
-                )
-            });
+        // Human-ask resume accounting is retired: a brokered turn now only
+        // resumes from its own mid-turn transcript checkpoint, never from a
+        // suspended human round, so there is no prior step/usage to carry.
+        let prior_steps = 0_usize;
+        let prior_usage = Value::Null;
         let resume_input;
         let run_input: &crate::harness_loop::BrokeredTurnInput =
             if resume_from.is_empty() && prior_steps == 0 {
@@ -497,75 +513,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             })?;
         }
 
-        if outcome.status == TurnStatus::Suspended {
-            let ask = outcome.pending_human_ask.as_ref().ok_or_else(|| {
-                StoreError::Conflict("suspended brokered turn has no human ask".to_owned())
-            })?;
-            let inbox_item_id = idempotency_key(&[
-                ctx.instance_id,
-                ctx.effect_id,
-                &ask.call_id,
-                "brokered-human-ask",
-            ]);
-            let choices_json = serde_json::to_string(&ask.choices).map_err(StoreError::Json)?;
-            self.store.create_inbox_item(NewInboxItem {
-                inbox_item_id: &inbox_item_id,
-                instance_id: ctx.instance_id,
-                effect_id: Some(ctx.effect_id),
-                status: "pending",
-                prompt: &ask.question,
-                choices_json: &choices_json,
-                freeform_allowed: ask.freeform_allowed,
-                severity: "normal",
-                related_effects_json: &json!([ctx.effect_id]).to_string(),
-                related_artifacts_json: "[]",
-            })?;
-            self.store.record_evidence(EvidenceRecord {
-                instance_id: ctx.instance_id,
-                kind: "human.ask",
-                subject_type: "run",
-                subject_id: &run_id,
-                causation_id: Some(ctx.effect_id),
-                correlation_id: Some(&ask.call_id),
-                summary: Some("brokered turn awaiting human answer"),
-                metadata_json: &json!({
-                    "inbox_item_id": inbox_item_id,
-                    "call_id": ask.call_id,
-                    "question": ask.question,
-                    "choices": ask.choices,
-                    "freeform_allowed": ask.freeform_allowed,
-                    "steps": outcome.steps,
-                    "usage": outcome.usage,
-                })
-                .to_string(),
-            })?;
-            let payload = json!({
-                "effect_id": ctx.effect_id,
-                "run_id": run_id,
-                "inbox_item_id": inbox_item_id,
-                "call_id": ask.call_id,
-                "question": ask.question,
-                "choices": ask.choices,
-                "freeform_allowed": ask.freeform_allowed,
-                "status": "awaiting_human",
-            })
-            .to_string();
-            return self.store.append_event(NewEvent {
-                instance_id: ctx.instance_id,
-                event_type: "agent.turn.awaiting_human",
-                payload_json: &payload,
-                source: "kernel",
-                causation_id: Some(&run_id),
-                correlation_id: Some(ctx.effect_id),
-                idempotency_key: Some(&idempotency_key(&[
-                    ctx.instance_id,
-                    ctx.effect_id,
-                    &ask.call_id,
-                    "awaiting-human",
-                ])),
-            });
-        }
-
         let terminal_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "terminal"]);
         let total_steps = prior_steps + outcome.steps;
         let total_usage = merge_numeric_json(prior_usage, outcome.usage.clone());
@@ -581,7 +528,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Failed => ("failed", "agent.turn.failed"),
             TurnStatus::TimedOut => ("timed_out", "agent.turn.timed_out"),
             TurnStatus::Cancelled => ("cancelled", "agent.turn.cancelled"),
-            TurnStatus::Suspended => unreachable!("handled above"),
         };
 
         let completion = EffectCompletion {
@@ -605,7 +551,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             TurnStatus::Failed => self.fail_run(completion)?,
             TurnStatus::TimedOut => self.timeout_run(completion)?,
             TurnStatus::Cancelled => self.cancel_run(completion)?,
-            TurnStatus::Suspended => unreachable!("handled above"),
         };
 
         // The single terminal fact (layer 3) -- the only fact a brokered turn
@@ -614,15 +559,37 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         // effect, provenance `effect`) so `after <turn> succeeds` /
         // `when <agent> completed turn` resolve identically. Mirrors
         // append_agent_turn_event_and_fact.
-        let fact_payload = json!({
+        let mut fact_payload_value = json!({
+            "id": run_id,
             "effect_id": ctx.effect_id,
             "run_id": run_id,
             "agent": ctx.agent,
             "provider": "owned-harness",
             "status": status,
             "summary": outcome.summary,
-        })
-        .to_string();
+        });
+        // DR-0032 parity with append_agent_turn_event_and_fact: a failed turn
+        // carries the EffectError base under `value` (what `after turn fails
+        // as f` binds — the checker approves f.reason/f.kind against it).
+        if matches!(outcome.status, TurnStatus::Failed | TurnStatus::TimedOut) {
+            if let Some(object) = fact_payload_value.as_object_mut() {
+                let mut base = effect_failure_base(
+                    "agent.tell",
+                    &outcome.summary,
+                    &outcome.summary,
+                    ctx.effect_id,
+                    &run_id,
+                );
+                if let Some(base_object) = base.as_object_mut() {
+                    base_object.insert(
+                        "error_class".to_owned(),
+                        Value::String("provider_error".to_owned()),
+                    );
+                }
+                object.insert("value".to_owned(), base);
+            }
+        }
+        let fact_payload = fact_payload_value.to_string();
         let fact_id = idempotency_key(&[ctx.instance_id, "agent-turn", &run_id]);
         let fact_event_key = idempotency_key(&[ctx.instance_id, &run_id, "agent-turn-fact"]);
         self.store.append_event(NewEvent {
@@ -656,130 +623,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })?;
 
         Ok(terminal)
-    }
-
-    /// Admit an attributable answer to a brokered `ask_human` tool call and
-    /// append the correlated tool result to the durable transcript. The owning
-    /// host authenticates `answered_by`; the runtime validates the pending ask,
-    /// permitted answer shape, instance/effect/call correlation, and idempotency.
-    #[allow(clippy::too_many_arguments)]
-    pub fn answer_brokered_human_ask(
-        &mut self,
-        instance_id: &str,
-        effect_id: &str,
-        inbox_item_id: &str,
-        call_id: &str,
-        answer: &str,
-        answered_by: &str,
-        idempotency_key: &str,
-    ) -> StoreResult<StoredEvent> {
-        let item = self
-            .store
-            .get_inbox_item(inbox_item_id)?
-            .ok_or_else(|| StoreError::Conflict("human ask was not found".to_owned()))?;
-        if item.instance_id != instance_id || item.effect_id.as_deref() != Some(effect_id) {
-            return Err(StoreError::Conflict(
-                "human answer does not match the pending instance/effect".to_owned(),
-            ));
-        }
-        let answer = answer.trim();
-        if answer.is_empty() {
-            return Err(StoreError::Conflict(
-                "human answer must not be empty".to_owned(),
-            ));
-        }
-        let choices: Vec<String> = serde_json::from_str(&item.choices_json)?;
-        if !item.freeform_allowed && !choices.iter().any(|choice| choice == answer) {
-            return Err(StoreError::Conflict(
-                "human answer must select one of the admitted choices".to_owned(),
-            ));
-        }
-        let answer_json = json!({
-            "text": answer,
-            "respondent_ref": answered_by,
-        })
-        .to_string();
-        match item.status.as_str() {
-            "pending" => {
-                self.store.answer_inbox_item(HumanAnswer {
-                    inbox_item_id,
-                    answer_json: &answer_json,
-                    answered_by,
-                    idempotency_key: Some(idempotency_key),
-                })?;
-            }
-            "answered"
-                if item.answer_json.as_deref() == Some(answer_json.as_str())
-                    && item.answered_by.as_deref() == Some(answered_by) => {}
-            "answered" => {
-                return Err(StoreError::Conflict(
-                    "human ask was already answered differently".to_owned(),
-                ));
-            }
-            _ => {
-                return Err(StoreError::Conflict(
-                    "human ask is no longer answerable".to_owned(),
-                ));
-            }
-        }
-
-        let mut transcript = self.load_brokered_transcript(instance_id, effect_id);
-        let already_correlated = matches!(
-            transcript.last(),
-            Some(crate::harness_loop::ChatMessage::ToolResults(results))
-                if results.iter().any(|result| result.tool_call_id == call_id)
-        );
-        if !already_correlated {
-            let valid_call = matches!(
-                transcript.last(),
-                Some(crate::harness_loop::ChatMessage::Assistant { tool_calls, .. })
-                    if tool_calls.iter().any(|call| call.id == call_id && call.name == "ask_human")
-            );
-            if !valid_call {
-                return Err(StoreError::Conflict(
-                    "human answer does not match the suspended tool call".to_owned(),
-                ));
-            }
-            transcript.push(crate::harness_loop::ChatMessage::ToolResults(vec![
-                crate::harness_loop::ToolResultMsg {
-                    tool_call_id: call_id.to_owned(),
-                    tool_name: "ask_human".to_owned(),
-                    content: answer_json.clone(),
-                    is_error: false,
-                },
-            ]));
-            let checkpoint_payload = json!({
-                "effect_id": effect_id,
-                "messages": crate::harness_loop::chat_messages_to_json(&transcript),
-            })
-            .to_string();
-            self.store.append_event(NewEvent {
-                instance_id,
-                event_type: "agent.turn.brokered.transcript",
-                payload_json: &checkpoint_payload,
-                source: "kernel",
-                causation_id: Some(inbox_item_id),
-                correlation_id: Some(effect_id),
-                idempotency_key: Some(&format!("{idempotency_key}:transcript")),
-            })?;
-        }
-        let payload = json!({
-            "effect_id": effect_id,
-            "inbox_item_id": inbox_item_id,
-            "call_id": call_id,
-            "respondent_ref": answered_by,
-            "status": "answered",
-        })
-        .to_string();
-        self.store.append_event(NewEvent {
-            instance_id,
-            event_type: "agent.turn.human_answered",
-            payload_json: &payload,
-            source: "kernel",
-            causation_id: Some(inbox_item_id),
-            correlation_id: Some(effect_id),
-            idempotency_key: Some(&format!("{idempotency_key}:resumed")),
-        })
     }
 
     /// The agent's conversation thread: the final transcript of its latest
@@ -1379,6 +1222,34 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let event = self
             .store
             .resolve_effect_uncertain(completion, diagnostic)?;
+        // Uncertain resolution SETTLES the effect as failed, and settled
+        // outcomes are facts: without one, a workflow handling
+        // `after x fails` (which suppresses the auto-fail net) had nothing to
+        // match after `whip recover` and idled forever.
+        let value_json = json!({
+            "effect_id": completion.effect_id,
+            "run_id": completion.run_id,
+            "status": "failed",
+            "summary": completion.summary,
+            "value": {
+                "reason": completion.summary,
+                "summary": completion.summary,
+                "error_class": "uncertain",
+            },
+        })
+        .to_string();
+        self.derive_fact(
+            completion.instance_id,
+            "effect.failed",
+            completion.effect_id,
+            &value_json,
+            Some(&event.event_id),
+            Some(&idempotency_key(&[
+                completion.instance_id,
+                completion.effect_id,
+                "uncertain-failed-fact",
+            ])),
+        )?;
         self.emit(TraceEvent::EffectTerminal {
             run_id: completion.run_id.to_owned(),
             effect_id: completion.effect_id.to_owned(),
@@ -1397,6 +1268,33 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ..completion
         };
         let event = self.store.complete_effect(completion)?;
+        // A cancelled RUN settles its effect, and settled outcomes are facts
+        // (the same invariant as cancel_effect): without this, the orphaned-run
+        // cancellation acknowledgement left `after x cancelled`/`completes`
+        // arms with nothing to match — and cancelled is auto-fail-exempt, so
+        // the instance idled forever. Kind-specific cancel facts (e.g.
+        // `agent.turn.cancelled`) may coexist; arm bindings prefer them by
+        // fact-name order.
+        let value_json = json!({
+            "effect_id": completion.effect_id,
+            "run_id": completion.run_id,
+            "status": "cancelled",
+            "reason": completion.summary,
+            "summary": completion.summary,
+        })
+        .to_string();
+        self.derive_fact(
+            completion.instance_id,
+            "effect.cancelled",
+            completion.effect_id,
+            &value_json,
+            Some(&event.event_id),
+            Some(&idempotency_key(&[
+                completion.instance_id,
+                completion.effect_id,
+                "cancelled-fact",
+            ])),
+        )?;
         self.emit(TraceEvent::EffectTerminal {
             run_id: completion.run_id.to_owned(),
             effect_id: completion.effect_id.to_owned(),
@@ -1430,6 +1328,29 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         cancellation: EffectCancellation<'_>,
     ) -> StoreResult<StoredEvent> {
         let event = self.store.cancel_effect(cancellation)?;
+        // A cancellation SETTLES the effect, and settled outcomes are facts:
+        // without this, `after x completes` / `after x cancelled` arms had
+        // nothing to match when a sibling arm (or the operator) cancelled the
+        // effect — the arm never fired and the instance idled forever.
+        let value_json = json!({
+            "effect_id": cancellation.effect_id,
+            "status": "cancelled",
+            "reason": cancellation.reason,
+            "summary": cancellation.reason,
+        })
+        .to_string();
+        self.derive_fact(
+            cancellation.instance_id,
+            "effect.cancelled",
+            cancellation.effect_id,
+            &value_json,
+            Some(&event.event_id),
+            Some(&idempotency_key(&[
+                cancellation.instance_id,
+                cancellation.effect_id,
+                "cancelled-fact",
+            ])),
+        )?;
         self.emit(TraceEvent::EffectCancelled {
             effect_id: cancellation.effect_id.to_owned(),
         });
@@ -1479,21 +1400,18 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             reason,
             idempotency_key,
         })?;
-        // A cancelled instance has reached a terminal: its pending human asks
-        // are moot, so retire them rather than leaving them answerable for a
-        // dead instance (holder-lifetime cleanup, mirrors lease/claim release).
-        self.store.cancel_pending_inbox_for_instance(instance_id)?;
         self.emit(TraceEvent::InstanceCancelled);
         Ok(event)
     }
 
-    /// Generic internal workflow failure (spec/implementation-plan.md flow
-    /// auto-fail): transitions the instance to `failed` with a plain reason and no
-    /// typed `failure` payload — used when an unhandled effect failure in a
-    /// self-terminating flow would otherwise stall the instance forever. Distinct
-    /// from an author `fail error { … }` (which produces the declared failure
-    /// type); this is a runtime/system failure the author did not handle. Mirrors
-    /// `cancel_instance`'s terminal cleanup (pending human asks are retired).
+    /// Generic internal workflow failure (auto-fail, R1 —
+    /// models/maude/rule-autofail.maude): transitions the instance to `failed`
+    /// with a plain reason and no typed `failure` payload — used when an
+    /// unhandled effect failure in a self-terminating workflow would otherwise
+    /// stall the instance forever. Distinct from an author `fail error { … }`
+    /// (which produces the declared failure type); this is a runtime/system
+    /// failure the author did not handle. Mirrors `cancel_instance`'s terminal
+    /// cleanup (pending human asks are retired).
     pub fn fail_instance_internal(
         &mut self,
         instance_id: &str,
@@ -1506,9 +1424,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             reason: Some(reason),
             idempotency_key,
         })?;
-        // A failed instance has reached a terminal: retire its pending human asks
-        // (holder-lifetime cleanup, mirrors cancel/lease/claim release).
-        self.store.cancel_pending_inbox_for_instance(instance_id)?;
         self.emit(TraceEvent::InstanceFailed);
         Ok(event)
     }
@@ -1690,6 +1605,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ProviderRunStatus::TimedOut => {
                 self.timeout_run_with_diagnostic(completion, diagnostic)?
             }
+            // A deliberate cancel is not a failure: no terminal diagnostic,
+            // and cancel_run derives the effect.cancelled settling fact.
+            ProviderRunStatus::Cancelled => self.cancel_run(completion)?,
         };
         self.append_agent_turn_event_and_fact(execution, result)?;
         Ok(event)
@@ -2112,6 +2030,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             ProviderRunStatus::TimedOut => {
                 self.timeout_run_with_diagnostic(completion, diagnostic)?
             }
+            // A deliberate cancel is not a failure: no terminal diagnostic,
+            // and cancel_run derives the effect.cancelled settling fact.
+            ProviderRunStatus::Cancelled => self.cancel_run(completion)?,
         };
         self.append_agent_turn_event_and_fact(execution, &result)?;
         Ok(Some(event))
@@ -2311,134 +2232,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(event)
     }
 
-    pub fn run_human_ask(&mut self, execution: HumanAskExecution<'_>) -> StoreResult<StoredEvent> {
-        self.start_run(RunStart {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            lease_id: execution.lease_id,
-            lease_expires_at: execution.lease_expires_at,
-            metadata_json: "{}",
-        })?;
-        self.store.create_inbox_item(NewInboxItem {
-            inbox_item_id: execution.inbox_item_id,
-            instance_id: execution.instance_id,
-            effect_id: Some(execution.effect_id),
-            status: "pending",
-            prompt: execution.prompt,
-            choices_json: execution.choices_json,
-            freeform_allowed: execution.freeform_allowed,
-            severity: execution.severity,
-            related_effects_json: execution.related_effects_json,
-            related_artifacts_json: execution.related_artifacts_json,
-        })?;
-        self.record_human_ask(execution)?;
-        let metadata_json = json!({
-            "inbox_item_id": execution.inbox_item_id,
-            "severity": execution.severity,
-            "choices": json_from_str(execution.choices_json),
-            "freeform_allowed": execution.freeform_allowed,
-        })
-        .to_string();
-        let completion = EffectCompletion {
-            instance_id: execution.instance_id,
-            effect_id: execution.effect_id,
-            run_id: execution.run_id,
-            provider: execution.provider,
-            worker_id: execution.worker_id,
-            status: "completed",
-            exit_code: Some(0),
-            summary: Some("human review requested"),
-            metadata_json: &metadata_json,
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "human-ask-terminal",
-            ])),
-        };
-        let event = self.complete_run(completion)?;
-        self.append_human_ask_fact(execution)?;
-        Ok(event)
-    }
-
-    fn record_human_ask(&self, execution: HumanAskExecution<'_>) -> StoreResult<()> {
-        let metadata = json!({
-            "effect_id": execution.effect_id,
-            "inbox_item_id": execution.inbox_item_id,
-            "prompt": execution.prompt,
-            "choices": json_from_str(execution.choices_json),
-            "freeform_allowed": execution.freeform_allowed,
-            "severity": execution.severity,
-            "related_effects": json_from_str(execution.related_effects_json),
-            "related_artifacts": json_from_str(execution.related_artifacts_json),
-        })
-        .to_string();
-        self.store.record_evidence(EvidenceRecord {
-            instance_id: execution.instance_id,
-            kind: "human.ask.provider",
-            subject_type: "run",
-            subject_id: execution.run_id,
-            causation_id: Some(execution.effect_id),
-            correlation_id: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "human-ask-provider",
-            ])),
-            summary: Some("human review requested"),
-            metadata_json: &metadata,
-        })?;
-        Ok(())
-    }
-
-    fn append_human_ask_fact(&mut self, execution: HumanAskExecution<'_>) -> StoreResult<()> {
-        let value = json!({
-            "effect_id": execution.effect_id,
-            "run_id": execution.run_id,
-            "inbox_item_id": execution.inbox_item_id,
-            "prompt": execution.prompt,
-            "choices": json_from_str(execution.choices_json),
-            "freeform_allowed": execution.freeform_allowed,
-            "severity": execution.severity,
-            "status": "pending",
-        })
-        .to_string();
-        self.store.append_event(NewEvent {
-            instance_id: execution.instance_id,
-            event_type: "human.ask.created",
-            payload_json: &value,
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            correlation_id: Some(execution.effect_id),
-            idempotency_key: Some(&idempotency_key(&[
-                execution.instance_id,
-                execution.run_id,
-                "human-ask-event",
-            ])),
-        })?;
-        let fact_id = idempotency_key(&[execution.instance_id, "human.ask", execution.run_id]);
-        let fact_key =
-            idempotency_key(&[execution.instance_id, execution.run_id, "human-ask-fact"]);
-        self.store.derive_fact(DerivedFact {
-            instance_id: execution.instance_id,
-            fact: NewFact {
-                fact_id: &fact_id,
-                name: "human.ask.created",
-                key: execution.inbox_item_id,
-                value_json: &value,
-                schema_id: Some("HumanAsk"),
-                provenance_class: "effect",
-                correlation_id: Some(execution.effect_id),
-                source_span_json: None,
-            },
-            source: "kernel",
-            causation_id: Some(execution.run_id),
-            idempotency_key: Some(&fact_key),
-        })?;
-        Ok(())
-    }
-
     fn record_coerce_result(
         &self,
         execution: CoerceExecution<'_>,
@@ -2501,13 +2294,38 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             // `error_json` is confidential model output. The base `reason` must be
             // the already-redacted summary, NOT the raw-error-derived text — echoing
             // the provider error here would leak it into the persisted fact value.
-            Some(effect_failure_base(
-                "schema.coerce",
-                &summary,
-                &summary,
-                execution.effect_id,
-                execution.run_id,
-            ))
+            // P3 per-kind extras: `error_class` (a coarse classification) and
+            // `http_status` (a number) are redaction-safe and ride the bound value.
+            Some({
+                let mut base = effect_failure_base(
+                    "schema.coerce",
+                    &summary,
+                    &summary,
+                    execution.effect_id,
+                    execution.run_id,
+                );
+                let error = result
+                    .error_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .unwrap_or(Value::Null);
+                if let Some(object) = base.as_object_mut() {
+                    object.insert(
+                        "error_class".to_owned(),
+                        Value::String(
+                            error
+                                .get("error_class")
+                                .and_then(Value::as_str)
+                                .unwrap_or("provider_error")
+                                .to_owned(),
+                        ),
+                    );
+                    if let Some(status) = error.get("http_status").and_then(Value::as_u64) {
+                        object.insert("http_status".to_owned(), Value::from(status));
+                    }
+                }
+                base
+            })
         };
         let value = json!({
             "effect_id": execution.effect_id,
@@ -2875,6 +2693,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let fact_name = format!("agent.turn.{status}");
         let summary = redacted_provider_summary(&result.summary);
         let mut payload_value = json!({
+            "id": execution.run_id,
             "effect_id": execution.effect_id,
             "run_id": execution.run_id,
             "agent": execution.agent,
@@ -2891,16 +2710,23 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         if let Some(failure) = result.failure.as_ref() {
             let reason = provider_failure_summary_message(&failure.message);
             if let Some(object) = payload_value.as_object_mut() {
-                object.insert(
-                    "value".to_owned(),
-                    effect_failure_base(
-                        "agent.tell",
-                        &reason,
-                        &summary,
-                        execution.effect_id,
-                        execution.run_id,
-                    ),
+                // P3 per-kind extras: the provider failure's `error_kind` is a
+                // coarse classification (redaction-safe), exposed as
+                // `error_class` on the bound value.
+                let mut base = effect_failure_base(
+                    "agent.tell",
+                    &reason,
+                    &summary,
+                    execution.effect_id,
+                    execution.run_id,
                 );
+                if let Some(base_object) = base.as_object_mut() {
+                    base_object.insert(
+                        "error_class".to_owned(),
+                        Value::String(failure.error_kind.clone()),
+                    );
+                }
+                object.insert("value".to_owned(), base);
             }
         }
         let payload = payload_value.to_string();
@@ -2973,7 +2799,8 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             summary: Some(&evidence_summary),
             metadata_json: &evidence_metadata,
         })?;
-        let payload = json!({
+        let mut payload_value = json!({
+            "id": execution.run_id,
             "effect_id": execution.effect_id,
             "run_id": execution.run_id,
             "agent": execution.agent,
@@ -2985,8 +2812,55 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             "provider_turn_id": observation.provider_turn_id,
             "provider_payload_shape": observation.provider_payload_shape,
             "evidence_id": evidence_id,
-        })
-        .to_string();
+        });
+        // Contract parity with the delegated-path terminal fact: the binding
+        // contracts promise `summary` on every terminal and the EffectError
+        // base under `value` on failures (`after turn fails as f` reads
+        // f.reason / f.error_class) — this native fact used to carry neither,
+        // so those checker-approved reads were null at runtime.
+        if observation.terminal {
+            let summary = match &observation.provider_error {
+                Some(detail) => format!(
+                    "{} native provider event from {}: {detail}",
+                    observation.kind.status(),
+                    observation.provider_event_type
+                ),
+                None => format!(
+                    "{} native provider event from {}",
+                    observation.kind.status(),
+                    observation.provider_event_type
+                ),
+            };
+            if let Some(object) = payload_value.as_object_mut() {
+                object.insert("summary".to_owned(), Value::String(summary.clone()));
+                let status = observation.kind.status();
+                if matches!(status, "failed" | "timed_out") {
+                    let reason = observation.provider_error.as_deref().unwrap_or(&summary);
+                    let mut base = effect_failure_base(
+                        "agent.tell",
+                        reason,
+                        &summary,
+                        execution.effect_id,
+                        execution.run_id,
+                    );
+                    if let Some(base_object) = base.as_object_mut() {
+                        base_object.insert(
+                            "error_class".to_owned(),
+                            Value::String(
+                                if status == "timed_out" {
+                                    "timeout"
+                                } else {
+                                    "provider_error"
+                                }
+                                .to_owned(),
+                            ),
+                        );
+                    }
+                    object.insert("value".to_owned(), base);
+                }
+            }
+        }
+        let payload = payload_value.to_string();
         let event = self.store.append_event(NewEvent {
             instance_id: execution.instance_id,
             event_type,
@@ -3583,17 +3457,18 @@ fn dependency_edge(dependency: &NewEffectDependency<'_>) -> DependencyEdge {
     }
 }
 
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn stable_hash_hex(value: &str) -> String {
-    format!("{:016x}", stable_hash(value))
+    // Collision-resistant (see idempotency_key): these hex digests cover
+    // user-reachable content (terminal payload hashes) that feeds key
+    // derivation, so an offline-collidable inner hash would undermine the
+    // outer one.
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 fn redacted_text_metadata(value: &str) -> Value {
@@ -3767,6 +3642,7 @@ fn provider_status(status: &ProviderRunStatus) -> &'static str {
         ProviderRunStatus::Completed => "completed",
         ProviderRunStatus::Failed => "failed",
         ProviderRunStatus::TimedOut => "timed_out",
+        ProviderRunStatus::Cancelled => "cancelled",
     }
 }
 
@@ -4045,6 +3921,7 @@ fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {
         ProviderRunStatus::Completed => EffectStatus::Completed,
         ProviderRunStatus::Failed => EffectStatus::Failed,
         ProviderRunStatus::TimedOut => EffectStatus::TimedOut,
+        ProviderRunStatus::Cancelled => EffectStatus::Cancelled,
     }
 }
 
@@ -4301,14 +4178,11 @@ pub fn kernel_stage() -> &'static str {
 mod tests {
     use super::*;
     use coerce::{CoerceRequest, FakeCoerceClient};
-    use harness::{
-        ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness,
-        PiStyleAgentHarness,
-    };
-    use native_lifecycle::{normalize_pi_rpc_event, AgentTurnLifecycleKind};
+    use harness::{ClaudeCodeAgentHarness, CodexAgentHarness, CommandLaunchPlan, MockAgentHarness};
+    use native_lifecycle::AgentTurnLifecycleKind;
     use provider::{
-        builtin_provider_capabilities, AdapterSurface, CancellationDepth,
-        NativeProviderBoundaryError, NativeProviderCancellation, ProviderCapability, ProviderKind,
+        builtin_provider_capabilities, CancellationDepth, NativeProviderBoundaryError,
+        NativeProviderCancellation, ProviderCapability,
     };
     use std::{fs, path::PathBuf, process::Command};
     use trace::check_trace;
@@ -4398,7 +4272,7 @@ workflow Root {
                 .get("hash")
                 .and_then(Value::as_str)
                 .expect("hash is a string");
-            assert_eq!(hash.len(), 16);
+            assert_eq!(hash.len(), 32);
             assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
             assert_ne!(entry.get("missing").and_then(Value::as_bool), Some(true));
         }
@@ -4436,9 +4310,9 @@ workflow Root {
                 .to_owned()
         };
 
-        // Include-free closure: deterministic 16-hex fingerprint.
+        // Include-free closure: deterministic 32-hex fingerprint.
         let empty = bundle_hash(&base);
-        assert_eq!(empty.len(), 16);
+        assert_eq!(empty.len(), 32);
         assert!(empty.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(empty, bundle_hash(&base), "same closure -> same hash");
 
@@ -4913,6 +4787,8 @@ rule start
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -5024,6 +4900,8 @@ rule start
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -5147,6 +5025,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -5181,6 +5061,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -5295,12 +5177,14 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
         let capability = provider::ProviderCapability {
-            provider_kind: provider::ProviderKind::Fixture,
-            surface: provider::AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             protocol_version: Some("fixture.v1".to_owned()),
             session_identity_fields: vec!["session".to_owned()],
             stream_event_kinds: vec!["fixture.turn.started".to_owned()],
@@ -5369,8 +5253,8 @@ rule wait
 
         let request = NativeProviderTurnRequest {
             provider_id: "native-fixture".to_owned(),
-            provider_kind: provider::ProviderKind::Fixture,
-            surface: provider::AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -5507,6 +5391,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -5568,6 +5454,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -5686,6 +5574,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -5708,9 +5598,10 @@ rule wait
             .expect("instance cancels");
 
         assert_eq!(cancelled_effect.sequence, 2);
-        assert_eq!(paused.sequence, 3);
-        assert_eq!(resumed.sequence, 4);
-        assert_eq!(cancelled_instance.sequence, 5);
+        // cancel_effect also derives the effect.cancelled settling fact at sequence 3
+        assert_eq!(paused.sequence, 4);
+        assert_eq!(resumed.sequence, 5);
+        assert_eq!(cancelled_instance.sequence, 6);
         check_trace(kernel.trace()).expect("kernel trace conforms");
     }
 
@@ -5785,6 +5676,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -5862,6 +5755,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -6026,15 +5921,18 @@ rule wait
         let instance_id = kernel
             .create_instance(&version, "{}")
             .expect("instance creates");
-        let observation = normalize_pi_rpc_event(&json!({
-            "type": "turn_end",
-            "message": {
-                "role": "assistant",
-                "stopReason": "aborted",
-                "content": [{"type": "text", "text": "secret"}],
-            },
-        }))
-        .expect("Pi event normalizes");
+        // Provider-agnostic: build the observation via the kernel's own
+        // shape-only `fixture` constructor rather than reaching into a provider
+        // crate's normalizer (that redaction is tested where the normalizer now
+        // lives, whipplescript-provider-codex). This test owns the kernel's
+        // record path: event + fact + evidence, no content leak.
+        let observation = native_lifecycle::NativeAgentTurnObservation::fixture(
+            AgentTurnLifecycleKind::Cancelled,
+            "turn/completed",
+            Some("session-1".to_owned()),
+            Some("turn-1".to_owned()),
+            json!({"type": "object", "keys": 4}),
+        );
         assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
 
         kernel
@@ -6043,7 +5941,7 @@ rule wait
                     instance_id: &instance_id,
                     effect_id: "tell",
                     run_id: "run-tell",
-                    provider: "pi-main",
+                    provider: "codex-main",
                     worker_id: "worker-1",
                     lease_id: "lease-tell",
                     lease_expires_at: "2030-01-01T00:00:00Z",
@@ -6053,7 +5951,7 @@ rule wait
                     skill_names: &[],
                 },
                 &observation,
-                "pi-turn-end-1",
+                "codex-turn-completed-1",
             )
             .expect("native lifecycle records");
 
@@ -6066,7 +5964,7 @@ rule wait
         let payload = serde_json::from_str::<Value>(&event.payload_json).expect("payload json");
         assert_eq!(
             payload.get("provider_event_type").and_then(Value::as_str),
-            Some("turn_end")
+            Some("turn/completed")
         );
         assert_eq!(payload.get("terminal").and_then(Value::as_bool), Some(true));
         let evidence_id = payload
@@ -6244,6 +6142,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-secret-seed"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -6418,6 +6318,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -6456,10 +6358,15 @@ rule wait
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].status, "terminal");
         let events = store.list_events(&instance_id).expect("events list");
+        // cancel_run settles the effect AND derives the effect.cancelled
+        // settling fact, so the log ends terminal-then-fact.
         assert_eq!(
             events.last().map(|event| event.event_type.as_str()),
-            Some("effect.terminal")
+            Some("fact.derived")
         );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "effect.terminal"));
         assert!(!events
             .iter()
             .any(|event| event.event_type == "agent.turn.completed"));
@@ -6508,6 +6415,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -6690,6 +6599,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-artifact-failure"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -6775,6 +6686,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-recovery"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -6932,6 +6845,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-uncertain"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         (kernel, instance_id)
@@ -6972,7 +6887,7 @@ rule wait
             Self {
                 capability: builtin_provider_capabilities()
                     .into_iter()
-                    .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                    .find(|capability| capability.provider_kind == "fixture")
                     .expect("fixture capability"),
                 script: script.into(),
                 on_start: None,
@@ -7085,8 +7000,8 @@ rule wait
         ]);
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7178,13 +7093,13 @@ rule wait
         let mut adapter = NeverLaunchAdapter {
             capability: builtin_provider_capabilities()
                 .into_iter()
-                .find(|capability| capability.provider_kind == ProviderKind::Fixture)
+                .find(|capability| capability.provider_kind == "fixture")
                 .expect("fixture capability"),
         };
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7263,8 +7178,8 @@ rule wait
         );
         let request = NativeProviderTurnRequest {
             provider_id: "scripted".to_owned(),
-            provider_kind: ProviderKind::Fixture,
-            surface: AdapterSurface::Fixture,
+            provider_kind: "fixture".to_owned(),
+            surface: "fixture".to_owned(),
             run_id: "run-tell".to_owned(),
             effect_id: "tell".to_owned(),
             agent: "worker".to_owned(),
@@ -7564,6 +7479,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-artifact-recovery"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -7710,6 +7627,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start-restart-provider-recovery"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -7784,17 +7703,17 @@ rule wait
     }
 
     #[test]
-    fn restart_recovers_running_pi_native_run_from_terminal_evidence() {
+    fn restart_recovers_running_codex_native_run_from_terminal_evidence() {
         let store_path = std::env::temp_dir().join(format!(
-            "whip-kernel-pi-native-recovery-{}.sqlite",
-            idempotency_key(&["pi-native-provider-recovery", "store"])
+            "whip-kernel-codex-native-recovery-{}.sqlite",
+            idempotency_key(&["codex-native-provider-recovery", "store"])
         ));
         let _ = fs::remove_file(&store_path);
         let store = SqliteStore::open(&store_path).expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {
-                program_name: "RestartPiNativeRecovery",
+                program_name: "RestartCodexNativeRecovery",
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
@@ -7814,7 +7733,7 @@ rule wait
                     timeout_seconds: None,
                     effect_id: "tell",
                     kind: "agent.tell",
-                    target: Some("pi"),
+                    target: Some("codex"),
                     input_json: r#"{"prompt":"go"}"#,
                     status: "queued",
                     idempotency_key: "rule=start;effect=tell",
@@ -7825,7 +7744,9 @@ rule wait
                 }],
                 dependencies: &[],
                 terminal: None,
-                idempotency_key: Some("commit-start-pi-native-recovery"),
+                idempotency_key: Some("commit-start-codex-native-recovery"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         kernel
@@ -7833,7 +7754,7 @@ rule wait
                 instance_id: &instance_id,
                 effect_id: "tell",
                 run_id: "run-tell",
-                provider: "pi",
+                provider: "codex",
                 worker_id: "worker-1",
                 lease_id: "lease-tell",
                 lease_expires_at: "2030-01-01T00:00:00Z",
@@ -7842,17 +7763,17 @@ rule wait
             .expect("run starts");
         let native_metadata = json!({
             "effect_id": "tell",
-            "agent": "pi",
+            "agent": "codex",
             "profile": "repo-reader",
-            "provider": "pi",
+            "provider": "codex",
             "native_event": {
-                "provider_id": "pi",
+                "provider_id": "codex",
                 "run_id": "run-tell",
                 "event_kind": "completed",
                 "terminal": true,
-                "provider_event_type": "turn_end",
-                "provider_session_id": "pi-session-1",
-                "provider_turn_id": "pi-turn-1",
+                "provider_event_type": "turn/completed",
+                "provider_session_id": "codex-session-1",
+                "provider_turn_id": "codex-turn-1",
                 "sequence": 4,
                 "evidence_shape": {"type": "object", "keys": 2},
                 "artifacts": []
@@ -7868,8 +7789,8 @@ rule wait
                 subject_type: "run",
                 subject_id: "run-tell",
                 causation_id: Some("tell"),
-                correlation_id: Some("native-pi-terminal-gap"),
-                summary: Some("completed native provider event from turn_end"),
+                correlation_id: Some("native-codex-terminal-gap"),
+                summary: Some("completed native provider event from turn/completed"),
                 metadata_json: &native_metadata,
             })
             .expect("native provider evidence records");
@@ -7904,8 +7825,8 @@ rule wait
             .expect("terminal event exists");
         assert!(terminal
             .payload_json
-            .contains("\"provider_event_type\":\"turn_end\""));
-        assert!(terminal.payload_json.contains("pi-session-1"));
+            .contains("\"provider_event_type\":\"turn/completed\""));
+        assert!(terminal.payload_json.contains("codex-session-1"));
 
         let _ = fs::remove_file(store_path);
     }
@@ -7948,23 +7869,6 @@ rule wait
     }
 
     #[test]
-    fn real_pi_failure_reaches_event_stream() {
-        if !command_exists("pi") {
-            eprintln!("skipping real Pi failure smoke: pi not found on PATH");
-            return;
-        }
-        let harness = PiStyleAgentHarness::new(
-            CommandLaunchPlan::new("pi", "pi").arg("--definitely-not-a-real-flag"),
-        );
-        assert_real_provider_failure_reaches_event_stream(
-            "RealPiFailure",
-            "pi",
-            &harness,
-            "Unknown option",
-        );
-    }
-
-    #[test]
     fn fake_coerce_records_evidence_and_success_fact() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let mut kernel = RuntimeKernel::new(store);
@@ -8003,6 +7907,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -8105,6 +8011,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         let request = CoerceRequest {
@@ -8169,87 +8077,6 @@ rule wait
         assert!(!failed_fact.value_json.contains("invalid output"));
     }
 
-    #[test]
-    fn human_ask_creates_inbox_item_and_pending_fact() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
-        let mut kernel = RuntimeKernel::new(store);
-        let version = kernel
-            .create_program_version(ProgramVersionInput {
-                program_name: "HumanReview",
-                source_hash: "source",
-                ir_hash: "ir",
-                compiler_version: "test",
-            })
-            .expect("program version creates");
-        let instance_id = kernel
-            .create_instance(&version, "{}")
-            .expect("instance creates");
-        let effects = [NewEffect {
-            timeout_seconds: None,
-            effect_id: "ask",
-            kind: "human.ask",
-            target: None,
-            input_json: r#"{"prompt":"Approve?"}"#,
-            status: "queued",
-            idempotency_key: "rule=start;effect=ask",
-            required_capabilities_json: r#"["human.ask"]"#,
-            profile: Some("human-review"),
-            correlation_id: None,
-            source_span_json: None,
-        }];
-        kernel
-            .commit_rule(RuleCommit {
-                instance_id: &instance_id,
-                rule: "start",
-                trigger_event_id: None,
-                facts: &[],
-                consumed_fact_ids: &[],
-                effects: &effects,
-                dependencies: &[],
-                terminal: None,
-                idempotency_key: Some("commit-start"),
-            })
-            .expect("rule commits");
-
-        let terminal = kernel
-            .run_human_ask(HumanAskExecution {
-                instance_id: &instance_id,
-                effect_id: "ask",
-                run_id: "run-ask",
-                provider: "builtin-human-review",
-                worker_id: "worker-1",
-                lease_id: "lease-ask",
-                lease_expires_at: "2030-01-01T00:00:00Z",
-                inbox_item_id: "inbox-ask",
-                prompt: "Approve this change?",
-                choices_json: r#"["approve","reject"]"#,
-                freeform_allowed: true,
-                severity: "normal",
-                related_effects_json: r#"["ask"]"#,
-                related_artifacts_json: "[]",
-            })
-            .expect("human ask runs");
-
-        assert_eq!(terminal.sequence, 3);
-        check_trace(kernel.trace()).expect("kernel trace conforms");
-        let store = kernel.into_store();
-        let inbox = store
-            .list_inbox_items(Some("pending"))
-            .expect("inbox lists");
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].inbox_item_id, "inbox-ask");
-        assert_eq!(inbox[0].choices_json, r#"["approve","reject"]"#);
-        let evidence = store.list_evidence(&instance_id).expect("evidence lists");
-        assert!(evidence
-            .iter()
-            .any(|evidence| evidence.kind == "human.ask.provider"
-                && evidence.metadata_json.contains("inbox-ask")));
-        let facts = store.list_facts(&instance_id).expect("facts list");
-        assert!(facts
-            .iter()
-            .any(|fact| fact.name == "human.ask.created" && fact.value_json.contains("inbox-ask")));
-    }
-
     fn command_exists(binary: &str) -> bool {
         Command::new(binary).arg("--version").output().is_ok()
     }
@@ -8297,6 +8124,8 @@ rule wait
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 

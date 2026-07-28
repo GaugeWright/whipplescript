@@ -1,0 +1,289 @@
+mod WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE is
+  protecting WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF .
+
+  sorts RuntimeEntrypointKind ClassOutputList NodeClassOutputList .
+
+  ops
+    factRecord
+    eventRecord
+    eventSourceTemplateEntrypoint
+    clockSourceTemplateEntrypoint
+    scheduleTemplateEntrypoint
+    effectGraphTemplate
+    ruleTemplate
+    effectDependencyTemplate
+    eventProjection
+    assertionCheck
+    diagnosticRecord
+    : -> RuntimeEntrypointKind .
+
+  op entrypointMatchesObjectKind : CoreObjectKind RuntimeEntrypointKind -> Cfg .
+
+  --- Platform-owned lowering-class lifecycle contract.
+  op classRegistered : LoweringClass -> Cfg .
+  op classAllowsFamily : LoweringClass ConstructFamily -> Cfg .
+  op classDeterministic : LoweringClass -> Cfg .
+  op classContractPinned : LoweringClass -> Cfg .
+  op classNoRuntimeInputs : LoweringClass -> Cfg .
+  op classNoHiddenAuthority : LoweringClass -> Cfg .
+  op classNoPackageScheduler : LoweringClass -> Cfg .
+  op classNoPackageLifecycle : LoweringClass -> Cfg .
+  op classNoDirectFactWrite : LoweringClass -> Cfg .
+  op classNoDirectRuleFire : LoweringClass -> Cfg .
+  op classStaticSafetyOk : LoweringClass -> Cfg .
+
+  --- Authority profiles. A lowering class must use one of these closed
+  --- profiles rather than inventing package-owned lifecycle authority.
+  op classNoAuthorityNeeded : LoweringClass -> Cfg .
+  op classCapabilityScoped : LoweringClass -> Cfg .
+  op classOutputBoundaryValidated : LoweringClass -> Cfg .
+  op classEventPayloadTyped : LoweringClass -> Cfg .
+  op classEventAdmissionOwned : LoweringClass -> Cfg .
+  op classProjectionSourceTyped : LoweringClass -> Cfg .
+  op classAuthorityOk : LoweringClass -> Cfg .
+
+  --- Finite output profiles used by the hand-written checks. A real compiler
+  --- report should carry the same object-kind to runtime-entrypoint mapping.
+  op classAllowsNoOutput : LoweringClass -> Cfg .
+  op classAllowsOutput : LoweringClass CoreObjectKind RuntimeEntrypointKind -> Cfg .
+  op classCoreOutputs0 : LoweringClass -> Cfg .
+  op classCoreOutputs1 : LoweringClass CoreObjectKind RuntimeEntrypointKind -> Cfg .
+  op classCoreOutputs2 :
+    LoweringClass CoreObjectKind RuntimeEntrypointKind CoreObjectKind RuntimeEntrypointKind
+    -> Cfg .
+  op noClassOutputs : -> ClassOutputList .
+  op classOutputCons : CoreObjectKind RuntimeEntrypointKind ClassOutputList -> ClassOutputList .
+  op classCoreOutputs : LoweringClass ClassOutputList -> Cfg .
+  op classCoreOutputsRemaining : LoweringClass ClassOutputList -> Cfg .
+  op acceptedClassOutput0 : LoweringClass -> Cfg .
+  op acceptedClassOutput1 : LoweringClass CoreObjectKind RuntimeEntrypointKind -> Cfg .
+  op acceptedClassOutput2 :
+    LoweringClass CoreObjectKind RuntimeEntrypointKind CoreObjectKind RuntimeEntrypointKind
+    -> Cfg .
+  op classOutputOk : LoweringClass -> Cfg .
+  op loweringClassLifecycleOk : LoweringClass -> Cfg .
+
+  --- Node-level bridge into the existing construct-lowering model.
+  op nodeUsesLoweringClass : GraphNode LoweringClass -> Cfg .
+  op nodeConstructFamily : GraphNode ConstructFamily -> Cfg .
+  op nodeClassOutput0 : GraphNode LoweringClass -> Cfg .
+  op nodeClassOutput1 :
+    GraphNode LoweringClass CoreObjectId CoreObjectKind RuntimeEntrypointKind
+    -> Cfg .
+  op nodeClassOutput2 :
+    GraphNode LoweringClass CoreObjectId CoreObjectKind RuntimeEntrypointKind
+    CoreObjectId CoreObjectKind RuntimeEntrypointKind
+    -> Cfg .
+  op noNodeClassOutputs : -> NodeClassOutputList .
+  op nodeClassOutputCons :
+    CoreObjectId CoreObjectKind RuntimeEntrypointKind NodeClassOutputList
+    -> NodeClassOutputList .
+  op nodeClassOutput : GraphNode LoweringClass NodeClassOutputList -> Cfg .
+  op nodeClassOutputRemaining :
+    GraphNode LoweringClass CoreObjectList NodeClassOutputList
+    -> Cfg .
+  op objectEntrypointAccepted : LoweringClass CoreObjectKind RuntimeEntrypointKind -> Cfg .
+
+  vars L : LoweringClass .
+  vars F : ConstructFamily .
+  vars N : GraphNode .
+  vars K K2 : CoreObjectKind .
+  vars Ep Ep2 : RuntimeEntrypointKind .
+  vars O O2 : CoreObjectId .
+  var ClassOutputs : ClassOutputList .
+  var NodeOutputs : NodeClassOutputList .
+  var Objects : CoreObjectList .
+
+  rl [authority-none] :
+    classNoAuthorityNeeded(L)
+    =>
+    classAuthorityOk(L) .
+
+  rl [authority-effect] :
+    classCapabilityScoped(L)
+    classOutputBoundaryValidated(L)
+    =>
+    classAuthorityOk(L) .
+
+  rl [authority-event] :
+    classEventPayloadTyped(L)
+    classEventAdmissionOwned(L)
+    =>
+    classAuthorityOk(L) .
+
+  rl [authority-projection] :
+    classProjectionSourceTyped(L)
+    =>
+    classAuthorityOk(L) .
+
+  rl [class-output-none] :
+    classAllowsNoOutput(L)
+    classCoreOutputs0(L)
+    =>
+    acceptedClassOutput0(L)
+    classOutputOk(L) .
+
+  rl [class-output-one] :
+    classAllowsOutput(L, K, Ep)
+    classCoreOutputs1(L, K, Ep)
+    entrypointMatchesObjectKind(K, Ep)
+    =>
+    acceptedClassOutput1(L, K, Ep)
+    classOutputOk(L)
+    objectEntrypointAccepted(L, K, Ep) .
+
+  rl [class-output-two] :
+    classAllowsOutput(L, K, Ep)
+    classAllowsOutput(L, K2, Ep2)
+    classCoreOutputs2(L, K, Ep, K2, Ep2)
+    entrypointMatchesObjectKind(K, Ep)
+    entrypointMatchesObjectKind(K2, Ep2)
+    =>
+    acceptedClassOutput2(L, K, Ep, K2, Ep2)
+    classOutputOk(L)
+    objectEntrypointAccepted(L, K, Ep)
+    objectEntrypointAccepted(L, K2, Ep2) .
+
+  rl [class-output-generated-none] :
+    classAllowsNoOutput(L)
+    classCoreOutputs(L, noClassOutputs)
+    =>
+    acceptedClassOutput0(L)
+    classOutputOk(L) .
+
+  rl [class-output-generated-start-cons] :
+    classCoreOutputs(L, classOutputCons(K, Ep, ClassOutputs))
+    classAllowsOutput(L, K, Ep)
+    entrypointMatchesObjectKind(K, Ep)
+    =>
+    objectEntrypointAccepted(L, K, Ep)
+    classCoreOutputsRemaining(L, ClassOutputs) .
+
+  rl [class-output-generated-cons] :
+    classCoreOutputsRemaining(L, classOutputCons(K, Ep, ClassOutputs))
+    classAllowsOutput(L, K, Ep)
+    entrypointMatchesObjectKind(K, Ep)
+    =>
+    objectEntrypointAccepted(L, K, Ep)
+    classCoreOutputsRemaining(L, ClassOutputs) .
+
+  rl [class-output-generated-finished] :
+    classCoreOutputsRemaining(L, noClassOutputs)
+    =>
+    classOutputOk(L) .
+
+  rl [accept-class-static-safety] :
+    classDeterministic(L)
+    classContractPinned(L)
+    classNoRuntimeInputs(L)
+    classNoHiddenAuthority(L)
+    classNoPackageScheduler(L)
+    classNoPackageLifecycle(L)
+    classNoDirectFactWrite(L)
+    classNoDirectRuleFire(L)
+    =>
+    classStaticSafetyOk(L) .
+
+  rl [accept-lowering-class-lifecycle] :
+    classRegistered(L)
+    classStaticSafetyOk(L)
+    classAuthorityOk(L)
+    classOutputOk(L)
+    =>
+    loweringClassLifecycleOk(L) .
+
+  rl [accept-node-class-lifecycle] :
+    nodeUsesLoweringClass(N, L)
+    nodeConstructFamily(N, F)
+    loweringClassLifecycleOk(L)
+    classAllowsFamily(L, F)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassLifecycleAccepted(N)
+    loweredByPlatform(N)
+    loweringCoreOnly(N)
+    noExtraCapability(N)
+    noPackageScheduler(N)
+    noPackageLifecycle(N) .
+
+  rl [accept-node-class-output-none] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutput0(N, L)
+    acceptedClassOutput0(L)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputAccepted(N, L)
+    nodeCoreObjects0(N) .
+
+  rl [accept-node-class-output-one] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutput1(N, L, O, K, Ep)
+    acceptedClassOutput1(L, K, Ep)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputAccepted(N, L)
+    nodeCoreObjects1(N, O)
+    allowedCoreObjectKind(K)
+    objectEntrypointAccepted(L, K, Ep) .
+
+  rl [accept-node-class-output-two] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutput2(N, L, O, K, Ep, O2, K2, Ep2)
+    acceptedClassOutput2(L, K, Ep, K2, Ep2)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputAccepted(N, L)
+    nodeCoreObjects2(N, O, O2)
+    allowedCoreObjectKind(K)
+    allowedCoreObjectKind(K2)
+    objectEntrypointAccepted(L, K, Ep)
+    objectEntrypointAccepted(L, K2, Ep2) .
+
+  rl [accept-generated-node-class-output-none] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutput(N, L, noNodeClassOutputs)
+    acceptedClassOutput0(L)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputAccepted(N, L)
+    nodeCoreObjects(N, noCoreObjects) .
+
+  rl [accept-generated-node-class-output-start-cons] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutput(N, L, nodeClassOutputCons(O, K, Ep, NodeOutputs))
+    objectEntrypointAccepted(L, K, Ep)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    allowedCoreObjectKind(K)
+    objectEntrypointAccepted(L, K, Ep)
+    nodeClassOutputRemaining(N, L, coreObjectCons(O, noCoreObjects), NodeOutputs) .
+
+  rl [accept-generated-node-class-output-cons] :
+    nodeClassOutputRemaining(N, L, Objects, nodeClassOutputCons(O, K, Ep, NodeOutputs))
+    objectEntrypointAccepted(L, K, Ep)
+    =>
+    allowedCoreObjectKind(K)
+    objectEntrypointAccepted(L, K, Ep)
+    nodeClassOutputRemaining(N, L, coreObjectCons(O, Objects), NodeOutputs) .
+
+  rl [accept-generated-node-class-output-finished] :
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputRemaining(N, L, Objects, noNodeClassOutputs)
+    =>
+    nodeUsesLoweringClass(N, L)
+    loweringClassLifecycleOk(L)
+    nodeClassOutputAccepted(N, L)
+    nodeCoreObjects(N, Objects) .
+endm

@@ -1,0 +1,65 @@
+--- Family C: child-milestone lifecycle. See spec/decision-records/discriminated-
+--- families-design.md sections 6.4 and 7.3. A child workflow projects named
+--- milestones a parent observes mid-flight via `after p reaches "<name>" as m`,
+--- generalizing the terminal-outcome family to a lifecycle family over states the
+--- child explicitly declares. Runtime is poll-based: the parent invoke effect reads
+--- the child's emitted milestones each step and derives idempotent `reached` facts.
+---
+--- Invariants pinned and bitten here:
+---   reject-undeclared: a parent `after p reaches "n"` for a milestone the child does
+---     NOT declare is rejected -- the terminal-only observation invariant (a parent
+---     cannot observe a state the child did not project);
+---   deliver: a declared, emitted milestone the parent reaches is observed (a derived
+---     `reached` fact) -- the coverage path;
+---   terminal-only at runtime: a parent that reaches a milestone the child did NOT
+---     emit observes nothing (no `reached`);
+---   idempotent: an emitted milestone is delivered exactly once (delivery consumes
+---     the emission), so no double `reached`.
+mod WHIPPLESCRIPT-MILESTONE-SIGNAL is
+  protecting BOOL .
+
+  sorts Name NameSet Cfg .
+  subsort Name < NameSet .
+
+  ops m1 m2 m3 : -> Name [ctor] .   --- m3 is an undeclared/unemitted milestone
+
+  op mt : -> NameSet [ctor] .
+  op _;_ : NameSet NameSet -> NameSet [ctor assoc comm id: mt] .
+  eq [n-idem] : N:Name ; N:Name = N:Name .
+
+  op inSet : Name NameSet -> Bool .
+  eq inSet(N:Name, (N:Name ; S:NameSet)) = true .
+  eq inSet(N:Name, S:NameSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- declared S: the child workflow declares it may emit these milestone names .
+  op declared : NameSet -> Cfg [ctor] .
+  --- parentReaches n: the parent observes milestone n via `after p reaches "n"` .
+  op parentReaches : Name -> Cfg [ctor] .
+  --- emitted n: the child actually emitted milestone n at runtime .
+  op emitted : Name -> Cfg [ctor] .
+  --- reached n: the parent has observed n -- a derived `reached` fact .
+  op reached : Name -> Cfg [ctor] .
+  --- reject marker .
+  op rejectUndeclared : Name -> Cfg [ctor] .
+
+  vars N : Name .
+  var S : NameSet .
+
+  --- static: a parent reaches a milestone the child never declared -> rejected. This
+  --- is the terminal-only observation invariant: the parent cannot observe a state
+  --- the child did not project.
+  crl [reject-undeclared] :
+      declared(S) parentReaches(N)
+      => declared(S) parentReaches(N) rejectUndeclared(N)
+      if inSet(N, S) = false .
+
+  --- runtime delivery: an emitted milestone the parent reaches is observed exactly
+  --- once. Consuming the emission gives idempotency (no second `reached`); requiring
+  --- emitted gives terminal-only observation at runtime (no emission, no `reached`).
+  rl [deliver] :
+      emitted(N) parentReaches(N)
+      => parentReaches(N) reached(N) .
+endm

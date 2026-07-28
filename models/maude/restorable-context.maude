@@ -1,0 +1,121 @@
+--- Restorable context (checkpoint/restore) -- the consistent-cut theorem for
+--- rewinding THREE planes as ONE atomic unit (decision record:
+--- spec/decision-records/restorable-context.md). The three planes are the
+--- agent transcript position, the instance event-log sequence N, and the
+--- file-store manifest hash. A checkpoint records all three captured at the
+--- SAME quiescent point; a restore reverts all three together or refuses.
+---
+--- Planes are modeled as SEPARATE facts -- transcriptPlane, instancePlane,
+--- filePlane -- so that a PARTIAL state such as file-at-cut while instance-at-pre
+--- is expressible as a term. The load-bearing bites then prove those partial
+--- terms unreachable.
+---
+--- INV-1 consistent cut such as coverage: a checkpoint taken at a quiescent
+---   point binds cut(cutId, tPos, seqN, mHash) whose three positions ARE the
+---   state's current plane positions.
+--- INV-2 no-in-flight straddle such as bite: the checkpoint rule fires ONLY
+---   when no inFlight marker is present anywhere; no reachable state carries a
+---   cut taken while an inFlight was present.
+--- INV-3 restore atomicity such as CRUX bite: restore sets all three plane
+---   positions in ONE rewrite -- the one-transaction boundary -- so no reachable
+---   state is partially restored -- a 2-of-3 plane mismatch.
+--- INV-4 restore coherence / no-dangling-hash such as CRUX bite: restore
+---   applies ONLY when every content hash the cut's manifest requires is present
+---   in the blob store; otherwise it refuses, leaving all planes unchanged. No
+---   reachable applied-restore state references a manifest hash absent from the
+---   store.
+---
+--- CRITICAL house rule -- wrapped state. The checkpoint guard such as "no
+--- inFlight anywhere" and the restore guard such as "every required hash
+--- present" are GLOBAL predicates. A guard over a bare associative-commutative
+--- soup is UNSOUND -- extension matching would rewrite a fragment with the rest
+--- bound to none, bypassing the guard. So the whole state is WRAPPED in the
+--- constructor { _ } and each rule captures the entire rest in C, forcing the
+--- guard to see every existing fact. The bites are No-solution searches that
+--- verify the guards actually bite.
+mod RESTORABLE-CONTEXT is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- The three rewindable planes, each a current position.
+  --- transcriptPlane(P): agent transcript position.
+  op transcriptPlane : Nat -> Fact [ctor] .
+  --- instancePlane(N): instance event-log sequence index N.
+  op instancePlane : Nat -> Fact [ctor] .
+  --- filePlane(H): file-store manifest hash currently materialized.
+  op filePlane : Nat -> Fact [ctor] .
+
+  --- inFlight(id): an effect straddling the cut -- the state is NOT quiescent.
+  op inFlight : Nat -> Fact [ctor] .
+
+  --- checkpointReq(cutId): a request to take a checkpoint.
+  op checkpointReq : Nat -> Fact [ctor] .
+  --- cut(cutId, tPos, seqN, mHash): a recorded consistent cut.
+  op cut : Nat Nat Nat Nat -> Fact [ctor] .
+
+  --- restoreReq(cutId): a request to restore to a recorded cut.
+  op restoreReq : Nat -> Fact [ctor] .
+  --- restored(cutId): the restore was applied to all three planes.
+  op restored : Nat -> Fact [ctor] .
+  --- refused(cutId): the restore was refused -- planes left unchanged.
+  op refused : Nat -> Fact [ctor] .
+
+  --- blob(hash): a content-addressed blob the store currently holds.
+  op blob : Nat -> Fact [ctor] .
+  --- requires(mHash, contentHash): the manifest mHash references contentHash.
+  op requires : Nat Nat -> Fact [ctor] .
+
+  vars P N H P0 N0 H0 Cut B X : Nat .
+  var C : Cfg .
+
+  --- Is any effect in flight anywhere in C -- i.e. the state is not quiescent?
+  op hasInFlight : Cfg -> Bool .
+  eq hasInFlight(inFlight(X) C) = true .
+  eq hasInFlight(C) = false [owise] .
+
+  --- Does the blob store in C hold content hash B?
+  op hasBlob : Nat Cfg -> Bool .
+  eq hasBlob(B, blob(B) C) = true .
+  eq hasBlob(B, C) = false [owise] .
+
+  --- Is EVERY content hash required by manifest H present in the blob store C?
+  --- Recurse over the requires(H, _) facts for this manifest; a single missing
+  --- blob makes the whole manifest un-restorable.
+  op allPresent : Nat Cfg -> Bool .
+  eq allPresent(H, requires(H, B) C) =
+    if hasBlob(B, C) then allPresent(H, C) else false fi .
+  eq allPresent(H, C) = true [owise] .
+
+  --- INV-1 + INV-2: checkpoint at a quiescent point. The rule binds the cut to
+  --- the current positions of all three planes in a single step, and fires ONLY
+  --- when no effect is in flight anywhere in the rest of the wrapped state.
+  crl [checkpoint] :
+    { checkpointReq(Cut) transcriptPlane(P) instancePlane(N) filePlane(H) C }
+    => { cut(Cut, P, N, H) transcriptPlane(P) instancePlane(N) filePlane(H) C }
+    if hasInFlight(C) = false .
+
+  --- INV-3 + INV-4: restore applied. ONE rewrite moves all three planes to the
+  --- cut's positions at once -- the atomic transaction boundary -- and fires
+  --- ONLY when every content hash the manifest requires is present in the blob
+  --- store. There is deliberately no rule that moves a single plane.
+  crl [restore-apply] :
+    { restoreReq(Cut) cut(Cut, P, N, H)
+      transcriptPlane(P0) instancePlane(N0) filePlane(H0) C }
+    => { restored(Cut) cut(Cut, P, N, H)
+      transcriptPlane(P) instancePlane(N) filePlane(H) C }
+    if allPresent(H, C) = true .
+
+  --- INV-4: restore refused. When a required content hash is missing -- a
+  --- dangling manifest -- the restore is refused and every plane is left
+  --- exactly where it was -- the planes ride through untouched inside C.
+  crl [restore-refuse] :
+    { restoreReq(Cut) cut(Cut, P, N, H) C }
+    => { refused(Cut) cut(Cut, P, N, H) C }
+    if allPresent(H, C) = false .
+endm

@@ -178,31 +178,53 @@ pub fn guard_url(raw: &str, policy: &FetchPolicy) -> Result<GuardedTarget, WebTo
 /// Why an IP is not publicly routable, if it is not. The metadata service
 /// (169.254.169.254) falls under link-local; it is named here for clarity.
 fn non_public_reason(ip: IpAddr) -> Option<&'static str> {
+    // Kept in parity with the `http source` classifier (`private_or_local_ipv4`
+    // / `private_or_local_ipv6` in main.rs): both must reject the same set.
     match ip {
         IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
             if v4.is_loopback() {
                 Some("loopback")
+            } else if a == 0 {
+                Some("non-routable (0.0.0.0/8)")
             } else if v4.is_private() {
                 Some("private range")
+            } else if a == 100 && (64..=127).contains(&b) {
+                Some("CGNAT (100.64/10)")
             } else if v4.is_link_local() {
                 Some("link-local/metadata")
+            } else if a == 198 && (b == 18 || b == 19) {
+                Some("benchmarking (198.18/15)")
             } else if v4.is_unspecified() || v4.is_broadcast() || v4.is_documentation() {
                 Some("non-routable")
+            } else if a >= 224 {
+                Some("multicast/reserved")
             } else {
                 None
             }
         }
         IpAddr::V6(v6) => {
+            let octets = v6.octets();
             if v6.is_loopback() {
                 Some("loopback")
             } else if v6.is_unspecified() {
                 Some("non-routable")
+            } else if let Some(mapped) = v6.to_ipv4_mapped() {
+                non_public_reason(IpAddr::V4(mapped))
+            } else if octets[..12] == [0u8; 12] {
+                // IPv4-compatible ::a.b.c.d (deprecated but dialed over IPv4).
+                non_public_reason(IpAddr::V4(std::net::Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )))
+            } else if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 destination.
+                non_public_reason(IpAddr::V4(std::net::Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )))
             } else if (v6.segments()[0] & 0xfe00) == 0xfc00 {
                 Some("unique-local")
             } else if (v6.segments()[0] & 0xffc0) == 0xfe80 {
                 Some("link-local")
-            } else if let Some(mapped) = v6.to_ipv4_mapped() {
-                non_public_reason(IpAddr::V4(mapped))
             } else {
                 None
             }
@@ -673,7 +695,7 @@ pub fn resolve_search_provider() -> Result<Box<dyn SearchProvider>, WebToolError
             }
         }
     }
-    if let Some((key, _source)) = crate::coerce_runtime::resolve_credential_with_source(
+    if let Some((key, _source)) = crate::model_auth::resolve_credential_with_source(
         whipplescript_kernel::coerce_native::CoerceProvider::Anthropic,
     ) {
         return Ok(Box::new(AnthropicNativeSearchProvider::new(key)));
@@ -712,6 +734,13 @@ mod tests {
             "http://192.168.1.1/router",
             "http://169.254.169.254/latest/meta-data/",
             "http://[::1]/x",
+            // IPv4-mapped/compatible IPv6 must be screened as their IPv4:
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[::ffff:10.0.0.5]/x",
+            // Ranges the stdlib v4 helpers miss:
+            "http://100.64.0.1/x",
+            "http://0.0.0.0/x",
             "file:///etc/passwd",
             "ftp://example.com/x",
             "http://example.com:8080/x",

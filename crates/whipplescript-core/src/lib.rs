@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod json;
 
-/// Current implementation stage for the active redesign.
-pub const IMPLEMENTATION_STAGE: &str = "stage-0-skeleton";
+/// Implementation-stage label shown alongside the version (for project tracking;
+/// does not replace the semantic version).
+pub const IMPLEMENTATION_STAGE: &str = "release";
 
 /// Returns the workspace package version.
 pub fn version() -> &'static str {
@@ -141,6 +142,36 @@ pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
 /// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
 pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
     &["from", "for", "into", "to", "via", "by"];
+
+/// The DR-0015 agent feature-class taxonomy, verbatim (spec/std-agent.md
+/// "Capability reports"). Shared vocabulary: the parser checks
+/// `requires [<feature.class>]` membership against it (slice 6), and the
+/// kernel's compiled provider feature reports may only state these classes
+/// (slice 5) — one list, no drift.
+pub const AGENT_FEATURE_CLASS_TAXONOMY: &[&str] = &[
+    "context.compact",
+    "context.auto_compact",
+    "session.resume",
+    "session.fork",
+    "session.clone",
+    "session.export",
+    "turn.cancel",
+    "turn.steer",
+    "turn.follow_up",
+    "subagent.spawn",
+    "subagent.observe",
+    "subagent.steer",
+    "skill.attach",
+    "plugin.load",
+    "hook.lifecycle",
+    "native.command.dispatch",
+    "permission.policy",
+    "model.select",
+    "reasoning.select",
+    "goal.track",
+    "command.list",
+    "feature.report",
+];
 
 impl ConstructGrammar {
     /// Derive the flat `fields[]` view downstream consumers read.
@@ -721,11 +752,14 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
         "named-many",
     ],
     reserved_keywords: &[
-        "agent", "ask", "call", "cancel", "case", "claim", "class", "coerce", "complete",
-        "counter", "decide", "effect", "else", "emit", "enum", "event", "fail", "flow", "from",
-        "harness", "if", "ledger", "lease", "let", "match", "release", "renew", "rule",
-        "tracker",
-        "signal", "tell", "then", "use", "when", "workflow",
+        // `acquire`/`append`/`consume` are reserved in the SAME change as their
+        // std.coord privilege tuples (spec/std-coord.md "Surface"): privilege
+        // rows for unreserved words are dead data, and the bare verbs would
+        // stay squattable by any future package construct path.
+        "acquire", "agent", "append", "ask", "call", "cancel", "case", "claim", "class", "coerce",
+        "complete", "consume", "counter", "decide", "effect", "else", "emit", "enum", "event",
+        "fail", "flow", "from", "harness", "if", "ledger", "lease", "let", "match", "release",
+        "renew", "rule", "tracker", "signal", "tell", "then", "use", "when", "workflow",
     ],
     reserved_keyword_privileges: &[
         PlatformReservedKeywordPrivilege {
@@ -781,6 +815,69 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
             construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
             scope: "top_level",
             lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        // std.coord effect operations (spec/std-coord.md "Surface", E4 first
+        // `resource_effect` producer): each tuple both clears the reserved
+        // keyword AND — because its lowering target is a non-authorable class —
+        // opens the authorability door for exactly this
+        // (library, keyword, family, scope, lowering) tuple (M5 "Authorability
+        // door"; models/maude/std-construct-authorization.maude
+        // [door-privileged]). The `release` row COEXISTS with std.tracker's:
+        // privilege rows are exact tuples, so the shared bare verb is two
+        // rows, not a collision.
+        PlatformReservedKeywordPrivilege {
+            keyword: "acquire",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_RESOURCE_EFFECT,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "append",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_RESOURCE_EFFECT,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "consume",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_RESOURCE_EFFECT,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "release",
+            library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_RESOURCE_EFFECT,
+        },
+        // std.ingress rows (spec/std-ingress.md "Catalog privilege additions"):
+        // `signal` and `emit` are reserved keywords, so the embedded std.ingress
+        // manifest's construct rows need exact privilege tuples to clear
+        // `reserved_keyword_privilege_error`. The `emit` tuple's lowering target
+        // (`signal_emit`) is a non-authorable class, so — like the std.coord
+        // `resource_effect` tuples above — it also opens the authorability door
+        // for exactly this tuple. `source` is not reserved and needs no tuple;
+        // its non-authorable `signal_source` lowering is admitted through the
+        // embedded-copy leg (`manifest_is_embedded_copy`). NOTE: the design
+        // sketch named lowering `metadata` for `signal`, but `metadata` is not
+        // compatible with `declaration_block` — the shipped decl-block lowering
+        // is `metadata_only` (the std.tracker/std.coord precedent).
+        PlatformReservedKeywordPrivilege {
+            keyword: "signal",
+            library_id: "std.ingress",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        PlatformReservedKeywordPrivilege {
+            keyword: "emit",
+            library_id: "std.ingress",
+            construct_family: CONSTRUCT_FAMILY_EFFECT_OPERATION,
+            scope: CONSTRUCT_SCOPE_RULE_BODY,
+            lowering_target: CONSTRUCT_LOWERING_SIGNAL_EMIT,
         },
     ],
 };
@@ -942,8 +1039,13 @@ pub fn std_messaging_send_effect_contract() -> EffectContract {
         // built-in class shape; the construct's provided EffectHandle carries
         // the class name.
         input_schema: Some(r#"{"channel":"string","text":"string"}"#.to_owned()),
+        // The full `MessageSendReceipt` shape (spec/std-messaging.md): every
+        // provider returns all eight fields; correlation fields the provider
+        // cannot report are empty strings (the fragment validator has no
+        // optional marker), `status` is `accepted` in v1, and failure is not
+        // a receipt (it settles `capability.call.failed`).
         output_schema: Some(
-            r#"{"channel":"string","delivered":"bool","provider_message_id":"string"}"#.to_owned(),
+            r#"{"accepted_at":"string","channel":"string","destination":"string","message_id":"string","provider":"string","provider_message_id":"string","status":"string","thread_id":"string"}"#.to_owned(),
         ),
         required_capabilities: vec![MESSAGING_SEND_CAPABILITY.to_owned()],
         provider_kinds: vec!["messaging".to_owned()],
@@ -1381,7 +1483,7 @@ mod tests {
 
     #[test]
     fn exposes_stage_marker() {
-        assert_eq!(IMPLEMENTATION_STAGE, "stage-0-skeleton");
+        assert_eq!(IMPLEMENTATION_STAGE, "release");
     }
 
     #[test]

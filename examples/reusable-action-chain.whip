@@ -1,6 +1,9 @@
+use std.agent
+
 workflow ReusableActionChain
 
 output result ReviewBatch
+failure error ReviewFailure
 
 # `action` removes a repeated *intra-rule effect chain*. Unlike `pattern`, which
 # generates whole declarations, an action inlines a chain of statements inside a
@@ -19,6 +22,10 @@ class ReviewedChange {
 
 class ReviewBatch {
   reviewed int
+}
+
+class ReviewFailure {
+  reason string
 }
 
 agent reviewer {
@@ -50,6 +57,12 @@ action review_change(who AgentRef<reviewer>, item ChangeRequest) {
       status "reviewed"
     }
   }
+
+  after turn fails as f {
+    record ReviewFailure {
+      reason f.reason
+    }
+  }
 }
 
 assert count(ChangeRequest where status == "queued") == 0
@@ -60,6 +73,14 @@ rule review
   when reviewer is available
 => {
   review_change(reviewer, item)
+}
+
+rule fail_on_review_failure
+  when ReviewFailure as failure
+=> {
+  fail error {
+    reason failure.reason
+  }
 }
 
 rule finish_batch

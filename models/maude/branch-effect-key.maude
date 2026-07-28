@@ -1,0 +1,73 @@
+--- Branch-distinct effect idempotency keys, per
+--- spec/versioned-workspace-research-note.md 9.1 and the untie-substrate
+--- readiness tracker Phase 0. Companion to effect-key.maude, which fixed
+--- key = key(program_version, effect_node); branches break that scheme:
+--- two branches firing the SAME version-node are distinct executions --
+--- a counterfactual regeneration against a real run, or two working
+--- branches running the same workflow on the same input -- and must not
+--- dedupe against each other. The branch/cut id joins program_version and
+--- revision_epoch in the key.
+---
+--- Both derivations are modeled side by side. The NAIVE system keys by
+--- version-node only and demonstrates the silent corruption in both
+--- directions: the counterfactual firing is absorbed into the real effect,
+--- or -- worse -- the real firing is absorbed into the counterfactual one,
+--- leaving production state pointing at a counterfactual execution. The
+--- BRANCH-DISTINCT system rejects the corruption while keeping the store
+--- unique-index idempotency within each branch.
+mod WHIPPLESCRIPT-BRANCH-EFFECT-KEY is
+  protecting BOOL .
+
+  sorts Br Version Node Key KeySet Cfg .
+  subsort Key < KeySet .
+
+  ops brMain brCf : -> Br [ctor] .  --- mainline and a counterfactual or second working branch
+  ops v1 v2 : -> Version [ctor] .
+  ops n1 n2 : -> Node [ctor] .
+
+  op key : Version Node -> Key [ctor] .        --- the naive, branch-blind key
+  op bkey : Br Version Node -> Key [ctor] .    --- the branch-distinct key
+
+  op mtKeys : -> KeySet [ctor] .
+  op _;_ : KeySet KeySet -> KeySet [ctor assoc comm id: mtKeys] .
+  eq [set-idem] : K:Key ; K:Key = K:Key .
+
+  op member : Key KeySet -> Bool .
+  eq member(K:Key, (K:Key ; KS:KeySet)) = true .
+  eq member(K:Key, KS:KeySet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op ncreate : Br Version Node -> Cfg [ctor] .  --- pending creation, naive store
+  op neffect : Key Br -> Cfg [ctor] .           --- naive effect + WHICH branch won
+  op ncreated : KeySet -> Cfg [ctor] .          --- naive unique index
+  op bcreate : Br Version Node -> Cfg [ctor] .  --- pending creation, branch-keyed store
+  op beffect : Key -> Cfg [ctor] .              --- branch-keyed effect
+  op bcreated : KeySet -> Cfg [ctor] .          --- branch-keyed unique index
+
+  var B : Br .
+  var V : Version .
+  var N : Node .
+  var KS : KeySet .
+
+  --- The naive store: the branch is known at creation but does NOT enter
+  --- the key, so the second branch's firing is absorbed by whichever
+  --- branch fired first.
+  crl [n-create-new] : ncreate(B, V, N) ncreated(KS)
+      => neffect(key(V, N), B) ncreated(key(V, N) ; KS)
+      if member(key(V, N), KS) = false .
+  crl [n-create-dup] : ncreate(B, V, N) ncreated(KS)
+      => ncreated(KS)
+      if member(key(V, N), KS) = true .
+
+  --- The branch-distinct store: the branch id joins the key, so branches
+  --- never dedupe against each other while repeats within one branch still
+  --- absorb into one effect.
+  crl [b-create-new] : bcreate(B, V, N) bcreated(KS)
+      => beffect(bkey(B, V, N)) bcreated(bkey(B, V, N) ; KS)
+      if member(bkey(B, V, N), KS) = false .
+  crl [b-create-dup] : bcreate(B, V, N) bcreated(KS)
+      => bcreated(KS)
+      if member(bkey(B, V, N), KS) = true .
+endm

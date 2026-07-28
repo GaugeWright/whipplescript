@@ -9,10 +9,16 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.3.1", path = "../whipplescript-core" }
 rusqlite = { version = "0.32.1", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10"
+# SHA-256 for the tracker event Merkle-DAG (ADR-0002 phase B1): content-hash
+# event ids make a tampered issue detectable, an adversarial-integrity property
+# FNV-1a content-addressing cannot provide. NOT optional: the durable-object
+# host (no-default-features, DR-0033) shares the pure hashing + DAG-conflict
+# core, so this must compile on wasm too (sha2 is pure-Rust wasm-safe).
 
 [features]
 # `native` pulls in the rusqlite-backed store impls (SqliteStore /

@@ -2,6 +2,8 @@ workflow FileStoreDemo
 workflow_contracts
   output result ref<Saved>
   failure error ref<FileError>
+uses
+  package std.files
 schemas
   class Saved
     content string
@@ -21,14 +23,14 @@ rules
     writes
       schema:Wrote
     effects
-      written kind=file.write binding=written key=69c052e4ac5ac811
-    body_hash a3e73a009d0fee04
+      written kind=file.write binding=written key=4182d64160c77f7064ef2225299f0628
+    body_hash 76f8970f1973fb03217ee60302603f83
   rule read_note
     when Wrote as wrote
     reads
       schema:Wrote
     effects
-      loaded kind=file.read binding=loaded key=5c9d19a02da2ed23
-    body_hash 30ffacebe759990f
+      loaded kind=file.read binding=loaded key=8f38a1f04585baf7b4d59f69ed94b6af
+    body_hash 9929445fcb30756f12f8fc737342ebe2
 rule_dependencies
   write_note --schema:Wrote--> read_note

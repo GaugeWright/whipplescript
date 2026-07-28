@@ -1,0 +1,23 @@
+load ../harness-class.maude
+
+--- Coverage: a context-assembly knob configures a Managed agent.
+search [1] in WHIPPLESCRIPT-HARNESS-CLASS :
+  managed compactionKnob
+  =>* managed configured .
+
+--- Coverage: a delegation knob configures a Delegated agent.
+search [1] in WHIPPLESCRIPT-HARNESS-CLASS :
+  delegated settingsKnob
+  =>* delegated configured .
+
+--- Bite: a delegation knob never configures a Managed agent. The RESIDUAL soup var
+--- makes a `configured` in ANY reachable state a solution, so No solution proves the
+--- wrong-class knob never takes effect (it is rejected, not silently applied).
+search [1] in WHIPPLESCRIPT-HARNESS-CLASS :
+  managed settingsKnob
+  =>* configured RESIDUAL:Cfg .
+
+--- Bite: a context-assembly knob never configures a Delegated agent.
+search [1] in WHIPPLESCRIPT-HARNESS-CLASS :
+  delegated compactionKnob
+  =>* configured RESIDUAL:Cfg .

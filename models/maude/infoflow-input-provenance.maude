@@ -1,0 +1,76 @@
+--- Input-side provenance narrowing at a marked crossing (DR-0027 I-IFC3
+--- refinement). A marked egress -- one whose payload is carried ENTIRELY by a
+--- `coerce ... declassified|endorsed` output -- previously inherited the whole
+--- rule read set: every confidential source in the rule needed a grant for the
+--- crossing to arm, even sources that never fed the coercion. The narrowing
+--- computes the CARRIED source set from the coercion's ARGUMENT roots: a root
+--- attributed to source S contributes S; an unattributable root (agent turn
+--- output, exec result, unrecognized binding) widens the carried set to ALL
+--- rule sources -- the fail-closed fallback, identical to the pre-narrowing
+--- behavior. The model is axis-neutral: `leak` stands for either the denied
+--- confidentiality flow, declassify grants, or the denied integrity influence,
+--- endorse grants; both narrow by the same carried-set rule.
+---
+--- Soundness shape (the field-signature discipline): the carried set never
+--- UNDER-reports. A root attributed to S contributes exactly S; an unknown
+--- root contributes EVERYTHING; so a source truly feeding the coercion is
+--- always carried (coverage), while a source with no path into the arguments
+--- is dropped only when every root is attributed (bite, the real refinement).
+--- Chaining through an intermediate unmarked coercion is an attribution detail
+--- -- its output root expands to ITS argument roots, a total mixing point --
+--- exercised by the Rust end-to-end tests; here a chained root is simply the
+--- union it resolves to.
+mod WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE is
+  protecting BOOL .
+
+  sorts Src Level Root RootList Cfg .
+  subsort Root < RootList .
+
+  ops sA sB : -> Src [ctor] .
+
+  --- two-point confidentiality lattice: hi needs a grant to cross, lo never leaks.
+  ops lo hi : -> Level [ctor] .
+
+  --- an argument root attributed to a source, or an unattributable root.
+  op rs : Src -> Root [ctor] .
+  op unknown : -> Root [ctor] .
+  op nilR : -> RootList [ctor] .
+  op _._ : Root RootList -> RootList [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- ground-truth inputs supplied per scenario. Grantedness lives INSIDE the
+  --- src constructor -- src(S, level, granted?) -- so the deny rule's condition
+  --- needs no whole-configuration lookup: an AC-extension sub-match (a rule
+  --- matching only part of the soup) then evaluates the identical condition,
+  --- which is what makes the negative searches trustworthy.
+  op src : Src Level Bool -> Cfg [ctor] . --- source, confidentiality, grant covering the sink
+  op crossing : RootList -> Cfg [ctor] .  --- the marked egress, its coercion's argument roots
+  op leak : -> Cfg [ctor] .
+  eq leak leak = leak .
+
+  var S : Src .  var L : Level .  var R : Root .  var RL : RootList .  var C : Cfg .
+
+  op mentions : RootList Src -> Bool .
+  eq mentions(nilR, S) = false .
+  eq mentions((rs(S) . RL), S) = true .
+  eq mentions((R . RL), S) = mentions(RL, S) [owise] .
+
+  op hasUnknown : RootList -> Bool .
+  eq hasUnknown(nilR) = false .
+  eq hasUnknown((unknown . RL)) = true .
+  eq hasUnknown((R . RL)) = hasUnknown(RL) [owise] .
+
+  --- S is carried by the crossing iff a root is attributed to S, OR any root is
+  --- unattributable (the fallback widens to every source -- fail-closed).
+  op carried : RootList Src -> Bool .
+  eq carried(RL, S) = hasUnknown(RL) or mentions(RL, S) .
+
+  --- The narrowed denial: a confidential source CARRIED by the marked crossing
+  --- and not covered by a grant denies the flow. A source NOT carried is not
+  --- checked against this sink at all -- the narrowing. lo sources never leak;
+  --- a granted source arms instead of leaking.
+  crl [deny] : crossing(RL) src(S, hi, false) C => crossing(RL) src(S, hi, false) C leak
+    if carried(RL, S) = true .
+endm

@@ -1,0 +1,52 @@
+load ../kernel.maude
+
+--- Bite proof for the generated no-commit checks. Each generated false-guard,
+--- error-guard, and assertion no-commit search targets event ruleCommitEvt plus
+--- a soup variable. The soup variable is what gives the check teeth: a bare
+--- event ruleCommitEvt target can never match a real multi-term state, so it is
+--- vacuously unsatisfiable and has no bite. This fixture proves the search shape
+--- stays unsatisfiable against the correct kernel and finds a counterexample the
+--- instant an unsafe rewrite lets a non-true guard or failing assertion commit.
+--- See implementation-plan.md Stage 1 acceptance for guard and assertion checks.
+
+--- Soundness: correct kernel, a false guard never reaches a commit.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guardExpr(guardedRule, issueFact, boolFalse)
+  =>*
+  event(ruleCommitEvt) RESIDUAL:Cfg .
+
+--- Soundness: correct kernel, a failing assertion never reaches a commit.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  assertionExpr(assertion1, boolFalse)
+  =>*
+  event(ruleCommitEvt) RESIDUAL:Cfg .
+
+mod WHIPPLESCRIPT-GUARD-COMMIT-BITE is
+  including WHIPPLESCRIPT-KERNEL .
+  vars F : FactId .
+  vars R : RuleId .
+  vars G : GraphId .
+  vars Ex : Expr .
+  vars A : AssertionId .
+  --- Intentionally unsafe: commit a rule ignoring its guard. A correct kernel
+  --- has no such rewrite. This models a broken guard lowering.
+  rl [unsafe-guard-commit] :
+    fact(F) rule(R, F, G) guardExpr(R, F, Ex)
+    => fact(F) rule(R, F, G) ruleFired(R, F, G) graphReady(G) event(ruleCommitEvt) .
+  --- Intentionally unsafe: reach a commit from a failing assertion checkpoint.
+  rl [unsafe-assertion-commit] :
+    assertionExpr(A, Ex)
+    => assertionDiagnostic(A) event(ruleCommitEvt) .
+endm
+
+--- Bite: with the unsafe guard rewrite the false-guard search finds it.
+search [1] in WHIPPLESCRIPT-GUARD-COMMIT-BITE :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guardExpr(guardedRule, issueFact, boolFalse)
+  =>*
+  event(ruleCommitEvt) RESIDUAL:Cfg .
+
+--- Bite: with the unsafe assertion rewrite the assertion search finds it.
+search [1] in WHIPPLESCRIPT-GUARD-COMMIT-BITE :
+  assertionExpr(assertion1, boolFalse)
+  =>*
+  event(ruleCommitEvt) RESIDUAL:Cfg .

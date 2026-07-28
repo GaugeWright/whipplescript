@@ -4,8 +4,9 @@ use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     harness::MockAgentHarness,
     idempotency_key,
+    time_pass::resolve_due_clock_sources,
     trace::check_trace,
-    AgentTurnExecution, CoerceExecution, HumanAskExecution, ProgramVersionInput, RuntimeKernel,
+    AgentTurnExecution, CoerceExecution, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_parser::compile_program;
 use whipplescript_store::{
@@ -43,6 +44,8 @@ fn e2e_compiles_and_runs_minimal_workflow() {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("commit-observe-start"),
+            marks: &[],
+            context_json: None,
         })
         .expect("minimal rule commits");
 
@@ -96,19 +99,10 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
         .any(|fact| fact.name == "schema.coerce.succeeded"));
 
     let (mut failure_kernel, failure_instance) = kernel_from_source("CoerceBranch", source);
-    let effects = [
-        effect(
-            "classification",
-            "schema.coerce",
-            r#"{"function_name":"classifyMessage"}"#,
-        ),
-        effect("fallback", "human.ask", r#"{"prompt":"classify manually"}"#),
-    ];
-    let dependencies = [dependency(
-        "dep-classification-fallback",
+    let effects = [effect(
         "classification",
-        "fails",
-        "fallback",
+        "schema.coerce",
+        r#"{"function_name":"classifyMessage"}"#,
     )];
     failure_kernel
         .commit_rule(RuleCommit {
@@ -118,9 +112,11 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
             facts: &[],
             consumed_fact_ids: &[],
             effects: &effects,
-            dependencies: &dependencies,
+            dependencies: &[],
             terminal: None,
             idempotency_key: Some("commit-classify-failure"),
+            marks: &[],
+            context_json: None,
         })
         .expect("coerce failure rule commits");
     failure_kernel
@@ -139,31 +135,12 @@ fn e2e_coerce_success_and_failure_branches_are_deterministic() {
             &FakeCoerceClient::fails("invalid classification"),
         )
         .expect("coerce failure records");
-    failure_kernel
-        .run_human_ask(HumanAskExecution {
-            instance_id: &failure_instance,
-            effect_id: "fallback",
-            run_id: "run-fallback",
-            provider: "builtin-human-review",
-            worker_id: "worker-1",
-            lease_id: "lease-fallback",
-            lease_expires_at: "2030-01-01T00:00:00Z",
-            inbox_item_id: "inbox-fallback",
-            prompt: "Classify manually.",
-            choices_json: r#"["low","normal","urgent"]"#,
-            freeform_allowed: true,
-            severity: "warning",
-            related_effects_json: r#"["classification"]"#,
-            related_artifacts_json: "[]",
-        })
-        .expect("fallback human review requested");
     assert_e2e_trace("coerce-failure", &failure_kernel);
     let failure_store = failure_kernel.into_store();
     let facts = failure_store
         .list_facts(&failure_instance)
         .expect("facts list");
     assert!(facts.iter().any(|fact| fact.name == "schema.coerce.failed"));
-    assert!(facts.iter().any(|fact| fact.name == "human.ask.created"));
 }
 
 #[test]
@@ -213,6 +190,8 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some(&idempotency_key(&[instance_id, "observe_start"])),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
     }
@@ -618,6 +597,8 @@ fn e2e_restart_rebuilds_projection_from_event_log() {
             dependencies: &dependencies,
             terminal: None,
             idempotency_key: Some("commit-recall"),
+            marks: &[],
+            context_json: None,
         })
         .expect("rule commits before restart");
 
@@ -662,6 +643,8 @@ fn e2e_repeated_dependency_claimability_stress() {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some(&format!("commit-stress-{index}")),
+                marks: &[],
+                context_json: None,
             })
             .expect("stress rule commits");
 
@@ -805,6 +788,8 @@ fn e2e_revision_queued_cancel_terminal_cancels_old_effects() {
             dependencies: &dependencies,
             terminal: None,
             idempotency_key: Some("commit-queued-revision"),
+            marks: &[],
+            context_json: None,
         })
         .expect("queued effects commit");
 
@@ -1060,6 +1045,8 @@ fn e2e_child_revision_parent_observes_terminal_output() {
                 idempotency_key: Some("child-terminal"),
             }),
             idempotency_key: Some("commit-child-terminal"),
+            marks: &[],
+            context_json: None,
         })
         .expect("child workflow completes");
     kernel
@@ -1102,6 +1089,88 @@ fn e2e_child_revision_parent_observes_terminal_output() {
         .expect("child loads")
         .expect("child exists");
     assert_eq!(child.status, "completed");
+}
+
+#[test]
+fn e2e_at_form_clock_source_fires_once_then_stays_quiet() {
+    // `at <hh:mm>` is one scheduled occurrence (spec/std-time.md "Recurrence
+    // Forms", slice T3): the first upcoming occurrence of that time-of-day
+    // fires exactly once, then the source stays quiet — later worker passes,
+    // including one a full day later (past the next occurrence of the same
+    // time-of-day), must not refire it.
+    let source = r#"@service
+workflow ClockAtOnce
+
+signal wake.tick {
+  scheduled_at time
+  observed_at time
+  occurrence_id string
+  missed_count int
+  schedule_name string
+}
+
+source clock as wake_once {
+  at 09:00
+
+  observe as tick
+  emit wake.tick {
+    scheduled_at tick.scheduled_at
+    observed_at tick.observed_at
+    occurrence_id tick.occurrence_id
+    missed_count tick.missed_count
+    schedule_name tick.schedule_name
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("clock source compiles");
+    let (mut kernel, instance_id) = kernel_from_source("ClockAtOnce", source);
+
+    let first = resolve_due_clock_sources(&mut kernel, &instance_id, "2030-01-02T12:00:00Z", &ir)
+        .expect("first worker pass resolves");
+    assert_eq!(first, 1, "the at-form source fires exactly once when due");
+    let second = resolve_due_clock_sources(&mut kernel, &instance_id, "2030-01-03T12:00:00Z", &ir)
+        .expect("second worker pass resolves");
+    assert_eq!(
+        second, 0,
+        "a pass past the next day's occurrence of the same time-of-day must not refire"
+    );
+    let much_later =
+        resolve_due_clock_sources(&mut kernel, &instance_id, "2031-06-01T12:00:00Z", &ir)
+            .expect("much later worker pass resolves");
+    assert_eq!(much_later, 0, "the one-shot source stays quiet forever");
+
+    // Exactly one durable signal fact was admitted, carrying the full declared
+    // ClockObservation field set including `schedule_name` (slice T2).
+    let store = kernel.into_store();
+    let facts = store.list_facts(&instance_id).expect("facts list");
+    let ticks: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.name == "wake.tick")
+        .collect();
+    assert_eq!(ticks.len(), 1, "exactly one admitted occurrence: {ticks:?}");
+    let payload: serde_json::Value =
+        serde_json::from_str(&ticks[0].value_json).expect("tick payload is JSON");
+    for field in [
+        "scheduled_at",
+        "observed_at",
+        "occurrence_id",
+        "missed_count",
+        "schedule_name",
+    ] {
+        assert!(
+            !payload.get(field).is_none_or(serde_json::Value::is_null),
+            "observation field `{field}` missing from payload: {payload}"
+        );
+    }
+    assert_eq!(
+        payload
+            .get("schedule_name")
+            .and_then(serde_json::Value::as_str),
+        Some("wake_once"),
+        "schedule_name carries the source's declared name: {payload}"
+    );
 }
 
 fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {
@@ -1191,6 +1260,8 @@ fn commit_single_effect(
             dependencies: &[],
             terminal: None,
             idempotency_key: Some(&commit_key),
+            marks: &[],
+            context_json: None,
         })
         .expect("single effect commits");
 }
@@ -1249,4 +1320,307 @@ fn assert_e2e_trace(name: &str, kernel: &RuntimeKernel) {
             violation
         )
     });
+}
+
+#[test]
+fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
+    // Handler honesty (spec/std-coord.md v1 slice 2): hand-crafted (forged)
+    // coordination inputs missing the numeric fields well-formed lowering
+    // always emits from the declaration must FAIL with the DR-0032 typed
+    // base -- never run under the old smuggled defaults
+    // (slots=1 / ttl=600 / retain=86400 / cap=0).
+    use whipplescript_kernel::effect_handlers::run_coordination_effect_generic;
+    use whipplescript_store::native_stores::NativeStores;
+    use whipplescript_store::{ClaimableEffect, RuntimeStore};
+
+    let dir = std::env::temp_dir().join(format!("whip-e2e-coord-honesty-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir creates");
+    let stores = NativeStores::open(
+        dir.join("rt.sqlite"),
+        dir.join("coord.sqlite"),
+        dir.join("items.sqlite"),
+    )
+    .expect("stores open");
+    let mut kernel = RuntimeKernel::new(stores);
+    // The native admission gate is REAL for coordination kinds (std.coord
+    // slice 4): mirror production, where the embedded manifest registers at
+    // store init.
+    kernel
+        .store()
+        .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+        .expect("std.coord manifest registers");
+    let version = kernel
+        .create_program_version(ProgramVersionInput {
+            program_name: "CoordHonesty",
+            source_hash: "source",
+            ir_hash: "ir",
+            compiler_version: "e2e",
+        })
+        .expect("program version creates");
+    let instance_id = kernel
+        .create_instance(&version, "{}")
+        .expect("instance creates");
+
+    let cases = [
+        (
+            "acq-forged",
+            "lease.acquire",
+            r#"{"resource":"gate","key":"k"}"#,
+            "slots",
+        ),
+        (
+            "cons-forged",
+            "counter.consume",
+            r#"{"counter":"c","key":"k","reset":"daily","cap":5}"#,
+            "amount",
+        ),
+        (
+            "app-forged",
+            "ledger.append",
+            r#"{"ledger":"l","partition":"p","entry":{"n":1},"schema":"E"}"#,
+            "retain_seconds",
+        ),
+    ];
+    for (effect_id, kind, input_json, missing_field) in cases {
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: &instance_id,
+                rule: "forged",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[NewEffect {
+                    timeout_seconds: None,
+                    effect_id,
+                    kind,
+                    target: None,
+                    input_json,
+                    status: "queued",
+                    idempotency_key: effect_id,
+                    required_capabilities_json: "[]",
+                    profile: None,
+                    correlation_id: None,
+                    source_span_json: None,
+                }],
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some(effect_id),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("forged effect commits");
+        let claimable = ClaimableEffect {
+            effect_id: effect_id.to_owned(),
+            kind: kind.to_owned(),
+            target: None,
+            profile: None,
+            input_json: input_json.to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        run_coordination_effect_generic(
+            &mut kernel,
+            &instance_id,
+            &claimable,
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("handler settles the malformed effect (typed failure, not a store error)");
+        let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+        let failed = facts
+            .iter()
+            .find(|fact| fact.name == format!("{kind}.failed"))
+            .unwrap_or_else(|| panic!("{kind} must derive a typed .failed fact"));
+        assert!(
+            failed.value_json.contains(missing_field),
+            "{kind} failure names the missing `{missing_field}`: {}",
+            failed.value_json
+        );
+        assert!(
+            failed.value_json.contains("\"reason\""),
+            "{kind} failure carries the DR-0032 base: {}",
+            failed.value_json
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
+    // std.coord slice 3: the consume outcome records the period it resolved
+    // against, computed from the INJECTED pass instant in the counter's
+    // declared timezone -- never from the wall clock -- so replay re-reads
+    // the recorded boundary instead of re-deriving one.
+    use whipplescript_kernel::effect_handlers::{counter_period, run_coordination_effect_generic};
+    use whipplescript_store::native_stores::NativeStores;
+    use whipplescript_store::{ClaimableEffect, RuntimeStore};
+
+    // DST spring-forward, America/New_York 2026-03-08: 02:00 local is skipped.
+    // 06:30Z is 01:30 EST; 07:30Z is 03:30 EDT -- hourly periods must jump
+    // 01 -> 03 with no 02 period ever minted.
+    assert_eq!(
+        counter_period("hourly", "America/New_York", "2026-03-08T06:30:00Z"),
+        Some("2026-03-08T01".to_owned())
+    );
+    assert_eq!(
+        counter_period("hourly", "America/New_York", "2026-03-08T07:30:00Z"),
+        Some("2026-03-08T03".to_owned())
+    );
+    // A daily boundary anchored west of UTC: 05:00Z on Jan 1 is still Dec 31
+    // in Los Angeles.
+    assert_eq!(
+        counter_period("daily", "America/Los_Angeles", "2026-01-01T05:00:00Z"),
+        Some("2025-12-31".to_owned())
+    );
+    // Unknown zone or unparseable instant is malformed, not defaulted.
+    assert_eq!(
+        counter_period("daily", "Mars/Olympus", "2026-01-01T05:00:00Z"),
+        None
+    );
+    assert_eq!(counter_period("daily", "UTC", "not-a-time"), None);
+
+    let dir = std::env::temp_dir().join(format!("whip-e2e-coord-tz-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("temp dir creates");
+    let stores = NativeStores::open(
+        dir.join("rt.sqlite"),
+        dir.join("coord.sqlite"),
+        dir.join("items.sqlite"),
+    )
+    .expect("stores open");
+    let mut kernel = RuntimeKernel::new(stores);
+    // The native admission gate is REAL for coordination kinds (std.coord
+    // slice 4): mirror production, where the embedded manifest registers at
+    // store init.
+    kernel
+        .store()
+        .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+        .expect("std.coord manifest registers");
+    let version = kernel
+        .create_program_version(ProgramVersionInput {
+            program_name: "CoordTz",
+            source_hash: "source",
+            ir_hash: "ir",
+            compiler_version: "e2e",
+        })
+        .expect("program version creates");
+    let instance_id = kernel
+        .create_instance(&version, "{}")
+        .expect("instance creates");
+
+    let consume_input = r#"{"counter":"quota","key":"k","amount":1,"cap":5,"reset":"daily","timezone":"America/Los_Angeles"}"#;
+    kernel
+        .commit_rule(whipplescript_store::RuleCommit {
+            instance_id: &instance_id,
+            rule: "spend",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[whipplescript_store::NewEffect {
+                timeout_seconds: None,
+                effect_id: "consume-1",
+                kind: "counter.consume",
+                target: None,
+                input_json: consume_input,
+                status: "queued",
+                idempotency_key: "consume-1",
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+            }],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("consume-1"),
+            marks: &[],
+            context_json: None,
+        })
+        .expect("consume commits");
+    let claimable = ClaimableEffect {
+        effect_id: "consume-1".to_owned(),
+        kind: "counter.consume".to_owned(),
+        target: None,
+        profile: None,
+        input_json: consume_input.to_owned(),
+        required_capabilities_json: "[]".to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    // The injected instant deliberately disagrees with today's wall clock:
+    // the recorded period must come from it, proving no wall-clock read.
+    run_coordination_effect_generic(
+        &mut kernel,
+        &instance_id,
+        &claimable,
+        "2026-01-01T05:00:00Z",
+    )
+    .expect("consume settles");
+    let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+    let completed = facts
+        .iter()
+        .find(|fact| fact.name == "counter.consume.completed")
+        .expect("consume completes");
+    assert!(
+        completed.value_json.contains(r#""period":"2025-12-31""#),
+        "outcome records the tz-anchored period it resolved against: {}",
+        completed.value_json
+    );
+
+    // The other standing hole: a runtime ledger.append e2e -- the handler
+    // appends and the completed fact carries the minted seq.
+    let append_input = r#"{"ledger":"audit","partition":"p1","entry":{"n":1},"schema":"E","retain_seconds":86400}"#;
+    kernel
+        .commit_rule(whipplescript_store::RuleCommit {
+            instance_id: &instance_id,
+            rule: "log",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &[whipplescript_store::NewEffect {
+                timeout_seconds: None,
+                effect_id: "append-1",
+                kind: "ledger.append",
+                target: None,
+                input_json: append_input,
+                status: "queued",
+                idempotency_key: "append-1",
+                required_capabilities_json: "[]",
+                profile: None,
+                correlation_id: None,
+                source_span_json: None,
+            }],
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("append-1"),
+            marks: &[],
+            context_json: None,
+        })
+        .expect("append commits");
+    let claimable = ClaimableEffect {
+        effect_id: "append-1".to_owned(),
+        kind: "ledger.append".to_owned(),
+        target: None,
+        profile: None,
+        input_json: append_input.to_owned(),
+        required_capabilities_json: "[]".to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    run_coordination_effect_generic(
+        &mut kernel,
+        &instance_id,
+        &claimable,
+        "2026-01-01T05:00:00Z",
+    )
+    .expect("append settles");
+    let facts = kernel.store().list_facts(&instance_id).expect("facts list");
+    let appended = facts
+        .iter()
+        .find(|fact| fact.name == "ledger.append.completed")
+        .expect("append completes");
+    assert!(
+        appended.value_json.contains(r#""variant":"Appended""#)
+            && appended.value_json.contains(r#""seq":1"#),
+        "append completes with the minted seq: {}",
+        appended.value_json
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

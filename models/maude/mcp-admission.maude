@@ -1,0 +1,140 @@
+--- MCP tool admission for the built-in (owned) harness, per
+--- spec/mcp-support-design-note.md section 11. The model is the admission
+--- function that decides which tools of an external MCP server are exposed to
+--- the model in one brokered turn:
+---
+---   exposed = grant INTERSECT offered INTERSECT profile
+---
+--- guarded by three FAIL-CLOSED prechecks that run before any tool is admitted:
+---
+---   1. the governance envelope's minimum rung  section 6 of the note;
+---   2. pin drift  a pinned manifest that no longer matches fails the WHOLE
+---      admission rather than silently narrowing to the surviving intersection;
+---   3. role-shaped grants below rung 2, which are a setup error rather than an
+---      empty success  a role has no admitted meaning until someone attested
+---      the server's annotations or wrote a classification.
+---
+--- The trust ladder is r0 unattested, r1 pinned, r2 annotations-admitted,
+--- r3 admin-classified. Note that plain rung monotonicity is FALSE by design and
+--- deliberately not modeled: climbing the ladder both adds refusals (the drift
+--- check switches on at r1) and unlocks vocabulary (role grants resolve at r2).
+--- The honest invariant, checked in tests as name-grant rung-invariance, is that
+--- an ENUMERATED-NAME grant means the same thing at every rung when nothing has
+--- drifted; rigor only ever adds failure modes, it never silently redefines a
+--- grant that already parsed.
+mod WHIPPLESCRIPT-MCP-ADMISSION is
+  protecting BOOL .
+  protecting NAT .
+
+  sorts Tool ToolSet Rung Phase Reason Cfg .
+  subsort Tool < ToolSet .
+
+  --- Fixture tool names drawn from the servers probed in the design note:
+  --- github's getIssue/createIssue/mergePR and the reference server's getEnv
+  --- the tool annotated read-only that returns every environment variable.
+  ops getIssue createIssue mergePR getEnv : -> Tool [ctor] .
+
+  op mt : -> ToolSet [ctor] .
+  op _;_ : ToolSet ToolSet -> ToolSet [ctor assoc comm id: mt] .
+  eq [tool-idem] : T:Tool ; T:Tool = T:Tool .
+
+  op member : Tool ToolSet -> Bool .
+  eq member(T:Tool, (T:Tool ; S:ToolSet)) = true .
+  eq member(T:Tool, S:ToolSet) = false [owise] .
+
+  --- The trust ladder, ordered.
+  ops r0 r1 r2 r3 : -> Rung [ctor] .
+  op level : Rung -> Nat .
+  eq level(r0) = 0 .
+  eq level(r1) = 1 .
+  eq level(r2) = 2 .
+  eq level(r3) = 3 .
+  op geq : Rung Rung -> Bool .
+  eq geq(A:Rung, B:Rung) = level(A:Rung) >= level(B:Rung) .
+
+  ops checkEnvelope checkDrift checkRole admitting done : -> Phase [ctor] .
+  ops envelopeRung pinDrift roleUnavailable : -> Reason [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op phase : Phase -> Cfg [ctor] .
+  op offered : ToolSet -> Cfg [ctor] .      --- what the server's tools/list returned
+  op profile : ToolSet -> Cfg [ctor] .      --- profile/registry-permitted tools
+  op classified : ToolSet -> Cfg [ctor] .   --- tools carrying an admitted classification
+  op drift : ToolSet -> Cfg [ctor] .        --- tools whose pinned hashes no longer match
+  op rung : Rung -> Cfg [ctor] .            --- the server's attained rung
+  op minRung : Rung -> Cfg [ctor] .         --- the envelope's required rung
+  op names : ToolSet -> Cfg [ctor] .        --- enumerated-name grant, still to process
+  op role : ToolSet -> Cfg [ctor] .         --- role-shaped grant: the role's member tools
+  op exposed : ToolSet -> Cfg [ctor] .      --- computed tool surface for this turn
+  op denied : Reason -> Cfg [ctor] .
+
+  --- Pin drift bites only once a pin exists: at r0 there is nothing to drift from.
+  op pinBroken : Rung ToolSet -> Bool .
+  eq pinBroken(R:Rung, D:ToolSet) = geq(R:Rung, r1) and D:ToolSet =/= mt .
+
+  --- A non-empty role grant below r2 has no admitted meaning.
+  op roleBlocked : Rung ToolSet -> Bool .
+  eq roleBlocked(R:Rung, S:ToolSet) = S:ToolSet =/= mt and geq(R:Rung, r2) == false .
+
+  op admissible : Tool ToolSet ToolSet -> Bool .
+  eq admissible(T:Tool, O:ToolSet, P:ToolSet) =
+     member(T:Tool, O:ToolSet) and member(T:Tool, P:ToolSet) .
+
+  vars O P C D G S E : ToolSet .
+  vars R M : Rung .
+  var T : Tool .
+
+  --- Precheck 1: a server below the envelope's minimum rung exposes nothing. The
+  --- grant is consumed so no later rule can admit from it.
+  crl [envelope-deny] : phase(checkEnvelope) rung(R) minRung(M) names(G) role(S)
+      => phase(done) rung(R) minRung(M) names(mt) role(mt) denied(envelopeRung)
+      if geq(R, M) = false .
+
+  crl [envelope-ok] : phase(checkEnvelope) rung(R) minRung(M)
+      => phase(checkDrift) rung(R) minRung(M)
+      if geq(R, M) = true .
+
+  --- Precheck 2: drift fails the whole admission. It must NOT degrade into
+  --- exposing whatever still matches.
+  crl [drift-deny] : phase(checkDrift) rung(R) drift(D) names(G) role(S)
+      => phase(done) rung(R) drift(D) names(mt) role(mt) denied(pinDrift)
+      if pinBroken(R, D) = true .
+
+  crl [drift-ok] : phase(checkDrift) rung(R) drift(D)
+      => phase(checkRole) rung(R) drift(D)
+      if pinBroken(R, D) = false .
+
+  --- Precheck 3: a role-shaped grant below r2 is a setup error, not an empty
+  --- success  the denial is observable in the final state.
+  crl [role-deny] : phase(checkRole) rung(R) names(G) role(S)
+      => phase(done) rung(R) names(mt) role(mt) denied(roleUnavailable)
+      if roleBlocked(R, S) = true .
+
+  crl [role-ok] : phase(checkRole) rung(R) role(S)
+      => phase(admitting) rung(R) role(S)
+      if roleBlocked(R, S) = false .
+
+  --- Role expansion admits only CLASSIFIED tools; an unclassified tool is
+  --- dropped, so a role can never reach a tool nobody classified.
+  crl [role-keep] : phase(admitting) role(T ; S) names(G) classified(C)
+      => phase(admitting) role(S) names(T ; G) classified(C)
+      if member(T, C) = true .
+
+  crl [role-drop] : phase(admitting) role(T ; S) classified(C)
+      => phase(admitting) role(S) classified(C)
+      if member(T, C) = false .
+
+  --- The intersection proper.
+  crl [admit] : phase(admitting) names(T ; G) exposed(E) offered(O) profile(P)
+      => phase(admitting) names(G) exposed(T ; E) offered(O) profile(P)
+      if admissible(T, O, P) = true .
+
+  crl [refuse] : phase(admitting) names(T ; G) offered(O) profile(P)
+      => phase(admitting) names(G) offered(O) profile(P)
+      if admissible(T, O, P) = false .
+
+  rl [finish] : phase(admitting) names(mt) role(mt)
+      => phase(done) names(mt) role(mt) .
+endm

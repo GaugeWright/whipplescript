@@ -1,0 +1,76 @@
+load ../infoflow-reader-sets.maude
+
+--- Delegation context theta: operator > bankRole, operator > emailRole, and
+--- operator > auditRole, so operator acts-for all three compartments, while
+--- bankRole, emailRole and auditRole are pairwise INCOMPARABLE. public acts-for
+--- no one. The constant context for every search below.
+
+--- ============================ COVERAGE (leak reachable) =====================
+
+--- Coverage: a single-compartment source not covered. src readable by {bankRole}
+--- reaching a sink readable by {emailRole} leaks; emailRole does not act-for
+--- bankRole. (The singleton case --- the legacy single-role check.)
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, bankRole) label(snk, emailRole)
+  =>* C:Cfg leak .
+
+--- Coverage: THE set bite. A single resource whose label is the SET
+--- {bankRole, emailRole} --- readable only by parties cleared for BOTH --- reaching
+--- a sink readable by {bankRole} leaks: the sink does not dominate the source,
+--- because emailRole is covered by no compartment of the sink. A single-role label
+--- cannot express "requires clearance for both"; the set can. This is the union
+--- join (ReaderSets.canRead_append) failing at an under-cleared sink.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, (bankRole , emailRole)) label(snk, bankRole)
+  =>* C:Cfg leak .
+
+--- Coverage: a public sink (empty reader set) cannot dominate any non-public
+--- source. src {bankRole} reaching snk {} leaks --- noP covers nothing.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, bankRole) label(snk, noP)
+  =>* C:Cfg leak .
+
+--- Coverage: a partial cover still leaks. src {bankRole, emailRole} reaching a sink
+--- {bankRole, auditRole} leaks on emailRole --- covering SOME compartments is not
+--- enough; dominates is universal over the required set.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, (bankRole , emailRole)) label(snk, (bankRole , auditRole))
+  =>* C:Cfg leak .
+
+--- ============================ BITE (no leak) ================================
+
+--- Bite: a higher authority dominates the whole set. src {bankRole, emailRole}
+--- reaching a sink {operator} is safe; operator acts-for both compartments, so the
+--- singleton sink set covers every source compartment. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, (bankRole , emailRole)) label(snk, operator)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the sink set covers the source set compartment-wise. src
+--- {bankRole, emailRole} to a sink {bankRole, emailRole} is safe --- each required
+--- compartment is covered reflexively. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, (bankRole , emailRole)) label(snk, (bankRole , emailRole))
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a public source never leaks. src {} reaching any sink is safe --- the
+--- empty required set is vacuously dominated (ReaderSets.canRead_nil). No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, noP) label(snk, bankRole)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a richer sink set still dominates. src {bankRole} to a sink
+--- {bankRole, emailRole} is safe --- adding sink compartments only adds covering
+--- candidates, never removes one (dominates is monotone in the provider set). No
+--- solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-READER-SETS :
+  deleg((operator > bankRole) | (operator > emailRole) | (operator > auditRole))
+  flow(src, snk) label(src, bankRole) label(snk, (bankRole , emailRole))
+  =>* leak RESIDUAL:Cfg .

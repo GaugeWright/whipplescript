@@ -1,0 +1,115 @@
+--- Typed effect failures: the EffectError discriminated family. See
+--- spec/decision-records/0032-typed-effect-failures.md. Effect failure is a closed
+--- family with a common BASE shared by every effect kind plus per-kind EXTRAS,
+--- narrowed by the STATIC effect kind at the failure-observation site (after
+--- <effect> fails as f). This is the no-generics translation of Gleam's
+--- Result(value, error): a finite-tag family, not a type parameter.
+---
+--- This model abstracts the failure-typing checker and pins the four invariants
+--- DR-0032 commits to. It is held to bite -- negative fixtures reach a reject
+--- marker -- and to not over-fire -- good fixtures reach no reject marker, proven
+--- non-vacuously with a RESIDUAL soup var. Invariants:
+---   base-present: a failure value declared WITHOUT a base field is rejected -- the
+---     wire-consistency contract D2 every effect kind carries the base;
+---   static-narrow: a read f.F at a site narrowed to kind K is well-typed iff F is in
+---     K's schema base ; extras-of-K -- the kind comes from the effect, not a runtime
+---     tag;
+---   extras-behind-narrowing: the LOAD-BEARING additivity invariant -- reading an
+---     extra with NO narrowing in scope is rejected, so an extra is reachable only
+---     through the matching kind narrowing. This is why adding a variant's extras
+---     later cannot change any existing base read = non-breaking by construction;
+---   observer-only: user code may eliminate an EffectError, never construct one.
+---
+--- P3 (language-refinement DQ-2, 2026-07-21): the real v1 variants are built.
+--- execK adds rExit (exit_code); coerceK adds rClass (error_class) and rStatus
+--- (http_status); tellK adds rClass. invokeK narrows to the CHILD's declared
+--- failure class (dynamic per program), which is beyond this fixed alphabet --
+--- the checker-side rule is the same static-narrow judgment. kind is a base
+--- field per resolved Q1.
+mod WHIPPLESCRIPT-EFFECT-ERROR is
+  protecting BOOL .
+
+  sorts Kind Field FieldSet Cfg .
+  subsort Field < FieldSet .
+
+  --- effect kinds with v1 variants; timerK stays base-only .
+  ops coerceK execK tellK timerK : -> Kind [ctor] .
+
+  --- base fields reason..kind, plus the v1 per-kind extras .
+  ops reason summary effectId runId kind rExit rClass rStatus : -> Field [ctor] .
+
+  op mt : -> FieldSet [ctor] .
+  op _;_ : FieldSet FieldSet -> FieldSet [ctor assoc comm id: mt] .
+  eq [field-idem] : F:Field ; F:Field = F:Field .
+
+  op inSet : Field FieldSet -> Bool .
+  eq inSet(F:Field, (F:Field ; S:FieldSet)) = true .
+  eq inSet(F:Field, S:FieldSet) = false [owise] .
+
+  --- the common base every effect failure carries, kind included per Q1 .
+  op base : -> FieldSet .
+  eq base = reason ; summary ; effectId ; runId ; kind .
+
+  --- per-kind extras, the ruled v1 field set .
+  op extrasOf : Kind -> FieldSet .
+  eq extrasOf(execK) = rExit .
+  eq extrasOf(coerceK) = rClass ; rStatus .
+  eq extrasOf(tellK) = rClass .
+  eq extrasOf(timerK) = mt .
+
+  --- the kind's failure schema = base ; extras-of-kind .
+  op schemaOf : Kind -> FieldSet .
+  eq schemaOf(K:Kind) = base ; extrasOf(K:Kind) .
+
+  op inBase : Field -> Bool .
+  eq inBase(F:Field) = inSet(F:Field, base) .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- program facts .
+  --- read K F: a field read f.F at a site statically narrowed to kind K .
+  op read : Kind Field -> Cfg [ctor] .
+  --- baseRead F: a field read with NO kind narrowing in scope the un-narrowed
+  --- failure context, where only base fields are observable .
+  op baseRead : Field -> Cfg [ctor] .
+  --- constructs K: user code tries to CONSTRUCT an EffectError of kind K .
+  op constructs : Kind -> Cfg [ctor] .
+  --- missingBase K F: a failure value of kind K declared WITHOUT field F .
+  op missingBase : Kind Field -> Cfg [ctor] .
+
+  --- reject markers the checker derives .
+  op rejectFieldNotInSchema : Kind Field -> Cfg [ctor] .
+  op rejectExtraUnnarrowed : Field -> Cfg [ctor] .
+  op rejectConstruct : Kind -> Cfg [ctor] .
+  op rejectMissingBase : Kind Field -> Cfg [ctor] .
+
+  vars K : Kind .
+  vars F : Field .
+
+  --- static-narrow: a read narrowed to K of a field not in K's schema is rejected. A
+  --- base field is in every schema so it is always accepted a different kind's extra
+  --- is not.
+  crl [field-not-in-schema] :
+      read(K, F)
+      => read(K, F) rejectFieldNotInSchema(K, F)
+      if inSet(F, schemaOf(K)) = false .
+
+  --- extras-behind-narrowing the additivity invariant: an un-narrowed read of a
+  --- non-base field is rejected, so an extra is reachable only under narrowing.
+  crl [extra-unnarrowed] :
+      baseRead(F)
+      => baseRead(F) rejectExtraUnnarrowed(F)
+      if inBase(F) = false .
+
+  --- observer-only: constructing an EffectError in user code is rejected .
+  rl [observer-only] :
+      constructs(K)
+      => constructs(K) rejectConstruct(K) .
+
+  --- base-present: a failure value that omits a base field is rejected wire D2 .
+  crl [missing-base] :
+      missingBase(K, F)
+      => missingBase(K, F) rejectMissingBase(K, F)
+      if inBase(F) = true .
+endm

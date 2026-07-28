@@ -368,10 +368,6 @@ impl RuntimeStore for NativeStores {
         self.runtime.record_claude_agent_sdk_evidence(evidence)
     }
 
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        self.runtime.record_pi_rpc_evidence(evidence)
-    }
-
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         self.runtime.link_evidence(link)
     }
@@ -416,26 +412,6 @@ impl RuntimeStore for NativeStores {
         self.runtime.effect_source_span_json(instance_id, effect_id)
     }
 
-    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
-        self.runtime.create_inbox_item(item)
-    }
-
-    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
-        self.runtime.list_inbox_items(status)
-    }
-
-    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
-        self.runtime.get_inbox_item(inbox_item_id)
-    }
-
-    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
-        self.runtime.answer_inbox_item(answer)
-    }
-
-    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
-        self.runtime.cancel_pending_inbox_for_instance(instance_id)
-    }
-
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
         self.runtime.record_skill_evidence(evidence)
     }
@@ -467,6 +443,15 @@ impl RuntimeStore for NativeStores {
 
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         self.runtime.list_events(instance_id)
+    }
+
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.runtime
+            .event_by_idempotency_key(instance_id, idempotency_key)
     }
 
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
@@ -557,6 +542,10 @@ impl RuntimeStore for NativeStores {
 
     fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
         self.runtime.retire_fact(instance_id, fact_id)
+    }
+
+    fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.runtime.revive_fact(instance_id, fact_id)
     }
 
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
@@ -660,8 +649,39 @@ impl Coordination for NativeStores {
             .consume_for_owner(owner, counter, key, amount, cap, period)
     }
 
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        self.coord.current_period(reset)
+    fn append_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: &str,
+    ) -> StoreResult<i64> {
+        self.coord.append_for_owner_idempotent(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+            effect_id,
+        )
+    }
+
+    fn consume_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.coord
+            .consume_for_owner_idempotent(owner, counter, key, amount, cap, period, effect_id)
     }
 
     fn list_leases_for_owner(
@@ -720,8 +740,13 @@ impl WorkItems for NativeStores {
         self.items.ready_items(queue)
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        self.items.claim_item(item_id, claimed_by)
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        self.items.claim_item(item_id, claimed_by, expires)
     }
 
     fn renew_claim(

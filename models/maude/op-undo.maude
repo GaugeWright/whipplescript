@@ -1,0 +1,55 @@
+--- Workspace-operation undo, per spec/versioned-workspace-research-note.md
+--- 7.3 (jj import: op-level undo is a front-and-center verb) and the
+--- untie-substrate readiness tracker Phase 2. The op log records every
+--- verb's before/after branch heads; undo-op re-points the touched heads
+--- to the recorded before-state AS A NEW OP -- history is append-only,
+--- undo-of-undo is trivial, and nothing is ever deleted.
+---
+--- Two undoers over one op log. The NAIVE undoer re-points
+--- unconditionally: if another operation moved the head since, its work
+--- is silently clobbered -- the modeled hazard (git reset --hard's
+--- disaster mode). The GUARDED undoer fires only while the branch head
+--- still equals the op's recorded after-state; a moved head is an honest
+--- refusal, never a lost update.
+mod WHIPPLESCRIPT-OP-UNDO is
+  sorts Oid Bid Head Cfg .
+
+  ops o1 o2 : -> Oid [ctor] .
+  op comp : Oid -> Oid [ctor] .   --- the compensating op undo appends
+  op b1 : -> Bid [ctor] .
+  ops h0 h1 h2 : -> Head [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op br : Bid Head -> Cfg [ctor] .            --- branch head pointer
+  op rec : Oid Bid Head Head -> Cfg [ctor] .  --- op record: before, after
+  op undoReq : Oid -> Cfg [ctor] .
+  op naiveReq : Oid -> Cfg [ctor] .
+  op refusedUndo : Oid -> Cfg [ctor] .
+
+  var O : Oid .
+  var B : Bid .
+  vars HB HA H : Head .
+
+  --- The naive undoer: re-points to the before-state no matter where the
+  --- head is now. That blindness is the modeled hazard.
+  rl [naive-undo] :
+      naiveReq(O) rec(O, B, HB, HA) br(B, H)
+      => rec(O, B, HB, HA) br(B, HB) .
+
+  --- The guarded undoer: fires only while the head still equals the
+  --- op's after-state, appends the compensating op (the original record
+  --- SURVIVES -- the log is append-only), and re-points.
+  crl [guarded-undo] :
+      undoReq(O) rec(O, B, HB, HA) br(B, H)
+      => rec(O, B, HB, HA) rec(comp(O), B, HA, HB) br(B, HB)
+      if H == HA .
+
+  --- A moved head is an honest refusal: the op stays recorded, the head
+  --- stays where later work put it.
+  crl [guarded-refuse] :
+      undoReq(O) rec(O, B, HB, HA) br(B, H)
+      => rec(O, B, HB, HA) refusedUndo(O) br(B, H)
+      if H =/= HA .
+endm

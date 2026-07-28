@@ -24,15 +24,6 @@ use whipplescript_core::json::{require_json_array_field, required_json_string};
 // The pure, wasm-kernel-hostable package-registry parse + validation core, lifted
 // out of this binary (S7 Step 3). The filesystem-coupled DR-0025 `@tool`
 // attestation and the embedded std manifest bytes stay in the CLI below.
-#[cfg(feature = "claude")]
-use whipplescript_kernel::claude_agent_sdk::{
-    ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
-    WHIP_SIDECAR_PROTOCOL,
-};
-#[cfg(feature = "codex")]
-use whipplescript_kernel::codex_app_server::{
-    CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
-};
 use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::{
@@ -43,14 +34,13 @@ use whipplescript_kernel::{
     idempotency_key,
     instance_machine::{EffectStep, InstanceDriver},
     lowering::{BranchReport, BranchStatus},
-    pi_rpc::{PiRpcAdapter, PiRpcClient, StdioPiRpcTransport},
     program_analysis_summary_json,
     provider::{
         builtin_provider_capabilities, validate_provider_binding, validate_provider_binding_json,
-        AdapterSurface, CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
+        CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
         NativeProviderEventKind, NativeProviderTurnRequest, ProviderBindingConfig,
-        ProviderCapability, ProviderKind, ProviderValidationResult, ProviderValidationStatus,
+        ProviderCapability, ProviderValidationResult, ProviderValidationStatus,
     },
     // The pure rule-lowering closure (`lower_rule`/`ready_contexts` + helpers +
     // their support types), lifted into the wasm-clean kernel (DR-0033 chunk 1b).
@@ -73,20 +63,28 @@ use whipplescript_parser::{
     parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
     EffectStatus as TestEffectStatus, ExpectTarget, Expr, ExprLiteral, ExprObjectField,
     FormatOutput, GivenClause, HarnessClass, IrConstructUse, IrEffectDependency, IrEffectKind,
-    IrEffectNode, IrExecTarget, IrInclude, IrPrimitiveType, IrProgram, IrProjectionRead, IrRule,
-    IrSchema, IrTest, IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind,
-    QueryKind, RuleStatus, RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+    IrEffectNode, IrExecTarget, IrInclude, IrProgram, IrProjectionRead, IrRule, IrSchema, IrTest,
+    IrType, IrWorkflowContract, IrWorkflowContractKind, Item, ProjQueryKind, QueryKind, RuleStatus,
+    RunKind, SourceSpan, StubPayload, TestClause, TestField, UnaryOp,
+};
+#[cfg(feature = "claude")]
+use whipplescript_provider_claude::{
+    ClaudeAgentSdkAdapter, ClaudeAgentSdkClient, StdioClaudeAgentSdkTransport,
+    WHIP_SIDECAR_PROTOCOL,
+};
+#[cfg(feature = "codex")]
+use whipplescript_provider_codex::{
+    CodexAppServerAdapter, CodexAppServerClient, StdioCodexAppServerTransport,
 };
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
     ClaimableEffect, ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView,
     EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
-    EvidenceRecord, EvidenceView, FactView, HumanAnswer, InboxItemView, InstanceView, NewEvent,
-    NewFact, NewInboxItem, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
-    RestoreDecision, RetryEffect, RevisionActivation, RevisionCancellationImpact,
-    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart,
-    RunView, RuntimeStore, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
-    WorkflowRevisionView,
+    EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent, NewFact, NewInstanceAuthority,
+    NewWorkflowInvocation, ProviderValidationEvidence, RestoreDecision, RetryEffect,
+    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
+    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
+    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -102,6 +100,8 @@ mod coerce_runtime;
 mod exec_server;
 mod harness_tools;
 mod improve;
+mod mcp_tools;
+mod model_auth;
 mod project_context;
 mod skills_loader;
 mod turn_server;
@@ -176,7 +176,15 @@ fn main() -> ExitCode {
         Some("package") => package(&options),
         Some("check") => check(&options),
         Some("gov") => gov(&options),
-        Some("agent") => whip_agent(&options),
+        Some("infoflow") => whip_infoflow(&options),
+        // The IFC REPL moved to `whip infoflow` (spec/std-agent.md "Operator
+        // CLI", ecosystem shape "Names"): a one-way rename with no alias, so the
+        // `whip agent`/`whip agents` namespace belongs to std.agent.
+        Some("agent") => {
+            eprintln!("`whip agent` was renamed: the information-flow REPL is now `whip infoflow`");
+            eprintln!("try `whip infoflow`");
+            ExitCode::from(2)
+        }
         Some("agents") => agents(&options),
         Some("providers") => providers(&options),
         Some("skills") => skills(&options),
@@ -187,34 +195,43 @@ fn main() -> ExitCode {
         Some("test") => test_command(&options),
         Some("compile") => compile(&options),
         Some("verify-report") => verify_report(&options),
-        Some("run") => run(&options),
+        Some("start") => start(&options),
         Some("revise") => revise(&options),
         Some("step") => step(&options),
         Some("worker") => worker(&options),
-        Some("dev") => dev(&options),
+        Some("run") => run(&options),
         Some("accept") => accept(&options),
         Some("instances") => instances(&options),
         Some("status") => status(&options),
         Some("log") => log(&options),
         Some("facts") => facts(&options),
         Some("effects") => effects(&options),
+        Some("progressions") => progressions(&options),
+        Some("progression") => progression_command(&options),
         Some("runs") => runs(&options),
         Some("artifacts") => artifacts(&options),
-        Some("inbox") => inbox(&options),
         Some("signal") => signal(&options),
+        Some("ingress") => ingress_command(&options),
         Some("message") => message_command(&options),
+        Some("mailbox") => mailbox_command(&options),
         Some("otel-export") => otel_export(&options),
         Some("telemetry") => telemetry(&options),
+        Some("coercion") => coercion(&options),
         Some("leases") => coordination_list(&options, "leases"),
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
-        Some("evidence") => evidence(&options),
+        Some("memory") => memory_command(&options),
+        Some("script") => script_command(&options),
+        Some("evidence") => evidence_router(&options),
         Some("improve") => improve::improve_command(&options),
         Some("campaigns") => improve::campaigns_command(&options),
         Some("campaign") => improve::campaign_detail_command(&options),
         Some("adopt") => improve::adopt_command(&options),
+        Some("answer") => improve::answer_command(&options),
         Some("pin") => improve::pin_command(&options),
+        Some("suppose") => improve::suppose_command(&options),
+        Some("settle") => improve::settle_command(&options),
         Some("gauges") => improve::gauges_command(&options),
         Some("diagnostics") => diagnostics(&options),
         Some("trace") => trace(&options),
@@ -230,6 +247,7 @@ fn main() -> ExitCode {
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
+        Some("mcp") => mcp_command(&options),
         Some("deploy") => deploy_command(&options),
         Some("executor") => executor_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -623,12 +641,25 @@ fn print_usage() {
         whipplescript_core::IMPLEMENTATION_STAGE
     );
     println!("usage: whip [--store path] [--json] <command> [args]");
-    println!("commands: package, check, compile, verify-report, run, revise, step, worker, dev, accept, instances, status, log, facts, effects, runs");
+    println!();
+    println!("authoring:    check  compile  verify-report  fmt  lint  lsp  test  package");
+    println!("run:          run  start  revise  step  worker  accept  ingress");
     println!(
-        "          artifacts, inbox, signal, issue, leases, ledger, counters, evidence, diagnostics, trace"
+        "inspect:      instances  status  log  facts  effects  runs  artifacts  evidence  diagnostics  trace  progressions"
     );
-    println!("          otel-export, pause, resume, cancel, checkpoint, restore, fork, retry, recover, doctor, deploy");
-    println!("          improve, campaigns, campaign, adopt, pin, gauges");
+    println!("messaging:    signal  message  mailbox");
+    println!("coordinate:   leases  ledger  counters");
+    println!("lifecycle:    pause  resume  cancel  retry  recover  progression");
+    println!("context:      checkpoint  restore  handles  fork");
+    println!("version ctl:  branch  stream");
+    println!("tracker:      issue");
+    println!(
+        "improve:      improve  campaigns  campaign  adopt  answer  pin  suppose  settle  gauges  evidence"
+    );
+    println!("ops/deploy:   doctor  deploy  executor  otel-export  telemetry");
+    println!("config:       auth  coercion  memory  script  agents  providers  skills  skill  mcp");
+    println!("governance:   gov  infoflow");
+    println!();
     println!("run `whip <command> --help` or `whip help <command>` for command usage");
 }
 
@@ -636,40 +667,48 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "check" => "usage: whip check [--model-search] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] <workflow.whip>...",
         "lint" => "usage: whip [--json] lint [--root <workflow>] <workflow.whip>",
-        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else)",
+        "improve" => "usage: whip [--json] improve [<gauge>[><=<target>] ... [then ...] | <campaign> | --resume <campaign-id>] [--program <workflow.whip>] [--sacrifice <gauge>] [--within <gauge>=<band>%] [--spend-cap $<n>] [--proposer fixture|native] [--provider <name>] [--provider-config <path>] [--redacted-view]\n  bare `whip improve` = repair mode (restore violated bars, touch nothing else); --resume continues a campaign parked on its spend cap (fresh per-invocation allowance)\n  spend prices from the provider config's `prices` block (USD per Mtok per provider/model); unpriced usage records cost 0 and cannot bind the cap",
         "campaigns" => "usage: whip [--json] campaigns",
         "campaign" => "usage: whip [--json] campaign <id>",
         "adopt" => "usage: whip [--json] adopt <campaign>:<candidate> [--program <workflow.whip>]",
-        "pin" => "usage: whip [--json] pin <instance> --as <name>",
+        "answer" => "usage: whip [--json] answer <campaign>:<candidate> --accept|--reject|--revoke [--by <who>]\n  answers a surfaced tradeoff; the answer is a precedent that auto-resolves future tradeoffs it Pareto-dominates",
+        "pin" => "usage: whip [--json] pin <instance> [at <mark>] --as <name>",
+        "suppose" => "usage: whip [--json] suppose <scenario> [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  one what-if regeneration of the pinned scenario; mark pins replay the frozen prefix and re-execute only the suffix",
+        "settle" => "usage: whip [--json] settle <gauge> [--certify] [--threshold <k>] [--spend-cap $<n>] [--program <workflow.whip>] [--root <workflow>] [--provider <name>] [--provider-config <path>]\n  name the decision and let the system stop itself: races regenerations over the pinned scenarios until the gauge's bar is cleared or evidence is exhausted (an honest undetermined) — never an operator-chosen N\n  --spend-cap is a guardrail in currency over PRICED regeneration cost (provider config `prices` block); unpriced usage cannot bind it",
         "gauges" => "usage: whip [--json] gauges [<gauge>]",
         "lsp" => "usage: whip lsp   (Language Server over stdio; launched by an editor)",
         "compile" => "usage: whip compile [--model-search] [--root <workflow>] [--package-lock <path>] <workflow.whip>",
         "fmt" => "usage: whip fmt [--check] <workflow.whip>...",
-        "test" => "usage: whip [--json] test <workflow.whip>... [--list] [-i <pattern>]... [-x <pattern>]... [--pass-if-no-tests]",
+        "test" => "usage: whip [--json] test <workflow.whip|dir>... [--list] [-i <pattern>]... [-x <pattern>]... [--pass-if-no-tests]\n       whip [--json] test replay <instance-id>",
         "verify-report" => "usage: whip verify-report [--entry-index <n>] [--emit construct-graph|lowered-ir|artifacts] <check-or-compile-or-artifacts-report.json>...",
-        "package" => "usage: whip package catalog | whip package check <manifest.json>... | whip package lock [--output <path>] <manifest.json>...",
-        "run" => "usage: whip [--store path] [--input <json>] run <workflow.whip> [--root <workflow>] [--package-lock <path>]",
+        "package" => "usage: whip package catalog | whip package check <manifest.json>... | whip package lock [--output <path>] <manifest.json>... | whip package sync --file <manifest.json> [--output <path>] [--check-only]",
+        "start" => "usage: whip [--store path] [--input <json>] start <workflow.whip> [--root <workflow>] [--package-lock <path>]\n  starts a durable instance and returns; drive it with `whip worker` (use `whip run` to run locally to idle)",
         "revise" => "usage: whip revise <instance> <workflow.whip> [--root <workflow>] [--dry-run] [--cancel keep|queued|running]",
         "step" => "usage: whip step <instance> --program <workflow.whip> [--root <workflow>]",
         "worker" => "usage: whip worker <instance> [--provider <name>] [--provider-config <path>] [--program <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--once] [--fail|--timeout|--cancel] [--max-child-iterations <n>]",
-        "dev" => "usage: whip dev <workflow.whip> [--provider <name>] [--provider-config <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--include-tag <tag>] [--exclude-tag <tag>] [--stream ndjson] [--until idle] [--max-iterations <n>] [--fail|--timeout|--cancel]",
+        "run" => "usage: whip run <workflow.whip> [--provider <name>] [--provider-config <path>] [--root <workflow>] [--exec-profile dev|hosted] [--script-manifest <path>] [--package-lock <path>] [--include-tag <tag>] [--exclude-tag <tag>] [--stream ndjson] [--until idle] [--wait] [--max-iterations <n>] [--fail|--timeout|--cancel]",
         "accept" => "usage: whip accept <fixture.json>",
         "instances" => "usage: whip [--store path] [--json] instances",
         "status" => "usage: whip status <instance>",
         "log" => "usage: whip log <instance>",
         "facts" => "usage: whip facts <instance>",
         "effects" => "usage: whip effects <instance>",
+        "progressions" => "usage: whip progressions <instance>",
+        "progression" => "usage: whip progression cancel <instance> <firing-id> [--reason <text>]",
         "runs" => "usage: whip runs <instance>",
         "artifacts" => "usage: whip artifacts <run-id>",
-        "inbox" => "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X) [--by NAME]]",
-        "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]",
-        "otel-export" => "usage: whip otel-export <instance> [--dry-run] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME)",
+        "signal" => "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]\n  --delivery-id: the provider/operator delivery id wins over the derived payload-hash key; the same id twice admits once (the duplicate is absorbed with a diagnostic)",
+        "ingress" => "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]\n  reads JSONL envelopes {\"instance\", \"signal\", \"payload\", \"delivery_id\"?} from stdin and admits each\n  through the shared admission core; one JSON result line per envelope on stdout\n  (the HTTP listener driver is deferred: spec/std-ingress.md \"Deferred with cause\")",
+        "otel-export" => "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>] (reads OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST)",
         "telemetry" => "usage: whip telemetry <status|reset-cursor> [<instance>] (export-cursor management for otel-export)",
+        "coercion" => "usage: whip [--store path] [--json] coercion status (the resolved schema.coerce provider config: provider, backend, model, credential source, selecting rung, fingerprint)",
         "leases" => "usage: whip leases [<resource>]",
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
         "issue" => ISSUE_USAGE,
-        "evidence" => "usage: whip evidence <instance>",
+        "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
+        "script" => "usage: whip script <list|verify> [--script-manifest <path>] (read-only views over the pinned script-capability manifest; verify re-hashes each pin, exit 1 on any mismatch)",
+        "evidence" => "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
         "diagnostics" => "usage: whip diagnostics [--grouped] <instance>",
         "trace" => "usage: whip trace <instance> [--check]",
         "pause" => "usage: whip pause <instance>",
@@ -684,14 +723,18 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
         "doctor" => "usage: whip doctor [--providers] [--provider-config <path>] [--record-provider-evidence <instance>]",
+        "gov" => "usage: whip gov <sign | verify | escalate | escalations | agent> [args]",
+        "infoflow" => "usage: whip infoflow   (interactive information-flow REPL: check <file> | escalate <request> | quit; renamed from `whip agent`)",
         "agents" => "usage: whip [--json] agents [--root <workflow>] <workflow.whip>",
         "providers" => "usage: whip [--json] providers [--root <workflow>] <workflow.whip>",
         "skills" => "usage: whip [--json] skills [--root <workflow>] <workflow.whip>",
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
+        "mcp" => "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
-        "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
+        "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
+        "mailbox" => "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
         _ => return None,
     })
 }
@@ -724,7 +767,7 @@ fn doctor(options: &CliOptions) -> ExitCode {
         }),
     };
     let tools = doctor_tool_checks();
-    let provider_capabilities = builtin_provider_capabilities();
+    let provider_capabilities = effective_provider_capabilities();
     let provider_configs = doctor_provider_config_checks(
         &doctor_options.provider_config_paths,
         &provider_capabilities,
@@ -756,6 +799,36 @@ fn doctor(options: &CliOptions) -> ExitCode {
     } else {
         0
     };
+    // Compiled agent feature reports (spec/std-agent.md slice 5): rendered
+    // under `--providers`, `source` included per entry (probed-vs-compiled
+    // honesty, DR-0015).
+    let agent_feature_reports: Vec<Value> = if doctor_options.providers {
+        whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS
+            .iter()
+            .map(|report| {
+                json!({
+                    "schema": whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORT_SCHEMA,
+                    "provider_kind": report.provider_kind,
+                    "entries": report.entries.iter().map(|entry| {
+                        let mut value = json!({
+                            "class": entry.class,
+                            "support": entry.support.as_str(),
+                            "source": entry.source.as_str(),
+                        });
+                        if let Some(native_name) = entry.native_name {
+                            value["native_name"] = json!(native_name);
+                        }
+                        if let Some(dispatch) = entry.dispatch {
+                            value["dispatch"] = json!(dispatch);
+                        }
+                        value
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if options.json {
         emit_json(json!({
             "stage": whipplescript_kernel::kernel_stage(),
@@ -773,6 +846,7 @@ fn doctor(options: &CliOptions) -> ExitCode {
                 .iter()
                 .map(provider_health_check_to_json)
                 .collect::<Vec<_>>(),
+            "agent_feature_reports": agent_feature_reports,
             "provider_validation_evidence_recorded": provider_validation_evidence_recorded,
         }))
     } else {
@@ -842,6 +916,36 @@ fn doctor(options: &CliOptions) -> ExitCode {
                     check.status.as_str(),
                     check.message
                 );
+            }
+        }
+        if doctor_options.providers {
+            println!("agent feature reports ({}):", {
+                whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORT_SCHEMA
+            });
+            for report in whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS {
+                for entry in report.entries {
+                    // The default posture is unsupported/compiled; print the
+                    // rows that state something, plus turn.cancel always (the
+                    // DR-0017 conservative-cancel surface).
+                    let stated = !matches!(
+                        entry.support,
+                        whipplescript_kernel::agent_profile::FeatureSupport::Unsupported
+                    );
+                    if !stated && entry.class != "turn.cancel" {
+                        continue;
+                    }
+                    println!(
+                        "  {:<16} {:<24} {:<12} source={}{}",
+                        report.provider_kind,
+                        entry.class,
+                        entry.support.as_str(),
+                        entry.source.as_str(),
+                        match (entry.native_name, entry.dispatch) {
+                            (Some(name), Some(dispatch)) => format!(" {name} via {dispatch}"),
+                            _ => String::new(),
+                        }
+                    );
+                }
             }
         }
         if provider_validation_evidence_recorded > 0 {
@@ -926,7 +1030,7 @@ fn doctor_provider_health_checks(
 ) -> Vec<DoctorProviderHealthCheck> {
     capabilities
         .iter()
-        .filter(|capability| matches!(capability.provider_kind.as_str(), "codex" | "claude" | "pi"))
+        .filter(|capability| matches!(capability.provider_kind.as_str(), "codex" | "claude"))
         .flat_map(|capability| {
             let mut checks = Vec::new();
             let provider = capability.provider_kind.as_str().to_owned();
@@ -987,7 +1091,6 @@ fn auth_health_check(
     let env_name = match provider {
         "codex" => Some("OPENAI_API_KEY"),
         "claude" => Some("ANTHROPIC_API_KEY"),
-        "pi" => Some("PI_API_KEY"),
         _ => None,
     };
     let env_set = env_name.is_some_and(|name| env::var_os(name).is_some());
@@ -1047,7 +1150,7 @@ fn doctor_provider_config_checks(
 fn validate_doctor_provider_config_json(config_json: &str) -> Vec<ProviderValidationResult> {
     validate_doctor_provider_config_json_with_bindings(
         config_json,
-        &builtin_provider_capabilities(),
+        &effective_provider_capabilities(),
     )
     .0
 }
@@ -1091,7 +1194,7 @@ fn validate_doctor_provider_config_json_with_bindings(
 fn validate_provider_runtime_config(
     config: &ProviderBindingConfig,
 ) -> Vec<ProviderValidationResult> {
-    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+    if config.provider_kind != "command" || config.surface != "command" {
         return Vec::new();
     }
     match command_launch_plan_from_config(config) {
@@ -1268,13 +1371,6 @@ fn doctor_tool_checks() -> Vec<ToolCheck> {
             &["claude"][..],
             false,
             "needed for Claude Code agent harness provider runs",
-        ),
-        (
-            "pi",
-            "provider",
-            &["pi"][..],
-            false,
-            "needed for Pi RPC provider runs",
         ),
     ]
     .into_iter()
@@ -1457,6 +1553,258 @@ fn lint_unused_coerces(ir: &IrProgram) -> Vec<LintFinding> {
             span: None,
         })
         .collect()
+}
+
+/// ADVISORY import lint (spec/std-coercion.md "Manifest": import bite is a
+/// missing-import advisory only — the graduated ladder, never an error):
+/// `coerce`/`decide`/`prompt` lower to the `schema.coerce` effect owned by
+/// std.coercion; a program using them without `use std.coercion` still runs,
+/// but the import is what names the operator-config package behind the
+/// effect. Detection is conservative: `coerce`/`prompt` declarations land in
+/// `ir.coerces`, and inline `decide` is matched only at a body-line start —
+/// under-reporting is possible, wrongly flagging is not.
+fn lint_missing_coercion_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.coercion")
+    {
+        return Vec::new();
+    }
+    let uses_decide = ir.rules.iter().any(|rule| {
+        rule.body
+            .lines()
+            .any(|line| line.trim().starts_with("decide "))
+    });
+    let first_coerce = ir.coerces.first().map(|coerce| coerce.name.clone());
+    if first_coerce.is_none() && !uses_decide {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_coercion_import",
+        severity: Severity::Warning,
+        message: "program uses `coerce`/`decide`/`prompt` without `use std.coercion`; add the \
+                  import to name the package that configures the schema.coerce backend \
+                  (advisory)"
+            .to_owned(),
+        name: first_coerce,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-coord.md "Manifest": import bite is a
+/// missing-import advisory only — the M5 graduated ladder, never an error):
+/// the coordination declarations and verbs lower to `lease.*` / `ledger.*` /
+/// `counter.*` effects owned by std.coord; a program using them without
+/// `use std.coord` still runs, but the import is what names the package whose
+/// embedded manifest seeds the admission rows behind the effects. Detection
+/// reads the compiled IR (declared resources + lowered effect kinds), so it
+/// cannot wrongly flag prose that merely mentions a verb.
+fn lint_missing_coord_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir.uses.iter().any(|use_decl| use_decl.name == "std.coord") {
+        return Vec::new();
+    }
+    let first_resource = ir
+        .leases
+        .first()
+        .map(|lease| lease.name.clone())
+        .or_else(|| ir.ledgers.first().map(|ledger| ledger.name.clone()))
+        .or_else(|| ir.counters.first().map(|counter| counter.name.clone()));
+    let uses_coordination_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::LeaseAcquire
+                    | whipplescript_parser::IrEffectKind::LeaseRenew
+                    | whipplescript_parser::IrEffectKind::LedgerAppend
+                    | whipplescript_parser::IrEffectKind::CounterConsume
+            )
+        })
+    });
+    if first_resource.is_none() && !uses_coordination_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_coord_import",
+        severity: Severity::Warning,
+        message: "program uses coordination resources (`lease`/`ledger`/`counter`, \
+                  `acquire`/`append`/`consume`/`release`) without `use std.coord`; add the \
+                  import to name the package that owns the coordination effects (advisory)"
+            .to_owned(),
+        name: first_resource,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-files.md "Manifest": import posture is a
+/// missing-import advisory only — the M5 graduated ladder, never an error;
+/// the hard `use std.files` requirement is explicitly deferred): `file store`
+/// declarations and the read/write/import/export verbs lower to `file.*`
+/// effects owned by std.files; a program using them without `use std.files`
+/// still runs, but the import is what names the package whose embedded
+/// manifest seeds the admission rows behind the effects. Detection reads the
+/// compiled IR (declared stores + lowered effect kinds), so it cannot wrongly
+/// flag prose that merely mentions a verb.
+fn lint_missing_files_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir.uses.iter().any(|use_decl| use_decl.name == "std.files") {
+        return Vec::new();
+    }
+    let first_store = ir.file_stores.first().map(|store| store.name.clone());
+    let uses_file_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::FileRead
+                    | whipplescript_parser::IrEffectKind::FileWrite
+                    | whipplescript_parser::IrEffectKind::FileImport
+                    | whipplescript_parser::IrEffectKind::FileExport
+            )
+        })
+    });
+    if first_store.is_none() && !uses_file_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_files_import",
+        severity: Severity::Warning,
+        message: "program uses file stores (`file store`, \
+                  `read`/`write`/`import`/`export`) without `use std.files`; add the \
+                  import to name the package that owns the file effects (advisory)"
+            .to_owned(),
+        name: first_store,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-tracker.md "Manifest": import bite per E5 is
+/// a missing-import advisory only — the M5 graduated ladder, never an error):
+/// `tracker` declarations and the file/claim/release/finish verbs lower to
+/// `tracker.*` effects owned by std.tracker; a program using them without
+/// `use std.tracker` still runs, but the import is what names the package
+/// whose embedded manifest seeds the admission rows behind the effects.
+/// Detection reads the compiled IR (declared trackers + lowered effect
+/// kinds), so it cannot wrongly flag prose that merely mentions a verb.
+fn lint_missing_tracker_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.tracker")
+    {
+        return Vec::new();
+    }
+    let first_tracker = ir.trackers.first().map(|tracker| tracker.name.clone());
+    // `TrackerRelease` is deliberately NOT a trigger: the bare `release` verb
+    // is shared with std.coord's lease release and the IR classifies BOTH as
+    // TrackerRelease (there is no IrEffectKind for lease.release — the kernel
+    // disambiguates by binding at lowering time), so keying on it would flag
+    // pure coordination programs (examples/coord-lease-renew.whip). A real
+    // tracker program always also declares a tracker or files/claims/finishes.
+    let uses_tracker_effect = ir.rules.iter().any(|rule| {
+        rule.metadata.effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                whipplescript_parser::IrEffectKind::TrackerFile
+                    | whipplescript_parser::IrEffectKind::TrackerClaim
+                    | whipplescript_parser::IrEffectKind::TrackerFinish
+            )
+        })
+    });
+    if first_tracker.is_none() && !uses_tracker_effect {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_tracker_import",
+        severity: Severity::Warning,
+        message: "program uses the work tracker (`tracker`, \
+                  `file`/`claim`/`release`/`finish`) without `use std.tracker`; add the \
+                  import to name the package that owns the tracker effects (advisory)"
+            .to_owned(),
+        name: first_tracker,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-ingress.md "Static checks" #2, the M5
+/// graduated ladder: provider-kind-known is the HARD check, the import line
+/// itself is advisory only): `signal` declarations, external `source` blocks
+/// (non-clock — the clock kind is std.time's), and `emit signal … to` lower
+/// to the admission surface owned by std.ingress; a program using them
+/// without `use std.ingress` still runs, but the import is what names the
+/// package whose embedded manifest seeds the `signal.emit` admission rows and
+/// carries the driver descriptors. Detection reads the compiled IR (declared
+/// signals + lowered sources/effects), so it cannot wrongly flag prose.
+fn lint_missing_ingress_import(ir: &IrProgram) -> Vec<LintFinding> {
+    if ir
+        .uses
+        .iter()
+        .any(|use_decl| use_decl.name == "std.ingress")
+    {
+        return Vec::new();
+    }
+    let first_subject = ir
+        .events
+        .first()
+        .map(|event| event.name.clone())
+        .or_else(|| {
+            ir.sources
+                .iter()
+                .find(|source| !source.is_clock)
+                .map(|source| source.name.clone())
+        });
+    let uses_signal_emit = ir.rules.iter().any(|rule| {
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| matches!(effect.kind, whipplescript_parser::IrEffectKind::SignalEmit))
+    });
+    if first_subject.is_none() && !uses_signal_emit {
+        return Vec::new();
+    }
+    vec![LintFinding {
+        code: "lint.missing_ingress_import",
+        severity: Severity::Warning,
+        message: "program uses typed signal admission (`signal`, external `source` blocks, \
+                  `emit signal … to`) without `use std.ingress`; add the import to name the \
+                  package that owns the admission surface (advisory)"
+            .to_owned(),
+        name: first_subject,
+        span: None,
+    }]
+}
+
+/// ADVISORY import lint (spec/std-agent.md "Open provider registry": the M5
+/// graduated ladder's middle rung — a provider kind contributed by a KNOWN
+/// embedded std package that the program does not import is valid but draws a
+/// missing-import advisory, never an error). Detection reads the compiled IR's
+/// agents/harnesses against the embedded manifests' agent-provider rows, so it
+/// cannot wrongly flag prose.
+fn lint_missing_agent_import(ir: &IrProgram) -> Vec<LintFinding> {
+    let mut findings = Vec::new();
+    let mut flagged_packages = BTreeSet::new();
+    for (kind, owner, _span) in ir_agent_provider_kind_uses(ir) {
+        for (package, json) in whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS {
+            if !manifest_json_agent_provider_kinds(json).contains(&kind) {
+                continue;
+            }
+            if ir.uses.iter().any(|use_decl| use_decl.name == *package) {
+                continue;
+            }
+            if flagged_packages.insert(*package) {
+                findings.push(LintFinding {
+                    code: "lint.missing_agent_import",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "provider kind `{kind}` is contributed by the std package \
+                         `{package}`; add `use {package}` to name the package that \
+                         defines the provider (advisory)"
+                    ),
+                    name: Some(owner.clone()),
+                    span: None,
+                });
+            }
+        }
+    }
+    findings
 }
 
 /// Whole-token occurrence count of `name` in `text` (an identifier run is a maximal
@@ -1793,8 +2141,231 @@ fn lint_tool_grant_requires_owned_harness(ir: &IrProgram) -> Vec<LintFinding> {
         .collect()
 }
 
+/// Marks placed off a consumption boundary (DR-0038's replay hazard): a mark
+/// whose frozen prefix can carry a settled effect from a rule that never
+/// consumes its trigger. Under a textually-different candidate the replay
+/// driver activates a revision, the still-live trigger re-derives the effect
+/// with a fresh id (a refire), and prefix replay refuses pre-flight —
+/// degrading the pin to input replay. The pre-cut set is exact (only the
+/// site's transitive fact producers, which commit before the mark in any run
+/// that reaches it) and the trigger must be consumed by NO rule at all, so a
+/// flagged mark degrades in every changed-candidate replay: no false
+/// positives.
+fn lint_mark_consumption_boundaries(ir: &IrProgram) -> Vec<LintFinding> {
+    let mut writers: std::collections::BTreeMap<&str, Vec<&whipplescript_parser::IrRule>> =
+        std::collections::BTreeMap::new();
+    for rule in &ir.rules {
+        for written in &rule.metadata.fact_writes {
+            writers.entry(written.as_str()).or_default().push(rule);
+        }
+    }
+    let consumed_somewhere: std::collections::BTreeSet<&str> = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.fact_consumes.iter().map(String::as_str))
+        .collect();
+    let mut findings = Vec::new();
+    for mark in &ir.marks {
+        let Some(site) = ir.rules.iter().find(|rule| rule.name == mark.site) else {
+            continue;
+        };
+        let mut pre_cut: std::collections::BTreeMap<&str, &whipplescript_parser::IrRule> =
+            std::collections::BTreeMap::new();
+        let mut frontier = vec![site];
+        while let Some(rule) = frontier.pop() {
+            if pre_cut.insert(rule.name.as_str(), rule).is_some() {
+                continue;
+            }
+            for read in &rule.metadata.fact_reads {
+                for producer in writers.get(read.as_str()).into_iter().flatten() {
+                    if !pre_cut.contains_key(producer.name.as_str()) {
+                        frontier.push(producer);
+                    }
+                }
+            }
+        }
+        for rule in pre_cut.values() {
+            if rule.metadata.effects.is_empty() {
+                continue;
+            }
+            let unconsumed: Vec<&str> = rule
+                .metadata
+                .fact_reads
+                .iter()
+                .filter(|read| !consumed_somewhere.contains(read.as_str()))
+                .filter_map(|read| read.strip_prefix("schema:"))
+                .collect();
+            if unconsumed.is_empty() {
+                continue;
+            }
+            findings.push(LintFinding {
+                code: "lint.mark_off_consumption_boundary",
+                severity: Severity::Warning,
+                message: format!(
+                    "mark `{}` sits off a consumption boundary: pre-cut rule `{}` creates \
+                     effects and its trigger `{}` is never consumed, so replaying a changed \
+                     candidate would refire the effect (prefix replay refuses pre-flight and \
+                     degrades to input replay); consume the trigger or move the mark",
+                    mark.name,
+                    rule.name,
+                    unconsumed.join("`, `"),
+                ),
+                name: None,
+                span: Some(mark.span),
+            });
+        }
+    }
+    findings
+}
+
+/// DR-0043 Decision 4: a firing's identity is composed from its trigger
+/// bindings' CONTENT keys, and every effect id hashes that identity. So when a
+/// trigger is re-presented, the rule's external work either **repeats** (the
+/// key changed: new identity, new effect ids, a second deploy running beside
+/// the first) or is silently **skipped** (the key held: the ids collide with
+/// the draining firing's, so the re-admission rides its results instead of
+/// doing fresh work). Which branch you get is decided by the projection's key
+/// shape and is invisible in the rule. A lease keyed on the trigger is the
+/// documented answer to both.
+///
+/// Flagged only when the hazard is DEMONSTRABLE in this program: the trigger
+/// binds, *this program* re-presents that trigger (a rule records it, or it is
+/// a tracker readiness pattern — projections regenerate), the rule performs
+/// world-visible work, and the rule holds no lease or claim. A program that
+/// never re-presents its trigger, or that coordinates, is never flagged.
+fn lint_readmission_unprotected_effects(ir: &IrProgram) -> Vec<LintFinding> {
+    /// Effects whose repetition is visible outside the instance. Store-local
+    /// bookkeeping (facts, timers, signals, ledger/counter/tracker writes) is
+    /// deliberately excluded: repeating those is idempotent-by-key or inert.
+    fn is_world_visible(kind: &IrEffectKind) -> bool {
+        matches!(
+            kind,
+            IrEffectKind::AgentTell
+                | IrEffectKind::SchemaCoerce
+                | IrEffectKind::ExecCommand
+                | IrEffectKind::CapabilityCall
+                | IrEffectKind::WorkflowInvoke
+                | IrEffectKind::FileWrite
+                | IrEffectKind::FileExport
+        )
+    }
+    fn coordinates(kind: &IrEffectKind) -> bool {
+        matches!(
+            kind,
+            IrEffectKind::LeaseAcquire | IrEffectKind::LeaseRenew | IrEffectKind::TrackerClaim
+        )
+    }
+    // Re-presentation of the SAME logical entity is the hazard — a brand-new
+    // entity is new work by construction. Two shapes make it certain without a
+    // cardinality analysis (which DR-0044 P2 defers):
+    //
+    //   1. a tracker readiness projection, which re-derives by construction
+    //      whenever its row changes (handled at the trigger below);
+    //   2. a RECORD-BACK CYCLE: one rule that both consumes a class and records
+    //      it again (the retract-and-re-present idiom), so the entity returns
+    //      by construction.
+    //
+    // A cross-rule producer is deliberately NOT enough: `seed` recording a
+    // class once per instance from a workflow input looks identical in the IR
+    // to a producer that fires forever, and telling those apart needs the
+    // deferred cardinality classifier. Flagging it would false-positive on
+    // every seed→dispatch program in the corpus.
+    let record_back_cycle: BTreeSet<&str> = ir
+        .rules
+        .iter()
+        .flat_map(|rule| {
+            let consumes: BTreeSet<&str> = rule
+                .metadata
+                .fact_consumes
+                .iter()
+                .filter_map(|consume| consume.strip_prefix("schema:"))
+                .collect();
+            rule.metadata
+                .fact_writes
+                .iter()
+                .filter_map(|write| write.strip_prefix("schema:"))
+                .filter(move |class| consumes.contains(class))
+        })
+        .collect();
+    let mut findings = Vec::new();
+    for rule in &ir.rules {
+        if rule
+            .metadata
+            .effects
+            .iter()
+            .any(|node| coordinates(&node.kind))
+        {
+            continue;
+        }
+        let world_visible: Vec<&str> = rule
+            .metadata
+            .effects
+            .iter()
+            .filter(|node| is_world_visible(&node.kind))
+            .filter_map(|node| node.binding.as_deref())
+            .collect();
+        if world_visible.is_empty() {
+            continue;
+        }
+        for when in &rule.whens {
+            let pattern = when.pattern.trim();
+            // Only a BINDING trigger contributes to firing identity; `when
+            // started` and bindingless gates cannot be re-presented.
+            if !pattern.contains(" as ") {
+                continue;
+            }
+            let head = pattern.split_whitespace().next().unwrap_or_default();
+            let tracker_readiness = pattern.contains(" has ready issue ");
+            let re_presented = if tracker_readiness {
+                true
+            } else if head.chars().next().is_some_and(char::is_uppercase) {
+                record_back_cycle.contains(head)
+            } else {
+                false
+            };
+            if !re_presented {
+                continue;
+            }
+            let trigger = if tracker_readiness {
+                "the tracker's readiness projection".to_owned()
+            } else {
+                format!("`{head}`")
+            };
+            let why = if tracker_readiness {
+                "a projection regenerates whenever its row changes"
+            } else {
+                "a rule consumes that class and records it again"
+            };
+            findings.push(LintFinding {
+                code: "lint.readmission_unprotected_effect",
+                severity: Severity::Warning,
+                message: format!(
+                    "rule `{}` runs world-visible work (`{}`) on a trigger that can be \
+                     re-presented ({trigger}: {why}), and holds no lease or claim — a \
+                     re-admission either repeats that work (if the trigger's key changed) \
+                     or silently skips it and rides the draining firing's results (if the \
+                     key held); acquire a lease keyed on the trigger to decide which",
+                    rule.name,
+                    world_visible.join("`, `"),
+                ),
+                name: Some(rule.name.clone()),
+                span: None,
+            });
+            break;
+        }
+    }
+    findings
+}
+
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
+    findings.extend(lint_missing_coercion_import(ir));
+    findings.extend(lint_missing_coord_import(ir));
+    findings.extend(lint_missing_files_import(ir));
+    findings.extend(lint_missing_tracker_import(ir));
+    findings.extend(lint_missing_ingress_import(ir));
+    findings.extend(lint_missing_agent_import(ir));
+    findings.extend(lint_agent_requires_probed_source(ir));
     findings.extend(lint_unused_coerce_results(ir));
     findings.extend(lint_unused_resources(ir));
     findings.extend(lint_noop_rules(ir));
@@ -1802,6 +2373,8 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_broad_file_grants(ir));
     findings.extend(lint_deep_after_nesting(ir));
     findings.extend(lint_tool_grant_requires_owned_harness(ir));
+    findings.extend(lint_mark_consumption_boundaries(ir));
+    findings.extend(lint_readmission_unprotected_effects(ir));
     // Resolve each finding's declaration name to its source span. Top-level names are
     // program-unique, so a single `document_symbols` match is the declaration site.
     let symbols = whipplescript_parser::document_symbols(source);
@@ -2536,10 +3109,10 @@ fn lsp_completion_kind(kind: &str) -> i32 {
 const LSP_KEYWORDS: &[&str] = &[
     "workflow", "class", "enum", "agent", "rule", "coerce", "flow", "action", "signal", "source",
     "table", "tracker", "channel", "lease", "ledger", "counter", "output", "failure", "input",
-    "when", "record", "done", "tell", "decide", "askHuman", "exec", "call", "invoke", "with",
-    "access", "to", "read", "write", "import", "export", "recall", "learn", "emit", "after",
-    "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire",
-    "renew", "append", "consume",
+    "when", "record", "done", "tell", "decide", "exec", "call", "invoke", "with", "access", "to",
+    "read", "write", "import", "export", "recall", "learn", "emit", "after", "case", "complete",
+    "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire", "renew", "append",
+    "consume",
 ];
 
 /// Compile `text` and publish its diagnostics (errors + warnings) for `uri`. This
@@ -3264,6 +3837,31 @@ fn check(options: &CliOptions) -> ExitCode {
                         }));
                     } else {
                         for diagnostic in hosted_exec_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
+                let mut provider_kind_diagnostics =
+                    agent_provider_kind_diagnostics(&ir, package_lock.as_ref());
+                provider_kind_diagnostics.extend(agent_requires_diagnostics(&ir));
+                if !provider_kind_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": provider_kind_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in provider_kind_diagnostics {
                             eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
                         }
                     }
@@ -11782,16 +12380,52 @@ fn run_test_scenario(test: &IrTest, source: &str, ir: &IrProgram, path: &str) ->
     }
 }
 
-fn scenario_store_path(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "whip-test-{}-{nanos}-{}.sqlite",
-        std::process::id(),
-        stable_hash_hex(name)
-    ))
+/// A scenario's scratch directory, reclaimed when the scenario ends.
+///
+/// Every artifact a scenario needs — its store, the per-scenario items store,
+/// and any `given file` fixture tree — lives inside one directory, so a single
+/// `Drop` reclaims all of them, including the sqlite `-shm`/`-wal` sidecars.
+/// `Drop` also runs on a `?` early return and during a panic unwind, which is
+/// the point: the previous shape scattered these as sibling paths in the temp
+/// dir and deleted only the store file, only on the success path. Every early
+/// return leaked the rest, and it never removed the fixture tree at all.
+struct ScenarioScratch {
+    root: PathBuf,
+}
+
+impl ScenarioScratch {
+    fn new(name: &str) -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "whip-test-{}-{nanos}-{}",
+            std::process::id(),
+            stable_hash_hex(name)
+        ));
+        fs::create_dir_all(&root)
+            .map_err(|error| format!("create scenario scratch dir: {error}"))?;
+        Ok(Self { root })
+    }
+
+    fn store_path(&self) -> PathBuf {
+        self.root.join("store.sqlite")
+    }
+
+    fn items_store_path(&self) -> PathBuf {
+        self.root.join("items.sqlite")
+    }
+
+    fn fixture_root(&self) -> PathBuf {
+        self.root.join("files")
+    }
+}
+
+impl Drop for ScenarioScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 /// Evaluate a `given` record's field list into a JSON object, running each field
@@ -11836,12 +12470,13 @@ fn execute_scenario(
     ir: &IrProgram,
     path: &str,
 ) -> Result<ScenarioWorld, String> {
-    let store_path = scenario_store_path(&test.name);
+    let scratch = ScenarioScratch::new(&test.name)?;
+    let store_path = scratch.store_path();
     // Isolate the workspace-scoped builtin tracker per scenario so `given tracker`
     // seeding (and any queue effects) never touch the developer's real items
     // store; the projection (`project_tracker_issues` in `step_instance`) reads the
     // same path via this env var.
-    let items_store_path = store_path.with_extension("items.sqlite");
+    let items_store_path = scratch.items_store_path();
     env::set_var("WHIPPLESCRIPT_ITEMS_STORE", &items_store_path);
     let store = SqliteStore::open(&store_path).map_err(store_error)?;
     let mut kernel = RuntimeKernel::new(store);
@@ -11870,9 +12505,9 @@ fn execute_scenario(
         if fixtures.is_empty() {
             ir
         } else {
-            let fixture_root = store_path.with_extension("files");
-            // Start from a clean slate so a prior run's fixtures never leak in.
-            let _ = fs::remove_dir_all(&fixture_root);
+            // The scratch dir is fresh per scenario, so there is no prior run's
+            // fixture tree to clear first.
+            let fixture_root = scratch.fixture_root();
             fs::create_dir_all(&fixture_root)
                 .map_err(|error| format!("create fixture dir: {error}"))?;
             let mut clone = ir.clone();
@@ -11915,6 +12550,10 @@ fn execute_scenario(
     };
 
     let snapshot = ir.to_snapshot();
+    // DR-0043 Decision 3: content-address the source (blob id == source_hash)
+    // so old-body completion can reload this version's rule bodies after a
+    // later revision. Idempotent; best-effort.
+    let _ = kernel.store().put_content(source);
     let version = kernel
         .create_program_version_for_program(
             ProgramVersionInput {
@@ -12111,6 +12750,7 @@ fn execute_scenario(
         coerce_outputs: scenario_coerce_outputs(&test.clauses),
         virtual_now: scenario_virtual_now(&test.clauses),
         work_unit_root: None,
+        side_stores: None,
     };
     let run_kind = scenario_run_kind(&test.clauses);
     let (max_rounds, drive_to_fixed_point) = match run_kind {
@@ -12119,8 +12759,15 @@ fn execute_scenario(
     };
     let mut previous_event_count = 0usize;
     for _ in 0..max_rounds {
-        step_instance(&store_path, &instance_id, ir, Some(Path::new(path)), None)
-            .map_err(store_error)?;
+        step_instance(
+            &store_path,
+            &instance_id,
+            ir,
+            Some(Path::new(path)),
+            None,
+            None,
+        )
+        .map_err(store_error)?;
         run_worker_once(&store_path, &worker_options).map_err(store_error)?;
         let store = SqliteStore::open(&store_path).map_err(store_error)?;
         let status = store
@@ -12156,8 +12803,9 @@ fn execute_scenario(
     let diagnostics = store
         .list_diagnostics(Some(&instance_id))
         .map_err(store_error)?;
+    // Dropping the store closes sqlite before `scratch` removes the directory
+    // holding it at the end of this function.
     drop(store);
-    let _ = std::fs::remove_file(&store_path);
 
     Ok(ScenarioWorld {
         instance_status,
@@ -12255,31 +12903,6 @@ fn scenario_run_kind(clauses: &[TestClause]) -> RunKind {
         }
     }
     RunKind::UntilIdle
-}
-
-/// Evaluate a `proj_query` predicate against one projection/fact row, reusing the
-/// guard expression kernel restricted to the row's fields. Returns `Err` on a
-/// predicate that cannot be parsed or does not evaluate to a boolean — never a
-/// silent false.
-fn evaluate_proj_predicate(predicate: &str, row: &Value) -> Result<bool, String> {
-    let expr = parse_expression(predicate)
-        .map_err(|error| format!("could not parse predicate `{predicate}`: {error}"))?;
-    let empty_ir = empty_ir_program();
-    let scope = EvalScope {
-        context: None,
-        facts: &[],
-        effects: &[],
-        ir: &empty_ir,
-        projection: Some(row),
-        projection_schema: None,
-    };
-    match guard_result(eval_expr_value(&expr, &scope)) {
-        (GuardStatus::Matched, _, _) => Ok(true),
-        (GuardStatus::False, _, _) => Ok(false),
-        (GuardStatus::Error, _, error) => {
-            Err(error.unwrap_or_else(|| "predicate did not evaluate to a boolean".to_owned()))
-        }
-    }
 }
 
 fn rule_committed_name(event: &EventView) -> Option<String> {
@@ -12727,14 +13350,15 @@ fn gov_escalate(options: &CliOptions) -> ExitCode {
     }
 }
 
-/// `whip agent` — the interactive whip agent loop (DR-0026/0028). UNPRIVILEGED: the
+/// `whip infoflow` — the interactive whip agent loop (DR-0026/0028), renamed from
+/// `whip agent` (spec/std-agent.md "Operator CLI"; no alias). UNPRIVILEGED: the
 /// user-facing agent that authors and checks whips under the active envelope. It can
 /// `check <file>` (run the IFC check) and `escalate <request>` (file a low-integrity
 /// request for the admin), but it has NO path to signing governance — a `sign` is
 /// refused. An LLM driver or a human user feeds it the same stdin.
-fn whip_agent(_options: &CliOptions) -> ExitCode {
+fn whip_infoflow(_options: &CliOptions) -> ExitCode {
     use std::io::BufRead;
-    println!("whip agent (unprivileged): check <file> | escalate <request> | quit");
+    println!("whip infoflow (unprivileged): check <file> | escalate <request> | quit");
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else {
@@ -13988,12 +14612,13 @@ fn verify_empty_diagnostics(value: &Value, field: &str, owner: &str) -> Result<(
 
 fn verify_report_digest_field(value: &Value, field: &str, owner: &str) -> Result<(), String> {
     let digest = required_json_str(value, field, owner)?;
-    if digest.len() != 16
+    // SHA-256/128 content digests (the FNV-collision hardening swap).
+    if digest.len() != 32
         || !digest
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
-        return Err(format!("{owner}.{field} must be a 16-character hex digest"));
+        return Err(format!("{owner}.{field} must be a 32-character hex digest"));
     }
     Ok(())
 }
@@ -16185,6 +16810,10 @@ fn revise(options: &CliOptions) -> ExitCode {
     }
 
     let mut kernel = RuntimeKernel::new(store);
+    // DR-0043 Decision 3: content-address the source (blob id == source_hash)
+    // so old-body completion can reload this version's rule bodies after a
+    // later revision. Idempotent; best-effort.
+    let _ = kernel.store().put_content(&source);
     let version = match kernel.create_program_version_for_program(
         ProgramVersionInput {
             program_name: &ir.workflow,
@@ -16307,35 +16936,6 @@ impl LoadedPackageLock {
     }
 }
 
-/// Standard-library package manifests compiled into the binary (M5 "embedded
-/// manifest"). Each entry is `(import name, manifest JSON)`; the binary is its
-/// own supply chain, so a workflow that `use`s one of these names (e.g.
-/// `use std.memory`) validates and runs with no `--package-lock` at all. Std
-/// packages live in the reserved `std.*` namespace: a package lock can never
-/// claim such a name (see `is_reserved_std_package_name`), so the embedded copy
-/// always wins. Add more std packages by appending `(name, include_str!(..))`
-/// pairs here.
-const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
-    (
-        "std.memory",
-        include_str!("../../../std/manifests/memory.json"),
-    ),
-    (
-        "std.messaging",
-        include_str!("../../../std/manifests/messaging.json"),
-    ),
-    // Contracts-only: `exec` is core grammar (never manifest-authored — the
-    // package pipeline forbids `core_effect` lowering), so this manifest
-    // carries the library identity and the `script.raw` capability row shape;
-    // the `script.<name>` family is instantiated from the operator script
-    // manifest at seeding time (spec/std-script.md). Deliberately absent from
-    // the parser build.rs manifest list, which is grammar-only.
-    (
-        "std.script",
-        include_str!("../../../std/manifests/script.json"),
-    ),
-];
-
 /// Whether `name` claims the reserved `std.*` package namespace. Std packages
 /// ship embedded in the platform binary (the binary is its own supply chain), so
 /// a package lock entry — or a lock/sync input manifest — claiming a `std.*`
@@ -16347,7 +16947,7 @@ fn is_reserved_std_package_name(name: &str) -> bool {
 
 /// Whether `name` is shipped as an embedded std manifest.
 fn is_embedded_std_manifest(name: &str) -> bool {
-    EMBEDDED_STD_MANIFESTS
+    whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
         .iter()
         .any(|(embedded, _)| *embedded == name)
 }
@@ -16355,7 +16955,7 @@ fn is_embedded_std_manifest(name: &str) -> bool {
 /// Parse the embedded std manifests. Panics only if a manifest baked into the
 /// binary is invalid (a build-time bug, guarded by `embedded_std_manifests_parse`).
 fn embedded_std_manifests() -> Vec<PackageManifest> {
-    EMBEDDED_STD_MANIFESTS
+    whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
         .iter()
         .map(|(name, json)| {
             let label = PathBuf::from(format!("<embedded:{name}>"));
@@ -16364,6 +16964,31 @@ fn embedded_std_manifests() -> Vec<PackageManifest> {
             })
         })
         .collect()
+}
+
+/// One registry default from an embedded std manifest's OPERATOR-PLANE
+/// provider row (std-telemetry.md T3): the row's `config.<key>` string, e.g.
+/// std.telemetry's `otlp` endpoint. Reads the raw embedded JSON — operator
+/// rows are deliberately invisible to the effect-provider surface
+/// (`package_operator_providers` is their only structured reader), and this
+/// consults defaults without registering anything on the admission plane.
+fn embedded_operator_provider_default(
+    package: &str,
+    provider_id: &str,
+    key: &str,
+) -> Option<String> {
+    let (_, json) = whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+        .iter()
+        .find(|(name, _)| *name == package)?;
+    let value: Value = serde_json::from_str(json).ok()?;
+    let label = PathBuf::from(format!("<embedded:{package}>"));
+    package_operator_providers(&label, &value)
+        .ok()?
+        .into_iter()
+        .find(|row| row.id == provider_id)?
+        .config_json
+        .and_then(|config| serde_json::from_str::<Value>(&config).ok())
+        .and_then(|config| config.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
 /// Merge embedded std manifests into `registry` for every imported name that is
@@ -16423,11 +17048,71 @@ fn contract_registry_for_ir(
     }
 }
 
+/// Every source-provider kind contributed by an embedded or locked manifest:
+/// the operator-plane provider rows' `provider_kind` values (std.ingress
+/// contributes cli/stdio/file/http, std.time contributes clock). Operator rows
+/// are deliberately invisible to the effect-provider surface, so this reads
+/// the raw manifest JSON like `embedded_operator_provider_default` does.
+fn known_source_provider_kinds(package_lock: Option<&LoadedPackageLock>) -> BTreeSet<String> {
+    let mut kinds = BTreeSet::new();
+    let mut collect = |label: PathBuf, value: &Value| {
+        if let Ok(rows) = package_operator_providers(&label, value) {
+            for row in rows {
+                kinds.insert(row.provider_kind);
+            }
+        }
+    };
+    for (name, json) in whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS {
+        if let Ok(value) = serde_json::from_str::<Value>(json) {
+            collect(PathBuf::from(format!("<embedded:{name}>")), &value);
+        }
+    }
+    if let Some(package_lock) = package_lock {
+        for manifest in &package_lock.manifests {
+            if let Ok(value) = serde_json::from_str::<Value>(&manifest.manifest_json) {
+                collect(manifest.path.clone(), &value);
+            }
+        }
+    }
+    kinds
+}
+
+/// Provider-kind-known HARD check (spec/std-ingress.md "Static checks" #2,
+/// the M5 graduated ladder's hard rung): a `source <kind> as …` header must
+/// name a provider kind some embedded or locked manifest contributes —
+/// before embedded manifests landed, any bare ident was silently accepted
+/// and the source never resolved. The `use <package>` import itself stays an
+/// ADVISORY lint (`lint_missing_ingress_import`), never a hard error.
+fn validate_source_provider_kinds(
+    ir: &IrProgram,
+    package_lock: Option<&LoadedPackageLock>,
+) -> Result<(), String> {
+    if ir.sources.is_empty() {
+        return Ok(());
+    }
+    let known = known_source_provider_kinds(package_lock);
+    for source in &ir.sources {
+        if !known.contains(&source.provider) {
+            return Err(format!(
+                "source `{}` uses unknown provider kind `{}`; no embedded or locked package \
+                 manifest contributes it (known source kinds: {})",
+                source.name,
+                source.provider,
+                known.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_construct_uses(
     package_lock: Option<&LoadedPackageLock>,
     ir: &IrProgram,
     registry: &ContractRegistry,
 ) -> Result<(), String> {
+    // Source headers ride the same validation door as construct uses: both
+    // resolve names against manifest-contributed vocabulary.
+    validate_source_provider_kinds(ir, package_lock)?;
     let uses = ir.construct_uses();
     let Some(package_lock) = package_lock else {
         // Without a lock, both a non-`std.` import and a package-owned construct
@@ -17318,7 +18003,11 @@ fn package_manifest_from_json(
     path: &Path,
     manifest_json: String,
 ) -> Result<PackageManifest, String> {
-    package_manifest_from_json_with_embedded(path, manifest_json, EMBEDDED_STD_MANIFESTS)
+    package_manifest_from_json_with_embedded(
+        path,
+        manifest_json,
+        whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS,
+    )
 }
 
 /// Attest a package's exported `@tool` workflows (DR-0025) by compiling their
@@ -17948,7 +18637,7 @@ fn persist_revision_source_bundle_diagnostic(
     Ok(())
 }
 
-fn run(options: &CliOptions) -> ExitCode {
+fn start(options: &CliOptions) -> ExitCode {
     let run_options = match RunOptions::parse(&options.args) {
         Ok(options) => options,
         Err(message) => {
@@ -18278,6 +18967,10 @@ fn start_workflow_instance(
         return Err(ExitCode::FAILURE);
     }
     let mut kernel = RuntimeKernel::new(store);
+    // DR-0043 Decision 3: content-address the source (blob id == source_hash)
+    // so old-body completion can reload this version's rule bodies after a
+    // later revision. Idempotent; best-effort.
+    let _ = kernel.store().put_content(&source);
     let version = match kernel.create_program_version_for_program(
         ProgramVersionInput {
             program_name: &ir.workflow,
@@ -18429,177 +19122,11 @@ fn workflow_input_fact_name(contract: &IrWorkflowContract) -> String {
     }
 }
 
-fn validate_json_for_ir_type(
-    ir: &IrProgram,
-    value: &Value,
-    ty: &IrType,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    match ty {
-        IrType::Primitive(primitive) => validate_json_for_primitive(value, primitive, path, errors),
-        IrType::LiteralString(expected) => {
-            if value.as_str() != Some(expected.as_str()) {
-                errors.push(format!("{path} must be literal {expected:?}"));
-            }
-        }
-        IrType::Ref(name) => validate_json_for_ref(ir, value, name, path, errors),
-        IrType::AgentRef(agents) => match value.as_str() {
-            Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
-            Some(_) => errors.push(format!(
-                "{path} must name one of these agents: {}",
-                agents.join(", ")
-            )),
-            None => errors.push(format!("{path} must be an agent name string")),
-        },
-        IrType::Object(fields) => validate_json_for_object(ir, value, fields, path, errors),
-        IrType::Optional(inner) => {
-            if !value.is_null() {
-                validate_json_for_ir_type(ir, value, inner, path, errors);
-            }
-        }
-        IrType::Array(inner) => match value.as_array() {
-            Some(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    validate_json_for_ir_type(ir, item, inner, &format!("{path}[{index}]"), errors);
-                }
-            }
-            None => errors.push(format!("{path} must be an array")),
-        },
-        IrType::Map(inner) => match value.as_object() {
-            Some(map) => {
-                for (key, item) in map {
-                    validate_json_for_ir_type(ir, item, inner, &format!("{path}.{key}"), errors);
-                }
-            }
-            None => errors.push(format!("{path} must be an object map")),
-        },
-        IrType::Union(types) => {
-            if !types
-                .iter()
-                .any(|candidate| json_matches_ir_type(ir, value, candidate))
-            {
-                errors.push(format!(
-                    "{path} must match one of: {}",
-                    types
-                        .iter()
-                        .map(ir_type_name)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                ));
-            }
-        }
-    }
-}
-
-fn validate_json_for_primitive(
-    value: &Value,
-    primitive: &IrPrimitiveType,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    let valid = match primitive {
-        IrPrimitiveType::String
-        | IrPrimitiveType::Duration
-        | IrPrimitiveType::Time
-        | IrPrimitiveType::Image
-        | IrPrimitiveType::Audio
-        | IrPrimitiveType::Pdf
-        | IrPrimitiveType::Video => value.is_string(),
-        IrPrimitiveType::Int => value.as_i64().is_some(),
-        IrPrimitiveType::Float => value.as_f64().is_some(),
-        IrPrimitiveType::Bool => value.is_boolean(),
-        IrPrimitiveType::Null => value.is_null(),
-    };
-    if !valid {
-        errors.push(format!(
-            "{path} must be {}",
-            ir_type_name(&IrType::Primitive(primitive.clone()))
-        ));
-    }
-}
-
-fn validate_json_for_ref(
-    ir: &IrProgram,
-    value: &Value,
-    name: &str,
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    if let Some(class) = ir.schemas.iter().find_map(|schema| match schema {
-        IrSchema::Class(class) if class.name == name => Some(class),
-        _ => None,
-    }) {
-        validate_json_for_object(ir, value, &class.fields, path, errors);
-        return;
-    }
-    if let Some(enum_decl) = ir.schemas.iter().find_map(|schema| match schema {
-        IrSchema::Enum(enum_decl) if enum_decl.name == name => Some(enum_decl),
-        _ => None,
-    }) {
-        match value.as_str() {
-            Some(variant)
-                if enum_decl
-                    .variants
-                    .iter()
-                    .any(|candidate| candidate == variant) => {}
-            Some(_) => errors.push(format!(
-                "{path} must be one of: {}",
-                enum_decl.variants.join(", ")
-            )),
-            None => errors.push(format!("{path} must be a string enum variant")),
-        }
-        return;
-    }
-    errors.push(format!("{path} references unknown type `{name}`"));
-}
-
-fn validate_json_for_object(
-    ir: &IrProgram,
-    value: &Value,
-    fields: &[whipplescript_parser::IrClassField],
-    path: &str,
-    errors: &mut Vec<String>,
-) {
-    let Some(object) = value.as_object() else {
-        errors.push(format!("{path} must be an object"));
-        return;
-    };
-    for key in object.keys() {
-        if !fields.iter().any(|field| field.name == *key) {
-            errors.push(format!("{path}.{key} is not declared"));
-        }
-    }
-    for field in fields {
-        let field_path = format!("{path}.{}", field.name);
-        // Family B conditional required-presence (discriminated-families-design.md
-        // §5.7): a `when <disc> is "<lit>"` field is required only when its
-        // discriminant equals the literal. An inapplicable sibling (the discriminant
-        // names a different value) is neither required nor rejected nor validated —
-        // soundness needs only positive presence, and this admits the
-        // all-keys-present webhook shape.
-        if let Some((disc, lit)) = &field.presence_condition {
-            let applicable = object
-                .get(disc)
-                .and_then(Value::as_str)
-                .is_some_and(|value| value == lit);
-            if !applicable {
-                continue;
-            }
-        }
-        match object.get(&field.name) {
-            Some(value) => validate_json_for_ir_type(ir, value, &field.ty, &field_path, errors),
-            None if matches!(field.ty, IrType::Optional(_)) => {}
-            None => errors.push(format!("{field_path} is required")),
-        }
-    }
-}
-
-fn json_matches_ir_type(ir: &IrProgram, value: &Value, ty: &IrType) -> bool {
-    let mut errors = Vec::new();
-    validate_json_for_ir_type(ir, value, ty, "$", &mut errors);
-    errors.is_empty()
-}
+// IR-typed JSON validation moved KERNEL-side with the std.ingress admission
+// core (spec/std-ingress.md I3): every ingress driver validates payloads
+// against the declaration through the same functions, so the CLI delegates
+// (S0 dedup — a shape change touches exactly one definition).
+use whipplescript_kernel::rule_lowering::validate_json_for_ir_type;
 
 fn step(options: &CliOptions) -> ExitCode {
     let step_options = match StepOptions::parse(&options.args) {
@@ -18632,6 +19159,7 @@ fn step(options: &CliOptions) -> ExitCode {
         &ir,
         Some(Path::new(&step_options.program_path)),
         Some(&active_version_id),
+        None,
     ) {
         Ok(report) if options.json => emit_json(step_report_to_json(&report)),
         Ok(report) => {
@@ -18854,6 +19382,25 @@ impl AssertionStatus {
     }
 }
 
+/// The rung-3 registry default for `schema.coerce` (spec/std-coercion.md
+/// "Backend selection and config precedence"): the capability binding row's
+/// provider plus that provider's `effect_providers` row `config_json` — one
+/// indexed SELECT at claim time, mirroring the `capability_bound` promotion.
+/// `Ok(None)` when no binding row exists (the ladder then falls to fixture).
+fn coerce_registry_default(
+    store: &SqliteStore,
+    instance_id: &str,
+) -> Result<Option<coerce_runtime::CoerceRegistryDefault>, StoreError> {
+    let Some(provider) = store.capability_bound_provider(instance_id, "schema.coerce")? else {
+        return Ok(None);
+    };
+    let config_json = store.effect_provider_config("schema.coerce", &provider)?;
+    Ok(Some(coerce_runtime::CoerceRegistryDefault {
+        provider,
+        config_json,
+    }))
+}
+
 /// Native entry: build the unified `NativeStores` handle (runtime + coordination +
 /// work-items) and drive the generic rule pass over one held `RuntimeKernel`.
 fn step_instance(
@@ -18862,9 +19409,22 @@ fn step_instance(
     ir: &IrProgram,
     source_path: Option<&Path>,
     active_version_guard: Option<&str>,
+    side_stores: Option<&SideStorePaths>,
 ) -> Result<StepReport, StoreError> {
-    let stores = NativeStores::open(store_path, coordination_store_path(), items_store_path())?;
-    let mut kernel = RuntimeKernel::new(stores);
+    let stores = NativeStores::open(
+        store_path,
+        resolved_coordination_store(side_stores),
+        resolved_items_store(side_stores),
+    )?;
+    // The coercion-config fingerprint resolves provider/model through the same
+    // ladder rungs 2-4 the dispatch path uses (rung 3 needs the registry
+    // default, so the open runtime store is consulted before the kernel takes
+    // it; rung 1 is per-effect and stays out of the kernel-construction
+    // fingerprint; credentials are never consulted).
+    let registry_default = coerce_registry_default(&stores.runtime, instance_id)?;
+    let mut kernel = RuntimeKernel::new(stores).with_coercion_config_fingerprint(
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref()),
+    );
     step_instance_generic(
         &mut kernel,
         instance_id,
@@ -18937,7 +19497,6 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
         let kernel = &mut self.kernel;
         let event = match effect.kind.as_str() {
             "event.emit" => run_event_effect_generic(kernel, id, effect, &config)?,
-            "human.ask" => run_human_effect_generic(kernel, id, effect, &config)?,
             // Local mailbox is a native-only, file-based provider; the DO/sans-IO
             // InstanceStepMachine path stays on the fixture provider (out of scope).
             "capability.call" => run_capability_effect_generic(
@@ -18948,11 +19507,14 @@ impl InstanceDriver for NativeInstanceDriver<'_> {
                 &PackageLockCapabilityContract(package_lock),
                 &FixtureCapabilityProvider,
             )?,
-            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-                run_queue_effect_generic(kernel, id, effect, &config)?
+            "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+            | "tracker.finish" => {
+                run_queue_effect_generic(kernel, id, effect, &wall_clock_instant(), &config)?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
-            | "counter.consume" => run_coordination_effect_generic(kernel, id, effect, "now")?,
+            | "counter.consume" => {
+                run_coordination_effect_generic(kernel, id, effect, &wall_clock_instant())?
+            }
             "signal.emit" => run_notify_effect_generic(kernel, id, effect, &IfcDeliveryGovernance)?,
             "file.read" => {
                 let files = file_store_for_instance(id, &effect.effect_id);
@@ -19089,6 +19651,10 @@ struct WorkerOptions {
     /// root's lease (keyed on `root`, so a parent and its descendants never
     /// contend) and does not release it — only the root does.
     work_unit_root: Option<String>,
+    /// Explicit coordination/items store overrides (the improve loop's
+    /// per-evaluation containment). `None` resolves from env/workspace as
+    /// always. Child workflow drives inherit the parent's overrides.
+    side_stores: Option<SideStorePaths>,
 }
 
 impl WorkerOptions {
@@ -19221,6 +19787,7 @@ impl WorkerOptions {
             coerce_outputs: std::collections::BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         })
     }
 }
@@ -19263,6 +19830,10 @@ struct WorkerReport {
 fn drive_pass_idle(step_report: &StepReport, worker_report: &WorkerReport) -> bool {
     step_report.committed_rules == 0
         && worker_report.ran_effects == 0
+        // A fired timer is fresh progress: the pass ordering is step-then-
+        // worker, so the rule reacting to the completed timer needs one more
+        // pass — a timer-only pass must not read as idle.
+        && worker_report.timers_fired == 0
         && worker_report.file_lines_admitted == 0
         && worker_report.http_items_admitted == 0
         && worker_report.inbound_messages_admitted == 0
@@ -19295,11 +19866,7 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
         fs::read_to_string(program_path)
             .ok()
             .and_then(|source_text| {
-                whipplescript_parser::compile_program_with_root(
-                    &source_text,
-                    options.root.as_deref(),
-                )
-                .ir
+                compile_program_with_root_cached(&source_text, options.root.as_deref()).ir
             })
     });
     // Fire due `every <duration>` clock-source occurrences (spec/std-time.md), like
@@ -19480,15 +20047,22 @@ fn run_claimable_effect(
     let result = match effect.kind.as_str() {
         "agent.tell" => run_agent_effect(store_path, instance_id, effect, options),
         "schema.coerce" => run_coerce_effect(store_path, instance_id, effect, options),
-        "human.ask" => run_human_effect(store_path, instance_id, effect, options),
         "capability.call" => {
             run_capability_effect(store_path, instance_id, effect, options, package_lock)
         }
         "event.emit" => run_event_effect(store_path, instance_id, effect, options),
         "workflow.invoke" => run_workflow_invoke_effect(store_path, instance_id, effect, options),
-        "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-            run_queue_effect(store_path, instance_id, effect, options)
-        }
+        "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+        | "tracker.finish" => run_queue_effect(
+            store_path,
+            instance_id,
+            effect,
+            options
+                .virtual_now
+                .as_deref()
+                .unwrap_or(&wall_clock_instant()),
+            options,
+        ),
         "exec.command" => run_exec_effect(
             store_path,
             instance_id,
@@ -19501,7 +20075,11 @@ fn run_claimable_effect(
                 store_path,
                 instance_id,
                 effect,
-                options.virtual_now.as_deref().unwrap_or("now"),
+                options
+                    .virtual_now
+                    .as_deref()
+                    .unwrap_or(&wall_clock_instant()),
+                options.side_stores.as_ref(),
             )
         }
         "signal.emit" => run_notify_effect(store_path, instance_id, effect),
@@ -19567,13 +20145,34 @@ fn run_claimable_effects_bounded<F>(
 where
     F: Fn(&ClaimableEffect) -> Result<Option<whipplescript_store::StoredEvent>, StoreError> + Sync,
 {
+    // One poisoned effect must not wedge the whole pass: a semantic (Conflict)
+    // handler failure is reported and skipped so sibling effects still run —
+    // aborting on the first error re-poisoned EVERY subsequent worker pass
+    // before any effect ran. Store-level errors still abort.
+    fn absorb_conflict(
+        effect: &ClaimableEffect,
+        result: Result<Option<whipplescript_store::StoredEvent>, StoreError>,
+        terminals: &mut Vec<whipplescript_store::StoredEvent>,
+    ) -> Result<(), StoreError> {
+        match result {
+            Ok(Some(terminal)) => terminals.push(terminal),
+            Ok(None) => {}
+            Err(StoreError::Conflict(message)) => {
+                eprintln!(
+                    "effect `{}` ({}) handler refused this pass: {message}",
+                    effect.effect_id, effect.kind
+                );
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
     let limit = concurrency.max(1);
     let mut terminals = Vec::new();
     if limit == 1 || effects.len() <= 1 {
         for effect in effects {
-            if let Some(terminal) = run(effect)? {
-                terminals.push(terminal);
-            }
+            let result = run(effect);
+            absorb_conflict(effect, result, &mut terminals)?;
         }
         return Ok(terminals);
     }
@@ -19589,13 +20188,31 @@ where
                     .map(|handle| handle.join().expect("worker effect thread panicked"))
                     .collect()
             });
-        for result in results {
-            if let Some(terminal) = result? {
-                terminals.push(terminal);
-            }
+        for (effect, result) in chunk.iter().zip(results) {
+            absorb_conflict(effect, result, &mut terminals)?;
         }
     }
     Ok(terminals)
+}
+
+/// Explicit side-store overrides for one evaluation: the improve loop's
+/// per-evaluation containment. Previously env-var redirection
+/// (process-global, so evaluations could not run in parallel); explicit
+/// paths make each evaluation's coordination/items state its own. The
+/// content store stays process-level (content-addressed, so sharing is
+/// pairing-safe).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SideStorePaths {
+    pub(crate) coordination: PathBuf,
+    pub(crate) items: PathBuf,
+}
+
+fn resolved_coordination_store(side_stores: Option<&SideStorePaths>) -> PathBuf {
+    side_stores.map_or_else(coordination_store_path, |paths| paths.coordination.clone())
+}
+
+fn resolved_items_store(side_stores: Option<&SideStorePaths>) -> PathBuf {
+    side_stores.map_or_else(items_store_path, |paths| paths.items.clone())
 }
 
 /// Workspace-scoped coordination state (spec/coordination.md): shared
@@ -19637,7 +20254,7 @@ fn items_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/items.sqlite"))
 }
 
-use whipplescript_kernel::time_pass::{clock_emit_payload, TimePassReport};
+use whipplescript_kernel::time_pass::TimePassReport;
 #[cfg(test)]
 use whipplescript_kernel::time_pass::{due_calendar_occurrences, select_clock_occurrences};
 #[cfg(test)]
@@ -19663,99 +20280,110 @@ fn resolve_due_clock_sources(
     whipplescript_kernel::time_pass::resolve_due_clock_sources(&mut kernel, instance_id, now, ir)
 }
 
-/// Admits durable signal facts from `file` sources (spec/std-time.md admission
-/// semantics): read each source's `path`, and for every non-empty line at
-/// (non-empty) ordinal `i`, admit one signal keyed by `line_id = H(source, i)`
-/// — append-only log semantics, so re-reading the file re-admits nothing already
-/// seen and a growing file only adds its new tail.
-///
-/// Dedup mirrors the clock source's cursor, not a store-level upsert: the event
-/// log hard-errors on a duplicate idempotency key (no `ON CONFLICT`), so — as
-/// `resolve_due_clock_sources` does with `last_clock_occurrence` — we must never
-/// re-attempt an already-admitted line. The cursor is the count of external
-/// events already admitted for this signal (each admitted line appends exactly
-/// one such event; `derive_fact` appends a `fact.derived` event, not one of this
-/// type, so it does not inflate the count). Because non-empty ordinals are
-/// gap-free and admissions form a prefix `0..count`, skipping `i < count` is
-/// exactly the set already admitted.
-///
-/// A missing file is not an error: the source simply has nothing to admit yet.
-/// The observation record `{ line, line_index, path }` is mapped onto the
-/// declared signal by the author's `emit` clause exactly as a clock occurrence
-/// is mapped by `clock_emit_payload`.
+/// Admits durable signal facts from `file` sources. Lifted KERNEL-side with
+/// the std.ingress admission core (spec/std-ingress.md I3,
+/// `whipplescript_kernel::ingress_pass::resolve_due_file_sources`): the CLI
+/// opens the store once and supplies the native filesystem seam — line-mode
+/// `path` reads plus the `watch` glob walk (the FileStore plane has no
+/// directory listing). Line keys are byte-identical to the pre-lift
+/// `H(source, i)` cursor keys, so existing stores never double-admit.
 fn resolve_due_file_sources(
     store_path: &Path,
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<u64, StoreError> {
-    let mut admitted = 0u64;
-    for source in &ir.sources {
-        if !source.is_file {
-            continue;
+    struct NativeIngressFileIo;
+    impl whipplescript_kernel::ingress_pass::IngressFileIo for NativeIngressFileIo {
+        fn read_file(&mut self, path: &str) -> Result<Option<String>, String> {
+            match fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                // A missing file is not an error: nothing to admit yet.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("reading `{path}` failed: {error}")),
+            }
         }
-        let Some(path) = source.path.as_ref() else {
-            continue;
-        };
-        let already_admitted = {
-            let store = SqliteStore::open(store_path)?;
-            if store.get_instance(instance_id)?.is_none() {
-                continue;
-            }
-            store
-                .list_events(instance_id)?
-                .into_iter()
-                .filter(|event| {
-                    event.source == "external" && event.event_type == source.emit_signal
-                })
-                .count()
-        };
-        // A missing file is not an error: there is simply nothing to admit yet.
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(StoreError::Conflict(error.to_string())),
-        };
-        for (index, line) in contents
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .enumerate()
-        {
-            if index < already_admitted {
-                continue;
-            }
-            let line_id = idempotency_key(&[&source.name, &index.to_string()]);
-            let mut observation = serde_json::Map::new();
-            observation.insert("line".to_owned(), Value::String(line.to_owned()));
-            observation.insert("line_index".to_owned(), json!(index));
-            observation.insert("path".to_owned(), Value::String(path.clone()));
-            let payload_json = clock_emit_payload(source, &observation).to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            // Record the line event, then derive its durable signal fact
-            // (mirroring `whip signal`), keyed by `line_id` so both steps stay
-            // idempotent under replay.
-            let received = kernel.ingest_external_event(
-                instance_id,
-                &source.emit_signal,
-                &payload_json,
-                Some(&line_id),
-            )?;
-            kernel.derive_fact(
-                instance_id,
-                &source.emit_signal,
-                &received.event_id,
-                &payload_json,
-                Some(&received.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    "file-fact",
-                    &received.event_id,
-                ])),
-            )?;
-            admitted += 1;
+        fn glob_files(&mut self, pattern: &str) -> Result<Vec<String>, String> {
+            glob_watch_files(pattern)
         }
     }
-    Ok(admitted)
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let report = whipplescript_kernel::ingress_pass::resolve_due_file_sources(
+        &mut kernel,
+        instance_id,
+        ir,
+        &mut NativeIngressFileIo,
+    )?;
+    for note in &report.notes {
+        eprintln!("{note}");
+    }
+    Ok(report.admitted)
+}
+
+/// The v1 `watch` glob walk (spec/std-ingress.md I2a): a literal directory
+/// prefix plus one filename pattern where `*` matches any run of characters —
+/// deliberately the WHIPPLESCRIPT_EXEC_ALLOW-style conservative surface, no
+/// `**` and no wildcard directories. Non-matching and non-file entries are
+/// skipped; a missing directory is an empty match (nothing dropped yet).
+fn glob_watch_files(pattern: &str) -> Result<Vec<String>, String> {
+    let (dir, name_pattern) = match pattern.rsplit_once('/') {
+        Some((dir, name)) => (dir.to_owned(), name.to_owned()),
+        None => (".".to_owned(), pattern.to_owned()),
+    };
+    if dir.contains('*') {
+        return Err(format!(
+            "watch glob `{pattern}` uses a wildcard directory; v1 supports wildcards in the file name only"
+        ));
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("listing `{dir}` failed: {error}")),
+    };
+    let mut matched = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("listing `{dir}` failed: {error}"))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if wildcard_name_matches(&name_pattern, name) {
+            matched.push(format!("{dir}/{name}"));
+        }
+    }
+    matched.sort();
+    Ok(matched)
+}
+
+/// `*`-only wildcard match over a single path segment (no `?`, no classes).
+fn wildcard_name_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == name;
+    };
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            // Last literal must be a suffix of what remains.
+            return part.is_empty() || rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(found) => rest = &rest[found + part.len()..],
+            None => return false,
+        }
+    }
+    // Pattern had no `*` at all: the strip_prefix consumed it entirely.
+    rest.is_empty()
 }
 
 /// Admits durable signal facts from `http` sources: GET each source's `url`,
@@ -19930,7 +20558,27 @@ fn private_or_local_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn private_or_local_ipv6(ip: Ipv6Addr) -> bool {
+    // An IPv4-mapped (::ffff:a.b.c.d) or IPv4-compatible (::a.b.c.d) address is
+    // dialed over IPv4, so screen it with the (comprehensive) IPv4 classifier —
+    // otherwise `[::ffff:169.254.169.254]` (IMDS) / `[::ffff:127.0.0.1]` slip
+    // through as "public". `to_ipv4_mapped` covers the mapped form; the compat
+    // form is caught below.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return private_or_local_ipv4(v4);
+    }
     let octets = ip.octets();
+    // IPv4-compatible ::a.b.c.d (first 96 bits zero, not ::/`::1`).
+    if octets[..12] == [0u8; 12] && !ip.is_loopback() && !ip.is_unspecified() {
+        return private_or_local_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 destination.
+    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return private_or_local_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
     ip.is_loopback()
         || ip.is_unspecified()
         || (octets[0] & 0xfe) == 0xfc
@@ -19943,115 +20591,43 @@ fn resolve_due_http_sources(
     instance_id: &str,
     ir: &IrProgram,
 ) -> Result<u64, StoreError> {
-    let mut admitted = 0u64;
-    for source in &ir.sources {
-        if !source.is_http {
-            continue;
-        }
-        let Some(url) = source.url.as_ref() else {
-            continue;
-        };
+    // Lifted KERNEL-side with the std.ingress admission core
+    // (spec/std-ingress.md I3): the CLI supplies the native fetch seam — the
+    // SSRF policy screen plus the in-tree `ureq` client (mirroring the coerce
+    // and otel transports) with connection-time DNS screening, so a rebinding
+    // name cannot swing to an internal address between check and connect.
+    // Element keys are byte-identical to the pre-lift `H(source, i)` cursor
+    // keys, so existing stores never double-admit. A network/HTTP error is
+    // not a hard failure: admit nothing this pass so a flaky endpoint can't
+    // crash the worker.
+    let mut fetch = |url: &str| -> Result<String, String> {
         if let Some(reason) = http_source_url_policy_error(url) {
-            eprintln!("http source `{}`: refused {url}: {reason}", source.name);
-            continue;
+            return Err(format!("refused {url}: {reason}"));
         }
-        let already_admitted = {
-            let store = SqliteStore::open(store_path)?;
-            if store.get_instance(instance_id)?.is_none() {
-                continue;
-            }
-            store
-                .list_events(instance_id)?
-                .into_iter()
-                .filter(|event| {
-                    event.source == "external" && event.event_type == source.emit_signal
-                })
-                .count()
-        };
-        // GET the endpoint over the in-tree `ureq` client (mirrors the coerce and
-        // otel transports). A network/HTTP error is not a hard failure: admit
-        // nothing this pass so a flaky endpoint can't crash the worker.
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("whipplescript-ingress")
-            // Screen at connection time so a rebinding DNS name cannot swing to
-            // an internal address between the policy check and the connect.
             .resolver(screen_public_addrs)
             .build();
-        let body = match agent.get(url).call() {
-            Ok(response) => match response.into_string() {
-                Ok(body) => body,
-                Err(error) => {
-                    eprintln!(
-                        "http source `{}`: reading {url} failed: {error}",
-                        source.name
-                    );
-                    continue;
-                }
-            },
-            Err(error) => {
-                eprintln!("http source `{}`: GET {url} failed: {error}", source.name);
-                continue;
-            }
-        };
-        // The body must be a JSON array; anything else admits nothing this pass.
-        let elements = match serde_json::from_str::<Value>(&body) {
-            Ok(Value::Array(elements)) => elements,
-            Ok(_) => {
-                eprintln!(
-                    "http source `{}`: {url} did not return a JSON array; skipping",
-                    source.name
-                );
-                continue;
-            }
-            Err(error) => {
-                eprintln!(
-                    "http source `{}`: {url} returned invalid JSON: {error}",
-                    source.name
-                );
-                continue;
-            }
-        };
-        for (index, element) in elements.into_iter().enumerate() {
-            if index < already_admitted {
-                continue;
-            }
-            let item_id = idempotency_key(&[&source.name, &index.to_string()]);
-            let mut observation = serde_json::Map::new();
-            // `item` carries the element re-stringified, so a source can emit the
-            // whole element as a string field (or, once field access lands, drill
-            // into it); `item_index`/`url` mirror `line_index`/`path`.
-            observation.insert("item".to_owned(), Value::String(element.to_string()));
-            observation.insert("item_index".to_owned(), json!(index));
-            observation.insert("url".to_owned(), Value::String(url.clone()));
-            let payload_json = clock_emit_payload(source, &observation).to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
-            // Record the item event, then derive its durable signal fact
-            // (mirroring `whip signal`), keyed by `item_id` so both steps stay
-            // idempotent under replay.
-            let received = kernel.ingest_external_event(
-                instance_id,
-                &source.emit_signal,
-                &payload_json,
-                Some(&item_id),
-            )?;
-            kernel.derive_fact(
-                instance_id,
-                &source.emit_signal,
-                &received.event_id,
-                &payload_json,
-                Some(&received.event_id),
-                Some(&idempotency_key(&[
-                    instance_id,
-                    "http-fact",
-                    &received.event_id,
-                ])),
-            )?;
-            admitted += 1;
+        match agent.get(url).call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| format!("reading {url} failed: {error}")),
+            Err(error) => Err(format!("GET {url} failed: {error}")),
         }
+    };
+    let store = SqliteStore::open(store_path)?;
+    let mut kernel = RuntimeKernel::new(store);
+    let report = whipplescript_kernel::ingress_pass::resolve_due_http_sources(
+        &mut kernel,
+        instance_id,
+        ir,
+        &mut fetch,
+    )?;
+    for note in &report.notes {
+        eprintln!("{note}");
     }
-    Ok(admitted)
+    Ok(report.admitted)
 }
 
 /// Autonomous inbound RECEIVE for `local` channels (spec/messaging.md): the
@@ -20134,7 +20710,9 @@ fn resolve_due_inbound_messages(
                 "message_id": message_id,
                 "channel": channel.name,
                 "provider": "local",
-                "received_at": "",
+                // Worker-boundary admission instant (wall reads live on worker
+                // passes): the envelope records WHEN the line was admitted.
+                "received_at": wall_clock_instant(),
                 "sender": field("sender"),
                 "sender_claims": "{}",
                 "thread_id": field("thread_id"),
@@ -20207,14 +20785,12 @@ enum ProviderCancellationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CancellationAcknowledgementOrder {
     BeforeTerminal,
-    AfterTerminalAllowed,
 }
 
 impl CancellationAcknowledgementOrder {
     fn as_str(self) -> &'static str {
         match self {
             Self::BeforeTerminal => "before_terminal",
-            Self::AfterTerminalAllowed => "after_terminal_allowed",
         }
     }
 }
@@ -20322,11 +20898,6 @@ fn provider_cancellation_policy(provider: &str) -> ProviderCancellationPolicy {
     {
         return ProviderCancellationPolicy::NativeStop {
             acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
-        };
-    }
-    if normalized == "pi" || normalized.starts_with("pi-") {
-        return ProviderCancellationPolicy::NativeStop {
-            acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
         };
     }
     ProviderCancellationPolicy::Unsupported
@@ -20444,9 +21015,9 @@ fn run_agent_effect(
     // no config launches with defaults; a sidecar that cannot launch is caught as
     // `provider_health` in the per-kind arms below.) Recoverable — a later worker
     // pass runs the effect once the binding is supplied.
-    if matches!(provider_selection.kind.as_str(), "codex" | "claude" | "pi") {
+    if matches!(provider_selection.kind.as_str(), "codex" | "claude") {
         if let Some(config) = provider_selection.provider_config.as_ref() {
-            let validation = validate_provider_binding(config, &builtin_provider_capabilities());
+            let validation = validate_provider_binding(config, &effective_provider_capabilities());
             if validation
                 .iter()
                 .any(|result| result.code == "missing_credentials_ref")
@@ -20592,33 +21163,6 @@ fn run_agent_effect(
                 .to_owned(),
         ));
     }
-    if provider_selection.kind == "pi" {
-        let request = pi_native_turn_request(
-            execution,
-            effect,
-            &input_json,
-            provider_selection.provider_config.as_ref(),
-        )?;
-        let mut adapter = match pi_rpc_adapter(&provider_selection.provider_id) {
-            Ok(healthy_adapter) => healthy_adapter,
-            Err(error) => {
-                return kernel.block_effect_binding(
-                    instance_id,
-                    &effect.effect_id,
-                    "provider_health",
-                    &binding_failure_detail(&error),
-                );
-            }
-        };
-        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
-        return kernel.run_native_agent_turn_with_metadata(
-            execution,
-            request,
-            &mut adapter,
-            native_provider_max_events(),
-            &metadata_json,
-        );
-    }
     if provider_selection.kind == "command" {
         let Some(plan) = provider_selection.command_plan.clone() else {
             return Err(StoreError::Conflict(format!(
@@ -20632,10 +21176,31 @@ fn run_agent_effect(
         return kernel.run_agent_turn_with_metadata(execution, &harness, &metadata_json);
     }
 
-    let harness = fixture_harness(
-        &provider_selection.provider_id,
-        fixture_outcome_for_agent(options, execution.agent).is_failed(),
-    );
+    let outcome = fixture_outcome_for_agent(options, execution.agent);
+    if matches!(
+        outcome,
+        FixtureOutcome::TimedOut | FixtureOutcome::Cancelled
+    ) {
+        // The subprocess fixture can only exit 0/nonzero (complete/fail); a
+        // requested timeout/cancel stub must produce a REAL terminal, not a
+        // silent completion (DR-0039 honest-failure rule). Route it through the
+        // native fixture adapter, which emits genuine timed_out/cancelled
+        // terminals.
+        let mut adapter = NativeFixtureAdapter::new(
+            &provider_selection.provider_id,
+            &run_id,
+            fixture_terminal_event_kind(outcome),
+        );
+        let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
+        return kernel.run_native_agent_turn_with_metadata(
+            execution,
+            native_fixture_turn_request(execution, &input_json),
+            &mut adapter,
+            8,
+            &metadata_json,
+        );
+    }
+    let harness = fixture_harness(&provider_selection.provider_id, outcome.is_failed());
     let metadata_json = agent_provider_selection_metadata_json(&provider_selection);
     kernel.run_agent_turn_with_metadata(execution, &harness, &metadata_json)
 }
@@ -20856,7 +21421,7 @@ fn provider_binding_for_harness(
         let config_json = fs::read_to_string(path)?;
         let (_results, bindings) = validate_doctor_provider_config_json_with_bindings(
             &config_json,
-            &builtin_provider_capabilities(),
+            &effective_provider_capabilities(),
         );
         for binding in bindings {
             if binding.config.provider_id != harness {
@@ -20881,7 +21446,7 @@ fn provider_binding_for_harness(
 fn command_launch_plan_from_config(
     config: &ProviderBindingConfig,
 ) -> Result<CommandLaunchPlan, StoreError> {
-    if config.provider_kind != ProviderKind::Command || config.surface != AdapterSurface::Command {
+    if config.provider_kind != "command" || config.surface != "command" {
         return Err(StoreError::Conflict(format!(
             "provider config `{}` must use provider_kind `command` and surface `command` for a command harness",
             config.provider_id
@@ -21015,8 +21580,6 @@ fn fallback_provider_kind(provider: &str) -> &'static str {
         "codex"
     } else if is_claude_native_provider(provider) {
         "claude"
-    } else if is_pi_native_provider(provider) {
-        "pi"
     } else if provider == "owned" || provider == "owned-fixture" {
         "owned"
     } else {
@@ -21130,9 +21693,19 @@ fn is_claude_native_provider(provider: &str) -> bool {
     normalized == "claude" || normalized.starts_with("claude-")
 }
 
-fn is_pi_native_provider(provider: &str) -> bool {
-    let normalized = provider.to_ascii_lowercase();
-    normalized == "pi" || normalized.starts_with("pi-")
+/// The effective provider capability catalog for this `whip` build: the kernel's
+/// builtins (fixture/command/schema-coercer, plus the still-in-kernel claude
+/// adapter) extended with each external provider crate compiled in. This is the
+/// composition root of the open registry (DR-0024) — the kernel no longer names
+/// codex, so the CLI assembles it in here from the provider crate's `capability()`.
+fn effective_provider_capabilities() -> Vec<whipplescript_kernel::provider::ProviderCapability> {
+    #[allow(unused_mut)]
+    let mut caps = builtin_provider_capabilities();
+    #[cfg(feature = "codex")]
+    caps.push(whipplescript_provider_codex::capability());
+    #[cfg(feature = "claude")]
+    caps.push(whipplescript_provider_claude::capability());
+    caps
 }
 
 #[cfg(feature = "codex")]
@@ -21160,13 +21733,7 @@ fn codex_app_server_adapter(
     let transport = StdioCodexAppServerTransport::spawn(&command, &args).map_err(|error| {
         StoreError::Conflict(format!("failed to launch Codex app-server: {error:?}"))
     })?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == ProviderKind::Codex
-                && capability.surface == AdapterSurface::CodexAppServer
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Codex capability".to_owned()))?;
+    let capability = whipplescript_provider_codex::capability();
     Ok(
         CodexAppServerAdapter::new(provider, capability, CodexAppServerClient::new(transport))
             .with_inactivity_budget(native_provider_inactivity_budget()),
@@ -21195,8 +21762,8 @@ fn codex_native_turn_request(
     apply_provider_config_options(&mut provider_options, config);
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Codex,
-        surface: AdapterSurface::CodexAppServer,
+        provider_kind: "codex".to_owned(),
+        surface: "codex_app_server".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -21261,13 +21828,7 @@ fn claude_agent_sdk_adapter(
                 "failed to launch Claude Agent SDK sidecar: {error:?}"
             ))
         })?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == ProviderKind::Claude
-                && capability.surface == AdapterSurface::ClaudeAgentSdk
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Claude capability".to_owned()))?;
+    let capability = whipplescript_provider_claude::capability();
     let mut client = ClaudeAgentSdkClient::new(transport);
     // Version exchange (DR-0035 Decision 7): a sidecar that ANSWERS with a
     // mismatched protocol blocks the binding here (provider_health,
@@ -21320,8 +21881,8 @@ fn claude_native_turn_request(
     }
     Ok(NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Claude,
-        surface: AdapterSurface::ClaudeAgentSdk,
+        provider_kind: "claude".to_owned(),
+        surface: "claude_agent_sdk".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -21336,73 +21897,6 @@ fn claude_native_turn_request(
             config,
             CancellationDepth::CooperativeRequest,
         ),
-        artifact_policy: provider_artifact_policy(config, "metadata"),
-        credential_ref: provider_credential_ref(config),
-        provider_options,
-    })
-}
-
-fn pi_rpc_adapter(provider: &str) -> Result<PiRpcAdapter<StdioPiRpcTransport>, StoreError> {
-    let args = ["--mode", "rpc", "--no-session"];
-    let command = env::var("WHIPPLESCRIPT_PI_RPC_COMMAND").unwrap_or_else(|_| "pi".to_owned());
-    let transport = StdioPiRpcTransport::spawn(&command, &args)
-        .map_err(|error| StoreError::Conflict(format!("failed to launch Pi RPC: {error:?}")))?;
-    let capability = builtin_provider_capabilities()
-        .into_iter()
-        .find(|capability| {
-            capability.provider_kind == ProviderKind::Pi
-                && capability.surface == AdapterSurface::PiRpc
-        })
-        .ok_or_else(|| StoreError::Conflict("missing built-in Pi capability".to_owned()))?;
-    Ok(
-        PiRpcAdapter::new(provider, capability, PiRpcClient::new(transport))
-            .with_inactivity_budget(native_provider_inactivity_budget()),
-    )
-}
-
-fn pi_native_turn_request(
-    execution: AgentTurnExecution<'_>,
-    effect: &ClaimableEffect,
-    input_json: &str,
-    config: Option<&ProviderBindingConfig>,
-) -> Result<NativeProviderTurnRequest, StoreError> {
-    let input = serde_json::from_str::<Value>(input_json)?;
-    let prompt_json = input
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(|prompt| Value::String(prompt.to_owned()))
-        .unwrap_or(input);
-    let mut provider_options = BTreeMap::new();
-    if let Ok(provider) = env::var("WHIPPLESCRIPT_PI_RPC_PROVIDER") {
-        provider_options.insert("provider".to_owned(), Value::String(provider));
-    }
-    if let Ok(model) = env::var("WHIPPLESCRIPT_PI_RPC_MODEL") {
-        provider_options.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(model) = config.and_then(|config| config.default_model.clone()) {
-        provider_options.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(config) = config {
-        if let Some(provider) = optional_extra_string(config, "model_provider")? {
-            provider_options.insert("provider".to_owned(), Value::String(provider));
-        }
-    }
-    apply_provider_config_options(&mut provider_options, config);
-    Ok(NativeProviderTurnRequest {
-        provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Pi,
-        surface: AdapterSurface::PiRpc,
-        run_id: execution.run_id.to_owned(),
-        effect_id: execution.effect_id.to_owned(),
-        agent: execution.agent.to_owned(),
-        profile: execution
-            .profile
-            .map(str::to_owned)
-            .or_else(|| Some("repo-reader".to_owned())),
-        prompt_json,
-        workspace_policy: provider_workspace_policy(config, "read_only"),
-        required_capabilities: native_required_capabilities(effect)?,
-        cancellation_depth: provider_cancellation_depth(config, CancellationDepth::NativeStop),
         artifact_policy: provider_artifact_policy(config, "metadata"),
         credential_ref: provider_credential_ref(config),
         provider_options,
@@ -21452,7 +21946,7 @@ fn codex_app_server_model(config: Option<&ProviderBindingConfig>) -> Result<Stri
     config
         .and_then(|config| config.default_model.clone())
         .or_else(|| env::var("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL").ok())
-        .or_else(coerce_runtime::codex_config_model)
+        .or_else(model_auth::codex_config_model)
         .ok_or_else(|| {
             StoreError::Conflict(
                 "no Codex agent model: set WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL, a provider-config `default_model`, or `model` in ~/.codex/config.toml"
@@ -21554,8 +22048,8 @@ impl NativeFixtureAdapter {
             terminal,
             next_index: 0,
             capability: ProviderCapability {
-                provider_kind: ProviderKind::Fixture,
-                surface: AdapterSurface::Fixture,
+                provider_kind: "fixture".to_owned(),
+                surface: "fixture".to_owned(),
                 protocol_version: Some("native-fixture.v1".to_owned()),
                 session_identity_fields: vec!["session_id".to_owned(), "turn_id".to_owned()],
                 stream_event_kinds: vec![
@@ -21689,8 +22183,8 @@ fn native_fixture_turn_request(
 ) -> NativeProviderTurnRequest {
     NativeProviderTurnRequest {
         provider_id: execution.provider.to_owned(),
-        provider_kind: ProviderKind::Fixture,
-        surface: AdapterSurface::Fixture,
+        provider_kind: "fixture".to_owned(),
+        surface: "fixture".to_owned(),
         run_id: execution.run_id.to_owned(),
         effect_id: execution.effect_id.to_owned(),
         agent: execution.agent.to_owned(),
@@ -21732,14 +22226,8 @@ fn run_coerce_effect(
     // fixture coerce should return; it takes precedence over the variant knob and
     // the generated placeholder.
     let injected_output = options.coerce_outputs.get(&function_name).cloned();
-    let request = CoerceRequest {
-        function_name,
-        arguments_json,
-        output_type: output_type.clone(),
-        generated_coerce_source_hash: "fixture".to_owned(),
-        input_schema_hash: "fixture".to_owned(),
-        output_schema_hash: "fixture".to_owned(),
-    };
+    let request =
+        CoerceRequest::with_evidence_hashes(function_name, arguments_json, output_type.clone());
     // Sum-type outputs carry embedded per-variant fixtures: return the
     // selected (or first declared) tagged variant (spec/sum-types.md).
     let value = injected_output
@@ -21766,16 +22254,21 @@ fn run_coerce_effect(
     if options.outcome == FixtureOutcome::Cancelled {
         return cancel_coerce_effect(store_path, instance_id, effect, &input, options);
     }
-    // Opt-in real path: when a coerce provider is configured, issue a
-    // provider-native structured-output call instead of the fixture. A
-    // misconfiguration (unknown provider, missing credential) surfaces as a
-    // clear error rather than silently degrading to a fixture.
+    // Registry-honest selection (spec/std-coercion.md "Backend selection and
+    // config precedence"): per-effect `provider` in source, then the operator
+    // override (env + whip auth), then the registry `schema.coerce` binding
+    // row, then fixture. A misconfiguration (unknown provider, missing
+    // credential) surfaces as a clear error rather than silently degrading to
+    // a fixture.
     let provider_override = input.get("provider").and_then(Value::as_str);
-    let native_config = match provider_override {
-        Some(provider) => coerce_runtime::resolve_native_coerce_config_for(Some(provider)),
-        None => coerce_runtime::resolve_native_coerce_config(),
-    }
-    .map_err(StoreError::Conflict)?;
+    let registry_default = {
+        let store = SqliteStore::open(store_path)?;
+        coerce_registry_default(&store, instance_id)?
+    };
+    let native_config =
+        coerce_runtime::resolve_coercion_selection(provider_override, registry_default.as_ref())
+            .map_err(StoreError::Conflict)?
+            .config;
     if let Some(config) = native_config {
         return run_native_coerce_effect(
             store_path,
@@ -21813,6 +22306,118 @@ fn run_coerce_effect(
     )
 }
 
+/// `whip coercion status [--json]`: the RESOLVED `schema.coerce` provider
+/// configuration and which selection-ladder rung chose it
+/// (spec/std-coercion.md "Backend selection and config precedence"; "Static
+/// checks" tier 2 — config validation promoted to operator-visible posture).
+/// Reports the credential SOURCE label only, never the credential itself.
+fn coercion(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip [--store path] [--json] coercion status";
+    let mut positional = options.args.iter();
+    match (positional.next().map(String::as_str), positional.next()) {
+        (Some("status"), None) => {}
+        _ => {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    }
+    // The rung-3 registry default: the GLOBAL `schema.coerce` binding row (no
+    // instance in hand, so program-scoped rows are out of scope here). A store
+    // that does not exist yet contributes none — a status command must not
+    // create one as a side effect.
+    let registry_default = if options.store_path.exists() {
+        match SqliteStore::open(&options.store_path)
+            .and_then(|store| coerce_registry_default(&store, ""))
+        {
+            Ok(default) => default,
+            Err(error) => {
+                eprintln!("coercion status: could not read the registry: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let fingerprint =
+        coerce_runtime::coercion_config_fingerprint_with_registry(registry_default.as_ref());
+    let selection =
+        match coerce_runtime::resolve_coercion_selection(None, registry_default.as_ref()) {
+            Ok(selection) => selection,
+            Err(error) => {
+                // Misconfiguration (unknown provider, provider-set-but-no-
+                // credential, OAuth-token-for-anthropic) is exactly what this
+                // surface exists to expose.
+                if options.json {
+                    let _ = emit_json(json!({ "error": error, "fingerprint": fingerprint }));
+                } else {
+                    eprintln!("coercion: misconfigured: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+    let rung = selection.rung;
+    let credential_source = selection
+        .credential_source
+        .map(model_auth::CredentialSource::label);
+    match &selection.config {
+        Some(config) => {
+            let backend = match config.backend {
+                whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
+                whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => {
+                    "openai-generic"
+                }
+                whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+            };
+            if options.json {
+                return emit_json(json!({
+                    "provider_id": config.provider_id,
+                    "backend": backend,
+                    "model": config.model,
+                    "credential_source": credential_source,
+                    "max_tokens": config.max_tokens,
+                    "timeout_secs": config.timeout_secs,
+                    "rung": rung.number(),
+                    "rung_label": rung.label(),
+                    "fingerprint": fingerprint,
+                }));
+            }
+            println!(
+                "coercion provider: {} (backend {backend}, model {})",
+                config.provider_id, config.model
+            );
+            println!(
+                "  credential: {}",
+                credential_source.unwrap_or_else(|| "none".to_owned())
+            );
+            println!(
+                "  max_tokens {} / timeout {}s",
+                config.max_tokens, config.timeout_secs
+            );
+            println!("  selected by rung {}: {}", rung.number(), rung.label());
+            println!("  fingerprint: {fingerprint}");
+        }
+        None => {
+            if options.json {
+                return emit_json(json!({
+                    "provider_id": "fixture",
+                    "backend": Value::Null,
+                    "model": Value::Null,
+                    "credential_source": Value::Null,
+                    "max_tokens": Value::Null,
+                    "timeout_secs": Value::Null,
+                    "rung": rung.number(),
+                    "rung_label": rung.label(),
+                    "fingerprint": fingerprint,
+                }));
+            }
+            println!("coercion provider: fixture (deterministic; no model call)");
+            println!("  selected by rung {}: {}", rung.number(), rung.label());
+            println!("  fingerprint: {fingerprint}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `whip auth`: manage coerce credentials and delegate harness OAuth.
 fn auth_command(options: &CliOptions) -> ExitCode {
     let usage = "usage: whip auth <status | set <openai|anthropic> <key>>";
@@ -21834,6 +22439,485 @@ fn auth_command(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// `whip mcp ...` — the operator door onto the MCP server registry
+/// (`spec/mcp-support-design-note.md`). Every subcommand here writes EVIDENCE
+/// (a pin, an attestation, a role file). The matching REQUIREMENT — the minimum
+/// trust rung a turn must meet — lives in the signed governance envelope
+/// (`require mcp <rung>`), never here, so attesting a server cannot also lower
+/// the bar it is judged against.
+fn mcp_command(options: &CliOptions) -> ExitCode {
+    let usage = command_usage("mcp").unwrap_or_default();
+    let mut positional = Vec::new();
+    let mut url = None::<String>;
+    let mut command = None::<String>;
+    let mut args = Vec::<String>::new();
+    let mut env = std::collections::BTreeMap::<String, String>::new();
+    let mut headers = std::collections::BTreeMap::<String, String>::new();
+    let mut trust_annotations = false;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--url" => url = iter.next().cloned(),
+            "--command" => command = iter.next().cloned(),
+            "--arg" => {
+                if let Some(value) = iter.next() {
+                    args.push(value.clone());
+                }
+            }
+            "--env" | "--header" => {
+                let Some(pair) = iter.next() else {
+                    eprintln!("{arg} needs KEY=VALUE");
+                    return ExitCode::from(2);
+                };
+                let Some((key, value)) = pair.split_once('=') else {
+                    eprintln!("{arg} needs KEY=VALUE, got `{pair}`");
+                    return ExitCode::from(2);
+                };
+                if arg == "--env" {
+                    env.insert(key.to_owned(), value.to_owned());
+                } else {
+                    headers.insert(key.to_owned(), value.to_owned());
+                }
+            }
+            "--trust-annotations" => trust_annotations = true,
+            other if other.starts_with('-') => {
+                eprintln!("unknown mcp option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => positional.push(other.to_owned()),
+        }
+    }
+    let subcommand = positional.first().map(String::as_str);
+    let name = positional.get(1).cloned();
+    match subcommand {
+        Some("list") => mcp_list(options),
+        Some("add") => mcp_add(name, url, command, args, env, headers),
+        Some("import") => mcp_import(name),
+        Some("status") => mcp_status(options, name),
+        Some("pin") | Some("sync") => mcp_pin(name, subcommand == Some("sync")),
+        Some("attest") => mcp_attest(name, trust_annotations),
+        Some("forget") => mcp_forget(name),
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn mcp_registry_or_exit(
+) -> Result<std::collections::BTreeMap<String, mcp_tools::McpServerConfig>, ExitCode> {
+    mcp_tools::load_registry().map_err(|error| {
+        eprintln!("{error}");
+        ExitCode::FAILURE
+    })
+}
+
+fn mcp_list(options: &CliOptions) -> ExitCode {
+    let registry = match mcp_registry_or_exit() {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    if options.json {
+        let rows: Vec<serde_json::Value> = registry
+            .values()
+            .map(|server| {
+                json!({
+                    "name": server.name,
+                    "rung": server.rung().as_str(),
+                    "transport": match &server.transport {
+                        mcp_tools::McpTransport::Stdio { .. } => "stdio",
+                        mcp_tools::McpTransport::Http { .. } => "http",
+                    },
+                    "pinned_tools": server.pin.as_ref().map_or(0, serde_json::Map::len),
+                    "roles": server.roles.keys().collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", json!({ "servers": rows }));
+        return ExitCode::SUCCESS;
+    }
+    if registry.is_empty() {
+        println!("no MCP servers registered");
+        println!("add one with `whip mcp add <name> --command <cmd>` or import an existing");
+        println!("config with `whip mcp import ~/.claude.json`");
+        return ExitCode::SUCCESS;
+    }
+    for server in registry.values() {
+        let transport = match &server.transport {
+            mcp_tools::McpTransport::Stdio { command, .. } => format!("stdio: {command}"),
+            mcp_tools::McpTransport::Http { url, .. } => format!("http: {url}"),
+        };
+        println!("{}  [{}]  {transport}", server.name, server.rung().as_str());
+    }
+    ExitCode::SUCCESS
+}
+
+fn mcp_save_one(server: mcp_tools::McpServerConfig) -> ExitCode {
+    let mut registry = match mcp_registry_or_exit() {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    let name = server.name.clone();
+    registry.insert(name.clone(), server);
+    match mcp_tools::save_registry(&registry) {
+        Ok(path) => {
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn mcp_add(
+    name: Option<String>,
+    url: Option<String>,
+    command: Option<String>,
+    args: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
+    headers: std::collections::BTreeMap<String, String>,
+) -> ExitCode {
+    let Some(name) = name else {
+        eprintln!("usage: whip mcp add <name> (--url <url> | --command <cmd> [--arg <a>]...)");
+        return ExitCode::from(2);
+    };
+    let transport = match (url, command) {
+        (Some(url), None) => {
+            // Fail at `add`, not at first use: an operator who pastes an
+            // http:// endpoint should learn immediately, while they still have
+            // the correct URL in hand.
+            if let Err(error) = mcp_tools::refuse_plaintext_endpoint(&name, &url) {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+            mcp_tools::McpTransport::Http { url, headers }
+        }
+        (None, Some(command)) => mcp_tools::McpTransport::Stdio { command, args, env },
+        (Some(_), Some(_)) => {
+            eprintln!("give either --url or --command, not both");
+            return ExitCode::from(2);
+        }
+        (None, None) => {
+            eprintln!("`whip mcp add` needs --url <url> or --command <cmd>");
+            return ExitCode::from(2);
+        }
+    };
+    let server = mcp_tools::McpServerConfig {
+        name: name.clone(),
+        transport,
+        pin: None,
+        trust_annotations: false,
+        roles: std::collections::BTreeMap::new(),
+    };
+    let code = mcp_save_one(server);
+    if code == ExitCode::SUCCESS {
+        // Rung 0 is a complete path, and saying so is the point: the server
+        // works right now, and the ladder above it is optional.
+        println!("added `{name}` at rung `unattested` — usable now, and every call is");
+        println!("recorded as untrusted. Grant it per turn by naming the tools you use:");
+        println!("    tell agent with access to {name} {{ some_tool other_tool }} \"...\"");
+        println!("Run `whip mcp status {name}` to see what it offers, then");
+        println!("`whip mcp pin {name}` to freeze the manifest against silent changes.");
+    }
+    code
+}
+
+fn mcp_import(path: Option<String>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("usage: whip mcp import <file>   (a Claude Code / Cursor style config)");
+        return ExitCode::from(2);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("could not read {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{path} is not valid JSON: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let imported = match mcp_tools::servers_from_mcp_servers_block(&value) {
+        Ok(servers) => servers,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut registry = match mcp_registry_or_exit() {
+        Ok(registry) => registry,
+        Err(code) => return code,
+    };
+    let mut names = Vec::new();
+    for server in imported {
+        names.push(server.name.clone());
+        // Importing is not trusting: an imported server lands at rung 0 and
+        // keeps any evidence it had already accrued here.
+        match registry.get(&server.name) {
+            Some(existing) => {
+                let mut merged = server;
+                // Evidence carries over ONLY if the transport is unchanged. A
+                // re-import that repoints a name at a different command or URL
+                // is a different server wearing a known name; inheriting its
+                // pin and attestation would hand a stranger someone else's
+                // trust, and the pin would no longer describe what runs.
+                if merged.transport == existing.transport {
+                    merged.pin = existing.pin.clone();
+                    merged.trust_annotations = existing.trust_annotations;
+                    merged.roles = existing.roles.clone();
+                } else {
+                    println!(
+                        "note: `{}` now points at a different command/URL — its pin, \
+                         attestation, and roles were dropped; re-review it with \
+                         `whip mcp status {}`",
+                        merged.name, merged.name
+                    );
+                }
+                registry.insert(merged.name.clone(), merged);
+            }
+            None => {
+                registry.insert(server.name.clone(), server);
+            }
+        }
+    }
+    match mcp_tools::save_registry(&registry) {
+        Ok(path) => {
+            println!("imported {} server(s): {}", names.len(), names.join(", "));
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn mcp_lookup(
+    name: Option<String>,
+) -> Result<
+    (
+        String,
+        mcp_tools::McpServerConfig,
+        std::collections::BTreeMap<String, mcp_tools::McpServerConfig>,
+    ),
+    ExitCode,
+> {
+    let Some(name) = name else {
+        eprintln!("that subcommand needs a server name");
+        return Err(ExitCode::from(2));
+    };
+    let registry = mcp_registry_or_exit()?;
+    let Some(server) = registry.get(&name).cloned() else {
+        eprintln!("no MCP server named `{name}` (see `whip mcp list`)");
+        return Err(ExitCode::FAILURE);
+    };
+    Ok((name, server, registry))
+}
+
+/// Connect and report what a server offers, plus how its live manifest compares
+/// to the pin. This is the door an admin reads before attesting or classifying.
+fn mcp_status(options: &CliOptions, name: Option<String>) -> ExitCode {
+    let (name, server, _) = match mcp_lookup(name) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let mut client = match mcp_tools::McpClient::connect(&server) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let live = match client.list_tools() {
+        Ok(live) => live,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let drift = server
+        .pin
+        .as_ref()
+        .map(|pin| whipplescript_kernel::mcp::manifest_drift(pin, &live))
+        .unwrap_or_default();
+    let annotated = live
+        .iter()
+        .filter(|tool| tool.annotations.is_some())
+        .count();
+    if options.json {
+        println!(
+            "{}",
+            json!({
+                "name": name,
+                "rung": server.rung().as_str(),
+                "tools": live.iter().map(|tool| json!({
+                    "name": tool.name,
+                    "annotated": tool.annotations.is_some(),
+                    "read_only_hint": tool.claims_read_only(),
+                })).collect::<Vec<_>>(),
+                "annotated": annotated,
+                "drift": drift,
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!("{name}  [{}]", server.rung().as_str());
+    println!("{} tool(s), {annotated} annotated", live.len());
+    for tool in &live {
+        let hint = if tool.annotations.is_none() {
+            "unannotated"
+        } else if tool.claims_read_only() {
+            "claims read-only"
+        } else {
+            "claims mutating"
+        };
+        println!("  {:<32} {hint}", tool.name);
+    }
+    if annotated < live.len() && server.rung() >= whipplescript_kernel::mcp::McpRung::Attested {
+        println!();
+        println!(
+            "note: {} tool(s) carry no annotation, so they can only be granted by name",
+            live.len() - annotated
+        );
+        println!("      or through a role you define in the config file.");
+    }
+    if !drift.is_empty() {
+        println!();
+        println!("PIN DRIFT — this server no longer matches its pinned manifest:");
+        for entry in &drift {
+            println!("  {entry}");
+        }
+        println!("turns granting this server will fail until you review and re-pin");
+        println!("with `whip mcp sync {name}`.");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Freeze (or re-freeze) the manifest. `sync` is the same operation after a
+/// drift, named differently because re-pinning is a review decision.
+fn mcp_pin(name: Option<String>, resync: bool) -> ExitCode {
+    let (name, mut server, mut registry) = match mcp_lookup(name) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let mut client = match mcp_tools::McpClient::connect(&server) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let live = match client.list_tools() {
+        Ok(live) => live,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(existing) = &server.pin {
+        let drift = whipplescript_kernel::mcp::manifest_drift(existing, &live);
+        if drift.is_empty() {
+            println!("`{name}` already matches its pin ({} tools)", live.len());
+            return ExitCode::SUCCESS;
+        }
+        if !resync {
+            eprintln!("`{name}` has drifted from its pin:");
+            for entry in &drift {
+                eprintln!("  {entry}");
+            }
+            eprintln!("review the change, then re-pin with `whip mcp sync {name}`");
+            return ExitCode::FAILURE;
+        }
+        println!("re-pinning `{name}` over {} change(s):", drift.len());
+        for entry in &drift {
+            println!("  {entry}");
+        }
+    }
+    server.pin = Some(whipplescript_kernel::mcp::manifest_pin(&live));
+    let rung = server.rung();
+    registry.insert(name.clone(), server);
+    match mcp_tools::save_registry(&registry) {
+        Ok(path) => {
+            println!(
+                "pinned {} tool(s) of `{name}` [{}]",
+                live.len(),
+                rung.as_str()
+            );
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Attest that a pinned server's self-reported annotations may be believed.
+/// This is the act that turns hints into admissible classification — and it is
+/// deliberately explicit, because the official reference server annotates a
+/// tool that dumps the whole environment as read-only and non-destructive.
+fn mcp_attest(name: Option<String>, trust_annotations: bool) -> ExitCode {
+    if !trust_annotations {
+        eprintln!("usage: whip mcp attest <name> --trust-annotations");
+        eprintln!(
+            "  attesting says you have read this server's tool list and believe its \
+             self-reported annotations."
+        );
+        return ExitCode::from(2);
+    }
+    let (name, mut server, mut registry) = match mcp_lookup(name) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    if server.pin.is_none() {
+        eprintln!("`{name}` is not pinned, so there is no fixed manifest to attest.");
+        eprintln!("run `whip mcp pin {name}` first, then attest what you pinned.");
+        return ExitCode::FAILURE;
+    }
+    server.trust_annotations = true;
+    let rung = server.rung();
+    registry.insert(name.clone(), server);
+    match mcp_tools::save_registry(&registry) {
+        Ok(path) => {
+            println!("attested `{name}` — now at rung `{}`", rung.as_str());
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn mcp_forget(name: Option<String>) -> ExitCode {
+    let (name, _, mut registry) = match mcp_lookup(name) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    registry.remove(&name);
+    match mcp_tools::save_registry(&registry) {
+        Ok(path) => {
+            println!("removed `{name}`");
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn coerce_provider_by_name(
     name: &str,
 ) -> Option<whipplescript_kernel::coerce_native::CoerceProvider> {
@@ -21848,11 +22932,10 @@ fn auth_status(options: &CliOptions) -> ExitCode {
     let mut rows = Vec::new();
     for provider in auth::KNOWN_PROVIDERS {
         let coerce_provider = coerce_provider_by_name(provider).expect("known provider");
-        let (source, redacted) =
-            match coerce_runtime::resolve_credential_with_source(coerce_provider) {
-                Some((key, source)) => (source.label(), Some(auth::redact(&key))),
-                None => ("none".to_owned(), None),
-            };
+        let (source, redacted) = match model_auth::resolve_credential_with_source(coerce_provider) {
+            Some((key, source)) => (source.label(), Some(auth::redact(&key))),
+            None => ("none".to_owned(), None),
+        };
         rows.push((provider.to_owned(), source, redacted));
     }
     // Phase 4 auth relocation: when the policy channel hands whip resolved
@@ -21937,7 +23020,7 @@ fn run_native_coerce_effect(
     options: &WorkerOptions,
     request: &CoerceRequest,
     input: &Value,
-    config: coerce_runtime::NativeCoerceConfig,
+    config: whipplescript_kernel::coerce_native::ResolvedCoercionConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let program_path = options.program_path.as_ref().ok_or_else(|| {
         StoreError::Conflict("native coerce requires the program path (--program)".to_owned())
@@ -21970,7 +23053,9 @@ fn run_native_coerce_effect(
         )
         .map_err(StoreError::Conflict)?
     };
-    let transport = coerce_runtime::UreqCoerceTransport::new(config.timeout);
+    let transport = coerce_runtime::UreqCoerceTransport::new(std::time::Duration::from_secs(
+        config.timeout_secs,
+    ));
     // Codex backend needs a (account_id, session_id) pair; the session id is a
     // stable per-effect identifier.
     let codex = config.codex_account_id.map(|account_id| {
@@ -21980,7 +23065,7 @@ fn run_native_coerce_effect(
         )
     });
     let client = whipplescript_kernel::coerce_native::NativeCoerceClient {
-        provider: config.provider,
+        provider: config.backend,
         base_url: config.base_url,
         api_key: config.api_key,
         model: config.model,
@@ -22074,16 +23159,6 @@ fn cancel_coerce_effect(
     Ok(terminal)
 }
 
-fn run_human_effect(
-    store_path: &Path,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-    options: &WorkerOptions,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
-    run_human_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
-}
-
 fn resolve_effect_input_after_bindings(
     store_path: &Path,
     instance_id: &str,
@@ -22114,43 +23189,88 @@ fn run_capability_effect(
         .map(|target| store.capability_bound_provider(instance_id, target))
         .transpose()?
         .flatten();
+    // Binding-driven messaging dispatch (spec/std-messaging.md
+    // "Channel→binding provider selection"): the channel's declared provider
+    // identifier resolves against the `capability_bindings` rows bound for
+    // `messaging.send` (seeded by the embedded std.messaging manifest), and
+    // the matching row's provider id names the implementation. The
+    // program×capability `capability_bound` gate stayed the policy check
+    // upstream; this is the explicit channel-scoped selection step on top.
+    let messaging_selection = if effect.target.as_deref() == Some("messaging.send") {
+        let bindings = store.capability_bindings_for(instance_id, "messaging.send")?;
+        Some(resolve_messaging_binding(
+            &bindings,
+            capability_input_provider(effect).as_deref(),
+        ))
+    } else {
+        None
+    };
     let mut kernel = RuntimeKernel::new(store);
     let contract = PackageLockCapabilityContract(package_lock);
-    // A `messaging.send` whose channel declares `provider local` is delivered by the
-    // native file-backed local mailbox (selected from the effect's threaded channel
-    // provider, not a binding row). Then the binding-owned name→impl map: a
-    // `memory-provider` binding (memory.query/memory.write) routes to the file-backed
-    // MemoryCapabilityProvider. Every unmapped provider name — and every unbound
-    // capability — falls back to the fixture, which keeps all existing capability
-    // tests byte-identical.
-    if effect.target.as_deref() == Some("messaging.send")
-        && capability_input_provider(effect).as_deref() == Some("local")
-    {
-        let mailbox = LocalMailboxCapabilityProvider {
-            mailbox_path: store_path.with_extension("mailbox.jsonl"),
+    // Provider map: messaging.send routes by resolved binding provider id;
+    // a `memory-provider` binding (memory.query/memory.write) routes to the
+    // file-backed MemoryCapabilityProvider. Every unbound capability falls
+    // back to the fixture, which keeps all existing capability tests
+    // byte-identical.
+    if let Some(selection) = messaging_selection {
+        return match selection {
+            Ok(provider_id) => match provider_id.as_str() {
+                "std.messaging.local" => {
+                    let mailbox = LocalMailboxCapabilityProvider {
+                        mailbox_path: store_path.with_extension("mailbox.jsonl"),
+                    };
+                    run_capability_effect_generic(
+                        &mut kernel,
+                        instance_id,
+                        effect,
+                        &options.effect_config(),
+                        &contract,
+                        &mailbox,
+                    )
+                }
+                "std.messaging.desktop" => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &DesktopCapabilityProvider,
+                ),
+                "std.messaging.stdio" => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &StdioCapabilityProvider,
+                ),
+                // The named `fixture` messaging provider (spec/std-messaging.md
+                // slice 1): registry-honest selection, full typed receipt.
+                _ => run_capability_effect_generic(
+                    &mut kernel,
+                    instance_id,
+                    effect,
+                    &options.effect_config(),
+                    &contract,
+                    &MessagingFixtureCapabilityProvider,
+                ),
+            },
+            // No/ambiguous binding for the channel's provider: settle
+            // `capability.call.failed` (routes to `fails as`), not a worker
+            // error — the effect outcome is the honest surface.
+            Err(reason) => run_capability_effect_generic(
+                &mut kernel,
+                instance_id,
+                effect,
+                &options.effect_config(),
+                &contract,
+                &UnroutableCapabilityProvider { reason },
+            ),
         };
-        run_capability_effect_generic(
-            &mut kernel,
-            instance_id,
-            effect,
-            &options.effect_config(),
-            &contract,
-            &mailbox,
-        )
-    } else if effect.target.as_deref() == Some("messaging.send")
-        && capability_input_provider(effect).as_deref() == Some("stdio")
-    {
-        run_capability_effect_generic(
-            &mut kernel,
-            instance_id,
-            effect,
-            &options.effect_config(),
-            &contract,
-            &StdioCapabilityProvider,
-        )
-    } else if bound_provider.as_deref() == Some("memory-provider") {
+    }
+    if bound_provider.as_deref() == Some("memory-provider") {
         let memory = MemoryCapabilityProvider {
-            store_path: store_path.with_extension("memory.jsonl"),
+            store_path: store_path.with_extension("memory.sqlite"),
         };
         run_capability_effect_generic(
             &mut kernel,
@@ -22182,11 +23302,86 @@ fn capability_input_provider(effect: &ClaimableEffect) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Native, file-backed local mailbox provider (S5 first real `CapabilityProvider`).
-/// Selected only for `messaging.send` on channels declaring `provider local`.
-/// Appends one JSON line per delivered message to a mailbox file derived from
-/// the store path. Deterministic: the message id is derived from the effect id
-/// (no wall-clock, no randomness), so replay yields identical mailbox contents.
+/// Resolve a channel's declared `provider <p>` identifier against the
+/// `capability_bindings` rows bound for `messaging.send` (spec/std-messaging.md
+/// "Channel→binding provider selection"): `p` matches a binding whose provider
+/// id is exactly `p` or `std.messaging.<p>` (the short-name resolution the
+/// static checker mirrors). Exactly one distinct provider id must match —
+/// unknown or ambiguous identifiers are a dispatch failure (the static check
+/// already rejects unknown identifiers at compile time; this is the runtime
+/// backstop for programs compiled before the check existed). A missing
+/// provider field (pre-selection programs) resolves as `fixture`.
+fn resolve_messaging_binding(
+    bindings: &[whipplescript_store::CapabilityBindingView],
+    channel_provider: Option<&str>,
+) -> Result<String, String> {
+    let requested = channel_provider.unwrap_or("fixture");
+    let qualified = format!("std.messaging.{requested}");
+    let matches: BTreeSet<&str> = bindings
+        .iter()
+        .filter_map(|binding| binding.provider.as_deref())
+        .filter(|provider| *provider == requested || *provider == qualified)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("one match").to_owned()),
+        0 => {
+            let bound = bindings
+                .iter()
+                .filter_map(|binding| binding.provider.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "channel provider `{requested}` resolves to no `messaging.send` binding (bound providers: {bound})"
+            ))
+        }
+        _ => Err(format!(
+            "channel provider `{requested}` is ambiguous across `messaging.send` bindings: {}",
+            matches.into_iter().collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// The full `MessageSendReceipt` value (spec/std-messaging.md
+/// "MessageSendReceipt"): every provider returns this shape. `message_id` is
+/// effect-key derived (stable across replay); correlation fields the provider
+/// cannot report (`provider_message_id`, `thread_id`, `destination`) are empty
+/// strings — the package output-schema validator carries no optional marker —
+/// and `status` is `accepted` (no v1 provider reports `delivered`). Failure is
+/// NOT a receipt: providers settle `capability.call.failed` instead.
+fn message_send_receipt(
+    effect: &ClaimableEffect,
+    provider_id: &str,
+    provider_message_id: &str,
+    accepted_at: &str,
+) -> Value {
+    let input: Value = serde_json::from_str(&effect.input_json).unwrap_or_default();
+    let message = input.pointer("/message");
+    let field = |name: &str| {
+        message
+            .and_then(|m| m.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    json!({
+        "message_id": idempotency_key(&[&effect.effect_id, "messaging-message"]),
+        "channel": field("channel"),
+        "provider": provider_id,
+        "status": "accepted",
+        "provider_message_id": provider_message_id,
+        "thread_id": field("thread_id"),
+        "destination": field("destination"),
+        "accepted_at": accepted_at,
+    })
+}
+
+/// Native, file-backed local mailbox provider (`std.messaging.local`, the
+/// reference provider). Selected by the `binding-messaging-send-local` binding
+/// when a channel declares `provider local`. Appends one JSON line per
+/// delivered message to a mailbox file derived from the store path. The
+/// message id is derived from the effect id (stable across replay — replay
+/// re-reads the recorded receipt, it never re-runs the provider);
+/// `accepted_at` is a worker-boundary wall-clock read, where wall reads live.
 struct LocalMailboxCapabilityProvider {
     mailbox_path: PathBuf,
 }
@@ -22222,6 +23417,11 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             .unwrap_or("local");
         // Deterministic message id: derived from the effect id, never wall-clock.
         let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+        // The provider correlation handle is minted DISTINCT from the durable
+        // message id (spec/std-messaging.md provider table: correlation =
+        // provider_message_id, thread_id).
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
+        let accepted_at = wall_clock_instant();
 
         let mut record = serde_json::Map::new();
         record.insert("message_id".to_owned(), Value::String(message_id.clone()));
@@ -22233,7 +23433,15 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
         if let Some(thread_id) = message.and_then(|m| m.pointer("/thread_id")) {
             record.insert("thread_id".to_owned(), thread_id.clone());
         }
+        if let Some(destination) = message.and_then(|m| m.pointer("/destination")) {
+            record.insert("destination".to_owned(), destination.clone());
+        }
         record.insert("provider".to_owned(), Value::String(provider.to_owned()));
+        record.insert(
+            "provider_message_id".to_owned(),
+            Value::String(provider_message_id.clone()),
+        );
+        record.insert("accepted_at".to_owned(), Value::String(accepted_at.clone()));
 
         let mut line =
             serde_json::to_string(&Value::Object(record)).unwrap_or_else(|_| "{}".to_owned());
@@ -22253,19 +23461,21 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
             };
         }
 
-        CapabilityOutcome::Produced(json!({
-            "provider_message_id": message_id,
-            "channel": channel,
-            "delivered": true,
-        }))
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "std.messaging.local",
+            &provider_message_id,
+            &accepted_at,
+        ))
     }
 }
 
-/// Native stdio messaging provider: `send via <channel>` where the channel
-/// declares `provider stdio` writes one marker line per message to the process
-/// stdout (`[messaging.stdio] channel=… text=…`). Deterministic message id from
-/// the effect id (no wall-clock). Non-breaking: only channels declaring
-/// `provider stdio` route here; every other channel keeps its existing provider.
+/// Native stdio messaging provider (`std.messaging.stdio`, outbound half):
+/// writes one marker line per message to the process stdout
+/// (`[messaging.stdio] channel=… text=…`). The bidirectional JSONL
+/// child-process adapter (spec/std-messaging.md slice 5) is deferred — the
+/// child command/lifecycle configuration surface is not yet specified — so
+/// this outbound seam is what ships.
 struct StdioCapabilityProvider;
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabilityProvider {
@@ -22293,45 +23503,169 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabili
             .and_then(|m| m.pointer("/text"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let message_id = idempotency_key(&[&effect.effect_id, "messaging-message"]);
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
         println!("[messaging.stdio] channel={channel} text={text}");
-        CapabilityOutcome::Produced(json!({
-            "provider_message_id": message_id,
-            "channel": channel,
-            "delivered": true,
-        }))
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "std.messaging.stdio",
+            &provider_message_id,
+            &wall_clock_instant(),
+        ))
     }
 }
 
-/// Native, file-backed memory provider (S5 first per-capability real provider,
-/// selected by the `memory-provider` binding for `memory.query`/`memory.write`).
-/// A single append-only `<store>.memory.jsonl` holds one JSON record per learned
-/// item; `recall` reads it back filtered by pool. Deterministic: the message id is
-/// derived from the effect id (no wall-clock, no randomness), so replay is stable.
-///
-/// Memory pools are provider-*less* by design — selection is owned by the binding,
-/// not the pool binding on the workflow — so both memory capabilities route here.
-struct MemoryCapabilityProvider {
-    store_path: PathBuf,
-}
+/// The named `fixture` messaging provider (spec/std-messaging.md slice 1):
+/// selected registry-honestly via the `binding-messaging-send-fixture`
+/// binding, returning the full typed `MessageSendReceipt` (the anonymous
+/// generic-fixture `{summary, target}` stand-in is gone for messaging).
+/// Deterministic: ids derive from the effect id and `accepted_at` stays empty
+/// — the fixture acknowledges nothing — so fixture runs replay byte-stable.
+/// Honors `--fail` (`config.outcome_failed`) like the generic fixture.
+struct MessagingFixtureCapabilityProvider;
 
-impl MemoryCapabilityProvider {
-    /// Read every stored record, keeping only those in `pool`. A missing store is
-    /// an empty history (recall must return a valid context, never fail, when empty).
-    fn items_in_pool(&self, pool: &str) -> Vec<Value> {
-        let Ok(content) = std::fs::read_to_string(&self.store_path) else {
-            return Vec::new();
-        };
-        content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|record| record.get("pool").and_then(Value::as_str) == Some(pool))
-            .collect()
+impl whipplescript_kernel::effect_handlers::CapabilityProvider
+    for MessagingFixtureCapabilityProvider
+{
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        if config.outcome_failed {
+            return CapabilityOutcome::Failed {
+                error_kind: "fixture_failure".to_owned(),
+                message: "fixture messaging failure".to_owned(),
+            };
+        }
+        let provider_message_id = idempotency_key(&[&effect.effect_id, "provider-message"]);
+        CapabilityOutcome::Produced(message_send_receipt(
+            effect,
+            "fixture",
+            &provider_message_id,
+            "",
+        ))
     }
 }
 
-impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabilityProvider {
+/// A capability provider for a `messaging.send` whose channel provider
+/// resolved to no (or several) bindings: settles `capability.call.failed`
+/// with the resolution reason so the failure routes to `fails as` instead of
+/// erroring the worker pass.
+struct UnroutableCapabilityProvider {
+    reason: String,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for UnroutableCapabilityProvider {
+    fn produce(
+        &self,
+        _effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        whipplescript_kernel::effect_handlers::CapabilityOutcome::Failed {
+            error_kind: "messaging_unroutable".to_owned(),
+            message: self.reason.clone(),
+        }
+    }
+}
+
+/// The desktop notifier command for one outbound message — PURE construction
+/// (spec/std-messaging.md slice 4: command construction testable without
+/// spawning). `notifier` is the resolved notifier program: anything ending in
+/// `osascript` builds a `display notification` AppleScript invocation
+/// (arguments embedded as JSON-escaped AppleScript string literals);
+/// everything else gets the `notify-send <summary> <body>` argument shape.
+fn desktop_notify_command(notifier: &str, title: &str, body: &str) -> (String, Vec<String>) {
+    let is_osascript = Path::new(notifier)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "osascript");
+    if is_osascript {
+        // JSON string encoding is a valid AppleScript string literal
+        // (double-quoted, backslash escapes), so titles/bodies cannot break
+        // out of the expression.
+        let script = format!(
+            "display notification {} with title {}",
+            Value::String(body.to_owned()),
+            Value::String(title.to_owned()),
+        );
+        (notifier.to_owned(), vec!["-e".to_owned(), script])
+    } else {
+        (notifier.to_owned(), vec![title.to_owned(), body.to_owned()])
+    }
+}
+
+/// Strip markdown decoration to plain notification text (desktop report:
+/// `content ⊆ {text}`, markdown stripped — spec/std-messaging.md provider
+/// notes). Minimal and lossless on words: emphasis/code markers dropped,
+/// `[text](url)` keeps the text, leading heading/quote markers dropped.
+fn markdown_to_text(markdown: &str) -> String {
+    let mut lines = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line
+            .trim_start()
+            .trim_start_matches(['#', '>'])
+            .trim_start();
+        let mut out = String::new();
+        let mut chars = trimmed.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '*' | '`' | '_' | '~' => {}
+                '[' => {
+                    // [text](url) -> text; a bare `[` stays.
+                    let rest: String = chars.clone().collect();
+                    if let Some(close) = rest.find(']') {
+                        if rest[close..].starts_with("](") {
+                            if let Some(end) = rest[close..].find(')') {
+                                out.push_str(&rest[..close]);
+                                // Advance by CHAR count of the consumed byte
+                                // range (link text may be non-ASCII).
+                                let consumed = rest[..close + end + 1].chars().count();
+                                for _ in 0..consumed {
+                                    chars.next();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    out.push('[');
+                }
+                other => out.push(other),
+            }
+        }
+        lines.push(out);
+    }
+    lines.join("\n").trim().to_owned()
+}
+
+/// Native desktop notification provider (`std.messaging.desktop`,
+/// spec/std-messaging.md slice 4): OUTBOUND-ONLY — the static checker rejects
+/// `when message from` on desktop channels — with no correlation and no
+/// interactions (its capability report). Markdown is stripped to text. The
+/// notifier binary resolves `WHIPPLESCRIPT_DESKTOP_NOTIFIER` (tests point it
+/// at a fake), then the platform default: `osascript` on macOS, `notify-send`
+/// elsewhere. Command construction is pure (`desktop_notify_command`); the
+/// spawn is the same std::process subprocess seam exec providers use. A
+/// nonzero exit or spawn failure settles `capability.call.failed` with the
+/// DR-0032 EffectError base.
+struct DesktopCapabilityProvider;
+
+impl DesktopCapabilityProvider {
+    fn notifier() -> String {
+        if let Ok(notifier) = env::var("WHIPPLESCRIPT_DESKTOP_NOTIFIER") {
+            if !notifier.trim().is_empty() {
+                return notifier;
+            }
+        }
+        if cfg!(target_os = "macos") {
+            "osascript".to_owned()
+        } else {
+            "notify-send".to_owned()
+        }
+    }
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for DesktopCapabilityProvider {
     fn produce(
         &self,
         effect: &ClaimableEffect,
@@ -22342,140 +23676,106 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabil
             Ok(value) => value,
             Err(err) => {
                 return CapabilityOutcome::Failed {
-                    error_kind: "memory".to_owned(),
-                    message: format!("invalid memory input: {err}"),
+                    error_kind: "messaging_delivery".to_owned(),
+                    message: format!("invalid messaging.send input: {err}"),
                 };
             }
         };
-        let pool = input
-            .get("pool")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        // Deterministic message id: derived from the effect id, never wall-clock.
-        let message_id = idempotency_key(&[&effect.effect_id, "memory-message"]);
-
-        match effect.target.as_deref() {
-            Some("memory.write") => {
-                // Append one record for the learned item. `source` is the resolved
-                // `from <source>` value; `note` the optional `{ note <expr> }` field.
-                let mut record = serde_json::Map::new();
-                record.insert("message_id".to_owned(), Value::String(message_id.clone()));
-                record.insert("pool".to_owned(), Value::String(pool.clone()));
-                record.insert(
-                    "source".to_owned(),
-                    input.get("source").cloned().unwrap_or(Value::Null),
-                );
-                if let Some(note) = input.get("note") {
-                    record.insert("note".to_owned(), note.clone());
-                }
-                let mut line = serde_json::to_string(&Value::Object(record))
-                    .unwrap_or_else(|_| "{}".to_owned());
-                line.push('\n');
-                if let Err(err) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.store_path)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
-                {
-                    return CapabilityOutcome::Failed {
-                        error_kind: "memory".to_owned(),
-                        message: format!(
-                            "memory write to {} failed: {err}",
-                            self.store_path.display()
-                        ),
-                    };
-                }
-                CapabilityOutcome::Produced(json!({
-                    "pool": pool,
-                    "message_id": message_id,
-                    "stored": true,
-                }))
-            }
-            Some("memory.query") => {
-                // A MemoryContext: the stored items for this pool (empty is valid).
-                let items = self.items_in_pool(&pool);
-                CapabilityOutcome::Produced(json!({
-                    "pool": pool,
-                    "count": items.len(),
-                    "items": items,
-                }))
-            }
-            Some("memory.curate") => {
-                // Deterministic maintenance: dedupe the pool's records by their
-                // `source`/`note` content (keep the first occurrence, drop later
-                // duplicates), rewrite the store, and report removed/kept. Records
-                // for OTHER pools are preserved verbatim. A missing store is empty
-                // (removed 0, kept 0). No wall-clock, no randomness — replay-stable.
-                let Ok(content) = std::fs::read_to_string(&self.store_path) else {
-                    return CapabilityOutcome::Produced(json!({
-                        "pool": pool,
-                        "removed": 0,
-                        "kept": 0,
-                    }));
-                };
-                let mut kept_lines: Vec<String> = Vec::new();
-                let mut seen: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                let mut removed: usize = 0;
-                let mut kept_in_pool: usize = 0;
-                for line in content.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let record: Value = match serde_json::from_str(line) {
-                        Ok(value) => value,
-                        // Preserve unparseable lines untouched (never lose data).
-                        Err(_) => {
-                            kept_lines.push(line.to_owned());
-                            continue;
-                        }
-                    };
-                    // Records for other pools pass through unchanged.
-                    if record.get("pool").and_then(Value::as_str) != Some(pool.as_str()) {
-                        kept_lines.push(line.to_owned());
-                        continue;
-                    }
-                    // Dedup key = the pool's content identity: (source, note).
-                    let dedup_key = serde_json::to_string(&json!({
-                        "source": record.get("source").cloned().unwrap_or(Value::Null),
-                        "note": record.get("note").cloned().unwrap_or(Value::Null),
-                    }))
-                    .unwrap_or_default();
-                    if seen.insert(dedup_key) {
-                        kept_lines.push(line.to_owned());
-                        kept_in_pool += 1;
-                    } else {
-                        removed += 1;
-                    }
-                }
-                let mut rewritten = kept_lines.join("\n");
-                if !rewritten.is_empty() {
-                    rewritten.push('\n');
-                }
-                if let Err(err) = std::fs::write(&self.store_path, rewritten.as_bytes()) {
-                    return CapabilityOutcome::Failed {
-                        error_kind: "memory".to_owned(),
-                        message: format!(
-                            "memory curate of {} failed: {err}",
-                            self.store_path.display()
-                        ),
-                    };
-                }
-                CapabilityOutcome::Produced(json!({
-                    "pool": pool,
-                    "removed": removed,
-                    "kept": kept_in_pool,
-                }))
-            }
-            other => CapabilityOutcome::Failed {
-                error_kind: "memory".to_owned(),
+        let message = input.pointer("/message");
+        let field = |name: &str| {
+            message
+                .and_then(|m| m.get(name))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let channel = field("channel");
+        let destination = field("destination");
+        let text = field("text");
+        // Desktop content is text-only: an empty `text` falls back to the
+        // stripped markdown body.
+        let body = if text.is_empty() {
+            markdown_to_text(&field("markdown"))
+        } else {
+            text
+        };
+        let title = if destination.is_empty() {
+            channel.clone()
+        } else {
+            destination.clone()
+        };
+        let (program, args) = desktop_notify_command(&Self::notifier(), &title, &body);
+        match std::process::Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => CapabilityOutcome::Produced(
+                // Desktop has no correlation handle (report: correlation =
+                // none); the receipt carries an empty provider_message_id.
+                message_send_receipt(effect, "std.messaging.desktop", "", &wall_clock_instant()),
+            ),
+            Ok(output) => CapabilityOutcome::Failed {
+                error_kind: "messaging_delivery".to_owned(),
                 message: format!(
-                    "memory-provider does not handle capability `{}`",
-                    other.unwrap_or_default()
+                    "desktop notifier `{program}` exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
                 ),
             },
+            Err(err) => CapabilityOutcome::Failed {
+                error_kind: "messaging_delivery".to_owned(),
+                message: format!("desktop notifier `{program}` failed to spawn: {err}"),
+            },
         }
+    }
+}
+
+/// Native, file-backed memory provider (S5 first per-capability real provider,
+/// selected by the `memory-provider` binding for `memory.query`/`memory.write`).
+/// The std.memory `local` provider (spec/std-memory.md MEM-3) over the store
+/// crate's `MemoryStore` seam: workspace-scoped SQLite at
+/// `<store>.memory.sqlite` (`WHIPPLESCRIPT_MEMORY_STORE` overrides), FTS5
+/// lexical match + recency. Deterministic inside the effect plane: message
+/// ids derive from the effect id and `created_at` stays empty — the effect
+/// plane never reads a clock; insertion order carries recency — so replay is
+/// stable. Memory pools are provider-*less* by design — selection is owned by
+/// the binding, not the pool declaration — so all three memory capabilities
+/// route here.
+struct MemoryCapabilityProvider {
+    store_path: PathBuf,
+}
+
+impl MemoryCapabilityProvider {
+    fn open(&self) -> Result<whipplescript_store::memory::SqliteMemoryStore, String> {
+        let path = std::env::var(whipplescript_store::memory::MEMORY_STORE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.store_path.clone());
+        whipplescript_store::memory::SqliteMemoryStore::open(&path)
+            .map_err(|error| format!("memory store {}: {error:?}", path.display()))
+    }
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabilityProvider {
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        // The recall/learn/curate logic is host-agnostic (shared with the DO's
+        // DoMemoryStore) — this native provider only supplies the file-backed
+        // store; everything else lives in `run_memory_capability`.
+        let mut store = match self.open() {
+            Ok(store) => store,
+            Err(message) => {
+                return CapabilityOutcome::Failed {
+                    error_kind: "memory".to_owned(),
+                    message,
+                };
+            }
+        };
+        whipplescript_kernel::effect_handlers::run_memory_capability(&mut store, effect)
     }
 }
 
@@ -22697,67 +23997,6 @@ fn run_file_import_effect(
     run_file_import_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
-/// CSV-escape one field (inverse of `split_csv_record`): quote when the value
-/// contains a comma, quote, or newline; double embedded quotes.
-fn csv_escape_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
-}
-
-/// Serialize export rows (std.files), the inverse of `decode_import_rows`. `jsonl`
-/// = one JSON object per line; `json` = a top-level array; `csv` = a header line
-/// from `fields` then one record per row (stable column order, values stringified).
-fn encode_export_rows(format: &str, rows: &[Value], fields: &[String]) -> Result<String, String> {
-    let cell = |row: &Value, field: &str| -> String {
-        match row.as_object().and_then(|object| object.get(field)) {
-            Some(Value::String(text)) => text.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
-        }
-    };
-    match format {
-        "jsonl" => {
-            let mut out = rows
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !rows.is_empty() {
-                out.push('\n');
-            }
-            Ok(out)
-        }
-        "json" => serde_json::to_string(&Value::Array(rows.to_vec()))
-            .map(|mut text| {
-                text.push('\n');
-                text
-            })
-            .map_err(|error| format!("json export serialize failed: {error}")),
-        "csv" => {
-            let mut out = fields
-                .iter()
-                .map(|field| csv_escape_field(field))
-                .collect::<Vec<_>>()
-                .join(",");
-            out.push('\n');
-            for row in rows {
-                let record = fields
-                    .iter()
-                    .map(|field| csv_escape_field(&cell(row, field)))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                out.push_str(&record);
-                out.push('\n');
-            }
-            Ok(out)
-        }
-        other => Err(format!("unknown export format `{other}`")),
-    }
-}
-
 /// Executes one `file.export` effect (std.files): resolve the collection of
 /// `<Schema>` facts (optionally filtered by the `where` predicate, ordered
 /// deterministically by the store's `(name, key)` ordering — DR-0022), serialize
@@ -22773,200 +24012,19 @@ fn run_file_export_effect(
     run_file_export_effect_generic(&mut kernel, &*files, instance_id, effect)
 }
 
-/// Host-agnostic core (DR-0033 chunk 3): export facts to a file through the
-/// `FileStore` seam over a held `RuntimeKernel<S>`.
-fn run_file_export_effect_generic<S: RuntimeStore>(
-    kernel: &mut RuntimeKernel<S>,
-    files: &dyn FileStore,
-    instance_id: &str,
-    effect: &ClaimableEffect,
-) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    let input = json_from_str(&effect.input_json);
-    let root = input
-        .get("root")
-        .and_then(Value::as_str)
+/// The wall-clock UTC instant as ISO-8601 — the coordination pass instant
+/// when no virtual clock is injected. The kernel never reads wall time
+/// itself (std.coord slice 3: the counter period derives from THIS injected
+/// instant and is recorded on the outcome), so the host resolves it once
+/// here; a `--virtual-now` still wins at every call site.
+fn wall_clock_instant() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    let path = input
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let format = input
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("jsonl")
-        .to_owned();
-    let schema = input
-        .get("schema")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let store_name = input
-        .get("store")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mode = input
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("create")
-        .to_owned();
-    let predicate = input
-        .get("predicate")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let allow = effect_allow_globs(&input);
-    let fields = input
-        .get("fields")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let full = Path::new(root).join(path);
-    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "file-run"]);
-    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "file-lease"]);
-    kernel.start_run(RunStart {
-        instance_id,
-        effect_id: &effect.effect_id,
-        run_id: &run_id,
-        provider: "files",
-        worker_id: "whip-files",
-        lease_id: &lease_id,
-        lease_expires_at: "2030-01-01T00:00:00Z",
-        metadata_json: &json!({ "path": full.display().to_string(), "schema": schema }).to_string(),
-    })?;
-    let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
-    let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
-
-    let outcome: Result<(usize, String), String> = (|| {
-        if let Some(reason) =
-            file_path_policy_error(path, store_name, &allow, "write").or_else(|| {
-                files.path_policy_error(Path::new(root), Path::new(path), store_name, "write")
-            })
-        {
-            return Err(reason);
-        }
-        // Resolve the collection: facts of <schema> [where predicate], ordered by
-        // the store's deterministic (name, key) ordering for reproducible output.
-        let facts = kernel
-            .store()
-            .list_facts(instance_id)
-            .map_err(|error| format!("{error:?}"))?;
-        let mut rows = Vec::new();
-        for fact in facts.iter().filter(|fact| fact.name == schema) {
-            let value: Value = serde_json::from_str(&fact.value_json)
-                .map_err(|error| format!("fact value is not JSON: {error}"))?;
-            if predicate.is_empty() || evaluate_proj_predicate(&predicate, &value)? {
-                rows.push(value);
-            }
-        }
-        let exists = files.exists(&full);
-        match mode.as_str() {
-            "create" if exists => {
-                return Err(format!(
-                    "write mode `create` requires `{path}` to not already exist"
-                ))
-            }
-            "replace" if !exists => {
-                return Err(format!(
-                    "write mode `replace` requires `{path}` to already exist"
-                ))
-            }
-            "create" | "replace" | "upsert" | "append" => {}
-            other => return Err(format!("unknown write mode `{other}`")),
-        }
-        let serialized = encode_export_rows(&format, &rows, &fields)?;
-        if let Some(parent) = full.parent() {
-            files
-                .create_dir_all(parent)
-                .map_err(|error| format!("create parent of `{path}`: {error}"))?;
-        }
-        if mode == "append" {
-            files
-                .append(&full, serialized.as_bytes())
-                .map_err(|error| format!("append to `{}` failed: {error}", full.display()))?;
-        } else {
-            files
-                .write(&full, serialized.as_bytes())
-                .map_err(|error| format!("write of `{}` failed: {error}", full.display()))?;
-        }
-        Ok((rows.len(), stable_hash_hex(&serialized)))
-    })();
-
-    match outcome {
-        Ok((row_count, content_hash)) => {
-            let value = json!({
-                "store": store_name,
-                "path": path,
-                "format": format,
-                "schema": schema,
-                "mode": mode,
-                "row_count": row_count,
-                "content_hash": content_hash,
-            });
-            let terminal = kernel.complete_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "completed",
-                exit_code: Some(0),
-                summary: Some(&format!("exported {row_count} rows to {}", full.display())),
-                metadata_json: &json!({ "value": value }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.export.completed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "completed",
-                    "value": value,
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.export.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
-    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|instant| instant.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 
 /// Executes one coordination verb (spec/coordination.md): one atomic store
@@ -22978,11 +24036,12 @@ fn run_coordination_effect(
     instance_id: &str,
     effect: &ClaimableEffect,
     now: &str,
+    side_stores: Option<&SideStorePaths>,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
         store_path,
-        coordination_store_path(),
-        items_store_path(),
+        resolved_coordination_store(side_stores),
+        resolved_items_store(side_stores),
     )?);
     run_coordination_effect_generic(&mut kernel, instance_id, effect, now)
 }
@@ -23028,6 +24087,11 @@ fn run_script_capability_exec(
     capability: &str,
     input: &Value,
     parse_contract: &Option<Value>,
+    // SC6: structured failure evidence (spec/std-script.md "operator surface
+    // polish") — a hash mismatch sets {expected_sha256, actual_sha256, path}
+    // here so the failed terminal and fact carry machine-readable fields, not
+    // message text alone.
+    failure_evidence: &mut Option<Value>,
 ) -> ExecOutcome {
     let Some(manifest) = script_manifest else {
         return Err((
@@ -23068,6 +24132,13 @@ fn run_script_capability_exec(
     };
     let actual_sha256 = sha256_hex(&bytes);
     if actual_sha256 != script.sha256 {
+        *failure_evidence = Some(json!({
+            "kind": "script.hash_mismatch",
+            "capability": capability,
+            "path": script_path.display().to_string(),
+            "expected_sha256": script.sha256,
+            "actual_sha256": actual_sha256,
+        }));
         return Err((
             None,
             format!(
@@ -23114,7 +24185,7 @@ fn run_script_capability_exec(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = fs::remove_file(&verified_path);
+            let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
             return Err((None, format!("exec command failed to start: {error}")));
         }
     };
@@ -23125,7 +24196,7 @@ fn run_script_capability_exec(
             // the child's own output and exit code decide the outcome.
             if error.kind() != io::ErrorKind::BrokenPipe {
                 let _ = child.kill();
-                let _ = fs::remove_file(&verified_path);
+                let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
                 return Err((None, format!("exec command failed to write stdin: {error}")));
             }
         }
@@ -23133,11 +24204,11 @@ fn run_script_capability_exec(
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
-            let _ = fs::remove_file(&verified_path);
+            let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
             return Err((None, format!("exec command failed: {error}")));
         }
     };
-    let _ = fs::remove_file(&verified_path);
+    let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
     exec_output_to_outcome(output, parse_contract)
 }
 
@@ -23185,14 +24256,47 @@ fn write_verified_script_copy(
         .and_then(|extension| extension.to_str())
         .map(|extension| format!(".{extension}"))
         .unwrap_or_default();
-    let path = env::temp_dir().join(format!(
-        "whipplescript-script-{sanitized}-{sha256}{extension}"
-    ));
+    // Stage the verified bytes inside a FRESH PRIVATE directory (0700, owned by
+    // us, created atomically so a pre-existing path/symlink is rejected) rather
+    // than a predictable shared-temp file. A predictable path let a local
+    // co-tenant pre-create it as a symlink (`fs::write` then clobbers a victim
+    // file) or swap the content between write and exec — defeating the content
+    // pin. Inside a 0700 dir we own, neither is possible.
+    let dir = private_staging_dir("whipplescript-script")?;
+    let path = dir.join(format!("{sanitized}-{sha256}{extension}"));
     fs::write(&path, bytes)?;
     if let Ok(metadata) = fs::metadata(original_path) {
         let _ = fs::set_permissions(&path, metadata.permissions());
     }
     Ok(path)
+}
+
+/// Create a fresh, private (0700) staging directory in the temp dir. The name
+/// is unpredictable enough to avoid collisions, and the directory is created
+/// with `mkdir` semantics that FAIL if the path already exists — so an attacker
+/// cannot pre-seed it as a symlink, and once created only we (its owner) can
+/// write inside it.
+fn private_staging_dir(prefix: &str) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!("{prefix}-{}-{nanos}-{n}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // `create` (non-recursive) fails with EEXIST if the path exists.
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(&dir)?;
+    }
+    Ok(dir)
 }
 
 /// Resolve a script capability's declared `env:` references against the host
@@ -23373,11 +24477,19 @@ fn run_exec_effect(
     // Set by the branch-bound raw-exec path: the import-back summary that
     // rides the effect's terminal metadata.
     let mut branch_import_meta: Option<Value> = None;
+    // SC6: structured failure evidence (hash mismatch fields).
+    let mut failure_evidence: Option<Value> = None;
 
     let outcome = if let Some(result) = cached_result {
         Ok(result)
     } else if mode == "capability" {
-        run_script_capability_exec(script_manifest, &capability, &input, &parse_contract)
+        run_script_capability_exec(
+            script_manifest,
+            &capability,
+            &input,
+            &parse_contract,
+            &mut failure_evidence,
+        )
     } else if exec_profile.is_hosted() {
         Err((
             None,
@@ -23553,7 +24665,7 @@ fn run_exec_effect(
             Ok(terminal)
         }
         Err((detail, reason)) => {
-            let metadata = match &detail {
+            let mut metadata = match &detail {
                 Some((exit_code, stdout, stderr)) => json!({
                     "failure": {"message": reason},
                     "exit_code": exit_code,
@@ -23562,6 +24674,14 @@ fn run_exec_effect(
                 }),
                 None => json!({"failure": {"message": reason}}),
             };
+            // SC6: structured evidence (e.g. hash-mismatch
+            // expected_sha256/actual_sha256) rides the failure object as
+            // machine-readable fields, not message text alone.
+            if let Some(evidence) = &failure_evidence {
+                if let Some(failure) = metadata.get_mut("failure").and_then(Value::as_object_mut) {
+                    failure.insert("evidence".to_owned(), evidence.clone());
+                }
+            }
             let terminal = kernel.fail_run(EffectCompletion {
                 instance_id,
                 effect_id: &effect.effect_id,
@@ -23578,16 +24698,30 @@ fn run_exec_effect(
                     "terminal",
                 ])),
             })?;
-            let fact = json!({
+            // P3 per-kind extras: the command's exit code (when the process
+            // actually ran) rides the bound failure value.
+            let mut exec_failure_value =
+                effect_failure_base("exec", &reason, &reason, &effect.effect_id, &run_id);
+            if let (Some((exit_code, _, _)), Some(object)) =
+                (&detail, exec_failure_value.as_object_mut())
+            {
+                object.insert("exit_code".to_owned(), Value::from(*exit_code));
+            }
+            let mut fact = json!({
                 "effect_id": effect.effect_id,
                 "run_id": run_id,
                 "status": "failed",
                 "mode": mode,
                 "capability": capability,
-                "value": effect_failure_base("exec", &reason, &reason, &effect.effect_id, &run_id),
+                "value": exec_failure_value,
                 "error": {"message": reason},
-            })
-            .to_string();
+            });
+            if let Some(evidence) = failure_evidence.take() {
+                if let Some(error) = fact.get_mut("error").and_then(Value::as_object_mut) {
+                    error.insert("evidence".to_owned(), evidence);
+                }
+            }
+            let fact = fact.to_string();
             kernel.derive_fact(
                 instance_id,
                 "exec.command.failed",
@@ -23609,14 +24743,21 @@ fn run_queue_effect(
     store_path: &Path,
     instance_id: &str,
     effect: &ClaimableEffect,
+    now: &str,
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(NativeStores::open(
         store_path,
-        coordination_store_path(),
-        items_store_path(),
+        resolved_coordination_store(options.side_stores.as_ref()),
+        resolved_items_store(options.side_stores.as_ref()),
     )?);
-    run_queue_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
+    run_queue_effect_generic(
+        &mut kernel,
+        instance_id,
+        effect,
+        now,
+        &options.effect_config(),
+    )
 }
 
 fn run_event_effect(
@@ -23627,6 +24768,54 @@ fn run_event_effect(
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
     run_event_effect_generic(&mut kernel, instance_id, effect, &options.effect_config())
+}
+
+/// Fail an invoke run AND derive its `workflow.invoke.failed` settling fact.
+/// The start-failure exits used to fail the run bare: an `after child fails`
+/// arm in the parent (which suppresses the auto-fail net) then had no fact to
+/// match, and the parent idled forever.
+fn fail_invoke_run_with_fact(
+    kernel: &mut RuntimeKernel<SqliteStore>,
+    instance_id: &str,
+    effect_id: &str,
+    run_id: &str,
+    provider: &str,
+    summary: &str,
+    metadata_json: &str,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    let terminal = kernel.fail_run(EffectCompletion {
+        instance_id,
+        effect_id,
+        run_id,
+        provider,
+        worker_id: "whip-worker",
+        status: "failed",
+        exit_code: Some(2),
+        summary: Some(summary),
+        metadata_json,
+        idempotency_key: Some(&idempotency_key(&[instance_id, effect_id, "terminal"])),
+    })?;
+    let value_json = json!({
+        "effect_id": effect_id,
+        "run_id": run_id,
+        "status": "failed",
+        "summary": summary,
+        "value": {"reason": summary, "summary": summary},
+    })
+    .to_string();
+    kernel.derive_fact(
+        instance_id,
+        "workflow.invoke.failed",
+        effect_id,
+        &value_json,
+        Some(&terminal.event_id),
+        Some(&idempotency_key(&[
+            instance_id,
+            effect_id,
+            "workflow.invoke.failed",
+        ])),
+    )?;
+    Ok(terminal)
 }
 
 fn run_workflow_invoke_effect(
@@ -23658,22 +24847,15 @@ fn run_workflow_invoke_effect(
             lease_expires_at: "2030-01-01T00:00:00Z",
             metadata_json: &json!({"input": input, "error": "missing program path"}).to_string(),
         })?;
-        return kernel.fail_run(EffectCompletion {
+        return fail_invoke_run_with_fact(
+            &mut kernel,
             instance_id,
-            effect_id: &effect.effect_id,
-            run_id: &run_id,
-            provider: &options.provider,
-            worker_id: "whip-worker",
-            status: "failed",
-            exit_code: Some(2),
-            summary: Some("workflow invocation requires --program"),
-            metadata_json: &json!({"input": input}).to_string(),
-            idempotency_key: Some(&idempotency_key(&[
-                instance_id,
-                &effect.effect_id,
-                "terminal",
-            ])),
-        });
+            &effect.effect_id,
+            &run_id,
+            &options.provider,
+            "workflow invocation requires --program",
+            &json!({"input": input}).to_string(),
+        );
     };
 
     let invocation_store = SqliteStore::open(store_path)?;
@@ -23733,22 +24915,15 @@ fn run_workflow_invoke_effect(
                         "error": format!("{error:?}"),
                     })
                     .to_string();
-                    return kernel.fail_run(EffectCompletion {
+                    return fail_invoke_run_with_fact(
+                        &mut kernel,
                         instance_id,
-                        effect_id: &effect.effect_id,
-                        run_id: &run_id,
-                        provider: &options.provider,
-                        worker_id: "whip-worker",
-                        status: "failed",
-                        exit_code: Some(2),
-                        summary: Some("child workflow failed to start"),
-                        metadata_json: &metadata_json,
-                        idempotency_key: Some(&idempotency_key(&[
-                            instance_id,
-                            &effect.effect_id,
-                            "terminal",
-                        ])),
-                    });
+                        &effect.effect_id,
+                        &run_id,
+                        &options.provider,
+                        "child workflow failed to start",
+                        &metadata_json,
+                    );
                 }
             };
             let child_instance_id = child_started.instance_id.clone();
@@ -23777,22 +24952,15 @@ fn run_workflow_invoke_effect(
                     "error": format!("{error:?}"),
                 })
                 .to_string();
-                return kernel.fail_run(EffectCompletion {
+                return fail_invoke_run_with_fact(
+                    &mut kernel,
                     instance_id,
-                    effect_id: &effect.effect_id,
-                    run_id: &run_id,
-                    provider: &options.provider,
-                    worker_id: "whip-worker",
-                    status: "failed",
-                    exit_code: Some(2),
-                    summary: Some("child workflow invocation link failed"),
-                    metadata_json: &metadata_json,
-                    idempotency_key: Some(&idempotency_key(&[
-                        instance_id,
-                        &effect.effect_id,
-                        "terminal",
-                    ])),
-                });
+                    &effect.effect_id,
+                    &run_id,
+                    &options.provider,
+                    "child workflow invocation link failed",
+                    &metadata_json,
+                );
             }
             (child_instance_id, child_ir, Some(started_run))
         }
@@ -23811,6 +24979,7 @@ fn run_workflow_invoke_effect(
             &child_ir,
             Some(program_path),
             None,
+            options.side_stores.as_ref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -23828,6 +24997,7 @@ fn run_workflow_invoke_effect(
             coerce_outputs: options.coerce_outputs.clone(),
             virtual_now: options.virtual_now.clone(),
             work_unit_root: options.work_unit_root.clone(),
+            side_stores: None,
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
         let child = SqliteStore::open(store_path)?
@@ -23888,8 +25058,12 @@ fn run_workflow_invoke_effect(
         "value": value,
     })
     .to_string();
-    let terminal_event = match status {
-        "completed" => kernel.complete_run(EffectCompletion {
+    let settle_result = (|kernel: &mut RuntimeKernel<SqliteStore>| -> Result<
+        whipplescript_store::StoredEvent,
+        StoreError,
+    > {
+        Ok(match status {
+            "completed" => kernel.complete_run(EffectCompletion {
             instance_id,
             effect_id: &effect.effect_id,
             run_id: &run_id,
@@ -23969,6 +25143,27 @@ fn run_workflow_invoke_effect(
                 "terminal",
             ])),
         })?,
+        })
+    })(&mut kernel);
+    let terminal_event = match settle_result {
+        Ok(event) => event,
+        Err(StoreError::Conflict(message))
+            if message.contains("terminal completion") || message.contains("not running") =>
+        {
+            // Crash-window retry: the terminal committed on a prior attempt
+            // but the settling facts below may not have. Re-read the stored
+            // terminal and re-run the (idempotent) fact derivations instead
+            // of aborting — aborting here left terminal-without-facts
+            // permanent, hanging every observing arm.
+            kernel
+                .store()
+                .event_by_idempotency_key(
+                    instance_id,
+                    &idempotency_key(&[instance_id, &effect.effect_id, "terminal"]),
+                )?
+                .ok_or(StoreError::Conflict(message))?
+        }
+        Err(error) => return Err(error),
     };
     // DR-0032: on a non-success terminal the bound `value` (what `after p fails as
     // f` reads) is the EffectError base; on success it is the child's output. The
@@ -23980,13 +25175,28 @@ fn run_workflow_invoke_effect(
             .get("reason")
             .and_then(Value::as_str)
             .unwrap_or(summary);
-        effect_failure_base(
+        let base = effect_failure_base(
             "workflow.invoke",
             reason,
             summary,
             &effect.effect_id,
             &run_id,
-        )
+        );
+        // P3 typed invoke failure: the parser types `after child fails as f` to
+        // the child's SOLE declared failure class (when it has one), so the
+        // bound value carries the child's typed failure fields alongside the
+        // base — the base keys win on collision so `f.reason` etc. stay the
+        // parent-consistent EffectError base.
+        match (value.as_object(), base.as_object()) {
+            (Some(child), Some(base_fields)) => {
+                let mut merged = child.clone();
+                for (key, field) in base_fields {
+                    merged.insert(key.clone(), field.clone());
+                }
+                Value::Object(merged)
+            }
+            _ => base,
+        }
     };
     let value_json = json!({
         "effect_id": effect.effect_id,
@@ -24114,6 +25324,10 @@ fn start_child_workflow_instance_in_package(
     let snapshot = ir.to_snapshot();
     let store = SqliteStore::open(store_path)?;
     let mut kernel = RuntimeKernel::new(store);
+    // DR-0043 Decision 3: content-address the source (blob id == source_hash)
+    // so old-body completion can reload this version's rule bodies after a
+    // later revision. Idempotent; best-effort.
+    let _ = kernel.store().put_content(&source);
     let version = kernel.create_program_version_for_program(
         ProgramVersionInput {
             program_name: &ir.workflow,
@@ -24269,6 +25483,7 @@ struct SubworkflowProviderContext {
     agent_outcomes: std::collections::BTreeMap<String, FixtureOutcome>,
     coerce_outputs: std::collections::BTreeMap<String, String>,
     virtual_now: Option<String>,
+    side_stores: Option<SideStorePaths>,
 }
 
 impl SubworkflowProviderContext {
@@ -24282,6 +25497,7 @@ impl SubworkflowProviderContext {
             agent_outcomes: options.agent_outcomes.clone(),
             coerce_outputs: options.coerce_outputs.clone(),
             virtual_now: options.virtual_now.clone(),
+            side_stores: options.side_stores.clone(),
         }
     }
 }
@@ -24314,6 +25530,7 @@ fn drive_subworkflow_tool(
             &child_ir,
             Some(program_path),
             None,
+            provider_ctx.side_stores.as_ref(),
         )?;
         let child_worker = WorkerOptions {
             instance_id: child_instance_id.clone(),
@@ -24334,6 +25551,7 @@ fn drive_subworkflow_tool(
             // workspace lease (DR-0025), so a nested owned turn re-enters the
             // lease the still-running parent holds rather than self-deadlocking.
             work_unit_root: Some(work_unit_root.to_owned()),
+            side_stores: provider_ctx.side_stores.clone(),
         };
         let worker_report = run_worker_once(store_path, &child_worker)?;
         let child = SqliteStore::open(store_path)?
@@ -24682,7 +25900,7 @@ fn load_workspace_skills(store_path: &Path) {
     }
 }
 
-fn dev(options: &CliOptions) -> ExitCode {
+fn run(options: &CliOptions) -> ExitCode {
     let dev_options = match DevOptions::parse(&options.args) {
         Ok(options) => options,
         Err(message) => {
@@ -24733,7 +25951,7 @@ fn dev(options: &CliOptions) -> ExitCode {
     // harness can offer them in its `<available_skills>` catalogue. Idempotent
     // (UPSERT by name); a missing skills directory loads nothing.
     load_workspace_skills(&options.store_path);
-    let (_source, ir) =
+    let (source, ir) =
         match compile_source_path_with_root(&dev_options.program_path, dev_options.root.as_deref())
         {
             Ok(compiled) => compiled,
@@ -24767,12 +25985,15 @@ fn dev(options: &CliOptions) -> ExitCode {
     }
     let mut steps = Vec::new();
     let mut workers = Vec::new();
-    for _ in 0..dev_options.max_iterations {
+    let mut iterations_left = dev_options.max_iterations;
+    while iterations_left > 0 {
+        iterations_left -= 1;
         let step_report = match step_instance(
             &options.store_path,
             &started.instance_id,
             &ir,
             Some(Path::new(&dev_options.program_path)),
+            None,
             None,
         ) {
             Ok(report) => report,
@@ -24810,6 +26031,7 @@ fn dev(options: &CliOptions) -> ExitCode {
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                side_stores: None,
             },
         ) {
             Ok(report) => report,
@@ -24837,6 +26059,35 @@ fn dev(options: &CliOptions) -> ExitCode {
         steps.push(step_report);
         workers.push(worker_report);
         if idle {
+            // R5 `--wait`: an idle instance holding a pending time deadline
+            // (a timer or an effect timeout) is not DONE — with `--wait` the
+            // loop sleeps until the earliest deadline and keeps driving; the
+            // waiting pass refunds its iteration so timer chains don't starve
+            // the budget.
+            if dev_options.wait_for_timers {
+                let pending_deadline =
+                    SqliteStore::open(&options.store_path)
+                        .ok()
+                        .and_then(|store| {
+                            let running = matches!(
+                                store.get_instance(&started.instance_id),
+                                Ok(Some(view)) if view.status == "running"
+                            );
+                            if !running {
+                                return None;
+                            }
+                            store
+                                .next_time_deadline_seconds(&started.instance_id)
+                                .ok()
+                                .flatten()
+                        });
+                if let Some(seconds) = pending_deadline {
+                    let sleep_seconds = u64::try_from(seconds.max(0)).unwrap_or(0) + 1;
+                    std::thread::sleep(std::time::Duration::from_secs(sleep_seconds));
+                    iterations_left += 1;
+                    continue;
+                }
+            }
             if stream
                 .emit(
                     "dev.idle",
@@ -24854,7 +26105,14 @@ fn dev(options: &CliOptions) -> ExitCode {
     }
     // Ambient measurement (experimentation surface): gauges score every dev
     // run; the primary evidence source has no verb at all.
-    improve::ambient_score_after_dev(&options.store_path, &started.instance_id, &ir, options.json);
+    improve::ambient_score_after_dev(
+        &options.store_path,
+        &started.instance_id,
+        &ir,
+        options.json,
+        &dev_options.provider_config_paths,
+        &sha256_hex(source.as_bytes()),
+    );
     let store = match SqliteStore::open(&options.store_path) {
         Ok(store) => store,
         Err(error) => return report_store_error("failed to open store", error),
@@ -25025,35 +26283,45 @@ fn dev(options: &CliOptions) -> ExitCode {
         }
         ExitCode::from(1)
     } else {
-        println!("dev {}", started.instance_id);
+        println!("run {}", started.instance_id);
         println!("workflow {}", started.workflow);
         println!("iterations {}", steps.len());
         // Report the final instance outcome so a run's result is visible without a
         // separate `whip status`: a terminal status, or — when still running and idle —
-        // an accurate reason (a pending human ask is the common command-to-unblock
-        // case; anything else, including a failure or blocked effect, points at
-        // `whip status`, which lists pending asks, blocked effects, and failures).
+        // an accurate reason (blocked effects are listed inline; anything else,
+        // including a failure, points at `whip status`).
         if let Ok(store) = SqliteStore::open(&options.store_path) {
             if let Ok(Some(view)) = store.get_instance(&started.instance_id) {
                 if view.status == "running" {
-                    let pending_ask = store
-                        .list_inbox_items(Some("pending"))
-                        .map(|items| {
-                            items
-                                .iter()
-                                .any(|item| item.instance_id == started.instance_id)
-                        })
-                        .unwrap_or(false);
-                    if pending_ask {
-                        println!(
-                            "status running (idle — awaiting a human answer; run `whip inbox answer <item>`, or `whip status {}` for details)",
-                            started.instance_id
-                        );
-                    } else {
-                        println!(
-                            "status running (idle, not terminal — run `whip status {}` for pending asks, blocked effects, or failures)",
-                            started.instance_id
-                        );
+                    {
+                        let blocked: Vec<_> = store
+                            .list_effects(&started.instance_id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|effect| effect.status.starts_with("blocked"))
+                            .collect();
+                        if blocked.is_empty() {
+                            println!(
+                                "status running (idle, not terminal — run `whip status {}` for blocked effects or failures)",
+                                started.instance_id
+                            );
+                        } else {
+                            println!(
+                                "status running (idle, not terminal — {} blocked effect{}; run `whip effects {}` for detail)",
+                                blocked.len(),
+                                if blocked.len() == 1 { "" } else { "s" },
+                                started.instance_id
+                            );
+                            for effect in blocked {
+                                println!(
+                                    "  {} {} {}: {}",
+                                    effect.effect_id,
+                                    effect.kind,
+                                    effect.status,
+                                    effect.policy_block_reason.as_deref().unwrap_or("-")
+                                );
+                            }
+                        }
                     }
                 } else {
                     println!("status {}", view.status);
@@ -25116,7 +26384,6 @@ fn validate_hosted_exec_for_path(
 struct DevStreamCursors {
     after_sequence: i64,
     evidence_emitted: usize,
-    asks_fingerprint: String,
 }
 
 fn stream_dev_event_deltas(
@@ -25161,46 +26428,6 @@ fn stream_dev_event_deltas(
                         "instance_id": instance_id,
                         "count": rows.len(),
                         "evidence": rows,
-                    }),
-                )
-                .is_err()
-            {
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-    // Pending-ask snapshot (`dev.asks`), emitted only when the set changes —
-    // the command-to-unblock surface an external UI shows as an inbox.
-    if let Ok(items) = store.list_inbox_items(Some("pending")) {
-        let pending = items
-            .iter()
-            .filter(|item| item.instance_id == instance_id)
-            .collect::<Vec<_>>();
-        let fingerprint = pending
-            .iter()
-            .map(|item| item.inbox_item_id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        if fingerprint != cursors.asks_fingerprint {
-            cursors.asks_fingerprint = fingerprint;
-            let asks = pending
-                .iter()
-                .map(|item| {
-                    json!({
-                        "item_id": item.inbox_item_id,
-                        "effect_id": item.effect_id,
-                        "prompt": item.prompt,
-                        "created_at": item.created_at,
-                    })
-                })
-                .collect::<Vec<_>>();
-            if stream
-                .emit(
-                    "dev.asks",
-                    json!({
-                        "instance_id": instance_id,
-                        "count": asks.len(),
-                        "asks": asks,
                     }),
                 )
                 .is_err()
@@ -25374,10 +26601,19 @@ fn acceptance_validate_fixture_shape(fixture: &Value) -> Result<(), String> {
                 ));
             }
         }
-        for key in ["facts", "inbox"] {
-            if setup.get(key).is_some_and(|value| !value.is_array()) {
-                return Err(format!("acceptance fixture setup.{key} must be an array"));
-            }
+        // `inbox` is deliberately absent: the human-ask inbox was removed, so a
+        // fixture naming it is describing a surface that no longer exists.
+        // Shape-validating it would say the fixture is fine when nothing will
+        // ever read it.
+        if setup.get("inbox").is_some() {
+            return Err(
+                "acceptance fixture setup.inbox refers to the removed human-ask inbox; \
+                 route human work through the tracker instead"
+                    .to_owned(),
+            );
+        }
+        if setup.get("facts").is_some_and(|value| !value.is_array()) {
+            return Err("acceptance fixture setup.facts must be an array".to_owned());
         }
     }
     Ok(())
@@ -25401,7 +26637,6 @@ fn acceptance_validate_expect_shape(expect: &Value) -> Result<(), String> {
         "diagnostics_by_code",
         "actions",
         "assertion_reads",
-        "inbox",
         "assertion_tags",
         "facts",
         "effects",
@@ -25628,6 +26863,7 @@ fn acceptance_dev_options(fixture: &Value, fixture_dir: &Path) -> Result<DevOpti
         max_iterations,
         assertion_filter,
         stream: None,
+        wait_for_timers: false,
     })
 }
 
@@ -25681,7 +26917,6 @@ struct AcceptanceDevRun {
     artifact_counts: BTreeMap<String, usize>,
     artifacts: Vec<ArtifactView>,
     evidence: Vec<EvidenceView>,
-    inbox_items: Vec<InboxItemView>,
     events: Vec<EventView>,
 }
 
@@ -25712,16 +26947,18 @@ fn acceptance_dev_report(
             Err(error) => return Err(report_compile_failure(&dev_options.program_path, error)),
         };
     acceptance_seed_setup_facts(fixture, options, &started.instance_id, &ir)?;
-    acceptance_seed_setup_inbox(fixture, options, &started.instance_id)?;
     let actions = acceptance_run_actions(fixture, options, &started.instance_id)?;
     let mut steps = Vec::new();
     let mut workers = Vec::new();
-    for _ in 0..dev_options.max_iterations {
+    let mut iterations_left = dev_options.max_iterations;
+    while iterations_left > 0 {
+        iterations_left -= 1;
         let step_report = match step_instance(
             &options.store_path,
             &started.instance_id,
             &ir,
             Some(Path::new(&dev_options.program_path)),
+            None,
             None,
         ) {
             Ok(report) => report,
@@ -25745,6 +26982,7 @@ fn acceptance_dev_report(
                 coerce_outputs: std::collections::BTreeMap::new(),
                 virtual_now: None,
                 work_unit_root: None,
+                side_stores: None,
             },
         ) {
             Ok(report) => report,
@@ -25788,13 +27026,6 @@ fn acceptance_dev_report(
     let evidence = match store.list_evidence(&started.instance_id) {
         Ok(evidence) => evidence,
         Err(error) => return Err(report_store_error("failed to list evidence", error)),
-    };
-    let inbox_items = match store.list_inbox_items(None) {
-        Ok(items) => items
-            .into_iter()
-            .filter(|item| item.instance_id == started.instance_id)
-            .collect::<Vec<_>>(),
-        Err(error) => return Err(report_store_error("failed to list inbox items", error)),
     };
     let events = match store.list_events(&started.instance_id) {
         Ok(events) => events,
@@ -25875,7 +27106,6 @@ fn acceptance_dev_report(
         artifact_counts,
         artifacts,
         evidence,
-        inbox_items,
         events,
     })
 }
@@ -25970,105 +27200,6 @@ fn acceptance_seed_setup_facts(
         }
     }
     Ok(())
-}
-
-fn acceptance_seed_setup_inbox(
-    fixture: &Value,
-    options: &CliOptions,
-    instance_id: &str,
-) -> Result<(), ExitCode> {
-    let Some(setup) = fixture.get("setup") else {
-        return Ok(());
-    };
-    let Some(inbox_items) = setup.get("inbox").and_then(Value::as_array) else {
-        if setup.get("inbox").is_some() {
-            eprintln!("acceptance fixture setup.inbox must be an array");
-            return Err(ExitCode::from(2));
-        }
-        return Ok(());
-    };
-    let store = open_store_or_exit(options)?;
-    for (index, item) in inbox_items.iter().enumerate() {
-        let Some(prompt) = item.get("prompt").and_then(Value::as_str) else {
-            eprintln!("acceptance fixture setup.inbox[{index}].prompt must be a string");
-            return Err(ExitCode::from(2));
-        };
-        let status = item
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("pending");
-        let severity = item
-            .get("severity")
-            .and_then(Value::as_str)
-            .unwrap_or("normal");
-        let choices_json = match acceptance_optional_array_json(item, "choices") {
-            Ok(value) => value,
-            Err(message) => {
-                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
-                return Err(ExitCode::from(2));
-            }
-        };
-        let related_effects_json = match acceptance_optional_array_json(item, "related_effects") {
-            Ok(value) => value,
-            Err(message) => {
-                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
-                return Err(ExitCode::from(2));
-            }
-        };
-        let related_artifacts_json = match acceptance_optional_array_json(item, "related_artifacts")
-        {
-            Ok(value) => value,
-            Err(message) => {
-                eprintln!("acceptance fixture setup.inbox[{index}].{message}");
-                return Err(ExitCode::from(2));
-            }
-        };
-        let freeform_allowed = item
-            .get("freeform_allowed")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let inbox_item_id = item
-            .get("inbox_item_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                idempotency_key(&[
-                    instance_id,
-                    "acceptance.setup.inbox",
-                    &index.to_string(),
-                    prompt,
-                    status,
-                    severity,
-                ])
-            });
-        if let Err(error) = store.create_inbox_item(NewInboxItem {
-            inbox_item_id: &inbox_item_id,
-            instance_id,
-            effect_id: item.get("effect_id").and_then(Value::as_str),
-            status,
-            prompt,
-            choices_json: &choices_json,
-            freeform_allowed,
-            severity,
-            related_effects_json: &related_effects_json,
-            related_artifacts_json: &related_artifacts_json,
-        }) {
-            eprintln!(
-                "failed to seed acceptance setup inbox item: {}",
-                store_error(error)
-            );
-            return Err(ExitCode::FAILURE);
-        }
-    }
-    Ok(())
-}
-
-fn acceptance_optional_array_json(item: &Value, key: &str) -> Result<String, String> {
-    match item.get(key) {
-        Some(value) if value.is_array() => Ok(value.to_string()),
-        Some(_) => Err(format!("{key} must be an array")),
-        None => Ok("[]".to_owned()),
-    }
 }
 
 fn acceptance_run_actions(
@@ -26200,7 +27331,6 @@ fn acceptance_failures(fixture: &Value, run: &AcceptanceDevRun) -> Vec<String> {
     acceptance_expect_runs(expect, &run.runs, &run.artifact_counts, &mut failures);
     acceptance_expect_artifacts(expect, &run.artifacts, &mut failures);
     acceptance_expect_evidence(expect, &run.evidence, &mut failures);
-    acceptance_expect_inbox(expect, &run.inbox_items, &mut failures);
     acceptance_expect_trace(expect, &run.events, &mut failures);
     failures
 }
@@ -26411,44 +27541,6 @@ fn acceptance_trace_item_selector(expected_item: &Value) -> String {
         }
     }
     selectors.join(" ")
-}
-
-fn acceptance_expect_inbox(
-    expect: &Value,
-    inbox_items: &[InboxItemView],
-    failures: &mut Vec<String>,
-) {
-    let Some(expected_items) = expect.get("inbox").and_then(Value::as_array) else {
-        return;
-    };
-    for (index, expected_item) in expected_items.iter().enumerate() {
-        let Some(status) = expected_item.get("status").and_then(Value::as_str) else {
-            failures.push(format!("expect.inbox[{index}].status must be a string"));
-            continue;
-        };
-        let Some(expected_count) = expected_item.get("count").and_then(Value::as_u64) else {
-            failures.push(format!("expect.inbox[{index}].count must be an integer"));
-            continue;
-        };
-        let severity = expected_item.get("severity").and_then(Value::as_str);
-        let actual_count = inbox_items
-            .iter()
-            .filter(|item| {
-                item.status == status
-                    && severity
-                        .map(|expected_severity| item.severity == expected_severity)
-                        .unwrap_or(true)
-            })
-            .count() as u64;
-        if actual_count != expected_count {
-            let severity_clause = severity
-                .map(|severity| format!(" severity={severity:?}"))
-                .unwrap_or_default();
-            failures.push(format!(
-                "expected inbox[{index}] status={status:?}{severity_clause} count={expected_count}, got {actual_count}"
-            ));
-        }
-    }
 }
 
 fn acceptance_expect_assertion_reads(
@@ -26874,7 +27966,6 @@ fn acceptance_observed_json(run: &AcceptanceDevRun) -> Value {
         "runs": provider_runs_summary_json(&run.runs, &run.artifact_counts),
         "artifacts": provider_artifacts_summary_json(&run.artifacts),
         "evidence": provider_evidence_summary_json(&run.evidence),
-        "inbox": acceptance_inbox_summary_json(&run.inbox_items),
         "trace": acceptance_observed_trace_json(&run.events),
         "diagnostics_by_code": acceptance_observed_diagnostics_by_code(&run.dev_report),
         "executable_spec": acceptance_observed_executable_spec(&run.dev_report),
@@ -26919,31 +28010,6 @@ fn acceptance_observed_trace_json(events: &[EventView]) -> Value {
         "groups": groups,
         "items": items,
         "conformance": conformance,
-    })
-}
-
-fn acceptance_inbox_summary_json(inbox_items: &[InboxItemView]) -> Value {
-    let mut groups = BTreeMap::<(String, String), u64>::new();
-    for item in inbox_items {
-        *groups
-            .entry((item.status.clone(), item.severity.clone()))
-            .or_insert(0) += 1;
-    }
-    let groups = groups
-        .into_iter()
-        .map(|((status, severity), count)| {
-            json!({
-                "status": status,
-                "severity": severity,
-                "count": count,
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "summary": {
-            "total": inbox_items.len(),
-        },
-        "groups": groups,
     })
 }
 
@@ -27626,6 +28692,9 @@ struct DevOptions {
     max_iterations: usize,
     assertion_filter: AssertionTagFilter,
     stream: Option<DevStreamFormat>,
+    /// R5 (`whip run --wait`): when the loop goes idle with a pending time
+    /// effect, sleep until its deadline and keep driving instead of stopping.
+    wait_for_timers: bool,
 }
 
 impl DevOptions {
@@ -27643,6 +28712,7 @@ impl DevOptions {
         let mut max_iterations = 8usize;
         let mut assertion_filter = AssertionTagFilter::default();
         let mut stream = None;
+        let mut wait_for_timers = false;
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -27740,6 +28810,9 @@ impl DevOptions {
                         return Err("only `--until idle` is supported".to_owned());
                     }
                 }
+                "--wait" => {
+                    wait_for_timers = true;
+                }
                 "--branch" => {
                     index += 1;
                     let Some(value) = args.get(index) else {
@@ -27753,7 +28826,7 @@ impl DevOptions {
                 value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
+                        "usage: whip run <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
                             .to_owned(),
                     )
                 }
@@ -27762,7 +28835,7 @@ impl DevOptions {
         }
         let Some(program_path) = program_path else {
             return Err(
-                "usage: whip dev <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
+                "usage: whip run <workflow.whip> [--provider fixture] [--provider-config path] [--until idle] [--include-tag tag] [--exclude-tag tag] [--stream ndjson] [--fail|--timeout|--cancel]"
                     .to_owned(),
             );
         };
@@ -27780,6 +28853,7 @@ impl DevOptions {
             max_iterations,
             assertion_filter,
             stream,
+            wait_for_timers,
         })
     }
 }
@@ -28785,32 +29859,6 @@ fn status(options: &CliOptions) -> ExitCode {
                 }
             }
         }
-        // Surface unanswered human asks so a `running` instance's reason for being idle
-        // is visible, with the command to unblock it.
-        if let Ok(asks) = store.list_inbox_items(Some("pending")) {
-            let asks: Vec<_> = asks
-                .into_iter()
-                .filter(|item| item.instance_id == instance_id)
-                .collect();
-            if !asks.is_empty() {
-                println!("pending human asks:");
-                for ask in asks {
-                    let prompt = ask.prompt.lines().next().unwrap_or("").trim();
-                    let choices: Vec<String> =
-                        serde_json::from_str(&ask.choices_json).unwrap_or_default();
-                    let choices_hint = if choices.is_empty() {
-                        " --text <answer>".to_owned()
-                    } else {
-                        format!(" --choice <{}>", choices.join("|"))
-                    };
-                    println!("  {} {}", ask.inbox_item_id, prompt);
-                    println!(
-                        "    answer with: whip inbox answer {}{}",
-                        ask.inbox_item_id, choices_hint
-                    );
-                }
-            }
-        }
         if status.recent_events.is_empty() {
             println!("recent events: none");
         } else {
@@ -28972,6 +30020,539 @@ fn effects(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// DR-0043 slice 1: the open-firing view. Fully log-derived: `rule.committed`
+/// events are grouped into FIRINGS by (rule, context identity) — one logical
+/// firing commits multiple events across passes as its lowering grows — and
+/// each firing shows its pinned trigger bindings (from the embedded context
+/// record), its requested effects with live statuses, and a coarse state.
+/// Slice 2 (pinned re-lowering) sharpens `effects-settled` into precise
+/// residue; this view exists first because it is the debugging surface the
+/// ch. 15 stall lacked.
+/// A firing's pinned trigger binding whose fact is no longer live (DR-0044 P4):
+/// `(binding, fact name, fact_id, Some((consuming rule, sequence)) if a
+/// cross-firing `rule.committed` recorded the consumption)`.
+type StaleTrigger = (String, String, String, Option<(String, i64)>);
+
+struct Firing {
+    firing_id: String,
+    rule: String,
+    identity: String,
+    admitted_sequence: i64,
+    context: Value,
+    effect_ids: Vec<String>,
+    terminal: Option<Value>,
+    cancelled: bool,
+}
+
+/// Folds an instance's log into its FIRINGS (DR-0043): `rule.committed`
+/// events grouped by (rule, context identity), each carrying its pinned
+/// context, requested effect ids, terminal, and whether a
+/// `progression.cancelled` closure exists. Shared by `whip progressions` and
+/// `whip progression cancel`.
+fn fold_firings(
+    instance_id: &str,
+    events: &[EventView],
+) -> (Vec<String>, BTreeMap<String, Firing>) {
+    let mut order: Vec<String> = Vec::new();
+    let mut firings: BTreeMap<String, Firing> = BTreeMap::new();
+    for event in events {
+        if event.event_type == "progression.cancelled" {
+            if let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) {
+                let rule = payload.get("rule").and_then(Value::as_str).unwrap_or("-");
+                let identity = payload
+                    .get("identity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("started");
+                let key = format!("{rule}\u{1f}{identity}");
+                if let Some(firing) = firings.get_mut(&key) {
+                    firing.cancelled = true;
+                }
+            }
+            continue;
+        }
+        if event.event_type != "rule.committed" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        let rule = payload
+            .get("rule")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_owned();
+        let identity = payload
+            .pointer("/context/identity")
+            .and_then(Value::as_str)
+            .unwrap_or("started")
+            .to_owned();
+        let key = format!("{rule}\u{1f}{identity}");
+        let firing = firings.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            Firing {
+                firing_id: format!(
+                    "fir_{}",
+                    whipplescript_kernel::idempotency_key(&[instance_id, &rule, &identity])
+                        .trim_start_matches("key_")
+                        .chars()
+                        .take(12)
+                        .collect::<String>()
+                ),
+                rule,
+                identity,
+                admitted_sequence: event.sequence,
+                context: Value::Null,
+                effect_ids: Vec::new(),
+                terminal: None,
+                cancelled: false,
+            }
+        });
+        if firing.context.is_null() {
+            if let Some(context) = payload.get("context") {
+                if !context.is_null() {
+                    firing.context = context.clone();
+                }
+            }
+        }
+        if let Some(effect_entries) = payload.get("effects").and_then(Value::as_array) {
+            for entry in effect_entries {
+                if let Some(effect_id) = entry.get("effect_id").and_then(Value::as_str) {
+                    if !firing.effect_ids.iter().any(|known| known == effect_id) {
+                        firing.effect_ids.push(effect_id.to_owned());
+                    }
+                }
+            }
+        }
+        if let Some(terminal) = payload.get("terminal") {
+            if !terminal.is_null() {
+                firing.terminal = Some(terminal.clone());
+            }
+        }
+    }
+    (order, firings)
+}
+
+/// `whip progression cancel <instance> <firing-id> [--reason …]` (DR-0043
+/// Decision 8): one committed closure — cancellation requests for the
+/// firing's outstanding effects (running work gets a provider cancellation
+/// request; queued/blocked work is cancelled directly; settled work is left
+/// alone) plus a durable `progression.cancelled` event that removes the
+/// firing from the derived open set, so pinned re-lowering never advances it
+/// again. Deliberately does NOT run the lapse arm (operator abandonment is
+/// not a condition lapse) and is exempt from the failure nets, mirroring
+/// effect-cancel. The instance keeps running.
+fn progression_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip progression cancel <instance> <firing-id> [--reason <text>]";
+    let mut args = options.args.iter();
+    if args.next().map(String::as_str) != Some("cancel") {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let Some(instance_id) = args.next() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let Some(firing_id) = args.next() else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let mut reason = "cancelled by operator".to_owned();
+    let rest: Vec<&String> = args.collect();
+    let mut index = 0;
+    while index < rest.len() {
+        if rest[index] == "--reason" && index + 1 < rest.len() {
+            reason = rest[index + 1].clone();
+            index += 2;
+        } else {
+            eprintln!("{usage}");
+            return ExitCode::from(2);
+        }
+    }
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to load events", error),
+    };
+    let (_, firings) = fold_firings(instance_id, &events);
+    let Some(firing) = firings
+        .values()
+        .find(|firing| firing.firing_id == *firing_id)
+    else {
+        eprintln!("no firing `{firing_id}` in instance `{instance_id}` — `whip progressions {instance_id}` lists them");
+        return ExitCode::FAILURE;
+    };
+    if firing.cancelled {
+        println!("{firing_id} already cancelled");
+        return ExitCode::SUCCESS;
+    }
+    if firing.terminal.is_some() {
+        eprintln!("{firing_id} already closed by a terminal; nothing to cancel");
+        return ExitCode::FAILURE;
+    }
+    let effects = match store.list_effects(instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return report_store_error("failed to load effects", error),
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    let mut cancelled_effects = 0usize;
+    for effect_id in &firing.effect_ids {
+        let Some(effect) = effects.iter().find(|view| &view.effect_id == effect_id) else {
+            continue;
+        };
+        match effect.status.as_str() {
+            "completed" | "failed" | "timed_out" | "cancelled" => {}
+            "running" => {
+                let key = whipplescript_kernel::idempotency_key(&[
+                    instance_id,
+                    effect_id,
+                    firing_id,
+                    "progression-cancel-request",
+                ]);
+                let _ = kernel.store_mut().request_effect_cancellation(
+                    whipplescript_store::EffectCancellationRequest {
+                        instance_id,
+                        effect_id,
+                        revision_id: None,
+                        reason: Some(&reason),
+                        requested_by: "operator",
+                        causation_event_id: None,
+                        idempotency_key: Some(&key),
+                    },
+                );
+                cancelled_effects += 1;
+            }
+            _ => {
+                let key = whipplescript_kernel::idempotency_key(&[
+                    instance_id,
+                    effect_id,
+                    firing_id,
+                    "progression-cancel",
+                ]);
+                let _ = kernel.cancel_effect(whipplescript_store::EffectCancellation {
+                    instance_id,
+                    effect_id,
+                    reason: Some(&reason),
+                    idempotency_key: Some(&key),
+                });
+                cancelled_effects += 1;
+            }
+        }
+    }
+    let payload = json!({
+        "firing_id": firing_id,
+        "rule": firing.rule,
+        "identity": firing.identity,
+        "reason": reason,
+    })
+    .to_string();
+    let closure_key =
+        whipplescript_kernel::idempotency_key(&[instance_id, "progression.cancelled", firing_id]);
+    if let Err(error) = kernel.store().append_event(whipplescript_store::NewEvent {
+        instance_id,
+        event_type: "progression.cancelled",
+        payload_json: &payload,
+        source: "operator",
+        causation_id: None,
+        correlation_id: Some(firing_id),
+        idempotency_key: Some(&closure_key),
+    }) {
+        return report_store_error("failed to record progression cancellation", error);
+    }
+    println!(
+        "{firing_id} cancelled (rule={} effects_cancelled={cancelled_effects})",
+        firing.rule
+    );
+    ExitCode::SUCCESS
+}
+
+fn progressions(options: &CliOptions) -> ExitCode {
+    let Some(instance_id) = single_arg(options, "usage: whip progressions <instance>") else {
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to load events", error),
+    };
+    let effects = match store.list_effects(instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return report_store_error("failed to load effects", error),
+    };
+    let facts = store.list_facts(instance_id).unwrap_or_default();
+    let effect_status: BTreeMap<&str, (&str, &str)> = effects
+        .iter()
+        .map(|effect| {
+            (
+                effect.effect_id.as_str(),
+                (effect.kind.as_str(), effect.status.as_str()),
+            )
+        })
+        .collect();
+    let (order, firings) = fold_firings(instance_id, &events);
+
+    // DR-0044 P4 (runtime justification view): a committed firing completes
+    // from its PINNED bindings even if a sibling rule retracts the trigger
+    // (DR-0043 fate-at-commit) — legal, but for an OPEN firing it means work in
+    // flight whose reason-for-being is gone (the stale-approval / page-after-
+    // withdrawal case). This surfaces it OBSERVATIONALLY (never a warning): a
+    // trigger binding whose pinned `fact_id` is no longer among the instance's
+    // live facts. Liveness is read from the `facts` table (not the event log),
+    // so it sees BOTH `done` consumption AND eventless `retire_fact` projection
+    // retirement (DR-0044 P1(c) boundary). Attribution ("consumed by <rule> at
+    // #<seq>") is added when a `rule.committed` from a DIFFERENT firing recorded
+    // the consumption; a retired projection fact has no such event and is simply
+    // "no longer live".
+    let live_fact_ids: BTreeSet<&str> = facts.iter().map(|fact| fact.fact_id.as_str()).collect();
+    // fact_id -> (consuming rule, consuming context identity, sequence).
+    let mut consumed_by: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
+    for event in &events {
+        if event.event_type != "rule.committed" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        let rule = payload.get("rule").and_then(Value::as_str).unwrap_or("-");
+        let identity = payload
+            .pointer("/context/identity")
+            .and_then(Value::as_str)
+            .unwrap_or("started");
+        if let Some(consumed) = payload.get("consumed_facts").and_then(Value::as_array) {
+            for entry in consumed {
+                // Durable payloads carry fact_id strings; the trace builder uses
+                // { "fact_id": … } objects — accept both.
+                let fact_id = entry
+                    .as_str()
+                    .or_else(|| entry.get("fact_id").and_then(Value::as_str));
+                if let Some(fact_id) = fact_id {
+                    consumed_by
+                        .entry(fact_id.to_owned())
+                        .or_insert_with(|| (rule.to_owned(), identity.to_owned(), event.sequence));
+                }
+            }
+        }
+    }
+    // A firing's stale trigger bindings: pinned fact_ids no longer live. Only
+    // meaningful for OPEN firings (a closed/cancelled firing's triggers being
+    // gone is expected), so callers gate on state first.
+    let stale_triggers = |firing: &Firing| -> Vec<StaleTrigger> {
+        let mut stale = Vec::new();
+        if let Some(bindings) = firing
+            .context
+            .pointer("/bindings")
+            .and_then(Value::as_array)
+        {
+            for entry in bindings {
+                let Some(fact_id) = entry.get("fact_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if live_fact_ids.contains(fact_id) {
+                    continue;
+                }
+                // Same-firing consumption (consume-at-completion — `done t` inside
+                // this firing's own body/after-arm) is the blessed pattern, not an
+                // orphan: exclude it by firing identity (DR-0044 P4).
+                let by = consumed_by.get(fact_id);
+                if by.is_some_and(|(rule, identity, _)| {
+                    rule == &firing.rule && identity == &firing.identity
+                }) {
+                    continue;
+                }
+                let binding = entry
+                    .get("binding")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .to_owned();
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .to_owned();
+                stale.push((
+                    binding,
+                    name,
+                    fact_id.to_owned(),
+                    by.map(|(rule, _, seq)| (rule.clone(), *seq)),
+                ));
+            }
+        }
+        stale
+    };
+    let firing_is_open =
+        |firing: &Firing| -> bool { !firing.cancelled && firing.terminal.is_none() };
+
+    let firing_state = |firing: &Firing| -> &'static str {
+        if firing.cancelled {
+            return "cancelled";
+        }
+        if firing.terminal.is_some() {
+            return "closed(terminal)";
+        }
+        let pending = firing.effect_ids.iter().any(|effect_id| {
+            effect_status
+                .get(effect_id.as_str())
+                .is_some_and(|(_, status)| {
+                    !matches!(*status, "completed" | "failed" | "timed_out" | "cancelled")
+                })
+        });
+        if pending {
+            "open(effects-pending)"
+        } else {
+            "effects-settled"
+        }
+    };
+
+    // DR-0043 Decisions 6 + 8: a lapsed region is durable state worth
+    // surfacing, and the pinned per-step statuses answer "did that step fail,
+    // or never run?" — which absence from the progress view alone cannot.
+    let lapsed_region = |firing: &Firing| -> Option<Value> {
+        let lapse_key = format!("{}:{}", firing.rule, firing.identity);
+        let lapse = facts
+            .iter()
+            .find(|fact| fact.name == "progression.region.lapsed" && fact.key == lapse_key)?;
+        let payload = serde_json::from_str::<Value>(&lapse.value_json).ok()?;
+        Some(json!({
+            "state": "lapsed",
+            "condition": payload.get("condition").and_then(Value::as_str).unwrap_or_default(),
+            "steps": payload.get("steps").cloned().unwrap_or_else(|| json!({})),
+        }))
+    };
+
+    if options.json {
+        let rows: Vec<Value> = order
+            .iter()
+            .filter_map(|key| firings.get(key))
+            .map(|firing| {
+                json!({
+                    "firing_id": firing.firing_id,
+                    "rule": firing.rule,
+                    "identity": firing.identity,
+                    "admitted_sequence": firing.admitted_sequence,
+                    "state": firing_state(firing),
+                    "context": firing.context,
+                    "effects": firing
+                        .effect_ids
+                        .iter()
+                        .map(|effect_id| {
+                            let (kind, status) = effect_status
+                                .get(effect_id.as_str())
+                                .copied()
+                                .unwrap_or(("-", "-"));
+                            json!({ "effect_id": effect_id, "kind": kind, "status": status })
+                        })
+                        .collect::<Vec<_>>(),
+                    "terminal": firing.terminal,
+                    // DR-0044 P4: pinned triggers no longer live (open firings
+                    // only). Advisory — never a conformance failure.
+                    "stale_triggers": if firing_is_open(firing) {
+                        stale_triggers(firing)
+                            .into_iter()
+                            .map(|(binding, name, fact_id, by)| {
+                                json!({
+                                    "binding": binding,
+                                    "name": name,
+                                    "fact_id": fact_id,
+                                    "consumed_by": by.map(|(rule, seq)| json!({ "rule": rule, "sequence": seq })),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    },
+                    // Decision 8's region-state field. Absent (null) when the
+                    // firing has no region or the region never lapsed.
+                    "region": lapsed_region(firing),
+                })
+            })
+            .collect();
+        emit_json(Value::Array(rows))
+    } else {
+        for key in &order {
+            let Some(firing) = firings.get(key) else {
+                continue;
+            };
+            println!(
+                "{}  rule={}  admitted=#{}  state={}",
+                firing.firing_id,
+                firing.rule,
+                firing.admitted_sequence,
+                firing_state(firing)
+            );
+            if let Some(region) = lapsed_region(firing) {
+                let condition = region
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                println!("  region   lapsed ({condition})");
+                if let Some(steps) = region.get("steps").and_then(Value::as_object) {
+                    if !steps.is_empty() {
+                        let rendered: Vec<String> = steps
+                            .iter()
+                            .map(|(name, status)| {
+                                format!("{name}={}", status.as_str().unwrap_or("?"))
+                            })
+                            .collect();
+                        println!("  steps    {}", rendered.join(" "));
+                    }
+                }
+            }
+            // DR-0044 P4: pinned triggers no longer live, for open firings.
+            let stale: BTreeMap<String, Option<(String, i64)>> = if firing_is_open(firing) {
+                stale_triggers(firing)
+                    .into_iter()
+                    .map(|(_, _, fact_id, by)| (fact_id, by))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            if let Some(bindings) = firing
+                .context
+                .pointer("/bindings")
+                .and_then(Value::as_array)
+            {
+                for entry in bindings {
+                    let binding = entry.get("binding").and_then(Value::as_str).unwrap_or("-");
+                    let name = entry.get("name").and_then(Value::as_str).unwrap_or("-");
+                    let mut value = entry
+                        .get("value")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "-".to_owned());
+                    if value.len() > 96 {
+                        value.truncate(93);
+                        value.push_str("...");
+                    }
+                    let note = entry
+                        .get("fact_id")
+                        .and_then(Value::as_str)
+                        .and_then(|fact_id| stale.get(fact_id))
+                        .map(|by| match by {
+                            Some((rule, seq)) => {
+                                format!("  [trigger no longer live; consumed by {rule} at #{seq}]")
+                            }
+                            None => "  [trigger no longer live]".to_owned(),
+                        })
+                        .unwrap_or_default();
+                    println!("  trigger  {binding} = {name} {value}{note}");
+                }
+            }
+            for effect_id in &firing.effect_ids {
+                let (kind, status) = effect_status
+                    .get(effect_id.as_str())
+                    .copied()
+                    .unwrap_or(("-", "-"));
+                println!("  effect   {effect_id} {kind} ({status})");
+            }
+        }
+        ExitCode::SUCCESS
+    }
+}
+
 fn runs(options: &CliOptions) -> ExitCode {
     let Some(instance_id) = single_arg(options, "usage: whip runs <instance>") else {
         return ExitCode::from(2);
@@ -29063,16 +30644,23 @@ fn artifacts(options: &CliOptions) -> ExitCode {
 }
 
 const ISSUE_USAGE: &str = "usage: whip issue <\
-new --queue Q --title T [--body B] [--label L]... [--actor A]|\
-list [--queue Q] [--status S]|\
+new --tracker TR --title T [--body B] [--label L]... [--actor A]|\
+list [--tracker TR] [--status S]|\
 show <id>|\
-ready <queue> [--limit N]|\
-claim <id> [--actor A]|\
-renew <id> [--actor A]|\
+ready <tracker> [--limit N]|\
+claim <id> [--actor A] [--ttl D]|\
+renew <id> [--actor A] [--ttl D]|\
 release <id>|\
+assign <id> [--to A|--clear]|\
 finish <id> [--summary S]|complete <id> [--summary S]|\
 fail <id> [--actor A]|\
-dep add <blocked> [depends-on] <blocker>|\
+set <id> <field> <value> [--expect-state-token T]|\
+conflicts <id>|conflicts --tracker TR|\
+dep add <blocked> [depends-on] <blocker> [--kind K]|\
+link <from> <kind> <to>|unlink <from> <kind> <to>|\
+note <id> <text>|comments <id>|\
+evidence <id> [--kind K --ref R --note N]|\
+export [--to DIR]|import <path|->|import --from DIR|sync DIR|\
 rebuild>";
 
 /// Run-identity provenance stamp: anything filed/claimed from inside a turn is
@@ -29102,6 +30690,21 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Resolve a `--ttl <duration>` flag to an ABSOLUTE deadline (`now + ttl`),
+/// formatted as SQLite's `datetime('now')` shape so it compares lexically
+/// against the store's clock (the T3 claim/renew TTL). `None` = no `--ttl` (an
+/// untimed claim, or a renew that heartbeats without moving the deadline).
+fn issue_ttl_expires(args: &[String]) -> Option<String> {
+    let ttl = flag_value(args, "--ttl")?;
+    let seconds = whipplescript_parser::body::parse_short_duration_seconds(&ttl)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    chrono::DateTime::<chrono::Utc>::from_timestamp(now + seconds as i64, 0)
+        .map(|instant| instant.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 /// Emit the full issue row after a mutation (DR-0002 "CLI Requirements": no
 /// show-after-claim round trip). Human mode prints a one-line confirmation.
 fn emit_issue_row(
@@ -29116,9 +30719,13 @@ fn emit_issue_row(
                 emit_json(work_item_to_json(&item))
             } else {
                 println!(
-                    "{} {note} [{}]{}",
+                    "{} {note} [{}]{}{}",
                     item.id,
                     item.status,
+                    item.assigned_to
+                        .as_deref()
+                        .map(|a| format!(" (assigned to {a})"))
+                        .unwrap_or_default(),
                     item.claimed_by
                         .as_deref()
                         .map(|c| format!(" (claimed by {c})"))
@@ -29136,7 +30743,7 @@ fn emit_issue_row(
 }
 
 fn issue(options: &CliOptions) -> ExitCode {
-    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, WorkItemStore};
+    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore};
     let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
@@ -29154,7 +30761,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
+                    "--tracker" => queue = iter.next().cloned(),
                     "--title" => title = iter.next().cloned(),
                     "--body" => item_body = iter.next().cloned().unwrap_or_default(),
                     "--actor" => actor = iter.next().cloned(),
@@ -29199,7 +30806,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             let mut iter = args.iter().skip(1);
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
-                    "--queue" => queue = iter.next().cloned(),
+                    "--tracker" => queue = iter.next().cloned(),
                     "--status" => status = iter.next().cloned(),
                     _ => {
                         eprintln!("{usage}");
@@ -29221,7 +30828,7 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             for item in listed {
                 println!(
-                    "{} [{}] queue={} {}{}",
+                    "{} [{}] tracker={} {}{}",
                     item.id,
                     item.status,
                     item.queue,
@@ -29241,10 +30848,40 @@ fn issue(options: &CliOptions) -> ExitCode {
             };
             match store.get_item(id) {
                 Ok(Some(item)) => {
+                    let conflicts = match store.issue_conflicts(id) {
+                        Ok(view) => view,
+                        Err(error) => return report_store_error("failed to read conflicts", error),
+                    };
                     if options.json {
-                        emit_json(work_item_to_json(&item))
+                        let mut value = work_item_to_json(&item);
+                        if let (Some(map), Some(view)) = (value.as_object_mut(), &conflicts) {
+                            map.insert("conflicted".to_owned(), json!(view.conflicted()));
+                            map.insert("heads".to_owned(), json!(view.heads));
+                            map.insert("state_token".to_owned(), json!(view.state_token));
+                            map.insert(
+                                "field_conflicts".to_owned(),
+                                issue_conflicts_to_json(id, view)["field_conflicts"].clone(),
+                            );
+                        }
+                        if let (Some(map), Ok(rels)) = (value.as_object_mut(), store.relations(id))
+                        {
+                            map.insert(
+                                "relations".to_owned(),
+                                Value::Array(
+                                    rels.iter()
+                                        .map(|r| {
+                                            json!({
+                                                "from": r.from, "kind": r.kind,
+                                                "to": r.to, "dep_kind": r.dep_kind,
+                                            })
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        emit_json(value)
                     } else {
-                        println!("{} [{}] queue={}", item.id, item.status, item.queue);
+                        println!("{} [{}] tracker={}", item.id, item.status, item.queue);
                         println!("title: {}", item.title);
                         if !item.body.is_empty() {
                             println!("body: {}", item.body);
@@ -29257,6 +30894,43 @@ fn issue(options: &CliOptions) -> ExitCode {
                         }
                         if let Some(filed) = &item.filed_by {
                             println!("filed by: {filed}");
+                        }
+                        if let Some(view) = &conflicts {
+                            if view.conflicted() {
+                                println!("CONFLICTED (not ready):");
+                                for fc in &view.field_conflicts {
+                                    println!("  {}: {}", fc.field, fc.values.join(" | "));
+                                }
+                            }
+                        }
+                        if let Ok(rels) = store.relations(id) {
+                            for r in &rels {
+                                let dep = r
+                                    .dep_kind
+                                    .as_deref()
+                                    .map(|d| format!(" ({d})"))
+                                    .unwrap_or_default();
+                                println!("relation: {} {} {}{dep}", r.from, r.kind, r.to);
+                            }
+                        }
+                        if let Ok(list) = store.comments(id) {
+                            for c in &list {
+                                println!(
+                                    "comment [{}]: {}",
+                                    c.author.as_deref().unwrap_or("?"),
+                                    c.body
+                                );
+                            }
+                        }
+                        if let Ok(list) = store.evidence(id) {
+                            for e in &list {
+                                println!(
+                                    "evidence [{}]: {} {}",
+                                    e.kind.as_deref().unwrap_or("evidence"),
+                                    e.reference.as_deref().unwrap_or(""),
+                                    e.note.as_deref().unwrap_or(""),
+                                );
+                            }
                         }
                         ExitCode::SUCCESS
                     }
@@ -29310,7 +30984,10 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             };
             let actor = issue_actor(flag_value(args, "--actor"));
-            match store.claim_item(id, &actor) {
+            // `--ttl <duration>` records a timed claim (`expires_at = now + ttl`);
+            // omitting it is the untimed backstop lease.
+            let expires = issue_ttl_expires(args);
+            match store.claim_item(id, &actor, expires.as_deref()) {
                 Ok(ClaimOutcome::Claimed) => emit_issue_row(&store, id, "claimed", options.json),
                 Ok(ClaimOutcome::AlreadyClaimed { holder }) => {
                     eprintln!("issue `{id}` is already claimed by {holder}");
@@ -29329,9 +31006,11 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             };
             let actor = issue_actor(flag_value(args, "--actor"));
-            // v1 renew is a holder heartbeat (no `--ttl`; the TTL mechanism is
-            // T3-gated). `expires = None` re-affirms the lease unchanged.
-            match store.renew_claim(id, &actor, None) {
+            // `--ttl <duration>` extends the claim to `now + ttl` (holder-checked,
+            // monotonic); omitting it is a heartbeat that re-affirms the lease
+            // without moving its deadline.
+            let expires = issue_ttl_expires(args);
+            match store.renew_claim(id, &actor, expires.as_deref()) {
                 Ok(RenewOutcome::Renewed { .. }) => {
                     emit_issue_row(&store, id, "renewed", options.json)
                 }
@@ -29358,6 +31037,33 @@ fn issue(options: &CliOptions) -> ExitCode {
                     ExitCode::FAILURE
                 }
                 Err(error) => report_store_error("failed to release claim", error),
+            }
+        }
+        // Direct an open issue at someone (0.2.2). Advisory: it says who should
+        // act and never restricts who may claim, so it is safe to assign
+        // optimistically and let anyone with access pick the issue up.
+        "assign" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let clear = args.iter().any(|arg| arg == "--clear");
+            let to = flag_value(args, "--to");
+            if clear && to.is_some() {
+                eprintln!("`--to` and `--clear` are mutually exclusive");
+                return ExitCode::from(2);
+            }
+            if !clear && to.is_none() {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            match store.assign_item(id, to.as_deref()) {
+                Ok(true) => emit_issue_row(&store, id, "assigned", options.json),
+                Ok(false) => {
+                    eprintln!("issue `{id}` is absent or no longer open");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to assign issue", error),
             }
         }
         "finish" | "complete" => {
@@ -29393,23 +31099,182 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
         }
         "dep" => {
-            // `dep add <blocked> [depends-on] <blocker>`: blocker blocks blocked.
+            // `dep add <blocked> [depends-on] <blocker> [--kind <dep_kind>]`:
+            // blocker blocks blocked (a `blocks` relation carrying the dep kind).
             if args.get(1).map(String::as_str) != Some("add") {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             }
-            let rest = args
-                .iter()
-                .skip(2)
-                .filter(|token| token.as_str() != "depends-on")
-                .collect::<Vec<_>>();
-            let (Some(blocked), Some(blocker)) = (rest.first(), rest.get(1)) else {
+            let dep_kind = flag_value(args, "--kind");
+            let mut positional = Vec::new();
+            let mut iter = args.iter().skip(2);
+            while let Some(token) = iter.next() {
+                match token.as_str() {
+                    "depends-on" => {}
+                    "--kind" => {
+                        iter.next(); // its value is consumed by flag_value above
+                    }
+                    _ => positional.push(token),
+                }
+            }
+            let (Some(blocked), Some(blocker)) = (positional.first(), positional.get(1)) else {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.add_blocks(blocker, blocked) {
+            match store.add_relation(blocker, blocked, "blocks", dep_kind.as_deref()) {
                 Ok(()) => emit_issue_row(&store, blocked, "gated by dependency", options.json),
                 Err(error) => report_store_error("failed to add dependency", error),
+            }
+        }
+        "link" => {
+            // `link <from> <kind> <to>`: add a directed relation edge.
+            let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.add_relation(from, to, kind, None) {
+                Ok(()) => emit_issue_row(&store, from, &format!("{kind} -> {to}"), options.json),
+                Err(error) => report_store_error("failed to link relation", error),
+            }
+        }
+        "unlink" => {
+            // `unlink <from> <kind> <to>`: remove a directed relation edge.
+            let (Some(from), Some(kind), Some(to)) = (args.get(1), args.get(2), args.get(3)) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.remove_relation(from, to, kind) {
+                Ok(true) => emit_issue_row(
+                    &store,
+                    from,
+                    &format!("unlinked {kind} -> {to}"),
+                    options.json,
+                ),
+                Ok(false) => {
+                    eprintln!("no `{kind}` relation from `{from}` to `{to}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to unlink relation", error),
+            }
+        }
+        "set" => {
+            // `set <id> <field> <value> [--expect-state-token <t>]`: append an
+            // `issue.field_set`. Two independent sets that meet at a merge fork
+            // the field; the conflict view (`issue conflicts`) surfaces the
+            // disagreement. `--expect-state-token` makes it optimistic: apply
+            // only if the frontier still matches the token the caller observed.
+            let positional = args
+                .iter()
+                .skip(1)
+                .take_while(|arg| !arg.starts_with("--"))
+                .collect::<Vec<_>>();
+            let (Some(id), Some(field), Some(value)) =
+                (positional.first(), positional.get(1), positional.get(2))
+            else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            if let Some(expected) = flag_value(args, "--expect-state-token") {
+                match store.set_field_checked(id, field, value, &expected) {
+                    Ok(SetFieldOutcome::Applied { state_token }) => {
+                        if options.json {
+                            emit_json(json!({
+                                "id": id, "outcome": "applied", "state_token": state_token,
+                            }))
+                        } else {
+                            println!("{id} {field} set (state-token {state_token})");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Ok(SetFieldOutcome::StateChanged { actual }) => {
+                        if options.json {
+                            return emit_json(json!({
+                                "id": id, "outcome": "state-changed", "state_token": actual,
+                            }));
+                        }
+                        eprintln!(
+                            "issue `{id}` changed under you (state-token is now {actual}); \
+                             not applied"
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Ok(SetFieldOutcome::NotFound) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to set field", error),
+                }
+            } else {
+                match store.set_field(id, field, value) {
+                    Ok(true) => emit_issue_row(&store, id, &format!("{field} set"), options.json),
+                    Ok(false) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to set field", error),
+                }
+            }
+        }
+        "conflicts" => {
+            // `conflicts <id>` reports one issue's DAG conflict view;
+            // `conflicts --tracker <q>` lists every conflicted issue in a tracker.
+            if let Some(queue) = flag_value(args, "--tracker") {
+                let listed = match store.list_items(Some(&queue), None) {
+                    Ok(items) => items,
+                    Err(error) => return report_store_error("failed to list issues", error),
+                };
+                let mut rows = Vec::new();
+                for item in listed {
+                    match store.issue_conflicts(&item.id) {
+                        Ok(Some(view)) if view.conflicted() => rows.push((item, view)),
+                        Ok(_) => {}
+                        Err(error) => return report_store_error("failed to read conflicts", error),
+                    }
+                }
+                if options.json {
+                    return emit_json(Value::Array(
+                        rows.iter()
+                            .map(|(item, view)| issue_conflicts_to_json(&item.id, view))
+                            .collect(),
+                    ));
+                }
+                if rows.is_empty() {
+                    println!("no conflicted issues in {queue}");
+                }
+                for (item, view) in rows {
+                    println!("{} {}", item.id, item.title);
+                    for fc in &view.field_conflicts {
+                        println!("  {} in dispute: {}", fc.field, fc.values.join(" | "));
+                    }
+                }
+                ExitCode::SUCCESS
+            } else if let Some(id) = args.get(1).filter(|arg| !arg.starts_with('-')) {
+                match store.issue_conflicts(id) {
+                    Ok(Some(view)) => {
+                        if options.json {
+                            return emit_json(issue_conflicts_to_json(id, &view));
+                        }
+                        println!("{id} state-token: {}", view.state_token);
+                        println!("heads: {}", view.heads.join(", "));
+                        if view.field_conflicts.is_empty() {
+                            println!("no field conflicts");
+                        } else {
+                            println!("conflicted fields:");
+                            for fc in &view.field_conflicts {
+                                println!("  {}: {}", fc.field, fc.values.join(" | "));
+                            }
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to read conflicts", error),
+                }
+            } else {
+                eprintln!("{usage}");
+                ExitCode::from(2)
             }
         }
         "rebuild" => match store.rebuild_projection() {
@@ -29423,10 +31288,286 @@ fn issue(options: &CliOptions) -> ExitCode {
             }
             Err(error) => report_store_error("failed to rebuild projection", error),
         },
+        "note" => {
+            // `note <id> <text...>`: add a comment to an issue.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let body = args
+                .iter()
+                .skip(2)
+                .take_while(|arg| !arg.starts_with("--"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if body.is_empty() {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            let author = issue_actor(flag_value(args, "--actor"));
+            match store.add_comment(id, Some(&author), &body) {
+                Ok(Some(_)) => emit_issue_row(&store, id, "comment added", options.json),
+                Ok(None) => {
+                    eprintln!("issue `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to add comment", error),
+            }
+        }
+        "comments" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.comments(id) {
+                Ok(list) => {
+                    if options.json {
+                        return emit_json(Value::Array(
+                            list.iter()
+                                .map(|c| {
+                                    json!({
+                                        "id": c.id, "author": c.author,
+                                        "body": c.body, "created_at": c.created_at,
+                                    })
+                                })
+                                .collect(),
+                        ));
+                    }
+                    if list.is_empty() {
+                        println!("no comments on {id}");
+                    }
+                    for c in list {
+                        println!(
+                            "[{}] {}: {}",
+                            c.created_at,
+                            c.author.as_deref().unwrap_or("?"),
+                            c.body
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => report_store_error("failed to read comments", error),
+            }
+        }
+        "evidence" => {
+            // `evidence <id> [--kind K] [--ref R] [--note N]`: add evidence if any
+            // field flag is given, else list the issue's evidence.
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let kind = flag_value(args, "--kind");
+            let reference = flag_value(args, "--ref");
+            let note = flag_value(args, "--note");
+            if kind.is_some() || reference.is_some() || note.is_some() {
+                let added_by = issue_actor(flag_value(args, "--actor"));
+                match store.add_evidence(
+                    id,
+                    kind.as_deref(),
+                    reference.as_deref(),
+                    note.as_deref(),
+                    Some(&added_by),
+                ) {
+                    Ok(Some(_)) => emit_issue_row(&store, id, "evidence attached", options.json),
+                    Ok(None) => {
+                        eprintln!("issue `{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to attach evidence", error),
+                }
+            } else {
+                match store.evidence(id) {
+                    Ok(list) => {
+                        if options.json {
+                            return emit_json(Value::Array(
+                                list.iter()
+                                    .map(|e| {
+                                        json!({
+                                            "id": e.id, "kind": e.kind, "reference": e.reference,
+                                            "note": e.note, "added_by": e.added_by,
+                                            "created_at": e.created_at,
+                                        })
+                                    })
+                                    .collect(),
+                            ));
+                        }
+                        if list.is_empty() {
+                            println!("no evidence on {id}");
+                        }
+                        for e in list {
+                            println!(
+                                "[{}] {}: {} {}",
+                                e.created_at,
+                                e.kind.as_deref().unwrap_or("evidence"),
+                                e.reference.as_deref().unwrap_or(""),
+                                e.note.as_deref().unwrap_or(""),
+                            );
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => report_store_error("failed to read evidence", error),
+                }
+            }
+        }
+        "export" => {
+            // `export` dumps the content-addressed event log as JSON to stdout;
+            // `export --to <dir>` writes it as content-addressed files (the
+            // portable cross-machine transport — union by directory).
+            if let Some(dir) = flag_value(args, "--to") {
+                return match store.export_to_dir(std::path::Path::new(&dir)) {
+                    Ok(written) => {
+                        if options.json {
+                            emit_json(json!({"exported_to": dir, "written": written}))
+                        } else {
+                            println!("wrote {written} new event file(s) to {dir}");
+                            ExitCode::SUCCESS
+                        }
+                    }
+                    Err(error) => report_store_error("failed to export events", error),
+                };
+            }
+            match store.export_events() {
+                Ok(events) => match serde_json::to_string_pretty(&events) {
+                    Ok(text) => {
+                        println!("{text}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("failed to serialize events: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => report_store_error("failed to export events", error),
+            }
+        }
+        "sync" => {
+            // `sync <dir>`: bidirectional reconcile against a shared directory —
+            // export local events to it, then import everything it holds. Two
+            // clones that both `sync` the same dir converge.
+            let Some(dir) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.sync_dir(std::path::Path::new(dir)) {
+                Ok((written, report)) => {
+                    // A repeated reconcile re-transmits events already held; those
+                    // dedup silently (idempotent, counted in `skipped`), so sync
+                    // does NOT spam. `duplicate_submissions` now holds only GENUINE
+                    // duplicates — a distinct issue filed independently with the
+                    // same queue+title — so we surface them for a human to
+                    // reconcile (via a `duplicates` relation).
+                    for alias in &report.duplicate_submissions {
+                        eprintln!(
+                            "warning: {alias} duplicates an existing issue (same queue + title)"
+                        );
+                    }
+                    if report.rejected > 0 {
+                        eprintln!(
+                            "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
+                            report.rejected
+                        );
+                    }
+                    if options.json {
+                        emit_json(json!({
+                            "pushed": written,
+                            "imported": report.imported,
+                            "new_issues": report.new_issues,
+                            "rejected": report.rejected,
+                            "duplicate_submissions": report.duplicate_submissions,
+                        }))
+                    } else {
+                        println!(
+                            "synced {dir}: pushed {written}, pulled {} new event(s), {} new issue(s)",
+                            report.imported, report.new_issues
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => report_store_error("failed to sync", error),
+            }
+        }
+        "import" => {
+            // `import <path>` (or `-` for stdin) unions a JSON event log;
+            // `import --from <dir>` unions a directory of event files.
+            if let Some(dir) = flag_value(args, "--from") {
+                return match store.import_from_dir(std::path::Path::new(&dir)) {
+                    Ok(report) => emit_import_report(&report, options.json),
+                    Err(error) => report_store_error("failed to import events", error),
+                };
+            }
+            let Some(path) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let raw = if path == "-" {
+                let mut buf = String::new();
+                match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                    Ok(_) => buf,
+                    Err(error) => {
+                        eprintln!("failed to read stdin: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("failed to read `{path}`: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            let events: Vec<whipplescript_store::items::TrackerEvent> =
+                match serde_json::from_str(&raw) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        eprintln!("failed to parse events: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            match store.import_events(&events) {
+                Ok(report) => emit_import_report(&report, options.json),
+                Err(error) => report_store_error("failed to import events", error),
+            }
+        }
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Render a tracker merge/import result: warn on every genuine duplicate
+/// submission (a distinct issue filed independently with the same queue + title;
+/// never a silent collapse), then summarize.
+fn emit_import_report(
+    report: &whipplescript_store::items::ImportReport,
+    json_out: bool,
+) -> ExitCode {
+    for alias in &report.duplicate_submissions {
+        eprintln!("warning: {alias} duplicates an existing issue (same queue + title)");
+    }
+    if report.rejected > 0 {
+        eprintln!(
+            "warning: rejected {} event(s) whose content hash did not verify (tampered or corrupt)",
+            report.rejected
+        );
+    }
+    if json_out {
+        emit_json(json!({
+            "imported": report.imported,
+            "skipped": report.skipped,
+            "new_issues": report.new_issues,
+            "rejected": report.rejected,
+            "duplicate_submissions": report.duplicate_submissions,
+        }))
+    } else {
+        println!(
+            "imported {} event(s), {} new issue(s), {} already present, {} rejected",
+            report.imported, report.new_issues, report.skipped, report.rejected
+        );
+        ExitCode::SUCCESS
     }
 }
 
@@ -29440,175 +31581,65 @@ fn work_item_to_json(item: &whipplescript_store::items::WorkItem) -> Value {
         "labels": item.labels,
         "metadata": item.metadata,
         "claimed_by": item.claimed_by,
+        "assigned_to": item.assigned_to,
         "filed_by": item.filed_by,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     })
 }
 
-fn inbox(options: &CliOptions) -> ExitCode {
-    match options.args.first().map(String::as_str) {
-        None => inbox_list(options, None),
-        Some("show") => inbox_show(options),
-        Some("answer") => inbox_answer(options),
-        Some(instance_id) if options.args.len() == 1 && instance_id.starts_with("ins_") => {
-            inbox_list(options, Some(instance_id))
-        }
-        _ => {
-            eprintln!(
-                "usage: whip inbox [<instance>|show <item>|answer <item> (--choice X|--text X)]"
-            );
-            ExitCode::from(2)
-        }
-    }
+/// The DAG conflict view of one issue as JSON (ADR-0002 phase B1 slice ii):
+/// the frontier, its content `state_token`, and any per-field disputes.
+fn issue_conflicts_to_json(id: &str, view: &whipplescript_store::items::IssueConflicts) -> Value {
+    json!({
+        "id": id,
+        "conflicted": view.conflicted(),
+        "heads": view.heads,
+        "state_token": view.state_token,
+        "field_conflicts": view.field_conflicts.iter().map(|fc| json!({
+            "field": fc.field,
+            "values": fc.values,
+        })).collect::<Vec<_>>(),
+    })
 }
 
-fn inbox_list(options: &CliOptions, instance_id: Option<&str>) -> ExitCode {
-    let store = match open_store_or_exit(options) {
-        Ok(store) => store,
-        Err(code) => return code,
+/// Cross-check a caller-supplied `--program` against the instance's committed
+/// program version before ingress admission. The payload MUST be validated
+/// against the schema the instance actually runs, not an arbitrary program the
+/// caller compiled: otherwise `whip signal <inst> --program attacker.whip` (or
+/// `ingress serve --program …`) admits a signal the committed program never
+/// declared, or coerces the payload to a shape the committed schema forbids.
+/// Returns Err(message) on a source-hash mismatch; Ok when they match or the
+/// instance has no committed version to check against (fail-open only where
+/// there is nothing to compare, never on a mismatch).
+fn verify_program_matches_committed_version(
+    store: &SqliteStore,
+    instance_id: &str,
+    source: &str,
+) -> Result<(), String> {
+    let Some(instance) = store.get_instance(instance_id).ok().flatten() else {
+        return Ok(()); // unknown instance: admission itself reports it
     };
-    let mut items = match store.list_inbox_items(Some("pending")) {
-        Ok(items) => items,
-        Err(error) => return report_store_error("failed to list inbox items", error),
+    if instance.version_id.is_empty() {
+        return Ok(()); // unversioned instance: nothing to cross-check
+    }
+    let Some(version) = store
+        .get_program_version(&instance.version_id)
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
     };
-    if let Some(instance_id) = instance_id {
-        items.retain(|item| item.instance_id == instance_id);
+    let compiled = stable_hash_hex(source);
+    if compiled != version.source_hash {
+        return Err(format!(
+            "the supplied `--program` (source hash {compiled}) does not match instance \
+             `{instance_id}`'s committed program version `{}` (source hash {}); ingress is \
+             validated against the committed program, not a caller-supplied one",
+            instance.version_id, version.source_hash
+        ));
     }
-
-    if options.json {
-        emit_json(Value::Array(
-            items.iter().map(inbox_item_to_json).collect::<Vec<_>>(),
-        ))
-    } else {
-        if items.is_empty() {
-            println!("inbox empty");
-        }
-        for item in items {
-            println!(
-                "{} instance={} severity={} created={}",
-                item.inbox_item_id, item.instance_id, item.severity, item.created_at
-            );
-            println!("  {}", one_line(&item.prompt));
-        }
-        ExitCode::SUCCESS
-    }
-}
-
-fn inbox_show(options: &CliOptions) -> ExitCode {
-    if options.args.len() != 2 {
-        eprintln!("usage: whip inbox show <item>");
-        return ExitCode::from(2);
-    }
-    let item_id = &options.args[1];
-    let store = match open_store_or_exit(options) {
-        Ok(store) => store,
-        Err(code) => return code,
-    };
-    let Some(item) = (match store.get_inbox_item(item_id) {
-        Ok(item) => item,
-        Err(error) => return report_store_error("failed to load inbox item", error),
-    }) else {
-        eprintln!("inbox item `{item_id}` was not found");
-        return ExitCode::FAILURE;
-    };
-
-    if options.json {
-        emit_json(inbox_item_to_json(&item))
-    } else {
-        println!("{} status={}", item.inbox_item_id, item.status);
-        println!("instance {}", item.instance_id);
-        println!("severity {}", item.severity);
-        println!("freeform_allowed {}", item.freeform_allowed);
-        println!("choices {}", item.choices_json);
-        println!();
-        println!("{}", item.prompt);
-        if let Some(answer) = item.answer_json {
-            println!();
-            println!("answer {answer}");
-        }
-        ExitCode::SUCCESS
-    }
-}
-
-fn inbox_answer(options: &CliOptions) -> ExitCode {
-    if options.args.len() < 4 {
-        eprintln!("usage: whip inbox answer <item> (--choice X|--text X) [--by NAME]");
-        return ExitCode::from(2);
-    }
-    let item_id = &options.args[1];
-    let mut choice = None;
-    let mut text = None;
-    let mut answered_by = env::var("USER").unwrap_or_else(|_| "operator".to_owned());
-    let mut index = 2;
-    while index < options.args.len() {
-        match options.args[index].as_str() {
-            "--choice" => {
-                index += 1;
-                let Some(value) = options.args.get(index) else {
-                    eprintln!("expected a value after `--choice`");
-                    return ExitCode::from(2);
-                };
-                choice = Some(value.clone());
-            }
-            "--text" => {
-                index += 1;
-                let Some(value) = options.args.get(index) else {
-                    eprintln!("expected a value after `--text`");
-                    return ExitCode::from(2);
-                };
-                text = Some(value.clone());
-            }
-            "--by" => {
-                index += 1;
-                let Some(value) = options.args.get(index) else {
-                    eprintln!("expected a value after `--by`");
-                    return ExitCode::from(2);
-                };
-                answered_by = value.clone();
-            }
-            other => {
-                eprintln!("unknown inbox answer option `{other}`");
-                return ExitCode::from(2);
-            }
-        }
-        index += 1;
-    }
-    if choice.is_some() == text.is_some() {
-        eprintln!("provide exactly one of `--choice` or `--text`");
-        return ExitCode::from(2);
-    }
-    let answer_json = if let Some(choice) = choice {
-        json!({"kind": "choice", "choice": choice, "answered_by": answered_by}).to_string()
-    } else {
-        json!({"kind": "text", "text": text.expect("text present"), "answered_by": answered_by})
-            .to_string()
-    };
-    let mut store = match open_store_or_exit(options) {
-        Ok(store) => store,
-        Err(code) => return code,
-    };
-    let event = match store.answer_inbox_item(HumanAnswer {
-        inbox_item_id: item_id,
-        answer_json: &answer_json,
-        answered_by: &answered_by,
-        idempotency_key: Some(&idempotency_key(&[item_id, "human-answer", &answer_json])),
-    }) {
-        Ok(event) => event,
-        Err(error) => return report_store_error("failed to answer inbox item", error),
-    };
-
-    if options.json {
-        emit_json(json!({
-            "inbox_item_id": item_id,
-            "event_id": event.event_id,
-            "sequence": event.sequence,
-            "answer": json_from_str(&answer_json),
-        }))
-    } else {
-        println!("{item_id} answered at event #{}", event.sequence);
-        ExitCode::SUCCESS
-    }
+    Ok(())
 }
 
 /// `whip signal <instance> --name <name> --data <json> --program <path>`:
@@ -29618,12 +31649,13 @@ fn inbox_answer(options: &CliOptions) -> ExitCode {
 /// recorded fact is the source of truth; replay re-reads it, never the
 /// delivery.
 fn signal(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>]";
+    let usage = "usage: whip signal <instance> --name <name> --data <json> --program <workflow.whip> [--root <workflow>] [--delivery-id <id>]";
     let mut instance_id = None;
     let mut event_name = None;
     let mut data = None;
     let mut program_path = None;
     let mut root = None;
+    let mut delivery_id = None;
     let mut index = 0;
     while index < options.args.len() {
         match options.args[index].as_str() {
@@ -29642,6 +31674,13 @@ fn signal(options: &CliOptions) -> ExitCode {
             "--root" => {
                 index += 1;
                 root = options.args.get(index).cloned();
+            }
+            // I5 (spec/std-ingress.md): the operator-supplied delivery id WINS
+            // over the derived payload-hash key, completing "CLI Admission" —
+            // the same id twice admits once, across process runs.
+            "--delivery-id" => {
+                index += 1;
+                delivery_id = options.args.get(index).cloned();
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown signal option `{other}`");
@@ -29662,43 +31701,10 @@ fn signal(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     };
-    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
-    let Some(event) = ir.events.iter().find(|event| event.name == event_name) else {
-        let declared = ir
-            .events
-            .iter()
-            .map(|event| event.name.as_str())
-            .collect::<Vec<_>>();
-        eprintln!(
-            "signal `{event_name}` is not declared in {program_path}{}",
-            if declared.is_empty() {
-                "; the program declares no signals".to_owned()
-            } else {
-                format!("; declared signals: {}", declared.join(", "))
-            }
-        );
-        return ExitCode::from(2);
-    };
-    // No laundering (H8 stage b): a signal governance marks INTERNAL is an internal
-    // channel whose integrity is carried from its emitter, so it may not be sourced
-    // by an external `whip signal` injection — otherwise an attacker could smuggle
-    // untrusted data in under a trusted signal name. Ungoverned/dev mode imposes
-    // nothing.
-    if ifc::signal_is_internal(&event_name) {
-        eprintln!(
-            "signal `{event_name}` is governed as an INTERNAL channel (DR-0027 H8); external \
-             injection is refused — an internal signal carries its emitter's integrity and may \
-             not be sourced from outside"
-        );
-        eprintln!(
-            "to allow external delivery, remove the `internal` mark on `signal:{event_name}` in \
-             the governance envelope (it then becomes an external-entry source, default low)"
-        );
-        return ExitCode::from(1);
-    }
     let payload: Value = match serde_json::from_str(&data) {
         Ok(payload) => payload,
         Err(error) => {
@@ -29706,73 +31712,281 @@ fn signal(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut errors = Vec::new();
-    validate_json_for_object(&ir, &payload, &event.fields, "$", &mut errors);
-    if !errors.is_empty() {
-        eprintln!(
-            "payload does not conform to signal `{event_name}`: {}",
-            errors.join("; ")
-        );
-        return ExitCode::from(2);
-    }
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
-    match store.get_instance(&instance_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            eprintln!("instance `{instance_id}` not found");
-            return ExitCode::from(2);
-        }
-        Err(error) => return report_store_error("failed to load instance", error),
+    // The supplied `--program` must be the instance's committed program, or a
+    // caller could admit a signal against a schema the instance never ran.
+    if let Err(message) = verify_program_matches_committed_version(&store, &instance_id, &source) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
     }
+    // The ONE shared admission core (spec/std-ingress.md I3): declared-signal
+    // check, H8 internal-channel gate, payload validation, idempotent append,
+    // fact derivation — the same door every ingress driver goes through.
     let payload_json = payload.to_string();
-    let mut kernel = RuntimeKernel::new(store);
-    let received = match kernel.ingest_external_event(
+    let delivery_key = whipplescript_kernel::ingress_pass::signal_delivery_key(
         &instance_id,
         &event_name,
         &payload_json,
-        Some(&idempotency_key(&[
-            &instance_id,
-            "signal",
-            &event_name,
-            &payload_json,
-        ])),
+        delivery_id.as_deref(),
+    );
+    let mut kernel = RuntimeKernel::new(store);
+    let admission = match whipplescript_kernel::ingress_pass::admit_external_signal(
+        &mut kernel,
+        &instance_id,
+        &ir,
+        &event_name,
+        &payload,
+        &delivery_key,
     ) {
-        Ok(event) => event,
+        Ok(admission) => admission,
         Err(error) => return report_store_error("failed to record event", error),
     };
-    let fact_event = match kernel.derive_fact(
-        &instance_id,
-        &event_name,
-        &received.event_id,
-        &payload_json,
-        Some(&received.event_id),
-        Some(&idempotency_key(&[
-            &instance_id,
-            "signal-fact",
-            &received.event_id,
-        ])),
-    ) {
-        Ok(event) => event,
-        Err(error) => return report_store_error("failed to record event fact", error),
-    };
-    if options.json {
-        emit_json(json!({
-            "instance_id": instance_id,
-            "signal": event_name,
-            "event_id": received.event_id,
-            "fact_event_id": fact_event.event_id,
-            "payload": payload,
-        }))
-    } else {
-        println!(
-            "signaled {instance_id} with `{event_name}` at event #{}",
-            fact_event.sequence
-        );
-        ExitCode::SUCCESS
+    use whipplescript_kernel::ingress_pass::{SignalAdmission, SignalRefusal};
+    match admission {
+        SignalAdmission::Refused(SignalRefusal::UndeclaredSignal { declared }) => {
+            eprintln!(
+                "signal `{event_name}` is not declared in {program_path}{}",
+                if declared.is_empty() {
+                    "; the program declares no signals".to_owned()
+                } else {
+                    format!("; declared signals: {}", declared.join(", "))
+                }
+            );
+            ExitCode::from(2)
+        }
+        // No laundering (H8 stage b): a signal governance marks INTERNAL is an
+        // internal channel whose integrity is carried from its emitter, so it
+        // may not be sourced by an external `whip signal` injection —
+        // otherwise an attacker could smuggle untrusted data in under a
+        // trusted signal name. Ungoverned/dev mode imposes nothing.
+        SignalAdmission::Refused(SignalRefusal::InternalChannel) => {
+            eprintln!(
+                "signal `{event_name}` is governed as an INTERNAL channel (DR-0027 H8); external \
+                 injection is refused — an internal signal carries its emitter's integrity and may \
+                 not be sourced from outside"
+            );
+            eprintln!(
+                "to allow external delivery, remove the `internal` mark on `signal:{event_name}` in \
+                 the governance envelope (it then becomes an external-entry source, default low)"
+            );
+            ExitCode::from(1)
+        }
+        SignalAdmission::Refused(SignalRefusal::PayloadInvalid { errors }) => {
+            eprintln!(
+                "payload does not conform to signal `{event_name}`: {}",
+                errors.join("; ")
+            );
+            ExitCode::from(2)
+        }
+        SignalAdmission::Refused(SignalRefusal::InstanceNotFound) => {
+            eprintln!("instance `{instance_id}` not found");
+            ExitCode::from(2)
+        }
+        // The observable duplicate ("CLI Admission", spec/event-ingress.md):
+        // the delivery was already admitted, nothing new landed — success,
+        // because the operator's intent (this delivery is in) holds.
+        SignalAdmission::Duplicate { existing_event_id } => {
+            if options.json {
+                emit_json(json!({
+                    "instance_id": instance_id,
+                    "signal": event_name,
+                    "duplicate": true,
+                    "event_id": existing_event_id,
+                    "payload": payload,
+                }))
+            } else {
+                println!(
+                    "signal `{event_name}` was already admitted to {instance_id} (event {existing_event_id}); duplicate delivery absorbed"
+                );
+                ExitCode::SUCCESS
+            }
+        }
+        SignalAdmission::Admitted {
+            event_id,
+            fact_event_id,
+            sequence,
+        } => {
+            if options.json {
+                emit_json(json!({
+                    "instance_id": instance_id,
+                    "signal": event_name,
+                    "event_id": event_id,
+                    "fact_event_id": fact_event_id,
+                    "payload": payload,
+                }))
+            } else {
+                println!("signaled {instance_id} with `{event_name}` at event #{sequence}");
+                ExitCode::SUCCESS
+            }
+        }
     }
+}
+
+/// `whip ingress serve --stdio` (spec/std-ingress.md slice I3, the
+/// `std.ingress.stdio` resident operator driver): read JSONL envelopes
+/// `{instance, signal, payload, delivery_id?}` from stdin and admit each
+/// through the SAME admission core `whip signal` and the file/http pollers
+/// use — a malformed envelope is rejected before any fact, a re-delivered
+/// `delivery_id` is absorbed once. One JSON result line per envelope on
+/// stdout; the process exits 0 at EOF (dev/test reference path, native-only,
+/// no M2 effect seam involved). The HTTP LISTENER driver is deferred with
+/// slice I4 ("Deferred with cause").
+fn ingress_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip ingress serve --stdio --program <workflow.whip> [--root <workflow>]";
+    if options.args.first().map(String::as_str) != Some("serve") {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let mut stdio = false;
+    let mut program_path = None;
+    let mut root = None;
+    let mut index = 1;
+    while index < options.args.len() {
+        match options.args[index].as_str() {
+            "--stdio" => stdio = true,
+            "--program" => {
+                index += 1;
+                program_path = options.args.get(index).cloned();
+            }
+            "--root" => {
+                index += 1;
+                root = options.args.get(index).cloned();
+            }
+            other => {
+                eprintln!("unknown ingress serve option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    if !stdio {
+        eprintln!(
+            "`whip ingress serve` currently drives --stdio only; the HTTP listener driver is \
+             deferred (spec/std-ingress.md \"Deferred with cause\", slice I4)"
+        );
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    }
+    let Some(program_path) = program_path else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+        Ok(compiled) => compiled,
+        Err(error) => return report_compile_failure(&program_path, error),
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let mut kernel = RuntimeKernel::new(store);
+    use whipplescript_kernel::ingress_pass::{
+        admit_external_signal, refusal_reason, signal_delivery_key, SignalAdmission,
+    };
+    let stdin = std::io::stdin();
+    let mut line_number = 0usize;
+    for line in std::io::BufRead::lines(stdin.lock()) {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("reading stdin failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_number += 1;
+        // Envelope validation happens BEFORE any store write: a malformed
+        // line rejects with a per-line result and admits nothing.
+        let reject =
+            |reason: String| json!({"line": line_number, "status": "rejected", "reason": reason});
+        let envelope: Value = match serde_json::from_str(&line) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                println!("{}", reject(format!("invalid JSON envelope: {error}")));
+                continue;
+            }
+        };
+        let (Some(instance_id), Some(signal_name)) = (
+            envelope.get("instance").and_then(Value::as_str),
+            envelope.get("signal").and_then(Value::as_str),
+        ) else {
+            println!(
+                "{}",
+                reject(
+                    "envelope must carry string `instance` and `signal` fields (and a `payload` object)"
+                        .to_owned()
+                )
+            );
+            continue;
+        };
+        let Some(payload) = envelope.get("payload") else {
+            println!("{}", reject("envelope has no `payload`".to_owned()));
+            continue;
+        };
+        // Each delivery names its target instance: the served `--program` must
+        // be that instance's committed program, or a caller could admit signals
+        // against a schema the instance never ran.
+        if let Err(message) =
+            verify_program_matches_committed_version(kernel.store(), instance_id, &source)
+        {
+            println!("{}", reject(message));
+            continue;
+        }
+        let delivery_id = envelope.get("delivery_id").and_then(Value::as_str);
+        let payload_json = payload.to_string();
+        let delivery_key =
+            signal_delivery_key(instance_id, signal_name, &payload_json, delivery_id);
+        let admission = match admit_external_signal(
+            &mut kernel,
+            instance_id,
+            &ir,
+            signal_name,
+            payload,
+            &delivery_key,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                eprintln!("failed to record event: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let result = match admission {
+            SignalAdmission::Admitted {
+                event_id,
+                fact_event_id,
+                ..
+            } => json!({
+                "line": line_number,
+                "status": "admitted",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "event_id": event_id,
+                "fact_event_id": fact_event_id,
+            }),
+            SignalAdmission::Duplicate { existing_event_id } => json!({
+                "line": line_number,
+                "status": "duplicate",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "event_id": existing_event_id,
+            }),
+            SignalAdmission::Refused(refusal) => json!({
+                "line": line_number,
+                "status": "rejected",
+                "instance_id": instance_id,
+                "signal": signal_name,
+                "reason": refusal_reason(&refusal),
+            }),
+        };
+        println!("{result}");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `whip message`: inject an inbound `Message` (spec/messaging.md) on a declared
@@ -29780,7 +31994,7 @@ fn signal(options: &CliOptions) -> ExitCode {
 /// fixture-parity ingestion path that mirrors how outbound `send` runs under the
 /// fixture provider; live messaging providers (Slack/email) stay credential-gated.
 fn message_command(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--from <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]";
+    let usage = "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]";
     let mut instance_id = None;
     let mut channel = None;
     let mut text = None;
@@ -29804,7 +32018,11 @@ fn message_command(options: &CliOptions) -> ExitCode {
                 index += 1;
                 markdown = options.args.get(index).cloned();
             }
-            "--from" => {
+            // `--by` is the claimed-actor identity flag (spec/std-messaging.md
+            // provider table: local identity = claimed, CLI `--by`). `--from`
+            // stays accepted as an alias so existing operator invocations keep
+            // working.
+            "--by" | "--from" => {
                 index += 1;
                 sender = options.args.get(index).cloned();
             }
@@ -29844,7 +32062,7 @@ fn message_command(options: &CliOptions) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
-    let (_source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
+    let (source, ir) = match compile_source_path_with_root(&program_path, root.as_deref()) {
         Ok(compiled) => compiled,
         Err(error) => return report_compile_failure(&program_path, error),
     };
@@ -29866,24 +32084,6 @@ fn message_command(options: &CliOptions) -> ExitCode {
     }
     let text = text.unwrap_or_default();
     let markdown = markdown.unwrap_or_default();
-    let message_id = idempotency_key(&[&instance_id, &channel, &text, &markdown]);
-    // The generic `Message` envelope (spec/messaging.md); structured sub-payloads
-    // are JSON strings, provider context lives in `raw_ref`.
-    let payload = json!({
-        "message_id": message_id,
-        "channel": channel,
-        "provider": "fixture",
-        "received_at": "",
-        "sender": sender.clone().unwrap_or_default(),
-        "sender_claims": "{}",
-        "thread_id": thread_id.clone().unwrap_or_default(),
-        "text": text,
-        "markdown": markdown,
-        "attachments": [],
-        "interaction": "{}",
-        "raw_ref": "",
-        "correlation": "{}",
-    });
     let fact_name = format!("message.{channel}");
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
@@ -29897,6 +32097,50 @@ fn message_command(options: &CliOptions) -> ExitCode {
         }
         Err(error) => return report_store_error("failed to load instance", error),
     }
+    // The supplied `--program` must be the instance's committed program, or a
+    // caller could admit a message against a schema the instance never ran.
+    if let Err(message) = verify_program_matches_committed_version(&store, &instance_id, &source) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
+    // Mint a UNIQUE message id per DELIVERY (spec/std-messaging.md local
+    // provider notes): the id is keyed by the channel's delivery ordinal —
+    // the count of messages already admitted on this channel — never by
+    // content, so re-sending identical text is a DISTINCT message while
+    // admission idempotency (the ordinal-keyed keys below) still dedups
+    // replays of the SAME delivery.
+    let delivery_ordinal = match store.list_events(&instance_id) {
+        Ok(events) => events
+            .into_iter()
+            .filter(|event| event.source == "external" && event.event_type == fact_name)
+            .count(),
+        Err(error) => return report_store_error("failed to read message ordinal", error),
+    };
+    let message_id = idempotency_key(&[
+        &instance_id,
+        &channel,
+        "delivery",
+        &delivery_ordinal.to_string(),
+    ]);
+    // The generic `Message` envelope (spec/messaging.md); structured sub-payloads
+    // are JSON strings, provider context lives in `raw_ref`. `received_at` is a
+    // real operator-boundary instant (it was `""` before slice 3), and `sender`
+    // carries the `--by` claimed-actor identity.
+    let payload = json!({
+        "message_id": message_id,
+        "channel": channel,
+        "provider": "fixture",
+        "received_at": wall_clock_instant(),
+        "sender": sender.clone().unwrap_or_default(),
+        "sender_claims": "{}",
+        "thread_id": thread_id.clone().unwrap_or_default(),
+        "text": text,
+        "markdown": markdown,
+        "attachments": [],
+        "interaction": "{}",
+        "raw_ref": "",
+        "correlation": "{}",
+    });
     let payload_json = payload.to_string();
     let mut kernel = RuntimeKernel::new(store);
     let received = match kernel.ingest_external_event(
@@ -29944,6 +32188,394 @@ fn message_command(options: &CliOptions) -> ExitCode {
 /// Coordination state is fully attributable and inspectable
 /// (spec/coordination.md): who holds which slot, who spent the budget, who
 /// wrote which entry.
+/// `whip memory pools|entries` (spec/std-memory.md MEM-3): the operator's
+/// read surface over the workspace memory store — the same
+/// `<store>.memory.sqlite` the std.memory `local` provider writes
+/// (`WHIPPLESCRIPT_MEMORY_STORE` overrides).
+/// SC6 operator surface (spec/std-script.md "operator surface polish"):
+/// read-only views over the pinned script-capability manifest. `list` shows
+/// the pins; `verify` re-hashes each entry's on-disk script against its
+/// pinned sha256 and reports verified/mismatch/missing with structured
+/// expected_sha256/actual_sha256 fields — exit 1 when any pin fails.
+fn script_command(options: &CliOptions) -> ExitCode {
+    let usage = "usage: whip script <list|verify> [--script-manifest <path>]";
+    let mut manifest_path = script_manifest_path_from_env();
+    let mut verb: Option<&str> = None;
+    let mut args = options.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--script-manifest" => match args.next() {
+                Some(value) => manifest_path = Some(PathBuf::from(value)),
+                None => {
+                    eprintln!("{usage}");
+                    return ExitCode::from(2);
+                }
+            },
+            "list" | "verify" if verb.is_none() => verb = Some(arg),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(verb) = verb else {
+        eprintln!("{usage}");
+        return ExitCode::from(2);
+    };
+    let Some(path) = manifest_path else {
+        eprintln!(
+            "no script manifest: pass --script-manifest <path> or set WHIPPLESCRIPT_SCRIPT_MANIFEST"
+        );
+        return ExitCode::from(2);
+    };
+    let manifest = match ScriptManifest::load(&path) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+    match verb {
+        "list" => {
+            if options.json {
+                return emit_json(Value::Array(
+                    manifest
+                        .capabilities
+                        .values()
+                        .map(|script| {
+                            json!({
+                                "name": script.name,
+                                "argv": script.argv,
+                                "sha256": script.sha256,
+                                "hermetic": script.hermetic,
+                                "env": script.env.keys().collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if manifest.capabilities.is_empty() {
+                println!("no script capabilities pinned in {}", path.display());
+            }
+            for script in manifest.capabilities.values() {
+                println!(
+                    "{}\tsha256={}\thermetic={}\t{}",
+                    script.name,
+                    script.sha256,
+                    script.hermetic,
+                    script.argv.join(" ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        "verify" => {
+            let mut rows = Vec::new();
+            let mut all_verified = true;
+            for script in manifest.capabilities.values() {
+                // Same file-location rule as the runtime pre-spawn check: the
+                // first argv element naming a readable file is the script body.
+                let row = match script.argv.iter().find(|arg| Path::new(arg).is_file()) {
+                    Some(script_path) => match fs::read(Path::new(script_path)) {
+                        Ok(bytes) => {
+                            let actual_sha256 = sha256_hex(&bytes);
+                            let verified = actual_sha256 == script.sha256;
+                            all_verified &= verified;
+                            json!({
+                                "name": script.name,
+                                "status": if verified { "verified" } else { "mismatch" },
+                                "path": script_path,
+                                "expected_sha256": script.sha256,
+                                "actual_sha256": actual_sha256,
+                            })
+                        }
+                        Err(error) => {
+                            all_verified = false;
+                            json!({
+                                "name": script.name,
+                                "status": "unreadable",
+                                "path": script_path,
+                                "expected_sha256": script.sha256,
+                                "error": error.to_string(),
+                            })
+                        }
+                    },
+                    None => {
+                        all_verified = false;
+                        json!({
+                            "name": script.name,
+                            "status": "missing",
+                            "argv": script.argv,
+                            "expected_sha256": script.sha256,
+                        })
+                    }
+                };
+                rows.push(row);
+            }
+            if options.json {
+                let code = if all_verified {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+                let _ = emit_json(json!({
+                    "manifest": path.display().to_string(),
+                    "verified": all_verified,
+                    "scripts": rows,
+                }));
+                return code;
+            }
+            for row in &rows {
+                println!(
+                    "{}\t{}\texpected={}\tactual={}",
+                    row.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    row.get("status").and_then(Value::as_str).unwrap_or("?"),
+                    row.get("expected_sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                    row.get("actual_sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-"),
+                );
+            }
+            if all_verified {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        _ => unreachable!("verb is validated above"),
+    }
+}
+
+fn memory_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::memory::{MemoryStore, SqliteMemoryStore};
+    let usage = "usage: whip memory <pools|entries <pool> [--limit <n>]>";
+    let path = std::env::var(whipplescript_store::memory::MEMORY_STORE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| options.store_path.with_extension("memory.sqlite"));
+    let store = match SqliteMemoryStore::open(&path) {
+        Ok(store) => store,
+        Err(error) => return report_store_error("failed to open memory store", error),
+    };
+    let mut args = options.args.iter().map(String::as_str);
+    match args.next() {
+        Some("pools") => {
+            let pools = match store.pools() {
+                Ok(pools) => pools,
+                Err(error) => return report_store_error("failed to list memory pools", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    pools
+                        .iter()
+                        .map(|pool| {
+                            json!({
+                                "pool": pool.pool,
+                                "entries": pool.entries,
+                                "last_created_at": pool.last_created_at,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            if pools.is_empty() {
+                println!("no memory pools at {}", path.display());
+            }
+            for pool in pools {
+                println!("{}\t{} entries", pool.pool, pool.entries);
+            }
+            ExitCode::SUCCESS
+        }
+        Some("entries") => {
+            let Some(pool) = args.next().filter(|arg| !arg.starts_with('-')) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let mut limit = None;
+            while let Some(arg) = args.next() {
+                if arg == "--limit" {
+                    limit = args.next().and_then(|raw| raw.parse::<usize>().ok());
+                }
+            }
+            let rows = match store.entries(pool, limit) {
+                Ok(rows) => rows,
+                Err(error) => return report_store_error("failed to list memory entries", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    rows.iter()
+                        .map(|row| {
+                            json!({
+                                "memory_id": row.memory_id,
+                                "pool": row.pool,
+                                "text": row.text,
+                                "source": row.source,
+                                "note": row.note,
+                                "created_at": row.created_at,
+                                "source_effect_id": row.source_effect_id,
+                                "author_actor": row.author_actor,
+                            })
+                        })
+                        .collect(),
+                ));
+            }
+            for row in rows {
+                println!("{}\t{}", row.memory_id, row.text.replace('\n', " "));
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip mailbox` (spec/std-messaging.md open question 1 resolved): the
+/// operator's read surface over the LOCAL messaging provider's files —
+/// `outbound` lists the delivered rows in `<store>.mailbox.jsonl` (what
+/// `send via` a `local` channel wrote), `inbound <channel>` lists the
+/// received rows in `<store>.inbox.<channel>.jsonl` (what the worker-pass
+/// poll admits). Read-only: injection stays `whip message`.
+fn mailbox_command(options: &CliOptions) -> ExitCode {
+    let usage =
+        "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]>";
+    let mut args = options.args.iter().map(String::as_str);
+    let subcommand = args.next();
+    let mut positional = None;
+    let mut channel_filter = None;
+    let mut limit = None;
+    while let Some(arg) = args.next() {
+        match arg {
+            "--channel" => channel_filter = args.next().map(str::to_owned),
+            "--limit" => limit = args.next().and_then(|raw| raw.parse::<usize>().ok()),
+            other if other.starts_with('-') => {
+                eprintln!("unknown mailbox option `{other}`");
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+            value if positional.is_none() => positional = Some(value.to_owned()),
+            _ => {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // Shared JSONL reader: absent file = empty mailbox (nothing delivered /
+    // received yet), matching the provider and poll semantics.
+    let read_rows = |path: &Path| -> Result<Vec<Value>, ExitCode> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                eprintln!("failed to read {}: {error}", path.display());
+                return Err(ExitCode::from(2));
+            }
+        };
+        Ok(contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(
+                |(ordinal, line)| match serde_json::from_str::<Value>(line) {
+                    Ok(mut record) => {
+                        if let Some(object) = record.as_object_mut() {
+                            object.insert("ordinal".to_owned(), json!(ordinal));
+                        }
+                        record
+                    }
+                    Err(_) => json!({ "ordinal": ordinal, "malformed": line }),
+                },
+            )
+            .collect())
+    };
+    let tail = |mut rows: Vec<Value>| -> Vec<Value> {
+        if let Some(limit) = limit {
+            if rows.len() > limit {
+                rows.drain(..rows.len() - limit);
+            }
+        }
+        rows
+    };
+    match subcommand {
+        Some("outbound") => {
+            let path = options.store_path.with_extension("mailbox.jsonl");
+            let rows = match read_rows(&path) {
+                Ok(rows) => rows,
+                Err(code) => return code,
+            };
+            let rows = tail(
+                rows.into_iter()
+                    .filter(|row| match &channel_filter {
+                        Some(channel) => {
+                            row.get("channel").and_then(Value::as_str) == Some(channel)
+                        }
+                        None => true,
+                    })
+                    .collect(),
+            );
+            if options.json {
+                return emit_json(json!({
+                    "mailbox": path.display().to_string(),
+                    "messages": rows,
+                }));
+            }
+            if rows.is_empty() {
+                println!("no outbound messages at {}", path.display());
+            }
+            for row in rows {
+                let field = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or_default();
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    field("message_id"),
+                    field("channel"),
+                    field("accepted_at"),
+                    field("text").replace('\n', " ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Some("inbound") => {
+            let Some(channel) = positional else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let path = options
+                .store_path
+                .with_extension(format!("inbox.{channel}.jsonl"));
+            let rows = match read_rows(&path) {
+                Ok(rows) => rows,
+                Err(code) => return code,
+            };
+            let rows = tail(rows);
+            if options.json {
+                return emit_json(json!({
+                    "inbox": path.display().to_string(),
+                    "channel": channel,
+                    "messages": rows,
+                }));
+            }
+            if rows.is_empty() {
+                println!("no inbound messages at {}", path.display());
+            }
+            for row in rows {
+                let field = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or_default();
+                println!(
+                    "#{}\t{}\t{}",
+                    row.get("ordinal").and_then(Value::as_u64).unwrap_or(0),
+                    field("sender"),
+                    field("text").replace('\n', " ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn coordination_list(options: &CliOptions, kind: &str) -> ExitCode {
     let store =
         match whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
@@ -30102,8 +32734,13 @@ fn telemetry(options: &CliOptions) -> ExitCode {
         }
     }
     let cursor_path = options.store_path.with_extension("otel-cursor.json");
+    // Endpoint resolution ladder (std-telemetry.md T3): environment wins,
+    // then the std.telemetry manifest's `otlp` registry default, then the
+    // OTLP local-collector convention.
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+        .ok()
+        .or_else(|| embedded_operator_provider_default("std.telemetry", "otlp", "endpoint"))
+        .unwrap_or_else(|| "http://localhost:4318".to_owned());
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
     match subcommand {
         Some("status") => {
@@ -30248,12 +32885,23 @@ fn telemetry(options: &CliOptions) -> ExitCode {
 }
 
 fn otel_export(options: &CliOptions) -> ExitCode {
-    let usage = "usage: whip otel-export <instance> [--dry-run]\n  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json), OTEL_EXPORTER_OTLP_HEADERS, OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME";
+    let usage = "usage: whip otel-export <instance> [--dry-run] [--telemetry-allowlist <Schema.field,...>]\n  env: OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL (http/json), OTEL_EXPORTER_OTLP_HEADERS, OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME, WHIPPLESCRIPT_TELEMETRY_ALLOWLIST";
     let mut instance_id = None;
     let mut dry_run = false;
-    for arg in &options.args {
+    let mut allowlist_flag: Option<String> = None;
+    let mut args = options.args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--telemetry-allowlist" => {
+                let Some(value) = args.next() else {
+                    eprintln!(
+                        "otel-export: --telemetry-allowlist requires a value: <Schema.field,Schema.field,...>"
+                    );
+                    return ExitCode::from(2);
+                };
+                allowlist_flag = Some(value.clone());
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown otel-export option `{other}`");
                 return ExitCode::from(2);
@@ -30279,6 +32927,25 @@ fn otel_export(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // T4 content allowlist carrier: the flag wins over the env variable
+    // (spec/std-telemetry.md "Allowlist mechanism v1"). Shape errors are
+    // config errors before any store or network I/O.
+    let allowlist_raw = allowlist_flag.or_else(|| {
+        env::var("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let allowlist = match allowlist_raw
+        .as_deref()
+        .map(parse_telemetry_allowlist)
+        .transpose()
+    {
+        Ok(allowlist) => allowlist,
+        Err(error) => {
+            eprintln!("otel-export: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let store = match open_store_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
@@ -30290,6 +32957,60 @@ fn otel_export(options: &CliOptions) -> ExitCode {
     let effects = match store.list_effects(&instance_id) {
         Ok(effects) => effects,
         Err(error) => return report_store_error("failed to list effects", error),
+    };
+    // T4 allowlist validation + content collection, before any network I/O.
+    // Validation strength (honest statement): entries validate against the
+    // *compiled program's* declared class schemas — the instance row gives
+    // its program version, whose `analysis_summary` carries the full
+    // schema/field lists the compiler recorded (kernel
+    // `program_analysis_summary_json`). This is real IR-derived schema
+    // knowledge, not a shape heuristic. An allowlist whose instance,
+    // program version, or schema catalog is unreachable is refused (fail
+    // closed); an unknown schema or field is a config error, no export.
+    let content_facts = if let Some(allowlist) = &allowlist {
+        let catalog = match otel_schema_catalog(&store, &instance_id) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                eprintln!("otel-export: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        for (schema, field) in allowlist {
+            let known = catalog
+                .get(schema)
+                .is_some_and(|fields| fields.contains(field));
+            if !known {
+                eprintln!(
+                    "otel-export: telemetry allowlist entry `{schema}.{field}` does not name a declared schema field of this instance's program"
+                );
+                return ExitCode::from(2);
+            }
+        }
+        // Where allowlisted content genuinely exists on the export path
+        // (honest statement): only runs and effects export, and neither
+        // carries schema-typed field values directly — effect `input_json`
+        // is a kind-specific envelope (rule/key/path/arguments, no declared
+        // schema payload) and run `metadata_json` redacts values by design.
+        // Effect-run OUTPUT fields typed by a declared schema DO exist as
+        // completion facts (`schema.coerce.succeeded` and kin) carrying
+        // `output_type` + `value` + the producing `run_id`, so those attach
+        // to the run's span below. Plain recorded facts have no spans of
+        // their own yet (drift D8), so they do not export.
+        match store.list_facts_including_consumed(&instance_id) {
+            Ok(facts) => facts
+                .iter()
+                .filter_map(|fact| {
+                    let value = json_from_str(&fact.value_json);
+                    let run_id = value.get("run_id")?.as_str()?.to_owned();
+                    let schema = value.get("output_type")?.as_str()?.to_owned();
+                    let fields = value.get("value")?.as_object()?.clone();
+                    Some((run_id, schema, fields))
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => return report_store_error("failed to list facts", error),
+        }
+    } else {
+        Vec::new()
     };
     drop(store);
 
@@ -30360,6 +33081,34 @@ fn otel_export(options: &CliOptions) -> ExitCode {
             // model-backed spans, so fleets land in LLM dashboards natively.
             if effect.kind == "agent.tell" || effect.kind == "schema.coerce" {
                 attributes.push(otel_attr("gen_ai.system", &run.provider));
+            }
+        }
+        // T4 allowlisted content: an allowlisted `<Schema>.<field>` exports as
+        // span attribute `whipplescript.field.<Schema>.<field>` on the span of
+        // the run whose schema-typed output carried it; everything else stays
+        // structural. With no allowlist this loop never runs and the payload
+        // is byte-identical to the structural export.
+        if let Some(allowlist) = &allowlist {
+            for (fact_run_id, schema, fields) in &content_facts {
+                if fact_run_id != &run.run_id {
+                    continue;
+                }
+                for (entry_schema, field) in allowlist {
+                    if entry_schema != schema {
+                        continue;
+                    }
+                    let Some(value) = fields.get(field) else {
+                        continue;
+                    };
+                    let rendered = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    attributes.push(otel_attr(
+                        &format!("whipplescript.field.{schema}.{field}"),
+                        &rendered,
+                    ));
+                }
             }
         }
         spans.push(json!({
@@ -30443,6 +33192,97 @@ fn otel_attr(key: &str, value: &str) -> Value {
     json!({"key": key, "value": {"stringValue": value}})
 }
 
+/// Parse the T4 telemetry content allowlist carrier: comma-separated
+/// `<Schema>.<field>` entries. A shape error (not exactly one dot, an empty
+/// half, or no entries at all) is a config error; whether the schema and
+/// field actually exist validates later against the instance's compiled
+/// program (spec/std-telemetry.md "Allowlist mechanism v1").
+fn parse_telemetry_allowlist(
+    raw: &str,
+) -> Result<std::collections::BTreeSet<(String, String)>, String> {
+    let mut entries = std::collections::BTreeSet::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let malformed = || {
+            format!(
+                "telemetry allowlist entry `{entry}` is malformed: expected exactly `<Schema>.<field>`"
+            )
+        };
+        let Some((schema, field)) = entry.split_once('.') else {
+            return Err(malformed());
+        };
+        if schema.is_empty() || field.is_empty() || field.contains('.') {
+            return Err(malformed());
+        }
+        entries.insert((schema.to_owned(), field.to_owned()));
+    }
+    if entries.is_empty() {
+        return Err("telemetry allowlist is empty (expected <Schema>.<field>[,...])".to_owned());
+    }
+    Ok(entries)
+}
+
+/// The declared class schemas (name -> field names) of the instance's compiled
+/// program, read from the stored program version's `analysis_summary` — the
+/// schema knowledge the export path genuinely has. Any missing link
+/// (instance, program version, or schema catalog) is an error so an allowlist
+/// can fail closed instead of silently skipping validation.
+fn otel_schema_catalog(
+    store: &SqliteStore,
+    instance_id: &str,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
+    let instance = store
+        .get_instance(instance_id)
+        .map_err(|error| {
+            format!("telemetry allowlist refused: failed to read instance: {error:?}")
+        })?
+        .ok_or_else(|| {
+            format!(
+                "telemetry allowlist refused: instance `{instance_id}` not found, so no program schemas are reachable to validate against"
+            )
+        })?;
+    let version = store
+        .get_program_version(&instance.version_id)
+        .map_err(|error| {
+            format!("telemetry allowlist refused: failed to read program version: {error:?}")
+        })?
+        .ok_or_else(|| {
+            format!(
+                "telemetry allowlist refused: program version `{}` not found, so no program schemas are reachable to validate against",
+                instance.version_id
+            )
+        })?;
+    let summary = json_from_str(&version.analysis_summary_json);
+    let Some(schemas) = summary.get("schemas").and_then(Value::as_array) else {
+        return Err(
+            "telemetry allowlist refused: this program version carries no schema catalog to validate against"
+                .to_owned(),
+        );
+    };
+    let mut catalog = std::collections::BTreeMap::new();
+    for schema in schemas {
+        let Some(name) = schema.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let fields = schema
+            .get("fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field.get("name").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        catalog.insert(name.to_owned(), fields);
+    }
+    Ok(catalog)
+}
+
 /// `YYYY-MM-DD HH:MM:SS` (store timestamps) to Unix nanoseconds, best-effort.
 fn otel_nanos(timestamp: &str) -> String {
     let normalized = timestamp.replace(' ', "T");
@@ -30492,8 +33332,13 @@ struct OtelExportConfig {
 /// on an unsupported protocol, a malformed header/resource list, or auth headers
 /// over an unsafe plaintext endpoint.
 fn resolve_otel_config() -> Result<OtelExportConfig, String> {
+    // Endpoint resolution ladder (std-telemetry.md T3): environment wins,
+    // then the std.telemetry manifest's `otlp` registry default, then the
+    // OTLP local-collector convention.
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318".to_owned());
+        .ok()
+        .or_else(|| embedded_operator_provider_default("std.telemetry", "otlp", "endpoint"))
+        .unwrap_or_else(|| "http://localhost:4318".to_owned());
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "whipplescript".to_owned());
 
     // Protocol validates before export: only the shipped wire shape is
@@ -30670,8 +33515,27 @@ fn otel_traces_url(endpoint: &str) -> Result<String, String> {
     Ok(format!("{}/v1/traces", endpoint.trim_end_matches('/')))
 }
 
+/// `whip evidence` routes by first positional (naming settled 2026-07-14):
+/// bare or `<gauge>` = the gauge evidence view (the experimentation
+/// surface's estimate view — same as `whip gauges`); `instance <id>` = a
+/// run's provider evidence chain (the former whole-verb meaning).
+fn evidence_router(options: &CliOptions) -> ExitCode {
+    if options.args.first().map(String::as_str) == Some("instance") {
+        let shifted = CliOptions {
+            command: options.command.clone(),
+            args: options.args[1..].to_vec(),
+            store_path: options.store_path.clone(),
+            json: options.json,
+            input_json: options.input_json.clone(),
+        };
+        return evidence(&shifted);
+    }
+    improve::gauges_command(options)
+}
+
 fn evidence(options: &CliOptions) -> ExitCode {
-    let Some(instance_id) = single_arg(options, "usage: whip evidence <instance>") else {
+    let Some(instance_id) = single_arg(options, "usage: whip evidence instance <instance-id>")
+    else {
         return ExitCode::from(2);
     };
     let store = match open_store_or_exit(options) {
@@ -33914,12 +36778,51 @@ enum CompileFailure {
     },
 }
 
+/// Byte-identical recompiles resolve from a process-lifetime cache: the
+/// improve evaluation loop drives every scenario through
+/// `start_workflow_instance` plus up to 16 `run_worker_once` passes, each
+/// of which previously re-lowered an unchanged program (DR-0037's recorded
+/// efficiency follow-on). Keyed by (root, source hash), so any changed
+/// byte — including in a resolved include, which changes the bundled
+/// source — recompiles; only successful compilations cache (diagnostics
+/// always re-derive), and warnings are cached so every caller prints
+/// exactly what a fresh compile would have printed.
+fn compile_program_with_root_cached(
+    source: &str,
+    root: Option<&str>,
+) -> whipplescript_parser::CompileOutput {
+    type CacheEntry = (IrProgram, Vec<whipplescript_parser::Diagnostic>);
+    type CacheMap = std::collections::HashMap<(Option<String>, String), CacheEntry>;
+    static CACHE: std::sync::Mutex<Option<CacheMap>> = std::sync::Mutex::new(None);
+    let key = (root.map(str::to_owned), sha256_hex(source.as_bytes()));
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((ir, warnings)) = guard.as_ref().and_then(|map| map.get(&key)) {
+            return whipplescript_parser::CompileOutput {
+                ir: Some(ir.clone()),
+                diagnostics: Vec::new(),
+                warnings: warnings.clone(),
+            };
+        }
+    }
+    let compiled = whipplescript_parser::compile_program_with_root(source, root);
+    if let Some(ir) = compiled.ir.as_ref() {
+        if let Ok(mut guard) = CACHE.lock() {
+            let map = guard.get_or_insert_with(CacheMap::new);
+            if map.len() >= 32 {
+                map.clear();
+            }
+            map.insert(key, (ir.clone(), compiled.warnings.clone()));
+        }
+    }
+    compiled
+}
+
 fn compile_source_path_with_root(
     path: &str,
     root: Option<&str>,
 ) -> Result<(String, IrProgram), CompileFailure> {
     let bundle = resolve_source_bundle(Path::new(path))?;
-    let compiled = whipplescript_parser::compile_program_with_root(&bundle.source, root);
+    let compiled = compile_program_with_root_cached(&bundle.source, root);
     for warning in &compiled.warnings {
         eprint!(
             "{}",
@@ -33952,6 +36855,13 @@ fn compile_source_path_for_validation(
     // the load-bearing runtime backstop is Layer 2 (S6d-6): import-conditional
     // two-key capability seeding + the store admission gate (`policy_block_on`).
     blocking.extend(check_script_hard_off(&ir));
+    // DQ-1 (language-refinement campaign): `use std.<pkg>` is uniformly
+    // LOAD-BEARING where present — the authority-bearing packages (files,
+    // messaging, ingress; script above) hard-error when their constructs
+    // appear without the import, and the capability-neutral packages (agent,
+    // coercion, coord, tracker, time, workflow, memory) are ambient and need
+    // no import at all.
+    blocking.extend(check_authority_imports(&ir));
     if !blocking.is_empty() {
         // Workflow-level diagnostics (span 0 for liveness) render against the root
         // path; the hard-off carries the offending `exec` effect's own span.
@@ -33972,6 +36882,56 @@ fn compile_source_path_for_validation(
 /// declaration that script execution is intended; without it, scripts are truly
 /// off. (Layer 2, the anti-forged-IR runtime backstop, is the two-key seeding in
 /// `run_worker_once` + the `script.*` requirement at the store admission gate.)
+/// DQ-1 authority-split namespace: the packages whose constructs open an I/O
+/// boundary require their `use std.<pkg>` import as the author-facing consent
+/// line (the same posture as script's hard-off):
+/// - `std.files` — a `file store` declaration (file effects require one);
+/// - `std.messaging` — a `channel` declaration (`send via` requires one);
+/// - `std.ingress` — a `signal` declaration or a non-clock `source` (the
+///   admission doorway for external events; clock sources alone are
+///   `std.time`, which is ambient — but a clock must emit into a declared
+///   signal, so clock programs carry the ingress import too).
+///
+/// Everything else (agent, coercion, coord, tracker, time, workflow, memory)
+/// is capability-neutral and AMBIENT: declarations register their package
+/// with no import line. Net: a `use std.*` line always means "this program
+/// opts into an authority" — never decoration.
+fn check_authority_imports(ir: &IrProgram) -> Vec<Diagnostic> {
+    let has_use = |package: &str| ir.uses.iter().any(|use_decl| use_decl.name == package);
+    let mut diagnostics = Vec::new();
+    let mut require = |package: &str, construct: &str, span: SourceSpan| {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "{construct} requires `use {package}` (security.package_import_required): \
+                 the import is the program's explicit opt-in to this authority"
+            ),
+            suggestion: Some(format!("add `use {package}` at the top of the program")),
+        });
+    };
+    if !has_use("std.files") && !ir.file_stores.is_empty() {
+        require(
+            "std.files",
+            "a `file store` declaration",
+            SourceSpan { start: 0, end: 0 },
+        );
+    }
+    if !has_use("std.messaging") {
+        if let Some(channel) = ir.channels.first() {
+            require("std.messaging", "a `channel` declaration", channel.span);
+        }
+    }
+    if !has_use("std.ingress") {
+        if let Some(event) = ir.events.first() {
+            require("std.ingress", "a `signal` declaration", event.span);
+        } else if let Some(source) = ir.sources.iter().find(|source| !source.is_clock) {
+            require("std.ingress", "a `source` declaration", source.span);
+        }
+    }
+    diagnostics
+}
+
 fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
     if ir.uses.iter().any(|use_decl| use_decl.name == "std.script") {
         return Vec::new();
@@ -34029,10 +36989,16 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
         .source_tags
         .iter()
         .any(|tag| tag.target_kind == "workflow" && tag.name == "service");
-    let has_terminal = ir
-        .rules
-        .iter()
-        .any(|rule| rule.body.lines().any(line_reaches_terminal));
+    let has_terminal = ir.rules.iter().any(|rule| {
+        rule.body.lines().any(line_reaches_terminal)
+            // DR-0043: a region's lapse arm reaches terminals through the
+            // LAPSED body variant, which the canonical body splices out.
+            || rule
+                .metadata
+                .region
+                .as_ref()
+                .is_some_and(|region| region.body_lapsed.lines().any(line_reaches_terminal))
+    });
     if !has_terminal && !service_tagged {
         diagnostics.push(Diagnostic { related: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
@@ -34061,12 +37027,6 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             _ => None,
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let has_human_ask = ir.rules.iter().any(|rule| {
-        rule.metadata
-            .effects
-            .iter()
-            .any(|effect| effect.kind == IrEffectKind::HumanAsk)
-    });
     let has_tell = ir.rules.iter().any(|rule| {
         rule.metadata
             .effects
@@ -34097,19 +37057,6 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 suggestion: Some(
                     "remove `@service` — non-termination is a root-only privilege, not for an invokable sub-workflow"
                         .to_owned(),
-                ),
-            });
-        }
-        if has_human_ask {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: SourceSpan { start: 0, end: 0 },
-                message: format!(
-                    "`@tool` workflow `{}` uses `askHuman`; a synchronously-invoked tool may not block on a human",
-                    ir.workflow
-                ),
-                suggestion: Some(
-                    "keep human gates at the root workflow, not in a `@tool` sub-workflow".to_owned(),
                 ),
             });
         }
@@ -34187,7 +37134,6 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 .strip_prefix("fact ")
                 .and_then(|rest| rest.split_whitespace().next());
             let pattern = match general_name {
-                Some("human.answer.received") => "human answered",
                 Some("agent.turn.completed") => "worker completed turn",
                 Some(name) if name.contains('.') => {
                     // Other dotted runtime facts arrive from outside the
@@ -34213,22 +37159,6 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 }
                 None => pattern,
             };
-            if pattern.starts_with("human answered") {
-                if !has_human_ask {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span: when.span,
-                        message: format!(
-                            "rule `{}` can never fire: no rule creates an `askHuman` request",
-                            rule.name
-                        ),
-                        suggestion: Some(
-                            "add an `askHuman` effect, or tag the rule `@external` if answers arrive from outside this workflow"
-                                .to_owned(),
-                        ),
-                    });
-                }
-                continue;
-            }
             if pattern.starts_with("worker completed turn") {
                 if !has_tell {
                     diagnostics.push(Diagnostic { related: Vec::new(),
@@ -34256,7 +37186,6 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 "AgentTurn"
                     | "WorkItem"
                     | "Evidence"
-                    | "HumanAnswer"
                     | "TerminalFailed"
                     | "TerminalTimedOut"
                     | "TerminalCancelled"
@@ -34315,6 +37244,222 @@ fn resolve_same_bundle_tool_grant(program_path: &Path, name: &str) -> Result<IrP
 /// must resolve and be a convergence-eligible `@tool`. Emits the DR's intended
 /// diagnostic, *"agent A is granted Z, which is not `@tool`"*. v1 resolves grants
 /// against the same bundle; cross-package resolution extends `resolve_tool_grant`.
+/// Every agent-provider kind the program binds, with the surface that binds it
+/// and the best available span: direct `provider <kind>` fields (which also
+/// cover the `delegated to` sugar and the managed `owned` default) and
+/// `harness <name>: <kind>` declarations.
+fn ir_agent_provider_kind_uses(ir: &IrProgram) -> Vec<(String, String, SourceSpan)> {
+    let mut uses = Vec::new();
+    for agent in &ir.agents {
+        if let Some(provider) = &agent.provider {
+            uses.push((
+                provider.clone(),
+                format!("agent `{}`", agent.name),
+                SourceSpan { start: 0, end: 0 },
+            ));
+        }
+    }
+    for harness in &ir.harnesses {
+        uses.push((
+            harness.kind.clone(),
+            format!("harness `{}`", harness.name),
+            harness.span,
+        ));
+    }
+    uses
+}
+
+/// The agent-provider kinds one manifest contributes (spec/std-agent.md "Open
+/// provider registry"): OPERATOR-PLANE provider rows carrying `"agent_provider":
+/// true` in their config. Operator rows are admission-inert by construction
+/// (`package_operator_providers` is their only structured reader), so a kind
+/// contribution is visibility data, never a runtime grant (X3).
+fn manifest_json_agent_provider_kinds(manifest_json: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<Value>(manifest_json) else {
+        return BTreeSet::new();
+    };
+    value
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row.get("plane").and_then(Value::as_str) == Some("operator")
+                && row
+                    .get("config")
+                    .and_then(|config| config.get("agent_provider"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
+        .filter_map(|row| {
+            row.get("provider_kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// The registry-derived agent-provider kind set (spec/std-agent.md "Open
+/// provider registry", replacing the parser's compiled-in
+/// `is_supported_harness_kind`): kind → the packages contributing it, from the
+/// embedded std manifests (feature-conditional: a binary without the `codex`
+/// feature genuinely does not know the kind) plus every locked manifest.
+fn known_agent_provider_kinds(
+    package_lock: Option<&LoadedPackageLock>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut kinds: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (package, json) in whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS {
+        for kind in manifest_json_agent_provider_kinds(json) {
+            kinds.entry(kind).or_default().insert((*package).to_owned());
+        }
+    }
+    if let Some(lock) = package_lock {
+        for manifest in &lock.manifests {
+            for kind in manifest_json_agent_provider_kinds(&manifest.manifest_json) {
+                kinds.entry(kind).or_default().insert(manifest.name.clone());
+            }
+        }
+    }
+    kinds
+}
+
+/// Provider-kind-known check (spec/std-agent.md "Static checks" 1, the M5
+/// graduated ladder's bottom rung): a provider/harness kind contributed by NO
+/// known manifest — embedded std (feature-conditional) or locked third-party —
+/// is an error naming it a missing package. The middle rung (contributed but
+/// not imported) is `lint.missing_agent_import`, advisory only.
+fn agent_provider_kind_diagnostics(
+    ir: &IrProgram,
+    package_lock: Option<&LoadedPackageLock>,
+) -> Vec<Diagnostic> {
+    let known = known_agent_provider_kinds(package_lock);
+    ir_agent_provider_kind_uses(ir)
+        .into_iter()
+        .filter(|(kind, _, _)| !known.contains_key(kind))
+        .map(|(kind, owner, span)| Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "{owner} uses unknown provider kind `{kind}`: no known package \
+                 manifest contributes it (missing package)"
+            ),
+            suggestion: Some(
+                "provider kinds are contributed by package manifests (embedded std \
+                 packages such as `std.agent`, `std.agent.codex`, `std.agent.claude`, \
+                 or a locked third-party package); add the providing package to the \
+                 package lock, or use a contributed kind"
+                    .to_owned(),
+            ),
+        })
+        .collect()
+}
+
+/// The provider kind one agent resolves to: a direct `provider`/`delegated to`
+/// binding (the parser also defaults bare managed agents to `owned`), or the
+/// kind of the bound `using <harness>` declaration.
+fn resolved_agent_provider_kind<'a>(
+    ir: &'a IrProgram,
+    agent: &'a whipplescript_parser::IrAgent,
+) -> Option<&'a str> {
+    agent.provider.as_deref().or_else(|| {
+        agent.harness.as_deref().and_then(|name| {
+            ir.harnesses
+                .iter()
+                .find(|harness| harness.name == name)
+                .map(|harness| harness.kind.as_str())
+        })
+    })
+}
+
+/// `requires [<feature.class>]` vs the selected provider's accepted feature
+/// report (spec/std-agent.md "Static checks" 2, slice 6): a required class the
+/// report cannot truthfully state as supported (`native`/`emulated`) is an
+/// error; a provider without a report cannot validate any requirement. The
+/// probed-vs-compiled source mismatch is the WARNING half, emitted as an
+/// advisory lint (`lint_agent_requires_probed_source`).
+fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
+    use whipplescript_kernel::agent_profile::agent_feature_report;
+    let mut diagnostics = Vec::new();
+    for agent in &ir.agents {
+        if agent.requires.is_empty() {
+            continue;
+        }
+        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+            continue;
+        };
+        let report = agent_feature_report(kind);
+        for class in &agent.requires {
+            let entry = report.and_then(|report| report.entry(class));
+            let satisfied = entry.is_some_and(|entry| entry.support.satisfies_requirement());
+            if satisfied {
+                continue;
+            }
+            let stated = match (report, entry) {
+                (None, _) => format!("provider kind `{kind}` publishes no feature report"),
+                (Some(_), None) => format!("provider `{kind}`'s report does not state it"),
+                (Some(_), Some(entry)) => format!(
+                    "provider `{kind}`'s report states it `{}`",
+                    entry.support.as_str()
+                ),
+            };
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: SourceSpan { start: 0, end: 0 },
+                message: format!(
+                    "agent `{}` requires feature class `{class}`, but {stated}",
+                    agent.name
+                ),
+                suggestion: Some(
+                    "a required class must be stated `native` or `emulated` by the selected \
+                     provider's accepted feature report (DR-0015); pick a provider that \
+                     supports it or drop the requirement"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+    diagnostics
+}
+
+/// ADVISORY probed-vs-compiled lint (DR-0015 severity rule; spec/std-agent.md
+/// slice 6): a requirement satisfied by a `probed` (not compiled) report entry
+/// is a warning — the claim depends on the local probe, not the shipped
+/// package. v1 reports are all compiled, so this cannot fire until the probed
+/// upgrade lands (deferred with cause in spec/std-agent.md); the check is
+/// wired so the severity rule has a home.
+fn lint_agent_requires_probed_source(ir: &IrProgram) -> Vec<LintFinding> {
+    use whipplescript_kernel::agent_profile::{agent_feature_report, FeatureReportSource};
+    let mut findings = Vec::new();
+    for agent in &ir.agents {
+        let Some(kind) = resolved_agent_provider_kind(ir, agent) else {
+            continue;
+        };
+        let Some(report) = agent_feature_report(kind) else {
+            continue;
+        };
+        for class in &agent.requires {
+            let Some(entry) = report.entry(class) else {
+                continue;
+            };
+            if entry.support.satisfies_requirement() && entry.source == FeatureReportSource::Probed
+            {
+                findings.push(LintFinding {
+                    code: "lint.agent_requires_probed_source",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "agent `{}` requires `{class}`, satisfied only by a probed (not \
+                         compiled) claim from provider `{kind}` (advisory)",
+                        agent.name
+                    ),
+                    name: Some(agent.name.clone()),
+                    span: None,
+                });
+            }
+        }
+    }
+    findings
+}
+
 fn lint_agent_tool_grants(
     program_path: &Path,
     ir: &IrProgram,
@@ -38249,25 +41394,6 @@ fn revision_would_create_to_json(
     })
 }
 
-fn inbox_item_to_json(item: &InboxItemView) -> Value {
-    json!({
-        "inbox_item_id": item.inbox_item_id,
-        "instance_id": item.instance_id,
-        "effect_id": item.effect_id,
-        "status": item.status,
-        "prompt": item.prompt,
-        "choices": json_from_str(&item.choices_json),
-        "freeform_allowed": item.freeform_allowed,
-        "severity": item.severity,
-        "related_effects": json_from_str(&item.related_effects_json),
-        "related_artifacts": json_from_str(&item.related_artifacts_json),
-        "answer": item.answer_json.as_deref().map(json_from_str),
-        "answered_by": item.answered_by,
-        "created_at": item.created_at,
-        "answered_at": item.answered_at,
-    })
-}
-
 fn evidence_to_json(evidence: &EvidenceView) -> Value {
     json!({
         "evidence_id": evidence.evidence_id,
@@ -38486,7 +41612,7 @@ fn status_to_json_with_effects_and_runs(
 
 /// Distinguishes the two failure categories side by side on the status surface:
 /// a workflow-level failure (an author-declared `fail` terminal, or the
-/// generated `flowfail` auto-fail) versus provider/effect failure *evidence*
+/// rule-level auto-fail net) versus provider/effect failure *evidence*
 /// (failed runs recorded against the instance). The two are independent: a
 /// workflow can fail on an author path with zero provider failures, and a
 /// provider failure can be recorded as evidence on a workflow that has not (yet)
@@ -38504,10 +41630,10 @@ fn failure_surface_to_json(status: &StatusView) -> Value {
                 .get("terminal_name")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            // The generated auto-fail terminal reserves the `flowfail` name; an
-            // author-declared `fail` carries the class name the author wrote.
+            // The auto-fail net produces no terminal name; an author-declared
+            // `fail` carries the class name the author wrote.
             let kind = match terminal_name.as_deref() {
-                Some("flowfail") | None => "internal",
+                None => "internal",
                 Some(_) => "author",
             };
             (Some(kind), terminal_name)
@@ -38703,6 +41829,90 @@ fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    /// The `whip mcp` subcommands are the only writers of trust evidence — the
+    /// pin, the attestation, the role file — so they are exactly the surface
+    /// that should not be hand-validated only. Driven sequentially in one test
+    /// because they share the process-global `WHIPPLESCRIPT_MCP_CONFIG`.
+    #[test]
+    fn whip_mcp_subcommands_write_and_gate_trust_evidence() {
+        let dir = std::env::temp_dir().join(format!("whip-mcp-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = dir.join("mcp.json");
+        std::env::set_var("WHIPPLESCRIPT_MCP_CONFIG", &config);
+
+        let opts = |args: &[&str]| CliOptions {
+            command: Some("mcp".to_owned()),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            store_path: dir.join("store.sqlite"),
+            json: false,
+            input_json: None,
+        };
+
+        // A plaintext remote endpoint is refused at `add`, before it is stored.
+        assert_eq!(
+            format!(
+                "{:?}",
+                mcp_command(&opts(&["add", "bad", "--url", "http://mcp.example.com/x"]))
+            ),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+        assert!(mcp_tools::load_registry().expect("registry").is_empty());
+
+        // A stdio server is stored, and lands at rung 0 — adding is not trusting.
+        assert_eq!(
+            format!(
+                "{:?}",
+                mcp_command(&opts(&["add", "srv", "--command", "true"]))
+            ),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        let registry = mcp_tools::load_registry().expect("registry");
+        let stored = registry.get("srv").expect("stored");
+        assert_eq!(
+            stored.rung(),
+            whipplescript_kernel::mcp::McpRung::Unattested
+        );
+
+        // Attestation without a pin is refused: there is no frozen manifest for
+        // the attestation to be about.
+        assert_eq!(
+            format!(
+                "{:?}",
+                mcp_command(&opts(&["attest", "srv", "--trust-annotations"]))
+            ),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+        assert!(
+            !mcp_tools::load_registry()
+                .expect("registry")
+                .get("srv")
+                .expect("stored")
+                .trust_annotations
+        );
+
+        // Attestation needs the flag spelled out; the bare verb is a usage error.
+        assert_eq!(
+            format!("{:?}", mcp_command(&opts(&["attest", "srv"]))),
+            format!("{:?}", ExitCode::from(2))
+        );
+
+        // An unknown server is an error, not a silent no-op.
+        assert_eq!(
+            format!("{:?}", mcp_command(&opts(&["status", "nope"]))),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+
+        // `forget` removes it.
+        assert_eq!(
+            format!("{:?}", mcp_command(&opts(&["forget", "srv"]))),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert!(mcp_tools::load_registry().expect("registry").is_empty());
+
+        std::env::remove_var("WHIPPLESCRIPT_MCP_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     // `NewEffect`/`IrRedaction` are exercised only by tests here (their production
     // users — the lowering `as_*` converters and the rule-lowering closure — moved
@@ -38727,6 +41937,12 @@ mod tests {
             "http://10.0.0.5/x",
             "http://192.168.1.1/x",
             "https://[::1]/x",
+            // IPv4-mapped / -compatible IPv6 must screen as their IPv4:
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[::ffff:10.0.0.5]/x",
+            "http://100.64.0.1/x",
+            "http://0.0.0.0/x",
         ] {
             assert!(
                 http_source_url_policy_error(url).is_some(),
@@ -39038,6 +42254,7 @@ workflow EchoText {
                         .to_string(),
                     provenance_class: "effect".to_owned(),
                     source_span_json: None,
+                    source_event_id: String::new(),
                 },
             )],
         };
@@ -39450,7 +42667,7 @@ coerce review() -> Review {
     fn package_manifest_accepts_first_class_library_shape() {
         let manifest = package_manifest_from_json(
             Path::new("memory.json"),
-            include_str!("../../../std/manifests/memory.json").to_owned(),
+            include_str!("../vendored-std/manifests/memory.json").to_owned(),
         )
         .expect("manifest parses");
 
@@ -40498,17 +43715,1106 @@ coerce review() -> Review {
         );
     }
 
+    /// A minimal manifest whose one construct is a `resource_effect` row —
+    /// the non-authorable class whose only producers are platform-catalog
+    /// privilege tuples (std.coord slice 4). `{LIB}` / `{KW}` are substituted
+    /// per test.
+    const RESOURCE_EFFECT_MANIFEST_TEMPLATE: &str = r#"{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "{LIB}",
+  "name": "{LIB}",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "{LIB}",
+      "version": "0.1.0",
+      "constructs": [
+        {
+          "id": "lease.acquire",
+          "construct_family": "effect_operation",
+          "keyword": "{KW}",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "resource_effect"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    /// std.coord slice 4 privilege acceptance (std-tracker.json claim-keyword
+    /// precedent, extended through the authorability wall): a manifest whose
+    /// (library, keyword, family, scope, lowering) tuple is in the platform
+    /// catalog may author a `resource_effect` construct WITHOUT being the
+    /// embedded byte-identical copy — the privilege-tuple leg of the door.
+    /// The embedded set is explicitly EMPTY so byte-identity cannot be the
+    /// key that admitted it.
+    #[test]
+    fn package_manifest_privilege_tuple_admits_resource_effect_construct() {
+        let manifest = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "std.coord")
+            .replace("{KW}", "acquire");
+        let manifest =
+            package_manifest_from_json_with_embedded(Path::new("coord.json"), manifest, &[])
+                .expect("the catalog privilege tuple authorizes the resource_effect class");
+        assert_eq!(manifest.registry.constructs.len(), 1);
+        assert_eq!(
+            manifest.registry.constructs[0].lowering_target,
+            "resource_effect"
+        );
+    }
+
+    /// Negative fixture (slice 4 gate): a NON-privileged manifest cannot
+    /// author a `resource_effect` construct — no catalog tuple, no row. Both
+    /// coordinates bite: a vendor library with the same keyword, and the
+    /// privileged library with a keyword outside its tuples.
+    #[test]
+    fn package_manifest_without_privilege_tuple_cannot_author_resource_effect() {
+        let vendor = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "acme.coord")
+            .replace("{KW}", "acquire");
+        let error =
+            package_manifest_from_json_with_embedded(Path::new("acme-coord.json"), vendor, &[])
+                .expect_err("a vendor library holds no resource_effect tuple");
+        assert!(
+            error.contains("platform-internal lowering_target `resource_effect`"),
+            "{error}"
+        );
+
+        let wrong_keyword = RESOURCE_EFFECT_MANIFEST_TEMPLATE
+            .replace("{LIB}", "std.coord")
+            .replace("{KW}", "seize");
+        let error = package_manifest_from_json_with_embedded(
+            Path::new("coord-seize.json"),
+            wrong_keyword,
+            &[],
+        )
+        .expect_err("std.coord holds no tuple for an un-cataloged keyword");
+        assert!(
+            error.contains("platform-internal lowering_target `resource_effect`"),
+            "{error}"
+        );
+    }
+
+    /// std.ingress I2b manifest template: the two reserved-keyword construct
+    /// rows (`signal` declaration_block + `emit` signal_emit) parameterized on
+    /// the library id, so both privilege coordinates can bite.
+    const INGRESS_KEYWORD_MANIFEST_TEMPLATE: &str = r#"
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "{LIB}",
+  "name": "{LIB}",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "{LIB}",
+      "constructs": [
+        {
+          "id": "ingress.signal",
+          "construct_family": "declaration_block",
+          "keyword": "signal",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "signal.emit",
+          "construct_family": "effect_operation",
+          "keyword": "emit",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Event" }],
+          "lowering_target": "signal_emit"
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    /// std.ingress I2b, privilege-tuple leg (spec/std-ingress.md "Catalog
+    /// privilege additions"): the catalog tuples (`signal`, std.ingress,
+    /// declaration_block, metadata_only) and (`emit`, std.ingress,
+    /// effect_operation, signal_emit) admit the construct rows WITHOUT the
+    /// embedded-copy key (empty embedded set), the same door std.coord's
+    /// resource_effect rows ride.
+    #[test]
+    fn package_manifest_privilege_tuples_admit_ingress_signal_and_emit() {
+        let manifest = INGRESS_KEYWORD_MANIFEST_TEMPLATE.replace("{LIB}", "std.ingress");
+        let manifest =
+            package_manifest_from_json_with_embedded(Path::new("ingress.json"), manifest, &[])
+                .expect("the catalog tuples authorize the signal/emit rows");
+        assert_eq!(manifest.registry.constructs.len(), 2);
+        assert!(manifest
+            .registry
+            .constructs
+            .iter()
+            .any(|form| form.keyword == "emit" && form.lowering_target == "signal_emit"));
+    }
+
+    /// Negative fixture (I2b gate): a NON-privileged manifest cannot author
+    /// the `signal`/`emit` keywords or the `signal_emit` lowering — the tuples
+    /// are exact, so a vendor library with the same rows is refused.
+    #[test]
+    fn package_manifest_without_ingress_tuples_cannot_author_signal_or_emit() {
+        let vendor = INGRESS_KEYWORD_MANIFEST_TEMPLATE.replace("{LIB}", "acme.ingress");
+        let error =
+            package_manifest_from_json_with_embedded(Path::new("acme-ingress.json"), vendor, &[])
+                .expect_err("a vendor library holds neither ingress tuple");
+        assert!(
+            error.contains("reserved construct keyword")
+                || error.contains("platform-internal lowering_target `signal_emit`"),
+            "{error}"
+        );
+    }
+
+    /// std.coord slice 4 drift test, contracts leg: the manifest's four
+    /// coordination effect contracts must FOLD against the parser-compiled
+    /// ones (same id/version/library/kind/schemas/validation), so a shape
+    /// drift between manifest and compiler surfaces as
+    /// `effect_contract_duplicate` and fails here.
+    #[test]
+    fn coord_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.coord
+
+workflow CoordImport
+
+output result Done
+failure error Busy
+
+class Ticket { id string }
+class Done { note string }
+class Busy { reason string }
+class Note { text string }
+class AuditEntry { area string text string }
+
+lease deploy_slot {
+  key Ticket
+  slots 1
+  ttl 60s
+}
+
+ledger audit_log {
+  entry AuditEntry
+  partition by area
+  retain 7d
+}
+
+counter request_budget {
+  key Ticket
+  cap 5
+  reset daily
+  timezone "UTC"
+}
+
+rule seed
+  when started
+=> {
+  record Ticket { id "prod" }
+}
+
+rule audit
+  when Ticket as t
+=> {
+  consume request_budget for t.id amount 1 as spend
+  append AuditEntry { area t.id text "went" } to audit_log as entry
+
+  after spend ok {
+    record Note { text "ok" }
+  }
+
+  after spend over {
+    record Note { text "over" }
+  }
+}
+
+rule go
+  when Ticket as t
+=> {
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {
+    release slot
+    complete result { note "ok" }
+  }
+
+  after slot contended {
+    fail error { reason "busy" }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form) in [
+            ("lease.acquire", "acquire"),
+            ("ledger.append", "append"),
+            ("counter.consume", "consume"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.coord");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "the manifest contributes the id==kind capability row (M3)"
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+        }
+        // The lease.release contract has no parser-compiled partner (the
+        // release verb has no IrEffectKind); the manifest copy stands alone.
+        assert_eq!(
+            registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == "lease.release")
+                .count(),
+            1
+        );
+        // The seven construct rows arrive from the embedded manifest merge.
+        let coord_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.coord")
+            .collect();
+        assert_eq!(coord_constructs.len(), 7, "{coord_constructs:?}");
+        for keyword in ["acquire", "release", "append", "consume"] {
+            assert!(
+                coord_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "resource_effect"
+                    && form.scope == "rule_body"),
+                "missing resource_effect row for `{keyword}`: {coord_constructs:?}"
+            );
+        }
+        for keyword in ["lease", "ledger", "counter"] {
+            assert!(
+                coord_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"),
+                "missing metadata_only row for `{keyword}`: {coord_constructs:?}"
+            );
+        }
+    }
+
+    /// std.coord slice 4 drift test, declarations leg: the runtime manifest's
+    /// `declaration_block` rows must name exactly the decl constructs the
+    /// grammar-only manifest (std/grammars/coord.json, build.rs-read) parses —
+    /// two spellings of one surface, kept in lockstep.
+    #[test]
+    fn coord_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../vendored-std/manifests/coord.json"))
+                .expect("valid json");
+        let grammar: Value = serde_json::from_str(include_str!("../../../std/grammars/coord.json"))
+            .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/coord.json must agree"
+        );
+    }
+
+    /// std.files slice F5 drift test, contracts leg: the manifest's four
+    /// `file.*` effect contracts must FOLD against the parser-compiled ones
+    /// (same id/version/library/kind/schemas/validation), so a shape drift
+    /// between manifest and compiler surfaces as `effect_contract_duplicate`
+    /// and fails here.
+    #[test]
+    fn files_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.files
+
+workflow FilesImport
+
+output result Done
+failure error Broken
+
+class Done { note string }
+class Broken { reason string }
+class Row { id string }
+
+file store docs {
+  root "fixtures"
+  allow read ["**/*"]
+  allow write ["out/**"]
+}
+
+rule go
+  when started
+=> {
+  read text from docs at "note.md" as loaded
+  import jsonl Row from docs at "rows.jsonl" as rows
+  export jsonl Row to docs at "out/rows.jsonl" { mode upsert } as dumped
+  write text to docs at "out/copy.md" { body "hi" mode upsert } as copied
+
+  after copied succeeds {
+    complete result { note "ok" }
+  }
+
+  after copied fails as oops {
+    fail error { reason oops.reason }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form, output_schema) in [
+            ("file.read", "read", "FileReadResult"),
+            ("file.write", "write", "FileWriteResult"),
+            ("file.import", "import", "FileImportResult"),
+            ("file.export", "export", "FileExportResult"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.files");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "capability id == effect kind (M3)"
+            );
+            assert_eq!(contract.output_schema.as_deref(), Some(output_schema));
+            assert_eq!(
+                contract.validation,
+                whipplescript_core::TypedOutputValidation::RuntimeBoundary
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+            assert_eq!(
+                contract.provider_kinds,
+                ["local"],
+                "the manifest contributes the `local` FileStore-seam provider kind"
+            );
+        }
+        // The five construct rows arrive from the embedded manifest merge —
+        // the catalog-honesty gate (E4): typed_effect_call's "promoted for
+        // std.files" claim is now TRUE via registered rows, keeping the
+        // `file.*` kind strings (attribution + admission, no rekey).
+        let files_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.files")
+            .collect();
+        assert_eq!(files_constructs.len(), 5, "{files_constructs:?}");
+        for keyword in ["read", "write", "import", "export"] {
+            assert!(
+                files_constructs.iter().any(|form| {
+                    form.keyword == keyword
+                        && form.lowering_target == "typed_effect_call"
+                        && form.scope == "rule_body"
+                        && form.target_capability.is_none()
+                }),
+                "missing typed_effect_call row for `{keyword}`: {files_constructs:?}"
+            );
+        }
+        assert!(
+            files_constructs.iter().any(|form| {
+                form.keyword == "file store"
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"
+            }),
+            "missing metadata_only row for `file store`: {files_constructs:?}"
+        );
+    }
+
+    /// std.files slice F5 drift test, declarations leg: the runtime manifest's
+    /// `declaration_block` rows must name exactly the decl constructs the
+    /// grammar-only manifest (std/grammars/files.json, build.rs-read) parses —
+    /// two spellings of one surface, kept in lockstep.
+    #[test]
+    fn files_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../vendored-std/manifests/files.json"))
+                .expect("valid json");
+        let grammar: Value = serde_json::from_str(include_str!("../../../std/grammars/files.json"))
+            .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/files.json must agree"
+        );
+    }
+
+    /// std.tracker slice T4 drift test, contracts leg: the manifest's five
+    /// tracker effect contracts must FOLD against the parser-compiled ones
+    /// (same id/version/library/kind/schemas/validation), so a shape drift
+    /// between manifest and compiler surfaces as `effect_contract_duplicate`
+    /// and fails here. `tracker.renew` now has a full contract too (T3 landed
+    /// the effect kind, spec/std-tracker.md "Renew/TTL semantics"): the rule
+    /// below renews its claim, so the parser emits the `tracker.renew`
+    /// contract and the manifest row folds against it.
+    #[test]
+    fn tracker_manifest_contracts_fold_against_the_parser_compiled_ones() {
+        let source = r#"use std.tracker
+
+workflow TrackerImport
+
+output result Done
+failure error Busy
+
+class Done { note string }
+class Busy { reason string }
+
+tracker backlog {
+  provider builtin
+}
+
+rule file_ticket
+  when started
+=> {
+  file issue into backlog {
+    title "Add retry telemetry"
+    body "Record retry count and final outcome."
+  }
+}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+=> {
+  claim issue as active_claim
+
+  after active_claim succeeds {
+    renew active_claim as renewed
+    finish issue {
+      summary "done"
+    }
+    complete result { note "ok" }
+  }
+
+  after active_claim fails {
+    release issue
+    fail error { reason "busy" }
+  }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        for (kind, source_form) in [
+            ("tracker.file", "file"),
+            ("tracker.claim", "claim"),
+            ("tracker.renew", "renew"),
+            ("tracker.release", "release"),
+            ("tracker.finish", "finish"),
+        ] {
+            let contracts: Vec<_> = registry
+                .effect_contracts
+                .iter()
+                .filter(|contract| contract.id == kind)
+                .collect();
+            assert_eq!(
+                contracts.len(),
+                1,
+                "manifest and parser `{kind}` contracts must fold into one: {contracts:?}"
+            );
+            let contract = contracts[0];
+            assert_eq!(contract.library_id, "std.tracker");
+            assert_eq!(contract.effect_kind, kind);
+            assert_eq!(
+                contract.required_capabilities,
+                [kind],
+                "contract carries the id==kind capability row (M3, slice T2)"
+            );
+            assert!(
+                contract.source_forms.iter().any(|form| form == source_form),
+                "{contract:?}"
+            );
+            assert!(
+                contract
+                    .provider_kinds
+                    .iter()
+                    .any(|provider| provider == "builtin-tracker"),
+                "the manifest contributes the admission-honesty provider kind: {contract:?}"
+            );
+        }
+        // T3 landed the `tracker.renew` effect kind: the manifest contract row
+        // now merge-folds against the parser-compiled contract (the loop above
+        // already asserted the single folded row), so a contract WITHOUT its
+        // parser partner is no longer the pretense — the fold is honest.
+        // The six construct rows arrive from the embedded manifest merge; the
+        // claim/renew/release rows are the reserved-keyword privilege tuples'
+        // first real exercisers (typed_effect_call, corrected by T4).
+        let tracker_constructs: Vec<_> = registry
+            .constructs
+            .iter()
+            .filter(|form| form.library_id == "std.tracker")
+            .collect();
+        assert_eq!(tracker_constructs.len(), 6, "{tracker_constructs:?}");
+        for keyword in ["file", "claim", "renew", "release", "finish"] {
+            assert!(
+                tracker_constructs.iter().any(|form| form.keyword == keyword
+                    && form.lowering_target == "typed_effect_call"
+                    && form.scope == "rule_body"),
+                "missing typed_effect_call row for `{keyword}`: {tracker_constructs:?}"
+            );
+        }
+        assert!(
+            tracker_constructs
+                .iter()
+                .any(|form| form.keyword == "tracker"
+                    && form.lowering_target == "metadata_only"
+                    && form.scope == "top_level"),
+            "missing metadata_only row for the `tracker` declaration: {tracker_constructs:?}"
+        );
+    }
+
+    /// std.tracker slice T4 drift test, declarations leg: the runtime
+    /// manifest's `declaration_block` rows must name exactly the decl
+    /// constructs the grammar-only manifest (std/grammars/tracker.json,
+    /// build.rs-read) parses — two spellings of one surface, kept in lockstep.
+    #[test]
+    fn tracker_manifest_decl_rows_agree_with_the_grammar_manifest() {
+        let runtime: Value =
+            serde_json::from_str(include_str!("../vendored-std/manifests/tracker.json"))
+                .expect("valid json");
+        let grammar: Value =
+            serde_json::from_str(include_str!("../../../std/grammars/tracker.json"))
+                .expect("valid json");
+        let decl_rows = |manifest: &Value, family_filter: bool| -> BTreeSet<(String, String)> {
+            manifest["libraries"]
+                .as_array()
+                .expect("libraries")
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .get("constructs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|construct| {
+                    !family_filter
+                        || construct["construct_family"].as_str() == Some("declaration_block")
+                })
+                .map(|construct| {
+                    (
+                        construct["id"].as_str().expect("id").to_owned(),
+                        construct["keyword"].as_str().expect("keyword").to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            decl_rows(&runtime, true),
+            decl_rows(&grammar, false),
+            "runtime manifest decl rows and std/grammars/tracker.json must agree"
+        );
+    }
+
     #[test]
     fn embedded_std_manifests_parse() {
         // Guard: every real embedded manifest validates clean through the full
-        // manifest validation (`embedded_std_manifests` panics otherwise). None
-        // declares a non-authorable lowering today, so the authorability door is
-        // exercised only by the synthetic tests above.
+        // manifest validation (`embedded_std_manifests` panics otherwise).
+        // std.coord's four `resource_effect` construct rows exercise the
+        // authorability door for real (both legs: byte-identity when loaded
+        // through `package_manifest_from_json`, and the catalog privilege
+        // tuples — see the slice-4 tests above).
         let manifests = embedded_std_manifests();
-        assert_eq!(manifests.len(), EMBEDDED_STD_MANIFESTS.len());
-        for ((name, _), manifest) in EMBEDDED_STD_MANIFESTS.iter().zip(&manifests) {
+        assert_eq!(
+            manifests.len(),
+            whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS.len()
+        );
+        for ((name, _), manifest) in whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+            .iter()
+            .zip(&manifests)
+        {
             assert_eq!(&manifest.name, name);
         }
+    }
+
+    /// Manifest/adapter drift (spec/std-agent.md "Static checks" 4, slice 7):
+    /// the thin provider packages' embedded manifests are present iff their
+    /// adapter cargo feature is compiled in — a binary without feature `codex`
+    /// genuinely does not know provider kind `codex`.
+    #[test]
+    fn agent_provider_manifests_track_adapter_features() {
+        assert!(is_embedded_std_manifest("std.agent"));
+        assert_eq!(
+            is_embedded_std_manifest("std.agent.codex"),
+            cfg!(feature = "codex"),
+            "std.agent.codex manifest presence must equal the codex feature"
+        );
+        assert_eq!(
+            is_embedded_std_manifest("std.agent.claude"),
+            cfg!(feature = "claude"),
+            "std.agent.claude manifest presence must equal the claude feature"
+        );
+        // Kind resolution flips with the feature set.
+        let kinds = known_agent_provider_kinds(None);
+        for kind in ["owned", "fixture", "native-fixture", "command"] {
+            assert!(
+                kinds.contains_key(kind),
+                "std.agent must contribute `{kind}`"
+            );
+        }
+        assert_eq!(kinds.contains_key("codex"), cfg!(feature = "codex"));
+        assert_eq!(kinds.contains_key("claude"), cfg!(feature = "claude"));
+        // And the compiled feature reports track the same features.
+        use whipplescript_kernel::agent_profile::agent_feature_report;
+        assert_eq!(
+            agent_feature_report("codex").is_some(),
+            cfg!(feature = "codex")
+        );
+        assert_eq!(
+            agent_feature_report("claude").is_some(),
+            cfg!(feature = "claude")
+        );
+    }
+
+    /// Manifest-vs-compiled drift (spec/std-agent.md slices 4/5/7): every
+    /// embedded agent-provider row's `config.feature_report` matches the
+    /// compiled report for that kind exactly, and the `std.agent` manifest's
+    /// `profiles` section mirrors the compiled preset table row for row.
+    #[test]
+    fn agent_manifest_reports_and_profiles_match_compiled_data() {
+        use whipplescript_kernel::agent_profile::{
+            agent_feature_report, agent_profile_preset, AGENT_PROFILE_PRESETS,
+        };
+        let mut kinds_with_manifest_reports = BTreeSet::new();
+        for (package, json) in whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS {
+            if *package != "std.agent" && !package.starts_with("std.agent.") {
+                continue;
+            }
+            let value: Value = serde_json::from_str(json).expect("embedded manifest json");
+            for row in value
+                .get("providers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let config = row.get("config").expect("provider config");
+                if config.get("agent_provider").and_then(Value::as_bool) != Some(true) {
+                    continue;
+                }
+                let kind = row
+                    .get("provider_kind")
+                    .and_then(Value::as_str)
+                    .expect("provider_kind");
+                let compiled = agent_feature_report(kind)
+                    .unwrap_or_else(|| panic!("no compiled report for manifest kind `{kind}`"));
+                let entries = config
+                    .get("feature_report")
+                    .and_then(Value::as_array)
+                    .unwrap_or_else(|| panic!("kind `{kind}` manifest row carries no report"));
+                assert_eq!(
+                    entries.len(),
+                    compiled.entries.len(),
+                    "kind `{kind}` report length drifted"
+                );
+                for (entry, compiled_entry) in entries.iter().zip(compiled.entries) {
+                    assert_eq!(
+                        entry.get("class").and_then(Value::as_str),
+                        Some(compiled_entry.class),
+                        "kind `{kind}` report class order drifted"
+                    );
+                    assert_eq!(
+                        entry.get("support").and_then(Value::as_str),
+                        Some(compiled_entry.support.as_str()),
+                        "kind `{kind}` class `{}` support drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("source").and_then(Value::as_str),
+                        Some(compiled_entry.source.as_str()),
+                        "kind `{kind}` class `{}` source drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("native_name").and_then(Value::as_str),
+                        compiled_entry.native_name,
+                        "kind `{kind}` class `{}` native_name drifted",
+                        compiled_entry.class
+                    );
+                    assert_eq!(
+                        entry.get("dispatch").and_then(Value::as_str),
+                        compiled_entry.dispatch,
+                        "kind `{kind}` class `{}` dispatch drifted",
+                        compiled_entry.class
+                    );
+                }
+                kinds_with_manifest_reports.insert(kind.to_owned());
+            }
+        }
+        // Every compiled report has a manifest home (feature-conditional on
+        // both sides, so the sets agree under any feature combination).
+        for report in whipplescript_kernel::agent_profile::AGENT_FEATURE_REPORTS {
+            assert!(
+                kinds_with_manifest_reports.contains(report.provider_kind),
+                "compiled report `{}` has no embedded manifest row",
+                report.provider_kind
+            );
+        }
+
+        // Profile table fold (slice 4's manifest home): std.agent `profiles`
+        // rows mirror the compiled preset table exactly.
+        let (_, agent_json) = whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.agent")
+            .expect("std.agent embedded");
+        let value: Value = serde_json::from_str(agent_json).expect("agent manifest json");
+        let profiles = value
+            .get("profiles")
+            .and_then(Value::as_array)
+            .expect("std.agent profiles");
+        assert_eq!(profiles.len(), AGENT_PROFILE_PRESETS.len());
+        for row in profiles {
+            let name = row.get("name").and_then(Value::as_str).expect("name");
+            let preset = agent_profile_preset(name)
+                .unwrap_or_else(|| panic!("manifest profile `{name}` is not a compiled preset"));
+            // Enforcement flows through the compiled preset leg; the manifest
+            // row is audit/visibility data so registered-policy seeding can
+            // never narrow (or widen) the preset expansion.
+            assert_eq!(
+                row.get("enforcement_mode").and_then(Value::as_str),
+                Some("audit"),
+                "profile `{name}` must be audit-mode data"
+            );
+            let config = row.get("config").expect("profile config");
+            assert_eq!(
+                config.get("canonical").and_then(Value::as_bool),
+                Some(preset.canonical)
+            );
+            assert_eq!(
+                config.get("codex_mapped").and_then(Value::as_bool),
+                Some(preset.codex_mapped)
+            );
+            let claude_tools: Option<Vec<&str>> = config
+                .get("claude_allowed_tools")
+                .and_then(Value::as_array)
+                .map(|tools| tools.iter().filter_map(Value::as_str).collect());
+            assert_eq!(
+                claude_tools,
+                preset.claude_allowed_tools.map(|tools| tools.to_vec()),
+                "profile `{name}` claude translation drifted"
+            );
+            let capabilities: Vec<&str> = config
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .map(|caps| caps.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                capabilities,
+                preset.capabilities.to_vec(),
+                "profile `{name}` capability list drifted"
+            );
+            let owned = config.get("owned_tools").expect("owned_tools");
+            let flag = |key: &str| owned.get(key).and_then(Value::as_bool).unwrap_or(false);
+            assert_eq!(
+                (
+                    flag("read_files"),
+                    flag("write_files"),
+                    flag("bash"),
+                    flag("tracker_file"),
+                    flag("tracker_claim"),
+                    flag("tracker_finish"),
+                    flag("tracker_release"),
+                    flag("workflow_invoke"),
+                ),
+                (
+                    preset.owned.read_files,
+                    preset.owned.write_files,
+                    preset.owned.bash,
+                    preset.owned.tracker_file,
+                    preset.owned.tracker_claim,
+                    preset.owned.tracker_finish,
+                    preset.owned.tracker_release,
+                    preset.owned.workflow_invoke,
+                ),
+                "profile `{name}` owned expansion drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_operator_provider_is_admission_inert_and_readable() {
+        // std-telemetry.md T3, machine-checkable Non-Goals: the package's
+        // `otlp` row is operator-plane — readable as a registry default,
+        // invisible to every admission-plane surface.
+        assert_eq!(
+            embedded_operator_provider_default("std.telemetry", "otlp", "endpoint").as_deref(),
+            Some("http://127.0.0.1:4318/v1/traces"),
+        );
+        assert_eq!(
+            embedded_operator_provider_default("std.telemetry", "otlp", "protocol").as_deref(),
+            Some("http/json"),
+        );
+        let (_, json) = whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.telemetry")
+            .expect("std.telemetry is embedded");
+        let value: Value = serde_json::from_str(json).expect("valid json");
+        let label = Path::new("<embedded:std.telemetry>");
+        // Registration writes no admission-plane row: zero effect providers,
+        // zero effect contracts, zero capabilities.
+        let providers = package_provider_contracts(label, &value).expect("effect-provider parse");
+        assert!(
+            providers.is_empty(),
+            "operator-plane rows must never become effect providers: {providers:?}"
+        );
+        let manifest = package_manifest_from_json(
+            &PathBuf::from("<embedded:std.telemetry>"),
+            (*json).to_owned(),
+        )
+        .expect("telemetry manifest validates");
+        assert!(manifest.registry.effect_contracts.is_empty());
+        // …while the operator surface sees exactly the one row.
+        let operator = package_operator_providers(label, &value).expect("operator parse");
+        assert_eq!(operator.len(), 1);
+        assert_eq!(operator[0].id, "otlp");
+        assert_eq!(operator[0].provider_kind, "otlp-exporter");
+    }
+
+    /// spec/std-coercion.md slice 4 gate: the std.coercion manifest's
+    /// capability/provider/binding rows must AGREE with migration 0001's
+    /// seeded `schema.coerce` rows — the manifest supersedes the seeds, so a
+    /// drift between them is a lie one side tells operators. Agreement is
+    /// semantic where the names differ historically: the seeded binding
+    /// provider `builtin-coerce` and the manifest default `fixture` must both
+    /// select the FIXTURE path through the same resolver predicate.
+    #[test]
+    fn coercion_manifest_agrees_with_migration_seeded_rows() {
+        let migration = include_str!("../../whipplescript-store/migrations/0001_runtime_store.sql");
+        let manifest: Value = serde_json::from_str(
+            whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+                .iter()
+                .find(|(name, _)| *name == "std.coercion")
+                .expect("std.coercion is embedded")
+                .1,
+        )
+        .expect("valid json");
+        // Capability row: both sides declare `schema.coerce`.
+        assert!(
+            migration.contains("('schema.coerce', 'Coerce unstructured data"),
+            "migration 0001 seeds the schema.coerce capability"
+        );
+        let capability_ids: Vec<&str> = manifest["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .filter_map(|capability| capability["id"].as_str())
+            .collect();
+        assert_eq!(capability_ids, ["schema.coerce"]);
+        // Provider row: the seed registers ONE schema.coerce effect provider;
+        // extract its provider name and require it to be the fixture path —
+        // the same path the manifest's default binding selects.
+        let seeded_provider_line = migration
+            .lines()
+            .find(|line| line.contains("'provider_coerce_builtin'"))
+            .expect("migration 0001 seeds the schema.coerce effect provider");
+        let seeded_provider = seeded_provider_line
+            .split(',')
+            .nth(2)
+            .expect("provider column")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == ' ');
+        assert!(
+            coerce_runtime::is_fixture_provider_name(seeded_provider),
+            "the seeded default provider `{seeded_provider}` must select the fixture path"
+        );
+        let provider_ids: Vec<&str> = manifest["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .filter_map(|provider| provider["id"].as_str())
+            .collect();
+        assert_eq!(provider_ids, ["fixture", "native"]);
+        for provider in manifest["providers"].as_array().expect("providers") {
+            assert_eq!(provider["provider_kind"], "schema_coercer");
+            assert_eq!(provider["capability"], "schema.coerce");
+        }
+        // Binding row: the seed binds schema.coerce globally to the fixture
+        // path; the manifest's default binding selects provider `fixture`.
+        let seeded_binding_line = migration
+            .lines()
+            .find(|line| line.contains("'binding_coerce_builtin'"))
+            .expect("migration 0001 seeds the schema.coerce binding");
+        let seeded_binding_provider = seeded_binding_line
+            .split(',')
+            .nth(3)
+            .expect("binding provider column")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == ')' || c == ' ');
+        assert!(
+            coerce_runtime::is_fixture_provider_name(seeded_binding_provider),
+            "the seeded binding provider `{seeded_binding_provider}` must select the fixture path"
+        );
+        let bindings = manifest["bindings"].as_array().expect("bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0]["capability"], "schema.coerce");
+        assert!(
+            coerce_runtime::is_fixture_provider_name(
+                bindings[0]["config"]["provider_id"]
+                    .as_str()
+                    .expect("default provider id")
+            ),
+            "the manifest default binding must select the fixture path"
+        );
+        // Profile row: both sides allow schema.coerce in a default profile.
+        assert!(
+            migration.contains(r#""schema.coerce""#),
+            "migration 0001 profiles allow schema.coerce"
+        );
+        let profiles = manifest["profiles"].as_array().expect("profiles");
+        assert!(profiles.iter().any(|profile| {
+            profile["allowed_capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "schema.coerce"))
+        }));
+    }
+
+    /// The std.coercion manifest's `schema.coerce` contract mirrors the
+    /// parser-compiled one, so merging both (a coerce-using program that
+    /// imports std.coercion) FOLDS into one contract — a shape drift between
+    /// manifest and parser would instead surface as `effect_contract_duplicate`.
+    #[test]
+    fn coercion_manifest_contract_folds_against_the_parser_compiled_one() {
+        let source = r#"use std.coercion
+
+@service
+workflow CoercionImport
+
+enum Verdict {
+  Yes
+  No
+}
+coerce judge(summary string) -> Verdict {
+  prompt """markdown
+  Decide: {{ summary }}
+  {{ ctx.output_format }}
+  """
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compiles");
+        let registry = contract_registry_for_ir(None, &ir).expect("registry resolves");
+        assert_eq!(registry.validate(), Vec::new());
+        let coerce_contracts: Vec<_> = registry
+            .effect_contracts
+            .iter()
+            .filter(|contract| contract.id == "schema.coerce")
+            .collect();
+        assert_eq!(
+            coerce_contracts.len(),
+            1,
+            "manifest and parser contracts must fold into one: {coerce_contracts:?}"
+        );
+        let contract = coerce_contracts[0];
+        assert_eq!(contract.effect_kind, "schema.coerce");
+        assert_eq!(contract.required_capabilities, ["schema.coerce"]);
+        assert_eq!(contract.provider_kinds, ["schema_coercer"]);
+        assert_eq!(
+            contract.source_forms,
+            ["coerce", "decide", "prompt"],
+            "source forms merge-unique across the two copies"
+        );
+    }
+
+    #[test]
+    fn operator_plane_provider_rows_are_shape_checked() {
+        // The two dishonest shapes the T3 validator amendment refuses: an
+        // operator row that ALSO claims a capability, and an unknown plane.
+        let with_capability = r#"{
+            "schema": "whipplescript.package_manifest.v0",
+            "package_id": "p", "name": "p", "version": "0.1.0",
+            "providers": [{"id": "x", "provider_kind": "k", "plane": "operator", "capability": "a.b"}]
+        }"#;
+        let error = package_manifest_from_json(Path::new("p.json"), with_capability.to_owned())
+            .expect_err("operator rows are capability-free by definition");
+        assert!(error.contains("capability-free"), "{error}");
+        let unknown_plane = r#"{
+            "schema": "whipplescript.package_manifest.v0",
+            "package_id": "p", "name": "p", "version": "0.1.0",
+            "providers": [{"id": "x", "provider_kind": "k", "plane": "orbital", "capability": "a.b"}]
+        }"#;
+        let error = package_manifest_from_json(Path::new("p.json"), unknown_plane.to_owned())
+            .expect_err("unknown plane values are refused");
+        assert!(error.contains("unknown plane"), "{error}");
     }
 
     #[test]
@@ -40517,7 +44823,7 @@ coerce review() -> Review {
         // (`embedded_std_construct_identities`) globs `std/manifests/*.json`
         // indiscriminately and treats every construct it finds as embedded-std
         // (door-privileged). The Rust authority instead reads only
-        // `EMBEDDED_STD_MANIFESTS`. If a construct-bearing manifest that is NOT
+        // `whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS`. If a construct-bearing manifest that is NOT
         // embedded ever lands under `std/manifests/`, Python would privilege it
         // (fail-open) while Rust would not — re-opening the gap the
         // grammar-only-manifests-live-in-std/grammars decision closed. This
@@ -40527,10 +44833,11 @@ coerce review() -> Review {
         let manifests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../std/manifests");
         let entries = std::fs::read_dir(&manifests_dir)
             .expect("std/manifests directory must exist and be readable");
-        let embedded_names: std::collections::HashSet<&str> = EMBEDDED_STD_MANIFESTS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
+        let embedded_names: std::collections::HashSet<&str> =
+            whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
         let mut checked = 0usize;
         for entry in entries {
             let path = entry.expect("std/manifests entry must be readable").path();
@@ -40562,7 +44869,7 @@ coerce review() -> Review {
             assert!(
                 embedded_names.contains(name),
                 "construct-bearing std manifest `{}` (name `{name}`) is under std/manifests/ but not in \
-                 EMBEDDED_STD_MANIFESTS; either embed it (and update the parser build.rs list + the \
+                 whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS; either embed it (and update the parser build.rs list + the \
                  Python door) or move it to std/grammars/ (grammar-only, build.rs-read, un-globbed by the door)",
                 path.display()
             );
@@ -41538,6 +45845,10 @@ workflow EmbeddedMemory
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Task {
   title string
 }
@@ -41672,6 +45983,203 @@ rule start
         assert_eq!(contract, &expected_contract);
     }
 
+    /// The embedded std.messaging manifest's `bindings[]` rows are the M2
+    /// load-bearing selection rows (spec/std-messaging.md "Manifest"): one per
+    /// v1 provider, each carrying that provider's capability report in the
+    /// binding config — mirroring the parser's compiled
+    /// `CHANNEL_PROVIDER_REPORTS` constants (reports are DATA in two mirrored
+    /// homes; this test is the drift gate between them).
+    #[test]
+    fn messaging_manifest_bindings_mirror_parser_capability_reports() {
+        let (_, json) = whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "std.messaging")
+            .expect("std.messaging embedded manifest");
+        let manifest: Value = serde_json::from_str(json).expect("valid json");
+        let bindings = manifest["bindings"].as_array().expect("bindings");
+        let reports = whipplescript_parser::CHANNEL_PROVIDER_REPORTS;
+        assert_eq!(
+            bindings.len(),
+            reports.len(),
+            "one binding row per v1 provider"
+        );
+        for report in reports {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding["provider"] == report.provider_id)
+                .unwrap_or_else(|| panic!("binding for provider `{}`", report.provider_id));
+            assert_eq!(binding["capability"], "messaging.send");
+            assert_eq!(
+                binding["program_id"],
+                Value::Null,
+                "v1 messaging bindings are global"
+            );
+            let manifest_report = &binding["config"]["report"];
+            assert_eq!(
+                manifest_report["direction"], report.direction,
+                "direction mirrors the parser report for `{}`",
+                report.short_name
+            );
+            assert_eq!(manifest_report["identity"], report.identity);
+            let interactions: Vec<&str> = manifest_report["interactions"]
+                .as_array()
+                .expect("interactions")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(interactions, report.interactions);
+            let receipts: Vec<&str> = manifest_report["delivery_receipts"]
+                .as_array()
+                .expect("delivery_receipts")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(receipts, report.delivery_receipts);
+        }
+        // Every binding's provider has a matching providers[] row (the
+        // manifest-consistency validator's cross-check), and the default
+        // profile allows messaging.send.
+        let provider_kinds: Vec<&str> = manifest["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .filter_map(|provider| provider["provider_kind"].as_str())
+            .collect();
+        for report in reports {
+            assert!(provider_kinds.contains(&report.provider_id));
+        }
+        let profiles = manifest["profiles"].as_array().expect("profiles");
+        assert!(profiles.iter().any(|profile| {
+            profile["allowed_capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "messaging.send"))
+        }));
+        // The contract's output schema is exactly the 8-field receipt.
+        let output_schema = manifest
+            .pointer("/libraries/0/effect_contracts/0/output_schema")
+            .and_then(Value::as_object)
+            .expect("output schema");
+        let fields: Vec<&str> = output_schema.keys().map(String::as_str).collect();
+        assert_eq!(
+            fields,
+            [
+                "accepted_at",
+                "channel",
+                "destination",
+                "message_id",
+                "provider",
+                "provider_message_id",
+                "status",
+                "thread_id",
+            ]
+        );
+    }
+
+    /// Channel→binding provider resolution (spec/std-messaging.md
+    /// "Channel→binding provider selection"): short names resolve to exactly
+    /// one bound provider id; unknown and ambiguous identifiers fail with the
+    /// bound set named; a missing provider field resolves as `fixture`.
+    #[test]
+    fn resolve_messaging_binding_selects_exactly_one_provider() {
+        let binding = |id: &str, provider: &str| whipplescript_store::CapabilityBindingView {
+            binding_id: id.to_owned(),
+            program_id: None,
+            capability: "messaging.send".to_owned(),
+            provider: Some(provider.to_owned()),
+            config_json: "{}".to_owned(),
+        };
+        let bindings = vec![
+            // A stray binding naming a provider no channel declares stays inert.
+            binding("stray", "builtin-messaging"),
+            binding("b-fixture", "fixture"),
+            binding("b-local", "std.messaging.local"),
+            binding("b-desktop", "std.messaging.desktop"),
+            binding("b-stdio", "std.messaging.stdio"),
+        ];
+        // Short names resolve to the qualified binding provider id.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("local")).as_deref(),
+            Ok("std.messaging.local")
+        );
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("desktop")).as_deref(),
+            Ok("std.messaging.desktop")
+        );
+        // Exact provider ids resolve as themselves.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("std.messaging.stdio")).as_deref(),
+            Ok("std.messaging.stdio")
+        );
+        assert_eq!(
+            resolve_messaging_binding(&bindings, Some("fixture")).as_deref(),
+            Ok("fixture")
+        );
+        // Pre-selection programs (no threaded provider) keep the fixture.
+        assert_eq!(
+            resolve_messaging_binding(&bindings, None).as_deref(),
+            Ok("fixture")
+        );
+        // Unknown identifiers fail, naming the bound set.
+        let unknown = resolve_messaging_binding(&bindings, Some("slack"))
+            .expect_err("unknown provider is a dispatch failure");
+        assert!(
+            unknown.contains("`slack`") && unknown.contains("std.messaging.local"),
+            "{unknown}"
+        );
+        // A short name matching BOTH a bare and a qualified binding is
+        // ambiguous (exactly-one rule).
+        let mut ambiguous = bindings.clone();
+        ambiguous.push(binding("b-local-bare", "local"));
+        let error = resolve_messaging_binding(&ambiguous, Some("local"))
+            .expect_err("two distinct matches are ambiguous");
+        assert!(error.contains("ambiguous"), "{error}");
+        // Duplicate rows naming the SAME provider id (program-scoped + global)
+        // are not ambiguous.
+        let mut duplicated = bindings.clone();
+        duplicated.push(binding("b-local-program", "std.messaging.local"));
+        assert_eq!(
+            resolve_messaging_binding(&duplicated, Some("local")).as_deref(),
+            Ok("std.messaging.local")
+        );
+    }
+
+    /// Desktop notifier command construction is PURE and platform-shaped
+    /// (spec/std-messaging.md slice 4): notify-send argument order, osascript
+    /// AppleScript embedding with quote-safe escaping.
+    #[test]
+    fn desktop_notify_command_builds_platform_invocations() {
+        let (program, args) = desktop_notify_command("notify-send", "Ops", "disk almost full");
+        assert_eq!(program, "notify-send");
+        assert_eq!(args, ["Ops", "disk almost full"]);
+
+        let (program, args) =
+            desktop_notify_command("/usr/bin/osascript", "Ops \"quoted\"", "body \\ slash");
+        assert_eq!(program, "/usr/bin/osascript");
+        assert_eq!(args[0], "-e");
+        assert_eq!(
+            args[1], r#"display notification "body \\ slash" with title "Ops \"quoted\"""#,
+            "arguments embed as JSON-escaped AppleScript string literals"
+        );
+
+        // A fake notifier override keeps the notify-send shape.
+        let (program, args) = desktop_notify_command("/tmp/fake-notifier.sh", "t", "b");
+        assert_eq!(program, "/tmp/fake-notifier.sh");
+        assert_eq!(args, ["t", "b"]);
+    }
+
+    /// Markdown strips to notification text (desktop report content ⊆ {text}).
+    #[test]
+    fn markdown_strips_to_plain_text() {
+        assert_eq!(
+            markdown_to_text("# Alert\n\n**disk** is `90%` _full_ — see [runbook](https://x.y/z)"),
+            "Alert\n\ndisk is 90% full — see runbook"
+        );
+        assert_eq!(markdown_to_text("> quoted *emphasis*"), "quoted emphasis");
+        // A bare `[` without a link tail survives.
+        assert_eq!(markdown_to_text("array[0] stays"), "array[0] stays");
+        assert_eq!(markdown_to_text(""), "");
+    }
+
     #[test]
     fn send_requires_std_messaging_import_and_validates_lock_free_with_it() {
         // `send` migrated from an ambient parser builtin to the embedded
@@ -41689,7 +46197,7 @@ class Trigger {{
 }}
 
 channel alerts {{
-  provider slack
+  provider fixture
   destination "#ops"
 }}
 
@@ -41911,6 +46419,10 @@ workflow PackageGraph
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Task {
   title string
 }
@@ -41935,6 +46447,10 @@ rule start
 workflow PackageGraph
 
 use std.memory
+
+memory pool project_memory {
+  context limit 8
+}
 
 class Task {
   title string
@@ -42953,7 +47469,7 @@ assert count(Item where status == "done") == 1
             artifact_model_search_check_report_entry("event-ingress.whip", &graph, &lowered);
         entry.as_object_mut().expect("report entry object").insert(
             "ir_hash".to_owned(),
-            Value::String("0000000000000000".to_owned()),
+            Value::String("00000000000000000000000000000000".to_owned()),
         );
         let report = Value::Array(vec![entry]);
 
@@ -46951,6 +51467,9 @@ assert count(Item where status == "done") == 1
         let effects = parse_effect_statements(
             "call memory.query for task as context",
             &RuleContext::default(),
+            &[],
+            &[],
+            &whipplescript_kernel::rule_lowering::empty_ir_program(),
         );
 
         assert_eq!(effects.len(), 1);
@@ -46967,6 +51486,9 @@ assert count(Item where status == "done") == 1
         let effects = parse_effect_statements(
             "recall project_memory for task as context",
             &RuleContext::default(),
+            &[],
+            &[],
+            &whipplescript_kernel::rule_lowering::empty_ir_program(),
         );
 
         assert_eq!(effects.len(), 1);
@@ -47006,7 +51528,13 @@ done task -> record Archived {
 }
 prompt "Summarize {{ ticket.title }}" as summary
 "#;
-        let effects = parse_effect_statements(body, &RuleContext::default());
+        let effects = parse_effect_statements(
+            body,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &whipplescript_kernel::rule_lowering::empty_ir_program(),
+        );
         assert_eq!(effects.len(), 1, "only the real prompt effect: {effects:?}");
         assert_eq!(effects[0].kind, "schema.coerce");
         assert_eq!(effects[0].name.as_deref(), Some("prompt"));
@@ -47019,7 +51547,6 @@ prompt "Summarize {{ ticket.title }}" as summary
 tell worker as turn "go"
 coerce classify(ticket.title) as review
 prompt "Summarize {{ ticket.title }}" using fixture as summary
-askHuman as answer choices ["yes", "no"] "approve?"
 decide "fixed?" -> { fixed bool } as verdict
 call memory.query for ticket as called
 recall project_memory for ticket.title as memories
@@ -47042,12 +51569,17 @@ import json Row from docs at "rows.json" as imported
 export json Row to docs at "rows.json" { mode create } as exported
 "#;
 
-        let effects = parse_effect_statements(body, &RuleContext::default());
+        let effects = parse_effect_statements(
+            body,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &whipplescript_kernel::rule_lowering::empty_ir_program(),
+        );
         let expected = [
             ("agent.tell", Some("turn")),
             ("schema.coerce", Some("review")),
             ("schema.coerce", Some("summary")),
-            ("human.ask", Some("answer")),
             ("schema.coerce", Some("verdict")),
             ("capability.call", Some("called")),
             ("capability.call", Some("memories")),
@@ -47221,6 +51753,7 @@ assert exists(Window where elapsed < limit)
             value_json: r#"{"elapsed":"bad-duration","limit":"PT1H"}"#.to_owned(),
             provenance_class: "external".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         }];
 
         let assertions = eval_assertions(&ir, &facts, &[], None, &AssertionTagFilter::default());
@@ -47253,7 +51786,7 @@ class Done {
 rule finish
   when Task as task where task.status == "queued"
 => {
-  consume task
+  done task
   record Done {
     status "done"
   }
@@ -47271,6 +51804,7 @@ rule finish
             value_json: r#"{"status":"queued"}"#.to_owned(),
             provenance_class: "rule".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         };
         let facts = vec![fact];
         let effects = Vec::new();
@@ -47281,6 +51815,7 @@ rule finish
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &ready.contexts[0],
@@ -47291,6 +51826,92 @@ rule finish
 
         assert_eq!(lowering.consumed_fact_ids, vec!["fact-task"]);
         assert_eq!(lowering.facts.len(), 1);
+    }
+
+    /// DR-0014 amendment (modeled in models/maude/effect-key.maude): the
+    /// `schema.coerce` admission key commits to the coercion name, declared
+    /// prompt template, synthesized output schema, and the host-supplied
+    /// config fingerprint — and ONLY schema.coerce keys see the fingerprint.
+    #[test]
+    fn schema_coerce_admission_key_commits_to_template_and_config_fingerprint() {
+        let source_template_a = r#"
+workflow CoerceKeyCommitments
+
+class Review {
+  accepted bool
+}
+
+output result Review
+
+coerce reviewArtifact() -> Review {
+  prompt """
+  Review the artifact.
+  """
+}
+
+agent scribe {
+  provider fixture
+  profile "issue-triager"
+  capacity 1
+}
+
+rule start
+  when started
+=> {
+  coerce reviewArtifact() as review
+  tell scribe as note """
+  Note the review.
+  """
+
+  after review succeeds as r {
+    complete result { accepted r.accepted }
+  }
+}
+"#;
+        let source_template_b =
+            source_template_a.replace("Review the artifact.", "Audit the artifact.");
+        let lower = |source: &str, fingerprint: &str| {
+            let ir = whipplescript_parser::compile_program(source)
+                .ir
+                .expect("compile");
+            let lowering = lower_rule(
+                "ins_test",
+                "ver_test",
+                "0",
+                fingerprint,
+                &ir,
+                &ir.rules[0],
+                &RuleContext::default(),
+                &[],
+                &[],
+                None,
+            );
+            let key_of = |kind: &str| {
+                lowering
+                    .effects
+                    .iter()
+                    .find(|effect| effect.kind == kind)
+                    .map(|effect| effect.idempotency_key.clone())
+                    .expect(kind)
+            };
+            (key_of("schema.coerce"), key_of("agent.tell"))
+        };
+
+        let (coerce_a1, tell_a1) = lower(source_template_a, "fixture");
+        let (coerce_a2, tell_a2) = lower(source_template_a, "fixture");
+        // Unchanged program + config dedups (same key both lowerings).
+        assert_eq!(coerce_a1, coerce_a2);
+        assert_eq!(tell_a1, tell_a2);
+
+        // A changed prompt template is a distinct coercion even under the SAME
+        // pinned program version literal (the prefix-replay hazard).
+        let (coerce_b, _) = lower(&source_template_b, "fixture");
+        assert_ne!(coerce_a1, coerce_b);
+
+        // A changed coercion config re-keys schema.coerce — and nothing else.
+        let (coerce_c, tell_c) = lower(source_template_a, "key_anthropic_sonnet");
+        assert_ne!(coerce_a1, coerce_c);
+        assert_eq!(tell_a1, tell_c);
     }
 
     #[test]
@@ -47336,6 +51957,7 @@ rule run
                 "ins_test",
                 version,
                 epoch,
+                "fixture",
                 &ir,
                 &ir.rules[0],
                 context,
@@ -47576,6 +52198,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -47624,6 +52247,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -47672,6 +52296,7 @@ rule start
             args: Vec::new(),
             prompt: Some("Summarize this.".to_owned()),
             prompt_content_type: Some("markdown".to_owned()),
+            prompt_template: Some("Summarize this.".to_owned()),
             required_capabilities: Vec::new(),
             after: None,
             timeout_seconds: None,
@@ -47684,6 +52309,8 @@ rule start
             &RuleContext::default(),
             &std::collections::BTreeMap::new(),
             &mut errors,
+            &[],
+            &[],
         );
 
         assert_eq!(errors, Vec::<String>::new());
@@ -47750,6 +52377,7 @@ rule start
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -47848,6 +52476,7 @@ workflow Child {
             "ins_test",
             "ver_test",
             "0",
+            "fixture",
             &ir,
             &ir.rules[0],
             &RuleContext::default(),
@@ -47875,48 +52504,6 @@ workflow Child {
                 .pointer("/operations/0/operation")
                 .and_then(Value::as_str),
             Some("invoke")
-        );
-    }
-
-    #[test]
-    fn lowering_preserves_human_prompt_content_type_metadata() {
-        let source = r#"
-workflow HumanPromptContentType
-
-rule start
-  when started
-=> {
-  askHuman """application/json
-  {
-    "question": "Approve this release?"
-  }
-  """
-}
-"#;
-        let ir = whipplescript_parser::compile_program(source)
-            .ir
-            .expect("compile");
-        let lowering = lower_rule(
-            "ins_test",
-            "ver_test",
-            "0",
-            &ir,
-            &ir.rules[0],
-            &RuleContext::default(),
-            &[],
-            &[],
-            None,
-        );
-
-        assert_eq!(lowering.effects.len(), 1);
-        let input = json_from_str(&lowering.effects[0].input_json);
-        assert_eq!(
-            input.get("prompt").and_then(Value::as_str),
-            Some("{\n    \"question\": \"Approve this release?\"\n  }")
-        );
-        assert_eq!(
-            input.get("prompt_content_type").and_then(Value::as_str),
-            Some("application/json")
         );
     }
 
@@ -47970,6 +52557,7 @@ rule claim_ready
                 .to_owned(),
             provenance_class: "queue".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         };
         let other_queue = FactView {
             fact_id: "fact-other-item".to_owned(),
@@ -47980,6 +52568,7 @@ rule claim_ready
             value_json: r#"{"queue":"other","id":"WS-2","title":"Other","body":""}"#.to_owned(),
             provenance_class: "queue".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         };
         let facts = vec![fact, other_queue];
         let effects = Vec::new();
@@ -48039,10 +52628,10 @@ case classification {
         let body = r#"
 case classification {
   Completed as result where result.summary => {
-    askHuman "should not commit"
+    tell worker "should not commit"
   }
   Failed as failure => {
-    askHuman "failed sibling"
+    tell worker "failed sibling"
   }
 }
 "#;
@@ -48062,7 +52651,7 @@ case classification {
 
         let (selected, _selected_context, reports) = selected_rule_body(body, &context);
 
-        assert!(!selected.contains("askHuman"));
+        assert!(selected.is_empty() || !selected.contains("tell worker \"should not commit\""));
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].status, BranchStatus::Error);
         assert!(reports[0]
@@ -48636,6 +53225,7 @@ rule go
             root: ".".to_owned(),
             read_globs: vec!["src/**".to_owned()],
             write_globs: vec!["src/**".to_owned()],
+            provider: None,
         });
 
         let (_principal, authority_json) = authority_for_ir(&ir);
@@ -49010,6 +53600,8 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit invoke effect");
 
@@ -49030,7 +53622,7 @@ workflow Child {
             package_lock_path: None,
             outcome: FixtureOutcome::Completed,
             variant: None,
-            program_path: Some(program_path.clone()),
+            program_path: Some(program_path.to_path_buf()),
             root: Some("Parent".to_owned()),
             provider_config_paths: Vec::new(),
             max_child_iterations: 0,
@@ -49038,6 +53630,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
@@ -49150,6 +53743,8 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit invoke effect");
 
@@ -49170,7 +53765,7 @@ workflow Child {
             package_lock_path: None,
             outcome: FixtureOutcome::Completed,
             variant: None,
-            program_path: Some(program_path.clone()),
+            program_path: Some(program_path.to_path_buf()),
             root: Some("Parent".to_owned()),
             provider_config_paths: Vec::new(),
             max_child_iterations: 0,
@@ -49178,6 +53773,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
@@ -49319,6 +53915,8 @@ workflow Child {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit invoke effect");
 
@@ -49339,7 +53937,7 @@ workflow Child {
             package_lock_path: None,
             outcome: FixtureOutcome::Completed,
             variant: None,
-            program_path: Some(program_path.clone()),
+            program_path: Some(program_path.to_path_buf()),
             root: Some("Parent".to_owned()),
             provider_config_paths: Vec::new(),
             max_child_iterations: 0,
@@ -49347,6 +53945,7 @@ workflow Child {
             coerce_outputs: BTreeMap::new(),
             virtual_now: None,
             work_unit_root: None,
+            side_stores: None,
         };
 
         let _terminal =
@@ -49387,15 +53986,57 @@ workflow Child {
         assert_eq!(coordination_owner_from_principal(""), None);
     }
 
-    fn unique_test_path(label: &str, ext: &str) -> PathBuf {
+    /// A unique temp path whose containing directory is removed when the
+    /// binding drops, panic included.
+    ///
+    /// The directory is the unit rather than the file: a `.sqlite` path handed
+    /// to the store grows `-shm`/`-wal` sidecars, which owning only the file
+    /// would leave behind. `Deref`/`AsRef` keep the 25 call sites unchanged.
+    /// Bind it — never use it inline, which would drop the directory at the
+    /// end of the statement.
+    struct TempPath {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for TempPath {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TempPath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for TempPath {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn unique_test_path(label: &str, ext: &str) -> TempPath {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        env::temp_dir().join(format!(
-            "whipplescript-{label}-{}-{stamp}.{ext}",
+        let dir = env::temp_dir().join(format!(
+            "whipplescript-{label}-{}-{stamp}",
             std::process::id()
-        ))
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique test dir");
+        let path = dir.join(format!("subject.{ext}"));
+        TempPath { dir, path }
     }
 
     #[test]
@@ -49869,6 +54510,8 @@ rule go
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit exec effects");
 
@@ -49979,6 +54622,13 @@ rule go
         let envelope_path = unique_test_path("e2-dyn-envelope", "json");
 
         let mut store = SqliteStore::open(&store_path).expect("store");
+        // Production order: `register_locked_packages` seeds the embedded
+        // std.ingress capability/provider/binding rows at store init, so the
+        // now-real `signal.emit` admission gate (std.ingress I2b) lets the
+        // effect start and the E2-DYN refusal under test is the run outcome.
+        store
+            .register_package_manifest(include_str!("../vendored-std/manifests/ingress.json"))
+            .expect("std.ingress manifest registers");
         let sender =
             create_runtime_identity_instance(&mut store, "Sender", "workflow:local/Sender");
         let target =
@@ -50014,6 +54664,8 @@ rule go
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-notify"),
+                marks: &[],
+                context_json: None,
             })
             .expect("queued notify effect");
 
@@ -50227,13 +54879,13 @@ rule classify
         let (_maude, expected) =
             generate_maude_model_search(source, &ir, Path::new("/tmp/kernel.maude"));
 
-        assert_eq!(expected.len(), 18);
+        assert_eq!(expected.len(), 15);
         assert_eq!(
             expected
                 .iter()
                 .filter(|result| result.outcome == ExpectedSearchResult::Solution)
                 .count(),
-            6
+            5
         );
         assert_eq!(
             expected
@@ -50247,7 +54899,7 @@ rule classify
                 .iter()
                 .filter(|result| result.predicate == "fails")
                 .count(),
-            6
+            3
         );
         assert_eq!(
             expected
@@ -51021,6 +55673,10 @@ rule finish_batch
         assert_eq!(dev.stream, Some(DevStreamFormat::Ndjson));
     }
 
+    // Feature-gated: validates codex/claude provider-config rows against the
+    // registered capability catalog, which only carries those rows when the
+    // adapter features are compiled in (std.agent slice 7 build matrix).
+    #[cfg(all(feature = "codex", feature = "claude"))]
     #[test]
     fn doctor_provider_config_validation_redacts_extra_values() {
         let results = validate_doctor_provider_config_json(
@@ -51035,11 +55691,11 @@ rule finish_batch
                   "api_key": "sk-should-not-appear"
                 },
                 {
-                  "provider_id": "pi-main",
-                  "provider_kind": "pi",
-                  "surface": "pi_rpc",
-                  "credentials_ref": "secret:pi",
-                  "cancellation_depth": "native_stop"
+                  "provider_id": "reviewer",
+                  "provider_kind": "claude",
+                  "surface": "claude_agent_sdk",
+                  "credentials_ref": "secret:claude",
+                  "cancellation_depth": "cooperative_request"
                 }
               ]
             }"#,
@@ -51050,10 +55706,12 @@ rule finish_batch
                 && result.provider == "codex-main"
                 && result.code == "surface_supported"
         }));
+        // DR-0017: Claude advertises no validated cancellation depth, so a
+        // binding claiming cooperative_request is refused, not rubber-stamped.
         assert!(results.iter().any(|result| {
-            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Pass
-                && result.provider == "pi-main"
-                && result.code == "cancellation_supported"
+            result.status == whipplescript_kernel::provider::ProviderValidationStatus::Fail
+                && result.provider == "reviewer"
+                && result.code == "unsupported_cancellation_depth"
         }));
         assert!(!json!(results
             .iter()
@@ -51099,10 +55757,10 @@ rule finish_batch
                 json!({
                     "run_id": "run-1",
                     "effect_id": "tell",
-                    "provider": "pi-main",
+                    "provider": "codex-main",
                     "status": "streamed",
                     "terminal": false,
-                    "provider_event_type": "message_end",
+                    "provider_event_type": "item/completed",
                     "provider_payload_shape": {"type":"object","keys":2},
                     "evidence_id": "evd_stream",
                 }),
@@ -51113,10 +55771,10 @@ rule finish_batch
                 json!({
                     "run_id": "run-1",
                     "effect_id": "tell",
-                    "provider": "pi-main",
+                    "provider": "codex-main",
                     "status": "cancelled",
                     "terminal": true,
-                    "provider_event_type": "turn_end",
+                    "provider_event_type": "turn/completed",
                     "provider_payload_shape": {"type":"object","keys":3},
                     "evidence_id": "evd_cancel",
                 }),
@@ -51129,7 +55787,7 @@ rule finish_batch
             lifecycle
                 .pointer("/1/provider_event_type")
                 .and_then(Value::as_str),
-            Some("turn_end")
+            Some("turn/completed")
         );
         assert!(lifecycle.to_string().contains("evd_cancel"));
         assert!(!lifecycle.to_string().contains("provider_payload_shape"));
@@ -51137,16 +55795,16 @@ rule finish_batch
         let run = RunView {
             run_id: "run-1".to_owned(),
             effect_id: "tell".to_owned(),
-            provider: "pi-main".to_owned(),
+            provider: "codex-main".to_owned(),
             worker_id: "worker-1".to_owned(),
             status: "running".to_owned(),
             started_at: "2026-01-01T00:00:00Z".to_owned(),
             completed_at: None,
             metadata_json: json!({
                 "native_provider": {
-                    "provider_id": "pi-main",
-                    "provider_kind": "pi",
-                    "surface": "pi_rpc"
+                    "provider_id": "codex-main",
+                    "provider_kind": "codex",
+                    "surface": "codex_app_server"
                 }
             })
             .to_string(),
@@ -51169,7 +55827,7 @@ rule finish_batch
             run_json
                 .pointer("/provider_selection/surface")
                 .and_then(Value::as_str),
-            Some("pi_rpc")
+            Some("codex_app_server")
         );
     }
 
@@ -51179,12 +55837,6 @@ rule finish_batch
             provider_cancellation_policy("codex-main"),
             ProviderCancellationPolicy::NativeStop {
                 acknowledgement_order: CancellationAcknowledgementOrder::BeforeTerminal,
-            }
-        );
-        assert_eq!(
-            provider_cancellation_policy("pi-main"),
-            ProviderCancellationPolicy::NativeStop {
-                acknowledgement_order: CancellationAcknowledgementOrder::AfterTerminalAllowed,
             }
         );
         assert_eq!(
@@ -51316,6 +55968,9 @@ rule finish_batch
         );
     }
 
+    // Feature-gated: binds a `codex` harness surface, which needs the codex
+    // capability row (std.agent slice 7 build matrix).
+    #[cfg(feature = "codex")]
     #[test]
     fn agent_provider_selection_uses_provider_config_for_harness_surface() {
         let config_path = std::env::temp_dir().join(format!(
@@ -51375,8 +56030,8 @@ rule finish_batch
             .provider_config
             .as_ref()
             .expect("provider config selected");
-        assert_eq!(config.provider_kind, ProviderKind::Codex);
-        assert_eq!(config.surface, AdapterSurface::CodexAppServer);
+        assert_eq!(config.provider_kind, "codex".to_owned());
+        assert_eq!(config.surface, "codex_app_server".to_owned());
         assert_eq!(config.workspace_policy, "read_only");
         assert_eq!(
             config.credentials_ref.as_deref(),
@@ -51487,7 +56142,7 @@ rule finish_batch
             .provider_config
             .as_ref()
             .expect("provider config selected");
-        assert_eq!(config.provider_kind, ProviderKind::Command);
+        assert_eq!(config.provider_kind, "command".to_owned());
         assert_eq!(config.timeout_ms, Some(2500));
         let _ = fs::remove_file(config_path);
     }
@@ -51583,6 +56238,10 @@ rule finish_batch
         );
     }
 
+    // Feature-gated: the codex/claude native-turn request builders exist only
+    // when their adapter features are compiled in (spec/std-agent.md slice 7
+    // build matrix: the features-off test target must also compile).
+    #[cfg(all(feature = "codex", feature = "claude"))]
     #[test]
     fn native_turn_request_applies_provider_config_fields() {
         let config_json = json!({
@@ -51726,52 +56385,6 @@ rule finish_batch
                 .get("settings")
                 .and_then(Value::as_str),
             Some("project")
-        );
-
-        let pi_config_json = json!({
-            "provider_id": "pi-main",
-            "provider_kind": "pi",
-            "surface": "pi_rpc",
-            "credentials_ref": "env:PI_API_KEY",
-            "default_model": "pi-model",
-            "workspace_policy": "shared",
-            "cancellation_depth": "native_stop",
-            "artifact_policy": "required",
-            "model_provider": "openai-compatible"
-        });
-        let pi_config =
-            ProviderBindingConfig::from_value(&pi_config_json).expect("pi config parses");
-        let pi_request = pi_native_turn_request(
-            AgentTurnExecution {
-                provider: "pi-main",
-                agent: "planner",
-                profile: None,
-                ..execution
-            },
-            &effect,
-            r#"{"prompt":"plan"}"#,
-            Some(&pi_config),
-        )
-        .expect("pi request builds");
-
-        assert_eq!(pi_request.provider_id, "pi-main");
-        assert_eq!(pi_request.workspace_policy, "shared");
-        assert_eq!(pi_request.cancellation_depth, CancellationDepth::NativeStop);
-        assert_eq!(pi_request.artifact_policy, "required");
-        assert_eq!(pi_request.credential_ref.as_deref(), Some("env:PI_API_KEY"));
-        assert_eq!(
-            pi_request
-                .provider_options
-                .get("model")
-                .and_then(Value::as_str),
-            Some("pi-model")
-        );
-        assert_eq!(
-            pi_request
-                .provider_options
-                .get("provider")
-                .and_then(Value::as_str),
-            Some("openai-compatible")
         );
     }
 

@@ -2,9 +2,6 @@
 
 use serde_json::{json, Value};
 
-#[cfg(feature = "claude")]
-use crate::claude_agent_sdk::ClaudeSidecarEvent;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentTurnLifecycleKind {
     Started,
@@ -102,7 +99,12 @@ impl NativeAgentTurnObservation {
         }
     }
 
-    fn new(kind: AgentTurnLifecycleKind, provider_event_type: impl Into<String>) -> Self {
+    // These builders are `pub` because provider *adapters* — now in their own
+    // crates (whipplescript-provider-codex / -claude, DR-0024 split) — assemble
+    // observations from raw provider events via `normalize_*` functions they own.
+    // The shape-only redaction (`payload_shape` → `json_shape`) stays kernel-side
+    // so every provider inherits the same egress boundary.
+    pub fn new(kind: AgentTurnLifecycleKind, provider_event_type: impl Into<String>) -> Self {
         Self {
             kind,
             provider_event_type: provider_event_type.into(),
@@ -114,184 +116,34 @@ impl NativeAgentTurnObservation {
         }
     }
 
-    fn provider_error(mut self, provider_error: Option<String>) -> Self {
+    pub fn provider_error(mut self, provider_error: Option<String>) -> Self {
         self.provider_error = provider_error;
         self
     }
 
-    fn session_id(mut self, session_id: Option<String>) -> Self {
+    pub fn session_id(mut self, session_id: Option<String>) -> Self {
         self.provider_session_id = session_id;
         self
     }
 
-    fn turn_id(mut self, turn_id: Option<String>) -> Self {
+    pub fn turn_id(mut self, turn_id: Option<String>) -> Self {
         self.provider_turn_id = turn_id;
         self
     }
 
-    fn payload_shape(mut self, payload: &Value) -> Self {
+    pub fn payload_shape(mut self, payload: &Value) -> Self {
         self.provider_payload_shape = json_shape(payload);
         self
     }
 }
 
-#[cfg(feature = "codex")]
-pub fn normalize_codex_app_server_event(message: &Value) -> Option<NativeAgentTurnObservation> {
-    let method = message.get("method").and_then(Value::as_str)?;
-    let params = message.get("params").unwrap_or(&Value::Null);
-    let kind = match method {
-        "turn/started" => AgentTurnLifecycleKind::Started,
-        "turn/completed" => codex_terminal_kind(params),
-        "turn/diff/updated" | "item/fileChange/patchUpdated" => {
-            AgentTurnLifecycleKind::ArtifactCaptured
-        }
-        "item/tool/call" | "item/tool/requestUserInput" => AgentTurnLifecycleKind::ToolRequested,
-        "item/started" | "item/completed" => AgentTurnLifecycleKind::Streamed,
-        method if method.contains("/requestApproval") => AgentTurnLifecycleKind::ToolRequested,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, method)
-            .session_id(
-                params
-                    .get("threadId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(
-                params
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .payload_shape(params)
-            .provider_error(codex_terminal_error(params)),
-    )
-}
-
-/// The Codex app-server reports a terminal failure reason under
-/// `params.turn.error.message` (with `codexErrorInfo` as a machine code). This is
-/// a control-plane error string, not model output.
-#[cfg(feature = "codex")]
-fn codex_terminal_error(params: &Value) -> Option<String> {
-    params
-        .pointer("/turn/error/message")
-        .or_else(|| params.pointer("/error/message"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-#[cfg(feature = "codex")]
-fn codex_terminal_kind(params: &Value) -> AgentTurnLifecycleKind {
-    match params
-        .get("status")
-        .or_else(|| params.pointer("/turn/status"))
-        .or_else(|| params.get("reason"))
-        .and_then(Value::as_str)
-    {
-        Some("cancelled" | "interrupted" | "canceled") => AgentTurnLifecycleKind::Cancelled,
-        Some("failed" | "error") => AgentTurnLifecycleKind::Failed,
-        Some("timed_out" | "timeout") => AgentTurnLifecycleKind::TimedOut,
-        _ => AgentTurnLifecycleKind::Completed,
-    }
-}
-
-#[cfg(feature = "claude")]
-pub fn normalize_claude_agent_sdk_event(
-    event: &ClaudeSidecarEvent,
-) -> Option<NativeAgentTurnObservation> {
-    let kind = match event.event_type.as_str() {
-        "claude.session.started" => AgentTurnLifecycleKind::Started,
-        "claude.stream.message" => AgentTurnLifecycleKind::Streamed,
-        "claude.tool.requested" | "claude.hook.event" => AgentTurnLifecycleKind::ToolRequested,
-        "claude.artifact.captured" => AgentTurnLifecycleKind::ArtifactCaptured,
-        "claude.turn.completed" => AgentTurnLifecycleKind::Completed,
-        "claude.turn.failed" => AgentTurnLifecycleKind::Failed,
-        "claude.turn.cancelled" => AgentTurnLifecycleKind::Cancelled,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, &event.event_type)
-            .session_id(
-                event
-                    .payload
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(Some(event.run_id.clone()))
-            .payload_shape(&event.payload)
-            .provider_error(
-                event
-                    .payload
-                    .pointer("/error/message")
-                    .or_else(|| event.payload.get("error").filter(|e| e.is_string()))
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("message")
-                            .filter(|_| event.event_type == "claude.turn.failed")
-                    })
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            ),
-    )
-}
-
-pub fn normalize_pi_rpc_event(message: &Value) -> Option<NativeAgentTurnObservation> {
-    let event_type = message.get("type").and_then(Value::as_str)?;
-    let kind = match event_type {
-        "turn_start" => AgentTurnLifecycleKind::Started,
-        "message_start" | "message_end" => AgentTurnLifecycleKind::Streamed,
-        "tool_call" | "tool_result" => AgentTurnLifecycleKind::ToolRequested,
-        "artifact" | "artifact_captured" => AgentTurnLifecycleKind::ArtifactCaptured,
-        "turn_end" => pi_terminal_kind(message),
-        "agent_start" | "agent_end" => AgentTurnLifecycleKind::Streamed,
-        _ => return None,
-    };
-    Some(
-        NativeAgentTurnObservation::new(kind, event_type)
-            .session_id(
-                message
-                    .get("sessionId")
-                    .or_else(|| message.pointer("/message/sessionId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .turn_id(
-                message
-                    .get("turnId")
-                    .or_else(|| message.pointer("/message/turnId"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            )
-            .payload_shape(message)
-            .provider_error(pi_terminal_error(message)),
-    )
-}
-
-/// Pi reports a terminal failure reason under `/message/errorMessage`.
-fn pi_terminal_error(message: &Value) -> Option<String> {
-    message
-        .pointer("/message/errorMessage")
-        .or_else(|| message.get("errorMessage"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn pi_terminal_kind(message: &Value) -> AgentTurnLifecycleKind {
-    match message
-        .pointer("/message/stopReason")
-        .or_else(|| message.get("stopReason"))
-        .and_then(Value::as_str)
-    {
-        Some("aborted" | "cancelled" | "canceled") => AgentTurnLifecycleKind::Cancelled,
-        Some("error" | "failed") => AgentTurnLifecycleKind::Failed,
-        Some("timeout" | "timed_out") => AgentTurnLifecycleKind::TimedOut,
-        _ if message.pointer("/message/errorMessage").is_some() => AgentTurnLifecycleKind::Failed,
-        _ => AgentTurnLifecycleKind::Completed,
-    }
-}
+// Provider event normalizers moved to their provider crates (DR-0024 split):
+// `normalize_codex_app_server_event` (+ `codex_terminal_*`) to
+// whipplescript-provider-codex, and `normalize_claude_agent_sdk_event` (+
+// `ClaudeSidecarEvent`) to whipplescript-provider-claude. Event-shape knowledge
+// belongs with the adapter that speaks the protocol; the kernel keeps only the
+// provider-agnostic `AgentTurnLifecycleKind` / `NativeAgentTurnObservation`
+// vocabulary and its shape-only redaction boundary (`payload_shape`).
 
 fn json_shape(value: &Value) -> Value {
     match value {
@@ -304,113 +156,6 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_codex_started_diff_tool_and_cancelled_terminal() {
-        let started = normalize_codex_app_server_event(&json!({
-            "method": "turn/started",
-            "params": {"threadId": "thread-1", "turnId": "turn-1"},
-        }))
-        .expect("started normalizes");
-        assert_eq!(started.kind, AgentTurnLifecycleKind::Started);
-        assert_eq!(started.provider_session_id.as_deref(), Some("thread-1"));
-        assert_eq!(started.provider_turn_id.as_deref(), Some("turn-1"));
-
-        let diff = normalize_codex_app_server_event(&json!({
-            "method": "turn/diff/updated",
-            "params": {"diff": "secret diff"},
-        }))
-        .expect("diff normalizes");
-        assert_eq!(diff.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert!(!diff
-            .provider_payload_shape
-            .to_string()
-            .contains("secret diff"));
-
-        let tool = normalize_codex_app_server_event(&json!({
-            "method": "item/commandExecution/requestApproval",
-            "params": {"command": "cat secret.txt"},
-        }))
-        .expect("tool normalizes");
-        assert_eq!(tool.kind, AgentTurnLifecycleKind::ToolRequested);
-
-        let terminal = normalize_codex_app_server_event(&json!({
-            "method": "turn/completed",
-            "params": {"status": "interrupted"},
-        }))
-        .expect("terminal normalizes");
-        assert_eq!(terminal.kind, AgentTurnLifecycleKind::Cancelled);
-        assert!(terminal.terminal);
-    }
-
-    #[test]
-    fn normalizes_claude_terminal_events() {
-        let event = ClaudeSidecarEvent {
-            event_type: "claude.turn.failed".to_owned(),
-            run_id: "run-1".to_owned(),
-            payload: json!({"session_id": "session-1", "error": "secret"}),
-        };
-
-        let observation = normalize_claude_agent_sdk_event(&event).expect("event normalizes");
-
-        assert_eq!(observation.kind, AgentTurnLifecycleKind::Failed);
-        assert_eq!(
-            observation.provider_session_id.as_deref(),
-            Some("session-1")
-        );
-        assert_eq!(observation.provider_turn_id.as_deref(), Some("run-1"));
-        assert!(!observation
-            .provider_payload_shape
-            .to_string()
-            .contains("secret"));
-    }
-
-    #[test]
-    fn normalizes_claude_and_pi_artifact_events() {
-        let claude = normalize_claude_agent_sdk_event(&ClaudeSidecarEvent {
-            event_type: "claude.artifact.captured".to_owned(),
-            run_id: "run-1".to_owned(),
-            payload: json!({"session_id": "session-1", "content": "secret"}),
-        })
-        .expect("claude artifact normalizes");
-        assert_eq!(claude.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert!(!claude.provider_payload_shape.to_string().contains("secret"));
-
-        let pi = normalize_pi_rpc_event(&json!({
-            "type": "artifact",
-            "message": {
-                "sessionId": "session-1",
-                "turnId": "turn-1",
-                "content": "secret",
-            },
-        }))
-        .expect("pi artifact normalizes");
-        assert_eq!(pi.kind, AgentTurnLifecycleKind::ArtifactCaptured);
-        assert_eq!(pi.provider_session_id.as_deref(), Some("session-1"));
-        assert_eq!(pi.provider_turn_id.as_deref(), Some("turn-1"));
-        assert!(!pi.provider_payload_shape.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn normalizes_pi_aborted_turn_end() {
-        let observation = normalize_pi_rpc_event(&json!({
-            "type": "turn_end",
-            "message": {
-                "role": "assistant",
-                "stopReason": "aborted",
-                "content": [{"type": "text", "text": "secret"}],
-            },
-        }))
-        .expect("event normalizes");
-
-        assert_eq!(observation.kind, AgentTurnLifecycleKind::Cancelled);
-        assert!(observation.terminal);
-        assert!(!observation
-            .provider_payload_shape
-            .to_string()
-            .contains("secret"));
-    }
-}
+// The codex/claude normalizer tests live with their crates now (DR-0024). The
+// provider-agnostic kernel record path is covered by
+// `native_provider_lifecycle_observation_records_event_and_fact` in lib.rs.

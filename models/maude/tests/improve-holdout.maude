@@ -1,0 +1,51 @@
+load ../improve-holdout.maude
+
+--- The corruption pattern throughout: sealed reflection material reaching
+--- the proposer, so search pressure tunes the candidate to the very
+--- scenarios meant to catch the gaming at promotion gates.
+
+--- Bite: under the sound reflection pass a sealed scenario's contents
+--- never reach the proposer, however much the proposer wants them.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  reflect wants(s1) sealed(s1, z) wants(s2) openSc(s2)
+  =>* readByProposer(s1) RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive reflection pass leaks the seal.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  naiveReflect wants(s1) sealed(s1, z)
+  =>* readByProposer(s1) RESIDUAL:Cfg .
+
+--- Coverage: open scenarios are legitimate reflection material.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  reflect wants(s1) sealed(s1, z) wants(s2) openSc(s2)
+  =>* readByProposer(s2) RESIDUAL:Cfg .
+
+--- Bite: under a campaign-attached redacted view NOTHING reaches the
+--- proposer -- open scenarios included, not just sealed ones.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  redactedReflect wants(s1) sealed(s1, z) wants(s2) openSc(s2)
+  =>* readByProposer(S:Sid) RESIDUAL:Cfg .
+
+--- Coverage: kmax promotion gates wear a sealed scenario out; it retires
+--- and holdout duty is refreshed from a recent ambient run.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  gate gate gate sealed(s1, z) ambient(s2)
+  =>* retired(s1) sealed(s2, z) RESIDUAL:Cfg .
+
+--- Bite: wear beyond kmax is impossible -- no fourth gate ever scores a
+--- scenario that already wore out.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  gate gate gate gate sealed(s1, z) ambient(s2)
+  =>* sealed(S:Sid, s(s(s(s(z))))) RESIDUAL:Cfg .
+
+--- Coverage: an anchor ask spends the seal honestly -- the scenario is
+--- labeled and retired in the same act.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  anchor sealed(s1, z)
+  =>* labeled(s1) retired(s1) RESIDUAL:Cfg .
+
+--- Coverage: progressive rigor -- below the sealing floor the promotion
+--- gate still passes, carrying the unheld-out tag instead of blocking.
+search [1] in WHIPPLESCRIPT-IMPROVE-HOLDOUT :
+  gate noSealed
+  =>* gated unheldOut RESIDUAL:Cfg .

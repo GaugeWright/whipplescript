@@ -1,0 +1,69 @@
+--- Workstream tier invariants, per spec/versioned-workspace-research-note.md
+--- 7.2 and the untie-substrate readiness tracker Phase 0: the two invariants
+--- discharged in un-tie's workstream.qnt -- membership-gates-autosync and
+--- archive-rehomes-members -- restated over this substrate, plus the note's
+--- two refinements: auto-admit requires a CERTIFICATE, not merely a clean
+--- merge, and membership is single-valued -- a branch homes to exactly one
+--- parent line, so joining a second stream leaves the first.
+---
+--- A workstream owns a named shared line, sline(S); mainline is the
+--- distinguished line main. homed(B, L) is the membership fact: branch B
+--- syncs into line L. A push is a contribution seeking greedy in-stream
+--- admission; it lands only when the target line is the branch's OWN home,
+--- the stream is still active, and the merge carries a certificate.
+--- Archiving a stream re-homes every member to mainline with a rebase-down
+--- pass; no branch is left syncing into a dead line.
+mod WHIPPLESCRIPT-WORKSTREAM is
+  protecting BOOL .
+
+  sorts Branch Stream Line Status Cert Cfg .
+
+  ops b1 b2 : -> Branch [ctor] .
+  ops s1 s2 : -> Stream [ctor] .
+  op main : -> Line [ctor] .           --- the mainline
+  op sline : Stream -> Line [ctor] .   --- the stream's shared line
+  ops active archived : -> Status [ctor] .
+  ops cert nocert : -> Cert [ctor] .   --- the merge certificate verdict
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op stream : Stream Status -> Cfg [ctor] .   --- stream lifecycle state
+  op homed : Branch Line -> Cfg [ctor] .      --- the membership fact
+  op push : Branch Line Cert -> Cfg [ctor] .  --- a contribution seeking admission
+  op admitted : Branch Line -> Cfg [ctor] .   --- the contribution landed
+  op join : Branch Stream -> Cfg [ctor] .     --- a join request
+  op archive : Stream -> Cfg [ctor] .         --- an archive command
+  op rebased : Branch -> Cfg [ctor] .         --- the rebase-down pass ran
+
+  var B : Branch .
+  var S : Stream .
+  var L : Line .
+
+  --- Greedy in-stream auto-admit: the target must be the pushing branch's
+  --- own home line, the stream must be active, and the contribution must
+  --- carry a certificate. Membership gates autosync by construction --
+  --- there is no admission rule that does not consume the homed fact.
+  rl [auto-admit] :
+      push(B, sline(S), cert) homed(B, sline(S)) stream(S, active)
+      => admitted(B, sline(S)) homed(B, sline(S)) stream(S, active) .
+
+  --- Membership is single-valued: joining a stream REWRITES the branch's
+  --- home; the old home is given up in the same step, so the sync topology
+  --- stays a tree.
+  rl [join] :
+      join(B, S) homed(B, L) stream(S, active)
+      => homed(B, sline(S)) stream(S, active) .
+
+  --- Archiving closes the line to new admissions immediately.
+  rl [archive-start] :
+      archive(S) stream(S, active)
+      => stream(S, archived) .
+
+  --- Archive re-homes members to mainline with a rebase-down pass; the
+  --- rule fires for every member, so no normal form leaves a branch homed
+  --- to a dead line.
+  rl [archive-rehome] :
+      stream(S, archived) homed(B, sline(S))
+      => stream(S, archived) homed(B, main) rebased(B) .
+endm

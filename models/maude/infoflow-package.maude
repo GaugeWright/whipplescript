@@ -1,0 +1,63 @@
+--- Cross-package information-flow governance (DR-0027/0028, Wave 3; the X1-X8
+--- obligations). A package that exports a @tool workflow must carry an IFC surface
+--- in its contract: every resource/effect/egress it can perform (X1), the crossings
+--- it requires (X3), bound to consumer-supplied resources (X4). For governance to
+--- compose across the package boundary the check is TWO-SIDED:
+---
+---   producer: runs the IFC check on the package internals, proving its lowered
+---             effects stay within the DECLARED surface and it performs no
+---             undeclared crossing; the contract then ATTESTS the IFC surface (X5).
+---   consumer: binds the surface to governed resources and checks the declared
+---             surface FITS the consumer envelope -- surface refines envelope, the
+---             inline-refines-envelope check (I-IFC4) lifted to packages (X8).
+---
+--- The soundness property: a cross-package tool grant is accepted ONLY when the
+--- package is IFC-attested AND its declared surface fits the consumer envelope. An
+--- un-attested package, or one whose surface exceeds the envelope, is never
+--- accepted (fail-closed, X8). This mirrors the convergence attestation in
+--- subworkflow-attestation, but for the information-flow surface.
+mod WHIPPLESCRIPT-INFOFLOW-PACKAGE is
+  sorts Tool Cfg .
+
+  ops t1 t2 : -> Tool [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- producer side
+  op ifcChecked : Tool -> Cfg [ctor] .      --- producer verified internals vs declared surface (X1, X3)
+  op attestsIfc : Tool -> Cfg [ctor] .       --- the contract attests the IFC surface (X5)
+  op notIfcAttested : Tool -> Cfg [ctor] .   --- consumer sees no IFC attestation
+
+  --- consumer side
+  op grants : Tool -> Cfg [ctor] .           --- a downstream whip grants the cross-package @tool
+  op surfaceFits : Tool -> Cfg [ctor] .       --- declared surface refines the consumer envelope (X4, X8)
+  op surfaceExceeds : Tool -> Cfg [ctor] .    --- declared surface exceeds the envelope
+  op accepted : Tool -> Cfg [ctor] .          --- consumer accepts the cross-package grant
+  op rejected : Tool -> Cfg [ctor] .          --- consumer rejects it
+
+  var T : Tool .
+
+  --- idempotent markers so the guarded rules reach a finite fixpoint.
+  eq attestsIfc(T) attestsIfc(T) = attestsIfc(T) .
+  eq accepted(T) accepted(T) = accepted(T) .
+  eq rejected(T) rejected(T) = rejected(T) .
+
+  --- producer: attest the IFC surface ONLY after checking internals against the
+  --- declared surface. attestsIfc can arise no other way, so it always trails the
+  --- check -- an attested surface is always a checked surface.
+  rl [attest-ifc] : ifcChecked(T) => ifcChecked(T) attestsIfc(T) .
+
+  --- consumer: accept a cross-package grant ONLY when the package is IFC-attested
+  --- AND its declared surface fits the consumer envelope. Both sides must hold.
+  rl [accept] : grants(T) attestsIfc(T) surfaceFits(T)
+              => grants(T) attestsIfc(T) surfaceFits(T) accepted(T) .
+
+  --- consumer: reject when the declared surface exceeds the envelope (fail-closed).
+  rl [reject-surface] : grants(T) surfaceExceeds(T)
+                      => grants(T) surfaceExceeds(T) rejected(T) .
+
+  --- consumer: reject a grant with no IFC attestation -- no attestation, no trust.
+  rl [reject-unattested] : grants(T) notIfcAttested(T)
+                         => grants(T) notIfcAttested(T) rejected(T) .
+endm

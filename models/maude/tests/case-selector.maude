@@ -1,0 +1,20 @@
+load ../case-selector.maude
+
+--- Coverage: a crossing selected by a low-integrity discriminant is rejected by
+--- NMIF on the selector -- no attacker-steered declassify/endorse.
+search [1] in WHIPPLESCRIPT-CASE-SELECTOR :
+  armCrossing(lo)
+  =>* C:Cfg rejectSelector .
+
+--- Bite: a crossing selected by a high-integrity discriminant is allowed; the
+--- selector's integrity acts-for the release authority. RESIDUAL makes it non-vacuous.
+search [1] in WHIPPLESCRIPT-CASE-SELECTOR :
+  armCrossing(hi)
+  =>* rejectSelector RESIDUAL:Cfg .
+
+--- Bite: an ordinary-effect arm selected by a low-integrity discriminant is NOT a
+--- hard error -- it is the pre-existing I-IFC5 control-flow channel (lint-only),
+--- identical to a `where` guard on the same discriminant.
+search [1] in WHIPPLESCRIPT-CASE-SELECTOR :
+  armOrdinary(lo)
+  =>* rejectSelector RESIDUAL:Cfg .

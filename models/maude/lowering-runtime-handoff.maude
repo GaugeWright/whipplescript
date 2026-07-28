@@ -1,0 +1,183 @@
+mod WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF is
+  protecting WHIPPLESCRIPT-CONSTRUCT-LOWERING .
+
+  --- Core IR entrypoints accepted by the existing runtime kernel. These are
+  --- templates or durable records, not package-defined lifecycle transitions.
+  op effectEntrypoint : CoreObjectId EffectId -> Cfg .
+  op dependencyEntrypoint : CoreObjectId EffectId Predicate EffectId -> Cfg .
+  op ruleEntrypoint : CoreObjectId RuleId FactId GraphId -> Cfg .
+  op factEntrypoint : CoreObjectId FactId -> Cfg .
+  op eventEntrypoint : CoreObjectId EventId -> Cfg .
+  op eventSourceEntrypoint : CoreObjectId EventId -> Cfg .
+  op clockSourceEntrypoint : CoreObjectId EventId -> Cfg .
+  op scheduleEntrypoint : CoreObjectId EventId -> Cfg .
+  op projectionEntrypoint : CoreObjectId EventId FactId -> Cfg .
+  op assertionEntrypoint : CoreObjectId AssertionId -> Cfg .
+  op diagnosticEntrypoint : CoreObjectId RuleId -> Cfg .
+  op eventSourceTemplate : EventId -> Cfg .
+  op clockSourceTemplate : EventId -> Cfg .
+  op scheduleTemplate : EventId -> Cfg .
+  op assertionCheckTemplate : AssertionId -> Cfg .
+
+  --- Runtime-owned symbols used only for negative handoff checks. They are not
+  --- lowerable core object kinds.
+  op runtimeRunObj : -> CoreObjectId .
+  op runtimeRunKind : -> CoreObjectKind .
+
+  op handoffObjectOk : GraphId CoreObjectId -> Cfg .
+  op handoffCoverageOk : GraphId -> Cfg .
+  op runtimeLifecycleBoundaryOk : GraphId -> Cfg .
+  op lifecycleHandoffOk : GraphId -> Cfg .
+
+  --- Negative boundary facts owned by the platform checker. They are emitted
+  --- individually from the lowered IR inventory; there is no aggregate shortcut
+  --- that can stand in for the concrete no-materialization checks.
+  op noLoweredRunMaterialization : GraphId -> Cfg .
+  op noLoweredClaimMaterialization : GraphId -> Cfg .
+  op noLoweredTerminalMaterialization : GraphId -> Cfg .
+  op noLoweredCancellationMaterialization : GraphId -> Cfg .
+  op noLoweredRetryLeaseMaterialization : GraphId -> Cfg .
+  op providerBoundaryRuntimeOwned : GraphId -> Cfg .
+
+  vars G G2 : GraphId .
+  vars Obj Obj2 Obj3 : CoreObjectId .
+  var Objs : CoreObjectList .
+  vars E U D : EffectId .
+  vars P : Predicate .
+  vars R : RuleId .
+  vars F : FactId .
+  vars Ev : EventId .
+  vars A : AssertionId .
+
+  rl [handoff-effect-entrypoint] :
+    emittedCoreObject(G, Obj, coreEffectKind)
+    effectEntrypoint(Obj, E)
+    =>
+    handoffObjectOk(G, Obj)
+    graph(G, E) .
+
+  rl [handoff-dependency-entrypoint] :
+    emittedCoreObject(G, Obj, coreDependencyKind)
+    dependencyEntrypoint(Obj, U, P, D)
+    =>
+    handoffObjectOk(G, Obj)
+    graph2(G, U, P, D) .
+
+  rl [handoff-rule-entrypoint] :
+    emittedCoreObject(G, Obj, coreRuleKind)
+    ruleEntrypoint(Obj, R, F, G2)
+    =>
+    handoffObjectOk(G, Obj)
+    rule(R, F, G2) .
+
+  rl [handoff-fact-entrypoint] :
+    emittedCoreObject(G, Obj, coreFactKind)
+    factEntrypoint(Obj, F)
+    =>
+    handoffObjectOk(G, Obj)
+    fact(F) .
+
+  rl [handoff-event-entrypoint] :
+    emittedCoreObject(G, Obj, coreEventKind)
+    eventEntrypoint(Obj, Ev)
+    =>
+    handoffObjectOk(G, Obj)
+    event(Ev) .
+
+  rl [handoff-event-source-entrypoint] :
+    emittedCoreObject(G, Obj, coreEventSourceKind)
+    eventSourceEntrypoint(Obj, Ev)
+    =>
+    handoffObjectOk(G, Obj)
+    eventSourceTemplate(Ev) .
+
+  rl [handoff-clock-source-entrypoint] :
+    emittedCoreObject(G, Obj, coreClockSourceKind)
+    clockSourceEntrypoint(Obj, Ev)
+    =>
+    handoffObjectOk(G, Obj)
+    clockSourceTemplate(Ev) .
+
+  rl [handoff-schedule-entrypoint] :
+    emittedCoreObject(G, Obj, coreScheduleKind)
+    scheduleEntrypoint(Obj, Ev)
+    =>
+    handoffObjectOk(G, Obj)
+    scheduleTemplate(Ev) .
+
+  rl [handoff-projection-entrypoint] :
+    emittedCoreObject(G, Obj, coreProjectionKind)
+    projectionEntrypoint(Obj, Ev, F)
+    =>
+    handoffObjectOk(G, Obj)
+    projection(Ev, F, pending) .
+
+  rl [handoff-assertion-entrypoint] :
+    emittedCoreObject(G, Obj, coreAssertionKind)
+    assertionEntrypoint(Obj, A)
+    =>
+    handoffObjectOk(G, Obj)
+    assertionCheckTemplate(A) .
+
+  rl [handoff-diagnostic-entrypoint] :
+    emittedCoreObject(G, Obj, coreDiagnosticKind)
+    diagnosticEntrypoint(Obj, R)
+    =>
+    handoffObjectOk(G, Obj)
+    diagnostic(R) .
+
+  rl [handoff-coverage-0] :
+    graphEmits0(G)
+    =>
+    handoffCoverageOk(G) .
+
+  rl [handoff-coverage-1] :
+    graphEmits1(G, Obj)
+    handoffObjectOk(G, Obj)
+    =>
+    handoffCoverageOk(G) .
+
+  rl [handoff-coverage-2] :
+    graphEmits2(G, Obj, Obj2)
+    handoffObjectOk(G, Obj)
+    handoffObjectOk(G, Obj2)
+    =>
+    handoffCoverageOk(G) .
+
+  rl [handoff-coverage-3] :
+    graphEmits3(G, Obj, Obj2, Obj3)
+    handoffObjectOk(G, Obj)
+    handoffObjectOk(G, Obj2)
+    handoffObjectOk(G, Obj3)
+    =>
+    handoffCoverageOk(G) .
+
+  rl [handoff-coverage-generated-empty] :
+    graphEmits(G, noCoreObjects)
+    =>
+    handoffCoverageOk(G) .
+
+  rl [handoff-coverage-generated-cons] :
+    graphEmits(G, coreObjectCons(Obj, Objs))
+    handoffObjectOk(G, Obj)
+    =>
+    handoffObjectOk(G, Obj)
+    graphEmits(G, Objs) .
+
+  rl [runtime-lifecycle-boundary-ok] :
+    noLoweredRunMaterialization(G)
+    noLoweredClaimMaterialization(G)
+    noLoweredTerminalMaterialization(G)
+    noLoweredCancellationMaterialization(G)
+    noLoweredRetryLeaseMaterialization(G)
+    providerBoundaryRuntimeOwned(G)
+    =>
+    runtimeLifecycleBoundaryOk(G) .
+
+  rl [lifecycle-handoff-ok] :
+    loweringPreserved(G)
+    handoffCoverageOk(G)
+    runtimeLifecycleBoundaryOk(G)
+    =>
+    lifecycleHandoffOk(G) .
+endm

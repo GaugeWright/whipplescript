@@ -1,0 +1,25 @@
+name = "whipplescript-runtime-test"
+main = "src/test-worker.ts"
+compatibility_date = "2026-07-24"
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[durable_objects.bindings]]
+name = "SESSION_ADMISSION"
+class_name = "TestDeployment"
+
+[[durable_objects.bindings]]
+name = "PUBLIC_CREDENTIALS"
+class_name = "TestCredentialRegistry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance", "TestDeployment", "TestCredentialRegistry"]
+
+[vars]
+WHIP_SESSION_TOKEN = "session-token"
+WHIP_PUBLIC_CONTROL_TOKEN = "public-control-secret"

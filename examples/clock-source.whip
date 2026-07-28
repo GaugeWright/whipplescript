@@ -1,3 +1,6 @@
+use std.agent
+use std.ingress
+
 @service
 workflow ClockSource
 

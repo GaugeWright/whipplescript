@@ -1,0 +1,66 @@
+--- Owned brokered agent harness, slice 1 loop safety invariants.
+--- Companion to spec/owned-harness-loop-contract.md and DR-0024, invariants I1 to
+--- I3 and the boundary corollary. Abstracts the brokered turn loop to three safety
+--- properties the slice-1 runner must preserve.
+---
+--- Leaf-ness, invariant I2: an in-turn stream observation only derives a
+--- rule-matchable fact when its kind gate is open. The interior kinds modelReq,
+--- toolReq and toolRes never do; only started and terminal lifecycle kinds derive
+--- facts. This mirrors the real derives_rule_matchable_fact gate in
+--- native_lifecycle.rs.
+---
+--- Brokering, invariant I1: a tool result is only produced through a kernel broker
+--- step, which requires the kernel mediation capability. With no broker capability
+--- the model cannot reach a tool result; it never touches the tool directly.
+---
+--- Single terminal, layer 3: a running turn reaches exactly one terminal fact. The
+--- terminal transitions consume the running marker, so two terminals are
+--- unreachable.
+mod WHIPPLESCRIPT-OWNED-HARNESS-LOOP is
+  protecting BOOL .
+
+  sorts Kind Status Cfg .
+
+  --- in-turn stream observation kinds, the leaf-ness gate domain
+  ops started modelReq toolReq toolRes : -> Kind [ctor] .
+  ops completed failed timedOut : -> Status [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op obs : Kind -> Cfg [ctor] .         --- a stream observation appended in-turn
+  op kept : Kind -> Cfg [ctor] .        --- observation recorded as evidence, fires once
+  op fact : Kind -> Cfg [ctor] .        --- a derived rule-matchable fact, leak detector
+  op running : -> Cfg [ctor] .          --- turn is running
+  op termFact : Status -> Cfg [ctor] .  --- terminal lifecycle fact, layer 3
+  op brokerEnabled : -> Cfg [ctor] .    --- kernel mediation capability, I1 precondition
+  op toolReqPending : -> Cfg [ctor] .   --- model requested a tool, awaiting broker
+  op toolReqBrokered : -> Cfg [ctor] .  --- kernel broker authorized the tool
+
+  --- The real gate, derives_rule_matchable_fact per observation kind.
+  op derivesFact : Kind -> Bool .
+  eq derivesFact(started) = true .
+  eq derivesFact(modelReq) = false .
+  eq derivesFact(toolReq) = false .
+  eq derivesFact(toolRes) = false .
+
+  var K : Kind .
+
+  --- Record an observation. The gate decides whether a fact is derived. Flipping a
+  --- false case to true, a leak, makes the leaf-ness bite searches satisfiable.
+  crl [record-derives] : obs(K) => kept(K) fact(K) if derivesFact(K) = true .
+  crl [record-plain]   : obs(K) => kept(K)         if derivesFact(K) = false .
+
+  --- Brokering: a tool result is reachable only through the kernel broker step,
+  --- which requires brokerEnabled. Dropping that requirement, or adding a direct
+  --- toolReqPending to obs(toolRes) rule, makes the brokering bite satisfiable.
+  rl [broker]  : toolReqPending brokerEnabled => toolReqBrokered brokerEnabled .
+  rl [execute] : toolReqBrokered => obs(toolRes) .
+
+  --- Single terminal: the terminal rules consume running, so a turn reaches
+  --- exactly one terminal fact. A rule that left running in place would make the
+  --- two-terminal bite satisfiable.
+  rl [complete] : running => termFact(completed) .
+  rl [fail]     : running => termFact(failed) .
+  rl [timeout]  : running => termFact(timedOut) .
+endm

@@ -1,0 +1,18 @@
+load ../provenance-completeness.maude
+
+--- Coverage: a staged bundle assembles into the prompt WITH its evidence row present.
+search [1] in WHIPPLESCRIPT-PROVENANCE-COMPLETENESS :
+  staged
+  =>* assembled evidence .
+
+--- Coverage: provenance is recorded (durable evidence row) before assembly.
+search [1] in WHIPPLESCRIPT-PROVENANCE-COMPLETENESS :
+  staged
+  =>* recorded evidence .
+
+--- Bite: a bundle with no provenance source never reaches the prompt. The RESIDUAL
+--- soup var means an assembled in ANY reachable state is a solution, so No solution
+--- proves assembly is provenance-gated.
+search [1] in WHIPPLESCRIPT-PROVENANCE-COMPLETENESS :
+  untracked
+  =>* assembled RESIDUAL:Cfg .

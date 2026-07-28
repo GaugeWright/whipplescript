@@ -1,0 +1,30 @@
+# Production public-session runtime. It is service-bound from the edge ingress,
+# has its own Session DO namespace, and intentionally has no executor, turn
+# container, private-host broker, route, or workers.dev trigger.
+name = "whipplescript-public-runtime"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+workers_dev = false
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[build]
+command = "npm run build:wasm"
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[durable_objects.bindings]]
+name = "SESSION_ADMISSION"
+class_name = "Deployment"
+script_name = "gaugewright-edge-runtime"
+
+[[durable_objects.bindings]]
+name = "PUBLIC_CREDENTIALS"
+class_name = "CredentialRegistry"
+script_name = "gaugewright-edge-runtime"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance"]

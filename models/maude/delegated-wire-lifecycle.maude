@@ -1,0 +1,58 @@
+--- DR-0035 B6: the delegated wire-protocol lifecycle. Companion to
+--- spec/decision-records/0035-delegated-harness-wire-protocol.md.
+---
+--- Models the kernel driver's view of one delegated run under the terminal
+--- contract of Decision 3 and the clock backstop of Decision 4. Tokens: the run
+--- is `running` until exactly one terminal is admitted; inbound frames are
+--- consumed by exactly one rule each, so the reachable space is finite and the
+--- No-solution bites below terminate. `evtAdmitted` marks an admitted lifecycle
+--- event; `violation` marks a protocol-violation diagnostic; `diag` marks a
+--- non-terminal acknowledgement diagnostic.
+---
+--- The safety properties: a run admits at most ONE terminal -- `terminal` is
+--- produced only by rules that consume `running`, and nothing re-creates
+--- `running`, so two `terminal` tokens are unreachable. A cancel acknowledgement
+--- never completes the run -- the only rule consuming `frameAck` leaves the run
+--- `running`. Post-terminal frames become violation diagnostics, never admitted
+--- events. And a misrouted frame does not abort the turn -- the run still
+--- reaches its terminal while the violation is recorded.
+mod WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op running : -> Cfg [ctor] .        --- the run is live; no terminal admitted yet
+  op terminal : -> Cfg [ctor] .       --- exactly-one-terminal admitted; run closed
+  op frameTerminal : -> Cfg [ctor] .  --- an inbound terminal frame
+  op frameStream : -> Cfg [ctor] .    --- an inbound non-terminal lifecycle frame
+  op frameAck : -> Cfg [ctor] .       --- a cancel acknowledgement frame
+  op frameMisrouted : -> Cfg [ctor] . --- a frame with an unknown or wrong run id
+  op clockFired : -> Cfg [ctor] .     --- the inactivity clock fired
+  op evtAdmitted : -> Cfg [ctor] .    --- a lifecycle event was admitted
+  op violation : -> Cfg [ctor] .      --- a protocol-violation diagnostic recorded
+  op diag : -> Cfg [ctor] .           --- a non-terminal ack diagnostic recorded
+
+  --- While running: a terminal frame closes the run; the ONLY producers of
+  --- `terminal` consume `running`, which nothing re-creates.
+  rl [admit-terminal] : running frameTerminal => terminal evtAdmitted .
+  rl [admit-stream] : running frameStream => running evtAdmitted .
+
+  --- A cancel acknowledgement is a diagnostic, never a terminal -- the run
+  --- stays running until a real terminal or the clock arrives.
+  rl [ack-diagnostic] : running frameAck => running diag .
+
+  --- Tolerant routing: a misrouted frame is dropped as a violation diagnostic;
+  --- the run keeps running rather than aborting.
+  rl [misrouted-diagnostic] : running frameMisrouted => running violation .
+
+  --- The clock backstop synthesizes the timedOut terminal, so every live run
+  --- reaches a terminal even if the peer goes silent.
+  rl [clock-timeout] : running clockFired => terminal evtAdmitted .
+
+  --- After the terminal: every further frame is a violation diagnostic. No rule
+  --- here produces `evtAdmitted` or a second `terminal`.
+  rl [post-terminal-frame] : terminal frameTerminal => terminal violation .
+  rl [post-terminal-stream] : terminal frameStream => terminal violation .
+  rl [post-terminal-misrouted] : terminal frameMisrouted => terminal violation .
+endm

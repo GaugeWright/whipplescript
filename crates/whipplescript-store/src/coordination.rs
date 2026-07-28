@@ -14,6 +14,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
+#[cfg(feature = "native")]
+use crate::StoreError;
 use crate::StoreResult;
 
 pub const DEFAULT_COORDINATION_OWNER: &str = "shared";
@@ -32,6 +34,28 @@ pub enum AcquireOutcome {
 pub enum ConsumeOutcome {
     Ok { remaining: i64 },
     Over { remaining: i64 },
+}
+
+/// Serialize a consume outcome for the `coord_applied` crash-atomicity marker.
+/// `variant:remaining` is stable and dependency-free (no serde on the store's
+/// hot path); `parse_consume_outcome` is its exact inverse.
+#[cfg(feature = "native")]
+fn format_consume_outcome(outcome: &ConsumeOutcome) -> String {
+    match outcome {
+        ConsumeOutcome::Ok { remaining } => format!("Ok:{remaining}"),
+        ConsumeOutcome::Over { remaining } => format!("Over:{remaining}"),
+    }
+}
+
+#[cfg(feature = "native")]
+fn parse_consume_outcome(recorded: &str) -> Option<ConsumeOutcome> {
+    let (variant, remaining) = recorded.split_once(':')?;
+    let remaining = remaining.parse::<i64>().ok()?;
+    match variant {
+        "Ok" => Some(ConsumeOutcome::Ok { remaining }),
+        "Over" => Some(ConsumeOutcome::Over { remaining }),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,10 +274,75 @@ impl CoordinationStore {
         appended_by: &str,
         retain_seconds: i64,
     ) -> StoreResult<i64> {
+        self.append_for_owner_marked(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+            None,
+        )
+    }
+
+    /// Crash-atomic append: applied at most once per `effect_id`. On replay
+    /// (the effect was applied but its cross-database terminal did not commit
+    /// before a crash) the recorded seq is returned and no second entry is
+    /// written. See `coord_applied`. `None` is the un-guarded append.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: &str,
+    ) -> StoreResult<i64> {
+        self.append_for_owner_marked(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+            Some(effect_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_for_owner_marked(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: Option<&str>,
+    ) -> StoreResult<i64> {
         let owner = normalized_owner(owner);
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(effect_id) = effect_id {
+            if let Some(recorded) = tx
+                .query_row(
+                    "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
+                    params![owner, effect_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                tx.commit()?;
+                return recorded.parse::<i64>().map_err(|_| {
+                    StoreError::Conflict(format!(
+                        "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
+                    ))
+                });
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO ledger_seq (owner, ledger, next_seq) VALUES (?1, ?2, 1)",
             params![owner, ledger],
@@ -271,6 +360,12 @@ impl CoordinationStore {
             "DELETE FROM ledger_entries WHERE owner = ?1 AND ledger = ?2 AND appended_at <= datetime('now', ?3)",
             params![owner, ledger, format!("-{retain_seconds} seconds")],
         )?;
+        if let Some(effect_id) = effect_id {
+            tx.execute(
+                "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
+                params![owner, effect_id, seq.to_string()],
+            )?;
+        }
         tx.commit()?;
         Ok(seq)
     }
@@ -305,10 +400,59 @@ impl CoordinationStore {
         cap: i64,
         period: &str,
     ) -> StoreResult<ConsumeOutcome> {
+        self.consume_for_owner_marked(owner, counter, key, amount, cap, period, None)
+    }
+
+    /// Crash-atomic consume: charged at most once per `effect_id`. On replay
+    /// the recorded outcome (`Ok`/`Over` + remaining) is returned and the
+    /// counter is NOT charged a second time, so a crash between the coordination
+    /// commit and the instance-store terminal cannot double-charge the budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.consume_for_owner_marked(owner, counter, key, amount, cap, period, Some(effect_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_for_owner_marked(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: Option<&str>,
+    ) -> StoreResult<ConsumeOutcome> {
         let owner = normalized_owner(owner);
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(effect_id) = effect_id {
+            if let Some(recorded) = tx
+                .query_row(
+                    "SELECT outcome_json FROM coord_applied WHERE owner = ?1 AND effect_id = ?2",
+                    params![owner, effect_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                tx.commit()?;
+                return parse_consume_outcome(&recorded).ok_or_else(|| {
+                    StoreError::Conflict(format!(
+                        "corrupt coord_applied outcome for effect `{effect_id}`: `{recorded}`"
+                    ))
+                });
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO counters (owner, counter, key, consumed, period) VALUES (?1, ?2, ?3, 0, ?4)",
             params![owner, counter, key, period],
@@ -322,20 +466,33 @@ impl CoordinationStore {
             params![owner, counter, key],
             |row| row.get(0),
         )?;
-        if consumed + amount <= cap {
+        // `amount` is workflow-authored, so guard the cap check against i64
+        // overflow: a near-MAX amount would wrap `consumed + amount` negative,
+        // passing the check and driving `consumed` negative — an unbounded
+        // counter (silent cap bypass in release, panic in debug). checked_add
+        // fails closed to `Over` (denied), never charging.
+        let outcome = match consumed.checked_add(amount) {
+            Some(total) if amount >= 0 && total <= cap => {
+                tx.execute(
+                    "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                    params![owner, counter, key, amount],
+                )?;
+                ConsumeOutcome::Ok {
+                    remaining: cap - total,
+                }
+            }
+            _ => ConsumeOutcome::Over {
+                remaining: (cap - consumed).max(0),
+            },
+        };
+        if let Some(effect_id) = effect_id {
             tx.execute(
-                "UPDATE counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-                params![owner, counter, key, amount],
+                "INSERT INTO coord_applied (owner, effect_id, outcome_json) VALUES (?1, ?2, ?3)",
+                params![owner, effect_id, format_consume_outcome(&outcome)],
             )?;
-            tx.commit()?;
-            return Ok(ConsumeOutcome::Ok {
-                remaining: cap - consumed - amount,
-            });
         }
         tx.commit()?;
-        Ok(ConsumeOutcome::Over {
-            remaining: cap - consumed,
-        })
+        Ok(outcome)
     }
 
     /// The current reset-period identifier, read from the store's clock at
@@ -357,18 +514,6 @@ impl CoordinationStore {
             rows.push(row?);
         }
         Ok(rows)
-    }
-
-    pub fn current_period(&self, reset: &str) -> StoreResult<String> {
-        let format = match reset {
-            "hourly" => "%Y-%m-%dT%H",
-            "weekly" => "%Y-W%W",
-            "monthly" => "%Y-%m",
-            _ => "%Y-%m-%d",
-        };
-        Ok(self
-            .connection
-            .query_row("SELECT strftime(?1, 'now')", [format], |row| row.get(0))?)
     }
 
     pub fn list_leases(&self, resource: Option<&str>) -> StoreResult<Vec<LeaseRow>> {
@@ -531,7 +676,53 @@ pub trait Coordination {
         period: &str,
     ) -> StoreResult<ConsumeOutcome>;
 
-    fn current_period(&self, reset: &str) -> StoreResult<String>;
+    /// Crash-atomic `ledger.append`, applied at most once per `effect_id`.
+    /// Native records an idempotency marker in the SAME coordination-database
+    /// transaction as the append, so a crash before the effect's terminal
+    /// commits (a physically separate database) cannot double-write on replay.
+    /// The DEFAULT delegation is exactly-once already on hosts where the
+    /// coordination write shares the instance store's single transaction (the
+    /// Durable Object commits all writes atomically at its output gate), so they
+    /// need no marker and inherit this.
+    #[allow(clippy::too_many_arguments)]
+    fn append_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: &str,
+    ) -> StoreResult<i64> {
+        let _ = effect_id;
+        self.append_for_owner(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+        )
+    }
+
+    /// Crash-atomic `counter.consume`, charged at most once per `effect_id`.
+    /// See [`Coordination::append_for_owner_idempotent`] for why native needs
+    /// the marker and the DO does not.
+    #[allow(clippy::too_many_arguments)]
+    fn consume_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        let _ = effect_id;
+        self.consume_for_owner(owner, counter, key, amount, cap, period)
+    }
 
     /// The workspace-plane HIGH-WATER positions of the monotone ledger
     /// stores: (owner, ledger, last minted seq). One half of the two-plane
@@ -713,8 +904,38 @@ impl Coordination for CoordinationStore {
         self.consume_for_owner(owner, counter, key, amount, cap, period)
     }
 
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        self.current_period(reset)
+    fn append_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        ledger: &str,
+        partition: &str,
+        payload_json: &str,
+        appended_by: &str,
+        retain_seconds: i64,
+        effect_id: &str,
+    ) -> StoreResult<i64> {
+        self.append_for_owner_idempotent(
+            owner,
+            ledger,
+            partition,
+            payload_json,
+            appended_by,
+            retain_seconds,
+            effect_id,
+        )
+    }
+
+    fn consume_for_owner_idempotent(
+        &mut self,
+        owner: &str,
+        counter: &str,
+        key: &str,
+        amount: i64,
+        cap: i64,
+        period: &str,
+        effect_id: &str,
+    ) -> StoreResult<ConsumeOutcome> {
+        self.consume_for_owner_idempotent(owner, counter, key, amount, cap, period, effect_id)
     }
 
     fn list_leases_for_owner(
@@ -776,6 +997,19 @@ fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
         create_counters_table(connection)?;
     } else if !column_exists(connection, "counters", "owner")? {
         migrate_counters_table(connection)?;
+    }
+
+    // Crash-atomicity marker (idempotent counter.consume / ledger.append). The
+    // native coordination store is a physically separate SQLite database from
+    // the instance store that records the effect's terminal, so the mutation
+    // and the terminal cannot share one transaction. Without a marker, a crash
+    // between the two commits leaves the effect `queued` in the instance store,
+    // it is re-claimed, and the mutation double-applies (double-charge / dup
+    // ledger entry). This table records — in the SAME transaction as the
+    // mutation — that `effect_id` was applied and what outcome it produced, so a
+    // replay returns the recorded outcome instead of mutating again.
+    if !table_exists(connection, "coord_applied")? {
+        create_coord_applied_table(connection)?;
     }
 
     connection.execute_batch(
@@ -850,6 +1084,22 @@ fn create_counters_table(connection: &Connection) -> StoreResult<()> {
             consumed INTEGER NOT NULL DEFAULT 0,
             period TEXT NOT NULL,
             PRIMARY KEY (owner, counter, key)
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "native")]
+fn create_coord_applied_table(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE coord_applied (
+            owner TEXT NOT NULL,
+            effect_id TEXT NOT NULL,
+            outcome_json TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (owner, effect_id)
         );
         "#,
     )?;
@@ -981,21 +1231,62 @@ pub fn entry_payload(entry: &LedgerEntry) -> Value {
 mod tests {
     use super::*;
 
-    fn store_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "whipplescript-coordination-{}-{}-{}.sqlite",
-            label,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos(),
-        ))
+    /// A temp directory removed when the binding drops, panic included. Owning
+    /// the directory rather than the `.sqlite` file means the `-shm`/`-wal`
+    /// sidecars go with it.
+    struct TempStoreDir(std::path::PathBuf);
+
+    impl TempStoreDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "whipplescript-coordination-{}-{}-{}",
+                label,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&dir).expect("create coordination temp dir");
+            Self(dir)
+        }
+
+        fn store_path(&self) -> std::path::PathBuf {
+            self.0.join("coordination.sqlite")
+        }
     }
 
-    fn store() -> CoordinationStore {
-        let path = store_path("test");
-        CoordinationStore::open(path).expect("open store")
+    impl Drop for TempStoreDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A store whose temp directory dies with it. `Deref`/`DerefMut` keep the
+    /// 12 call sites unchanged: `let mut store = store(); store.append(..)`.
+    struct TempStore {
+        _dir: TempStoreDir,
+        inner: CoordinationStore,
+    }
+
+    impl std::ops::Deref for TempStore {
+        type Target = CoordinationStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for TempStore {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    fn store() -> TempStore {
+        let dir = TempStoreDir::new("test");
+        let inner = CoordinationStore::open(dir.store_path()).expect("open store");
+        TempStore { _dir: dir, inner }
     }
 
     /// The two-plane cut's coordination half: ledger positions are the
@@ -1024,6 +1315,101 @@ mod tests {
             .find(|(_, ledger, _)| ledger == "mail")
             .expect("mail ledger");
         assert!(audit.2 > mail.2, "two appends outrank one: {positions:?}");
+    }
+
+    /// Crash-atomicity (ultracode #5): the coordination mutation and the
+    /// instance-store terminal live in different databases and cannot share a
+    /// transaction, so a crash between them replays the effect. The idempotent
+    /// append is applied ONCE per effect_id: a replay returns the recorded seq
+    /// and writes no second entry.
+    #[test]
+    fn idempotent_append_does_not_double_write_on_replay() {
+        let mut store = store();
+        let seq1 = store
+            .append_for_owner_idempotent("shared", "audit", "p1", "{\"n\":1}", "w1", 3600, "eff-A")
+            .expect("append");
+        // Replay the SAME effect (terminal never committed -> re-claimed).
+        let seq2 = store
+            .append_for_owner_idempotent("shared", "audit", "p1", "{\"n\":1}", "w1", 3600, "eff-A")
+            .expect("replay");
+        assert_eq!(
+            seq1, seq2,
+            "replay returns the recorded seq, not a fresh one"
+        );
+        let entries = store
+            .list_entries_for_owner(Some("shared"), Some("audit"), None)
+            .expect("list");
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one durable entry despite the replay: {entries:?}"
+        );
+        // A genuinely different effect still appends independently.
+        let seq3 = store
+            .append_for_owner_idempotent("shared", "audit", "p1", "{\"n\":2}", "w1", 3600, "eff-B")
+            .expect("second effect");
+        assert_ne!(seq3, seq1, "a distinct effect_id mints a fresh seq");
+    }
+
+    /// Crash-atomicity for counter.consume: a replayed consume is NOT charged
+    /// twice, so the budget cannot be double-debited by a crash-and-retry.
+    #[test]
+    fn idempotent_consume_does_not_double_charge_on_replay() {
+        let mut store = store();
+        let first = store
+            .consume_for_owner_idempotent("shared", "budget", "k", 3, 10, "2026-07", "eff-C")
+            .expect("consume");
+        assert_eq!(first, ConsumeOutcome::Ok { remaining: 7 });
+        // Replay the same effect: remaining must be unchanged (charged once).
+        let replay = store
+            .consume_for_owner_idempotent("shared", "budget", "k", 3, 10, "2026-07", "eff-C")
+            .expect("replay");
+        assert_eq!(
+            replay,
+            ConsumeOutcome::Ok { remaining: 7 },
+            "replay returns the recorded outcome, counter charged once"
+        );
+        // A distinct effect debits again from the once-charged 7.
+        let second = store
+            .consume_for_owner_idempotent("shared", "budget", "k", 3, 10, "2026-07", "eff-D")
+            .expect("second consume");
+        assert_eq!(
+            second,
+            ConsumeOutcome::Ok { remaining: 4 },
+            "distinct effect debits from 7, not from a double-charged 4"
+        );
+    }
+
+    /// An adversarial near-i64::MAX amount must not overflow the cap check:
+    /// it fails closed to `Over` (denied), never wrapping `consumed` negative
+    /// into an unbounded counter (and never panicking in debug).
+    #[test]
+    fn consume_rejects_an_overflowing_amount() {
+        let mut store = store();
+        let outcome = store
+            .consume("budget", "k", i64::MAX, 10, "2026-07")
+            .expect("consume");
+        assert_eq!(outcome, ConsumeOutcome::Over { remaining: 10 });
+        // The counter was not charged, so a legitimate consume still succeeds.
+        assert_eq!(
+            store.consume("budget", "k", 4, 10, "2026-07").expect("ok"),
+            ConsumeOutcome::Ok { remaining: 6 }
+        );
+    }
+
+    /// A replayed `Over` consume also returns its recorded verdict unchanged and
+    /// does not perturb the counter.
+    #[test]
+    fn idempotent_consume_replays_the_over_verdict() {
+        let mut store = store();
+        let over = store
+            .consume_for_owner_idempotent("shared", "budget", "k", 20, 10, "2026-07", "eff-E")
+            .expect("consume");
+        assert_eq!(over, ConsumeOutcome::Over { remaining: 10 });
+        let replay = store
+            .consume_for_owner_idempotent("shared", "budget", "k", 20, 10, "2026-07", "eff-E")
+            .expect("replay");
+        assert_eq!(replay, ConsumeOutcome::Over { remaining: 10 });
     }
 
     /// Mutual exclusion: at most `slots` holders per key, ever; contended
@@ -1075,7 +1461,7 @@ mod tests {
     #[test]
     fn coordination_trait_seam_is_faithful() {
         let mut store = store();
-        let coordination: &mut dyn Coordination = &mut store;
+        let coordination: &mut dyn Coordination = &mut *store;
 
         // Shared-owner convenience forms route through the owner primitives.
         assert_eq!(
@@ -1291,7 +1677,8 @@ mod tests {
 
     #[test]
     fn open_migrates_unpartitioned_coordination_rows_to_shared_owner() {
-        let path = store_path("migration");
+        let dir = TempStoreDir::new("migration");
+        let path = dir.store_path();
         {
             let connection = Connection::open(&path).expect("open raw");
             connection

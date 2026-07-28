@@ -13,6 +13,18 @@ rules = [{ type = "Text", globs = ["**/*.sql"] }]
 name = "WORKFLOW_INSTANCE"
 class_name = "WorkflowInstance"
 
+# Public session objects reserve/settle spend with their owning deployment DO.
+# Only reservation metadata crosses this binding; provider/model bytes do not.
+[[durable_objects.bindings]]
+name = "SESSION_ADMISSION"
+class_name = "Deployment"
+script_name = "gaugewright-edge-runtime"
+
+[[durable_objects.bindings]]
+name = "PUBLIC_CREDENTIALS"
+class_name = "CredentialRegistry"
+script_name = "gaugewright-edge-runtime"
+
 # The Class-A executor pool (compute plane P8): `whip executor` containers,
 # each paired 1:1 with an ExecutorContainer DO; the workflow DO routes
 # whip-executor/1 rounds to a getRandom-picked instance. Pool size is the
@@ -48,7 +60,8 @@ WHIP_TURN_URL = "http://turn"
 [build]
 command = "npm run build:wasm"
 
-# Provider credentials are DO secrets, set out-of-band:
-#   wrangler secret put ANTHROPIC_API_KEY
-#   wrangler secret put OPENAI_API_KEY
-# They flow into DurableEffectPorts (coerce/agent) once create() accepts them.
+# Secret-free governed turns configure the non-secret broker URL, then set only
+# the broker-hop token as a Worker secret. The verified signed policy epoch owns
+# the exact non-secret provider tuple; there is no Worker provider map.
+#   WHIP_MODEL_BROKER_URL = "https://home.example/model-egress"
+#   wrangler secret put WHIP_MODEL_BROKER_TOKEN

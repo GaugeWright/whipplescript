@@ -1,0 +1,41 @@
+load ../tracker-readiness.maude
+
+--- Coverage 1: an open, unblocked, unleased issue is ready.
+search in TRACKER-READINESS :
+  { issue(1, open) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Coverage 2: when the blocking issue is CLOSED, the blocked issue 2 becomes
+--- ready.
+search in TRACKER-READINESS :
+  { issue(2, open) issue(1, closed) blocks(1, 2) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Coverage 3: when the lease EXPIRES -- expiresAt 40 <= now 50 -- the issue
+--- becomes ready again.
+search in TRACKER-READINESS :
+  { issue(1, open) lease(1, 7, 40) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 1: an issue blocked by an ACTIVE (open) issue is never ready.
+search in TRACKER-READINESS :
+  { issue(2, open) issue(1, open) blocks(1, 2) now(50) }
+  =>* { ready(2) RESIDUAL:Cfg } .
+
+--- Bite 2: an issue under an ACTIVE lease -- expiresAt 100 > now 50 -- is
+--- never ready.
+search in TRACKER-READINESS :
+  { issue(1, open) lease(1, 7, 100) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 3: a CLOSED issue is never ready.
+search in TRACKER-READINESS :
+  { issue(1, closed) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+--- Bite 4: a CANCELED issue is never ready.
+search in TRACKER-READINESS :
+  { issue(1, canceled) now(50) }
+  =>* { ready(1) RESIDUAL:Cfg } .
+
+quit .

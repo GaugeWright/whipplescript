@@ -1,0 +1,44 @@
+load ../discriminant-schema.maude
+
+--- Coverage inv a: reading f1 -- present only when disc == v1 -- inside the v2 arm is
+--- a cross-arm sibling access and is rejected.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  accessIn(f1, v2) whenField(f1, v1)
+  =>* C:Cfg rejectCrossSibling(f1, v2) .
+
+--- Coverage inv b: a when literal v3 outside the declared union v1,v2 is rejected.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) whenField(f1, v3)
+  =>* C:Cfg rejectWhenLiteral(v3) .
+
+--- Coverage inv d: disc == v1 but the required when-v1 field f1 is absent.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) disc(v1) whenField(f1, v1) present(mtF)
+  =>* C:Cfg rejectMissingRequired(f1, v1) .
+
+--- Coverage inv e: a runtime discriminant value v3 outside the union is rejected.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) disc(v3)
+  =>* C:Cfg rejectOutOfRange(v3) .
+
+--- Coverage inv c: a when clause referencing a non-discriminant field is rejected.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  whenRefsNonDisc(f2)
+  =>* C:Cfg rejectWhenRef(f2) .
+
+--- Bite: a same-arm read -- f1 read in its own v1 arm -- is fine; no cross-sibling.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) accessIn(f1, v1) whenField(f1, v1)
+  =>* rejectCrossSibling(X:Field, Y:Val) RESIDUAL:Cfg .
+
+--- Bite: the soundness-minimal admission rule -- disc == v1 with f1 present (required,
+--- ok) AND f2 present (inapplicable, for v2) -- is accepted. An inapplicable present
+--- sibling is NOT rejected; this is the all-keys-present webhook shape.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) disc(v1) whenField(f1, v1) whenField(f2, v2) present(f1 . f2)
+  =>* rejectMissingRequired(X:Field, Y:Val) RESIDUAL:Cfg .
+
+--- Bite: an in-range discriminant value is fine; no out-of-range rejection.
+search [1] in WHIPPLESCRIPT-DISCRIMINANT-SCHEMA :
+  union(v1 , v2) disc(v1)
+  =>* rejectOutOfRange(X:Val) RESIDUAL:Cfg .

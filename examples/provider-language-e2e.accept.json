@@ -3,10 +3,17 @@
   "workflow": "provider-language-e2e.whip",
   "provider": "fixture",
   "actions": [
-    {"type": "pause", "reason": "exercise acceptance fixture control action"},
-    {"type": "resume"}
+    {
+      "type": "pause",
+      "reason": "exercise acceptance fixture control action"
+    },
+    {
+      "type": "resume"
+    }
   ],
-  "include_tags": ["acceptance"],
+  "include_tags": [
+    "acceptance"
+  ],
   "expect": {
     "dev_status": "success",
     "workflow": "ProviderLanguageE2E",
@@ -16,13 +23,18 @@
         {
           "target_kind": "workflow",
           "target": "ProviderLanguageE2E",
-          "tags": ["fixture", "acceptance"],
+          "tags": [
+            "fixture",
+            "acceptance"
+          ],
           "description": "Fixture-backed provider x language acceptance workflow"
         },
         {
           "target_kind": "table",
           "target": "language_tasks",
-          "tags": ["fixture"],
+          "tags": [
+            "fixture"
+          ],
           "description": "Static provider x language task rows"
         },
         {
@@ -34,89 +46,170 @@
     },
     "diagnostics": 0,
     "actions": [
-      {"type": "pause", "count": 1},
-      {"type": "resume", "count": 1}
+      {
+        "type": "pause",
+        "count": 1
+      },
+      {
+        "type": "resume",
+        "count": 1
+      }
     ],
     "assertions": {
-      "total": 6,
-      "passed": 6,
+      "total": 5,
+      "passed": 5,
       "failed": 0,
       "error": 0
     },
     "assertion_tags": [
-      {"tag": "acceptance", "total": 6, "passed": 6, "failed": 0, "error": 0}
+      {
+        "tag": "acceptance",
+        "total": 5,
+        "passed": 5,
+        "failed": 0,
+        "error": 0
+      }
     ],
     "assertion_reads": [
       {
         "source": "effect:kind agent.tell where status == completed",
-        "match_count": 6,
+        "match_count": 4,
         "matches": [
           {
             "name": "agent.tell",
             "status": "completed",
             "prompt_content_type": "markdown",
-            "trace_items": 24,
-            "evidence_items": 12,
-            "count": 6
+            "trace_items": 16,
+            "evidence_items": 8,
+            "count": 4
           }
         ]
       },
       {
         "source": "effect:kind schema.coerce where status == completed",
-        "match_count": 6,
+        "match_count": 4,
         "matches": [
           {
             "name": "schema.coerce",
             "status": "completed",
             "prompt_content_type": "markdown",
-            "trace_items": 24,
-            "evidence_items": 6,
-            "count": 6
+            "trace_items": 16,
+            "evidence_items": 4,
+            "count": 4
           }
         ]
       }
     ],
     "trace": {
-      "conformance": {"ok": true},
+      "conformance": {
+        "ok": true
+      },
       "summary": {
-        "events": 70,
-        "abstract_events": 50
+        "events": 48,
+        "abstract_events": 34
       },
       "groups": [
-        {"type": "effect_created", "count": 12},
-        {"type": "effect_claimed", "count": 12},
-        {"type": "run_started", "count": 12},
-        {"type": "effect_terminal", "count": 12},
-        {"type": "instance_paused", "count": 1},
-        {"type": "instance_resumed", "count": 1}
+        {
+          "type": "effect_created",
+          "count": 8
+        },
+        {
+          "type": "effect_claimed",
+          "count": 8
+        },
+        {
+          "type": "run_started",
+          "count": 8
+        },
+        {
+          "type": "effect_terminal",
+          "count": 8
+        },
+        {
+          "type": "instance_paused",
+          "count": 1
+        },
+        {
+          "type": "instance_resumed",
+          "count": 1
+        }
       ]
     },
     "summary": {
-      "facts": 18,
-      "effects": 12
+      "facts": 12,
+      "effects": 8
     },
     "facts": [
-      {"name": "LanguageE2EResult", "count": 6}
+      {
+        "name": "LanguageE2EResult",
+        "count": 4
+      }
     ],
     "effects": [
-      {"kind": "agent.tell", "status": "completed", "count": 6},
-      {"kind": "schema.coerce", "status": "completed", "count": 6}
+      {
+        "kind": "agent.tell",
+        "status": "completed",
+        "count": 4
+      },
+      {
+        "kind": "schema.coerce",
+        "status": "completed",
+        "count": 4
+      }
     ],
     "runs": [
-      {"provider": "claude", "status": "completed", "count": 2, "artifact_count": 4},
-      {"provider": "codex", "status": "completed", "count": 2, "artifact_count": 4},
-      {"provider": "fixture", "status": "completed", "count": 6, "artifact_count": 0},
-      {"provider": "pi", "status": "completed", "count": 2, "artifact_count": 4}
+      {
+        "provider": "claude",
+        "status": "completed",
+        "count": 2,
+        "artifact_count": 4
+      },
+      {
+        "provider": "codex",
+        "status": "completed",
+        "count": 2,
+        "artifact_count": 4
+      },
+      {
+        "provider": "fixture",
+        "status": "completed",
+        "count": 4,
+        "artifact_count": 0
+      }
     ],
     "artifacts": [
-      {"kind": "stdout_ref", "mime_type": "text/plain", "count": 6},
-      {"kind": "transcript_ref", "mime_type": "text/plain", "count": 6}
+      {
+        "kind": "stdout_ref",
+        "mime_type": "text/plain",
+        "count": 4
+      },
+      {
+        "kind": "transcript_ref",
+        "mime_type": "text/plain",
+        "count": 4
+      }
     ],
     "evidence": [
-      {"kind": "agent.turn.provider", "subject_type": "run", "count": 6},
-      {"kind": "schema.coerce.provider", "subject_type": "run", "count": 6},
-      {"kind": "skills.injected", "subject_type": "run", "count": 6},
-      {"kind": "rule.committed", "subject_type": "rule_commit", "count": 19}
+      {
+        "kind": "agent.turn.provider",
+        "subject_type": "run",
+        "count": 4
+      },
+      {
+        "kind": "schema.coerce.provider",
+        "subject_type": "run",
+        "count": 4
+      },
+      {
+        "kind": "skills.injected",
+        "subject_type": "run",
+        "count": 4
+      },
+      {
+        "kind": "rule.committed",
+        "subject_type": "rule_commit",
+        "count": 13
+      }
     ]
   }
 }

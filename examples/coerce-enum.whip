@@ -1,3 +1,5 @@
+use std.coercion
+
 # `coerce` returning a sum-type `enum` (discriminated family A): the model picks a
 # variant, and the result is consumed by an exhaustive `case` whose arms narrow to
 # each variant's payload. The provider sees an anyOf-of-objects schema (one object

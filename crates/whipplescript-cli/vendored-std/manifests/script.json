@@ -1,0 +1,19 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.script",
+  "name": "std.script",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.script",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "script.raw",
+      "description": "Run a raw dev-profile exec command behind the operator allowlist (WHIPPLESCRIPT_EXEC_ALLOW). Seeded per program only when the program imports std.script AND the dev allowlist authority exists; hosted profiles never seed it. Operator script-manifest entries seed the script.<name> capability family under the same two-key rule (spec/std-script.md)."
+    }
+  ]
+}

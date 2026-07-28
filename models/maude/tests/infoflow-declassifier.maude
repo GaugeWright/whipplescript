@@ -1,0 +1,50 @@
+load ../infoflow-declassifier.maude
+
+--- ===================== COVERAGE =====================
+
+--- A privileged release with a TRUSTED (high-integrity) selector, granted, predicate
+--- holding, budget remaining -> released to the privileged reader.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  selectorInteg(hi) releaseReq(hi) granted predHolds budget(s 0)
+  =>* C:Cfg released(hi) .
+
+--- A refusal that depends only on a fixed PUBLIC budget (lo) is safely observable by
+--- the public -- no leak.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  refusalAt(lo) observer(lo) =>* C:Cfg obsOk .
+
+--- The refusal-channel DETECTOR fires: a secret-dependent refusal (hi) observed by
+--- the public (lo) is flagged as a leak.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  refusalAt(hi) observer(lo) =>* C:Cfg obsLeak .
+
+--- ===================== BITES =====================
+
+--- Bite (NMIF ON THE SELECTOR): an ATTACKER-STEERED selector (lo) can never drive a
+--- PRIVILEGED release (to a hi reader). No adaptive oracle to a privileged reader.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  selectorInteg(lo) releaseReq(hi) granted predHolds budget(s 0)
+  =>* released(hi) RESIDUAL:Cfg .
+
+--- Bite (BUDGET BACKSTOP): an exhausted budget (0) blocks any further release, even
+--- with grant and predicate satisfied.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  releaseReq(lo) granted predHolds budget(0)
+  =>* released(lo) RESIDUAL:Cfg .
+
+--- Bite (REFUSAL CHANNEL): a secret-dependent refusal cannot be safely observed by
+--- the public -- the refusal itself is a leak, so a budget must be fixed/public, not
+--- a data-dependent "refuse when dangerous".
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  refusalAt(hi) observer(lo) =>* obsOk RESIDUAL:Cfg .
+
+--- Bite (AUTHORITY, X3): an UNGRANTED release never fires, even with a trusted
+--- selector, predicate, and budget.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  selectorInteg(hi) releaseReq(hi) predHolds budget(s 0)
+  =>* released(hi) RESIDUAL:Cfg .
+
+--- Bite (PREDICATE): a release whose trusted predicate does NOT hold never fires.
+search [1] in WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER :
+  releaseReq(lo) granted budget(s 0)
+  =>* released(lo) RESIDUAL:Cfg .

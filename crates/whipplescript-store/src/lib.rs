@@ -10,6 +10,7 @@ pub mod files;
 pub mod improve;
 pub mod items;
 pub mod materialize;
+pub mod memory;
 pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
@@ -244,6 +245,17 @@ pub struct RuleCommit<'a> {
     pub dependencies: &'a [NewEffectDependency<'a>],
     pub terminal: Option<WorkflowTerminal<'a>>,
     pub idempotency_key: Option<&'a str>,
+    /// Declared `mark` names riding this committing site: a `mark.reached`
+    /// event per name is appended IN the commit transaction, so a cut
+    /// coordinate can never be lost between a durable commit and a
+    /// separate append (the experimentation surface's named cut points).
+    pub marks: &'a [&'a str],
+    /// DR-0043 slice 1: the firing's pinned context — identity plus the bound
+    /// trigger values — serialized by the kernel and embedded verbatim in the
+    /// `rule.committed` payload, making every firing record self-contained
+    /// (pinned re-lowering reads the record, replay is byte-exact). `None`
+    /// for callers that predate the pinning surface.
+    pub context_json: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -406,6 +418,22 @@ pub struct CapabilityBinding<'a> {
     pub capability: &'a str,
     pub provider: &'a str,
     pub config_json: &'a str,
+}
+
+/// One `capability_bindings` row as READ back for provider selection
+/// (spec/std-messaging.md "Channel→binding provider selection"): where
+/// `capability_bound_provider` collapses to a single name, this view carries
+/// every binding bound for a capability — provider id plus the binding's
+/// `config_json` (the capability report for messaging bindings) — so a
+/// channel-scoped selection step can resolve its declared provider against
+/// the full bound set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityBindingView {
+    pub binding_id: String,
+    pub program_id: Option<String>,
+    pub capability: String,
+    pub provider: Option<String>,
+    pub config_json: String,
 }
 
 /// One project-instruction document (AGENTS.md / CLAUDE.md) registered for the
@@ -607,16 +635,6 @@ pub struct ClaudeAgentSdkEvidence<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PiRpcEvidence<'a> {
-    pub instance_id: &'a str,
-    pub provider_id: &'a str,
-    pub session_id: &'a str,
-    pub run_id: &'a str,
-    pub metadata_json: &'a str,
-    pub correlation_id: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactRecord<'a> {
     pub run_id: &'a str,
     pub kind: &'a str,
@@ -728,46 +746,6 @@ pub struct DiagnosticView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NewInboxItem<'a> {
-    pub inbox_item_id: &'a str,
-    pub instance_id: &'a str,
-    pub effect_id: Option<&'a str>,
-    pub status: &'a str,
-    pub prompt: &'a str,
-    pub choices_json: &'a str,
-    pub freeform_allowed: bool,
-    pub severity: &'a str,
-    pub related_effects_json: &'a str,
-    pub related_artifacts_json: &'a str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InboxItemView {
-    pub inbox_item_id: String,
-    pub instance_id: String,
-    pub effect_id: Option<String>,
-    pub status: String,
-    pub prompt: String,
-    pub choices_json: String,
-    pub freeform_allowed: bool,
-    pub severity: String,
-    pub related_effects_json: String,
-    pub related_artifacts_json: String,
-    pub answer_json: Option<String>,
-    pub answered_by: Option<String>,
-    pub created_at: String,
-    pub answered_at: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HumanAnswer<'a> {
-    pub inbox_item_id: &'a str,
-    pub answer_json: &'a str,
-    pub answered_by: &'a str,
-    pub idempotency_key: Option<&'a str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NewEffectDependency<'a> {
     pub dependency_id: &'a str,
     pub upstream_effect_id: &'a str,
@@ -855,6 +833,12 @@ pub struct FactView {
     pub value_json: String,
     pub provenance_class: String,
     pub source_span_json: Option<String>,
+    /// The event that ADMITTED this fact (its current liveness generation).
+    /// A consumed-then-re-recorded fact keeps its content identity but gains
+    /// a fresh admitting event; the stepper folds this into a firing's
+    /// trigger_event_id so re-admissions commit under distinct keys. Empty
+    /// when reconstructed from contexts that predate the field.
+    pub source_event_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2130,6 +2114,38 @@ impl SqliteStore {
             }
         }
         let payload = rule_commit_payload(commit, program_version_id.as_deref(), revision_epoch)?;
+        // Replays are idempotent, collisions are bugs: a pinned re-lowering
+        // that reproduces a committed firing byte-for-byte (same idempotency
+        // key, same payload) returns the stored commit and touches nothing —
+        // while a DISTINCT commit landing on an existing key stays a loud
+        // error (it means two different firings derived one key).
+        if let Some(key) = commit.idempotency_key {
+            if let Some((event_id, sequence, stored_payload)) = tx
+                .query_row(
+                    "SELECT event_id, sequence, payload_json FROM events \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    params![commit.instance_id, key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                if stored_payload == payload {
+                    return Ok(StoredEvent { event_id, sequence });
+                }
+                return Err(StoreError::Conflict(format!(
+                    "rule commit idempotency key reused with a DIFFERENT payload \
+                     (rule `{}`, key `{key}`): two distinct firings derived one \
+                     commit key — this is a whip bug, please report it",
+                    commit.rule
+                )));
+            }
+        }
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -2143,6 +2159,29 @@ impl SqliteStore {
             },
         )?;
 
+        for mark in commit.marks {
+            let mark_payload = serde_json::json!({
+                "mark": mark,
+                "site": commit.rule,
+                "committed_event_id": event.event_id,
+            })
+            .to_string();
+            // Length-prefixed so a mark name containing `:` cannot shift the
+            // component boundary and alias another (mark, event) pair.
+            let mark_key = format!("mark-reached:{}:{mark}:{}", mark.len(), event.event_id);
+            append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: commit.instance_id,
+                    event_type: "mark.reached",
+                    payload_json: &mark_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&mark_key),
+                },
+            )?;
+        }
         for fact in commit.facts {
             insert_fact(
                 &tx,
@@ -2322,28 +2361,66 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let event = append_event_on(
-            &tx,
-            NewEvent {
-                instance_id: derived.instance_id,
-                event_type: "fact.derived",
-                payload_json: &payload,
-                source: derived.source,
-                causation_id: derived.causation_id,
-                correlation_id: derived.fact.correlation_id,
-                idempotency_key: derived.idempotency_key,
-            },
-        )?;
-        let (program_version_id, revision_epoch) = active_revision_on(&tx, derived.instance_id)?;
-        insert_fact(
-            &tx,
-            derived.instance_id,
-            derived.source,
-            &event.event_id,
-            program_version_id.as_deref(),
-            revision_epoch,
-            &derived.fact,
-        )?;
+        // Replay-tolerant: a re-derivation under an existing idempotency key is
+        // a crash-window heal (the caller's projection re-ran), not an error.
+        // On replay the fact row is inserted only if it is missing entirely —
+        // NEVER revived from consumed — so a replayed projection cannot
+        // resurrect a fact a rule legitimately consumed after the original
+        // derivation.
+        let existing_event = match derived.idempotency_key {
+            Some(key) => tx
+                .query_row(
+                    "SELECT event_id, sequence FROM events \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    params![derived.instance_id, key],
+                    |row| {
+                        Ok(StoredEvent {
+                            event_id: row.get(0)?,
+                            sequence: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?,
+            None => None,
+        };
+        let replayed = existing_event.is_some();
+        let event = match existing_event {
+            Some(event) => event,
+            None => append_event_on(
+                &tx,
+                NewEvent {
+                    instance_id: derived.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: derived.source,
+                    causation_id: derived.causation_id,
+                    correlation_id: derived.fact.correlation_id,
+                    idempotency_key: derived.idempotency_key,
+                },
+            )?,
+        };
+        let fact_row_exists = replayed
+            && tx
+                .query_row(
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
+                    params![derived.instance_id, derived.fact.name, derived.fact.key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        if !fact_row_exists {
+            let (program_version_id, revision_epoch) =
+                active_revision_on(&tx, derived.instance_id)?;
+            insert_fact(
+                &tx,
+                derived.instance_id,
+                derived.source,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                &derived.fact,
+            )?;
+        }
         tx.commit()?;
         Ok(event)
     }
@@ -2375,6 +2452,26 @@ impl SqliteStore {
                 .optional()?
                 .is_some();
             if exists {
+                skipped += 1;
+                continue;
+            }
+            // A LIVE identical row from an earlier admission (different
+            // fact_id, same (name, key)) makes this row a no-op re-assertion:
+            // report it `skipped`, not `admitted` — the counters feed the
+            // import completion fact, and an operator re-importing an
+            // unchanged file used to read "admitted: N" when nothing changed.
+            // A CONSUMED row falls through: re-admission via insert_fact's
+            // revive clause is a fresh admission (DR-0044) and counts.
+            let live_conflict = tx
+                .query_row(
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 \
+                     AND key = ?3 AND consumed_at IS NULL",
+                    params![batch.instance_id, batch.schema_name, row.key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if live_conflict {
                 skipped += 1;
                 continue;
             }
@@ -2627,7 +2724,7 @@ impl SqliteStore {
             WHERE candidate.instance_id = ?1
               AND candidate.kind != 'timer.wait'
               AND (
-                  candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+                  candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running')
               )
               AND NOT EXISTS (
@@ -2647,7 +2744,7 @@ impl SqliteStore {
                     AND dependency.downstream_effect_id = candidate.effect_id
                     AND NOT (
                         (dependency.predicate = 'succeeds' AND upstream.status = 'completed')
-                        OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out'))
+                        OR (dependency.predicate = 'fails' AND upstream.status = 'failed')
                         OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out')
                         OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled')
                         OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled'))
@@ -2686,7 +2783,13 @@ impl SqliteStore {
             .collect();
         let mut claimable = Vec::new();
         for effect in effects {
-            if policy_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
+            if let Some(block) = policy_block_on(&self.connection, instance_id, &effect.effect_id)?
+            {
+                // Persist the block where it is observed: skipping silently
+                // here left the effect reading `queued` with no reason forever
+                // (the only other persist point, `start_run`, is exactly what
+                // this filter prevents from running).
+                persist_policy_block_on(&self.connection, instance_id, &effect.effect_id, &block)?;
                 continue;
             }
             if capacity_block_on(&self.connection, instance_id, &effect.effect_id)?.is_some() {
@@ -2770,6 +2873,13 @@ impl SqliteStore {
             .into_iter()
             .flatten()
         {
+            // Operator-plane rows (`"plane": "operator"`, std-telemetry.md
+            // T3) are capability-free configuration for operator CLI
+            // surfaces: registering one here would mint exactly the
+            // decorative admission-plane row the design forbids.
+            if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+                continue;
+            }
             let config_json = provider
                 .get("config")
                 .map(Value::to_string)
@@ -2986,6 +3096,71 @@ impl SqliteStore {
             .optional()?
             .unwrap_or_default();
         capability_bound_provider(&self.connection, &program_id, capability)
+    }
+
+    /// Every binding bound for `capability` visible to the program running
+    /// `instance_id` (program-scoped rows first, then global `NULL` rows;
+    /// stable `binding_id` order within each scope). This is the
+    /// channel-scoped provider-selection read (spec/std-messaging.md
+    /// "Channel→binding provider selection"): the `capability_bound` gate
+    /// stays the program×capability policy check, and dispatch resolves a
+    /// channel's declared provider against these rows' provider ids, taking
+    /// the matching row's `config_json` capability report.
+    pub fn capability_bindings_for(
+        &self,
+        instance_id: &str,
+        capability: &str,
+    ) -> StoreResult<Vec<CapabilityBindingView>> {
+        let program_id = self
+            .connection
+            .query_row(
+                "SELECT program_id FROM instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT binding_id, program_id, capability, provider, config_json
+            FROM capability_bindings
+            WHERE capability = ?1
+              AND (program_id = ?2 OR program_id IS NULL)
+            ORDER BY (program_id IS NULL) ASC, binding_id ASC
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![capability, program_id], |row| {
+                Ok(CapabilityBindingView {
+                    binding_id: row.get(0)?,
+                    program_id: row.get(1)?,
+                    capability: row.get(2)?,
+                    provider: row.get(3)?,
+                    config_json: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The `effect_providers.config_json` for `(effect_kind, provider)` — the
+    /// registry-default configuration half of the coerce selection ladder's
+    /// rung 3 (spec/std-coercion.md "Backend selection and config precedence"):
+    /// `capability_bound_provider` names the provider, this row carries its
+    /// config. `None` when no such provider row exists.
+    pub fn effect_provider_config(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT config_json FROM effect_providers WHERE effect_kind = ?1 AND provider = ?2",
+                params![effect_kind, provider],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn bind_capability(&self, binding: CapabilityBinding<'_>) -> StoreResult<()> {
@@ -3502,55 +3677,6 @@ impl SqliteStore {
         Ok(evidence_id)
     }
 
-    pub fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        let metadata = serde_json::from_str::<Value>(evidence.metadata_json)?;
-        let metadata = json!({
-            "provider_id": evidence.provider_id,
-            "session_id": evidence.session_id,
-            "run_id": evidence.run_id,
-            "evidence": metadata,
-        })
-        .to_string();
-        let summary = format!(
-            "Pi RPC evidence for provider `{}` session `{}`",
-            evidence.provider_id, evidence.session_id
-        );
-        let evidence_id = insert_evidence_on(
-            &self.connection,
-            EvidenceRecord {
-                instance_id: evidence.instance_id,
-                kind: "pi.rpc.evidence",
-                subject_type: "provider_session",
-                subject_id: evidence.session_id,
-                causation_id: Some(evidence.run_id),
-                correlation_id: evidence.correlation_id,
-                summary: Some(&summary),
-                metadata_json: &metadata,
-            },
-        )?;
-        insert_evidence_link_on(
-            &self.connection,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider",
-                target_id: evidence.provider_id,
-                relation: "observes",
-            },
-        )?;
-        insert_evidence_link_on(
-            &self.connection,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider_run",
-                target_id: evidence.run_id,
-                relation: "observes",
-            },
-        )?;
-        Ok(evidence_id)
-    }
-
     pub fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         insert_evidence_link_on(&self.connection, link)
     }
@@ -3876,263 +4002,6 @@ impl SqliteStore {
         Ok(span)
     }
 
-    pub fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
-        serde_json::from_str::<Value>(item.choices_json)?;
-        serde_json::from_str::<Value>(item.related_effects_json)?;
-        serde_json::from_str::<Value>(item.related_artifacts_json)?;
-        self.connection.execute(
-            r#"
-            INSERT INTO inbox_items (
-                inbox_item_id,
-                instance_id,
-                effect_id,
-                status,
-                prompt,
-                choices_json,
-                freeform_allowed,
-                severity,
-                related_effects_json,
-                related_artifacts_json
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-            params![
-                item.inbox_item_id,
-                item.instance_id,
-                item.effect_id,
-                item.status,
-                item.prompt,
-                item.choices_json,
-                if item.freeform_allowed { 1 } else { 0 },
-                item.severity,
-                item.related_effects_json,
-                item.related_artifacts_json,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
-        let mut sql = r#"
-            SELECT
-                inbox_item_id,
-                instance_id,
-                effect_id,
-                status,
-                prompt,
-                choices_json,
-                freeform_allowed,
-                severity,
-                related_effects_json,
-                related_artifacts_json,
-                answer_json,
-                answered_by,
-                created_at,
-                answered_at
-            FROM inbox_items
-        "#
-        .to_owned();
-        if status.is_some() {
-            sql.push_str(" WHERE status = ?1");
-        }
-        sql.push_str(" ORDER BY created_at, inbox_item_id");
-
-        let mut statement = self.connection.prepare(&sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| {
-            Ok(InboxItemView {
-                inbox_item_id: row.get(0)?,
-                instance_id: row.get(1)?,
-                effect_id: row.get(2)?,
-                status: row.get(3)?,
-                prompt: row.get(4)?,
-                choices_json: row.get(5)?,
-                freeform_allowed: row.get::<_, i64>(6)? != 0,
-                severity: row.get(7)?,
-                related_effects_json: row.get(8)?,
-                related_artifacts_json: row.get(9)?,
-                answer_json: row.get(10)?,
-                answered_by: row.get(11)?,
-                created_at: row.get(12)?,
-                answered_at: row.get(13)?,
-            })
-        };
-        let rows = if let Some(status) = status {
-            statement
-                .query_map([status], map_row)?
-                .collect::<result::Result<Vec<_>, _>>()?
-        } else {
-            statement
-                .query_map([], map_row)?
-                .collect::<result::Result<Vec<_>, _>>()?
-        };
-        Ok(rows)
-    }
-
-    pub fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
-        self.connection
-            .query_row(
-                r#"
-                SELECT
-                    inbox_item_id,
-                    instance_id,
-                    effect_id,
-                    status,
-                    prompt,
-                    choices_json,
-                    freeform_allowed,
-                    severity,
-                    related_effects_json,
-                    related_artifacts_json,
-                    answer_json,
-                    answered_by,
-                    created_at,
-                    answered_at
-                FROM inbox_items
-                WHERE inbox_item_id = ?1
-                "#,
-                [inbox_item_id],
-                |row| {
-                    Ok(InboxItemView {
-                        inbox_item_id: row.get(0)?,
-                        instance_id: row.get(1)?,
-                        effect_id: row.get(2)?,
-                        status: row.get(3)?,
-                        prompt: row.get(4)?,
-                        choices_json: row.get(5)?,
-                        freeform_allowed: row.get::<_, i64>(6)? != 0,
-                        severity: row.get(7)?,
-                        related_effects_json: row.get(8)?,
-                        related_artifacts_json: row.get(9)?,
-                        answer_json: row.get(10)?,
-                        answered_by: row.get(11)?,
-                        created_at: row.get(12)?,
-                        answered_at: row.get(13)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
-        let answer_value = serde_json::from_str::<Value>(answer.answer_json)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let item = tx
-            .query_row(
-                r#"
-                SELECT instance_id, effect_id, prompt, status
-                FROM inbox_items
-                WHERE inbox_item_id = ?1
-                "#,
-                [answer.inbox_item_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::Conflict("inbox item was not found".to_owned()))?;
-        if item.3 != "pending" {
-            return Err(StoreError::Conflict(format!(
-                "inbox item `{}` is not pending",
-                answer.inbox_item_id
-            )));
-        }
-
-        tx.execute(
-            r#"
-            UPDATE inbox_items
-            SET status = 'answered',
-                answer_json = ?2,
-                answered_by = ?3,
-                answered_at = CURRENT_TIMESTAMP
-            WHERE inbox_item_id = ?1
-              AND status = 'pending'
-            "#,
-            params![answer.inbox_item_id, answer.answer_json, answer.answered_by],
-        )?;
-        let choice = answer_value
-            .get("choice")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let text = answer_value
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let payload = json!({
-            "inbox_item_id": answer.inbox_item_id,
-            "effect_id": item.1,
-            "prompt": item.2,
-            "answered_by": answer.answered_by,
-            "choice": choice,
-            "text": text,
-            "answer": answer_value,
-        })
-        .to_string();
-        let event = append_event_on(
-            &tx,
-            NewEvent {
-                instance_id: &item.0,
-                event_type: "human.answer.received",
-                payload_json: &payload,
-                source: "human",
-                causation_id: Some(answer.inbox_item_id),
-                correlation_id: item.1.as_deref(),
-                idempotency_key: answer.idempotency_key,
-            },
-        )?;
-        let fact_id = stable_hash_hex(&format!("{}:human-answer", answer.inbox_item_id));
-        let fact = NewFact {
-            fact_id: &fact_id,
-            name: "human.answer.received",
-            key: answer.inbox_item_id,
-            value_json: &payload,
-            schema_id: Some("HumanAnswer"),
-            provenance_class: "human",
-            correlation_id: item.1.as_deref(),
-            source_span_json: None,
-        };
-        let (program_version_id, revision_epoch) = active_revision_on(&tx, &item.0)?;
-        insert_fact(
-            &tx,
-            &item.0,
-            "human",
-            &event.event_id,
-            program_version_id.as_deref(),
-            revision_epoch,
-            &fact,
-        )?;
-        tx.commit()?;
-        Ok(event)
-    }
-
-    /// Holder-lifetime cleanup: when an instance reaches a terminal, its still
-    /// `pending` human asks are moot. Mark them `cancelled` so they drop out of
-    /// the inbox and can no longer be answered (`answer_inbox_item` rejects any
-    /// non-`pending` item) — otherwise an operator could waste a decision on a
-    /// dead instance. `inbox_items` is an authoritative table (not rebuilt by
-    /// `rebuild_projections`), so a direct status update is durable. Returns the
-    /// number of items cancelled.
-    pub fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
-        let changed = self.connection.execute(
-            r#"
-            UPDATE inbox_items
-            SET status = 'cancelled'
-            WHERE instance_id = ?1 AND status = 'pending'
-            "#,
-            [instance_id],
-        )?;
-        Ok(changed)
-    }
-
     pub fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
         let skills = self.skills_by_name(evidence.skill_names)?;
         let metadata = json!({
@@ -4393,10 +4262,38 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// The already-recorded event carrying this `(instance_id, idempotency_key)`
+    /// pair, if any — the read side of the events unique index, so admission
+    /// drivers can absorb a re-delivered key instead of tripping the index.
+    pub fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT event_id, sequence
+                FROM events
+                WHERE instance_id = ?1
+                  AND idempotency_key = ?2
+                "#,
+                params![instance_id, idempotency_key],
+                |row| {
+                    Ok(StoredEvent {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json
+            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json, source_event_id
             FROM facts
             WHERE instance_id = ?1
               AND consumed_at IS NULL
@@ -4414,6 +4311,7 @@ impl SqliteStore {
                     value_json: row.get(5)?,
                     provenance_class: row.get(6)?,
                     source_span_json: row.get(7)?,
+                    source_event_id: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -4423,7 +4321,7 @@ impl SqliteStore {
     pub fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let mut statement = self.connection.prepare(
             r#"
-            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json
+            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json, source_event_id
             FROM facts
             WHERE instance_id = ?1
             ORDER BY name, key
@@ -4440,6 +4338,7 @@ impl SqliteStore {
                     value_json: row.get(5)?,
                     provenance_class: row.get(6)?,
                     source_span_json: row.get(7)?,
+                    source_event_id: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 })
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -4643,7 +4542,7 @@ impl SqliteStore {
                 "reason": block.reason,
             })
             .to_string();
-            append_event_on(
+            append_event_idempotent_on(
                 &tx,
                 NewEvent {
                     instance_id: run.instance_id,
@@ -4666,7 +4565,7 @@ impl SqliteStore {
                     updated_at = CURRENT_TIMESTAMP
                 WHERE instance_id = ?3
                   AND effect_id = ?4
-                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+                  AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
                 "#,
                 params![block.status, block.reason, run.instance_id, run.effect_id],
             )?;
@@ -4719,7 +4618,10 @@ impl SqliteStore {
                 "reason": reason,
             })
             .to_string();
-            append_event_on(
+            // Idempotent: the same (effect, run) can be capacity-blocked again
+            // on a later worker pass after an interleaved unblock — the same
+            // durable statement, not a second event.
+            append_event_idempotent_on(
                 &tx,
                 NewEvent {
                     instance_id: run.instance_id,
@@ -4783,7 +4685,7 @@ impl SqliteStore {
                 updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1
               AND effect_id = ?2
-              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')
+              AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
             "#,
             params![run.instance_id, run.effect_id],
         )?;
@@ -5005,6 +4907,35 @@ impl SqliteStore {
     /// effects (dependency-cleared) and effects whose `timeout` deadline has
     /// expired. Resolved on worker passes; rule evaluation never reads the
     /// clock.
+    /// Seconds until the EARLIEST pending time deadline of this instance — a
+    /// relative `timeout_seconds` or an absolute `deadline_at` — or `None` when
+    /// no pending effect carries one. Negative when already due. Backs
+    /// `whip run --wait` (R5): the loop sleeps this long instead of stopping
+    /// idle on a pending timer.
+    pub fn next_time_deadline_seconds(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        let deadline: Option<i64> = self.connection.query_row(
+            r#"
+            SELECT MIN(due) - CAST(strftime('%s', 'now') AS INTEGER)
+            FROM (
+                SELECT CAST(strftime('%s', created_at) AS INTEGER) + timeout_seconds AS due
+                FROM effects
+                WHERE instance_id = ?1
+                  AND timeout_seconds IS NOT NULL
+                  AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+                UNION ALL
+                SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) AS INTEGER)
+                FROM effects
+                WHERE instance_id = ?1
+                  AND json_extract(input_json, '$.deadline_at') IS NOT NULL
+                  AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled')
+            )
+            "#,
+            params![instance_id],
+            |row| row.get(0),
+        )?;
+        Ok(deadline)
+    }
+
     pub fn due_time_effects(
         &self,
         instance_id: &str,
@@ -5220,12 +5151,40 @@ impl SqliteStore {
 
     /// Marks a projection fact consumed outside a rule commit (used when a
     /// projected work item stops being ready).
+    ///
+    /// DR-0044 ruling (P1 c, the `retire_fact` boundary): this retirement is a
+    /// raw projection UPDATE and appends NO event — projection facts are a
+    /// derived overlay (a `tracker.issue.ready` fact reflects live lease/blocks
+    /// state), not durable rule truth, so their coming-and-going is not part of
+    /// the event log. The ruling is DOCUMENTED BOUNDARY, not "make it an event":
+    /// any event-log-based tooling (`whip trace`, `local_trace.v0`, a log-join
+    /// staleness detector) is therefore BLIND to projection retirement. That is
+    /// acceptable because the consumers that need to observe retirement read the
+    /// live `facts` table instead — in particular DR-0044 P4's justification
+    /// view checks whether a firing's pinned binding fact_ids are still live
+    /// (a `facts` liveness read), which sees this UPDATE directly and needs no
+    /// event. Do NOT add a log-join detector for this class; use liveness.
     pub fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
         self.connection.execute(
             r#"
             UPDATE facts
             SET consumed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
             WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NULL
+            "#,
+            params![instance_id, fact_id],
+        )?;
+        Ok(())
+    }
+
+    /// Undo a [`retire_fact`](Self::retire_fact): the projection's backing
+    /// state is ready again under an unchanged generation. Same DR-0044
+    /// ruling — a raw overlay UPDATE, no event.
+    pub fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.connection.execute(
+            r#"
+            UPDATE facts
+            SET consumed_at = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NOT NULL
             "#,
             params![instance_id, fact_id],
         )?;
@@ -5453,6 +5412,89 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(event)
+    }
+
+    /// A transactionally-consistent snapshot of this store into a new file
+    /// (`VACUUM INTO`): safe against live writers and WAL sidecars, unlike
+    /// a file copy. The prefix-replay driver clones sources through this.
+    pub fn snapshot_to(&self, target: &Path) -> StoreResult<()> {
+        let target = target.to_string_lossy().replace('\'', "''");
+        self.connection
+            .execute_batch(&format!("VACUUM INTO '{target}'"))
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Prefix-replay support (`models/maude/prefix-replay.maude`): drop
+    /// every event after the cut for one instance, so a subsequent
+    /// `rebuild_projections` folds exactly the frozen prefix. FOR
+    /// DISPOSABLE COUNTERFACTUAL STORES ONLY — the live store's log is
+    /// append-only (a live rewind is `commit_restore`, which marks instead
+    /// of deleting); the caller owns that discipline. Unlike a restore
+    /// marker this does not bump the restore generation, so every pre-cut
+    /// identity re-derives byte-identically and replayed work dedupes
+    /// exactly (INV-P1 by exact dedup).
+    pub fn truncate_instance_events_after(
+        &mut self,
+        instance_id: &str,
+        cut_sequence: i64,
+    ) -> StoreResult<u64> {
+        let dropped = self
+            .connection
+            .execute(
+                "DELETE FROM events WHERE instance_id = ?1 AND sequence > ?2",
+                params![instance_id, cut_sequence],
+            )
+            .map_err(StoreError::from)?;
+        // Interaction rows are not sequence-keyed and would otherwise
+        // resurrect POST-cut recorded outcomes through byte-identical
+        // re-derived effect ids: a re-claimed pre-cut invoke would harvest
+        // the recorded child terminal, a re-asked human question would find
+        // its recorded answer. Dropping them is safe for the prefix too —
+        // effects settled pre-cut fold terminal and are never re-claimed,
+        // so their rows are unread; queued ones must regenerate fresh.
+        self.connection
+            .execute(
+                "DELETE FROM workflow_invocations WHERE parent_instance_id = ?1",
+                params![instance_id],
+            )
+            .map_err(StoreError::from)?;
+        Ok(dropped as u64)
+    }
+
+    /// Prefix-replay support: pin the instance row's version pointer to
+    /// the given prefix-derived value — a live activation that happened
+    /// AFTER the cut stamped the row with a version the truncated log no
+    /// longer contains (only replayed activation events restore it).
+    pub fn set_instance_version(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        revision_epoch: i64,
+    ) -> StoreResult<()> {
+        self.connection
+            .execute(
+                "UPDATE instances SET version_id = ?2, revision_epoch = ?3
+                 WHERE instance_id = ?1",
+                params![instance_id, version_id, revision_epoch],
+            )
+            .map_err(StoreError::from)?;
+        Ok(())
+    }
+
+    /// Prefix-replay support: a truncated prefix may predate the source
+    /// run's terminal, but `rebuild_projections` never resets the instance
+    /// row's status (only replayed terminal/transition events move it) —
+    /// reopen it so the suffix can drive.
+    pub fn reset_instance_to_running(&mut self, instance_id: &str) -> StoreResult<()> {
+        self.connection
+            .execute(
+                "UPDATE instances SET status = 'running', last_error = NULL,
+                   completed_at = NULL WHERE instance_id = ?1",
+                params![instance_id],
+            )
+            .map_err(StoreError::from)?;
+        Ok(())
     }
 
     pub fn rebuild_projections(&mut self, instance_id: &str) -> StoreResult<()> {
@@ -6051,7 +6093,6 @@ pub trait RuntimeStore {
         &self,
         evidence: ClaudeAgentSdkEvidence<'_>,
     ) -> StoreResult<String>;
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String>;
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()>;
     fn record_artifact(&self, artifact: ArtifactRecord<'_>) -> StoreResult<String>;
     fn list_artifacts_for_run(&self, run_id: &str) -> StoreResult<Vec<ArtifactView>>;
@@ -6066,11 +6107,6 @@ pub trait RuntimeStore {
         instance_id: &str,
         effect_id: &str,
     ) -> StoreResult<Option<String>>;
-    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()>;
-    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>>;
-    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>>;
-    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent>;
-    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize>;
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String>;
     fn list_evidence(&self, instance_id: &str) -> StoreResult<Vec<EvidenceView>>;
     fn list_evidence_for_subject(
@@ -6082,6 +6118,16 @@ pub trait RuntimeStore {
     fn list_instances(&self) -> StoreResult<Vec<InstanceView>>;
     fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>>;
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>>;
+    /// The already-recorded event carrying this `(instance_id, idempotency_key)`
+    /// pair, if any — the read side of the events unique index
+    /// (migrations/0001), so an admission driver can absorb a re-delivered
+    /// key instead of tripping the index (spec/std-ingress.md, one shared
+    /// admission core for every driver).
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>>;
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
     fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
     fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>>;
@@ -6118,6 +6164,10 @@ pub trait RuntimeStore {
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent>;
     fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()>;
+    /// Undo a [`retire_fact`](Self::retire_fact): a projection fact whose
+    /// backing state is ready again (with an unchanged generation) comes back
+    /// live. Same DR-0044 ruling — a raw overlay UPDATE, no event.
+    fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()>;
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent>;
     fn renew_lease(&mut self, renewal: LeaseRenewal<'_>) -> StoreResult<StoredEvent>;
     fn expire_leases(&mut self, instance_id: &str, now: &str) -> StoreResult<Vec<ExpiredLease>>;
@@ -6401,9 +6451,6 @@ impl RuntimeStore for SqliteStore {
     ) -> StoreResult<String> {
         self.record_claude_agent_sdk_evidence(evidence)
     }
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        self.record_pi_rpc_evidence(evidence)
-    }
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         self.link_evidence(link)
     }
@@ -6438,21 +6485,6 @@ impl RuntimeStore for SqliteStore {
     ) -> StoreResult<Option<String>> {
         self.effect_source_span_json(instance_id, effect_id)
     }
-    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
-        self.create_inbox_item(item)
-    }
-    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
-        self.list_inbox_items(status)
-    }
-    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
-        self.get_inbox_item(inbox_item_id)
-    }
-    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
-        self.answer_inbox_item(answer)
-    }
-    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
-        self.cancel_pending_inbox_for_instance(instance_id)
-    }
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
         self.record_skill_evidence(evidence)
     }
@@ -6477,6 +6509,13 @@ impl RuntimeStore for SqliteStore {
     }
     fn list_events(&self, instance_id: &str) -> StoreResult<Vec<EventView>> {
         self.list_events(instance_id)
+    }
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        self.event_by_idempotency_key(instance_id, idempotency_key)
     }
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         self.list_facts(instance_id)
@@ -6548,6 +6587,9 @@ impl RuntimeStore for SqliteStore {
     }
     fn retire_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
         self.retire_fact(instance_id, fact_id)
+    }
+    fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.revive_fact(instance_id, fact_id)
     }
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
         self.cancel_effect(cancellation)
@@ -6868,10 +6910,61 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
                 })
             },
         )
-        .map_err(Into::into)
+        .map_err(|error| {
+            // Name the colliding event in the error: a UNIQUE hit on the
+            // idempotency key is otherwise undebuggable from the generic
+            // "internal store error" the CLI wraps around it.
+            if let rusqlite::Error::SqliteFailure(f, _) = &error {
+                if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
+                    return StoreError::Conflict(format!(
+                        "duplicate event idempotency key for `{}` (key {:?}): a second \
+                         distinct commit produced an already-used key",
+                        event.event_type, event.idempotency_key
+                    ));
+                }
+            }
+            error.into()
+        })
+}
+
+/// `append_event_on`, tolerant of an idempotency-key replay: re-appending an
+/// event that already exists (same instance, same idempotency key) returns the
+/// stored row instead of a UNIQUE-constraint error. For observability events
+/// that legitimately recur — a capacity block re-observed for the same
+/// (effect, run) on a later worker pass is the same durable statement, not a
+/// second one.
+#[cfg(feature = "native")]
+fn append_event_idempotent_on(
+    connection: &Connection,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    if let Some(key) = event.idempotency_key {
+        if let Some(existing) = connection
+            .query_row(
+                "SELECT event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                params![event.instance_id, key],
+                |row| {
+                    Ok(StoredEvent {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+        {
+            return Ok(existing);
+        }
+    }
+    append_event_on(connection, event)
 }
 
 #[cfg(feature = "native")]
+/// Facts are set-like by (instance, name, key), and the record key is
+/// content-derived (`record_fact_key`). A conflicting insert is either a
+/// byte-identical fact already ACTIVE in the projection — a harmless no-op
+/// re-assertion — or a CONSUMED row being re-recorded, which is a fresh
+/// admission (DR-0044): the row revives, taking the new admission's
+/// fact_id/source_event_id so the committing event and the live row agree.
 fn insert_fact(
     connection: &Connection,
     instance_id: &str,
@@ -6902,6 +6995,16 @@ fn insert_fact(
             source_span_json
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(instance_id, name, key) DO UPDATE SET
+            consumed_at = NULL,
+            fact_id = excluded.fact_id,
+            value_json = excluded.value_json,
+            source_event_id = excluded.source_event_id,
+            source_rule = excluded.source_rule,
+            program_version_id = excluded.program_version_id,
+            revision_epoch = excluded.revision_epoch,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE facts.consumed_at IS NOT NULL
         "#,
         params![
             fact.fact_id,
@@ -7399,9 +7502,17 @@ fn policy_block_on(
         return Ok(None);
     };
 
+    // A persisted policy block (`blocked_by_capability` / `blocked_by_profile`)
+    // is re-evaluated here every pass: this is what makes it RECOVERABLE — the
+    // moment the missing profile/capability is registered, the gate returns
+    // None and the effect is claimable again.
     if !matches!(
         effect.status.as_str(),
-        "queued" | "blocked_by_dependency" | "blocked_by_capacity"
+        "queued"
+            | "blocked_by_dependency"
+            | "blocked_by_capacity"
+            | "blocked_by_capability"
+            | "blocked_by_profile"
     ) {
         return Ok(None);
     }
@@ -7410,17 +7521,22 @@ fn policy_block_on(
         return Ok(Some(block));
     }
 
-    // Timers, builtin-tracker verbs, and coordination verbs
-    // (spec/coordination.md) are resolved by the runtime itself on worker
-    // passes: no provider, capability, or profile applies.
-    if effect.kind == "timer.wait"
-        || effect.kind.starts_with("tracker.")
-        || effect.kind.starts_with("lease.")
-        || effect.kind.starts_with("ledger.")
-        || effect.kind.starts_with("counter.")
-        || effect.kind == "signal.emit"
-        || effect.kind.starts_with("file.")
-    {
+    // Timers are resolved by the runtime itself on worker passes: no provider,
+    // capability, or profile applies.
+    //
+    // Coordination kinds (`lease.*` / `ledger.*` / `counter.*`, std.coord
+    // slice 4), file kinds (`file.*`, std.files slice F2), tracker kinds
+    // (`tracker.*`, std.tracker slice T4), and the ingress kind
+    // (`signal.emit`, std.ingress slice I2b) are NOT exempt here: the
+    // embedded std.coord / std.files / std.tracker / std.ingress manifests
+    // seed their capability/provider/binding rows at store init, so the
+    // admission gate is REAL for them — an unbound kind blocks as
+    // blocked_by_capability. INTENTIONAL DIVERGENCE from the DO mirror
+    // (host-do/do_store.rs `do_policy_block_on`), which keeps the exemptions
+    // until the DO tracker's package-registration row seeds the same rows in
+    // the DO bootstrap (spec/std-coord.md / spec/std-files.md /
+    // spec/std-tracker.md / spec/std-ingress.md "Deferred with cause").
+    if effect.kind == "timer.wait" {
         return Ok(None);
     }
 
@@ -7479,6 +7595,55 @@ fn policy_block_on(
     }
 
     policy_block_for_capabilities(connection, &effect, &capabilities)
+}
+
+/// Persist a policy block observed by the claim-list filter, so the record
+/// tells the truth: the effect flips to the block's status with its reason and
+/// an `effect.blocked` event is appended — idempotent per (effect, reason), so
+/// repeated passes with an unchanged verdict write nothing. Recovery is
+/// automatic: `policy_block_on` re-evaluates persisted blocks each pass and
+/// the effect rejoins the claimable set the moment the gate clears.
+#[cfg(feature = "native")]
+fn persist_policy_block_on(
+    connection: &Connection,
+    instance_id: &str,
+    effect_id: &str,
+    block: &PolicyBlock,
+) -> StoreResult<()> {
+    let changed = connection.execute(
+        r#"
+        UPDATE effects
+        SET status = ?1,
+            policy_block_reason = ?2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE instance_id = ?3
+          AND effect_id = ?4
+          AND (status != ?1 OR policy_block_reason IS NOT ?2)
+          AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')
+        "#,
+        params![block.status, block.reason, instance_id, effect_id],
+    )?;
+    if changed == 1 {
+        let payload = json!({
+            "effect_id": effect_id,
+            "status": block.status,
+            "reason": block.reason,
+        })
+        .to_string();
+        append_event_idempotent_on(
+            connection,
+            NewEvent {
+                instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&format!("policy-block:{effect_id}:{}", block.reason)),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native")]
@@ -9143,7 +9308,11 @@ fn skill_to_json(skill: &SkillView) -> Value {
 
 #[cfg(feature = "native")]
 fn stable_hash_hex(value: &str) -> String {
-    format!("{:016x}", stable_hash(value))
+    let mut hex = String::with_capacity(32);
+    for byte in stable_hash_bytes(value) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// Execution fingerprint for a run, per spec/execution-contract.md: the
@@ -9209,13 +9378,17 @@ fn fingerprint_salt_from_metadata(metadata_json: &str) -> Option<String> {
 }
 
 #[cfg(feature = "native")]
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn stable_hash_bytes(value: &str) -> [u8; 16] {
+    // SHA-256/128 (the FNV-collision hardening swap): these digests cover
+    // user-authored content — file bodies (`file.write.completed`
+    // content_hash), skill bodies, manifests — where a crafted collision
+    // aliases two contents. The DO mirror in do_store.rs must stay
+    // byte-identical.
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
 }
 
 #[cfg(feature = "native")]
@@ -9350,6 +9523,14 @@ fn rule_commit_payload(
             Some(terminal) => Some(serde_json::from_str::<Value>(&workflow_terminal_payload(commit, terminal)?)?),
             None => None,
         },
+        // DR-0043 slice 1: the firing's pinned context (identity + bound
+        // trigger values), kernel-serialized; makes the firing record
+        // self-contained for pinned re-lowering and `whip progressions`.
+        "context": commit
+            .context_json
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .unwrap_or(Value::Null),
     });
     serde_json::to_string(&payload).map_err(Into::into)
 }
@@ -10547,7 +10728,7 @@ mod tests {
 
     #[test]
     fn store_scaffold_links_to_core() {
-        assert_eq!(store_stage(), "stage-0-skeleton");
+        assert_eq!(store_stage(), "release");
     }
 
     /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:
@@ -10594,7 +10775,6 @@ mod tests {
             "skills",
             "skill_attachments",
             "capability_bindings",
-            "inbox_items",
             "compute_result_cache",
             "content_blobs",
         ] {
@@ -10840,6 +11020,71 @@ mod tests {
         );
     }
 
+    /// The batch-admission ruling (Jack 2026-07-24, DR-0044 alignment): the
+    /// per-row fact_id skip is REPLAY-scoped (same admission re-running never
+    /// re-admits), while a NEW admission (fresh effect → fresh fact_ids) of a
+    /// CONSUMED identical row revives it as a fresh admission via
+    /// insert_fact's revive clause — and a LIVE identical row counts
+    /// `skipped`, not `admitted` (a no-op re-assertion).
+    #[test]
+    fn admit_fact_batch_readmits_consumed_rows_under_a_new_admission() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let rows = [FactBatchRow {
+            fact_id: "imp1:row:0",
+            key: "0",
+            value_json: r#"{"title":"a"}"#,
+        }];
+        let first_batch = FactBatch {
+            instance_id: "instance-a",
+            source: "kernel",
+            causation_id: None,
+            correlation_id: Some("effect-1"),
+            schema_name: "IssueRow",
+            schema_id: Some("IssueRow"),
+            rows: &rows,
+        };
+        let first = store.admit_fact_batch(first_batch).expect("batch admits");
+        assert_eq!((first.admitted, first.skipped), (1, 0));
+
+        // A NEW admission while the row is LIVE: no-op re-assertion, skipped.
+        let live_rows = [FactBatchRow {
+            fact_id: "imp2:row:0",
+            key: "0",
+            value_json: r#"{"title":"a"}"#,
+        }];
+        let live_again = FactBatch {
+            correlation_id: Some("effect-2"),
+            rows: &live_rows,
+            ..first_batch
+        };
+        let second = store.admit_fact_batch(live_again).expect("live re-import");
+        assert_eq!((second.admitted, second.skipped), (0, 1));
+        let live = store.list_facts("instance-a").expect("facts");
+        assert_eq!(live[0].fact_id, "imp1:row:0", "live row untouched");
+
+        // Consume the fact, then re-import via a THIRD admission: fresh
+        // admission — the row revives carrying the new fact_id.
+        store
+            .retire_fact("instance-a", "imp1:row:0")
+            .expect("consumes");
+        assert!(store.list_facts("instance-a").expect("facts").is_empty());
+        let readmit_rows = [FactBatchRow {
+            fact_id: "imp3:row:0",
+            key: "0",
+            value_json: r#"{"title":"a"}"#,
+        }];
+        let readmit = FactBatch {
+            correlation_id: Some("effect-3"),
+            rows: &readmit_rows,
+            ..first_batch
+        };
+        let third = store.admit_fact_batch(readmit).expect("re-admits");
+        assert_eq!((third.admitted, third.skipped), (1, 0));
+        let revived = store.list_facts("instance-a").expect("facts");
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].fact_id, "imp3:row:0", "new admission identity");
+    }
+
     #[test]
     fn creates_program_versions_and_instances() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
@@ -10898,6 +11143,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-keep"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit keep");
         // Orphaned-to-be segment: seq 2 commits eff-orphan.
@@ -10912,6 +11159,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-orphan"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit orphan");
         assert_eq!(store.list_effects("instance-a").expect("list").len(), 2);
@@ -10959,6 +11208,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-resume"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit resume");
         let visible = store.list_effects("instance-a").expect("list");
@@ -10998,6 +11249,8 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11038,6 +11291,8 @@ mod tests {
                     idempotency_key: Some("workflow-complete-result"),
                 }),
                 idempotency_key: Some("commit-finish"),
+                marks: &[],
+                context_json: None,
             })
             .expect("terminal commit succeeds");
 
@@ -11063,6 +11318,8 @@ mod tests {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("commit-again"),
+            marks: &[],
+            context_json: None,
         });
         assert!(matches!(duplicate, Err(StoreError::Conflict(_))));
     }
@@ -11084,6 +11341,8 @@ mod tests {
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("bad-commit"),
+            marks: &[],
+            context_json: None,
         });
 
         assert!(result.is_err());
@@ -11108,6 +11367,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11147,6 +11408,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11239,6 +11502,8 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
         store
@@ -11303,6 +11568,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-seed"),
+                marks: &[],
+                context_json: None,
             })
             .expect("seed commit succeeds");
 
@@ -11325,6 +11592,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-finish"),
+                marks: &[],
+                context_json: None,
             })
             .expect("consume commit succeeds");
 
@@ -11370,6 +11639,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11416,6 +11687,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11557,6 +11830,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11621,6 +11896,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11668,6 +11945,8 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11744,6 +12023,8 @@ mod tests {
                     dependencies: &dependencies,
                     terminal: None,
                     idempotency_key: Some("commit-start"),
+                    marks: &[],
+                    context_json: None,
                 })
                 .expect("rule commit succeeds");
             store
@@ -11820,6 +12101,8 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -11907,6 +12190,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -11966,6 +12251,8 @@ mod tests {
                     idempotency_key: Some("workflow-complete-terminal-guard"),
                 }),
                 idempotency_key: Some("commit-finish-terminal-guard"),
+                marks: &[],
+                context_json: None,
             })
             .expect("terminal commit succeeds");
 
@@ -12040,6 +12327,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-old"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old rule commits");
         assert_eq!(
@@ -12079,6 +12368,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-new"),
+                marks: &[],
+                context_json: None,
             })
             .expect("new rule commits");
 
@@ -12162,6 +12453,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-stale"),
+                marks: &[],
+                context_json: None,
             },
             RuleCommitRevisionGuard {
                 program_version_id: &version1.version_id,
@@ -12259,6 +12552,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-old"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old rule commits");
         store
@@ -12310,6 +12605,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-new"),
+                marks: &[],
+                context_json: None,
             })
             .expect("new rule commits");
         let blocked = store
@@ -12363,6 +12660,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-policy-old"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old rule commits");
         store
@@ -12576,6 +12875,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-kept-effects"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old effects commit");
         store
@@ -12651,6 +12952,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -12746,6 +13049,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel-after-terminal"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -12821,6 +13126,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-request-cancel-timeout"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -12930,6 +13237,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-invoke-child"),
+                marks: &[],
+                context_json: None,
             })
             .expect("parent invoke rule commits");
         let child = store
@@ -13244,6 +13553,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-work"),
+                marks: &[],
+                context_json: None,
             })
             .expect("fact commits");
 
@@ -13348,6 +13659,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-work"),
+                marks: &[],
+                context_json: None,
             })
             .expect("fact commits");
 
@@ -13464,6 +13777,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-full-old"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old rule commits");
         store
@@ -13595,6 +13910,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-bounded-a"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect A commits");
         store
@@ -13608,6 +13925,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-bounded-b"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect B commits");
 
@@ -13681,6 +14000,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-a"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect A commits");
         store
@@ -13694,6 +14015,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-b"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect B commits");
 
@@ -13723,6 +14046,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-restore-c"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect C commits");
 
@@ -13876,6 +14201,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-checkpoint-busy"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect commits");
         store
@@ -14089,6 +14416,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-terminal-replay"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect commits");
         store
@@ -14177,6 +14506,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-lease-replay"),
+                marks: &[],
+                context_json: None,
             })
             .expect("effect commits");
         store
@@ -14255,6 +14586,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-old"),
+                marks: &[],
+                context_json: None,
             })
             .expect("old rule commits");
         store
@@ -14278,6 +14611,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-replay-new"),
+                marks: &[],
+                context_json: None,
             })
             .expect("new rule commits");
 
@@ -14335,6 +14670,8 @@ mod tests {
                 dependencies: &dependencies,
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
 
@@ -14366,6 +14703,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
         store
@@ -14419,6 +14758,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commit succeeds");
         store
@@ -14532,6 +14873,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         let run_metadata_json = r#"{"native_provider":{"provider_id":"coder","provider_kind":"codex","surface":"codex.app_server"}}"#;
@@ -14605,62 +14948,6 @@ mod tests {
     }
 
     #[test]
-    fn creates_and_answers_human_inbox_items() {
-        let mut store = SqliteStore::open_in_memory().expect("store opens");
-        let version = store
-            .create_program_version(test_program_version("HumanReview", "source-1", "ir-1"))
-            .expect("program version creates");
-        let instance = store
-            .create_instance(NewInstance {
-                program_id: &version.program_id,
-                version_id: &version.version_id,
-                input_json: "{}",
-            })
-            .expect("instance creates");
-
-        store
-            .create_inbox_item(NewInboxItem {
-                inbox_item_id: "inbox-review",
-                instance_id: &instance.instance_id,
-                effect_id: None,
-                status: "pending",
-                prompt: "Approve this change?",
-                choices_json: r#"["approve","reject"]"#,
-                freeform_allowed: false,
-                severity: "normal",
-                related_effects_json: "[]",
-                related_artifacts_json: "[]",
-            })
-            .expect("inbox item creates");
-        let pending = store
-            .list_inbox_items(Some("pending"))
-            .expect("pending inbox lists");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].inbox_item_id, "inbox-review");
-        assert!(!pending[0].freeform_allowed);
-
-        let event = store
-            .answer_inbox_item(HumanAnswer {
-                inbox_item_id: "inbox-review",
-                answer_json: r#"{"kind":"choice","choice":"approve"}"#,
-                answered_by: "jack",
-                idempotency_key: Some("answer-inbox-review"),
-            })
-            .expect("inbox item answers");
-        assert_eq!(event.sequence, 1);
-        let item = store
-            .get_inbox_item("inbox-review")
-            .expect("item loads")
-            .expect("item exists");
-        assert_eq!(item.status, "answered");
-        assert_eq!(item.answered_by.as_deref(), Some("jack"));
-        let facts = store.list_facts(&instance.instance_id).expect("facts list");
-        assert!(facts.iter().any(
-            |fact| fact.name == "human.answer.received" && fact.value_json.contains("approve")
-        ));
-    }
-
-    #[test]
     fn records_lists_and_deduplicates_diagnostics_with_links() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
         let version = store
@@ -14685,6 +14972,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         let run_event = store
@@ -14830,6 +15119,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -15007,6 +15298,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-workspace-record"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -15207,6 +15500,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         let blocked = store
@@ -15289,6 +15584,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15356,6 +15653,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15433,6 +15732,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15480,6 +15781,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15541,6 +15844,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15549,7 +15854,19 @@ mod tests {
             .expect("claimable effects load");
 
         assert!(claimable.is_empty());
-        assert_eq!(effect_status(&store, "memory"), "queued");
+        // The observed block is persisted, not silently skipped: the record
+        // must say WHY the effect is going nowhere.
+        assert_eq!(effect_status(&store, "memory"), "blocked_by_capability");
+        let effect = store
+            .list_effects(&instance.instance_id)
+            .expect("effects list")
+            .into_iter()
+            .find(|effect| effect.effect_id == "memory")
+            .expect("effect exists");
+        assert_eq!(
+            effect.policy_block_reason.as_deref(),
+            Some("capability `plugin.memory` is not registered")
+        );
     }
 
     #[test]
@@ -15561,6 +15878,201 @@ mod tests {
         assert!(
             !declared_agents_present(r#"{"harnesses":[{"name":"coder","kind":"codex"}]}"#)
                 .expect("metadata parses")
+        );
+    }
+
+    /// A capacity-blocked effect is retried by the worker on later passes with
+    /// its SAME (effect, run) identity; each re-block re-records the
+    /// `effect.blocked` event under the same `capacity-block:<effect>:<run>`
+    /// idempotency key. That replay must be tolerated as the same durable
+    /// statement — it used to surface as a raw UNIQUE-constraint store error
+    /// that crashed `whip run` whenever the interleaving re-blocked a run
+    /// (three fan-out tells against `capacity 1` hit it most passes).
+    #[test]
+    fn repeated_capacity_block_for_same_run_is_idempotent() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(NewProgramVersion {
+                declared_profiles_json: r#"[{"name":"worker","profile":"repo-writer","capacity":1,"capabilities":["agent.tell"]}]"#,
+                ..test_program_version("CapacityReplay", "source-1", "ir-1")
+            })
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [
+            test_effect("tell-one", "agent.tell", "rule=start;effect=tell-one"),
+            test_effect("tell-two", "agent.tell", "rule=start;effect=tell-two"),
+        ];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell-one",
+                run_id: "run-one",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-one",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("first run starts");
+        for attempt in 0..2 {
+            let blocked = store
+                .start_run(RunStart {
+                    instance_id: &instance.instance_id,
+                    effect_id: "tell-two",
+                    run_id: "run-two",
+                    provider: "test",
+                    worker_id: "worker-1",
+                    lease_id: "lease-two",
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: "{}",
+                })
+                .expect_err("capacity blocks the run");
+            assert!(
+                matches!(blocked, StoreError::CapacityBlocked { .. }),
+                "attempt {attempt} must report CapacityBlocked, not a raw store error: {blocked:?}"
+            );
+        }
+        assert_eq!(effect_status(&store, "tell-two"), "blocked_by_capacity");
+    }
+
+    #[test]
+    fn claim_list_persists_policy_block_and_registration_recovers_it() {
+        // An effect whose profile is unregistered must not sit `queued` with no
+        // reason forever: listing claimable effects persists the block (status
+        // + reason + effect.blocked event), and registering the profile later
+        // makes the same effect claimable again with the stale reason cleared.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("GhostProfile", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let effects = [NewEffect {
+            profile: Some("ghost"),
+            ..test_effect("tell", "agent.tell", "rule=start;effect=tell")
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable listing works");
+        assert!(claimable.is_empty(), "blocked effect must not be claimable");
+        assert_eq!(effect_status(&store, "tell"), "blocked_by_profile");
+        let effect = store
+            .list_effects(&instance.instance_id)
+            .expect("effects list")
+            .into_iter()
+            .find(|effect| effect.effect_id == "tell")
+            .expect("effect exists");
+        assert_eq!(
+            effect.policy_block_reason.as_deref(),
+            Some("profile `ghost` is not registered")
+        );
+        let blocked_events = store
+            .list_events(&instance.instance_id)
+            .expect("events list")
+            .into_iter()
+            .filter(|event| event.event_type == "effect.blocked")
+            .count();
+        assert_eq!(blocked_events, 1, "block is recorded as an event");
+
+        // A second pass with an unchanged verdict writes nothing new.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable listing works");
+        assert!(claimable.is_empty());
+        let blocked_events = store
+            .list_events(&instance.instance_id)
+            .expect("events list")
+            .into_iter()
+            .filter(|event| event.event_type == "effect.blocked")
+            .count();
+        assert_eq!(blocked_events, 1, "re-observation is idempotent");
+
+        // Registering the profile recovers the effect without any requeue verb.
+        store
+            .register_profile(ProfileRegistration {
+                profile_id: "profile-ghost",
+                name: "ghost",
+                description: "late-registered",
+                enforcement_mode: "audit",
+                allowed_capabilities_json: "[]",
+                config_json: "{}",
+            })
+            .expect("profile registers");
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable listing works");
+        assert_eq!(
+            claimable
+                .iter()
+                .map(|e| e.effect_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tell"],
+            "registration makes the blocked effect claimable again"
+        );
+        store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "tell",
+                run_id: "run-1",
+                provider: "test",
+                worker_id: "worker-1",
+                lease_id: "lease-1",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect("recovered effect starts");
+        assert_eq!(effect_status(&store, "tell"), "running");
+        let effect = store
+            .list_effects(&instance.instance_id)
+            .expect("effects list")
+            .into_iter()
+            .find(|effect| effect.effect_id == "tell")
+            .expect("effect exists");
+        assert!(
+            effect.policy_block_reason.is_none(),
+            "claiming clears the stale block reason"
         );
     }
 
@@ -15596,6 +16108,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         let claimable = store
@@ -15708,6 +16222,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15772,6 +16288,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15848,6 +16366,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
         store
@@ -15910,6 +16430,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15962,6 +16484,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
             })
             .expect("rule commits");
 
@@ -15970,6 +16494,478 @@ mod tests {
             .expect("claimable effects load");
         assert_eq!(claimable.len(), 1);
         assert_eq!(claimable[0].effect_id, "query");
+    }
+
+    /// std.coord slice 4 gate: the NATIVE admission gate is real for
+    /// coordination kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND coordination kind blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.coord manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn coordination_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("CoordGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "acquire-1",
+            kind: "lease.acquire",
+            target: None,
+            input_json: r#"{"resource":"deploy_slot","key":"prod","slots":1,"ttl_seconds":60}"#,
+            status: "queued",
+            idempotency_key: "rule=grab;effect=acquire-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "grab",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-grab"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound coordination kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "acquire-1",
+                run_id: "run-acquire",
+                provider: "coordination",
+                worker_id: "worker-1",
+                lease_id: "lease-acquire",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound coordination kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("lease.acquire")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "acquire-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.coord manifest registered
+        // first (production order — `register_locked_packages` runs at store
+        // init, before any worker pass), the same effect is claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/coord.json"))
+            .expect("std.coord manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version("CoordGateSeeded", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "grab",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-grab"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "acquire-1");
+    }
+
+    /// std.files slice F2 gate: the NATIVE admission gate is real for
+    /// `file.*` kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND file kind blocks loudly as
+    /// blocked_by_capability — the stale-store fixture (a workspace whose
+    /// store lacks the std.files rows fails loud, never hangs) — and the
+    /// same kind becomes claimable once the embedded std.files manifest's
+    /// capability/provider/binding rows are registered, exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn file_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("FilesGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "read-1",
+            kind: "file.read",
+            target: None,
+            input_json: r#"{"store":"docs","root":".","path":"note.md","format":"text"}"#,
+            status: "queued",
+            idempotency_key: "rule=load;effect=read-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "load",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-load"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        // Unbound (stale store): no worker may claim it, and a forced start
+        // blocks durably and loudly.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound file kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "read-1",
+                run_id: "run-read",
+                provider: "files",
+                worker_id: "worker-1",
+                lease_id: "lease-read",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound file kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("file.read")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "read-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.files manifest registered
+        // first (production order — `register_locked_packages` runs at store
+        // init, before any worker pass), the same effect is claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/files.json"))
+            .expect("std.files manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version("FilesGateSeeded", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "load",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-load"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "read-1");
+    }
+
+    /// std.tracker slice T4 gate: the NATIVE admission gate is real for
+    /// tracker kinds. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND tracker kind blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.tracker manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn tracker_kind_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("TrackerGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "claim-1",
+            kind: "tracker.claim",
+            target: None,
+            input_json: r#"{"id":"WS-1"}"#,
+            status: "queued",
+            idempotency_key: "rule=work;effect=claim-1",
+            required_capabilities_json: r#"["tracker.claim"]"#,
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "work",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound tracker kind must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "claim-1",
+                run_id: "run-claim",
+                provider: "queue",
+                worker_id: "worker-1",
+                lease_id: "lease-claim",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound tracker kind blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("tracker.claim")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "claim-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.tracker manifest
+        // registered first (production order — `register_locked_packages`
+        // runs at store init, before any worker pass), the same effect is
+        // claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/tracker.json"))
+            .expect("std.tracker manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version(
+                "TrackerGateSeeded",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "work",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-work"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "claim-1");
+    }
+
+    /// std.ingress slice I2b gate: the NATIVE admission gate is real for
+    /// `signal.emit`. With the builtin exemption deleted from
+    /// `policy_block_on`, an UNBOUND `signal.emit` effect blocks as
+    /// blocked_by_capability (no effect provider registered), and the same
+    /// kind becomes claimable once the embedded std.ingress manifest's
+    /// capability/provider/binding rows are registered — exactly what
+    /// `register_locked_packages` seeds at store init in production.
+    #[test]
+    fn signal_emit_blocks_unbound_and_claims_once_manifest_seeded() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("IngressGate", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+
+        let effects = [NewEffect {
+            timeout_seconds: None,
+            effect_id: "emit-1",
+            kind: "signal.emit",
+            target: None,
+            input_json: r#"{"target_instance":"peer","event":"deploy.finished","payload":{}}"#,
+            status: "queued",
+            idempotency_key: "rule=notify;effect=emit-1",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+        }];
+        store
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "notify",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-notify"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+
+        // Unbound: no worker may claim it, and a forced start blocks durably.
+        let claimable = store
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert!(
+            claimable.is_empty(),
+            "unbound signal.emit must not be claimable: {claimable:?}"
+        );
+        let blocked = store
+            .start_run(RunStart {
+                instance_id: &instance.instance_id,
+                effect_id: "emit-1",
+                run_id: "run-emit",
+                provider: "notify",
+                worker_id: "worker-1",
+                lease_id: "lease-emit",
+                lease_expires_at: "2030-01-01T00:00:00Z",
+                metadata_json: "{}",
+            })
+            .expect_err("unbound signal.emit blocks at admission");
+        assert!(
+            matches!(&blocked, StoreError::PolicyBlocked { reason, .. } if reason.contains("signal.emit")),
+            "{blocked:?}"
+        );
+        assert_eq!(effect_status(&store, "emit-1"), "blocked_by_capability");
+
+        // Seeded: on a store where the embedded std.ingress manifest
+        // registered first (production order — `register_locked_packages`
+        // runs at store init, before any worker pass), the same effect is
+        // claimable.
+        let mut seeded = SqliteStore::open_in_memory().expect("store opens");
+        seeded
+            .register_package_manifest(include_str!("../../../std/manifests/ingress.json"))
+            .expect("std.ingress manifest registers");
+        let version = seeded
+            .create_program_version(test_program_version(
+                "IngressGateSeeded",
+                "source-1",
+                "ir-1",
+            ))
+            .expect("program version creates");
+        let instance = seeded
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        seeded
+            .commit_rule(RuleCommit {
+                instance_id: &instance.instance_id,
+                rule: "notify",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-notify"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = seeded
+            .claimable_effects(&instance.instance_id)
+            .expect("claimable effects load");
+        assert_eq!(claimable.len(), 1, "{claimable:?}");
+        assert_eq!(claimable[0].effect_id, "emit-1");
     }
 
     #[test]
@@ -16353,93 +17349,6 @@ mod tests {
             );
         }
         fs::remove_file(path).expect("claude evidence db removes");
-    }
-
-    #[test]
-    fn pi_rpc_evidence_records_refs_and_reopens() {
-        let path = std::env::temp_dir().join(format!(
-            "whipplescript-pi-rpc-evidence-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
-        {
-            let mut store = SqliteStore::open(&path).expect("store opens");
-            let version = store
-                .create_program_version(test_program_version("PiEvidence", "source", "ir"))
-                .expect("program version creates");
-            let instance = store
-                .create_instance(NewInstance {
-                    program_id: &version.program_id,
-                    version_id: &version.version_id,
-                    input_json: "{}",
-                })
-                .expect("instance creates");
-            let evidence_id = store
-                .record_pi_rpc_evidence(PiRpcEvidence {
-                    instance_id: &instance.instance_id,
-                    provider_id: "pi-main",
-                    session_id: "session-1",
-                    run_id: "run-1",
-                    metadata_json: r#"{"session_id":"session-1","model_provider":"openai-codex","model_id":"gpt-5.5","event_counts":{"message":2,"tool_call":1},"terminal_type":"completed","terminal_payload":{"result_shape":{"type":"string","chars":12}}}"#,
-                    correlation_id: Some("pi-rpc:run-1"),
-                })
-                .expect("pi evidence records");
-            assert!(evidence_id.starts_with("evd_"));
-            let evidence = store
-                .list_evidence(&instance.instance_id)
-                .expect("evidence lists");
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
-            assert_eq!(evidence[0].subject_type, "provider_session");
-            assert_eq!(evidence[0].subject_id, "session-1");
-            assert_eq!(evidence[0].causation_id.as_deref(), Some("run-1"));
-            let metadata =
-                serde_json::from_str::<Value>(&evidence[0].metadata_json).expect("metadata json");
-            assert_eq!(
-                metadata.get("provider_id").and_then(Value::as_str),
-                Some("pi-main")
-            );
-            assert_eq!(
-                metadata
-                    .pointer("/evidence/event_counts/tool_call")
-                    .and_then(Value::as_i64),
-                Some(1)
-            );
-            assert_eq!(
-                metadata
-                    .pointer("/evidence/model_provider")
-                    .and_then(Value::as_str),
-                Some("openai-codex")
-            );
-            let links = store
-                .list_evidence_links(&instance.instance_id)
-                .expect("evidence links list");
-            assert!(links.iter().any(|link| {
-                link.evidence_id == evidence_id
-                    && link.target_type == "provider"
-                    && link.target_id == "pi-main"
-                    && link.relation == "observes"
-            }));
-            assert!(links.iter().any(|link| {
-                link.evidence_id == evidence_id
-                    && link.target_type == "provider_run"
-                    && link.target_id == "run-1"
-                    && link.relation == "observes"
-            }));
-        }
-        {
-            let store = SqliteStore::open(&path).expect("store reopens");
-            let evidence = store
-                .list_evidence_for_subject("provider_session", "session-1")
-                .expect("subject evidence lists");
-            assert_eq!(evidence.len(), 1);
-            assert_eq!(evidence[0].kind, "pi.rpc.evidence");
-            assert_eq!(evidence[0].correlation_id.as_deref(), Some("pi-rpc:run-1"));
-        }
-        fs::remove_file(path).expect("pi evidence db removes");
     }
 
     fn new_event<'a>(

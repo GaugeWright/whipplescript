@@ -110,7 +110,7 @@ fn renew_effect_completes_end_to_end() {
             "--store",
             store_str,
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8"),
             "--provider",
             "fixture",

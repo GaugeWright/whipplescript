@@ -1,3 +1,8 @@
+use std.coercion
+use std.coord
+use std.tracker
+use std.agent
+
 @service
 workflow GastownLite
 
@@ -108,9 +113,6 @@ rule implement_ready_ticket
 
   after slot contended {
     release issue
-    askHuman """markdown
-    Checkout workspace is busy. Split or retry {{ issue.id }}.
-    """
   }
 
   after turn succeeds as work {
@@ -140,9 +142,7 @@ rule implement_ready_ticket
         release issue
       }
       "blocked" => {
-        askHuman """markdown
-        Review blocked {{ issue.id }}. Inspect the turn before continuing.
-        """
+        release issue
       }
     }
   }

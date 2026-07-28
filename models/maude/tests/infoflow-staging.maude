@@ -1,0 +1,29 @@
+load ../infoflow-staging.maude
+
+--- Coverage (the per-turn WIN, sound): a field assembled from a PUBLIC turn (b2)
+--- egresses to a public sink and is ACCEPTED, even though a SECRET turn (b1, hi) ran
+--- in the same rule. Under a per-RULE join box the rule's whole join would be hi and
+--- this field would be wrongly rejected; the per-turn box stays precise because b1
+--- does not feed f1.
+search [1] in WHIPPLESCRIPT-INFOFLOW-STAGING :
+  turnOut(b1,hi) turnOut(b2,lo) field(f1,b2) sink(f1,lo)
+  =>* C:Cfg accepted .
+
+--- Coverage: a secret field to a secret-cleared sink is fine.
+search [1] in WHIPPLESCRIPT-INFOFLOW-STAGING :
+  turnOut(b1,hi) field(f1,b1) sink(f1,hi)
+  =>* C:Cfg accepted .
+
+--- Bite: a field fed by the SECRET turn cannot egress to a public sink. No laundering
+--- across turns -- the per-turn box still joins WITHIN the producing turn.
+search [1] in WHIPPLESCRIPT-INFOFLOW-STAGING :
+  turnOut(b1,hi) field(f1,b1) sink(f1,lo)
+  =>* accepted RESIDUAL:Cfg .
+
+--- Bite: the UNSOUND single-output split. A claim that a sub-field of the secret turn
+--- output b1 is public (lo) is IGNORED; the field carries b1's real hi level, so a
+--- public sink rejects it. Per-field precision exists only ACROSS whip-assembled
+--- turns, never WITHIN one model output.
+search [1] in WHIPPLESCRIPT-INFOFLOW-STAGING :
+  claimSub(f1,b1,lo) turnOut(b1,hi) sink(f1,lo)
+  =>* accepted RESIDUAL:Cfg .

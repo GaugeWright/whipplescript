@@ -1,0 +1,266 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+
+mod WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES is
+  protecting WHIPPLESCRIPT-CONSTRUCT-GRAMMAR .
+
+  --- Abstract package constructs used by the interop examples.
+  ops
+    memoryRecallOp
+    agentTellOp
+    createIssueOp
+    linkIssueOp
+    coerceRouteOp
+    commentIssueOp
+    claimIssueOp
+    runTestsOp
+    notifyOpsOp
+    finishIssueOp
+    rememberMemoryOp
+    agentTurnOp
+    : -> ConstructId .
+
+  ops
+    trackerCap
+    agentCap
+    scriptCap
+    notifyCap
+    schemaCoercionCap
+    memoryWriteCap
+    : -> CapabilityId .
+
+  ops localBacklog incidents : -> ResourceId .
+
+  ops
+    triageTickType
+    deployFailedType
+    digestDueType
+    trackedIssueType
+    leaseType
+    issueRouteType
+    testReportType
+    testFailureType
+    turnType
+    memoryWriteType
+    : -> TypeId .
+
+  ops
+    tickFact
+    failureFact
+    digestFact
+    criticalIssueFact
+    : -> FactId .
+
+  ops triageEvt deployEvt digestEvt : -> EventId .
+endm
+
+--- 1. Tracker + Memory + Agent: tracker projection produces Issue, memory
+--- recall produces MemoryContext, and agent tell consumes explicit memory.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(localBacklog, issueType))
+  projectionUse(projectionInterface(localBacklog, issueType), issueFact)
+  acceptedConstruct(memoryRecallOp)
+  operationNeedsValue(memoryRecallOp, issueType)
+  loweredConstructEffect(e1, memoryRecallOp, memoryQuery, memoryContext, v1)
+  afterSucceeds(e1)
+  acceptedConstruct(agentTellOp)
+  operationNeedsValue(agentTellOp, memoryContext)
+  =>*
+  C:Cfg
+  operationReady(memoryRecallOp)
+  terminalBinding(e1, memoryContext)
+  operationReady(agentTellOp) .
+
+--- 1 negative. The agent cannot receive memory context unless recall output is
+--- explicitly composed into the turn.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(localBacklog, issueType))
+  projectionUse(projectionInterface(localBacklog, issueType), issueFact)
+  acceptedConstruct(agentTellOp)
+  operationNeedsValue(agentTellOp, memoryContext)
+  =>*
+  C:Cfg
+  operationReady(agentTellOp) .
+
+--- 2. Schedule + Tracker: schedule emits a durable event, rule binding gets
+--- the event payload, and tracker create consumes that typed value.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(triageTickType))
+  eventSourceTick(eventSourceInterface(triageTickType), triageEvt)
+  eventUse(triageEvt, triageTickType, tickFact)
+  acceptedConstruct(createIssueOp)
+  operationNeedsValue(createIssueOp, triageTickType)
+  =>*
+  C:Cfg
+  event(triageEvt)
+  eventPayload(triageEvt, triageTickType)
+  ruleBinding(tickFact, triageTickType)
+  operationReady(createIssueOp) .
+
+--- 2 negative. A schedule source cannot directly fire a rule.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(triageTickType))
+  eventSourceTick(eventSourceInterface(triageTickType), triageEvt)
+  =>*
+  C:Cfg
+  directRuleFire(triageEvt) .
+
+--- 3. Ingress + Tracker + Agent: ingress event feeds tracker link, link output
+--- feeds the agent.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(deployFailedType))
+  eventSourceTick(eventSourceInterface(deployFailedType), deployEvt)
+  eventUse(deployEvt, deployFailedType, failureFact)
+  acceptedConstruct(linkIssueOp)
+  operationNeedsValue(linkIssueOp, deployFailedType)
+  loweredConstructEffect(e1, linkIssueOp, trackerCap, trackedIssueType, v1)
+  afterSucceeds(e1)
+  acceptedConstruct(agentTellOp)
+  operationNeedsValue(agentTellOp, trackedIssueType)
+  =>*
+  C:Cfg
+  event(deployEvt)
+  ruleBinding(failureFact, deployFailedType)
+  operationReady(linkIssueOp)
+  terminalBinding(e1, trackedIssueType)
+  operationReady(agentTellOp) .
+
+--- 3 negative. The raw ingress event is not a tracked issue.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(deployFailedType))
+  eventSourceTick(eventSourceInterface(deployFailedType), deployEvt)
+  eventUse(deployEvt, deployFailedType, failureFact)
+  acceptedConstruct(agentTellOp)
+  operationNeedsValue(agentTellOp, trackedIssueType)
+  =>*
+  C:Cfg
+  operationReady(agentTellOp) .
+
+--- 4. Memory + Schema Coercion + Tracker: coercion requires Issue and
+--- MemoryContext; its output can route to tracker/agent work.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(localBacklog, issueType))
+  projectionUse(projectionInterface(localBacklog, issueType), issueFact)
+  loweredConstructEffect(e1, memoryRecallOp, memoryQuery, memoryContext, v1)
+  afterSucceeds(e1)
+  acceptedConstruct(coerceRouteOp)
+  operationNeeds2(coerceRouteOp, issueType, memoryContext)
+  loweredConstructEffect(e2, coerceRouteOp, schemaCoercionCap, issueRouteType, v1)
+  afterSucceeds(e2)
+  acceptedConstruct(commentIssueOp)
+  operationNeedsValue(commentIssueOp, issueRouteType)
+  =>*
+  C:Cfg
+  operationReady(coerceRouteOp)
+  terminalBinding(e2, issueRouteType)
+  operationReady(commentIssueOp) .
+
+--- 4 negative. Schema coercion is not ready until both typed inputs exist.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(localBacklog, issueType))
+  projectionUse(projectionInterface(localBacklog, issueType), issueFact)
+  acceptedConstruct(coerceRouteOp)
+  operationNeeds2(coerceRouteOp, issueType, memoryContext)
+  =>*
+  C:Cfg
+  operationReady(coerceRouteOp) .
+
+--- 5. Agent + Script + Tracker + Notification: lease gates agent work, agent
+--- output feeds tests, and test report feeds tracker/notification consumers.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  loweredConstructEffect(e1, claimIssueOp, trackerCap, leaseType, v1)
+  afterSucceeds(e1)
+  acceptedConstruct(agentTurnOp)
+  operationNeedsValue(agentTurnOp, leaseType)
+  loweredConstructEffect(e2, agentTurnOp, agentCap, turnType, v1)
+  afterSucceeds(e2)
+  acceptedConstruct(runTestsOp)
+  operationNeedsValue(runTestsOp, turnType)
+  loweredConstructEffect(e3, runTestsOp, scriptCap, testReportType, v1)
+  afterSucceeds(e3)
+  acceptedConstruct(finishIssueOp)
+  operationNeedsValue(finishIssueOp, testReportType)
+  acceptedConstruct(notifyOpsOp)
+  operationNeedsValue(notifyOpsOp, testReportType)
+  =>*
+  C:Cfg
+  operationReady(agentTurnOp)
+  operationReady(runTestsOp)
+  terminalBinding(e3, testReportType)
+  operationReady(finishIssueOp)
+  operationReady(notifyOpsOp) .
+
+--- 5 negative. A distinct failure payload cannot satisfy the tracker finish
+--- operation that expects a typed test report.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  loweredConstructEffect(e3, runTestsOp, scriptCap, testFailureType, v1)
+  afterSucceeds(e3)
+  acceptedConstruct(finishIssueOp)
+  operationNeedsValue(finishIssueOp, testReportType)
+  =>*
+  C:Cfg
+  operationReady(finishIssueOp) .
+
+--- 6. Ingress + Schedule + Tracker + Notification: ingress creates incidents,
+--- schedule creates digest events, and digest + critical issue feeds notify.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(deployFailedType))
+  eventSourceTick(eventSourceInterface(deployFailedType), deployEvt)
+  eventUse(deployEvt, deployFailedType, failureFact)
+  acceptedConstruct(createIssueOp)
+  operationNeedsValue(createIssueOp, deployFailedType)
+  providesInterface(eventSourceInterface(digestDueType))
+  eventSourceTick(eventSourceInterface(digestDueType), digestEvt)
+  eventUse(digestEvt, digestDueType, digestFact)
+  providesInterface(projectionInterface(incidents, issueType))
+  projectionUse(projectionInterface(incidents, issueType), criticalIssueFact)
+  acceptedConstruct(notifyOpsOp)
+  operationNeeds2(notifyOpsOp, digestDueType, issueType)
+  =>*
+  C:Cfg
+  event(deployEvt)
+  operationReady(createIssueOp)
+  event(digestEvt)
+  ruleBinding(digestFact, digestDueType)
+  ruleBinding(criticalIssueFact, issueType)
+  operationReady(notifyOpsOp) .
+
+--- 6 negative. Digest alone cannot notify without the tracker projection.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(eventSourceInterface(digestDueType))
+  eventSourceTick(eventSourceInterface(digestDueType), digestEvt)
+  eventUse(digestEvt, digestDueType, digestFact)
+  acceptedConstruct(notifyOpsOp)
+  operationNeeds2(notifyOpsOp, digestDueType, issueType)
+  =>*
+  C:Cfg
+  operationReady(notifyOpsOp) .
+
+--- 7. Two Trackers + Memory: two tracker resources coexist, the GitHub
+--- projection feeds recall, and recall context plus the issue feed Linear create.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  acceptedConstruct(memoryRecallOp)
+  operationNeedsValue(memoryRecallOp, issueType)
+  loweredConstructEffect(e1, memoryRecallOp, memoryQuery, memoryContext, v1)
+  afterSucceeds(e1)
+  acceptedConstruct(createIssueOp)
+  operationNeeds2(createIssueOp, issueType, memoryContext)
+  =>*
+  C:Cfg
+  operationReady(memoryRecallOp)
+  terminalBinding(e1, memoryContext)
+  operationReady(createIssueOp) .
+
+--- 7 negative. A Linear projection cannot satisfy a source use of the GitHub
+--- projection, even though both project Issue.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-INTEROP-EXAMPLES :
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  acceptedConstruct(memoryRecallOp)
+  operationNeedsValue(memoryRecallOp, issueType)
+  =>*
+  C:Cfg
+  operationReady(memoryRecallOp) .

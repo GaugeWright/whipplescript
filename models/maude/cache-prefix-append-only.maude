@@ -1,0 +1,36 @@
+--- Context-assembly Phase 0, invariant 1: the request prefix is append-only
+--- between compactions. Companion to spec/context-assembly-tracker.md (Decision 7)
+--- and the pi/Codex cache-preservation findings. Server-side prompt caching keys
+--- on a stable prefix: editing the middle of the context invalidates the cache
+--- from the edit point on. So a normal turn only APPENDS (the cached prefix is
+--- reused verbatim -> a cache hit), and the ONLY operation allowed to rewrite the
+--- prefix is a deliberate, triggered compaction (a one-time bust, after which the
+--- new prefix is held stable). The safety property modeled here: no
+--- between-compaction turn invalidates the cache. There is no rule that edits the
+--- prefix outside [compact], so `cacheMiss` (mid-conversation invalidation) is
+--- unreachable -- the current per-turn elision (harness_loop compact_context) is
+--- exactly the forbidden shape this rules out.
+mod WHIPPLESCRIPT-CACHE-PREFIX-APPEND-ONLY is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op prefix : -> Cfg [ctor] .          --- the cached, byte-stable request prefix
+  op turnPending : -> Cfg [ctor] .     --- a new turn waiting to be added
+  op tail : -> Cfg [ctor] .            --- an appended turn entry (uncached growth)
+  op cacheHit : -> Cfg [ctor] .        --- the request reused the cached prefix
+  op compactDue : -> Cfg [ctor] .      --- compaction has been triggered
+  op prefixRewritten : -> Cfg [ctor] . --- compaction installed a fresh prefix (one deliberate bust)
+  op cacheMiss : -> Cfg [ctor] .       --- BAD: prefix invalidated mid-conversation, no compaction
+
+  --- Between compactions a turn only APPENDS; prefix is preserved on both sides,
+  --- so the request hits the cache. Rewriting this rule to edit prefix as the old
+  --- per-turn elision did is exactly what the cacheMiss bite forbids.
+  rl [append] : prefix turnPending => prefix tail cacheHit .
+
+  --- Compaction is the ONLY prefix rewrite: triggered (compactDue), it folds the
+  --- accumulated tail into a fresh stable prefix -- one deliberate cache bust. The
+  --- new prefix persists and subsequent appends hit the cache again.
+  rl [compact] : prefix compactDue tail => prefix prefixRewritten .
+endm

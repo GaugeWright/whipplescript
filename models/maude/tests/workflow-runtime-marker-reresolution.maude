@@ -1,0 +1,56 @@
+load ../workflow-runtime-marker-reresolution.maude
+
+--- ============================ COVERAGE (reject reachable) =================
+
+--- Coverage: cross-package runtime delivery to a private workflow is rejected after
+--- resolving the instance handle to its owning workflow/package.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  deliverByHandle(pkgA, instPrivate)
+  instanceOf(instPrivate, wfPrivate)
+  workflowPackage(wfPrivate, pkgB)
+  privateWorkflow(wfPrivate)
+  =>* C:Cfg markerReject .
+
+--- Coverage: a stale/benign surface target does not launder the runtime handle.
+--- The handle resolves to wfPrivate, so the private marker is still enforced.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  surfaceTarget(wfPublic)
+  deliverByHandle(pkgA, instPrivate)
+  instanceOf(instPrivate, wfPrivate)
+  workflowPackage(wfPrivate, pkgB)
+  privateWorkflow(wfPrivate)
+  =>* C:Cfg markerReject .
+
+--- Coverage: unresolved handles fail closed instead of trusting static metadata.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  surfaceTarget(wfPublic)
+  deliverByHandle(pkgA, instUnknown)
+  unresolvedHandle(instUnknown)
+  =>* C:Cfg markerReject .
+
+--- ============================ BITE (no reject) ============================
+
+--- Bite: same-package delivery to a private workflow is not cross-boundary. No solution.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  deliverByHandle(pkgB, instPrivate)
+  instanceOf(instPrivate, wfPrivate)
+  workflowPackage(wfPrivate, pkgB)
+  privateWorkflow(wfPrivate)
+  =>* markerReject RESIDUAL:Cfg .
+
+--- Bite: cross-package delivery to a public workflow is not rejected by E2-DYN.
+--- No solution.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  deliverByHandle(pkgA, instPublic)
+  instanceOf(instPublic, wfPublic)
+  workflowPackage(wfPublic, pkgB)
+  =>* markerReject RESIDUAL:Cfg .
+
+--- Bite: a hostile surface target cannot fabricate a private marker for a public
+--- runtime target; the resolved identity remains authoritative. No solution.
+search [1] in WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION :
+  surfaceTarget(wfPrivate)
+  deliverByHandle(pkgA, instPublic)
+  instanceOf(instPublic, wfPublic)
+  workflowPackage(wfPublic, pkgB)
+  =>* markerReject RESIDUAL:Cfg .

@@ -1,0 +1,46 @@
+load ../messaging-capability-report.maude
+
+--- Coverage: observing an outbound-only (desktop) channel is REJECTED -- the
+--- v1 acceptance test (send/receive-capable are distinguishable).
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(alerts, desktop) report(desktop, outboundOnly) observeFrom(alerts)
+  =>* observeRejected(alerts) RESIDUAL:Cfg .
+
+--- Coverage: the SAME desktop channel admits outbound send.
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(alerts, desktop) report(desktop, outboundOnly) sendVia(alerts)
+  =>* sendAdmitted(alerts) RESIDUAL:Cfg .
+
+--- Coverage: a bidirectional (local) channel admits inbound observation.
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(room, local) report(local, both) observeFrom(room)
+  =>* observeAdmitted(room) RESIDUAL:Cfg .
+
+--- Coverage: a channel naming a provider with NO capability report is
+--- rejected at the declaration (the unknown-provider check).
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(room, slack) noReport(slack) sendVia(room)
+  =>* chanRejected(room) RESIDUAL:Cfg .
+
+--- Bite: a bidirectional channel is NEVER rejected in either direction. The
+--- RESIDUAL soup var makes any reachable rejection a solution, so No solution
+--- proves the conditioned checks cannot misfire on a capable provider.
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(room, local) report(local, both) sendVia(room) observeFrom(room)
+  =>* observeRejected(room) RESIDUAL:Cfg .
+
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(room, local) report(local, both) sendVia(room) observeFrom(room)
+  =>* sendRejected(room) RESIDUAL:Cfg .
+
+--- Bite: outbound send over an outbound-only channel is never rejected.
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(alerts, desktop) report(desktop, outboundOnly) sendVia(alerts)
+  =>* sendRejected(alerts) RESIDUAL:Cfg .
+
+--- Bite: a channel whose provider HAS a report never trips the
+--- unknown-provider rejection.
+search [1] in WHIPPLESCRIPT-MESSAGING-CAPABILITY-REPORT :
+  chan(alerts, desktop) report(desktop, outboundOnly)
+  sendVia(alerts) observeFrom(alerts)
+  =>* chanRejected(alerts) RESIDUAL:Cfg .

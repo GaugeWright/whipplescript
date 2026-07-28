@@ -1,0 +1,190 @@
+--- Pinned progressions + during/until regions (DR-0043; research note
+--- spec/pinned-progressions-research-note.md).
+---
+--- The semantic: a rule firing, once committed, OWNS its trigger bindings as
+--- immutable VALUES; matching gates only ADMISSION. Reactivity inside a
+--- progression is explicit: a during-region -- written
+--- `during <cond> { ... } on lapse { ... }`; `until <cond>` is the negated
+--- polarity -- whose steps commit only while the condition holds, atomically
+--- with the condition check, and whose first evaluation under a broken
+--- condition WITH THE REGION STILL OPEN instead commits the lapse arm,
+--- exactly once per firing. [lapse) is deliberately enabled the moment the
+--- condition breaks with the region open -- it does NOT wait for a step that
+--- would advance -- because the kernel evaluates the condition in every pass
+--- an open region survives, including passes where every region effect is
+--- still in flight [rule_pass.rs, the region_in_flight clause). That is what
+--- makes a region an in-flight abort lever.
+--- Statements after the region are the point of no return.
+---
+--- The commit log is modeled with an explicit sequence counter: every
+--- world-visible transition stamps the next sequence number, so log-order
+--- properties (fate-at-commit determinism) are reachability searches over
+--- stamps. Firings are parameterized by identity (f1, f2): Decision 4 (fact
+--- identity is admission identity) admits DISTINCT firings independently --
+--- both may act -- while one firing can never lapse twice (its region cell is
+--- consumed). Admission dedup of an IDENTICAL re-record is set semantics
+--- [same fact id, same firing id) and is implicit in the identity parameter.
+---
+--- Cells (all firing-indexed where progression-local):
+---   clk(N)               next commit sequence number (shared log)
+---   trig(F, present|consumed)
+---                        the admission trigger fact; a sibling may consume it
+---                        at any time -- pinned semantics ignore it
+---   condHolds / condBroken(M) / brokeEver
+---                        the shared during-condition; breaking is a logged
+---                        commit stamped M; REPAIR returns it to holding (the
+---                        stateful stamp leaves with it) while brokeEver is
+---                        the permanent record that a break ever happened
+---   region(F, open(K) | done | lapsed)
+---   post(F, K)           steps after the region (the point of no return)
+---   stepAt(F, N) / lapseAt(F, N) / postAt(F, N)
+---   workflowDone(F)      the firing's terminal
+---
+--- Properties (models/maude/tests/pinned-progressions.maude):
+---   coverage: completion; completion despite trigger consumption (THE
+---     pinning claim); lapse reachability; post-region commit after the break
+---     [point of no return); break-then-REPAIR completing WITHOUT a lapse
+---     [lapse is observed at commits, not wall-clock -- REACHABILITY only:
+---     since [lapse) is enabled throughout the broken window, this shows a
+---     no-lapse path EXISTS, not that repair prevents a lapse; the kernel's
+---     healing window is one pass); two distinct firings
+---     each completing (re-admission, Decision 4);
+---   invariants: no region step commits while the condition stands broken
+---     [fate-at-commit); one firing never lapses twice; no final state
+---     strands an open region; lapsed never reads as done; lapse requires
+---     the break;
+---   bite: the REACTIVE module models the pre-DR-0043 semantics
+---     [continuations require the trigger to still match, no lapse rule) and
+---     reaches a final state with the region still open -- the silent stall
+---     found live in manual ch. 15.
+
+fmod PINNED-PROGRESSION-STATE is
+  protecting BOOL .
+
+  sorts Cnt Fid TState RState Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+
+  ops f1 f2 : -> Fid [ctor] .
+
+  op present : -> TState [ctor] .
+  op consumed : -> TState [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op clk : Cnt -> Cfg [ctor] .
+  --- World-transition fuel: bounds break/repair alternation so the state
+  --- space stays finite under the growing commit clock. Two units admit a
+  --- break and a repair (or two breaks) -- enough for every property here.
+  op flux : Cnt -> Cfg [ctor] .
+  op trig : Fid TState -> Cfg [ctor] .
+  op condHolds : -> Cfg [ctor] .
+  op condBroken : Cnt -> Cfg [ctor] .
+  op brokeEver : -> Cfg [ctor] .
+  op open : Cnt -> RState [ctor] .
+  op done : -> RState [ctor] .
+  op lapsed : -> RState [ctor] .
+  op region : Fid RState -> Cfg [ctor] .
+  op post : Fid Cnt -> Cfg [ctor] .
+  op stepAt : Fid Cnt -> Cfg [ctor] .
+  op lapseAt : Fid Cnt -> Cfg [ctor] .
+  op postAt : Fid Cnt -> Cfg [ctor] .
+  op workflowDone : Fid -> Cfg [ctor] .
+
+  --- One-firing initial soup: a two-step region then one post step.
+  op init : -> Cfg .
+  --- Two-firing initial soup (Decision 4): distinct admissions, each with a
+  --- one-step region and one post step, sharing the log and the condition.
+  op init2 : -> Cfg .
+
+  vars N M : Cnt .
+
+  eq lt(z, s(N)) = true .
+  eq lt(s(N), s(M)) = lt(N, M) .
+  eq lt(N, z) = false .
+
+  eq init = clk(z) flux(s(s(z))) condHolds trig(f1, present)
+            region(f1, open(s(s(z)))) post(f1, s(z)) .
+  eq init2 = clk(z) flux(s(s(z))) condHolds trig(f1, present) trig(f2, present)
+             region(f1, open(s(z))) post(f1, s(z))
+             region(f2, open(s(z))) post(f2, s(z)) .
+endfm
+
+mod WHIPPLESCRIPT-PINNED-PROGRESSION is
+  including PINNED-PROGRESSION-STATE .
+
+  vars N M K : Cnt .
+  var F : Fid .
+
+  --- The world breaks the during-condition: a logged commit like any other,
+  --- stamped, with a permanent record that it ever happened.
+  rl [break] : clk(N) flux(s(K)) condHolds
+      => clk(s(N)) flux(K) condBroken(N) brokeEver .
+
+  --- The world REPAIRS the condition (the incident closes). The stateful
+  --- stamp leaves with the broken state; brokeEver remains. A repair that no
+  --- evaluation observed means no lapse -- lapse is observed at commits, the
+  --- only race-free definition. In the kernel that healing window is one
+  --- pass, so this interleaving is narrow in practice.
+  rl [repair] : clk(N) flux(s(K)) condBroken(M) => clk(s(N)) flux(K) condHolds .
+
+  --- A sibling rule consumes the admission trigger at any moment. Under
+  --- bindings-as-values this is invisible to the progression: no other rule
+  --- here mentions the trigger cells.
+  rl [consume] : clk(N) trig(F, present) => clk(s(N)) trig(F, consumed) .
+
+  --- A region step commits only while the condition holds -- the check is in
+  --- the same transaction as the commit, so there is no check-then-act window.
+  rl [advance] : clk(N) condHolds region(F, open(s(K)))
+      => clk(s(N)) condHolds region(F, open(K)) stepAt(F, N) .
+
+  --- A broken condition with the region still OPEN commits the lapse arm --
+  --- no advancing step required, matching the kernel's per-pass evaluation of
+  --- an open region. The region cell is CONSUMED into lapsed, so a second
+  --- lapse of the SAME firing has nothing to match: exactly-once is
+  --- structural.
+  rl [lapse] : clk(N) condBroken(M) region(F, open(s(K)))
+      => clk(s(N)) condBroken(M) region(F, lapsed) lapseAt(F, N) .
+
+  --- Clean exit: every region step committed while the condition held.
+  rl [exit] : region(F, open(z)) => region(F, done) .
+
+  --- Point of no return: statements after the region consult no condition.
+  rl [apply] : clk(N) region(F, done) post(F, s(K))
+      => clk(s(N)) region(F, done) post(F, K) postAt(F, N) .
+
+  --- The firing's terminal.
+  rl [finish] : region(F, done) post(F, z) => region(F, done) workflowDone(F) .
+endm
+
+--- The pre-DR-0043 semantics, kept as the negative fixture: continuations
+--- are re-derived from CURRENT matching, so a step requires the trigger to
+--- still be present and the guard to still hold -- and there is no lapse
+--- rule. Retraction of either strands the region silently.
+mod WHIPPLESCRIPT-REACTIVE-PROGRESSION is
+  including PINNED-PROGRESSION-STATE .
+
+  vars N M K : Cnt .
+  var F : Fid .
+
+  rl [break] : clk(N) flux(s(K)) condHolds
+      => clk(s(N)) flux(K) condBroken(N) brokeEver .
+
+  rl [consume] : clk(N) trig(F, present) => clk(s(N)) trig(F, consumed) .
+
+  --- A continuation commits only while the trigger still matches and the
+  --- guard still holds. No rule handles the other case: that absence IS the
+  --- silent stall.
+  rl [advance] : clk(N) condHolds trig(F, present) region(F, open(s(K)))
+      => clk(s(N)) condHolds trig(F, present) region(F, open(K)) stepAt(F, N) .
+
+  rl [exit] : region(F, open(z)) => region(F, done) .
+
+  rl [apply] : clk(N) condHolds trig(F, present) region(F, done) post(F, s(K))
+      => clk(s(N)) condHolds trig(F, present) region(F, done) post(F, K) postAt(F, N) .
+
+  rl [finish] : region(F, done) post(F, z) => region(F, done) workflowDone(F) .
+endm

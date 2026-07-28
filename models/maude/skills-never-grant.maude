@@ -1,0 +1,40 @@
+--- Context-assembly Phase 0, invariant 3: skills never grant authority.
+--- Companion to spec/context-assembly-tracker.md (Decision 4), spec/skills.md
+--- which requires that skill content must not silently grant capability
+--- authority, and the turn-access-grant intersection model. A skill allowed-tools
+--- frontmatter list is
+--- recorded as provenance but is NOT an input to the turn's effective tool
+--- authority: the effective set is seeded only from the agent profile. The safety
+--- property modeled here: a tool a skill lists but the profile does not permit
+--- never enters the effective authority. `allowed-tools` are consumed as
+--- provenance (never moved into effective), so a skill cannot widen authority.
+mod WHIPPLESCRIPT-SKILLS-NEVER-GRANT is
+  protecting BOOL .
+
+  sorts Cap CapSet Cfg .
+  subsort Cap < CapSet .
+
+  ops read write bash : -> Cap [ctor] .   --- example tool capabilities
+
+  op mt : -> CapSet [ctor] .
+  op _;_ : CapSet CapSet -> CapSet [ctor assoc comm id: mt] .
+  eq [cap-idem] : C:Cap ; C:Cap = C:Cap .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op profile : CapSet -> Cfg [ctor] .     --- caps the agent profile permits
+  op skillTools : CapSet -> Cfg [ctor] .  --- a skill's `allowed-tools` frontmatter
+  op effective : CapSet -> Cfg [ctor] .   --- the turn's effective tool authority
+
+  vars P E G : CapSet .
+  var C : Cap .
+
+  --- Profile caps flow into the effective authority.
+  rl [grant-profile] : profile(C ; P) effective(E) => profile(P) effective(C ; E) .
+
+  --- A skill's allowed-tools are CONSUMED as provenance only -- never added to
+  --- effective authority. Rewriting this to move C into effective (a skill
+  --- granting a tool) is exactly what the bites forbid.
+  rl [note-skill] : skillTools(C ; G) => skillTools(G) .
+endm

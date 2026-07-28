@@ -1,0 +1,35 @@
+load ../delegated-wire-lifecycle.maude
+
+--- Coverage: a terminal frame closes the run as an admitted lifecycle event.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  running frameTerminal
+  =>* terminal evtAdmitted .
+
+--- Coverage: the clock backstop closes a silent run -- every live run reaches
+--- a terminal.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  running clockFired
+  =>* terminal evtAdmitted .
+
+--- Coverage: a misrouted frame is recorded as a violation while the run still
+--- reaches its terminal -- tolerant routing does not abort the turn.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  running frameMisrouted frameTerminal
+  =>* terminal evtAdmitted violation .
+
+--- Bite: exactly one terminal. Even with two terminal frames inbound, a state
+--- with two `terminal` tokens is unreachable -- the second frame lands as a
+--- violation diagnostic.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  running frameTerminal frameTerminal
+  =>* terminal terminal RESIDUAL:Cfg .
+
+--- Bite: a cancel acknowledgement never completes the run.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  running frameAck
+  =>* terminal RESIDUAL:Cfg .
+
+--- Bite: post-terminal frames are never admitted as lifecycle events.
+search [1] in WHIPPLESCRIPT-DELEGATED-WIRE-LIFECYCLE :
+  terminal frameStream
+  =>* evtAdmitted RESIDUAL:Cfg .

@@ -1,3 +1,5 @@
+use std.agent
+
 workflow ScheduledEscalation
 
 output result ReviewClosed
@@ -21,6 +23,12 @@ class ReviewEscalated {
   reason string
 }
 
+agent reviewer {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
 table reviews as ReviewRequest [
   {
     id "REV-1"
@@ -33,7 +41,7 @@ table reviews as ReviewRequest [
 rule request_review_with_deadline
   when ReviewRequest as review where review.status == "waiting"
 => {
-  askHuman as answer choices ["approve", "reject"] timeout 24h """markdown
+  tell reviewer as answer timeout 24h """markdown
   {{ review.title }}
   """
 
@@ -46,7 +54,7 @@ rule request_review_with_deadline
         cancel deadline
         complete result {
           id review.id
-          decision decided.choice
+          decision decided.summary
         }
       }
       Failed as failure => {

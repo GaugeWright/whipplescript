@@ -60,9 +60,148 @@ pub struct WorkItem {
     pub labels: Vec<String>,
     pub metadata: Value,
     pub claimed_by: Option<String>,
+    /// Who the issue is *directed at*, if anyone (0.2.2).
+    ///
+    /// Distinct from `claimed_by`, and the distinction is the point: an
+    /// assignment is a durable statement about who *should* act, which survives
+    /// restarts and is visible before anyone responds; a claim is the transient
+    /// CAS that decides who *is* acting. Unassigned means "whoever has access",
+    /// which is a real and common answer — an issue anyone may claim.
+    pub assigned_to: Option<String>,
     pub filed_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The relation kinds the builtin provider supports (ADR-0002 "Relations And
+/// Dependencies"). Only `blocks` gates readiness; the rest are graph metadata.
+pub const RELATION_KINDS: &[&str] = &[
+    "blocks",
+    "parent-of",
+    "related",
+    "duplicates",
+    "supersedes",
+    "discovered-from",
+];
+
+/// The dependency-kind taxonomy a `blocks` relation may carry (small and
+/// operational). Recorded metadata; every `blocks` edge gates readiness
+/// regardless of `dep_kind` (providers may later refine).
+pub const DEPENDENCY_KINDS: &[&str] = &[
+    "hard",
+    "soft",
+    "order",
+    "resource",
+    "review",
+    "contract",
+    "discovered",
+];
+
+/// A directed relation edge between two issues (by alias). `dep_kind` is the
+/// dependency flavor, only present on `blocks` edges.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Relation {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub dep_kind: Option<String>,
+}
+
+/// A comment on an issue (`comment.added`). `id` is the comment's content hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Comment {
+    pub id: String,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// A piece of evidence attached to an issue (`evidence.added`) — a reference /
+/// artifact / note supporting it. `id` is the evidence's content hash.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Evidence {
+    pub id: String,
+    pub kind: Option<String>,
+    pub reference: Option<String>,
+    pub note: Option<String>,
+    pub added_by: Option<String>,
+    pub created_at: String,
+}
+
+/// One field whose value is disputed: its `bef`-maximal setters in the event
+/// DAG disagree (ADR-0002 phase B1 slice ii; `tracker-merge.maude` `conflict`).
+/// `values` are the distinct maximal-setter values, sorted for stable output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldConflict {
+    pub field: String,
+    pub values: Vec<String>,
+}
+
+/// The DAG view of one issue: its frontier (`heads`), a content-derived
+/// `state_token` over that frontier (the optimistic-concurrency token, slice v),
+/// and any per-field conflicts. An issue is `conflicted` iff `field_conflicts`
+/// is non-empty — and a conflicted issue is not ready. Heads and token are
+/// content-hashes (unit 1), so they are already merge-stable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssueConflicts {
+    pub heads: Vec<String>,
+    pub state_token: String,
+    pub field_conflicts: Vec<FieldConflict>,
+}
+
+impl IssueConflicts {
+    #[must_use]
+    pub fn conflicted(&self) -> bool {
+        !self.field_conflicts.is_empty()
+    }
+}
+
+/// The outcome of an optimistic field set (ADR-0002 phase B1 slice v): a set
+/// guarded by the `state_token` the caller last observed. `StateChanged` means
+/// the frontier moved under the caller — the set was NOT applied, and `actual`
+/// is the current token to retry against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetFieldOutcome {
+    Applied { state_token: String },
+    NotFound,
+    StateChanged { actual: String },
+}
+
+/// One tracker event in transport form (ADR-0002 phase B1 slice iii): the
+/// content-addressed unit that crosses between clones. `issue_id` is the opaque
+/// content_id (never a WS-N alias), so a set-union of two clones' events is
+/// well-defined and deduped by `event_id`.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackerEvent {
+    pub event_id: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    pub issue_id: Option<String>,
+    pub kind: String,
+    pub payload_json: String,
+    pub actor: Option<String>,
+    pub created_at: String,
+}
+
+/// The result of importing another clone's events (ADR-0002 phase B1 slice iii).
+/// `duplicate_submissions` names each newly-seen issue (by local alias) that
+/// describes the same work (queue + title) as a DISTINCT issue already present —
+/// two independent submissions of one issue, surfaced as a WARNING for a human
+/// to reconcile (via a `duplicates` relation), never silently collapsed. A
+/// byte-identical event re-arriving is an idempotent re-transmit, not a
+/// duplicate, and is counted in `skipped`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportReport {
+    pub imported: usize,
+    pub skipped: usize,
+    pub new_issues: usize,
+    pub duplicate_submissions: Vec<String>,
+    /// Events refused because their `event_id` did not equal the SHA-256 of
+    /// their own content (tamper / corruption), or a created event whose id did
+    /// not match its issue identity. The content-addressed integrity check that
+    /// makes tamper-evidence and suppression-resistance real on the (untrusted)
+    /// shared-folder transport.
+    pub rejected: usize,
 }
 
 #[cfg(feature = "native")]
@@ -80,6 +219,22 @@ impl WorkItemStore {
         }
         let connection = Connection::open(path)?;
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
+        // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
+        // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
+        // existing table, so add the Merkle-DAG columns before the unique index
+        // over `event_id` (which would otherwise fail on the old shape).
+        tx_ensure_column(&connection, "tracker_events", "event_id", "TEXT")?;
+        tx_ensure_column(
+            &connection,
+            "tracker_events",
+            "parents_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        // Self-heal a pre-0.2.2 `tracker_issues`, which had no assignment.
+        tx_ensure_column(&connection, "tracker_issues", "assigned_to", "TEXT")?;
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);",
+        )?;
         Ok(Self { connection })
     }
 
@@ -117,11 +272,22 @@ impl WorkItemStore {
             "metadata": metadata,
             "filed_by": filed_by,
         });
-        tx_append_event(
+        let payload_json = payload.to_string();
+        // The issue's opaque MERGE identity = the content-hash of its creation
+        // event (issue_id excluded — it derives FROM this). WS-N is only a local
+        // alias for it; the event log is keyed by content_id.
+        let content_id =
+            event_content_id("issue.created", None, &payload_json, filed_by, &[], &now);
+        tx.execute(
+            "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+            params![content_id, item_id],
+        )?;
+        tx_append_raw(
             &tx,
-            Some(&item_id),
+            Some(&content_id),
+            Some(&content_id),
             "issue.created",
-            &payload,
+            &payload_json,
             filed_by,
             &now,
         )?;
@@ -201,10 +367,27 @@ impl WorkItemStore {
         let rows = statement
             .query_map([queue], row_to_item)?
             .collect::<Result<Vec<_>, _>>()?;
+        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
+        // field values are in dispute, so handing it to a worker would race a
+        // resolution. The DAG conflict test is not expressible in the SQL
+        // predicate above, so filter it here (the candidate set is small).
+        let mut ready = Vec::with_capacity(rows.len());
+        for item in rows {
+            let conflicted = match content_id_of(&self.connection, &item.id)? {
+                Some(content_id) => {
+                    analyze_issue_dag(&load_issue_events(&self.connection, &content_id)?)
+                        .conflicted()
+                }
+                None => false,
+            };
+            if !conflicted {
+                ready.push(item);
+            }
+        }
         // Ready items have no active lease by construction, so the overlay is a
         // no-op here; return them as the projection sees them (durable `open`,
         // unclaimed).
-        Ok(rows)
+        Ok(ready)
     }
 
     /// Atomic claim (`tracker-lease.maude` I1, exclusivity): grants a lease ONLY
@@ -213,7 +396,18 @@ impl WorkItemStore {
     /// the lease insert are serialized against every concurrent claim — exactly
     /// one wins, the rest see `AlreadyClaimed`. "Already claimed" is a normal,
     /// branchable outcome, not an error.
-    pub fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+    /// `expires` is an ABSOLUTE deadline (`None` = no TTL, the historical
+    /// backstop behavior — the lease never auto-expires and terminal
+    /// auto-release is the only recovery). A finite `expires` records a
+    /// claim-TTL lease that `ready`/`claim` lazily reclaim once past-due
+    /// (`tracker-lease.maude`: expired leases do not block). The T3 claim-TTL
+    /// half of the renew mechanism.
+    pub fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -235,28 +429,29 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(ClaimOutcome::AlreadyClaimed { holder });
         }
-        // No active lease: mint a stable, rebuild-deterministic lease id (the
-        // k-th acquire on this issue) and grant. A plain claim writes NO durable
+        // No active lease: grant. The lease's identity IS its `claim.acquired`
+        // event (content hash) — like comments/evidence, so ids from different
+        // clones can never collide on merge and rebuild re-derives the same id
+        // from the log. (Alias-derived `L-{alias}-{n}` ids collided across
+        // clones: both mint `L-WS-1-0`, and the import fold's INSERT OR IGNORE
+        // silently destroyed one lease.) A plain claim writes NO durable
         // status — readiness changes through the lease overlay.
-        let n: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
-            [item_id],
-            |row| row.get(0),
-        )?;
-        let lease_id = format!("L-{item_id}-{n}");
-        let payload = json!({"lease_id": lease_id, "actor": claimed_by, "expires_at": Value::Null});
-        tx_append_event(
+        let content_id = content_id_of(&tx, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
+        let payload = json!({"actor": claimed_by, "expires_at": expires});
+        let lease_id = tx_append_raw(
             &tx,
-            Some(item_id),
+            Some(&content_id),
+            None,
             "claim.acquired",
-            &payload,
+            &payload.to_string(),
             Some(claimed_by),
             &now,
         )?;
         tx.execute(
             "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
-            params![lease_id, item_id, claimed_by, now],
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![lease_id, item_id, claimed_by, now, expires],
         )?;
         tx.commit()?;
         Ok(ClaimOutcome::Claimed)
@@ -386,25 +581,356 @@ impl WorkItemStore {
         Ok(true)
     }
 
+    /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
+    ///
+    /// Assignment is advisory by design: it records who *should* act, and does
+    /// not restrict who *may* claim. Enforcing it in the store would put an
+    /// authority model here, and this crate deliberately has none — `assignee`
+    /// is an opaque string the embedding host interprets. A host that wants
+    /// "only the assignee may claim" enforces it where it knows what an
+    /// identity is.
+    ///
+    /// Returns `false` if the issue is absent or no longer open, so reassigning
+    /// a closed issue is a no-op rather than a silent rewrite of history.
+    pub fn assign_item(&mut self, item_id: &str, assignee: Option<&str>) -> StoreResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if status.as_deref() != Some("open") {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let payload = json!({ "assigned_to": assignee });
+        tx_append_event(&tx, Some(item_id), "issue.assigned", &payload, None, &now)?;
+        tx.execute(
+            "UPDATE tracker_issues SET assigned_to = ?2, updated_at = ?3 WHERE issue_id = ?1",
+            params![item_id, assignee, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Records a `blocks(from -> to)` edge: `from` blocks `to`, so `to` is not
     /// ready until `from` closes (`tracker-readiness.maude`). Appends a
     /// `relation.added` event and folds it into `tracker_relations` in one
     /// transaction; idempotent via `INSERT OR IGNORE`. The `whip issue dep add`
     /// door (blocked depends-on blocker => `add_blocks(blocker, blocked)`).
     pub fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
+        self.add_relation(from, to, "blocks", None)
+    }
+
+    /// Records a directed relation `kind(from -> to)` (ADR-0002 "Relations And
+    /// Dependencies"). `blocks` gates readiness (`from` blocks `to`); the other
+    /// kinds are graph metadata. `dep_kind` (the dependency flavor) is only
+    /// valid on a `blocks` edge. A pair may carry several kinds at once
+    /// (the projection PK is `(from, to, kind)`). Merge-stable: the event
+    /// payload references issues by opaque content_id; the projection keeps
+    /// aliases (the readiness join is alias-keyed and clone-local).
+    pub fn add_relation(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+    ) -> StoreResult<()> {
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        if let Some(dk) = dep_kind {
+            if kind != "blocks" {
+                return Err(StoreError::Conflict(
+                    "dep_kind only applies to `blocks` relations".to_owned(),
+                ));
+            }
+            if !DEPENDENCY_KINDS.contains(&dk) {
+                return Err(StoreError::Conflict(format!(
+                    "unknown dependency kind `{dk}`"
+                )));
+            }
+        }
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
-        let payload = json!({"from": from, "to": to, "kind": "blocks"});
+        let from_cid = content_id_of(&tx, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = content_id_of(&tx, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload = json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
         tx.execute(
             "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
-             VALUES (?1, ?2, 'blocks', NULL)",
-            params![from, to],
+             VALUES (?1, ?2, ?3, ?4)",
+            params![from, to, kind, dep_kind],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Removes a relation edge (`relation.removed`). Returns whether an edge was
+    /// present. The event is appended even if the edge was already absent, so
+    /// the removal is durable across a rebuild and a merge.
+    pub fn remove_relation(&mut self, from: &str, to: &str, kind: &str) -> StoreResult<bool> {
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let from_cid = content_id_of(&tx, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = content_id_of(&tx, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload = json!({"from": from_cid, "to": to_cid, "kind": kind});
+        tx_append_event(&tx, Some(to), "relation.removed", &payload, None, &now)?;
+        let removed = tx.execute(
+            "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
+            params![from, to, kind],
+        )?;
+        tx.commit()?;
+        Ok(removed > 0)
+    }
+
+    /// Every relation edge touching an issue (as `from` or `to`), by alias.
+    pub fn relations(&self, item_id: &str) -> StoreResult<Vec<Relation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT from_issue, to_issue, kind, dep_kind FROM tracker_relations \
+             WHERE from_issue = ?1 OR to_issue = ?1 ORDER BY kind, from_issue, to_issue",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Relation {
+                    from: row.get(0)?,
+                    to: row.get(1)?,
+                    kind: row.get(2)?,
+                    dep_kind: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Adds a comment to an issue (`comment.added`, ADR-0002 phase B2). Returns
+    /// the comment's content-hash id. Merge-stable: the event is keyed by the
+    /// issue's content_id and deduped by its own hash, so a comment made in one
+    /// clone folds exactly once after import. Returns `None` if the issue is
+    /// unknown.
+    pub fn add_comment(
+        &mut self,
+        item_id: &str,
+        author: Option<&str>,
+        body: &str,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({"author": author, "body": body});
+        let comment_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "comment.added",
+            &payload.to_string(),
+            author,
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![comment_id, item_id, author, body, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(comment_id))
+    }
+
+    /// An issue's comments in chronological order.
+    pub fn comments(&self, item_id: &str) -> StoreResult<Vec<Comment>> {
+        let mut statement = self.connection.prepare(
+            "SELECT comment_id, author, body, created_at FROM tracker_comments \
+             WHERE issue_id = ?1 ORDER BY created_at, comment_id",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Comment {
+                    id: row.get(0)?,
+                    author: row.get(1)?,
+                    body: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Attaches evidence to an issue (`evidence.added`, ADR-0002 phase B2) — a
+    /// reference / artifact / note. Returns the evidence's content-hash id, or
+    /// `None` if the issue is unknown. Merge-stable and deduped like comments.
+    pub fn add_evidence(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+        });
+        let evidence_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_evidence \
+             (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![evidence_id, item_id, kind, reference, note, added_by, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(evidence_id))
+    }
+
+    /// An issue's attached evidence in chronological order.
+    pub fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
+        let mut statement = self.connection.prepare(
+            "SELECT evidence_id, kind, reference, note, added_by, created_at \
+             FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Evidence {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    reference: row.get(2)?,
+                    note: row.get(3)?,
+                    added_by: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Sets one field of an issue (`issue.field_set`) — the mutation whose
+    /// events the conflict engine folds. Appends the event (chaining onto the
+    /// issue's current heads, so two independent sets across a merge FORK the
+    /// DAG) and updates the linear projection column for the known display
+    /// fields. Returns `false` if the issue does not exist.
+    pub fn set_field(&mut self, item_id: &str, field: &str, value: &str) -> StoreResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx_apply_field_set(&tx, item_id, field, value, &now)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Optimistic field set (ADR-0002 phase B1 slice v): apply only if the
+    /// issue's current `state_token` still equals `expect_token`. The check and
+    /// the append share one `Immediate` transaction, so a concurrent writer
+    /// cannot slip a change in between — a stale token is refused with the
+    /// current `actual`, never silently overwriting the other change.
+    pub fn set_field_checked(
+        &mut self,
+        item_id: &str,
+        field: &str,
+        value: &str,
+        expect_token: &str,
+    ) -> StoreResult<SetFieldOutcome> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            tx.commit()?;
+            return Ok(SetFieldOutcome::NotFound);
+        }
+        let content_id = content_id_of(&tx, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
+        let current = analyze_issue_dag(&load_issue_events(&tx, &content_id)?).state_token;
+        if current != expect_token {
+            tx.commit()?;
+            return Ok(SetFieldOutcome::StateChanged { actual: current });
+        }
+        tx_apply_field_set(&tx, item_id, field, value, &now)?;
+        let after = analyze_issue_dag(&load_issue_events(&tx, &content_id)?).state_token;
+        tx.commit()?;
+        Ok(SetFieldOutcome::Applied { state_token: after })
+    }
+
+    /// The DAG conflict view of one issue (ADR-0002 phase B1 slice ii): its
+    /// `heads`, the `state_token` over that frontier, and any field whose
+    /// `bef`-maximal setters disagree. `None` if the issue does not exist.
+    pub fn issue_conflicts(&self, item_id: &str) -> StoreResult<Option<IssueConflicts>> {
+        let exists: bool = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM tracker_issues WHERE issue_id = ?1",
+                [item_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let Some(content_id) = content_id_of(&self.connection, item_id)? else {
+            return Ok(None);
+        };
+        let events = load_issue_events(&self.connection, &content_id)?;
+        Ok(Some(analyze_issue_dag(&events)))
     }
 
     /// Rebuilds the disposable projections (`tracker_issues`,
@@ -417,22 +943,311 @@ impl WorkItemStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
-            "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases;",
+            "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases; \
+             DELETE FROM tracker_comments; DELETE FROM tracker_evidence;",
         )?;
-        let events: Vec<(Option<String>, String, String, String)> = tx
+        // The event log is keyed by opaque content_id; the projections are
+        // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
+        let alias_of: std::collections::HashMap<String, String> = tx
+            .prepare("SELECT content_id, alias FROM tracker_aliases")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        // (event_id, issue_id/content_id, kind, payload_json, created_at, parents)
+        type ProjectionEventRow = (String, Option<String>, String, String, String, Vec<String>);
+        let events: Vec<ProjectionEventRow> = tx
             .prepare(
-                "SELECT issue_id, kind, payload_json, created_at FROM tracker_events ORDER BY event_seq",
+                "SELECT event_id, issue_id, kind, payload_json, created_at, parents_json \
+                 FROM tracker_events ORDER BY event_seq",
             )?
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                let parents: Vec<String> =
+                    serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
+                Ok((
+                    row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    parents,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        for (issue_id, kind, payload_json, created_at) in &events {
+        // Fold in a deterministic TOPOLOGICAL order (parents strictly before
+        // children; concurrent events by event_id). `event_seq` is insertion
+        // order, which is NOT causal after a merge — folding by it can apply a
+        // field_set before its own `issue.created` (lost UPDATE) or a superseded
+        // value last, so two clones holding the same event set would project
+        // different columns. Topological order is content-derived and identical
+        // on every clone.
+        for id in topological_event_order(&events, |e| e.0.as_str(), |e| e.5.as_slice()) {
+            let (event_id, content_id, kind, payload_json, created_at, _parents) = &events[id];
             let payload: Value = serde_json::from_str(payload_json).unwrap_or_else(|_| json!({}));
-            fold_event(&tx, issue_id.as_deref(), kind, &payload, created_at)?;
+            let issue_alias = content_id
+                .as_deref()
+                .and_then(|c| alias_of.get(c))
+                .map(String::as_str);
+            fold_event(
+                &tx,
+                Some(event_id.as_str()),
+                issue_alias,
+                kind,
+                &payload,
+                created_at,
+                &alias_of,
+            )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Export every event in transport form (ADR-0002 phase B1 slice iii) — the
+    /// content-addressed log another clone unions in. Ordered by append seq.
+    pub fn export_events(&self) -> StoreResult<Vec<TrackerEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
+             FROM tracker_events ORDER BY event_seq",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let event_id: Option<String> = row.get(0)?;
+                let parents_json: String = row.get(1)?;
+                Ok(TrackerEvent {
+                    event_id: event_id.unwrap_or_default(),
+                    parents: serde_json::from_str(&parents_json).unwrap_or_default(),
+                    issue_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload_json: row.get(4)?,
+                    actor: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Merge another clone's events into this one (ADR-0002 phase B1 slice iii):
+    /// a set-union of the content-addressed log, deduped by `event_id`. Two
+    /// clones that edited the SAME issue (same content_id) from a shared parent
+    /// FORK its DAG — the conflict engine then surfaces the disagreement. Newly
+    /// seen issues are RE-ALIASED locally (this clone's WS-N, independent of the
+    /// origin's). A re-transmitted event (same content id) is deduped silently as
+    /// an idempotent re-sync; a newly-seen creation that duplicates an existing
+    /// issue (same queue + title, distinct content id) is reported in
+    /// `duplicate_submissions` — a warning, never a silent collapse. Projections
+    /// are rebuilt from the unioned log.
+    pub fn import_events(&mut self, events: &[TrackerEvent]) -> StoreResult<ImportReport> {
+        let mut report = ImportReport::default();
+        {
+            let tx = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for event in events {
+                // Re-verify the content-addressed id before admitting an event
+                // from an untrusted transport (shared folder / rsync / synced
+                // drive). Without this, a tampered `<hash>.json` whose payload
+                // does not match its `event_id` would be folded verbatim, and an
+                // event carrying an honest event's id but different content would
+                // SUPPRESS the honest one via `INSERT OR IGNORE`. A created
+                // event is hashed with no issue_id and no parents, and its id IS
+                // the issue identity.
+                let expected_id = if event.kind == "issue.created" {
+                    event_content_id(
+                        &event.kind,
+                        None,
+                        &event.payload_json,
+                        event.actor.as_deref(),
+                        &[],
+                        &event.created_at,
+                    )
+                } else {
+                    event_content_id(
+                        &event.kind,
+                        event.issue_id.as_deref(),
+                        &event.payload_json,
+                        event.actor.as_deref(),
+                        &event.parents,
+                        &event.created_at,
+                    )
+                };
+                let created_identity_ok = event.kind != "issue.created"
+                    || event.issue_id.as_deref() == Some(event.event_id.as_str());
+                if expected_id != event.event_id || !created_identity_ok {
+                    report.rejected += 1;
+                    continue;
+                }
+                let parents_json = serde_json::to_string(&event.parents)?;
+                let changes = tx.execute(
+                    "INSERT OR IGNORE INTO tracker_events \
+                     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        event.event_id,
+                        parents_json,
+                        event.issue_id,
+                        event.kind,
+                        event.payload_json,
+                        event.actor,
+                        event.created_at,
+                    ],
+                )?;
+                if changes == 1 {
+                    report.imported += 1;
+                } else {
+                    // Byte-identical event already held. Under content-addressing
+                    // this is an IDEMPOTENT re-transmit (the normal cross-machine
+                    // re-sync) — the same event arriving twice, NOT a duplicate
+                    // submission. Count it and stay silent; genuine duplicates are
+                    // caught below by their distinct content ids.
+                    report.skipped += 1;
+                }
+            }
+            // Re-alias every newly-seen issue (has a created event, no local
+            // alias yet) in append order, minting this clone's own WS-N.
+            let unaliased: Vec<String> = tx
+                .prepare(
+                    "SELECT issue_id FROM tracker_events \
+                     WHERE kind = 'issue.created' AND issue_id IS NOT NULL \
+                       AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                     GROUP BY issue_id ORDER BY MIN(event_seq)",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut new_alias: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for content_id in &unaliased {
+                let next: i64 = tx.query_row(
+                    "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let alias = format!("WS-{next}");
+                tx.execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    params![content_id, alias],
+                )?;
+                new_alias.insert(content_id.clone(), alias);
+                report.new_issues += 1;
+            }
+            // Genuine duplicate submission: a newly-seen creation that describes
+            // the SAME issue (same queue + title) as a DISTINCT issue already in
+            // the log. Content-addressing gives every independent submission its
+            // own id, so a real duplicate is two distinct `issue.created` events —
+            // unlike a re-transmit, which shares one id. Advisory only (resolved
+            // by a `duplicates` relation), NEVER a silent collapse.
+            if !unaliased.is_empty() {
+                let created: Vec<(String, String)> = tx
+                    .prepare(
+                        "SELECT issue_id, payload_json FROM tracker_events \
+                         WHERE kind = 'issue.created' AND issue_id IS NOT NULL",
+                    )?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .map(|row| {
+                        let (cid, payload_json) = row?;
+                        let payload: Value =
+                            serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+                        let queue = payload
+                            .get("queue")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let title = payload
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        Ok((cid, format!("{queue}\u{1e}{title}")))
+                    })
+                    .collect::<StoreResult<Vec<_>>>()?;
+                let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
+                    std::collections::HashMap::new();
+                for (cid, key) in &created {
+                    by_key.entry(key).or_default().push(cid);
+                }
+                for content_id in &unaliased {
+                    if let Some((_, key)) = created.iter().find(|(c, _)| c == content_id) {
+                        // A distinct issue already carries this queue+title.
+                        if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                            report.duplicate_submissions.push(
+                                new_alias
+                                    .get(content_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| content_id.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        // Materialize projections from the unioned log (folds forks in on read).
+        self.rebuild_projection()?;
+        Ok(report)
+    }
+
+    /// Export the event log as content-addressed files under `dir` — the
+    /// portable cross-machine transport (ADR-0002 phase B2). Each event is one
+    /// JSON file at `dir/<aa>/<event_id>.json` (git-object-style sharding by
+    /// hash prefix), so a write is idempotent and two clones' directories union
+    /// by the mere set of files (drop-a-folder / rsync / synced-drive sync).
+    /// Returns the number of NEW files written.
+    pub fn export_to_dir(&self, dir: &Path) -> StoreResult<usize> {
+        let events = self.export_events()?;
+        let mut written = 0;
+        for event in &events {
+            if event.event_id.len() < 2 {
+                continue;
+            }
+            let shard = dir.join(&event.event_id[..2]);
+            std::fs::create_dir_all(&shard)?;
+            let path = shard.join(format!("{}.json", event.event_id));
+            if path.exists() {
+                continue; // content-addressed: same id ⇒ same bytes, already present
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(event)?)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Import every event file under `dir` (set-union, deduped by content hash).
+    /// Events are applied in a deterministic order (clock, then id) so local
+    /// re-aliasing is stable. Returns the merge report.
+    pub fn import_from_dir(&mut self, dir: &Path) -> StoreResult<ImportReport> {
+        let mut events = Vec::new();
+        if dir.exists() {
+            for shard in std::fs::read_dir(dir)? {
+                let shard = shard?.path();
+                if !shard.is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&shard)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Ok(event) =
+                        serde_json::from_str::<TrackerEvent>(&std::fs::read_to_string(&path)?)
+                    {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+        events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        self.import_events(&events)
+    }
+
+    /// Bidirectional reconcile against a shared directory: export local events
+    /// to it, then import everything it holds. Two clones that both `sync_dir`
+    /// the same directory converge — the cross-machine multi-writer exchange.
+    pub fn sync_dir(&mut self, dir: &Path) -> StoreResult<(usize, ImportReport)> {
+        let written = self.export_to_dir(dir)?;
+        let report = self.import_from_dir(dir)?;
+        Ok((written, report))
     }
 
     fn active_holder(&self, item_id: &str) -> StoreResult<Option<String>> {
@@ -463,9 +1278,18 @@ impl WorkItemStore {
 }
 
 /// The append-only tracker schema (native file and the DO share this shape).
-/// `tracker_events` is INSERT-only — the source of truth; the rest are
-/// disposable projections folded from it. `tracker_counter` mints the sequential
-/// `WS-N` alias.
+/// `tracker_events` is INSERT-only — the source of truth; `tracker_issues` /
+/// `tracker_relations` / `tracker_leases` are disposable projections folded from
+/// it. `tracker_aliases` is NOT a projection: it is durable clone-local naming
+/// state (content-hash issue id ↔ human `WS-N`), survives a rebuild, and is
+/// re-assigned locally on merge-import — the WS-N of clone A is not the WS-N of
+/// clone B. `tracker_counter` mints the sequential `WS-N`.
+///
+/// Identity (ADR-0002 phase B1 slice i unit 2): an issue's MERGE identity is the
+/// content-hash of its `issue.created` event (`content_id`), carried in every
+/// event's `issue_id` and in relation payloads, so two clones' logs union
+/// correctly. `WS-N` is only a local alias for a human; the projection tables
+/// stay keyed by it (clone-local), the event log by the opaque `content_id`.
 #[cfg(feature = "native")]
 const TRACKER_SCHEMA_SQL: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -473,6 +1297,8 @@ PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS tracker_events (
     event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT,
+    parents_json TEXT NOT NULL DEFAULT '[]',
     issue_id TEXT,
     kind TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
@@ -488,6 +1314,7 @@ CREATE TABLE IF NOT EXISTS tracker_issues (
     labels_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     claim_summary TEXT,
+    assigned_to TEXT,
     filed_by TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -512,15 +1339,54 @@ CREATE TABLE IF NOT EXISTS tracker_counter (
     next_id INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+CREATE TABLE IF NOT EXISTS tracker_aliases (
+    content_id TEXT PRIMARY KEY,
+    alias TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS tracker_comments (
+    comment_id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    author TEXT,
+    body TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracker_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    kind TEXT,
+    reference TEXT,
+    note TEXT,
+    added_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_tracker_issues_queue ON tracker_issues(queue, status);
 CREATE INDEX IF NOT EXISTS idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_tracker_events_issue ON tracker_events(issue_id, kind);
 "#;
 
+/// Add a column to a table if it is missing (`CREATE TABLE IF NOT EXISTS` never
+/// alters an existing table). Idempotent — the schema self-heals across phase
+/// upgrades without a migration file.
+#[cfg(feature = "native")]
+fn tx_ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> StoreResult<()> {
+    let present = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Projection columns in `WorkItem` order (see `row_to_item`).
 #[cfg(feature = "native")]
 const ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, metadata_json, \
-     filed_by, created_at, updated_at";
+     assigned_to, filed_by, created_at, updated_at";
 
 /// Capture a single now-timestamp for one mutating op; every event + projection
 /// field derived from this op uses it, so a rebuild reproduces the same values.
@@ -530,20 +1396,145 @@ fn tx_now(tx: &Transaction<'_>) -> StoreResult<String> {
         .map_err(Into::into)
 }
 
-/// Append one immutable event (INSERT only — never updated or deleted).
+/// The SHA-256 content id of an event (ADR-0002 phase B1: the tracker event
+/// Merkle-DAG). The id commits to the event's whole content INCLUDING its
+/// sorted parent ids, so the log is a hash-chain: altering any past event
+/// changes its id and breaks every downstream `parents` link — a tampered
+/// issue is DETECTABLE, the adversarial-integrity property FNV content-addressing
+/// cannot give. SHA-256 (not FNV) precisely because the threat is a deliberate
+/// forger, who could otherwise compute a colliding event. Two byte-identical
+/// events (same kind/issue/payload/actor/parents/clock) share an id and dedup on
+/// merge; the distinguishing `created_at` keeps genuine re-submissions distinct.
+///
+/// Backend-agnostic (shared by the native rusqlite store and the durable-object
+/// `DoSql` store — DO parity) so both mint identical ids for identical events.
+pub fn event_content_id(
+    kind: &str,
+    issue_id: Option<&str>,
+    payload_json: &str,
+    actor: Option<&str>,
+    parents: &[String],
+    created_at: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted = parents.to_vec();
+    sorted.sort();
+    // A field-separated canonical form; the fields cannot themselves contain the
+    // record separator (0x1e), so the encoding is injective.
+    let material = [
+        kind,
+        issue_id.unwrap_or(""),
+        payload_json,
+        actor.unwrap_or(""),
+        &sorted.join(","),
+        created_at,
+    ]
+    .join("\u{1e}");
+    format!("{:x}", Sha256::digest(material.as_bytes()))
+}
+
+/// The current head event id(s) of an issue — events with no child (nothing
+/// lists them as a parent). A new event's parents. Under single-writer appends
+/// (this store) there is exactly one head, the latest event; the DAG can only
+/// FORK when a merge imports a divergent log (phase B1 slice iii), which is when
+/// multiple heads arise. `None` (no prior event) roots the issue's history.
+#[cfg(feature = "native")]
+fn tx_issue_heads(tx: &Transaction<'_>, issue_id: &str) -> StoreResult<Vec<String>> {
+    let heads: Vec<String> = tx
+        .prepare(
+            "SELECT e.event_id FROM tracker_events e \
+             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM tracker_events c \
+                 WHERE c.issue_id = ?1 \
+                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+        )?
+        .query_map(params![issue_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(heads)
+}
+
+/// Resolve a human `WS-N` alias to its opaque `content_id` merge identity.
+#[cfg(feature = "native")]
+fn content_id_of(conn: &Connection, alias: &str) -> StoreResult<Option<String>> {
+    conn.query_row(
+        "SELECT content_id FROM tracker_aliases WHERE alias = ?1",
+        [alias],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Append one immutable event keyed by the issue's opaque `content_id` (INSERT
+/// only). Its parents are the issue's current heads; its `event_id` is the
+/// content hash over the whole event, so the log is a Merkle-DAG. Pass
+/// `event_id_override` only for the `issue.created` root, whose id IS the issue's
+/// `content_id` (identity = the creation event). Deduped by `event_id` on merge.
+#[cfg(feature = "native")]
+fn tx_append_raw(
+    tx: &Transaction<'_>,
+    issue_content_id: Option<&str>,
+    event_id_override: Option<&str>,
+    kind: &str,
+    payload_json: &str,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<String> {
+    let parents = match issue_content_id {
+        Some(id) => tx_issue_heads(tx, id)?,
+        None => Vec::new(),
+    };
+    let event_id = match event_id_override {
+        Some(id) => id.to_owned(),
+        None => event_content_id(kind, issue_content_id, payload_json, actor, &parents, now),
+    };
+    let parents_json = serde_json::to_string(&parents)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO tracker_events \
+         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            event_id,
+            parents_json,
+            issue_content_id,
+            kind,
+            payload_json,
+            actor,
+            now
+        ],
+    )?;
+    Ok(event_id)
+}
+
+/// Append one event for an issue given by its `WS-N` alias — the door for every
+/// mutation the CLI drives (which speaks WS-N). Resolves the alias to the opaque
+/// `content_id` the event log is keyed by, so the log stays merge-stable while
+/// callers keep using the human handle.
 #[cfg(feature = "native")]
 fn tx_append_event(
     tx: &Transaction<'_>,
-    issue_id: Option<&str>,
+    alias: Option<&str>,
     kind: &str,
     payload: &Value,
     actor: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
-    tx.execute(
-        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![issue_id, kind, payload.to_string(), actor, now],
+    let content_id = match alias {
+        Some(a) => Some(
+            content_id_of(tx, a)?
+                .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {a}")))?,
+        ),
+        None => None,
+    };
+    tx_append_raw(
+        tx,
+        content_id.as_deref(),
+        None,
+        kind,
+        &payload.to_string(),
+        actor,
+        now,
     )?;
     Ok(())
 }
@@ -623,17 +1614,264 @@ fn tx_mark_lease_released(
     Ok(())
 }
 
+/// Append one `issue.field_set` (chaining onto the issue's heads) and fold it
+/// into the linear display column. Shared by the plain and token-checked sets.
+#[cfg(feature = "native")]
+fn tx_apply_field_set(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    field: &str,
+    value: &str,
+    now: &str,
+) -> StoreResult<()> {
+    let payload = json!({"field": field, "value": value});
+    tx_append_event(tx, Some(item_id), "issue.field_set", &payload, None, now)?;
+    // The conflict view is computed on read from the DAG; the column is only
+    // the last-writer display value.
+    if let Some(column) = projection_column(field) {
+        tx.execute(
+            &format!(
+                "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+            ),
+            params![item_id, value, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// The `tracker_issues` display column an `issue.field_set` writes, if any.
+/// Unknown fields still record an event (so the conflict view sees them) but
+/// touch no column. Backend-agnostic (native + DO share it).
+pub fn projection_column(field: &str) -> Option<&'static str> {
+    match field {
+        "title" => Some("title"),
+        "body" => Some("body"),
+        "status" => Some("status"),
+        _ => None,
+    }
+}
+
+/// SHA-256 hex of a string (the `state_token` hasher). Backend-agnostic.
+pub fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+
+/// One event as the conflict engine reads it (id + DAG parents + kind/payload).
+/// Backend-agnostic: both the native and DO stores load their rows into this
+/// shape and call `analyze_issue_dag`, so the conflict logic lives in one place.
+#[derive(Clone, Debug)]
+pub struct IssueEvent {
+    pub event_id: String,
+    pub parents: Vec<String>,
+    pub kind: String,
+    pub payload: Value,
+}
+
+/// Load one issue's events in append order for DAG analysis.
+#[cfg(feature = "native")]
+fn load_issue_events(conn: &Connection, issue_id: &str) -> StoreResult<Vec<IssueEvent>> {
+    let mut statement = conn.prepare(
+        "SELECT event_id, parents_json, kind, payload_json FROM tracker_events \
+         WHERE issue_id = ?1 ORDER BY event_seq",
+    )?;
+    let rows = statement
+        .query_map([issue_id], |row| {
+            let event_id: Option<String> = row.get(0)?;
+            let parents_json: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let payload_json: String = row.get(3)?;
+            Ok((event_id, parents_json, kind, payload_json))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, parents_json, kind, payload_json)| IssueEvent {
+            event_id: event_id.unwrap_or_default(),
+            parents: serde_json::from_str(&parents_json).unwrap_or_default(),
+            kind,
+            payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
+        })
+        .collect())
+}
+
+/// The DAG conflict analysis (ADR-0002 phase B1 slice ii, realizing
+/// `tracker-merge.maude`): compute the frontier (`heads`), a content `state_token`
+/// over it, and any field whose `bef`-maximal `issue.field_set` setters disagree.
+/// A setter is `bef`-maximal iff no OTHER setter of the same field has it as a
+/// transitive ancestor — i.e. nothing supersedes it along the DAG. A field with
+/// two or more distinct maximal values is conflicted; a linear history (one
+/// maximal setter) never is, and agreeing forks converge. Backend-agnostic —
+/// the native and DO stores share this exact analysis (DO parity).
+pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    // Frontier: an event that nothing else lists as a parent.
+    let claimed: HashSet<&str> = events
+        .iter()
+        .flat_map(|e| e.parents.iter().map(String::as_str))
+        .collect();
+    let mut heads: Vec<String> = events
+        .iter()
+        .filter(|e| !e.event_id.is_empty() && !claimed.contains(e.event_id.as_str()))
+        .map(|e| e.event_id.clone())
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let state_token = sha256_hex(&heads.join("\n"));
+
+    // Transitive-ancestor test over the parent map.
+    let parents: HashMap<&str, &[String]> = events
+        .iter()
+        .map(|e| (e.event_id.as_str(), e.parents.as_slice()))
+        .collect();
+    let is_ancestor = |ancestor: &str, of: &str| -> bool {
+        let mut stack: Vec<&str> = parents
+            .get(of)
+            .map(|ps| ps.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(x) = stack.pop() {
+            if x == ancestor {
+                return true;
+            }
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Some(ps) = parents.get(x) {
+                stack.extend(ps.iter().map(String::as_str));
+            }
+        }
+        false
+    };
+
+    // Group the field-setting events by field. The lifecycle events
+    // (`issue.closed`/`issue.canceled`/`issue.reopened`) are ALSO status
+    // setters — including them means a `finish` (close) concurrent with a
+    // `set status open` on another clone is detected as a conflict, instead of
+    // silently folding to an order-dependent status and being handed to a worker.
+    let mut setters: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
+    for e in events {
+        if e.event_id.is_empty() {
+            continue;
+        }
+        let (field, value) = match e.kind.as_str() {
+            "issue.field_set" => {
+                let (Some(field), Some(value)) = (
+                    e.payload.get("field").and_then(Value::as_str),
+                    e.payload.get("value").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                (field.to_owned(), value.to_owned())
+            }
+            "issue.closed" => ("status".to_owned(), "closed".to_owned()),
+            "issue.canceled" => ("status".to_owned(), "canceled".to_owned()),
+            "issue.reopened" => ("status".to_owned(), "open".to_owned()),
+            _ => continue,
+        };
+        setters
+            .entry(field)
+            .or_default()
+            .push((e.event_id.as_str(), value));
+    }
+
+    let mut field_conflicts = Vec::new();
+    for (field, ss) in &setters {
+        let values: BTreeSet<String> = ss
+            .iter()
+            .filter(|(id, _)| {
+                !ss.iter()
+                    .any(|(other, _)| other != id && is_ancestor(id, other))
+            })
+            .map(|(_, val)| val.clone())
+            .collect();
+        if values.len() > 1 {
+            field_conflicts.push(FieldConflict {
+                field: field.clone(),
+                values: values.into_iter().collect(),
+            });
+        }
+    }
+
+    IssueConflicts {
+        heads,
+        state_token,
+        field_conflicts,
+    }
+}
+
 /// Fold one event into the projection tables — the shared step of both live
 /// application and `rebuild_projection`, so a rebuild is bit-identical. `issue_id`
-/// is the event row's subject column (the issue for issue/claim events, the
-/// blocked issue for `relation.added`).
+/// is the alias of the event's subject issue (already resolved from the event's
+/// Deterministic topological order over a content-addressed event DAG: every
+/// event's in-set parents come strictly before it; concurrent events are broken
+/// by `event_id`. Returns indices into `events`. Because both the parent edges
+/// and the tiebreak are content-derived, the order is IDENTICAL on every clone,
+/// independent of insertion / import order — so folding in this order makes the
+/// projected columns converge. Cycle-safe: a Merkle DAG has no cycles, but any
+/// leftover (e.g. a dangling parent from a partial import) is appended by
+/// `event_id`. Shared by the native rebuild and (via the DO's own copy) the DO.
+pub fn topological_event_order<T>(
+    events: &[T],
+    id_of: impl Fn(&T) -> &str,
+    parents_of: impl Fn(&T) -> &[String],
+) -> Vec<usize> {
+    use std::collections::{BTreeSet, HashMap};
+    let index: HashMap<&str, usize> = events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (id_of(e), i))
+        .collect();
+    let mut indeg = vec![0usize; events.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); events.len()];
+    for (i, e) in events.iter().enumerate() {
+        for parent in parents_of(e) {
+            if let Some(&pi) = index.get(parent.as_str()) {
+                children[pi].push(i);
+                indeg[i] += 1;
+            }
+        }
+    }
+    let mut ready: BTreeSet<(&str, usize)> = (0..events.len())
+        .filter(|&i| indeg[i] == 0)
+        .map(|i| (id_of(&events[i]), i))
+        .collect();
+    let mut order = Vec::with_capacity(events.len());
+    while let Some(&(_, i)) = ready.iter().next() {
+        ready.remove(&(id_of(&events[i]), i));
+        order.push(i);
+        for &child in &children[i] {
+            indeg[child] -= 1;
+            if indeg[child] == 0 {
+                ready.insert((id_of(&events[child]), child));
+            }
+        }
+    }
+    if order.len() < events.len() {
+        let mut seen = vec![false; events.len()];
+        for &i in &order {
+            seen[i] = true;
+        }
+        let mut rest: Vec<usize> = (0..events.len()).filter(|&i| !seen[i]).collect();
+        rest.sort_by(|&a, &b| id_of(&events[a]).cmp(id_of(&events[b])));
+        order.extend(rest);
+    }
+    order
+}
+
+/// opaque `content_id`). `alias_of` maps content_id → alias so `relation.added`
+/// payloads (which reference issues by opaque id) fold into the alias-keyed
+/// projection.
 #[cfg(feature = "native")]
 fn fold_event(
     tx: &Transaction<'_>,
+    event_id: Option<&str>,
     issue_id: Option<&str>,
     kind: &str,
     payload: &Value,
     created_at: &str,
+    alias_of: &std::collections::HashMap<String, String>,
 ) -> StoreResult<()> {
     let str_of = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
     match kind {
@@ -683,29 +1921,97 @@ fn fold_event(
         "issue.canceled" => fold_set_status(tx, issue_id, payload, "canceled", created_at)?,
         "issue.reopened" => fold_set_status(tx, issue_id, payload, "open", created_at)?,
         "relation.added" => {
+            // The payload references issues by opaque content_id; the projection
+            // is alias-keyed. Skip the edge if either endpoint has no local alias
+            // (an imported relation whose issue we do not yet hold).
+            let (Some(from), Some(to)) = (
+                str_of("from").and_then(|c| alias_of.get(&c).cloned()),
+                str_of("to").and_then(|c| alias_of.get(&c).cloned()),
+            ) else {
+                return Ok(());
+            };
             tx.execute(
                 "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    str_of("from"),
-                    str_of("to"),
+                    from,
+                    to,
                     str_of("kind").unwrap_or_else(|| "blocks".to_owned()),
                     str_of("dep_kind"),
                 ],
             )?;
         }
-        "claim.acquired" => {
+        "relation.removed" => {
+            let (Some(from), Some(to)) = (
+                str_of("from").and_then(|c| alias_of.get(&c).cloned()),
+                str_of("to").and_then(|c| alias_of.get(&c).cloned()),
+            ) else {
+                return Ok(());
+            };
             tx.execute(
-                "INSERT OR IGNORE INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                "DELETE FROM tracker_relations \
+                 WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
                 params![
-                    str_of("lease_id"),
-                    issue_id,
-                    str_of("actor"),
-                    created_at,
-                    payload.get("expires_at").and_then(Value::as_str),
+                    from,
+                    to,
+                    str_of("kind").unwrap_or_else(|| "blocks".to_owned())
                 ],
             )?;
+        }
+        "comment.added" => {
+            // Keyed by the comment's own event_id (content hash) so a merge /
+            // re-import folds each comment exactly once.
+            if let (Some(comment_id), Some(issue)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_comments \
+                     (comment_id, issue_id, author, body, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        comment_id,
+                        issue,
+                        str_of("author"),
+                        str_of("body").unwrap_or_default(),
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+        "evidence.added" => {
+            if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_evidence \
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        evidence_id,
+                        issue,
+                        str_of("kind"),
+                        str_of("reference"),
+                        str_of("note"),
+                        str_of("added_by"),
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+        "claim.acquired" => {
+            // Keyed by the acquire event's own event_id (content hash), like
+            // comments/evidence: clone-local payload ids collide across clones
+            // and INSERT OR IGNORE would silently drop one of two concurrent
+            // cross-clone claims.
+            if let (Some(lease_id), Some(issue)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                    params![
+                        lease_id,
+                        issue,
+                        str_of("actor"),
+                        created_at,
+                        payload.get("expires_at").and_then(Value::as_str),
+                    ],
+                )?;
+            }
         }
         "claim.renewed" => {
             tx.execute(
@@ -785,11 +2091,25 @@ pub trait WorkItems {
 
     fn get_item(&self, item_id: &str) -> StoreResult<Option<WorkItem>>;
 
+    /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
+    /// Advisory: it records who *should* act and never restricts who may claim.
+    /// Default: no-op, for a store with no assignment plane.
+    fn assign_item(&mut self, _item_id: &str, _assignee: Option<&str>) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>>;
 
     fn ready_items(&self, queue: &str) -> StoreResult<Vec<WorkItem>>;
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome>;
+    /// Atomic claim with an optional absolute expiry (`None` = no TTL). The
+    /// T3 claim-TTL half: the caller computes `now + ttl` and passes it here.
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome>;
 
     /// Holder-only lease extension/heartbeat (the T3 sanctioned extension).
     fn renew_claim(
@@ -839,6 +2159,10 @@ impl WorkItems for WorkItemStore {
         self.get_item(item_id)
     }
 
+    fn assign_item(&mut self, item_id: &str, assignee: Option<&str>) -> StoreResult<bool> {
+        self.assign_item(item_id, assignee)
+    }
+
     fn list_items(&self, queue: Option<&str>, status: Option<&str>) -> StoreResult<Vec<WorkItem>> {
         self.list_items(queue, status)
     }
@@ -847,8 +2171,13 @@ impl WorkItems for WorkItemStore {
         self.ready_items(queue)
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
-        self.claim_item(item_id, claimed_by)
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
+        self.claim_item(item_id, claimed_by, expires)
     }
 
     fn renew_claim(
@@ -909,9 +2238,10 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
         // Durable projection carries no holder; the overlay supplies it.
         claimed_by: None,
-        filed_by: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        assigned_to: row.get(7)?,
+        filed_by: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -944,6 +2274,920 @@ mod tests {
         assert_eq!(second.filed_by.as_deref(), Some("turn-1"));
     }
 
+    /// Reads the raw event log for one issue (given by alias) in append order.
+    fn events_for(store: &WorkItemStore, alias: &str) -> Vec<(String, Vec<String>, String)> {
+        let content_id = content_id_of(&store.connection, alias).unwrap().unwrap();
+        store
+            .connection
+            .prepare(
+                "SELECT event_id, parents_json, kind FROM tracker_events \
+                 WHERE issue_id = ?1 ORDER BY event_seq",
+            )
+            .unwrap()
+            .query_map([&content_id], |row| {
+                let id: String = row.get(0)?;
+                let parents_json: String = row.get(1)?;
+                let kind: String = row.get(2)?;
+                Ok((id, serde_json::from_str(&parents_json).unwrap(), kind))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// ADR-0002 phase B1 slice i: every tracker event carries a SHA-256
+    /// content-hash id, and each new event's parents are the issue's prior
+    /// heads — so the log is a hash-chained Merkle-DAG, not a flat list.
+    #[test]
+    fn events_form_a_content_hash_chain() {
+        let mut store = open_memory();
+        let filed = store
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .expect("files");
+        // A second event on the same issue (claim), so we have a chain to check.
+        assert_eq!(
+            store
+                .claim_item(&filed.id, "worker-1", None)
+                .expect("claim"),
+            ClaimOutcome::Claimed
+        );
+
+        let events = events_for(&store, &filed.id);
+        assert_eq!(events.len(), 2, "created + claim");
+
+        let (created_id, created_parents, created_kind) = &events[0];
+        assert_eq!(created_kind, "issue.created");
+        // Content-hash id: 64 lowercase hex chars (SHA-256), not "WS-N".
+        assert_eq!(created_id.len(), 64);
+        assert!(created_id.chars().all(|c| c.is_ascii_hexdigit()));
+        // The issue's root event has no parents.
+        assert!(created_parents.is_empty());
+
+        let (claim_id, claim_parents, _) = &events[1];
+        assert_eq!(claim_id.len(), 64);
+        // The claim event chains onto the created event: it is a child.
+        assert_eq!(claim_parents.as_slice(), std::slice::from_ref(created_id));
+        assert_ne!(claim_id, created_id);
+    }
+
+    /// ADR-0002 phase B1 slice i unit 2: the event log is keyed by the opaque
+    /// content_id (merge identity), NOT the clone-local WS-N alias; the alias
+    /// table bridges the two. Identity = the creation event's id.
+    #[test]
+    fn events_are_keyed_by_opaque_content_id_not_alias() {
+        let mut store = open_memory();
+        let filed = store
+            .file_item("backlog", "Fix login", "repro", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(filed.id, "WS-1");
+
+        let content_id = content_id_of(&store.connection, "WS-1")
+            .unwrap()
+            .expect("alias resolves");
+        assert_eq!(content_id.len(), 64, "content_id is a SHA-256");
+
+        // No event row carries the WS-N alias; every event's issue_id is the id.
+        let alias_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = 'WS-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_rows, 0, "no event is keyed by the alias");
+        let id_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1",
+                [&content_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_rows, 1, "the created event is keyed by content_id");
+        // Identity = the creation event: the created event's id IS the content_id.
+        let (created_id, _, _) = &events_for(&store, "WS-1")[0];
+        assert_eq!(created_id, &content_id);
+    }
+
+    /// A pre-phase-B `tracker_events` (the ADR-0002 v1 linear log, no `event_id`
+    /// / `parents_json`) opens without crashing: the schema self-heals the
+    /// columns before the unique index, so an old store upgrades in place.
+    #[test]
+    fn open_self_heals_a_pre_phase_b_event_table() {
+        // Own the whole directory so the sqlite file and its `-shm`/`-wal`
+        // sidecars all go away when this test ends, panic or not. Removing
+        // only the file, only at the start, left one behind on every run.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("whip-tracker-heal-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&scratch.0);
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let path = scratch.0.join("items.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tracker_events ( \
+                   event_seq INTEGER PRIMARY KEY AUTOINCREMENT, \
+                   issue_id TEXT, kind TEXT NOT NULL, \
+                   payload_json TEXT NOT NULL DEFAULT '{}', \
+                   actor TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+            )
+            .unwrap();
+        }
+        // Opening adds the Merkle-DAG columns + index rather than erroring.
+        let mut store = WorkItemStore::open(&path).expect("open self-heals old schema");
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files on the healed store");
+        assert_eq!(filed.id, "WS-1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rebuild reconstructs the alias-keyed projection from the content_id-keyed
+    /// event log via the durable `tracker_aliases` bridge — bit-identical to the
+    /// live projection, across issues / field sets / dependencies / claims.
+    #[test]
+    fn rebuild_reproduces_projection_through_the_alias_bridge() {
+        let mut store = open_memory();
+        let a = store
+            .file_item("q", "A title", "", &[], &json!({}), None)
+            .expect("files");
+        let b = store
+            .file_item("q", "B title", "", &[], &json!({}), None)
+            .expect("files");
+        store.set_field(&a.id, "title", "A retitled").expect("set");
+        store.add_blocks(&b.id, &a.id).expect("dep"); // b blocks a
+        store.claim_item(&b.id, "worker-1", None).expect("claim");
+
+        let before = store.get_item(&a.id).unwrap().unwrap();
+        let ready_before = store.ready_items("q").unwrap();
+
+        store.rebuild_projection().expect("rebuild");
+
+        let after = store.get_item(&a.id).unwrap().unwrap();
+        assert_eq!(after.id, "WS-1");
+        assert_eq!(after.title, "A retitled", "field_set folded through");
+        assert_eq!(after, before, "projection is bit-identical after rebuild");
+        // a is still blocked by open b; b is claimed → neither ready, same as before.
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            ready_before.len(),
+            "readiness (deps + leases) reproduced"
+        );
+        // The dependency edge survived the content_id→alias round-trip.
+        let edges: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2",
+                params![b.id, a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1, "relation folded back to aliases");
+    }
+
+    /// Inserts one event with EXPLICIT parents, bypassing the linear
+    /// head-chaining of `tx_append_event`. This is how a test manufactures a
+    /// DAG fork — two events sharing a parent — which single-writer appends
+    /// never produce (only a merge does). Returns the event's content id.
+    fn insert_event(
+        store: &WorkItemStore,
+        alias: &str,
+        kind: &str,
+        payload: &Value,
+        parents: &[String],
+        now: &str,
+    ) -> String {
+        let content_id = content_id_of(&store.connection, alias).unwrap().unwrap();
+        let payload_json = payload.to_string();
+        let event_id = event_content_id(kind, Some(&content_id), &payload_json, None, parents, now);
+        let parents_json = serde_json::to_string(parents).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO tracker_events \
+                 (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                params![event_id, parents_json, content_id, kind, payload_json, now],
+            )
+            .unwrap();
+        event_id
+    }
+
+    fn heads_of(store: &WorkItemStore, id: &str) -> Vec<String> {
+        store.issue_conflicts(id).unwrap().unwrap().heads
+    }
+
+    /// ADR-0002 phase B1 slice ii, realizing `tracker-merge.maude`. Single
+    /// clone: a linear field history has one maximal setter, so it never
+    /// conflicts and the issue stays ready.
+    #[test]
+    fn linear_field_history_never_conflicts() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        assert!(store.set_field(&it.id, "title", "A").expect("set"));
+        assert!(store.set_field(&it.id, "title", "B").expect("set"));
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 1, "linear frontier is a single head");
+        // The linear last-writer projection column tracks the latest set.
+        assert_eq!(store.get_item(&it.id).unwrap().unwrap().title, "B");
+        assert_eq!(store.ready_items("q").unwrap().len(), 1);
+    }
+
+    /// A fork whose two maximal setters DISAGREE conflicts, is reported per
+    /// field with both values, and is no longer ready.
+    #[test]
+    fn disagreeing_fork_conflicts_and_is_not_ready() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "B"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(c.conflicted());
+        assert_eq!(c.field_conflicts.len(), 1);
+        assert_eq!(c.field_conflicts[0].field, "title");
+        assert_eq!(c.field_conflicts[0].values, vec!["A", "B"]);
+        assert_eq!(c.heads.len(), 2, "the fork has two heads");
+        assert!(
+            store.ready_items("q").unwrap().is_empty(),
+            "a conflicted issue is not ready"
+        );
+    }
+
+    /// A fork whose two maximal setters AGREE converges: distinct events (they
+    /// differ by clock) but one value, so no conflict — and still ready.
+    #[test]
+    fn agreeing_fork_converges() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 2);
+        assert_eq!(store.ready_items("q").unwrap().len(), 1);
+    }
+
+    /// A fork that sets DIFFERENT fields is not a conflict (soundness bite):
+    /// each field has a single maximal setter.
+    #[test]
+    fn different_fields_fork_does_not_conflict() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "body", "value": "X"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let c = store.issue_conflicts(&it.id).expect("q").expect("exists");
+        assert!(!c.conflicted());
+        assert_eq!(c.heads.len(), 2);
+    }
+
+    /// Resolution: an event parented on BOTH conflicting heads supersedes them,
+    /// leaving one maximal setter — the conflict clears and the frontier
+    /// collapses to the resolver. The `state_token` changes across the resolve.
+    #[test]
+    fn merge_resolution_clears_conflict() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let base = heads_of(&store, &it.id);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "A"}),
+            &base,
+            "2020-01-01 00:00:01",
+        );
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "B"}),
+            &base,
+            "2020-01-01 00:00:02",
+        );
+        let conflicted = store.issue_conflicts(&it.id).unwrap().unwrap();
+        assert!(conflicted.conflicted());
+        let token_before = conflicted.state_token.clone();
+
+        // Resolve: a single setter descending from both heads.
+        let heads = heads_of(&store, &it.id);
+        assert_eq!(heads.len(), 2);
+        insert_event(
+            &store,
+            &it.id,
+            "issue.field_set",
+            &json!({"field": "title", "value": "C"}),
+            &heads,
+            "2020-01-01 00:00:03",
+        );
+        let resolved = store.issue_conflicts(&it.id).unwrap().unwrap();
+        assert!(!resolved.conflicted(), "resolver supersedes both forks");
+        assert_eq!(resolved.heads.len(), 1);
+        assert_ne!(resolved.state_token, token_before, "the frontier changed");
+    }
+
+    /// ADR-0002 phase B1 slice iii — the real multi-writer scenario (two clones,
+    /// one shared workbench). Clone B imports clone A's issue, both edit the SAME
+    /// field independently, and a cross-import FORKS the field: the merged clone
+    /// sees a genuine conflict with both values. This is what gaugedesk needs.
+    #[test]
+    fn two_clones_editing_one_issue_merge_to_a_conflict() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+
+        // A creates the issue; B imports it and re-aliases it locally.
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        let report = b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(report.new_issues, 1, "B re-aliased A's issue");
+        assert_eq!(report.imported, 1, "just the created event");
+        // Both clones happen to name it WS-1 — independent, clone-local aliases.
+        let b_alias = "WS-1";
+        assert_eq!(b.get_item(b_alias).unwrap().unwrap().title, "Shared");
+
+        // Divergent edits to the SAME field from a shared parent.
+        a.set_field(&issue.id, "title", "from-A").expect("set A");
+        b.set_field(b_alias, "title", "from-B").expect("set B");
+
+        // Cross-import A's edit into B → the title forks.
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts(b_alias).unwrap().unwrap();
+        assert!(conflicts.conflicted(), "the two writers disagree on title");
+        assert_eq!(conflicts.field_conflicts.len(), 1);
+        assert_eq!(conflicts.field_conflicts[0].field, "title");
+        assert_eq!(
+            conflicts.field_conflicts[0].values,
+            vec!["from-A", "from-B"]
+        );
+        assert!(
+            b.ready_items("q").unwrap().is_empty(),
+            "a conflicted issue is not handed to a worker"
+        );
+    }
+
+    /// A lifecycle close on one clone concurrent with a `status` set on another
+    /// is a real status conflict — `issue.closed` is a status setter, so the
+    /// fork is flagged (and kept off the ready queue) rather than folding to an
+    /// order-dependent status.
+    #[test]
+    fn close_vs_concurrent_status_set_is_a_conflict() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let b_alias = "WS-1";
+
+        // A finishes (issue.closed → status "closed"); B sets status "open" —
+        // both chaining off the shared created event.
+        a.finish_item(&issue.id, Some("done")).expect("finish");
+        b.set_field(b_alias, "status", "open").expect("set");
+
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts(b_alias).unwrap().unwrap();
+        assert!(conflicts.conflicted(), "close vs status-open must conflict");
+        assert_eq!(conflicts.field_conflicts[0].field, "status");
+        assert_eq!(conflicts.field_conflicts[0].values, vec!["closed", "open"]);
+        assert!(
+            b.ready_items("q").unwrap().is_empty(),
+            "a status-conflicted issue is not handed to a worker"
+        );
+    }
+
+    /// Agreeing writers converge: two clones set the same value, merge is clean.
+    #[test]
+    fn two_clones_agreeing_merge_cleanly() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        a.set_field(&issue.id, "status", "closed").expect("set A");
+        b.set_field("WS-1", "status", "closed").expect("set B");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        let conflicts = b.issue_conflicts("WS-1").unwrap().unwrap();
+        assert!(!conflicts.conflicted(), "same value → convergence");
+    }
+
+    /// Cross-clone concurrent claims must BOTH survive a merge. Regression:
+    /// lease ids were minted from the clone-LOCAL alias (`L-WS-1-0` on both
+    /// clones), so the import fold's INSERT OR IGNORE on the `lease_id`
+    /// PRIMARY KEY silently destroyed one of the two leases — the losing
+    /// holder's own lease vanished from their store, `release` could release
+    /// the OTHER actor's lease, and an actively-claimed issue could be handed
+    /// out as ready. Lease identity is now the acquire event's content id.
+    #[test]
+    fn cross_clone_concurrent_claims_survive_merge() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+
+        // Each clone claims its local WS-1; per-store exclusivity cannot see
+        // the other clone, so both grants succeed — the double-claim case.
+        assert!(matches!(
+            a.claim_item(&issue.id, "alice", None).unwrap(),
+            ClaimOutcome::Claimed
+        ));
+        assert!(matches!(
+            b.claim_item("WS-1", "bob", None).unwrap(),
+            ClaimOutcome::Claimed
+        ));
+
+        // Cross-import both ways: the union must carry BOTH leases, live,
+        // under distinct ids, on both clones.
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        a.import_events(&b.export_events().unwrap()).unwrap();
+        for (label, store) in [("A", &a), ("B", &b)] {
+            let live: Vec<(String, String)> = store
+                .connection
+                .prepare(
+                    "SELECT lease_id, actor FROM tracker_leases \
+                     WHERE released_at IS NULL ORDER BY actor",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let actors: Vec<&str> = live.iter().map(|(_, actor)| actor.as_str()).collect();
+            assert_eq!(
+                actors,
+                vec!["alice", "bob"],
+                "clone {label}: both concurrent leases survive the merge"
+            );
+            assert_ne!(live[0].0, live[1].0, "clone {label}: lease ids distinct");
+            assert!(
+                store.ready_items("q").unwrap().is_empty(),
+                "clone {label}: a claimed issue is never handed out as ready"
+            );
+            assert_leases_reconcile_with_log(store, label);
+        }
+    }
+
+    /// DR-0044 formal-verification follow-on (the log-vs-projection
+    /// reconciliation invariant): every unreleased `claim.acquired` in the
+    /// event log folds to exactly one live lease row, and no `claim.released`/
+    /// `claim.expired` lacks its lease. This is the invariant the alias-derived
+    /// lease-id collision violated silently — a determinism/convergence sweep
+    /// cannot see it (the buggy fold converged identically under every delivery
+    /// order to a projection that had simply LOST a row), so it is checked
+    /// directly against the log. Content-addressed acquire ids make the count
+    /// exact: re-transmitted duplicates share an id (deduped), genuinely
+    /// concurrent claims get distinct ids (both survive).
+    fn assert_leases_reconcile_with_log(store: &WorkItemStore, label: &str) {
+        use std::collections::{HashMap, HashSet};
+        let events = store.export_events().expect("export");
+        // Net unreleased acquires, keyed by the acquire event's id (= lease_id).
+        let mut released: HashSet<String> = HashSet::new();
+        for ev in &events {
+            if ev.kind == "claim.released" || ev.kind == "claim.expired" {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&ev.payload_json).unwrap_or_default();
+                if let Some(id) = payload.get("lease_id").and_then(serde_json::Value::as_str) {
+                    released.insert(id.to_owned());
+                }
+            }
+        }
+        let mut expected_live: HashMap<String, String> = HashMap::new();
+        for ev in &events {
+            if ev.kind == "claim.acquired" {
+                let id = ev.event_id.clone();
+                if released.contains(&id) {
+                    continue;
+                }
+                let payload: serde_json::Value =
+                    serde_json::from_str(&ev.payload_json).unwrap_or_default();
+                let actor = payload
+                    .get("actor")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                expected_live.insert(id, actor);
+            }
+        }
+        let live: HashMap<String, String> = store
+            .connection
+            .prepare("SELECT lease_id, actor FROM tracker_leases WHERE released_at IS NULL")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            live, expected_live,
+            "clone {label}: live leases must reconcile 1:1 with unreleased \
+             claim.acquired events in the log"
+        );
+    }
+
+    /// ADR-0002 phase B2 (richer model): only `blocks` gates readiness; other
+    /// relation kinds are graph metadata. `blocks` carries a dependency kind,
+    /// and removal frees the blocked issue. Relations survive rebuild.
+    #[test]
+    fn relation_kinds_gate_readiness_only_for_blocks() {
+        let mut store = open_memory();
+        let a = store
+            .file_item("q", "A", "", &[], &json!({}), None)
+            .expect("files");
+        let b = store
+            .file_item("q", "B", "", &[], &json!({}), None)
+            .expect("files");
+
+        // A non-blocking relation does not affect readiness.
+        store
+            .add_relation(&a.id, &b.id, "related", None)
+            .expect("related");
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            2,
+            "related does not block"
+        );
+
+        // A dependency (blocks, with a kind) gates the blocked issue.
+        store
+            .add_relation(&b.id, &a.id, "blocks", Some("resource"))
+            .expect("blocks");
+        let ready: Vec<String> = store
+            .ready_items("q")
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ready, vec![b.id.clone()], "a is blocked by b, b is ready");
+
+        // The dep_kind is recorded on the edge.
+        let rels = store.relations(&a.id).unwrap();
+        let blocks = rels.iter().find(|r| r.kind == "blocks").unwrap();
+        assert_eq!(blocks.dep_kind.as_deref(), Some("resource"));
+
+        // Removing the blocks edge frees a; the related edge is untouched.
+        assert!(store.remove_relation(&b.id, &a.id, "blocks").unwrap());
+        assert_eq!(
+            store.ready_items("q").unwrap().len(),
+            2,
+            "unblocked after removal"
+        );
+        assert!(
+            store
+                .relations(&a.id)
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == "related"),
+            "the metadata relation survives"
+        );
+
+        // Rebuild reproduces the surviving relation set (added then removed nets out).
+        store.rebuild_projection().unwrap();
+        let after = store.relations(&a.id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].kind, "related");
+
+        // Validation: unknown kinds and misplaced dep_kind are rejected.
+        assert!(store.add_relation(&a.id, &b.id, "bogus", None).is_err());
+        assert!(store
+            .add_relation(&a.id, &b.id, "related", Some("hard"))
+            .is_err());
+    }
+
+    /// ADR-0002 phase B2 cross-machine transport: two clones reconcile by
+    /// sharing a directory of content-addressed event files. After both
+    /// `sync_dir` the same dir, divergent field edits surface as a conflict in
+    /// BOTH — the drop-a-folder multi-writer exchange.
+    #[test]
+    fn dir_sync_reconciles_two_clones() {
+        let dir = std::env::temp_dir().join(format!("whip-tracker-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut a = open_memory();
+        let mut b = open_memory();
+        let issue = a
+            .file_item("q", "Shared", "", &[], &json!({}), None)
+            .expect("files");
+
+        // Seed B with A's issue through the shared directory.
+        a.export_to_dir(&dir).expect("export");
+        let report = b.import_from_dir(&dir).expect("import");
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(b.get_item("WS-1").unwrap().unwrap().title, "Shared");
+
+        // Divergent edits, then both sync against the shared dir.
+        a.set_field(&issue.id, "title", "A version").expect("set A");
+        b.set_field("WS-1", "title", "B version").expect("set B");
+        a.sync_dir(&dir).expect("sync a");
+        b.sync_dir(&dir).expect("sync b"); // b now sees A's edit → forks
+        a.sync_dir(&dir).expect("sync a2"); // a now sees B's edit → forks
+
+        for (name, store) in [("a", &a), ("b", &b)] {
+            let c = store.issue_conflicts("WS-1").unwrap().unwrap();
+            assert!(c.conflicted(), "{name} sees the conflict after sync");
+            assert_eq!(c.field_conflicts[0].values, vec!["A version", "B version"]);
+            // Content-addressed heads: both clones agree on the frontier.
+            assert_eq!(c.heads.len(), 2);
+        }
+        // Both frontiers are byte-identical — true convergence, not just "both
+        // conflicted": the state_token is a content hash of the shared heads.
+        assert_eq!(
+            a.issue_conflicts("WS-1").unwrap().unwrap().state_token,
+            b.issue_conflicts("WS-1").unwrap().unwrap().state_token
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0002 phase B2: comments and evidence attach to an issue, survive a
+    /// rebuild, and fold exactly once through a merge (keyed by content hash).
+    #[test]
+    fn comments_and_evidence_attach_and_merge_once() {
+        let mut a = open_memory();
+        let issue = a
+            .file_item("q", "Task", "", &[], &json!({}), None)
+            .expect("files");
+        a.add_comment(&issue.id, Some("worker-1"), "looks done")
+            .expect("comment");
+        a.add_evidence(
+            &issue.id,
+            Some("log"),
+            Some("s3://run/42.log"),
+            Some("green"),
+            Some("worker-1"),
+        )
+        .expect("evidence");
+
+        let comments = a.comments(&issue.id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "looks done");
+        assert_eq!(comments[0].author.as_deref(), Some("worker-1"));
+        let evidence = a.evidence(&issue.id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].reference.as_deref(), Some("s3://run/42.log"));
+
+        // Survive a rebuild.
+        a.rebuild_projection().unwrap();
+        assert_eq!(a.comments(&issue.id).unwrap().len(), 1);
+        assert_eq!(a.evidence(&issue.id).unwrap().len(), 1);
+
+        // Merge into a second clone: the comment + evidence fold exactly once,
+        // and a re-import does not duplicate them.
+        let mut b = open_memory();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(b.comments("WS-1").unwrap().len(), 1, "comment merged once");
+        assert_eq!(b.evidence("WS-1").unwrap().len(), 1, "evidence merged once");
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(
+            b.comments("WS-1").unwrap().len(),
+            1,
+            "re-import does not dup"
+        );
+    }
+
+    /// Re-importing the same log is idempotent and SILENT: byte-identical events
+    /// are re-transmits (same content id), deduped without a duplicate warning —
+    /// this is the normal cross-machine re-sync, and it must not spam.
+    #[test]
+    fn reimport_is_a_silent_idempotent_resync() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        a.file_item("q", "One", "", &[], &json!({}), None)
+            .expect("files");
+        a.file_item("q", "Two", "", &[], &json!({}), None)
+            .expect("files");
+        let events = a.export_events().unwrap();
+
+        let first = b.import_events(&events).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.new_issues, 2);
+        assert!(first.duplicate_submissions.is_empty());
+
+        let second = b.import_events(&events).unwrap();
+        assert_eq!(second.imported, 0, "nothing new on re-import");
+        assert_eq!(second.new_issues, 0, "no re-aliasing");
+        assert_eq!(second.skipped, 2, "both events deduped as re-transmits");
+        assert!(
+            second.duplicate_submissions.is_empty(),
+            "a re-transmit is NOT a duplicate submission — re-sync stays quiet"
+        );
+        assert_eq!(b.list_items(Some("q"), None).unwrap().len(), 2);
+    }
+
+    /// Two clones holding the byte-identical event set must project the SAME
+    /// field value regardless of import order. A linear title history
+    /// orig→A→B is folded TOPOLOGICALLY, so a non-causal import order can no
+    /// longer drop edits or leave clones disagreeing. (Pre-fix bug: folding by
+    /// insertion order projected "orig" in one order and "B" in another.)
+    #[test]
+    fn projection_converges_across_import_orders() {
+        let mut source = open_memory();
+        let it = source
+            .file_item("q", "orig", "", &[], &json!({}), None)
+            .expect("file");
+        source.set_field(&it.id, "title", "A").expect("set A");
+        source.set_field(&it.id, "title", "B").expect("set B");
+        let events = source.export_events().unwrap();
+        assert_eq!(source.get_item(&it.id).unwrap().unwrap().title, "B");
+
+        let title_after = |order: &[TrackerEvent]| {
+            let mut clone = open_memory();
+            clone.import_events(order).unwrap();
+            let alias = clone.list_items(Some("q"), None).unwrap()[0].id.clone();
+            clone.get_item(&alias).unwrap().unwrap().title
+        };
+        let mut asc = events.clone();
+        asc.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        let mut desc = events.clone();
+        desc.sort_by(|a, b| b.event_id.cmp(&a.event_id));
+        assert_eq!(title_after(&asc), "B", "ascending import must project B");
+        assert_eq!(title_after(&desc), "B", "descending import must project B");
+    }
+
+    /// A genuine duplicate submission — two clones independently FILE the same
+    /// issue (same queue + title) — mints two distinct content ids. Merging them
+    /// surfaces the second as a duplicate_submission warning (advisory; a human
+    /// reconciles via a `duplicates` relation), never a silent collapse.
+    /// A tampered event (payload mutated but the id kept, or an id that collides
+    /// with an honest event) is REJECTED on import, not folded — the content-
+    /// addressed integrity the shared-folder transport claims. Also proves an
+    /// id-collision cannot SUPPRESS the honest event.
+    #[test]
+    fn import_rejects_events_whose_id_does_not_match_their_content() {
+        let mut a = open_memory();
+        let it = a
+            .file_item("q", "Original", "", &[], &json!({}), Some("ann"))
+            .expect("files");
+        a.set_field(&it.id, "title", "Legit").expect("set");
+        let events = a.export_events().unwrap();
+
+        // Tamper: keep a field_set event's id + parents, mutate its payload to a
+        // hostile value (a forger rewriting the title under a valid-looking id).
+        let mut tampered = events.clone();
+        let victim = tampered
+            .iter_mut()
+            .find(|e| e.kind == "issue.field_set")
+            .expect("a field_set event");
+        victim.payload_json = victim.payload_json.replace("Legit", "Hijacked");
+
+        let mut b = open_memory();
+        let report = b.import_events(&tampered).unwrap();
+        assert!(report.rejected >= 1, "the tampered event must be rejected");
+        // The honest events still import; the hijacked value never lands.
+        let alias = b.list_items(Some("q"), None).unwrap()[0].id.clone();
+        assert_eq!(b.get_item(&alias).unwrap().unwrap().title, "Original");
+
+        // A created event whose id does not equal its issue identity is rejected.
+        let mut forged = a.export_events().unwrap();
+        let created = forged
+            .iter_mut()
+            .find(|e| e.kind == "issue.created")
+            .expect("created");
+        created.issue_id = Some("WS-forged-identity".to_owned());
+        let mut c = open_memory();
+        let report = c.import_events(std::slice::from_ref(created)).unwrap();
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.imported, 0);
+    }
+
+    #[test]
+    fn independent_same_issue_submissions_warn_as_duplicates() {
+        let mut a = open_memory();
+        let mut b = open_memory();
+        // Two clones each file "Fix login" into queue q — same work, filed twice.
+        a.file_item("q", "Fix login", "", &[], &json!({}), Some("ann"))
+            .expect("files");
+        b.file_item("q", "Fix login", "", &[], &json!({}), Some("bob"))
+            .expect("files");
+        let a_events = a.export_events().unwrap();
+        let b_events = b.export_events().unwrap();
+        // Distinct content ids — independent submissions are not the same event.
+        assert_ne!(a_events[0].event_id, b_events[0].event_id);
+
+        // A pulls in B's independent submission of the same issue.
+        let report = a.import_events(&b_events).unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(
+            report.duplicate_submissions.len(),
+            1,
+            "B's independent submission duplicates the one A already had"
+        );
+        // Both issues survive — advisory warning, never a silent collapse.
+        assert_eq!(a.list_items(Some("q"), None).unwrap().len(), 2);
+        // A different title in the same queue is NOT flagged.
+        let mut c = open_memory();
+        c.file_item("q", "Other work", "", &[], &json!({}), None)
+            .expect("files");
+        let clean = c.import_events(&a_events).unwrap();
+        assert!(clean.duplicate_submissions.is_empty());
+    }
+
+    /// ADR-0002 phase B1 slice v: an optimistic set applies against the current
+    /// state token, moves the token, and refuses a stale token — reporting the
+    /// actual one to retry against, without overwriting the intervening change.
+    #[test]
+    fn optimistic_set_guards_on_state_token() {
+        let mut store = open_memory();
+        let it = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .expect("files");
+        let token0 = store.issue_conflicts(&it.id).unwrap().unwrap().state_token;
+
+        // A fresh token applies and returns the new frontier token.
+        let token1 = match store
+            .set_field_checked(&it.id, "title", "A", &token0)
+            .expect("set")
+        {
+            SetFieldOutcome::Applied { state_token } => {
+                assert_ne!(state_token, token0);
+                state_token
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // Re-using the stale token0 is refused with the current actual token1.
+        match store
+            .set_field_checked(&it.id, "title", "B", &token0)
+            .expect("set")
+        {
+            SetFieldOutcome::StateChanged { actual } => assert_eq!(actual, token1),
+            other => panic!("expected StateChanged, got {other:?}"),
+        }
+        // The refused set did not apply: the linear column is still "A".
+        assert_eq!(store.get_item(&it.id).unwrap().unwrap().title, "A");
+
+        // A missing issue reports NotFound, not a false token mismatch.
+        assert_eq!(
+            store
+                .set_field_checked("WS-999", "title", "Z", &token0)
+                .unwrap(),
+            SetFieldOutcome::NotFound
+        );
+    }
+
     /// Drive the store through the `WorkItems` trait as a `dyn` object: proves
     /// the seam is object-safe (a boxed durable-object backend is legal) and
     /// forwards faithfully to the inherent methods.
@@ -965,7 +3209,9 @@ mod tests {
         assert_eq!(filed.id, "WS-1");
         assert_eq!(items.ready_items("backlog").expect("ready").len(), 1);
         assert_eq!(
-            items.claim_item(&filed.id, "worker-1").expect("claim"),
+            items
+                .claim_item(&filed.id, "worker-1", None)
+                .expect("claim"),
             ClaimOutcome::Claimed
         );
         assert!(items.ready_items("backlog").expect("ready").is_empty());
@@ -997,7 +3243,9 @@ mod tests {
             .expect("files");
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
         assert_eq!(
-            store.claim_item(&item.id, "worker-1").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-1", None)
+                .expect("claims"),
             ClaimOutcome::Claimed
         );
         assert!(store.ready_items("backlog").expect("ready").is_empty());
@@ -1010,15 +3258,165 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         assert_eq!(
-            store.claim_item(&item.id, "worker-1").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-1", None)
+                .expect("claims"),
             ClaimOutcome::Claimed
         );
         assert_eq!(
-            store.claim_item(&item.id, "worker-2").expect("claims"),
+            store
+                .claim_item(&item.id, "worker-2", None)
+                .expect("claims"),
             ClaimOutcome::AlreadyClaimed {
                 holder: "worker-1".to_owned()
             }
         );
+    }
+
+    /// An issue files unassigned, which is the "whoever has access" case and
+    /// must stay expressible — assignment is optional, not a required field
+    /// callers work around.
+    #[test]
+    fn an_issue_files_unassigned() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(item.assigned_to, None);
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().assigned_to,
+            None
+        );
+    }
+
+    #[test]
+    fn assignment_round_trips_and_clears() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        assert!(store.assign_item(&item.id, Some("alice")).expect("assigns"));
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().assigned_to,
+            Some("alice".to_owned())
+        );
+        // Reassignment is ordinary; so is clearing back to "anyone".
+        assert!(store.assign_item(&item.id, Some("bob")).expect("reassigns"));
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().assigned_to,
+            Some("bob".to_owned())
+        );
+        assert!(store.assign_item(&item.id, None).expect("clears"));
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().assigned_to,
+            None
+        );
+    }
+
+    /// Assignment is advisory: it says who *should* act and never restricts who
+    /// *may* claim. Enforcing it here would require an authority model this
+    /// crate deliberately does not have.
+    #[test]
+    fn assignment_does_not_restrict_who_may_claim() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        store.assign_item(&item.id, Some("alice")).expect("assigns");
+        assert!(matches!(
+            store.claim_item(&item.id, "bob", None).expect("claims"),
+            ClaimOutcome::Claimed
+        ));
+        let held = store.get_item(&item.id).expect("gets").unwrap();
+        assert_eq!(held.assigned_to, Some("alice".to_owned()));
+        assert_eq!(held.claimed_by, Some("bob".to_owned()));
+    }
+
+    /// Assignment and claim are different facts and must not collapse into one
+    /// another: an assigned issue is still unclaimed until someone claims it.
+    #[test]
+    fn assigning_does_not_claim() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        store.assign_item(&item.id, Some("alice")).expect("assigns");
+        let held = store.get_item(&item.id).expect("gets").unwrap();
+        assert_eq!(held.claimed_by, None);
+        assert_eq!(held.status, "open");
+        assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
+    }
+
+    #[test]
+    fn a_closed_issue_is_not_reassigned() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        store.finish_item(&item.id, Some("done")).expect("finishes");
+        assert!(
+            !store.assign_item(&item.id, Some("alice")).expect("no-op"),
+            "reassigning a closed issue must be a no-op, not a silent rewrite",
+        );
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().assigned_to,
+            None
+        );
+    }
+
+    #[test]
+    fn assigning_an_unknown_issue_is_a_no_op() {
+        let mut store = open_memory();
+        assert!(!store.assign_item("WS-404", Some("alice")).expect("no-op"));
+    }
+
+    /// The column self-heals onto a database written before 0.2.2, so an
+    /// existing tracker keeps working rather than failing to open.
+    #[test]
+    fn a_pre_assignment_database_self_heals() {
+        let path = std::env::temp_dir().join(format!(
+            "whip-tracker-selfheal-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // A pre-0.2.2 shape: the issues table without `assigned_to`.
+            let conn = Connection::open(&path).expect("opens");
+            conn.execute_batch(
+                "CREATE TABLE tracker_issues (
+                    issue_id TEXT PRIMARY KEY,
+                    queue TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open',
+                    labels_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    claim_summary TEXT,
+                    filed_by TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE tracker_aliases (
+                    content_id TEXT PRIMARY KEY,
+                    alias TEXT NOT NULL UNIQUE
+                );
+                INSERT INTO tracker_issues (issue_id, queue, title)
+                VALUES ('WS-1', 'backlog', 'existing');
+                INSERT INTO tracker_aliases (content_id, alias)
+                VALUES ('content-ws-1', 'WS-1');",
+            )
+            .expect("seeds the old shape");
+        }
+        let mut store = WorkItemStore::open(&path).expect("opens and self-heals");
+        let existing = store.get_item("WS-1").expect("gets").expect("present");
+        assert_eq!(existing.assigned_to, None, "an old row reads as unassigned");
+        assert!(store.assign_item("WS-1", Some("alice")).expect("assigns"));
+        assert_eq!(
+            store.get_item("WS-1").expect("gets").unwrap().assigned_to,
+            Some("alice".to_owned())
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1027,7 +3425,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w").expect("claims");
+        store.claim_item(&item.id, "w", None).expect("claims");
         assert!(store.release_item(&item.id).expect("releases"));
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
     }
@@ -1057,7 +3455,7 @@ mod tests {
             let mut already = 0;
             for worker in 0..5 {
                 match store
-                    .claim_item(id, &format!("worker-{worker}"))
+                    .claim_item(id, &format!("worker-{worker}"), None)
                     .expect("claims")
                 {
                     ClaimOutcome::Claimed => claimed += 1,
@@ -1081,14 +3479,14 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         assert_eq!(
-            store.claim_item(&item.id, "w1").expect("claims"),
+            store.claim_item(&item.id, "w1", None).expect("claims"),
             ClaimOutcome::Claimed
         );
         assert!(store.release_item(&item.id).expect("releases"));
         let mut claimed = 0;
         for worker in 0..3 {
             if let ClaimOutcome::Claimed = store
-                .claim_item(&item.id, &format!("w{worker}"))
+                .claim_item(&item.id, &format!("w{worker}"), None)
                 .expect("claims")
             {
                 claimed += 1;
@@ -1109,8 +3507,10 @@ mod tests {
         let theirs = store
             .file_item("backlog", "theirs", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&mine.id, "w1").expect("claims mine");
-        store.claim_item(&theirs.id, "w2").expect("claims theirs");
+        store.claim_item(&mine.id, "w1", None).expect("claims mine");
+        store
+            .claim_item(&theirs.id, "w2", None)
+            .expect("claims theirs");
 
         assert_eq!(
             store.release_claims_for_holder("w1").expect("releases"),
@@ -1128,7 +3528,7 @@ mod tests {
         // The released item is claimable again; a holder with nothing held is a
         // no-op (e.g. an instance that already `finish`ed everything).
         assert_eq!(
-            store.claim_item(&mine.id, "w3").expect("reclaims"),
+            store.claim_item(&mine.id, "w3", None).expect("reclaims"),
             ClaimOutcome::Claimed
         );
         assert_eq!(store.release_claims_for_holder("w1").expect("noop"), 0);
@@ -1140,7 +3540,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w").expect("claims");
+        store.claim_item(&item.id, "w", None).expect("claims");
         assert!(store
             .finish_item(&item.id, Some("done by agent"))
             .expect("finishes"));
@@ -1157,7 +3557,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w1").expect("claims");
+        store.claim_item(&item.id, "w1", None).expect("claims");
 
         // Non-holder cannot renew.
         assert_eq!(
@@ -1187,6 +3587,60 @@ mod tests {
         );
     }
 
+    /// Claim TTL (T3): a finite absolute `expires` records a timed lease that
+    /// blocks readiness while in the future and stops blocking once past-due —
+    /// so a claim in the past is expired-on-arrival and never blocks.
+    #[test]
+    fn claim_with_ttl_records_a_finite_expiry() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        // A far-future TTL: the claim is held, so the issue is not ready.
+        assert_eq!(
+            store
+                .claim_item(&item.id, "w1", Some("2099-01-01 00:00:00"))
+                .expect("claims"),
+            ClaimOutcome::Claimed
+        );
+        assert!(store.ready_items("backlog").expect("ready").is_empty());
+        let held = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(held.status, "in_progress");
+        assert_eq!(held.claimed_by.as_deref(), Some("w1"));
+        // A different worker cannot claim the still-live timed lease.
+        assert!(matches!(
+            store
+                .claim_item(&item.id, "w2", None)
+                .expect("contended claim"),
+            ClaimOutcome::AlreadyClaimed { .. }
+        ));
+        // A past TTL is expired-on-arrival: it never blocks readiness, and the
+        // lazy expiry sweep lets a fresh claim win.
+        let stale = store
+            .file_item("backlog", "b", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(
+            store
+                .claim_item(&stale.id, "w1", Some("2000-01-01 00:00:00"))
+                .expect("claims"),
+            ClaimOutcome::Claimed
+        );
+        let ready: Vec<String> = store
+            .ready_items("backlog")
+            .expect("ready")
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert!(
+            ready.contains(&stale.id),
+            "expired claim does not block: {ready:?}"
+        );
+        assert_eq!(
+            store.claim_item(&stale.id, "w2", None).expect("reclaims"),
+            ClaimOutcome::Claimed
+        );
+    }
+
     /// An expired lease frees the issue for a fresh claim and lets it be ready
     /// again (`tracker-lease.maude`: expired leases do not block).
     #[test]
@@ -1195,7 +3649,7 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.claim_item(&item.id, "w1").expect("claims");
+        store.claim_item(&item.id, "w1", None).expect("claims");
         // Set the holder's own lease to a past deadline (NULL -> finite is
         // allowed for the holder), so it is now expired.
         assert!(matches!(
@@ -1208,7 +3662,7 @@ mod tests {
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
         // And a different worker can claim it (the lazy expiry sweep frees it).
         assert_eq!(
-            store.claim_item(&item.id, "w2").expect("claims"),
+            store.claim_item(&item.id, "w2", None).expect("claims"),
             ClaimOutcome::Claimed
         );
     }
@@ -1268,11 +3722,11 @@ mod tests {
             .file_item("backlog", "c", "", &[], &json!({}), None)
             .expect("files c");
         store.add_blocks(&a.id, &b.id).expect("blocks");
-        store.claim_item(&c.id, "w1").expect("claims c");
+        store.claim_item(&c.id, "w1", None).expect("claims c");
         store
             .renew_claim(&c.id, "w1", Some("2099-01-01 00:00:00"))
             .expect("renew");
-        store.claim_item(&a.id, "w2").expect("claims a");
+        store.claim_item(&a.id, "w2", None).expect("claims a");
         store.release_item(&a.id).expect("release a");
         store.finish_item(&b.id, Some("done")).expect("finish b");
 

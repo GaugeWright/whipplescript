@@ -1,0 +1,298 @@
+load ../kernel.maude
+
+--- A false guard cannot make a rule ready or commit its effect graph.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gFalse)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- An error guard produces diagnostics but cannot commit its effect graph.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gError)
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A true guard can make the same rule/effect graph fire.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1) guard(guardedRule, issueFact, gTrue)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A lowered equality/boolean guard can make the same rule/effect graph fire.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, andExpr(eqExpr(scalar(scalar1), scalar(scalar1)), emptyExpr(query(query1, qZero))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- A lowered false guard cannot make the same rule/effect graph fire.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, andExpr(boolTrue, existsExpr(query(query1, qZero))))
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A lowered error guard produces diagnostics without committing effects.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact, countExpr(query(query1, qError)))
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Lowered ordering, membership, map index, and filtered-query expressions compose.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(
+      andExpr(geExpr(countExpr(queryFilter(query1, boolTrue, qOne)), countOne),
+        inExpr(scalar(scalar1), arrayHas(scalar(scalar1)))),
+      eqExpr(indexExpr(mapHas(scalar(scalar2), scalar(scalar1)), scalar(scalar2)),
+        scalar(scalar1))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Lowered membership misses and failed filtered-query guards block commits.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    orExpr(inExpr(scalar(scalar1), arrayMissing(scalar(scalar1))),
+      existsExpr(queryFilter(query1, boolFalse, qOne))))
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Finite non-empty query cardinalities reduce through empty?.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  evalGuard(andExpr(notExpr(emptyExpr(query(query1, qTwo))),
+    notExpr(emptyExpr(queryFilter(query1, boolTrue, qThree)))))
+  =>*
+  gTrue .
+
+--- Lowered object-literal witnesses support emptiness and field membership.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(emptyExpr(objectEmpty),
+      inExpr(scalar(scalar1), objectHas(scalar(scalar1), scalar(scalar2)))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Lowered index misses are guard errors and still cannot commit effects.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    eqExpr(indexExpr(mapMissing(scalar(scalar1)), scalar(scalar1)), scalar(scalar2)))
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Exact finite arrays preserve multi-item cardinality and membership.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(eqExpr(countExpr(arrayOf(exprCons(scalar(scalar1), exprCons(scalar(scalar2), exprNil)))), countTwo),
+      inExpr(scalar(scalar2), arrayOf(exprCons(scalar(scalar1), exprCons(scalar(scalar2), exprNil))))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Exact finite objects preserve key cardinality and path-sensitive index reads.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  guardExpr(guardedRule, issueFact,
+    andExpr(eqExpr(countExpr(objectOf(entryCons(entry(scalar(scalar1), scalar(scalar2)), entryCons(entry(scalar(scalar2), scalar(scalar1)), entryNil)))), countTwo),
+      eqExpr(indexExpr(objectOf(entryCons(entry(scalar(scalar1), scalar(scalar2)), entryCons(entry(scalar(scalar2), scalar(scalar1)), entryNil))), scalar(scalar2)), scalar(scalar1))))
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Distinct finite scalars reduce for equality and inequality.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  evalGuard(andExpr(neExpr(scalar(scalar1), scalar(scalar2)),
+    notExpr(eqExpr(scalar(scalar1), scalar(scalar2)))))
+  =>*
+  gTrue .
+
+--- Four-or-more object entries reduce to the many cardinality.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  evalGuard(eqExpr(
+    countExpr(objectOf(
+      entryCons(entry(scalar(scalar1), scalar(scalar1)),
+        entryCons(entry(scalar(scalar2), scalar(scalar2)),
+          entryCons(entry(boolTrue, boolTrue),
+            entryCons(entry(boolFalse, boolFalse), entryNil)))))),
+    countMany))
+  =>*
+  gTrue .
+
+--- Terminal tag matches can commit the matching branch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranch(guardedRule, issueFact, terminalCompleted, terminalCompleted, g1)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued) .
+
+--- Terminal tag misses cannot commit a sibling branch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranch(guardedRule, issueFact, terminalFailed, terminalCompleted, g1)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Terminal branch guards are evaluated after tag matching.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  terminalBranchGuard(guardedRule, issueFact, terminalCompleted, terminalCompleted, boolFalse, g1)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Exhaustive terminal tag misses emit diagnostics.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact)
+  exhaustiveTerminal(guardedRule, issueFact, terminalFailed, terminalCompleted)
+  =>*
+  fact(issueFact) diagnostic(guardedRule) .
+
+--- A finite enum/literal domain guard cannot match values outside its domain.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  domainGuard(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A finite enum/literal domain guard can match values inside its domain.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  domainGuard(guardedRule, issueFact, codexValue, providerDomain)
+  domainMember(codexValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  domainMember(codexValue, providerDomain) .
+
+--- A finite enum/literal pattern branch cannot match values outside its domain.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  patternBranch(guardedRule, issueFact, invalidProviderValue, providerDomain, g1)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A finite enum/literal pattern branch can fire for a covered value.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  patternBranch(guardedRule, issueFact, codexValue, providerDomain, g1)
+  domainMember(codexValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  domainMember(codexValue, providerDomain) .
+
+--- An exhaustive finite-domain pattern miss produces a diagnostic without committing effects.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  exhaustivePattern(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) diagnostic(guardedRule)
+  domainNonMember(invalidProviderValue, providerDomain) graph(g1, tellEff) .
+
+--- An exhaustive finite-domain pattern miss cannot commit its effect graph.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  exhaustivePattern(guardedRule, issueFact, invalidProviderValue, providerDomain)
+  domainNonMember(invalidProviderValue, providerDomain)
+  graph(g1, tellEff)
+  =>*
+  diagnostic(guardedRule) graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A Some/non-null pattern branch cannot fire for a missing optional path.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalSomeBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, missing)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- A Some/non-null pattern branch binds a proven-present optional path.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalSomeBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, present)
+  readPath(assigneePath)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  path(assigneePath, present) boundPresent(assigneePath) readOk(assigneePath) .
+
+--- A None/null pattern branch can fire for a missing optional path.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact) rule(guardedRule, issueFact, g1)
+  optionalNoneBranch(guardedRule, issueFact, assigneePath, g1)
+  path(assigneePath, missing)
+  graph(g1, tellEff)
+  =>*
+  fact(issueFact) rule(guardedRule, issueFact, g1) ruleFired(guardedRule, issueFact, g1)
+  event(ruleCommitEvt) graphCommitted(g1) effect(tellEff, queued)
+  path(assigneePath, missing) .
+
+--- Assertion failure is observable, but it cannot mutate workflow facts/effects.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  assertion(assertion1, aFail)
+  =>*
+  assertionDiagnostic(assertion1) effect(tellEff, queued) Rest:Cfg .
+
+--- Assertion failure can produce a diagnostic by itself.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  assertion(assertion1, aFail)
+  =>*
+  assertionDiagnostic(assertion1) .
+
+--- Missing optional paths cannot be read successfully.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  path(assigneePath, missing) readPath(assigneePath)
+  =>*
+  path(assigneePath, missing) readPath(assigneePath) readOk(assigneePath) .
+
+--- Present optional paths can be read successfully.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  path(assigneePath, present) readPath(assigneePath)
+  =>*
+  path(assigneePath, present) readOk(assigneePath) .
+
+--- Dynamic agent targets cannot enqueue effects for undeclared agents.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  graphAgent(g1, tellEff, missingAgent) graphReady(g1)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) tellTarget(tellEff, missingAgent) Rest:Cfg .
+
+--- Dynamic agent targets can enqueue effects for declared agents.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  graphAgent(g1, tellEff, codexAgent) graphReady(g1) declaredAgent(codexAgent)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) tellTarget(tellEff, codexAgent) declaredAgent(codexAgent) .

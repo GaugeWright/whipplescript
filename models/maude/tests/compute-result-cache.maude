@@ -1,0 +1,33 @@
+load ../compute-result-cache.maude
+
+--- Coverage 1: a repeat request on an already-run key is a cache hit --
+--- reachable final state where id 2 was served without a second ran.
+search in COMPUTE-RESULT-CACHE :
+  req(1, k(1)) req(2, k(1)) fresh(k(1))
+  =>! ran(1, k(1)) cached(k(1)) served(1, k(1), k(1)) served(2, k(1), k(1)) .
+
+--- Coverage 2: distinct keys each run once (env/script/input change = new
+--- key = a real run, which is how image redeploys invalidate).
+search in COMPUTE-RESULT-CACHE :
+  req(1, k(1)) req(2, k(2)) fresh(k(1)) fresh(k(2))
+  =>! ran(1, k(1)) ran(2, k(2)) cached(k(1)) cached(k(2))
+      served(1, k(1), k(1)) served(2, k(2), k(2)) .
+
+--- I1 at-most-one-run-per-key: no reachable state runs the same key twice.
+search in COMPUTE-RESULT-CACHE :
+  req(1, k(1)) req(2, k(1)) fresh(k(1))
+  =>* ran(1, k(1)) ran(2, k(1)) RESIDUAL:Cfg .
+
+--- I2 no-stale-serve: no reachable state serves a request a result keyed
+--- differently from the request.
+search in COMPUTE-RESULT-CACHE :
+  req(1, k(1)) req(2, k(2)) fresh(k(1)) fresh(k(2))
+  =>* served(I:Nat, k(1), k(2)) RESIDUAL:Cfg .
+
+--- Bite: the stale-serving mutant DOES reach an I2 violation (a request on
+--- k(2) served k(1)'s cached result). Expect a solution here.
+search in COMPUTE-RESULT-CACHE-STALE :
+  req(1, k(1)) req(2, k(2)) fresh(k(1))
+  =>* served(2, k(2), k(1)) RESIDUAL:Cfg .
+
+quit .

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: ["**"]
   pull_request:
@@ -12,12 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          persist-credentials: false
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Install Maude
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maude
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Install Python tooling
+        run: python3 -m pip install --user -r requirements-dev.txt
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -26,10 +38,25 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Rust tests
-        # The policy-denial e2e iterates the codex/claude/pi adapters and
-        # needs the codex and pi CLIs on PATH; hosted runners don't have
-        # them (it runs in the working repo's local gate, where they do).
-        run: cargo test --workspace -- --skip dev_native_provider_records_policy_denial_from_source_required_capabilities
+        run: cargo test --workspace
 
-      - name: Example programs compile and lint clean
-        run: scripts/check-docs-examples.sh
+      - name: Formal model checks
+        run: scripts/check-formal-models.sh
+
+      - name: TLA model checks
+        run: scripts/check-tla-models.sh
+
+      - name: E2E smoke
+        run: scripts/check-e2e.sh
+
+      - name: Release readiness
+        run: scripts/check-release-readiness.sh
+
+      - name: Upload readiness reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: readiness-reports
+          path: |
+            target/release-readiness-report.md
+            target/real-provider-smoke-report.md

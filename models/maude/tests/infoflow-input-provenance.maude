@@ -1,0 +1,48 @@
+load ../infoflow-input-provenance.maude
+
+--- Input-side provenance narrowing at a marked crossing. Coverage searches show
+--- the carried set never under-reports (a reaching or fallback-widened source
+--- still denies); bite searches show the refinement is real (a source with no
+--- path into the coercion's arguments needs no grant, and literal-only
+--- arguments carry nothing).
+
+--- ============================ COVERAGE, leak reachable =====================
+
+--- Coverage: a confidential source attributed into the coercion's arguments and
+--- NOT granted denies the crossing. Narrowing never waives a reaching source.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, false) src(sB, lo, false) crossing(rs(sA) . nilR)
+  =>* C:Cfg leak .
+
+--- Coverage: an UNATTRIBUTABLE root widens the carried set to every source --
+--- the fail-closed fallback. sB never appears in the roots, yet its
+--- confidential, ungranted read still denies (pre-narrowing behavior exactly).
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, true) src(sB, hi, false) crossing(rs(sA) . unknown . nilR)
+  =>* C:Cfg leak .
+
+--- Coverage: a grant on the wrong source does not cover a reaching one -- the
+--- carried source itself must carry the grant flag.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, false) src(sB, lo, true) crossing(rs(sA) . nilR)
+  =>* C:Cfg leak .
+
+--- ============================ BITE, no leak ================================
+
+--- Bite: the headline narrowing. sB is confidential and UNGRANTED but has no
+--- path into the coercion's arguments (all roots attributed, none to sB), so
+--- the crossing needs no sB grant. sA reaches and is granted.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, true) src(sB, hi, false) crossing(rs(sA) . nilR)
+  =>* RESIDUAL:Cfg leak .
+
+--- Bite: a reaching, granted source arms cleanly -- no denial.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, true) src(sB, lo, false) crossing(rs(sA) . nilR)
+  =>* RESIDUAL:Cfg leak .
+
+--- Bite: literal-only arguments (no roots) carry no source at all -- a
+--- constant release denies nothing, whatever the rule read.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INPUT-PROVENANCE :
+  src(sA, hi, false) src(sB, hi, false) crossing(nilR)
+  =>* RESIDUAL:Cfg leak .

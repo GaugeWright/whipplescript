@@ -1,0 +1,36 @@
+--- Owned brokered agent harness, slice 2: the enforced governance envelope.
+--- Companion to DR-0024 and spec/owned-harness-loop-contract.md section 7. The
+--- envelope bounds the loop from OUTSIDE the model's control: a model step
+--- requires remaining budget, and a tool execution requires the held workspace
+--- lease. Releasing the lease (or exhausting the budget) bounds further work.
+---
+--- Budget enforcement: a model step consumes one budget token; with no token no
+--- step can occur. The model cannot widen its own budget.
+---
+--- Lease enforcement: a tool runs only while the workspace lease is held; once
+--- released, no further tool execution is reachable.
+mod WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op running : -> Cfg [ctor] .          --- turn is active
+  op budgetToken : -> Cfg [ctor] .      --- one remaining model step (the budget)
+  op modelStepped : -> Cfg [ctor] .     --- evidence a model step occurred
+  op workspaceLease : -> Cfg [ctor] .   --- the held workspace lease (I1 envelope)
+  op leaseReleased : -> Cfg [ctor] .    --- the lease has been released on terminal
+  op toolRan : -> Cfg [ctor] .          --- evidence a tool executed
+
+  --- A model step requires a budget token and consumes it. No token, no step:
+  --- dropping the budgetToken from the lhs makes the budget bite satisfiable.
+  rl [step] : running budgetToken => running modelStepped .
+
+  --- A tool executes only while the workspace lease is held. Dropping the
+  --- workspaceLease requirement makes the lease bite satisfiable.
+  rl [tool] : running workspaceLease => running workspaceLease toolRan .
+
+  --- The lease is released on terminal; release consumes it so no further tool
+  --- can run.
+  rl [release] : running workspaceLease => leaseReleased .
+endm

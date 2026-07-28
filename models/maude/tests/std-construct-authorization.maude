@@ -1,0 +1,83 @@
+load ../std-construct-authorization.maude
+
+--- Coverage: an embedded std construct use authorizes with NO lock when the
+--- owning package is imported (the S6d re-keyed exemption).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  embeddedUse(stdMemory, recall) imported(stdMemory)
+  =>* authorized(recall) RESIDUAL:Cfg .
+
+--- Coverage: a third-party construct use authorizes when a lock provides its
+--- package (supply-chain path unchanged; the entry is admitted first).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(vendorKit, fetch) lockProvides(vendorKit)
+  =>* authorized(fetch) RESIDUAL:Cfg .
+
+--- Coverage: a lock entry claiming a reserved std-namespace name reaches the
+--- refusal (the check error is a real, reachable outcome).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  lockProvides(stdMessaging)
+  =>* lockRejected(stdMessaging) RESIDUAL:Cfg .
+
+--- Bite (import ladder): an embedded std construct use WITHOUT the owning
+--- import is never authorized -- embedded alone is not enough; `use` bites.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  embeddedUse(stdMemory, recall)
+  =>* authorized(recall) RESIDUAL:Cfg .
+
+--- Bite (supply chain): a third-party construct use with no lock is never
+--- authorized.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(vendorKit, fetch)
+  =>* authorized(fetch) RESIDUAL:Cfg .
+
+--- Bite (no std shadowing): a lock entry claiming a std name never authorizes
+--- a use through it -- the entry is refused, so [locked-ok] cannot fire. If
+--- [lock-admit] dropped its namespace guard, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  thirdPartyUse(stdMemory, bogus) lockProvides(stdMemory)
+  =>* authorized(bogus) RESIDUAL:Cfg .
+
+--- Bite (no name-only bypass): a use with no registration behind it is never
+--- authorized.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  unknownUse(bogus)
+  =>* authorized(bogus) RESIDUAL:Cfg .
+
+--- Coverage (authorability door): an EMBEDDED manifest may declare a construct
+--- in a non-package-authorable lowering class.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(stdMemory, recall) embedded(stdMemory)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
+--- Bite (door): a vendor manifest declaring the same internal-class row is
+--- never admitted, even with a lock -- the lock grants supply-chain authority,
+--- not class authority. If [door-embedded] keyed on anything weaker than
+--- embedded, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, fetch) lockProvides(vendorKit)
+  =>* classAuthorized(fetch) RESIDUAL:Cfg .
+
+--- Coverage (door, privilege-tuple leg): a manifest whose (library, keyword)
+--- pair carries a platform-catalog privilege tuple targeting the internal
+--- class may author it WITHOUT being the embedded copy -- the std.coord
+--- resource_effect posture (slice 4).
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(stdMemory, recall) catalogPrivilege(stdMemory, recall)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
+--- Bite (tuple keyword coordinate is exact): a catalog tuple for a DIFFERENT
+--- keyword grants nothing -- a non-privileged construct row stays rejected.
+--- If [door-privileged] matched on the package alone, this would find a
+--- solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, fetch) catalogPrivilege(vendorKit, send)
+  =>* classAuthorized(fetch) RESIDUAL:Cfg .
+
+--- Bite (tuple library coordinate is exact): a tuple held by another library
+--- never authorizes a different library's identical construct row. If
+--- [door-privileged] matched on the keyword alone, this would find a solution.
+search [1] in WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION :
+  declaresInternalClass(vendorKit, recall) catalogPrivilege(stdMemory, recall)
+  =>* classAuthorized(recall) RESIDUAL:Cfg .
+
+quit .

@@ -1,0 +1,247 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.memory",
+  "name": "std.memory",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.memory",
+      "version": "0.1.0",
+      "effect_contracts": [
+        {
+          "id": "memory.query",
+          "effect_kind": "capability.call",
+          "source_forms": ["call memory.query", "recall <pool> for <query> as <binding>"],
+          "input_schema": {
+            "query": "string"
+          },
+          "output_schema": {
+            "pool": "string",
+            "items": ["json"],
+            "count": "int"
+          },
+          "required_capabilities": ["memory.query"],
+          "provider_kinds": ["memory-provider"],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "memory.write",
+          "effect_kind": "capability.call",
+          "source_forms": ["call memory.write", "learn from <source> into <pool> as <binding>"],
+          "input_schema": {
+            "pool": "string",
+            "source": "json"
+          },
+          "output_schema": {
+            "pool": "string",
+            "message_id": "string",
+            "stored": "bool"
+          },
+          "required_capabilities": ["memory.write"],
+          "provider_kinds": ["memory-provider"],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "memory.curate",
+          "effect_kind": "capability.call",
+          "source_forms": ["call memory.curate", "curate <pool> as <binding>"],
+          "input_schema": {
+            "pool": "string"
+          },
+          "output_schema": {
+            "pool": "string",
+            "removed": "int",
+            "kept": "int"
+          },
+          "required_capabilities": ["memory.curate"],
+          "provider_kinds": ["memory-provider"],
+          "validation": "runtime_boundary"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "memory.recall",
+          "construct_family": "effect_operation",
+          "keyword": "recall",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "recall",
+            "slots": [
+              { "name": "pool", "kind": "identifier" },
+              { "name": "query", "kind": "expression", "connective": "for" }
+            ],
+            "payload": null,
+            "binding": "required",
+            "target_capability": "memory.query"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "memory.query"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "memory.query.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "memory.query"
+        },
+        {
+          "id": "memory.learn",
+          "construct_family": "effect_operation",
+          "keyword": "learn",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "learn",
+            "slots": [
+              { "name": "source", "kind": "expression", "connective": "from" },
+              { "name": "pool", "kind": "identifier", "connective": "into" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "note", "kind": "expression", "required": false }
+              ]
+            },
+            "binding": "required",
+            "target_capability": "memory.write"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "memory.write"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "memory.write.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "memory.write"
+        },
+        {
+          "id": "memory.curate",
+          "construct_family": "effect_operation",
+          "keyword": "curate",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "curate",
+            "slots": [
+              { "name": "pool", "kind": "identifier" }
+            ],
+            "payload": {
+              "fields": [
+                { "name": "reason", "kind": "expression", "required": false }
+              ]
+            },
+            "binding": "required",
+            "target_capability": "memory.curate"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "memory.curate"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "memory.curate.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "memory.curate"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "memory.query",
+      "description": "Query package memory.",
+      "schema": {
+        "input": {
+          "query": "string"
+        }
+      }
+    },
+    {
+      "id": "memory.write",
+      "description": "Write package memory.",
+      "schema": {
+        "input": {
+          "summary": "string"
+        }
+      }
+    },
+    {
+      "id": "memory.curate",
+      "description": "Maintain and compact package memory.",
+      "schema": {
+        "input": {
+          "pool": "string"
+        }
+      }
+    }
+  ],
+  "providers": [
+    {
+      "id": "provider-memory-query",
+      "provider_kind": "memory-provider",
+      "capability": "memory.query",
+      "config": {}
+    },
+    {
+      "id": "provider-memory-write",
+      "provider_kind": "memory-provider",
+      "capability": "memory.write",
+      "config": {}
+    },
+    {
+      "id": "provider-memory-curate",
+      "provider_kind": "memory-provider",
+      "capability": "memory.curate",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-memory-user",
+      "name": "memory-user",
+      "description": "Allow memory package queries and writes.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["memory.query", "memory.write", "memory.curate"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-memory-query-global",
+      "program_id": null,
+      "capability": "memory.query",
+      "provider": "memory-provider",
+      "config": {}
+    },
+    {
+      "id": "binding-memory-write-global",
+      "program_id": null,
+      "capability": "memory.write",
+      "provider": "memory-provider",
+      "config": {}
+    },
+    {
+      "id": "binding-memory-curate-global",
+      "program_id": null,
+      "capability": "memory.curate",
+      "provider": "memory-provider",
+      "config": {}
+    }
+  ]
+}

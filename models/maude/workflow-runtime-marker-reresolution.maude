@@ -1,0 +1,54 @@
+--- Workflow encapsulation E2-DYN: runtime delivery by instance handle must
+--- re-resolve the target instance identity before consulting workflow privacy
+--- markers. A surface/static target name is not authoritative once an instance id
+--- has been obtained.
+---
+--- Grounding: deliverByHandle(P, I) = a runtime operation by caller package P that
+--- delivers to instance I (for example notify/invoke-by-handle). instanceOf(I, W)
+--- and workflowPackage(W, Q) are the re-derived instance -> workflow -> package
+--- identity. privateWorkflow(W) is the governed marker. surfaceTarget(W) is the
+--- static/surface claim carried by the call site; it is deliberately ignored by
+--- the runtime door. unresolvedHandle(I) models a handle whose instance identity
+--- cannot be resolved and therefore fails closed.
+mod WHIPPLESCRIPT-WORKFLOW-RUNTIME-MARKER-RERESOLUTION is
+  protecting BOOL .
+  sorts Package Workflow Instance Cfg .
+
+  ops pkgA pkgB : -> Package [ctor] .
+  ops wfPublic wfPrivate : -> Workflow [ctor] .
+  ops instPublic instPrivate instUnknown : -> Instance [ctor] .
+
+  op samePackage : Package Package -> Bool .
+  vars P Q : Package .  vars W StaticW : Workflow .  var I : Instance .
+  eq samePackage(P, P) = true .
+  eq samePackage(pkgA, pkgB) = false .
+  eq samePackage(pkgB, pkgA) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deliverByHandle : Package Instance -> Cfg [ctor] .
+  op instanceOf : Instance Workflow -> Cfg [ctor] .
+  op workflowPackage : Workflow Package -> Cfg [ctor] .
+  op privateWorkflow : Workflow -> Cfg [ctor] .
+  op surfaceTarget : Workflow -> Cfg [ctor] .
+  op unresolvedHandle : Instance -> Cfg [ctor] .
+  op markerReject : -> Cfg [ctor] .
+  eq markerReject markerReject = markerReject .
+
+  --- E2-DYN: the runtime door re-derives the handle's target workflow identity and
+  --- rejects cross-package delivery to a private workflow. surfaceTarget is ignored.
+  crl [private-cross-handle] :
+    deliverByHandle(P, I) instanceOf(I, W) workflowPackage(W, Q) privateWorkflow(W)
+    =>
+    deliverByHandle(P, I) instanceOf(I, W) workflowPackage(W, Q) privateWorkflow(W)
+    markerReject
+    if samePackage(P, Q) =/= true .
+
+  --- Fail-closed: if the handle cannot be re-resolved to a workflow identity, the
+  --- door refuses rather than trusting caller-supplied static metadata.
+  rl [unresolved-handle] :
+    deliverByHandle(P, I) unresolvedHandle(I)
+    =>
+    deliverByHandle(P, I) unresolvedHandle(I) markerReject .
+endm

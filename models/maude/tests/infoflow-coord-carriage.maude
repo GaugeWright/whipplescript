@@ -1,0 +1,53 @@
+load ../infoflow-coord-carriage.maude
+
+--- ============================ COVERAGE ======================================
+
+--- Coverage: under explicit `shared`, A's consume can reach B's observed
+--- `remaining` outcome.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  shared(counter) consume(wfA, counter) observeRemaining(wfB, counter)
+  =>* C:Cfg outcomeRead(wfA, wfB, counter, remaining) .
+
+--- Coverage: under explicit `shared`, A's acquire can reach B's observed
+--- `holders` outcome.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  shared(lease) acquire(wfA, lease) observeHolders(wfB, lease)
+  =>* C:Cfg outcomeRead(wfA, wfB, lease, holders) .
+
+--- Coverage: the inbound integrity gate catches an untrusted workflow writing a
+--- high-integrity coordination resource.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  resourceIntegrity(counter, hi) workflowIntegrity(wfA, lo) consume(wfA, counter)
+  =>* C:Cfg coordInjection .
+
+--- Coverage: the outbound read gate catches a private coordination outcome flowing
+--- to a public sink.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  resourceReaders(counter, hi) sinkClearance(wfB, lo)
+  outcomeRead(wfA, wfB, counter, remaining)
+  =>* C:Cfg outcomeLeak .
+
+--- ============================ BITE ==========================================
+
+--- Bite: under the default partition, A's consume never reaches B's `remaining`.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  partitioned(counter) consume(wfA, counter) observeRemaining(wfB, counter)
+  =>* C:Cfg outcomeRead(wfA, wfB, counter, remaining) .
+
+--- Bite: under the default partition, A's acquire never reaches B's `holders`.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  partitioned(lease) acquire(wfA, lease) observeHolders(wfB, lease)
+  =>* C:Cfg outcomeRead(wfA, wfB, lease, holders) .
+
+--- Bite: a trusted workflow writing a high-integrity coordination resource does
+--- not inject.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  resourceIntegrity(counter, hi) workflowIntegrity(wfA, hi) consume(wfA, counter)
+  =>* C:Cfg coordInjection .
+
+--- Bite: a private coordination outcome flowing to a private-cleared sink does not
+--- leak.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COORD-CARRIAGE :
+  resourceReaders(counter, hi) sinkClearance(wfB, hi)
+  outcomeRead(wfA, wfB, counter, remaining)
+  =>* C:Cfg outcomeLeak .

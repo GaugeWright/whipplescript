@@ -1,3 +1,5 @@
+use std.agent
+
 workflow RevisionTicket {
   input ticket TicketRequest
   output result TicketResult
@@ -73,6 +75,12 @@ workflow RevisionTicket {
 
       complete result {
         summary turn.summary
+      }
+    }
+
+    after turn fails as f {
+      fail error {
+        reason f.reason
       }
     }
   }

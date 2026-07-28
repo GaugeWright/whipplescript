@@ -1,0 +1,26 @@
+--- Owned brokered agent harness, slice 6: resume-from-projection crash recovery.
+--- Companion to DR-0024 "Crash recovery is resume-from-projection". A turn
+--- interrupted mid-flight is recovered by rebuilding the model context from the
+--- persisted transcript projection and continuing the loop, rather than
+--- re-running the turn from scratch. The safety property modeled here: resume
+--- requires the persisted transcript -- with no projection there is nothing to
+--- resume from. The durable event stream is never rewritten by resume.
+mod WHIPPLESCRIPT-OWNED-HARNESS-RESUME is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op crashed : -> Cfg .       --- a turn interrupted before reaching a terminal
+  op transcript : -> Cfg .    --- the persisted context projection
+  op resumed : -> Cfg .       --- the loop has been resumed from the projection
+  op terminal : -> Cfg .      --- the resumed turn reached its terminal
+
+  --- Resume requires the persisted transcript and consumes the crashed marker.
+  --- The transcript persists. Dropping the transcript from the lhs would let a
+  --- turn resume with no projection, which is the bite.
+  rl [resume] : crashed transcript => resumed transcript .
+
+  --- A resumed turn drives to a terminal like any running turn.
+  rl [finish] : resumed => terminal .
+endm

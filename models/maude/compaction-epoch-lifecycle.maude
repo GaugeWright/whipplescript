@@ -1,0 +1,54 @@
+--- Context-assembly Phase 4 (Layer B), the Compactor epoch lifecycle. Companion
+--- to spec/context-assembly-tracker.md, Decisions 6/7/8, and the concrete
+--- BrokeredTurnMachine states the Rust compactor threads through its snapshot --
+--- the awaiting = Main | Summary flag and the compaction_epoch counter. Where
+--- cache-prefix-append-only proves the abstract "append-only between compactions"
+--- and compaction-record-once proves "summary recorded once, reused on replay",
+--- THIS model proves the two failure modes specific to the interleaved epoch state
+--- machine the new compactor introduces:
+---
+---   1. at-most-once-per-epoch: once a compaction for the current epoch is applied,
+---      no second summarization round fires for that same epoch, else the summarizer
+---      double-charges / thrashes; and
+---   2. atomic apply / no half-rewrite: while the summarizer round is in flight
+---      -- awaiting = Summary -- a normal main turn never rewrites the stable prefix;
+---      the prefix is installed exactly once, atomically, by [apply].
+---
+--- The epoch lifecycle is: armed (trigger fired: real usage >= 90% window) -> begin
+--- the summarizer round (summarizing) -> apply the summary as the one deliberate
+--- prefix rewrite (prefix + applied) -> thereafter main turns only append (tail).
+mod WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op armed : -> Cfg [ctor] .        --- trigger fired for the current epoch (usage >= 90% window)
+  op summarizing : -> Cfg [ctor] .  --- the summarizer round is in flight (awaiting = Summary)
+  op prefix : -> Cfg [ctor] .       --- the byte-stable post-compaction request prefix
+  op applied : -> Cfg [ctor] .      --- the compaction for this epoch installed the new prefix
+  op turnPending : -> Cfg [ctor] .  --- a main turn waiting to append
+  op tail : -> Cfg [ctor] .         --- appended growth after the held prefix (a cache hit)
+
+  op refired : -> Cfg [ctor] .              --- BAD: a second summarization began in the same epoch
+  op prefixDuringSummary : -> Cfg [ctor] .  --- BAD: the prefix was rewritten while summarizing (half-rewrite)
+
+  --- Arming begins the summarizer round exactly once: it CONSUMES `armed` into
+  --- `summarizing`. Nothing re-produces `armed` within the epoch (there is no
+  --- `applied => armed` re-arm rule), so [begin] can fire at most once per epoch.
+  --- A re-arm rule is exactly what the `refired` bite forbids.
+  rl [begin] : armed => summarizing .
+
+  --- Applying the summary is the single, atomic prefix rewrite: it consumes the
+  --- in-flight `summarizing` and installs a fresh stable `prefix` plus the `applied`
+  --- epoch marker (one deliberate cache bust, mirroring cache-prefix [compact]).
+  --- Because it consumes `summarizing`, no `summarizing` survives the apply -- the
+  --- prefix is installed once, atomically.
+  rl [apply] : summarizing => prefix applied .
+
+  --- After apply, a main turn only APPENDS to the held prefix (a cache hit); it never
+  --- rewrites it. [append] requires `prefix`, which only [apply] produces, so no main
+  --- turn can touch a prefix while the round is still `summarizing` -- a mid-summary
+  --- prefix rewrite (`prefixDuringSummary`) is unreachable.
+  rl [append] : prefix turnPending => prefix tail .
+endm

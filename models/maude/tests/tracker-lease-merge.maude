@@ -1,0 +1,40 @@
+load ../tracker-lease-merge.maude
+
+--- Coverage: a single unreleased acquire folds to one live lease keyed by its
+--- own content id.
+search [1] in TRACKER-LEASE-MERGE :
+  t(acq(i1, s1, alice))
+  =>* t(lease(i1, s1, alice) C:Cfg) .
+
+--- Coverage: a released acquire grants no live lease -- the fixpoint carries
+--- no lease for that actor.
+search [1] in TRACKER-LEASE-MERGE :
+  t(acq(i1, s1, alice) rel(i1))
+  =>! t(C:Cfg) such that hasActorLease(alice, C:Cfg) = false .
+
+--- Coverage (the fix): two clones' CONCURRENT claims on the SAME issue carry
+--- distinct content ids, so BOTH leases survive the merged fold.
+search [1] in TRACKER-LEASE-MERGE :
+  t(acq(i1, s1, alice) acq(i2, s1, bob))
+  =>* t(lease(i1, s1, alice) lease(i2, s1, bob) C:Cfg) .
+
+--- Bite (idempotent re-transmit): the same acquire id delivered twice folds to
+--- ONE lease, never two -- the id-keyed guard blocks the second.
+search [1] in TRACKER-LEASE-MERGE :
+  t(acq(i1, s1, alice) acq(i1, s1, alice))
+  =>* t(lease(i1, s1, alice) lease(i1, s1, alice) C:Cfg) .
+
+--- Bite (no lost lease -- the invariant the bug violated): from two distinct-
+--- actor concurrent claims, NO fixpoint drops an actor's lease. Every
+--- unreleased acquire has its lease at the fold's normal form.
+search [1] in TRACKER-LEASE-MERGE :
+  t(acq(i1, s1, alice) acq(i2, s1, bob))
+  =>! t(C:Cfg) such that hasActorLease(bob, C:Cfg) = false .
+
+--- Bite teeth: the ALIAS-keyed fold (the pre-fix behaviour) DOES reach a
+--- fixpoint where bob's lease is gone -- the silent lease destruction the
+--- id-keyed fold above makes unreachable. This is the negative fixture
+--- proving the No-solution has real content.
+search [1] in TRACKER-LEASE-MERGE-ALIAS :
+  t(acq(i1, s1, alice) acq(i2, s1, bob))
+  =>! t(C:Cfg) such that hasActorLease(bob, C:Cfg) = false .

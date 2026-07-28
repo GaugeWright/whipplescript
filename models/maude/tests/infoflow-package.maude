@@ -1,0 +1,31 @@
+load ../infoflow-package.maude
+
+--- Coverage: a package that ran the IFC check is attested, and a cross-package
+--- grant whose surface fits the consumer envelope is accepted.
+search [1] in WHIPPLESCRIPT-INFOFLOW-PACKAGE :
+  ifcChecked(t1) grants(t1) surfaceFits(t1)
+  =>* C:Cfg accepted(t1) .
+
+--- Coverage: a grant whose declared surface exceeds the envelope is rejected.
+search [1] in WHIPPLESCRIPT-INFOFLOW-PACKAGE :
+  grants(t1) surfaceExceeds(t1)
+  =>* C:Cfg rejected(t1) .
+
+--- Coverage: a grant to a package with no IFC attestation is rejected.
+search [1] in WHIPPLESCRIPT-INFOFLOW-PACKAGE :
+  grants(t1) notIfcAttested(t1)
+  =>* C:Cfg rejected(t1) .
+
+--- Bite: no attestation, no acceptance. A package the producer never IFC-attested
+--- is never accepted across the boundary. The RESIDUAL soup var makes any accepted
+--- state a solution, so No solution proves it.
+search [1] in WHIPPLESCRIPT-INFOFLOW-PACKAGE :
+  grants(t1) notIfcAttested(t1)
+  =>* accepted(t1) RESIDUAL:Cfg .
+
+--- Bite: the consumer-side surface gate holds. Even an IFC-attested package whose
+--- declared surface EXCEEDS the consumer envelope is never accepted -- the producer
+--- attestation alone does not grant; the surface must fit the envelope (X8).
+search [1] in WHIPPLESCRIPT-INFOFLOW-PACKAGE :
+  grants(t1) attestsIfc(t1) surfaceExceeds(t1)
+  =>* accepted(t1) RESIDUAL:Cfg .

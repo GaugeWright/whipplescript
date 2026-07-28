@@ -1,0 +1,73 @@
+--- Compute-plane delta-kernel result cache (P8, spec/compute-plane-design-note.md S2).
+--- Content key = script hash + environment hash + input hashes. Invariants:
+---   I1 at-most-one-run-per-key: once a key is cached, a request on it is
+---      served from cache -- it never runs again (the economic lever).
+---   I2 no-stale-serve: a served result always matches its own key's
+---      canonical result (never another key's -- cross-key serve is the
+---      stale-cache bug; an env-hash bump is a NEW key by construction,
+---      which is how image redeploys invalidate).
+--- Finite, consuming rules only (no persistent LHS).
+
+mod COMPUTE-RESULT-CACHE is
+  protecting NAT .
+
+  sorts Key Fact Cfg .
+  subsort Fact < Cfg .
+
+  op k : Nat -> Key [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- req(id, key): an invocation demanding this content key.
+  op req : Nat Key -> Fact [ctor] .
+  --- fresh(key): the key has no cache entry yet (explicit absence token).
+  op fresh : Key -> Fact [ctor] .
+  --- cached(key): the key's result sits in the content-addressed store.
+  op cached : Key -> Fact [ctor] .
+  --- ran(id, key): invocation id actually woke a container for key.
+  op ran : Nat Key -> Fact [ctor] .
+  --- served(id, key-of-request, key-of-result): what the invocation got.
+  op served : Nat Key Key -> Fact [ctor] .
+
+  vars I J : Nat .
+  vars K K2 : Key .
+
+  --- Miss: no cache entry (fresh token consumed) -> run once, populate,
+  --- serve the key's own result.
+  rl [miss] : req(I, K) fresh(K)
+           => ran(I, K) cached(K) served(I, K, K) .
+
+  --- Hit: entry present -> served from cache, no run. cached persists via
+  --- re-emission (consumed and re-produced, not a persistent LHS).
+  rl [hit] : req(I, K) cached(K)
+          => cached(K) served(I, K, K) .
+endm
+
+--- Mutant for bite: a cache that serves whatever entry it holds regardless
+--- of the requested key (the cross-key stale-serve bug I2 exists to catch).
+mod COMPUTE-RESULT-CACHE-STALE is
+  protecting NAT .
+
+  sorts Key Fact Cfg .
+  subsort Fact < Cfg .
+
+  op k : Nat -> Key [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op req : Nat Key -> Fact [ctor] .
+  op fresh : Key -> Fact [ctor] .
+  op cached : Key -> Fact [ctor] .
+  op ran : Nat Key -> Fact [ctor] .
+  op served : Nat Key Key -> Fact [ctor] .
+
+  vars I : Nat .
+  vars K K2 : Key .
+
+  rl [miss] : req(I, K) fresh(K)
+           => ran(I, K) cached(K) served(I, K, K) .
+
+  --- BUG: serves K2's cached result for a request on K.
+  rl [stale-hit] : req(I, K) cached(K2)
+               => cached(K2) served(I, K, K2) .
+endm

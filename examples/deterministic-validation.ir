@@ -25,7 +25,7 @@ rules
       schema:Artifact
     record_sources
       schema:Artifact construct=table_row span=1050..1119
-    body_hash 0c1ff08cdc581ffb
+    body_hash b6c7fc10fa2f25f426e1d35f1f3b963a
   rule validate_artifact_script
     when Artifact as artifact
     reads
@@ -33,7 +33,7 @@ rules
     consumes
       schema:Artifact
     effects
-      check kind=exec.command binding=check key=9f679eb8f308ab6b
-    body_hash b04c86aba98f210d
+      check kind=exec.command binding=check key=36febac44ac95de9d1581cdad0fa9b77
+    body_hash 0c2290b1120ed2e17a1a5029a77baeb1
 rule_dependencies
   table_artifacts --schema:Artifact--> validate_artifact_script

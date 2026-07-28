@@ -1,0 +1,36 @@
+--- DR-0034 Decision 5 (D8-2): the evidence path forks on the harness class.
+--- Companion to spec/decision-records/0034-managed-vs-delegated-harnesses.md and a
+--- sibling of harness-class.maude (which models the knob partition, Decision 3).
+---
+--- A Managed turn records full hermetic provenance -- a `context.bundle` row per
+--- assembled bundle. A Delegated turn's context is assembled by the foreign runtime,
+--- so WhippleScript does NOT fabricate a bundle for it; it records a single
+--- `context.attestation` row tagged `context: provider-assembled` instead. The
+--- safety property modeled here: the two rows are exclusive by class -- a Delegated
+--- turn can never reach a state carrying a `bundleRow`, and a Managed turn can never
+--- reach one carrying an `attestationRow`. There is no rule emitting a bundle from a
+--- delegated turn, nor an attestation from a managed one, so the wrong-provenance row
+--- is unreachable rather than merely unwritten by convention.
+mod WHIPPLESCRIPT-HARNESS-EVIDENCE-FORK is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op managedTurn : -> Cfg [ctor] .      --- a Managed (owned/fixture) turn to record
+  op delegatedTurn : -> Cfg [ctor] .    --- a Delegated (foreign-runtime) turn to record
+  op record : -> Cfg [ctor] .           --- a pending evidence-recording step
+
+  op bundleRow : -> Cfg [ctor] .        --- context.bundle: hermetic provenance
+  op attestationRow : -> Cfg [ctor] .   --- context.attestation: provider-assembled
+
+  --- A Managed turn records a hermetic `context.bundle`. There is no rule emitting an
+  --- attestationRow from a managedTurn, so a managed turn never claims a
+  --- provider-assembled context.
+  rl [record-managed] : managedTurn record => managedTurn bundleRow .
+
+  --- A Delegated turn records only the provider-assembled attestation. There is no
+  --- rule emitting a bundleRow from a delegatedTurn, so a delegated turn never
+  --- fabricates hermetic provenance for a context WhippleScript did not build.
+  rl [record-delegated] : delegatedTurn record => delegatedTurn attestationRow .
+endm

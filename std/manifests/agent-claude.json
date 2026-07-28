@@ -1,0 +1,141 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.agent.claude",
+  "name": "std.agent.claude",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.agent.claude",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": [],
+  "providers": [
+    {
+      "id": "claude",
+      "provider_kind": "claude",
+      "plane": "operator",
+      "config": {
+        "agent_provider": true,
+        "description": "Claude Agent SDK sidecar adapter (DR-0017 'Native Surface'; request-only cancel resolving to the uncertain terminal; turn.cancel reported unknown per DR-0017). Depends on std.agent for the boundary vocabulary.",
+        "feature_report": [
+          {
+            "class": "context.compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "context.auto_compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.resume",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.fork",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.clone",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.export",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.cancel",
+            "support": "unknown",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.follow_up",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.spawn",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.observe",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "skill.attach",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "plugin.load",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "hook.lifecycle",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "native.command.dispatch",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "permission.policy",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "allowedTools/disallowedTools/permissionMode",
+            "dispatch": "sdk_option"
+          },
+          {
+            "class": "model.select",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "model",
+            "dispatch": "sdk_option"
+          },
+          {
+            "class": "reasoning.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "goal.track",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "command.list",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "feature.report",
+            "support": "unsupported",
+            "source": "compiled"
+          }
+        ]
+      }
+    }
+  ]
+}

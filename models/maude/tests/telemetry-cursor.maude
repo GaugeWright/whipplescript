@@ -1,0 +1,44 @@
+load ../telemetry-cursor.maude
+
+--- Coverage: both scopes export the full recorded-run stream; the terminal
+--- state carries one export event per (scope, run) pair and both cursors at
+--- the high-water mark.
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR :
+  cur(s1, m0) cur(s2, m0) run(r1) run(r2)
+  =>! C:Cfg cur(s1, m2) cur(s2, m2)
+      exported(s1, r1) exported(s1, r2) exported(s2, r1) exported(s2, r2) .
+
+--- Coverage of the endpoint-change re-export: a FRESH scope (new endpoint or
+--- mapping version) starts at m0 and re-sends a run the old scope already
+--- exported -- one idempotent re-export per new scope, the v2 semantic.
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR :
+  cur(s1, m2) exported(s1, r1) exported(s1, r2) cur(s2, m0) run(r1) run(r2)
+  =>* exported(s2, r1) RESIDUAL:Cfg .
+
+--- Coverage of scope isolation: one scope advances while the other's cursor
+--- stands untouched at m0.
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR :
+  cur(s1, m0) cur(s2, m0) run(r1) run(r2)
+  =>* cur(s1, m1) cur(s2, m0) RESIDUAL:Cfg .
+
+--- Bite on emit-once per scope: no reachable state carries the same run
+--- exported twice to the same scope; the monotonic per-scope cursor absorbs
+--- every re-walk.
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR :
+  cur(s1, m0) cur(s2, m0) run(r1) run(r2)
+  =>* exported(S:Scope, R:Run) exported(S:Scope, R:Run) RESIDUAL:Cfg .
+
+--- Shared-cursor fixture coverage: the second endpoint only receives an
+--- already-exported run via the store-wide reset (the v1 recovery).
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR-SHARED :
+  active(s1) scur(m0) run(r1) run(r2)
+  =>* exported(s2, r1) RESIDUAL:Cfg .
+
+--- Shared-cursor fixture bite: the double export the scoped design excludes
+--- IS reachable when two scopes share one cursor -- serve s1 fully, reset to
+--- serve s2 its first run, switch back to s1: the shared position sits
+--- mid-stream and re-emits r2 to s1. This is the negative fixture proving the
+--- emit-once search above has bite.
+search [1] in WHIPPLESCRIPT-TELEMETRY-CURSOR-SHARED :
+  active(s1) scur(m0) run(r1) run(r2)
+  =>* exported(s1, r2) exported(s1, r2) RESIDUAL:Cfg .

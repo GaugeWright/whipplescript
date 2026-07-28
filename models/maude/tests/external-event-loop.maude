@@ -1,0 +1,46 @@
+load ../kernel.maude
+
+--- An external-event loop cannot start a turn from a pending projection alone;
+--- the external completion/init event is the durable boundary.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  projection(turnCompletedEvt, turnFact, pending)
+  rule(externalEventRule, turnFact, g1)
+  ruleReady(externalEventRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  effect(tellEff, running) Rest:Cfg .
+
+--- Once the event is in the log, projection can derive the fact, the rule can
+--- commit an effect graph, and the agent turn can run.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  event(turnCompletedEvt)
+  projection(turnCompletedEvt, turnFact, pending)
+  rule(externalEventRule, turnFact, g1)
+  ruleReady(externalEventRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  event(turnCompletedEvt)
+  projection(turnCompletedEvt, turnFact, projected)
+  fact(turnFact)
+  rule(externalEventRule, turnFact, g1)
+  ruleFired(externalEventRule, turnFact, g1)
+  event(ruleCommitEvt)
+  graphCommitted(g1)
+  effect(tellEff, running) .
+
+--- Rule firing commits an outbox effect; it does not run the provider inline.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  event(initEvt)
+  projection(initEvt, turnFact, pending)
+  rule(externalEventRule, turnFact, g1)
+  ruleReady(externalEventRule, turnFact, g1)
+  graph(g1, tellEff)
+  =>*
+  event(initEvt)
+  projection(initEvt, turnFact, projected)
+  fact(turnFact)
+  rule(externalEventRule, turnFact, g1)
+  ruleFired(externalEventRule, turnFact, g1)
+  event(ruleCommitEvt)
+  graphCommitted(g1)
+  effect(tellEff, queued) .

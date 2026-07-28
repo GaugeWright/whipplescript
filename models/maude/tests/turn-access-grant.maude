@@ -1,0 +1,25 @@
+load ../turn-access-grant.maude
+
+--- Coverage: a grant fully within the profile is honored -- both requested caps
+--- end up in the effective authority.
+search [1] in WHIPPLESCRIPT-TURN-ACCESS-GRANT :
+  profile(read ; write ; recall) grant(read ; recall) effective(mt)
+  =>! profile(read ; write ; recall) grant(mt) effective(read ; recall) .
+
+--- Coverage: the in-profile part of a mixed grant is still honored (read is kept
+--- even though the grant also asks for the out-of-profile write).
+search [1] in WHIPPLESCRIPT-TURN-ACCESS-GRANT :
+  profile(read ; recall) grant(read ; write) effective(mt)
+  =>! profile(read ; recall) grant(mt) effective(read) .
+
+--- Bite: a grant requesting a cap OUTSIDE the profile never widens authority. The
+--- RESIDUAL soup var means `write` appearing in ANY reachable effective set would be
+--- a solution, so No solution proves the out-of-profile cap is never granted.
+search [1] in WHIPPLESCRIPT-TURN-ACCESS-GRANT :
+  profile(read ; recall) grant(read ; write) effective(mt)
+  =>* effective(write ; E:CapSet) RESIDUAL:Cfg .
+
+--- Bite: an empty profile grants nothing, whatever the grant requests.
+search [1] in WHIPPLESCRIPT-TURN-ACCESS-GRANT :
+  profile(mt) grant(read ; write ; learn) effective(mt)
+  =>* effective(C:Cap ; E:CapSet) RESIDUAL:Cfg .

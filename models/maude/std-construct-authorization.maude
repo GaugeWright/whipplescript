@@ -1,0 +1,93 @@
+--- Standard-library construct authorization, S6d re-key (2026-07-08). The old
+--- model keyed the lock exemption on a compiler BUILT-IN registration (1929
+--- OPTION A). S6d replaces built-ins with EMBEDDED STD MANIFESTS: standard
+--- packages ship as package manifests compiled into the binary, so the binary
+--- is its own supply chain. The exemption is re-keyed accordingly, and the
+--- import ladder (E5) makes `use` bite for manifest-borne constructs:
+---
+---   embedded + imported : a construct registered by an embedded std manifest
+---     authorizes with NO lock, but ONLY when the program imports the owning
+---     package (import-to-authorize tier). Embedded alone is not enough.
+---   third-party + locked : a third-party package construct authorizes only
+---     when a package lock authorizes its package (supply-chain requirement,
+---     unchanged).
+---   reserved namespace : a package lock entry that claims a std-namespace
+---     name is REFUSED (check error) -- the embedded copy always wins, so a
+---     supply-chain lock can never shadow the platform's std packages. A use
+---     that would authorize through such a lock entry never authorizes.
+---   unknown : a construct with no registration behind it is never
+---     authorized -- the exemption never leaks on a name alone.
+mod WHIPPLESCRIPT-STD-CONSTRUCT-AUTHORIZATION is
+  protecting BOOL .
+
+  sorts Pkg Use Cfg .
+
+  --- Sample packages: two reserved std-namespace names and one vendor name.
+  ops stdMemory stdMessaging vendorKit : -> Pkg [ctor] .
+  --- Sample construct uses.
+  ops recall send fetch bogus : -> Use [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Is the package name inside the reserved std namespace?
+  op isStd : Pkg -> Bool .
+  eq isStd(stdMemory) = true .
+  eq isStd(stdMessaging) = true .
+  eq isStd(vendorKit) = false .
+
+  op imported : Pkg -> Cfg [ctor] .     --- the program has `use <pkg>`
+  op embeddedUse : Pkg Use -> Cfg [ctor] . --- use registered by an embedded std manifest
+  op thirdPartyUse : Pkg Use -> Cfg [ctor] . --- use registered by a lock-provided package
+  op unknownUse : Use -> Cfg [ctor] .   --- a use with no registration behind it
+  op lockProvides : Pkg -> Cfg [ctor] . --- a package lock entry provides this package
+  op lockAdmitted : Pkg -> Cfg [ctor] . --- the lock entry passed the namespace check
+  op lockRejected : Pkg -> Cfg [ctor] . --- the lock entry was refused (reserved namespace)
+  op authorized : Use -> Cfg [ctor] .   --- the construct use is authorized to compile
+
+  var P : Pkg .
+  var U : Use .
+
+  --- Import ladder, import-to-authorize tier: an embedded std construct use
+  --- authorizes with no lock ONLY when the owning package is imported. The
+  --- imported premise stays in the soup (one import authorizes many uses).
+  rl [embedded-import-ok] : embeddedUse(P, U) imported(P)
+    => authorized(U) imported(P) .
+
+  --- Reserved namespace gate on the lock: a std-namespace claim is refused,
+  --- anything else is admitted.
+  crl [lock-admit] : lockProvides(P) => lockAdmitted(P) if isStd(P) = false .
+  crl [lock-refuse] : lockProvides(P) => lockRejected(P) if isStd(P) = true .
+
+  --- A third-party construct use authorizes only through an ADMITTED lock
+  --- entry for its package. A refused (std-shadowing) entry never admits, so
+  --- this rule can never fire for it.
+  rl [locked-ok] : thirdPartyUse(P, U) lockAdmitted(P)
+    => authorized(U) lockAdmitted(P) .
+
+  --- Authorability door (S6d-5). Some platform lowering classes are NOT
+  --- package-authorable (resource_effect, signal_source, clock_source, ...):
+  --- a manifest construct in such a class is admitted only through a
+  --- platform-owned privilege key. A lock grants supply-chain authority but
+  --- never class authority. The door has TWO legs:
+  ---
+  ---   embedded leg (S6d-5): the manifest IS the platform copy compiled into
+  ---     the binary (byte-identity) -- unforgeable by third parties.
+  ---   privilege-tuple leg (std.coord slice 4, M5 "Authorability door"): the
+  ---     PLATFORM CATALOG carries a reserved-keyword privilege tuple whose
+  ---     lowering target is the non-authorable class; the tuple authorizes
+  ---     that class for exactly that (library, keyword) pair. The catalog is
+  ---     compiled into the platform, so third parties can never mint a tuple,
+  ---     and a tuple for a different keyword or a different library grants
+  ---     nothing -- rows are exact tuples.
+  op embedded : Pkg -> Cfg [ctor] .     --- the manifest ships compiled into the binary
+  op declaresInternalClass : Pkg Use -> Cfg [ctor] . --- construct in a non-authorable class
+  op classAuthorized : Use -> Cfg [ctor] . --- the internal-class construct is admitted
+  op catalogPrivilege : Pkg Use -> Cfg [ctor] . --- catalog tuple: (library, keyword) may use the class
+
+  rl [door-embedded] : declaresInternalClass(P, U) embedded(P)
+    => classAuthorized(U) embedded(P) .
+
+  rl [door-privileged] : declaresInternalClass(P, U) catalogPrivilege(P, U)
+    => classAuthorized(U) catalogPrivilege(P, U) .
+endm

@@ -1,0 +1,55 @@
+load ../improve-acceptance.maude
+
+--- The corruption pattern throughout: a candidate surfaced as adoptable
+--- while a dimension the campaign never released measured worse than its
+--- indifference band -- "improved the gauge, broke the system."
+
+--- Hazard demonstrated: the naive judge proposes a candidate whose
+--- guarded gauge regressed beyond band, because it only read the focus.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  naive ascend(g1) meas(g1, better) guard(g2) meas(g2, worse)
+  =>* proposed guard(g2) meas(g2, worse) RESIDUAL:Cfg .
+
+--- Bite: the sound judge never proposes a candidate with a guarded
+--- regression beyond band, in any discharge order.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, better) guard(g2) meas(g2, worse) obl(s(s(z)))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Bite: declared bars are hard constraints -- a bar-violating candidate
+--- is never proposable even when the focus improved and guards held.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, better) guard(g3) meas(g3, inband) barViol(g2)
+    obl(s(s(s(z))))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Bite: a candidate that regresses its own focus dimension is refused.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, worse) obl(s(z))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Bite: a candidate that improves nothing is not an improvement -- flat
+--- everywhere never reaches proposed.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, inband) guard(g2) meas(g2, inband) obl(s(s(z)))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Coverage: an undominated candidate is proposed -- focus better, guard
+--- within band, bar met.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, better) guard(g2) meas(g2, inband) barMet(g1)
+    obl(s(s(s(z))))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Coverage: --sacrifice releases a gauge from the guard set -- the same
+--- regression that killed the guarded candidate is accepted once the
+--- user explicitly traded that dimension away.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, better) sacrifice(g2) meas(g2, worse) obl(s(s(z)))
+  =>* proposed RESIDUAL:Cfg .
+
+--- Coverage: refusal is honest and reachable -- the dominated candidate
+--- ends rejected, not silently dropped.
+search [1] in WHIPPLESCRIPT-IMPROVE-ACCEPTANCE :
+  judge ascend(g1) meas(g1, better) guard(g2) meas(g2, worse) obl(s(s(z)))
+  =>* rejected RESIDUAL:Cfg .

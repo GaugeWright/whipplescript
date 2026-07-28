@@ -1,0 +1,71 @@
+--- The standing-contradiction reopener (research note section 4.3,
+--- design pass 2026-07-14): as ambient evidence accumulates against an
+--- answered call, `whip gauges` raises an advisory flag citing the
+--- precedent -- the system respectfully reopening a decision with
+--- evidence rather than opinion. The trigger is SUSTAINED: the
+--- contradiction posterior must sit at the threshold AND have tightened
+--- monotonically over the last three informative observations, so a
+--- single noisy day never nags. And the flag is ADVISORY ONLY: the
+--- precedent's authority is revoked exclusively by the human's own
+--- `answer --revoke`, never by the flag.
+---
+--- Two triggers over one movement stream. The SOUND trigger counts a
+--- tightening streak (an up-movement extends it, any down-movement
+--- resets it) and flags exactly when the streak reaches three. The NAIVE
+--- trigger is the spike hazard: it flags on any single up-movement --
+--- one noisy observation mints a contradiction no trend supports.
+mod WHIPPLESCRIPT-CONTRADICTION-REOPENER is
+  sorts Cnt Mov MovList Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+
+  ops up down : -> Mov [ctor] .    --- the posterior tightened / receded
+  op nilM : -> MovList [ctor] .
+  op _;_ : Mov MovList -> MovList [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op streak : Cnt -> Cfg [ctor] .   --- consecutive tightening movements
+  op stream : MovList -> Cfg [ctor] .
+  op sound : -> Cfg [ctor] .
+  op naive : -> Cfg [ctor] .
+  op watching : -> Cfg [ctor] .     --- no flag raised (consumed once)
+  op flagged : -> Cfg [ctor] .      --- the advisory flag
+  op answered : -> Cfg [ctor] .     --- the precedent's standing authority
+  op revoked : -> Cfg [ctor] .      --- removable only by the human's verb
+
+  var N : Cnt .
+  var L : MovList .
+
+  --- Sound: tightening extends the streak; any recession resets it.
+  rl [tighten] :
+      sound streak(N) stream(up ; L)
+      => sound streak(s(N)) stream(L) .
+
+  rl [recede] :
+      sound streak(N) stream(down ; L)
+      => sound streak(z) stream(L) .
+
+  --- Flag exactly at three consecutive tightenings (the sustained
+  --- trigger), consuming `watching`: one watch, one flag.
+  rl [flag] :
+      sound watching streak(s(s(s(N))))
+      => sound flagged streak(s(s(s(N)))) .
+
+  --- Naive: the spike hazard -- any single tightening flags.
+  rl [naive-tighten] :
+      naive streak(N) stream(up ; L)
+      => naive streak(s(N)) stream(L) .
+
+  rl [naive-flag] :
+      naive watching streak(s(N))
+      => naive flagged streak(s(N)) .
+
+  --- Advisory only: this module deliberately has NO rule producing
+  --- `revoked` -- the reopener carries no revocation authority at all.
+  --- Revocation lives with the human's `answer --revoke`, outside this
+  --- model; the bite search proves `revoked` unreachable from any
+  --- flagged state.
+endm

@@ -407,28 +407,10 @@ CREATE TABLE capability_bindings (
     UNIQUE(program_id, capability, provider)
 );
 
-CREATE TABLE inbox_items (
-    inbox_item_id TEXT PRIMARY KEY,
-    instance_id TEXT NOT NULL,
-    effect_id TEXT REFERENCES effects(effect_id),
-    status TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    choices_json TEXT NOT NULL DEFAULT '[]',
-    freeform_allowed INTEGER NOT NULL DEFAULT 1,
-    severity TEXT NOT NULL DEFAULT 'normal',
-    related_effects_json TEXT NOT NULL DEFAULT '[]',
-    related_artifacts_json TEXT NOT NULL DEFAULT '[]',
-    answer_json TEXT,
-    answered_by TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    answered_at TEXT
-);
-
 INSERT INTO capability_schemas (capability, description, schema_json)
 VALUES
     ('agent.tell', 'Run an agent turn through a provider harness.', '{}'),
     ('schema.coerce', 'Coerce unstructured data into a typed value.', '{}'),
-    ('human.ask', 'Request a human decision.', '{}'),
     ('event.emit', 'Emit an external event.', '{}'),
     ('workflow.invoke', 'Start and observe a child workflow.', '{}'),
     ('capability.call', 'Call a registered package capability.', '{}'),
@@ -442,29 +424,24 @@ INSERT INTO effect_providers (provider_id, effect_kind, provider, capability)
 VALUES
     ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell'),
     ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce'),
-    ('provider_human_ask_builtin', 'human.ask', 'builtin-human-review', 'human.ask'),
     ('provider_event_emit_builtin', 'event.emit', 'builtin-event', 'event.emit'),
     ('provider_workflow_invoke_builtin', 'workflow.invoke', 'builtin-workflow-runtime', 'workflow.invoke'),
-    ('provider_capability_call_builtin', 'capability.call', 'builtin-package-call', 'capability.call'),
-    ('provider_messaging_send_builtin', 'capability.call', 'builtin-messaging', 'messaging.send');
+    ('provider_capability_call_builtin', 'capability.call', 'builtin-package-call', 'capability.call');
 
 INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities)
 VALUES
     ('profile_permissive', 'permissive', 'Allow all registered capabilities.', 'audit', '["*"]'),
-    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
-    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","human.ask","schema.coerce","event.emit","workflow.invoke","capability.call"]'),
-    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","human.ask","schema.coerce","event.emit","workflow.invoke"]'),
-    ('profile_human_review', 'human-review', 'Allow human review requests, answers, and read-only repository context.', 'enforce', '["human.ask","repo.read","event.emit","workflow.invoke"]');
+    ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","schema.coerce","event.emit","workflow.invoke"]'),
+    ('profile_repo_writer', 'repo-writer', 'Allow repository-writing agent workflows.', 'enforce', '["agent.tell","repo.read","repo.write","command.run","schema.coerce","event.emit","workflow.invoke","capability.call"]'),
+    ('profile_internet_research', 'internet-research', 'Allow networked research workflows.', 'enforce', '["agent.tell","internet.research","schema.coerce","event.emit","workflow.invoke"]');
 
 INSERT INTO capability_bindings (binding_id, program_id, capability, provider)
 VALUES
     ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness'),
     ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce'),
-    ('binding_human_ask_builtin', NULL, 'human.ask', 'builtin-human-review'),
     ('binding_event_emit_builtin', NULL, 'event.emit', 'builtin-event'),
     ('binding_workflow_invoke_builtin', NULL, 'workflow.invoke', 'builtin-workflow-runtime'),
     ('binding_capability_call_builtin', NULL, 'capability.call', 'builtin-package-call'),
-    ('binding_messaging_send_builtin', NULL, 'messaging.send', 'builtin-messaging'),
     ('binding_repo_read_builtin', NULL, 'repo.read', 'builtin-agent-harness'),
     ('binding_repo_write_builtin', NULL, 'repo.write', 'builtin-agent-harness'),
     ('binding_command_run_builtin', NULL, 'command.run', 'builtin-agent-harness');

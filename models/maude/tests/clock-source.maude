@@ -1,0 +1,180 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+load ../construct-graph.maude
+load ../construct-lowering.maude
+load ../lowering-runtime-handoff.maude
+load ../lowering-class-lifecycle.maude
+
+--- Clock-source admission calculus. A clock occurrence is keyed by
+--- occId(source, scheduled instant) -- the H(source_id, scheduled_occurrence_instant)
+--- admission key from admission-and-idempotency.md. Missed policy decides which
+--- occurrences become durable signal facts, but never which key an occurrence
+--- gets: the key is always a function of the scheduled instant. Instant order
+--- here is i1 before i2 before i3.
+mod WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION is
+  protecting WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE .
+
+  sorts ClockSourceId Instant OccId MissedCount .
+
+  op src : -> ClockSourceId .
+  ops i1 i2 i3 : -> Instant .
+  op occId : ClockSourceId Instant -> OccId .
+  ops cnt0 cnt1 cnt2 : -> MissedCount .
+
+  --- Pending folds produced by the provider/kernel before admission. A coalesce
+  --- fold carries the latest missed instant and how many earlier ticks folded in.
+  --- A catch-up or skip emission carries one instant to admit under its own key.
+  op coalesceFold : ClockSourceId Instant MissedCount -> Cfg .
+  op catchUpInstant : ClockSourceId Instant -> Cfg .
+  op skipNext : ClockSourceId Instant -> Cfg .
+
+  --- A durable signal fact keyed by its occurrence id.
+  op admittedFact : OccId MissedCount -> Cfg .
+  --- A replay re-admission attempt for an occurrence already recorded.
+  op reAdmit : OccId -> Cfg .
+
+  vars S : ClockSourceId .
+  vars I : Instant .
+  vars C : MissedCount .
+  vars K : OccId .
+
+  --- coalesce admits exactly one fact, at the latest missed instant.
+  rl [admit-coalesce] :
+    coalesceFold(S, I, C)
+    =>
+    admittedFact(occId(S, I), C) .
+
+  --- catch_up admits one fact per emitted occurrence, each under its own key.
+  rl [admit-catch-up] :
+    catchUpInstant(S, I)
+    =>
+    admittedFact(occId(S, I), cnt0) .
+
+  --- skip admits one fact at the next observed occurrence.
+  rl [admit-skip] :
+    skipNext(S, I)
+    =>
+    admittedFact(occId(S, I), cnt0) .
+
+  --- replay re-reads the recorded fact rather than admitting a second one.
+  rl [admit-idempotent] :
+    reAdmit(K) admittedFact(K, C)
+    =>
+    admittedFact(K, C) .
+endm
+
+--- INV-1 lowering preservation + INV-2 admits-never-fires (positive): a fully
+--- specified clock_source class in the source_declaration family lowers to one
+--- clock_source object reaching the clock_source admission template.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  classRegistered(clockSourceLowering)
+  classAllowsFamily(clockSourceLowering, sourceDeclaration)
+  classDeterministic(clockSourceLowering)
+  classContractPinned(clockSourceLowering)
+  classNoRuntimeInputs(clockSourceLowering)
+  classNoHiddenAuthority(clockSourceLowering)
+  classNoPackageScheduler(clockSourceLowering)
+  classNoPackageLifecycle(clockSourceLowering)
+  classNoDirectFactWrite(clockSourceLowering)
+  classNoDirectRuleFire(clockSourceLowering)
+  classEventPayloadTyped(clockSourceLowering)
+  classEventAdmissionOwned(clockSourceLowering)
+  classAllowsOutput(clockSourceLowering, coreClockSourceKind, clockSourceTemplateEntrypoint)
+  classCoreOutputs1(clockSourceLowering, coreClockSourceKind, clockSourceTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreClockSourceKind, clockSourceTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(clockSourceLowering)
+  objectEntrypointAccepted(clockSourceLowering, coreClockSourceKind, clockSourceTemplateEntrypoint) .
+
+--- INV-2 admits-never-fires (negative): a clock_source that omits the
+--- no-direct-rule-fire guarantee cannot pass static safety, so its lifecycle is
+--- never accepted. Removing the guard makes this go red, which is the point.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  classRegistered(clockSourceLowering)
+  classAllowsFamily(clockSourceLowering, sourceDeclaration)
+  classDeterministic(clockSourceLowering)
+  classContractPinned(clockSourceLowering)
+  classNoRuntimeInputs(clockSourceLowering)
+  classNoHiddenAuthority(clockSourceLowering)
+  classNoPackageScheduler(clockSourceLowering)
+  classNoPackageLifecycle(clockSourceLowering)
+  classNoDirectFactWrite(clockSourceLowering)
+  classEventPayloadTyped(clockSourceLowering)
+  classEventAdmissionOwned(clockSourceLowering)
+  classAllowsOutput(clockSourceLowering, coreClockSourceKind, clockSourceTemplateEntrypoint)
+  classCoreOutputs1(clockSourceLowering, coreClockSourceKind, clockSourceTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreClockSourceKind, clockSourceTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(clockSourceLowering) .
+
+--- INV-1 handoff (positive): a lowered clock_source object registers the
+--- clock_source admission template at runtime.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  emittedCoreObject(g1, coreClockSourceObj, coreClockSourceKind)
+  clockSourceEntrypoint(coreClockSourceObj, event1)
+  =>*
+  Rest:Cfg
+  handoffObjectOk(g1, coreClockSourceObj)
+  clockSourceTemplate(event1) .
+
+--- INV-1 distinct-from-schedule (negative): a clock_source object handed a
+--- schedule entrypoint never produces a clock_source template. clock_source and
+--- schedule_emitter/timer.wait are distinct constructs that do not interchange.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  emittedCoreObject(g1, coreClockSourceObj, coreClockSourceKind)
+  scheduleEntrypoint(coreClockSourceObj, event1)
+  =>*
+  Rest:Cfg
+  clockSourceTemplate(event1) .
+
+--- INV-5 coalesce uses the latest instant (positive): a coalesce fold of three
+--- ticks records one fact at the latest scheduled instant carrying the folded
+--- count of earlier ticks.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  coalesceFold(src, i3, cnt2)
+  =>*
+  Rest:Cfg
+  admittedFact(occId(src, i3), cnt2) .
+
+--- INV-5 coalesce uses the latest instant (negative): a coalesce fold never
+--- records the fact under an earlier scheduled instant's key.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  coalesceFold(src, i3, cnt2)
+  =>*
+  Rest:Cfg
+  admittedFact(occId(src, i1), cnt2) .
+
+--- INV-5 catch_up per-occurrence (positive): catch_up records one fact per
+--- emitted occurrence, each under that occurrence's own scheduled-instant key.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  catchUpInstant(src, i1)
+  catchUpInstant(src, i2)
+  =>*
+  Rest:Cfg
+  admittedFact(occId(src, i1), cnt0)
+  admittedFact(occId(src, i2), cnt0) .
+
+--- INV-5 cross-mode key uniqueness (positive): switching coalesce to catch_up
+--- re-admits the earlier, not-yet-recorded instants under their own occurrence
+--- keys without colliding with the coalesced tick's key.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  coalesceFold(src, i3, cnt1)
+  catchUpInstant(src, i1)
+  catchUpInstant(src, i2)
+  =>*
+  Rest:Cfg
+  admittedFact(occId(src, i3), cnt1)
+  admittedFact(occId(src, i1), cnt0)
+  admittedFact(occId(src, i2), cnt0) .
+
+--- INV-3 occurrence idempotency / record-once (negative): replaying an occurrence
+--- already recorded never produces a second fact for the same key.
+search [1] in WHIPPLESCRIPT-CLOCK-SOURCE-ADMISSION :
+  admittedFact(occId(src, i3), cnt0)
+  reAdmit(occId(src, i3))
+  =>*
+  Rest:Cfg
+  admittedFact(occId(src, i3), cnt0)
+  admittedFact(occId(src, i3), cnt0) .

@@ -1,0 +1,19 @@
+[package]
+name = "whipplescript-provider-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Codex App Server provider adapter for WhippleScript (external, opt-in)"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+whipplescript-kernel = { version = "0.3.1", path = "../whipplescript-kernel", default-features = false }
+serde_json = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

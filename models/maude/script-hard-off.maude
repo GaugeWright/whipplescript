@@ -1,0 +1,85 @@
+--- Script hard-off, the SPAWN-plane model (SC1, spec/std-script.md "Model");
+--- covers the five properties of spec/script-capabilities.md "Modeling
+--- notes". The ADMISSION-plane half of property 1 -- the two-key
+--- import-conditional capability seeding that resists forged IR -- is the
+--- separate models/maude/script-capability-seeding.maude (S6d-6); this model
+--- carries the spawn-side statement of hard-off plus the four properties
+--- that model does not touch:
+---   1. hard-off soundness: no spawn from a configuration lacking the
+---      import or lacking the operator-plane pin;
+---   2. fail-closed: bytes whose hash mismatches the operator pin never
+---      spawn under a capability name;
+---   3. no-injection: no author-controlled string reaches argv -- argv
+---      comes from the operator manifest only, the author's `with` payload
+---      rides stdin;
+---   4. provenance: every spawn records the executing content hash;
+---   5. plane separation: the composite -- nothing the authoring plane
+---      controls can cause execution of unpinned bytes.
+---
+--- The companion SLOPPY module is the negative fixture: it spawns whatever
+--- bytes sit on disk and lets the author payload reach argv, so the
+--- patterns the good module proves unreachable find witnesses there --
+--- coverage AND bite.
+mod WHIPPLESCRIPT-SCRIPT-HARD-OFF is
+  sorts Cap Hash Argv Cfg .
+
+  ops judge : -> Cap [ctor] .          --- a manifest-named script capability
+  ops h1 h2 : -> Hash [ctor] .         --- pinned content hash vs drifted bytes
+  op opArgv : -> Argv [ctor] .         --- the operator-pinned argv template
+  op authorArgv : -> Argv [ctor] .     --- an author-controlled string, as argv
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op imported : -> Cfg [ctor] .        --- the program imports std.script
+  op pin : Cap Hash -> Cfg [ctor] .    --- operator manifest pin: name -> sha256
+  op bytes : Cap Hash -> Cfg [ctor] .  --- the on-disk script body's CURRENT hash
+  op execReq : Cap -> Cfg [ctor] .     --- an admitted exec effect for the capability
+  op authorPayload : -> Cfg [ctor] .   --- the author's `with` payload (stdin-bound)
+  op spawn : Cap Hash Argv -> Cfg [ctor] . --- a spawned process: what ran, how
+  op recorded : Cap Hash -> Cfg [ctor] .   --- provenance: the executing hash, recorded
+
+  var C : Cap .
+  var H : Hash .
+
+  --- THE one spawn rule: requires the import AND the operator pin, requires
+  --- the on-disk bytes to hash to the PINNED value (the shared H), takes
+  --- argv from the operator template only, and records the executing hash.
+  --- The author payload never appears -- it rides stdin, not argv.
+  rl [spawn-pinned] : execReq(C) imported pin(C, H) bytes(C, H)
+      => spawn(C, H, opArgv) recorded(C, H) imported pin(C, H) bytes(C, H) .
+endm
+
+--- Negative fixture: a sloppy runner with no hash check and author argv.
+--- The searches the good module proves unreachable find witnesses here,
+--- proving those searches have bite.
+mod WHIPPLESCRIPT-SCRIPT-HARD-OFF-SLOPPY is
+  sorts Cap Hash Argv Cfg .
+
+  ops judge : -> Cap [ctor] .
+  ops h1 h2 : -> Hash [ctor] .
+  op opArgv : -> Argv [ctor] .
+  op authorArgv : -> Argv [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op imported : -> Cfg [ctor] .
+  op pin : Cap Hash -> Cfg [ctor] .
+  op bytes : Cap Hash -> Cfg [ctor] .
+  op execReq : Cap -> Cfg [ctor] .
+  op authorPayload : -> Cfg [ctor] .
+  op spawn : Cap Hash Argv -> Cfg [ctor] .
+  op recorded : Cap Hash -> Cfg [ctor] .
+
+  vars C : Cap .
+  vars H HP : Hash .
+
+  --- Spawns whatever bytes are on disk, pinned hash ignored.
+  rl [spawn-any-bytes] : execReq(C) imported pin(C, HP) bytes(C, H)
+      => spawn(C, H, opArgv) recorded(C, H) imported pin(C, HP) bytes(C, H) .
+
+  --- Lets the author payload reach argv.
+  rl [spawn-author-argv] : execReq(C) imported pin(C, H) bytes(C, H) authorPayload
+      => spawn(C, H, authorArgv) recorded(C, H) imported pin(C, H) bytes(C, H) .
+endm

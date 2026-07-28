@@ -1,0 +1,51 @@
+--- Turn-access grant authority narrowing, per spec/agent-harness.md +
+--- spec/construct-lowering-preservation.md (Proposal A). A `with access to <resource>
+--- { <grant clauses> }` modifier on a `tell` is authority-narrowing metadata on the
+--- agent.tell effect: the turn's EFFECTIVE authority is the intersection of the
+--- agent profile's permitted capabilities and the grant's requested capabilities.
+---
+--- The core safety invariant: a grant can only NARROW, never widen. A capability the
+--- grant requests but the profile does not permit must NOT appear in the effective
+--- authority. This model abstracts caps to a set and computes effective = profile
+--- intersect grant, then checks by reachability search that:
+---   * a grant within the profile is honored (effective = the requested caps);
+---   * a grant requesting a cap OUTSIDE the profile never widens authority -- that
+---     cap is absent from the effective set (no privilege escalation via a grant).
+mod WHIPPLESCRIPT-TURN-ACCESS-GRANT is
+  protecting BOOL .
+
+  sorts Cap CapSet Cfg .
+  subsort Cap < CapSet .
+
+  ops read write recall learn : -> Cap [ctor] .   --- example capabilities
+
+  op mt : -> CapSet [ctor] .
+  op _;_ : CapSet CapSet -> CapSet [ctor assoc comm id: mt] .
+  eq [cap-idem] : C:Cap ; C:Cap = C:Cap .
+
+  op member : Cap CapSet -> Bool .
+  eq member(C:Cap, (C:Cap ; S:CapSet)) = true .
+  eq member(C:Cap, S:CapSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op profile : CapSet -> Cfg [ctor] .     --- caps the agent profile permits
+  op grant : CapSet -> Cfg [ctor] .        --- caps the `with access to` grant requests
+  op effective : CapSet -> Cfg [ctor] .    --- computed effective authority for the turn
+
+  vars P E : CapSet .
+  var G : CapSet .
+  var C : Cap .
+
+  --- A requested cap that the profile permits is granted into the effective set.
+  crl [keep] : profile(P) grant(C ; G) effective(E)
+      => profile(P) grant(G) effective(C ; E)
+      if member(C, P) = true .
+
+  --- A requested cap the profile does NOT permit is dropped -- the grant cannot
+  --- widen authority beyond the profile.
+  crl [drop] : profile(P) grant(C ; G) effective(E)
+      => profile(P) grant(G) effective(E)
+      if member(C, P) = false .
+endm

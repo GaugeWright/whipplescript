@@ -1,0 +1,100 @@
+--- Signal label CARRIAGE (DR-0027 I-IFC7 / audit H8 stage b). A signal crossing the
+--- instance boundary carries the EMITTING instance's integrity to the receiver, so
+--- only information entering from an EXTERNAL source is ever hand-classified and
+--- internal flows propagate automatically. This is the stage-(b) destination model
+--- the way-station (signal-name-as-resource, stage a) deferred: instead of every
+--- signal defaulting low, a signal governance marks INTERNAL derives its integrity
+--- from its emitter.
+---
+--- Two stage-(b) properties beyond stage (a):
+---   carriage   -- a `when <Sig>` on an internal signal observes the emitter's
+---                 integrity label, not a hardcoded default.
+---   no-laundering -- an internal signal cannot be sourced from OUTSIDE (an external
+---                 `whip signal` injection is refused), so an attacker cannot launder
+---                 untrusted data in under a trusted signal name.
+--- Soundness is preserved: carriage does not FABRICATE trust -- an untrusted emitter
+--- yields an untrusted receiver (the meet/intersection of what flowed into the emit).
+---
+--- D2b extension: an `invoke:<B>` inbound payload is a signal-like entry into the
+--- child workflow. A selector rooted in that payload may not gate a branch whose
+--- required integrity is higher than the payload's carried label.
+---
+--- Grounding: emit(S, L) = an `emit signal S` whose payload carries integrity L (the
+--- intersection of the emitting rule's read-source vouchers). internalSig/externalSig
+--- = the governance classification. receiver(S) = a `when S` reads it. controlSink(R)
+--- = the receiver drives a sink requiring integrity R. invokePayload(T, L) = the
+--- inbound payload delivered to workflow target T with integrity L. selectorRequires(T, R)
+--- records that the selected branch for target T requires integrity R. trusted/untrusted
+--- = a 2-point integrity order (trusted geq untrusted); enough for the carriage and
+--- selector properties.
+mod WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE is
+  protecting BOOL .
+  sorts Sig InvokeTarget Label Cfg .
+
+  ops trusted untrusted : -> Label [ctor] .   --- 2-point integrity order
+  ops sigA sigB : -> Sig [ctor] .
+  ops childB childC : -> InvokeTarget [ctor] .
+
+  --- integrity dominance: does a carried label L meet a sink requirement R? trusted
+  --- meets everything; untrusted meets only untrusted (the public/low requirement).
+  op meets : Label Label -> Bool .
+  eq meets(trusted, R:Label) = true .
+  eq meets(untrusted, untrusted) = true .
+  eq meets(untrusted, trusted) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op internalSig : Sig -> Cfg [ctor] .         --- governance: S is an internal channel
+  op externalSig : Sig -> Cfg [ctor] .         --- governance: S is an external entry point
+  op emit : Sig Label -> Cfg [ctor] .          --- an in-system emit of S carrying integrity L
+  op extInject : Sig -> Cfg [ctor] .           --- an external `whip signal` injection of S
+  op receiver : Sig -> Cfg [ctor] .            --- a `when S` reads the signal
+  op controlSink : Label -> Cfg [ctor] .       --- the receiver drives a sink requiring R
+  op carried : Sig Label -> Cfg [ctor] .       --- the integrity the receiver observes
+  op injection : -> Cfg [ctor] .               --- untrusted carried label into a trusted sink
+  op laundering : -> Cfg [ctor] .              --- an internal signal sourced externally
+  op invokePayload : InvokeTarget Label -> Cfg [ctor] .
+                                                --- inbound `invoke:<B>` payload label
+  op selectorRequires : InvokeTarget Label -> Cfg [ctor] .
+                                                --- branch selector integrity requirement
+  op invokeSelectorReject : -> Cfg [ctor] .     --- low selector gating a high branch
+
+  vars S : Sig .  vars L R : Label .  vars T : InvokeTarget .
+
+  eq carried(S, L) carried(S, L) = carried(S, L) .
+  eq injection injection = injection .
+  eq laundering laundering = laundering .
+  eq invokeSelectorReject invokeSelectorReject = invokeSelectorReject .
+
+  --- CARRIAGE: an internal signal's receiver observes the EMITTER's label. The emit
+  --- crosses the instance boundary carrying L unchanged; the receiver reads it.
+  rl [carry] : internalSig(S) emit(S, L) receiver(S)
+    => internalSig(S) emit(S, L) receiver(S) carried(S, L) .
+
+  --- EXTERNAL ENTRY: an external signal's receiver observes the untrusted entry label
+  --- of stage a -- hand-classified, default low. It is NOT raised by any emitter.
+  rl [entry] : externalSig(S) receiver(S)
+    => externalSig(S) receiver(S) carried(S, untrusted) .
+
+  --- NO LAUNDERING: an external injection of an INTERNAL signal is refused -- the
+  --- internal channel cannot be sourced from outside, so an attacker cannot smuggle
+  --- untrusted data in under a trusted signal name. (Runtime: `whip signal` refuses
+  --- to inject an internal-marked signal under a governed envelope.)
+  rl [launder] : internalSig(S) extInject(S)
+    => internalSig(S) extInject(S) laundering .
+
+  --- INJECTION: the carried integrity does not meet the sink's requirement. Fires
+  --- when an untrusted emitter feeds a trusted sink -- carriage preserves the low
+  --- label, so trust is never fabricated.
+  crl [inject] : carried(S, L) controlSink(R)
+    => carried(S, L) controlSink(R) injection
+    if meets(L, R) =/= true .
+
+  --- D2b INVOKE SELECTOR: the invoke inbound payload is substituted for the signal
+  --- payload as the selector source. A low-integrity payload cannot select a branch
+  --- that requires a higher-integrity discriminator.
+  crl [invoke-selector] : invokePayload(T, L) selectorRequires(T, R)
+    => invokePayload(T, L) selectorRequires(T, R) invokeSelectorReject
+    if meets(L, R) =/= true .
+endm

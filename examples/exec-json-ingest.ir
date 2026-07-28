@@ -19,8 +19,8 @@ rules
     reads
       pattern:started
     effects
-      report kind=exec.command binding=report key=2fc16e0bc5727815
-    body_hash dcb8311298d981c3
+      report kind=exec.command binding=report key=fb4ef6c32790211e4d5f15c109b0405b
+    body_hash 0790aecc3e2d30280fce9015ba0d06e9
   rule ingest_failed_tests
     when started
     reads
@@ -28,5 +28,5 @@ rules
     writes
       schema:FailedTest
     effects
-      effect1 kind=exec.command binding=- key=62319a228129080d
-    body_hash 3dbc8ed5c83d4f1c
+      effect1 kind=exec.command binding=- key=fd4fb074cfc76ecbe0b702e8467ad23b
+    body_hash 926044308c8ce4b46482e9b0b62dbbdf

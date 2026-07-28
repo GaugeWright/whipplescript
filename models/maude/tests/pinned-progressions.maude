@@ -1,0 +1,71 @@
+load ../pinned-progressions.maude
+
+--- Coverage: the progression completes -- region steps, clean exit, post
+--- steps, terminal.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* workflowDone(f1) RESIDUAL:Cfg .
+
+--- Coverage (THE pinning claim): the admission trigger is consumed mid-flight
+--- and the progression STILL completes -- bindings are values, matching gates
+--- only admission.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* trig(f1, consumed) workflowDone(f1) RESIDUAL:Cfg .
+
+--- Coverage: the lapse arm is reachable -- a break before the region drains
+--- routes to lapsed with the arm's commit stamped.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* region(f1, lapsed) lapseAt(f1, N:Cnt) RESIDUAL:Cfg .
+
+--- Coverage (point of no return): a post-region step commits AFTER the break
+--- in log order -- statements outside the region consult no condition.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* condBroken(M:Cnt) postAt(f1, N:Cnt) RESIDUAL:Cfg
+  such that lt(M:Cnt, N:Cnt) .
+
+--- Coverage (repair): the condition breaks and REPAIRS before any advancing
+--- commit observed the broken window -- the progression completes with no
+--- lapse. `workflowDone` requires `region(_, done)`, and lapsed never becomes
+--- done, so this state PROVES no lapse occurred despite `brokeEver`.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* brokeEver workflowDone(f1) RESIDUAL:Cfg .
+
+--- Coverage (re-admission, Decision 4): two DISTINCT firings -- fact identity
+--- is admission identity -- each complete independently.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init2 =>* workflowDone(f1) workflowDone(f2) RESIDUAL:Cfg .
+
+--- Invariant (fate-at-commit): no region step ever commits while the
+--- condition stands broken -- the stateful break stamp coexisting with a
+--- LATER step stamp is unreachable (the check is atomic with the commit).
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* condBroken(M:Cnt) stepAt(f1, N:Cnt) RESIDUAL:Cfg
+  such that lt(M:Cnt, N:Cnt) .
+
+--- Invariant (lapse exactly once per firing): two lapse commits of the SAME
+--- firing are unreachable -- its region cell is consumed into lapsed.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* lapseAt(f1, M:Cnt) lapseAt(f1, N:Cnt) RESIDUAL:Cfg .
+
+--- Invariant (no silent stall): no FINAL state strands an open region --
+--- every progression ends done, lapsed, or terminal. The reactive bite below
+--- proves this non-vacuous.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>! region(f1, open(K:Cnt)) RESIDUAL:Cfg .
+
+--- Invariant (lapse is terminal for the region): a lapsed firing never reads
+--- as done -- the two exits are exclusive by construction.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* lapseAt(f1, N:Cnt) region(f1, done) RESIDUAL:Cfg .
+
+--- Invariant (the region gates its point of no return): a post-region step
+--- never commits while the region is still open -- [apply] requires done, and
+--- done is only reached by draining every step under the condition.
+search [1] in WHIPPLESCRIPT-PINNED-PROGRESSION :
+  init =>* region(f1, open(K:Cnt)) postAt(f1, N:Cnt) RESIDUAL:Cfg .
+
+--- Bite (today's semantics stall silently): under reactive re-derivation --
+--- continuations require the trigger to still match and the guard to still
+--- hold, no lapse rule -- a FINAL state with the region still open is
+--- reachable: the silent stall observed live in manual ch. 15.
+search [1] in WHIPPLESCRIPT-REACTIVE-PROGRESSION :
+  init =>! region(f1, open(K:Cnt)) RESIDUAL:Cfg .

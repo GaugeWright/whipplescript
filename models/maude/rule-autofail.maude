@@ -1,0 +1,65 @@
+--- Rule-level unhandled-failure auto-fail (R1, language-refinement campaign).
+--- Generalizes (and absorbs) the old flow-level 503 net: the scope is now the
+--- WORKFLOW, not a flow. An effect that reaches a terminal failed or timed_out
+--- status with no observing after block on its binding (fails / times out /
+--- completes) can never progress its rule again; rather than leaving the
+--- instance running and idle forever, the kernel auto-fails it with a generic
+--- reason and no typed payload (fail_instance_internal).
+---
+--- Dispositions, mirroring crates/whipplescript-kernel/src/rule_lowering.rs:
+---   effFailedUnhandled(E)  terminal failed/timed_out, no observer on binding
+---   effFailedHandled(E)    an observing after block settles it (typed path)
+---   effCancelled(E)        cancelled terminal: EXEMPT (cancel is deliberate;
+---                          the watchdog pattern depends on it)
+--- Scope markers (exactly one per workflow):
+---   selfTerminating        workflow not tagged @service: auto-fail applies
+---   service                @service workflow: can never auto-fail; each
+---                          unhandled failure records ONE durable diagnostic
+---                          and the instance keeps running
+--- The model checks by reachability search that:
+---   a self-terminating workflow with an unhandled failed effect reaches the
+---     failed terminal (auto-fail fires, no stall);
+---   a handled failure settles via its own terminal, never the auto-fail;
+---   a service workflow records a diagnostic and stays running -- it never
+---     reaches instanceFailed;
+---   a cancelled effect never trips the net in any scope.
+mod WHIPPLESCRIPT-RULE-AUTOFAIL is
+  protecting BOOL .
+
+  sorts Eff Cfg .
+
+  ops e1 e2 : -> Eff [ctor] .   --- effects requested by rules
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op selfTerminating : -> Cfg [ctor] .        --- workflow not tagged @service
+  op service : -> Cfg [ctor] .                --- workflow tagged @service
+  op running : -> Cfg [ctor] .                --- instance is running
+  op effFailedUnhandled : Eff -> Cfg [ctor] . --- terminal failure, no observer on the binding
+  op effFailedHandled : Eff -> Cfg [ctor] .   --- terminal failure with an observing after block
+  op effCancelled : Eff -> Cfg [ctor] .       --- cancelled terminal (exempt by design)
+  op settled : Eff -> Cfg [ctor] .            --- a handled failure resolved via its own terminal
+  op diagRecorded : Eff -> Cfg [ctor] .       --- the durable service diagnostic (idempotent per effect)
+  op instanceFailed : -> Cfg [ctor] .         --- the auto-fail terminal, fail_instance_internal
+
+  var E : Eff .
+
+  --- A self-terminating workflow with a genuinely-unhandled failed effect
+  --- auto-fails the instance. The LHS requires both selfTerminating and an
+  --- effFailedUnhandled, so neither a service workflow nor a handled failure
+  --- nor a cancelled effect can ever match. That is the scoping bite.
+  rl [autofail] : selfTerminating effFailedUnhandled(E) running
+      => selfTerminating instanceFailed .
+
+  --- A handled failure settles through its own observing after block; it never
+  --- routes to the generic auto-fail. Leaving running untouched lets a sibling
+  --- unhandled failure in the same workflow still auto-fail.
+  rl [handled] : effFailedHandled(E) => settled(E) .
+
+  --- A service workflow can never auto-fail: the unhandled failure is consumed
+  --- into a durable diagnostic and running stays in the soup -- the service
+  --- keeps reacting.
+  rl [servicediag] : service effFailedUnhandled(E) running
+      => service diagRecorded(E) running .
+endm

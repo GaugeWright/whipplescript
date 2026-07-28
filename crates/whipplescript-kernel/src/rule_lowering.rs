@@ -20,7 +20,7 @@ use whipplescript_store::{EffectView, FactView, WorkflowTerminalKind};
 use crate::idempotency_key;
 use crate::lowering::{
     BranchReport, BranchStatus, OwnedDependency, OwnedEffect, OwnedFact, OwnedLowering,
-    OwnedWorkflowTerminal,
+    OwnedUnhandledFailure, OwnedWorkflowTerminal,
 };
 
 pub fn insert_json_field(value: &mut Value, key: &str, field: Value) {
@@ -175,6 +175,89 @@ pub struct RuleContext {
     pub bindings: Vec<(String, FactView)>,
 }
 
+/// DR-0043 slice 1: serializes a firing's pinned context — identity plus the
+/// bound trigger values, each with the full `FactView` shape — for embedding
+/// in the `rule.committed` payload. The inverse is `context_from_record`;
+/// round-tripping must reconstruct a `RuleContext` that derives byte-identical
+/// effect keys (the effect-key-stability invariant).
+pub fn context_record_json(context: &RuleContext) -> String {
+    let bindings: Vec<Value> = context
+        .bindings
+        .iter()
+        .map(|(binding, fact)| {
+            json!({
+                "binding": binding,
+                "fact_id": fact.fact_id,
+                "program_version_id": fact.program_version_id,
+                "revision_epoch": fact.revision_epoch,
+                "name": fact.name,
+                "key": fact.key,
+                "value": json_from_str(&fact.value_json),
+                "provenance_class": fact.provenance_class,
+            })
+        })
+        .collect();
+    json!({
+        "identity": context.identity,
+        "trigger_event_id": context.trigger_event_id,
+        "bindings": bindings,
+    })
+    .to_string()
+}
+
+/// Reconstructs a firing's `RuleContext` from a recorded `context` payload
+/// (the `context_record_json` inverse). Returns `None` on a malformed or
+/// absent record — the caller treats that as "no pinned context", never a
+/// panic (old stores predate the field).
+pub fn context_from_record(record: &Value) -> Option<RuleContext> {
+    let record = record.as_object()?;
+    let bindings = record
+        .get("bindings")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            let binding = entry.get("binding")?.as_str()?.to_owned();
+            let fact = FactView {
+                fact_id: entry.get("fact_id")?.as_str()?.to_owned(),
+                program_version_id: entry
+                    .get("program_version_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                revision_epoch: entry
+                    .get("revision_epoch")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                name: entry.get("name")?.as_str()?.to_owned(),
+                key: entry.get("key")?.as_str()?.to_owned(),
+                value_json: entry
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+                provenance_class: entry
+                    .get("provenance_class")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                source_span_json: None,
+                source_event_id: String::new(),
+            };
+            Some((binding, fact))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(RuleContext {
+        trigger_event_id: record
+            .get("trigger_event_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        identity: record
+            .get("identity")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        bindings,
+    })
+}
+
 pub fn ready_contexts(
     ir: &IrProgram,
     rule: &IrRule,
@@ -194,9 +277,33 @@ pub fn ready_contexts(
             if started_event_id.is_none() {
                 return ReadyContexts::empty(guard_reports);
             }
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         if pattern.ends_with(" is available") {
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         if let Some((schema, binding)) = pattern.split_once(" as ") {
@@ -216,7 +323,32 @@ pub fn ready_contexts(
             for context in contexts {
                 for fact in &matching {
                     let mut context = context.clone();
-                    context.identity = Some(format!("{binding}:{}", fact.key));
+                    // Accumulate identity across EVERY `as` binding, not just the
+                    // last: a multi-when join (`when A as aa` + `when B as bb`)
+                    // otherwise gives (a1,b1) and (a2,b1) the same identity
+                    // (`bb:<b1>`), so their effect ids — derived from the
+                    // identity — collide and one join firing's fan-out effects
+                    // are silently dropped. Compose the per-binding fragments so
+                    // distinct combinations stay distinct. Single-binding rules
+                    // are unchanged (no prior fragment to prepend).
+                    let fragment = format!("{binding}:{}", fact.key);
+                    context.identity = Some(match context.identity.take() {
+                        Some(prev) => format!("{prev}|{fragment}"),
+                        None => fragment,
+                    });
+                    // Compose the ADMITTING events alongside the identity: a
+                    // consumed-then-re-recorded fact keeps its content key
+                    // (same identity) but carries a fresh admitting event, so
+                    // folding source_event_id into trigger_event_id gives each
+                    // re-admission's firing a distinct commit key instead of a
+                    // UNIQUE-constraint crash. Replay-safe: the pinned context
+                    // records the composed value verbatim.
+                    if !fact.source_event_id.is_empty() {
+                        context.trigger_event_id = Some(match context.trigger_event_id.take() {
+                            Some(prev) => format!("{prev}|{}", fact.source_event_id),
+                            None => fact.source_event_id.clone(),
+                        });
+                    }
                     context.bindings.push((binding.to_owned(), fact.clone()));
                     match &when.guard {
                         Some(guard) => {
@@ -255,6 +387,18 @@ pub fn ready_contexts(
             if !satisfied {
                 return ReadyContexts::empty(guard_reports);
             }
+            contexts = filter_bindingless_guard(
+                rule,
+                when,
+                contexts,
+                facts,
+                effects,
+                ir,
+                &mut guard_reports,
+            );
+            if contexts.is_empty() {
+                return ReadyContexts::empty(guard_reports);
+            }
             continue;
         }
         return ReadyContexts::empty(guard_reports);
@@ -263,6 +407,48 @@ pub fn ready_contexts(
         contexts,
         guard_reports,
     }
+}
+
+/// Apply a bindingless trigger's `where` guard (`started`, `<agent> is
+/// available`, `<agent> completed turn`, `<tracker> has ready issue`, ...) to
+/// the current contexts. These triggers bind no fact, so the guard evaluates
+/// against global facts. The guard used to be honored ONLY on `<Class> as
+/// <binding>` triggers, so a guard on a bindingless trigger was silently
+/// dropped and the rule fired even when the guard was false — the exact
+/// silent-no-op class B1 exists to eliminate. Reuses the same `eval_guard` as
+/// the bound path, so the "a rule fires only when its guard holds" invariant is
+/// uniform. A guardless trigger returns the contexts unchanged.
+fn filter_bindingless_guard(
+    rule: &IrRule,
+    when: &IrWhen,
+    contexts: Vec<RuleContext>,
+    facts: &[FactView],
+    effects: &[EffectView],
+    ir: &IrProgram,
+    guard_reports: &mut Vec<GuardReport>,
+) -> Vec<RuleContext> {
+    let Some(guard) = &when.guard else {
+        return contexts;
+    };
+    let mut kept = Vec::new();
+    for context in contexts {
+        let report = eval_guard(
+            &rule.name,
+            &when.source,
+            &guard.source,
+            &guard.expr,
+            &context,
+            facts,
+            effects,
+            ir,
+        );
+        let matched = report.matched;
+        guard_reports.push(report);
+        if matched {
+            kept.push(context);
+        }
+    }
+    kept
 }
 
 /// For `<tracker> has ready issue` patterns, only the named tracker's projected
@@ -425,7 +611,7 @@ pub struct EvalScope<'a> {
 }
 
 impl<'a> EvalScope<'a> {
-    fn rule(
+    pub fn rule(
         context: &'a RuleContext,
         facts: &'a [FactView],
         effects: &'a [EffectView],
@@ -480,6 +666,7 @@ pub fn empty_ir_program() -> IrProgram {
         trackers: Vec::new(),
         channels: Vec::new(),
         gauges: Vec::new(),
+        marks: Vec::new(),
         campaigns: Vec::new(),
         file_stores: Vec::new(),
         memory_pools: Vec::new(),
@@ -726,6 +913,19 @@ pub fn eval_call(name: &str, args: &[Expr], scope: &EvalScope<'_>) -> EvalValue 
         ("exists", [expr]) => EvalValue::Json(Value::Bool(
             !eval_expr_value(expr, scope).is_missing_or_null(),
         )),
+        ("empty", [query @ Expr::Query { .. }]) => eval_query_count(query, scope)
+            .map(|count| EvalValue::Json(Value::Bool(count == 0)))
+            .unwrap_or_else(|value| value),
+        ("empty", [expr]) => match eval_expr_value(expr, scope) {
+            EvalValue::Json(Value::Array(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
+            EvalValue::Json(Value::Object(items)) => EvalValue::Json(Value::Bool(items.is_empty())),
+            EvalValue::Json(Value::String(value)) => EvalValue::Json(Value::Bool(value.is_empty())),
+            // Spec: for optional values `empty` is true for missing/null and
+            // otherwise delegates to the present inner value.
+            EvalValue::Json(Value::Null) | EvalValue::Missing => EvalValue::Json(Value::Bool(true)),
+            EvalValue::Error(message) => EvalValue::Error(message),
+            _ => EvalValue::error("unsupported value for empty"),
+        },
         _ => EvalValue::error("unknown expression function"),
     }
 }
@@ -1000,6 +1200,11 @@ pub fn lower_rule(
     // branch/cut ref once the timeline forked) — see
     // rule_pass::revision_branch_key. A key part only, never parsed.
     revision_epoch_key: &str,
+    // Host-supplied at kernel construction (native: resolved coerce config;
+    // DO: `coerce_config_json`; fixture: literal "fixture") and folded into
+    // `schema.coerce` effect keys only — switching the coercion backend or
+    // model re-runs future coercions instead of replaying a stale terminal.
+    coercion_config_fingerprint: &str,
     ir: &IrProgram,
     rule: &IrRule,
     context: &RuleContext,
@@ -1023,17 +1228,30 @@ pub fn lower_rule(
     lowering.branch_reports.extend(branch_reports);
     let pre_terminal_body = strip_after_blocks(&body);
     append_consumed_fact_ids(&mut lowering, &pre_terminal_body, &context, facts);
-    append_workflow_terminal(&mut lowering, ir, rule, &pre_terminal_body, &context, None);
+    append_workflow_terminal(
+        &mut lowering,
+        ir,
+        rule,
+        &pre_terminal_body,
+        &context,
+        None,
+        facts,
+        effects,
+    );
 
     for (record_index, block) in top_level_record_blocks(&pre_terminal_body)
         .into_iter()
         .enumerate()
     {
-        let value = parse_record_fields(
+        let value = parse_record_fields_with_from(
             &block.body,
             &context,
             block.from_binding.as_deref(),
+            schema_field_names(ir, &block.schema),
             &mut lowering.errors,
+            facts,
+            effects,
+            ir,
         );
         let value_json = Value::Object(value).to_string();
         let fact_key = record_fact_key(&block.schema, &value_json);
@@ -1096,8 +1314,12 @@ pub fn lower_rule(
         .to_string();
         // One fact per (instance, rule, milestone, context) — idempotent across
         // re-evaluations; the milestone name is in the key so distinct
-        // milestones never collide.
-        let fact_key = idempotency_key(&[instance_id, &rule.name, &fact_name]);
+        // milestones never collide, and the firing IDENTITY is in the key so a
+        // rule firing per-identity (DR-0043 fragments) emits one milestone per
+        // identity instead of silently swallowing every identity after the
+        // first (the key used to omit it, contradicting this comment).
+        let identity = context.identity.as_deref().unwrap_or("started");
+        let fact_key = idempotency_key(&[instance_id, &rule.name, &fact_name, identity]);
         let fact_id = idempotency_key(&[instance_id, &rule.name, &fact_name, &fact_key]);
         if existing_fact_ids
             .iter()
@@ -1117,13 +1339,17 @@ pub fn lower_rule(
         });
     }
 
-    let mut parsed_effects = parse_effect_statements(&pre_terminal_body, &context);
-    rewrite_lease_releases(&mut parsed_effects, &rule.body);
+    let mut parsed_effects =
+        parse_effect_statements(&pre_terminal_body, &context, facts, effects, ir);
+    let acquire_bindings = lease_acquire_bindings(&parsed_effects);
+    rewrite_lease_releases(&mut parsed_effects, &acquire_bindings);
+    let claim_bindings = claim_item_bindings(&parsed_effects);
+    rewrite_claim_renews(&mut parsed_effects, &claim_bindings);
     let parsed_effects = parsed_effects;
     let mut node_to_effect_id = std::collections::BTreeMap::new();
     let mut binding_to_effect_id = std::collections::BTreeMap::new();
     for (index, parsed) in parsed_effects.iter().enumerate() {
-        let effect_node = effect_node_for_parsed(rule, parsed, index);
+        let effect_node = effect_node_for_parsed(rule, &parsed_effects, index);
         let node_id = effect_node
             .map(|effect| effect.id.as_str())
             .unwrap_or(parsed.kind.as_str());
@@ -1144,7 +1370,7 @@ pub fn lower_rule(
         }
     }
     for (index, parsed) in parsed_effects.iter().enumerate() {
-        let effect_node = effect_node_for_parsed(rule, parsed, index);
+        let effect_node = effect_node_for_parsed(rule, &parsed_effects, index);
         let node_id = effect_node
             .map(|effect| effect.id.as_str())
             .unwrap_or(parsed.kind.as_str());
@@ -1154,6 +1380,10 @@ pub fn lower_rule(
         if existing_effect_ids
             .iter()
             .any(|existing| *existing == effect_id)
+            || lowering
+                .effects
+                .iter()
+                .any(|existing| existing.effect_id == effect_id)
         {
             continue;
         }
@@ -1174,13 +1404,21 @@ pub fn lower_rule(
             &context,
             &binding_to_effect_id,
             &mut lowering.errors,
+            facts,
+            effects,
         );
         let profile = parsed
             .target
             .as_deref()
             .and_then(|target| ir.agents.iter().find(|agent| agent.name == target))
             .and_then(|agent| agent.profile.clone());
-        let effect_idempotency_key = idempotency_key(&[&effect_id, "effect"]);
+        let effect_idempotency_key = effect_admission_key(
+            ir,
+            &rule.name,
+            parsed,
+            &effect_id,
+            coercion_config_fingerprint,
+        );
         lowering.effects.push(OwnedEffect {
             effect_id,
             kind: parsed.kind.clone(),
@@ -1264,7 +1502,12 @@ pub fn lower_rule(
         // block — its alias (the redaction's source) is now bound.
         materialize_redactions(&mut after_context, &rule.metadata.redactions);
         lowering.branch_reports.extend(branch_reports);
-        append_consumed_fact_ids(&mut lowering, &selected_after_body, &after_context, facts);
+        // Consumes/cancels belong to THIS scope only: a `done`/`cancel` inside a
+        // deeper (not-yet-fired) nested `after` must not run when the outer
+        // block fires — strip nested blocks before scanning (the recursion
+        // handles them when their own scope fires).
+        let own_scope_body = strip_after_blocks(&selected_after_body);
+        append_consumed_fact_ids(&mut lowering, &own_scope_body, &after_context, facts);
         append_workflow_terminal(
             &mut lowering,
             ir,
@@ -1272,25 +1515,19 @@ pub fn lower_rule(
             &selected_after_body,
             &after_context,
             Some((&after.binding, &after.predicate)),
+            facts,
+            effects,
         );
-        // 503 auto-fail: a generated `flowfail` inside this fired `after <step>
-        // fails` block means the step's failure is unhandled in a self-terminating
-        // flow. The block only fires when the upstream effect actually failed
-        // (`effect_binding_value(.., "fails")` above returned a value), so reaching
-        // here is exactly the unhandled-failure case. Route to the kernel generic
-        // failed terminal rather than a typed terminal.
-        if lowering.internal_fail.is_none() && body_has_top_level_flowfail(&selected_after_body) {
-            lowering.internal_fail = Some(format!(
-                "unhandled failure of `{}` in flow rule `{}`",
-                after.binding, rule.name
-            ));
-        }
         for record in top_level_record_blocks(&selected_after_body) {
-            let value = parse_record_fields(
+            let value = parse_record_fields_with_from(
                 &record.body,
                 &after_context,
                 record.from_binding.as_deref(),
+                schema_field_names(ir, &record.schema),
                 &mut lowering.errors,
+                facts,
+                effects,
+                ir,
             );
             let value_json = Value::Object(value).to_string();
             let fact_key = record_fact_key(&record.schema, &value_json);
@@ -1321,8 +1558,19 @@ pub fn lower_rule(
                 source_span_json: None,
             });
         }
-        let mut selected_effects = parse_effect_statements(&selected_after_body, &after_context);
-        rewrite_lease_releases(&mut selected_effects, &rule.body);
+        let mut selected_effects =
+            parse_effect_statements(&selected_after_body, &after_context, facts, effects, ir);
+        // An after-block release resolves against the main-body acquires PLUS
+        // any acquire parsed in this block itself (sibling after-blocks stay
+        // invisible, matching the binding→effect-id data flow below).
+        let mut after_acquire_bindings = acquire_bindings.clone();
+        after_acquire_bindings.extend(lease_acquire_bindings(&selected_effects));
+        rewrite_lease_releases(&mut selected_effects, &after_acquire_bindings);
+        // Claim bindings from the main body plus any claim in this after-block,
+        // so an after-block `renew <claim>` resolves to `tracker.renew`.
+        let mut after_claim_bindings = claim_bindings.clone();
+        after_claim_bindings.extend(claim_item_bindings(&selected_effects));
+        rewrite_claim_renews(&mut selected_effects, &after_claim_bindings);
         for effect in &mut selected_effects {
             effect.after.get_or_insert_with(|| AfterScope {
                 binding: after.binding.clone(),
@@ -1332,7 +1580,7 @@ pub fn lower_rule(
         let mut selected_binding_to_effect_id = binding_to_effect_id.clone();
         let mut selected_node_to_effect_id = std::collections::BTreeMap::new();
         for (index, parsed) in selected_effects.iter().enumerate() {
-            let effect_node = effect_node_for_parsed(rule, parsed, index);
+            let effect_node = effect_node_for_parsed(rule, &selected_effects, index);
             let node_id = effect_node
                 .map(|effect| effect.id.as_str())
                 .unwrap_or(parsed.kind.as_str());
@@ -1359,7 +1607,7 @@ pub fn lower_rule(
                 .entry(binding.clone())
                 .or_insert_with(|| effect_id.clone());
         }
-        for binding in cancel_statements(&selected_after_body) {
+        for binding in cancel_statements(&own_scope_body) {
             if let Some(effect_id) = selected_binding_to_effect_id.get(&binding) {
                 lowering.cancels.push(effect_id.clone());
             } else {
@@ -1368,14 +1616,39 @@ pub fn lower_rule(
                     .push(format!("cancel of unknown effect binding `{binding}`"));
             }
         }
+        // Nested (depth ≥ 2) scopes whose upstream has ALREADY settled: bind
+        // their outcome values — including the `as <alias>` aliases only these
+        // deeper scopes declare — into the emission context, and remember which
+        // nested scopes have settled. Without this, an effect nested two
+        // `after`s deep (`claim` → `tell` → `finish`, the tracker idiom) was
+        // emitted the moment the LEVEL-1 block fired, serializing its input
+        // before the alias it references existed — a `Missing` sentinel leaked
+        // into a durable payload.
+        let settled_nested_scopes = push_settled_nested_scope_bindings(
+            &selected_after_body,
+            &selected_binding_to_effect_id,
+            facts,
+            &mut after_context,
+        );
         for (index, parsed) in selected_effects.iter().enumerate() {
-            let effect_node = effect_node_for_parsed(rule, parsed, index);
+            let effect_node = effect_node_for_parsed(rule, &selected_effects, index);
             let node_id = effect_node
                 .map(|effect| effect.id.as_str())
                 .unwrap_or(parsed.kind.as_str());
             let Some(effect_id) = selected_node_to_effect_id.get(node_id).cloned() else {
                 continue;
             };
+            // Defer effects whose OWN scope is a nested one that has not yet
+            // settled: emitting now would freeze their input before the
+            // scope's bindings exist. A later pass re-parses this block (its
+            // level-1 upstream stays settled) and emits them once
+            // `push_settled_nested_scope_bindings` reports their scope fired.
+            if let Some(scope) = &parsed.after {
+                if scope.binding != after.binding && !settled_nested_scopes.contains(&scope.binding)
+                {
+                    continue;
+                }
+            }
             if existing_effect_ids
                 .iter()
                 .any(|existing| *existing == effect_id)
@@ -1403,13 +1676,21 @@ pub fn lower_rule(
                 &after_context,
                 &selected_binding_to_effect_id,
                 &mut lowering.errors,
+                facts,
+                effects,
             );
             let profile = parsed
                 .target
                 .as_deref()
                 .and_then(|target| ir.agents.iter().find(|agent| agent.name == target))
                 .and_then(|agent| agent.profile.clone());
-            let effect_idempotency_key = idempotency_key(&[&effect_id, "effect"]);
+            let effect_idempotency_key = effect_admission_key(
+                ir,
+                &rule.name,
+                parsed,
+                &effect_id,
+                coercion_config_fingerprint,
+            );
             lowering.effects.push(OwnedEffect {
                 effect_id,
                 kind: parsed.kind.clone(),
@@ -1425,26 +1706,301 @@ pub fn lower_rule(
                 timeout_seconds: parsed.timeout_seconds,
             });
         }
+        // NESTED after blocks inside this fired block (a chained pipeline —
+        // hand-written or `then`-desugared). Their EFFECTS were already parsed
+        // and admitted above (`parse_effect_statements` descends into nested
+        // scopes, and store-side dependency gating defers them until their
+        // upstream settles); what the one-level loop never did was run their
+        // NON-effect actions — terminals, records, cancels, consumed facts —
+        // so a `complete` two `after`s deep silently never fired. The
+        // recursion fixes exactly that.
+        lower_nested_after_blocks(
+            instance_id,
+            ir,
+            rule,
+            facts,
+            effects,
+            &existing_fact_ids,
+            &binding_to_effect_id,
+            &selected_after_body,
+            &after_context,
+            &mut lowering,
+        );
+    }
+
+    // Auto-fail (R1): an effect of this rule at terminal `failed`/`timed_out`
+    // whose failure no `after` block in the selected body observes can never
+    // progress this rule again — without a net the instance sits `running`
+    // forever. Self-terminating workflows route to the generic internal-fail
+    // terminal; `@service` workflows record a durable diagnostic instead and
+    // keep running (handled in rule_pass). `cancelled` is exempt (effect-level
+    // cancel is deliberate — the watchdog pattern depends on it), and the
+    // effect ROW status is consulted (not the derived facts) so a retried
+    // effect's stale `.failed` fact never re-fires the net. A terminal produced
+    // this pass wins over the net: the author's typed outcome is the real one.
+    if lowering.terminal.is_none() && lowering.internal_fail.is_none() {
+        let service = workflow_is_service(ir);
+        for (binding, effect_id) in &binding_to_effect_id {
+            let Some(effect) = effects.iter().find(|view| view.effect_id == *effect_id) else {
+                continue;
+            };
+            if !matches!(effect.status.as_str(), "failed" | "timed_out") {
+                continue;
+            }
+            if body_observes_effect_failure(&body, binding) {
+                continue;
+            }
+            if service {
+                lowering.unhandled_failures.push(OwnedUnhandledFailure {
+                    rule: rule.name.clone(),
+                    binding: binding.clone(),
+                    effect_id: effect_id.clone(),
+                    status: effect.status.clone(),
+                });
+            } else {
+                // A `then`-chained effect carries a synthetic `__then_<name>`
+                // handle; the reason names the author's binding, not the handle.
+                let named = binding.strip_prefix("__then_").unwrap_or(binding);
+                lowering.internal_fail = Some(format!(
+                    "unhandled failure of `{named}` in rule `{}`",
+                    rule.name
+                ));
+                break;
+            }
+        }
     }
 
     lowering
 }
 
+/// Walks the `after` blocks nested inside an already-fired block, and for each
+/// whose upstream effect has settled, binds the outcome value under BOTH the
+/// effect binding and the block's `as <alias>` name (only the block header
+/// declares the alias, so no flat binding map can supply it), recursing into
+/// settled scopes. Returns the set of settled nested-scope bindings so the
+/// emission loop can defer effects whose own scope has not fired yet.
+fn push_settled_nested_scope_bindings(
+    body: &str,
+    binding_to_effect_id: &std::collections::BTreeMap<String, String>,
+    facts: &[FactView],
+    context: &mut RuleContext,
+) -> std::collections::BTreeSet<String> {
+    let mut settled = std::collections::BTreeSet::new();
+    for nested in after_blocks(body) {
+        let Some(effect_id) = binding_to_effect_id.get(&nested.binding) else {
+            continue;
+        };
+        let Some(value) = effect_binding_value(facts, effect_id, &nested.predicate) else {
+            continue;
+        };
+        push_effect_binding(context, &nested.binding, effect_id, value.clone());
+        if let Some(alias) = &nested.alias {
+            push_effect_binding(context, alias, effect_id, value);
+        }
+        settled.insert(nested.binding.clone());
+        settled.extend(push_settled_nested_scope_bindings(
+            &nested.body,
+            binding_to_effect_id,
+            facts,
+            context,
+        ));
+    }
+    settled
+}
+
+/// Runs the NON-effect actions of after blocks nested inside an already-fired
+/// after body, recursively: terminals (including `case`-selected ones), record
+/// blocks, `cancel`s, and consumed facts. Effects at every depth are admitted
+/// by the level-1 pass (`parse_effect_statements` descends; the store's
+/// dependency gating defers them until their upstream settles), so this
+/// recursion deliberately requests nothing — re-deriving effect ids here would
+/// diverge from the admission keys and double-request.
+#[allow(clippy::too_many_arguments)]
+fn lower_nested_after_blocks(
+    instance_id: &str,
+    ir: &IrProgram,
+    rule: &IrRule,
+    facts: &[FactView],
+    effects: &[EffectView],
+    existing_fact_ids: &[&str],
+    binding_to_effect_id: &std::collections::BTreeMap<String, String>,
+    body: &str,
+    context: &RuleContext,
+    lowering: &mut OwnedLowering,
+) {
+    for after in after_blocks(body) {
+        let Some(upstream_effect_id) = binding_to_effect_id.get(&after.binding) else {
+            continue;
+        };
+        let Some(binding_value) = effect_binding_value(facts, upstream_effect_id, &after.predicate)
+        else {
+            continue;
+        };
+        let mut after_context = context.clone();
+        push_effect_binding(
+            &mut after_context,
+            &after.binding,
+            upstream_effect_id,
+            binding_value.clone(),
+        );
+        if let Some(alias) = &after.alias {
+            push_effect_binding(&mut after_context, alias, upstream_effect_id, binding_value);
+        }
+        for (binding, effect_id) in binding_to_effect_id {
+            if binding == &after.binding {
+                continue;
+            }
+            if let Some(value) = effect_binding_value(facts, effect_id, "succeeds") {
+                push_effect_binding(&mut after_context, binding, effect_id, value);
+            }
+        }
+        let (selected_after_body, mut after_context, branch_reports) =
+            selected_rule_body(&after.body, &after_context);
+        materialize_redactions(&mut after_context, &rule.metadata.redactions);
+        lowering.branch_reports.extend(branch_reports);
+        // Same own-scope discipline as level 1: strip deeper nested blocks
+        // before scanning consumes/cancels.
+        let own_scope_body = strip_after_blocks(&selected_after_body);
+        append_consumed_fact_ids(lowering, &own_scope_body, &after_context, facts);
+        append_workflow_terminal(
+            lowering,
+            ir,
+            rule,
+            &selected_after_body,
+            &after_context,
+            Some((&after.binding, &after.predicate)),
+            facts,
+            effects,
+        );
+        for record in top_level_record_blocks(&selected_after_body) {
+            let value = parse_record_fields_with_from(
+                &record.body,
+                &after_context,
+                record.from_binding.as_deref(),
+                schema_field_names(ir, &record.schema),
+                &mut lowering.errors,
+                facts,
+                effects,
+                ir,
+            );
+            let value_json = Value::Object(value).to_string();
+            let fact_key = record_fact_key(&record.schema, &value_json);
+            let fact_id = idempotency_key(&[
+                instance_id,
+                &rule.name,
+                &after.binding,
+                &after.predicate,
+                &record.schema,
+                &fact_key,
+                &value_json,
+            ]);
+            if existing_fact_ids
+                .iter()
+                .any(|existing| *existing == fact_id)
+                || lowering.facts.iter().any(|fact| fact.fact_id == fact_id)
+            {
+                continue;
+            }
+            lowering.facts.push(OwnedFact {
+                fact_id,
+                name: record.schema.clone(),
+                key: fact_key,
+                value_json,
+                schema_id: Some(record.schema),
+                provenance_class: "rule".to_owned(),
+                correlation_id: after_context.identity.clone(),
+                source_span_json: None,
+            });
+        }
+        for binding in cancel_statements(&own_scope_body) {
+            if let Some(effect_id) = binding_to_effect_id.get(&binding) {
+                lowering.cancels.push(effect_id.clone());
+            }
+        }
+        lower_nested_after_blocks(
+            instance_id,
+            ir,
+            rule,
+            facts,
+            effects,
+            existing_fact_ids,
+            binding_to_effect_id,
+            &selected_after_body,
+            &after_context,
+            lowering,
+        );
+    }
+}
+
+/// Whether the program's workflow is tagged `@service` (a workflow that
+/// intentionally runs forever). A service can never auto-fail on an unhandled
+/// effect failure — it records a durable diagnostic instead.
+pub fn workflow_is_service(ir: &IrProgram) -> bool {
+    ir.source_tags
+        .iter()
+        .any(|tag| tag.target_kind == "workflow" && tag.name == "service")
+}
+
+/// Auto-fail (R1) observer scan: whether `body` contains an `after <binding>
+/// fails` / `times out` / `completes` block at any depth. Any of the three
+/// counts as an observer of the binding's failure, so the net stays out;
+/// `succeeds`-only handling leaves the failure unhandled. The scan is textual
+/// (headers only) on the selected body, matching how `after_blocks` parses.
+pub fn body_observes_effect_failure(body: &str, binding: &str) -> bool {
+    body.lines().any(|line| {
+        let Some(rest) = line.trim().strip_prefix("after ") else {
+            return false;
+        };
+        let mut parts = rest.split_whitespace();
+        if parts.next() != Some(binding) {
+            return false;
+        }
+        // `times` only occurs as the two-token predicate `times out`.
+        matches!(
+            parts.next().map(|token| token.trim_end_matches('{')),
+            Some("fails" | "times" | "completes")
+        )
+    })
+}
+
 pub fn effect_node_for_parsed<'a>(
     rule: &'a IrRule,
-    parsed: &ParsedEffect,
+    parsed_effects: &[ParsedEffect],
     index: usize,
 ) -> Option<&'a IrEffectNode> {
-    parsed
-        .binding
-        .as_ref()
-        .and_then(|binding| {
-            rule.metadata
-                .effects
-                .iter()
-                .find(|effect| effect.binding.as_ref() == Some(binding))
-        })
-        .or_else(|| rule.metadata.effects.get(index))
+    let parsed = parsed_effects.get(index)?;
+    if let Some(binding) = parsed.binding.as_ref() {
+        if let Some(node) = rule
+            .metadata
+            .effects
+            .iter()
+            .find(|effect| effect.binding.as_ref() == Some(binding))
+        {
+            return Some(node);
+        }
+    }
+    // Bindingless effects (`finish issue`, `release slot`, ...) cannot be
+    // matched by binding, and a positional `metadata.effects.get(index)`
+    // fallback is wrong whenever the pass parsed a SUBSET of the rule's
+    // effects (the per-after-block passes do): the subset-local index then
+    // lands on an arbitrary global node — in the worst case one whose effect
+    // id this pass already emitted, silently dropping the effect. Match by
+    // kind + occurrence instead: the k-th bindingless parsed effect of a kind
+    // maps to the k-th bindingless metadata node of that kind.
+    let occurrence = parsed_effects[..index]
+        .iter()
+        .filter(|earlier| earlier.binding.is_none() && earlier.kind == parsed.kind)
+        .count();
+    let mut seen = 0;
+    for node in &rule.metadata.effects {
+        if node.binding.is_none() && node.kind.as_str() == parsed.kind {
+            if seen == occurrence {
+                return Some(node);
+            }
+            seen += 1;
+        }
+    }
+    rule.metadata.effects.get(index)
 }
 
 pub fn push_effect_binding(
@@ -1467,6 +2023,7 @@ pub fn push_effect_binding(
             value_json: value.to_string(),
             provenance_class: "effect".to_owned(),
             source_span_json: None,
+            source_event_id: String::new(),
         },
     ));
 }
@@ -1559,9 +2116,11 @@ pub fn consume_statements(body: &str) -> Vec<String> {
     body.lines()
         .filter_map(|line| {
             let line = line.trim().trim_end_matches(';');
+            // `done <binding>` consumes the matched fact. (The bare `consume`
+            // alias was removed; `consume <counter> for ...` is a distinct
+            // counter verb and is not an identifier here, so it never matches.)
             let binding = line
-                .strip_prefix("consume ")
-                .or_else(|| line.strip_prefix("done "))?
+                .strip_prefix("done ")?
                 .split("->")
                 .next()
                 .unwrap_or_default()
@@ -1592,15 +2151,11 @@ pub fn selected_rule_body(
     while index < lines.len() {
         let trimmed = lines[index].trim();
         if trimmed.starts_with("after ") {
-            let mut depth = brace_delta(trimmed).max(1);
-            selected.push(lines[index].to_owned());
-            index += 1;
-            while index < lines.len() && depth > 0 {
-                let line = lines[index];
-                depth += brace_delta(line);
-                selected.push(line.to_owned());
-                index += 1;
+            let end = skip_block(&lines, index);
+            for line in &lines[index..end] {
+                selected.push((*line).to_owned());
             }
+            index = end;
             continue;
         }
         if !trimmed.starts_with("case ") {
@@ -1636,12 +2191,7 @@ pub fn strip_after_blocks(body: &str) -> String {
     while index < lines.len() {
         let trimmed = lines[index].trim();
         if trimmed.starts_with("after ") {
-            let mut depth = brace_delta(trimmed).max(1);
-            index += 1;
-            while index < lines.len() && depth > 0 {
-                depth += brace_delta(lines[index]);
-                index += 1;
-            }
+            index = skip_block(&lines, index);
             continue;
         }
         selected.push(lines[index].to_owned());
@@ -1682,34 +2232,53 @@ pub fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usiz
     let mut case_depth = brace_delta(header).max(1);
     while index < lines.len() && case_depth > 0 {
         let trimmed = lines[index].trim();
-        if let Some((pattern, guard, before_body)) = case_branch_header(trimmed) {
-            // `before_body` is the `=>` right-hand side, always starting with
-            // `{`. A SINGLE-LINE branch (`pat => { complete ... }`) carries its
-            // whole body here and its braces balance on this line; a multi-line
-            // branch has just `{` with the body on the following lines. The old
-            // logic forced depth to >= 1 and only collected following lines, so
-            // a single-line branch's inline body was silently dropped and the
-            // branch never materialized at runtime (a check/runtime divergence
-            // that `whip fmt` did not fix, since fmt leaves branches single-line).
+        if let Some((pattern, guard, rhs)) = split_case_head(trimmed) {
+            // A branch header is `pattern [where guard] => ...`. The body's
+            // opening `{` may sit on THIS line (`=> { ... }`) or on the NEXT
+            // line (`=>` then `{`). The token parser is whitespace-insensitive
+            // and accepts both, so the line scanner must too — otherwise a whole
+            // branch is silently dropped at runtime (a check/runtime divergence,
+            // same class as the single-line-branch bug). `header_lines` counts
+            // the header line plus a separate `{` line if the brace is not inline.
+            let (inline, header_lines) = if let Some(rest) = rhs.strip_prefix('{') {
+                (rest.to_owned(), 1usize)
+            } else if rhs.is_empty() {
+                let mut j = index + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                match lines.get(j).map(|line| line.trim()) {
+                    Some(next) if next.starts_with('{') => (next[1..].to_owned(), j - index + 1),
+                    _ => {
+                        case_depth += brace_delta(trimmed);
+                        index += 1;
+                        continue;
+                    }
+                }
+            } else {
+                // `=>` present but the RHS is not a `{ ... }` body.
+                case_depth += brace_delta(trimmed);
+                index += 1;
+                continue;
+            };
             let mut body = Vec::new();
-            let inline = before_body.strip_prefix('{').unwrap_or(before_body);
-            let mut branch_depth = 1 + brace_delta(inline);
+            let mut branch_depth = 1 + brace_delta(&inline);
             if branch_depth <= 0 {
-                // Single-line branch: the body is the inline text minus its
-                // closing `}`.
-                let inline_body = inline.trim().strip_suffix('}').unwrap_or(inline).trim();
+                // Single-line branch: body is the inline text minus its `}`.
+                let inline_trim = inline.trim();
+                let inline_body = inline_trim.strip_suffix('}').unwrap_or(inline_trim).trim();
                 if !inline_body.is_empty() {
                     body.push(inline_body.to_owned());
                 }
-                index += 1;
+                index += header_lines;
             } else {
-                // Multi-line branch: keep any inline lead, then collect the
-                // following lines until the branch's braces close.
+                // Multi-line branch: keep any inline lead, then collect following
+                // lines until the branch's braces close.
                 let inline_body = inline.trim();
                 if !inline_body.is_empty() {
                     body.push(inline_body.to_owned());
                 }
-                index += 1;
+                index += header_lines;
                 while index < lines.len() && branch_depth > 0 {
                     let line = lines[index];
                     let next_depth = branch_depth + brace_delta(line);
@@ -1739,18 +2308,44 @@ pub fn parse_case_block(lines: &[&str], start: usize) -> Option<(CaseBlock, usiz
     ))
 }
 
-pub fn case_branch_header(line: &str) -> Option<(String, Option<String>, &str)> {
-    let (head, body_start) = line.split_once("=>")?;
-    let body_start = body_start.trim();
-    if !body_start.starts_with('{') {
+/// Split a case-branch header line into (pattern, optional guard, `=>` RHS).
+/// The RHS is returned trimmed and may be `{ ... }`, a bare `{`, or "" (when the
+/// opening brace is on the next line) — the caller resolves where the body opens.
+/// Position of `needle` in `haystack` OUTSIDE any string literal — a guard
+/// like `where f.msg == "a => b"` must not split at the quoted arrow.
+fn find_outside_strings(haystack: &str, needle: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'"' {
+            in_string = !in_string;
+            index += 1;
+            continue;
+        }
+        if !in_string && haystack[index..].starts_with(needle) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+pub fn split_case_head(line: &str) -> Option<(String, Option<String>, String)> {
+    let arrow = find_outside_strings(line, "=>")?;
+    let head = line[..arrow].trim();
+    let rhs = &line[arrow + 2..];
+    if head.is_empty() {
         return None;
     }
-    let head = head.trim();
-    let (pattern, guard) = match head.split_once(" where ") {
-        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim().to_owned())),
-        None => (head, None),
+    let (pattern, guard) = match find_outside_strings(head, " where ") {
+        Some(at) => (
+            head[..at].trim().to_owned(),
+            Some(head[at + " where ".len()..].trim().to_owned()),
+        ),
+        None => (head.to_owned(), None),
     };
-    Some((pattern.to_owned(), guard, body_start))
+    Some((pattern, guard, rhs.trim().to_owned()))
 }
 
 pub fn select_case_branch(case: &CaseBlock, context: &mut RuleContext) -> CaseSelection {
@@ -1855,6 +2450,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                     value_json: payload.to_string(),
                     provenance_class: "case".to_owned(),
                     source_span_json: None,
+                    source_event_id: String::new(),
                 },
             ));
         }
@@ -1878,6 +2474,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                 value_json: value.to_string(),
                 provenance_class: "case".to_owned(),
                 source_span_json: None,
+                source_event_id: String::new(),
             },
         ));
         return true;
@@ -1908,6 +2505,7 @@ pub fn case_pattern_matches(pattern: &str, value: &Value, context: &mut RuleCont
                     value_json: value.to_string(),
                     provenance_class: "case".to_owned(),
                     source_span_json: None,
+                    source_event_id: String::new(),
                 },
             ));
         }
@@ -1974,6 +2572,8 @@ pub fn append_workflow_terminal(
     body: &str,
     context: &RuleContext,
     after: Option<(&str, &str)>,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
 ) {
     if lowering.terminal.is_some() {
         return;
@@ -1987,14 +2587,50 @@ pub fn append_workflow_terminal(
     let payload = if let Some(scalar_source) = &terminal.scalar {
         // A bare scalar payload: evaluate the value expression to a JSON scalar
         // (a literal, or a binding path resolved against the rule context).
-        parse_record_field_value("", scalar_source, context, None, &mut lowering.errors)
-    } else {
-        Value::Object(parse_record_fields(
-            &terminal.body,
+        parse_record_field_value(
+            "",
+            scalar_source,
             context,
-            terminal.from.as_deref(),
+            None,
             &mut lowering.errors,
-        ))
+            live_facts,
+            live_effects,
+            ir,
+        )
+    } else {
+        {
+            // `complete <name> from <b>`: the projection target is the declared
+            // workflow-contract payload type.
+            let wanted = match terminal.kind {
+                WorkflowTerminalKind::Completed => {
+                    whipplescript_parser::IrWorkflowContractKind::Output
+                }
+                WorkflowTerminalKind::Failed => {
+                    whipplescript_parser::IrWorkflowContractKind::Failure
+                }
+            };
+            let contract_fields = ir
+                .workflow_contracts
+                .iter()
+                .find(|contract| contract.kind == wanted && contract.name == terminal.name)
+                .and_then(|contract| match &contract.ty {
+                    IrType::Ref(name) => schema_field_names(ir, name),
+                    IrType::Object(fields) => {
+                        Some(fields.iter().map(|field| field.name.clone()).collect())
+                    }
+                    _ => None,
+                });
+            Value::Object(parse_record_fields_with_from(
+                &terminal.body,
+                context,
+                terminal.from.as_deref(),
+                contract_fields,
+                &mut lowering.errors,
+                live_facts,
+                live_effects,
+                ir,
+            ))
+        }
     };
     let payload_json = payload.to_string();
     let mut key_parts = vec![
@@ -2069,6 +2705,12 @@ pub struct ParsedEffect {
     pub args: Vec<String>,
     pub prompt: Option<String>,
     pub prompt_content_type: Option<String>,
+    /// The DECLARED prompt template source, before interpolation — only for
+    /// the inline `decide`/`prompt` schema.coerce forms (named `coerce`
+    /// functions keep their template in `IrProgram::coerces`). The admission
+    /// key commits to the template, never the interpolated text (DR-0014
+    /// amendment): inputs are already keyed by the firing identity.
+    pub prompt_template: Option<String>,
     pub required_capabilities: Vec<String>,
     pub after: Option<AfterScope>,
     pub timeout_seconds: Option<i64>,
@@ -2078,7 +2720,6 @@ impl ParsedEffect {
     pub fn required_capabilities_json(&self) -> String {
         let mut capabilities = match self.kind.as_str() {
             "schema.coerce" => vec!["schema.coerce".to_owned()],
-            "human.ask" => vec!["human.ask".to_owned()],
             "capability.call" => Vec::new(),
             "event.emit" => vec!["event.emit".to_owned()],
             "workflow.invoke" => vec!["workflow.invoke".to_owned()],
@@ -2140,33 +2781,83 @@ pub fn coordination_key_string(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-/// `release <x>` is queue-or-lease by referent: a binding acquired in this
-/// rule body is a lease release (spec/coordination.md); anything else stays
-/// the queue verb.
-pub fn rewrite_lease_releases(effects: &mut [ParsedEffect], rule_body: &str) {
-    let acquires = rule_body
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .starts_with("acquire ")
-                .then(|| binding_after_as(trimmed))
-                .flatten()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
+/// `release <x>` is queue-or-lease by referent: a binding bound by a
+/// `lease.acquire` effect visible to this release is a lease release
+/// (spec/coordination.md); anything else stays the queue verb. Resolution is
+/// binding-typed over the PARSED effects (std.coord slice 5), never a raw
+/// body-line scan — so an `acquire … as <b>` line inside a record block or
+/// prompt text can no longer forge a lease referent, and a release of a
+/// work-item binding stays `tracker.release`.
+pub fn rewrite_lease_releases(
+    effects: &mut [ParsedEffect],
+    acquire_bindings: &std::collections::BTreeSet<String>,
+) {
     for effect in effects {
         if effect.kind == "tracker.release"
             && effect
                 .args
                 .first()
-                .is_some_and(|binding| acquires.contains(binding))
+                .is_some_and(|binding| acquire_bindings.contains(binding))
         {
             effect.kind = "lease.release".to_owned();
         }
     }
 }
 
-pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedEffect> {
+/// The lease-acquire result bindings among `effects` — the referent set
+/// `rewrite_lease_releases` resolves against. The pre-terminal and after-block
+/// lowerings parse separately, so the caller computes this from the
+/// PRE-TERMINAL parse and threads it to both rewrite sites (an after-block
+/// release must still see main-body acquires), unioning each after block's own
+/// acquires for its site.
+pub fn lease_acquire_bindings(effects: &[ParsedEffect]) -> std::collections::BTreeSet<String> {
+    effects
+        .iter()
+        .filter(|effect| effect.kind == "lease.acquire")
+        .filter_map(|effect| effect.binding.clone())
+        .collect()
+}
+
+/// `renew <x>` is claim-or-lease by referent, mirroring `rewrite_lease_releases`
+/// (T3): the parser lowers every `renew` to the coord `lease.renew`; a renew
+/// whose binding names a `claim ... as <x>` CLAIM binding is a tracker
+/// claim-renew and flips to `tracker.renew`, resolving the claimed issue id from
+/// the claim's output fact. A renew naming an acquire stays `lease.renew`.
+/// Binding-typed over the PARSED effects, never a raw body scan.
+pub fn rewrite_claim_renews(
+    effects: &mut [ParsedEffect],
+    claim_bindings: &std::collections::BTreeSet<String>,
+) {
+    for effect in effects {
+        if effect.kind == "lease.renew"
+            && effect
+                .args
+                .first()
+                .is_some_and(|binding| claim_bindings.contains(binding))
+        {
+            effect.kind = "tracker.renew".to_owned();
+        }
+    }
+}
+
+/// The claim result bindings among `effects` — the referent set
+/// `rewrite_claim_renews` resolves against (the `as` binding of a `claim`,
+/// whose output fact carries the issue id). Threaded like `lease_acquire_bindings`.
+pub fn claim_item_bindings(effects: &[ParsedEffect]) -> std::collections::BTreeSet<String> {
+    effects
+        .iter()
+        .filter(|effect| effect.kind == "tracker.claim")
+        .filter_map(|effect| effect.binding.clone())
+        .collect()
+}
+
+pub fn parse_effect_statements(
+    body: &str,
+    context: &RuleContext,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> Vec<ParsedEffect> {
     let mut effects = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
@@ -2192,6 +2883,18 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
             index = next_index + 1;
             continue;
         }
+        // Turn-access grant blocks are tell METADATA, not statements: even
+        // when a tell arm leaves one unconsumed, its read/write lines must
+        // never become file effects.
+        if trimmed.starts_with("with access to ") {
+            let (_, next_index) = parse_statement_until_balanced_braces(&lines, index, trimmed);
+            index = next_index + 1;
+            continue;
+        }
+        if trimmed.starts_with("with skills ") {
+            index += 1;
+            continue;
+        }
         let current_after = after_scopes.last().map(|scope| scope.scope.clone());
         if let Some(rest) = trimmed.strip_prefix("invoke ") {
             let (statement, next_index) =
@@ -2212,6 +2915,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2240,6 +2944,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, store, path],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 // v0: the `file store` declaration's `root` is the scope boundary;
                 // a `files.read` capability-grant layer is a documented follow-up
                 // (spec/std-library/files.md). Requiring it here without a grantor
@@ -2300,6 +3005,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![channel, text_expr, markdown_expr, thread_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -2360,6 +3066,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, store, path, body_expr, mode],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 // v0: the `file store` `root` is the scope boundary (mirrors
                 // `read`); a `files.write` capability-grant layer is a follow-up.
                 required_capabilities: Vec::new(),
@@ -2394,6 +3101,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, schema, store, path],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2452,6 +3160,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![format, schema, store, path, predicate, mode],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2466,10 +3175,11 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .trim()
                 .trim_matches('"')
                 .to_owned();
-            let deadline = parse_field_value(&operand, context)
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or(operand);
+            let deadline =
+                parse_field_value_scoped(&operand, context, live_facts, live_effects, live_ir)
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or(operand);
             effects.push(ParsedEffect {
                 timeout_seconds: None,
                 kind: "timer.wait".to_owned(),
@@ -2479,6 +3189,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![deadline],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2496,6 +3207,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![duration.to_owned()],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2518,27 +3230,38 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
             index = next_index;
         } else if trimmed.starts_with("claim ") && !trimmed.contains(" with ") {
-            let item = trimmed
-                .strip_prefix("claim ")
-                .unwrap_or_default()
+            let rest = trimmed.strip_prefix("claim ").unwrap_or_default();
+            let item = rest
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
+            // `ttl <duration>` clause (T3): the claim-TTL in seconds, carried on
+            // args[1] so the input builder can emit `ttl_seconds`.
+            let ttl_seconds = rest
+                .split(" as ")
+                .next()
+                .unwrap_or_default()
+                .split_once(" ttl ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(whipplescript_parser::body::parse_short_duration_seconds)
+                .map(|seconds| seconds.to_string());
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "tracker.claim".to_owned(),
                 target: None,
                 name: None,
                 binding: binding_after_as(trimmed),
-                args: vec![item],
+                args: vec![item, ttl_seconds.unwrap_or_default()],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2557,6 +3280,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![item],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2589,6 +3313,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 ],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2613,6 +3338,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![item, body],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2639,6 +3365,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![shape],
                 prompt: Some(interpolate_prompt(&prompt, context)),
                 prompt_content_type: None,
+                prompt_template: Some(prompt.clone()),
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2706,11 +3433,12 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args,
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
         } else if let Some(rest) = trimmed.strip_prefix("emit signal ") {
-            // emit signal <name> to <instance-expr> { payload }
+            // emit signal <name> to <instance-expr> [from <binding>] { payload }
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
             let event = statement
@@ -2721,15 +3449,28 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 .unwrap_or_default()
                 .trim()
                 .to_owned();
-            let target_expr = rest
+            let after_to = rest
                 .split_once(" to ")
                 .map(|(_, tail)| tail)
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let target_expr = after_to
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
                 .trim_end_matches('{')
                 .to_owned();
+            // S6: `from <binding>` projection — the header words after the
+            // target, before the block.
+            let mut header_words = after_to
+                .split('{')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .skip(1);
+            let from_binding = match (header_words.next(), header_words.next()) {
+                (Some("from"), Some(binding)) if is_identifier(binding) => binding.to_owned(),
+                _ => String::new(),
+            };
             let fields = statement
                 .split_once('{')
                 .and_then(|(_, tail)| tail.rsplit_once('}'))
@@ -2741,9 +3482,10 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 target: None,
                 name: Some(event.clone()),
                 binding: binding_after_as(&statement),
-                args: vec![target_expr, event, fields],
+                args: vec![target_expr, event, fields, from_binding],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2795,6 +3537,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 ],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2830,6 +3573,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![schema, fields],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2872,12 +3616,47 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![key_expr, amount_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
         } else if let Some(rest) = trimmed.strip_prefix("tell ") {
             let target_expr = rest.split_whitespace().next().unwrap_or("agent");
-            let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
+            // A multi-line tell may carry modifier lines between its header and
+            // its prompt — `with access to <res> { … }` grant blocks, `with
+            // skills […]`, `requires […]`, `timeout …`. Walk past them to the
+            // prompt opener, so the prompt is captured AND the grant block's
+            // `read [...]`/`write [...]` lines are never re-scanned as file
+            // effects (they minted phantom bindingless file.read/file.write
+            // effects that failed at runtime).
+            let mut prompt_index = index;
+            let mut prompt_trimmed = trimmed;
+            if !trimmed.contains('"') {
+                let mut cursor = index + 1;
+                while cursor < lines.len() {
+                    let candidate = lines[cursor].trim();
+                    if candidate.starts_with("with access to ") {
+                        let (_, next) =
+                            parse_statement_until_balanced_braces(&lines, cursor, candidate);
+                        cursor = next + 1;
+                        continue;
+                    }
+                    if candidate.starts_with("with skills ")
+                        || candidate.starts_with("requires ")
+                        || candidate.starts_with("timeout ")
+                    {
+                        cursor += 1;
+                        continue;
+                    }
+                    if candidate.starts_with('"') {
+                        prompt_index = cursor;
+                        prompt_trimmed = candidate;
+                    }
+                    break;
+                }
+            }
+            let (prompt, next_index) =
+                parse_prompt_from_lines(&lines, prompt_index, prompt_trimmed);
             effects.push(ParsedEffect {
                 timeout_seconds: parse_timeout_clause_seconds(trimmed),
                 kind: "agent.tell".to_owned(),
@@ -2887,6 +3666,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: Some(interpolate_prompt(&prompt.text, context)),
                 prompt_content_type: prompt.content_type,
+                prompt_template: None,
                 required_capabilities: parse_required_capabilities(trimmed),
                 after: current_after,
             });
@@ -2912,6 +3692,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                     args: Vec::new(),
                     prompt: Some(interpolate_prompt(&prompt.text, context)),
                     prompt_content_type: prompt.content_type,
+                    prompt_template: Some(prompt.text.clone()),
                     required_capabilities: parse_required_capabilities(&statement),
                     after: current_after,
                 });
@@ -2937,39 +3718,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args,
                 prompt: None,
                 prompt_content_type: None,
-                required_capabilities: Vec::new(),
-                after: current_after,
-            });
-            index = next_index;
-        } else if trimmed.starts_with("askHuman ") {
-            let (prompt, next_index) = parse_prompt_from_lines(&lines, index, trimmed);
-            // Typed choices declared in source drive the inbox options.
-            let choices = trimmed
-                .split_once("choices ")
-                .and_then(|(_, tail)| tail.split_once('['))
-                .and_then(|(_, tail)| tail.split_once(']'))
-                .map(|(inner, _)| {
-                    inner
-                        .split(',')
-                        .filter_map(|value| {
-                            value
-                                .trim()
-                                .strip_prefix('"')
-                                .and_then(|v| v.strip_suffix('"'))
-                        })
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            effects.push(ParsedEffect {
-                timeout_seconds: parse_timeout_clause_seconds(trimmed),
-                kind: "human.ask".to_owned(),
-                target: Some("human".to_owned()),
-                name: Some("askHuman".to_owned()),
-                binding: binding_after_as(trimmed),
-                args: choices,
-                prompt: Some(interpolate_prompt(&prompt.text, context)),
-                prompt_content_type: prompt.content_type,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -2985,6 +3734,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![pool, query],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3028,6 +3778,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![source_expr, pool, note_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3069,6 +3820,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: vec![pool, reason_expr],
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
@@ -3088,10 +3840,26 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: vec![target],
                 after: current_after,
             });
         } else if let Some(rest) = trimmed.strip_prefix("emit ") {
+            // `emit milestone "<name>" [of Class] { … }` is Family C -- a
+            // SYNCHRONOUS fact projection handled by `milestone_blocks`, not
+            // an effect. Parsing it here minted a bogus `event.emit` whose
+            // positional node fallback collided with the rule's REAL effect
+            // (same node id, double insert, UNIQUE crash). Skip the whole
+            // statement, block included.
+            if rest.trim_start().starts_with("milestone") {
+                let (_, next_index) = if trimmed.contains('{') {
+                    parse_statement_until_balanced_braces(&lines, index, trimmed)
+                } else {
+                    (trimmed.to_owned(), index)
+                };
+                index = next_index + 1;
+                continue;
+            }
             let event_type = rest
                 .split_whitespace()
                 .next()
@@ -3106,6 +3874,7 @@ pub fn parse_effect_statements(body: &str, context: &RuleContext) -> Vec<ParsedE
                 args: Vec::new(),
                 prompt: None,
                 prompt_content_type: None,
+                prompt_template: None,
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
@@ -3206,7 +3975,10 @@ pub fn parsed_effect_input_json(
     context: &RuleContext,
     effect_bindings: &std::collections::BTreeMap<String, String>,
     errors: &mut Vec<String>,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
 ) -> String {
+    let live_ir = ir;
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
@@ -3267,7 +4039,8 @@ pub fn parsed_effect_input_json(
             // already in `context`, so `r.field` evaluates here (no worker-time
             // resolution needed). A string value is the content; anything else is
             // rendered as its JSON text.
-            let body_value = parse_field_value(&body_expr, context);
+            let body_value =
+                parse_field_value_scoped(&body_expr, context, live_facts, live_effects, live_ir);
             let body = match &body_value {
                 Value::String(text) => text.clone(),
                 other => other.to_string(),
@@ -3431,7 +4204,10 @@ pub fn parsed_effect_input_json(
             };
             let mut arguments = serde_json::Map::new();
             for (index, arg) in effect.args.iter().enumerate() {
-                arguments.insert(format!("arg{index}"), parse_field_value(arg, context));
+                arguments.insert(
+                    format!("arg{index}"),
+                    parse_field_value_scoped(arg, context, live_facts, live_effects, live_ir),
+                );
             }
             let mut input = json!({
                 "function_name": function_name,
@@ -3500,19 +4276,6 @@ pub fn parsed_effect_input_json(
             }
             input
         }
-        "human.ask" => {
-            let choices = if effect.args.is_empty() {
-                json!(["accept", "revise", "block"])
-            } else {
-                json!(effect.args)
-            };
-            json!({
-                "prompt": effect.prompt.as_deref().unwrap_or_default(),
-                "choices": choices,
-                "severity": "normal",
-                "rule": rule.name,
-            })
-        }
         "tracker.file" => {
             let fields = parse_record_fields(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
@@ -3526,14 +4289,27 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
-        "tracker.claim" | "tracker.release" | "tracker.finish" => {
+        "tracker.claim" | "tracker.renew" | "tracker.release" | "tracker.finish" => {
             let binding = effect.args.first().map(String::as_str).unwrap_or_default();
-            let item = parse_field_value(binding, context);
+            let item =
+                parse_field_value_scoped(binding, context, live_facts, live_effects, live_ir);
             let mut input = json!({
                 "queue": item.get("queue").cloned().unwrap_or(Value::Null),
                 "id": item.get("id").cloned().unwrap_or(Value::Null),
                 "rule": rule.name,
             });
+            if effect.kind == "tracker.claim" {
+                // The `ttl <duration>` clause (T3), carried on args[1] as
+                // seconds; the handler computes `expires_at = now + ttl`.
+                if let Some(ttl_seconds) = effect
+                    .args
+                    .get(1)
+                    .filter(|arg| !arg.is_empty())
+                    .and_then(|arg| arg.parse::<i64>().ok())
+                {
+                    insert_json_field(&mut input, "ttl_seconds", json!(ttl_seconds));
+                }
+            }
             if effect.kind == "tracker.finish" {
                 let fields = parse_record_fields(
                     effect.args.get(1).map(String::as_str).unwrap_or_default(),
@@ -3551,15 +4327,37 @@ pub fn parsed_effect_input_json(
             if event.is_none() {
                 errors.push(format!("emit signal of undeclared signal `{event_name}`"));
             }
-            let target = parse_field_value(
+            let target = parse_field_value_scoped(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
+                live_facts,
+                live_effects,
+                live_ir,
             );
-            let payload = Value::Object(parse_record_fields(
+            // S6 `from` projection: copy the source binding's fields bounded
+            // to the signal's declared field set, block fields overriding —
+            // the `record … from` semantics applied to emit.
+            let from_binding = effect
+                .args
+                .get(3)
+                .map(String::as_str)
+                .filter(|binding| !binding.is_empty());
+            let signal_field_names = event.map(|event| {
+                event
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect()
+            });
+            let payload = Value::Object(parse_record_fields_with_from(
                 effect.args.get(2).map(String::as_str).unwrap_or_default(),
                 context,
-                None,
+                from_binding,
+                signal_field_names,
                 errors,
+                live_facts,
+                live_effects,
+                ir,
             ));
             let shape = event
                 .map(|event| ingest_shape_json(ir, &IrType::Object(event.fields.clone()), 0))
@@ -3583,9 +4381,12 @@ pub fn parsed_effect_input_json(
                     effect.target.as_deref().unwrap_or_default()
                 ));
             }
-            let key = parse_field_value(
+            let key = parse_field_value_scoped(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
+                live_facts,
+                live_effects,
+                live_ir,
             );
             json!({
                 "resource": effect.target,
@@ -3655,13 +4456,19 @@ pub fn parsed_effect_input_json(
                     effect.target.as_deref().unwrap_or_default()
                 ));
             }
-            let key = parse_field_value(
+            let key = parse_field_value_scoped(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
+                live_facts,
+                live_effects,
+                live_ir,
             );
-            let amount = parse_field_value(
+            let amount = parse_field_value_scoped(
                 effect.args.get(1).map(String::as_str).unwrap_or_default(),
                 context,
+                live_facts,
+                live_effects,
+                live_ir,
             );
             json!({
                 "counter": effect.target,
@@ -3670,6 +4477,9 @@ pub fn parsed_effect_input_json(
                 "amount": amount.as_i64().unwrap_or(0),
                 "cap": counter.map(|counter| counter.cap).unwrap_or(0),
                 "reset": counter.map(|counter| counter.reset.clone()).unwrap_or_else(|| "daily".to_owned()),
+                "timezone": counter
+                    .and_then(|counter| counter.timezone.clone())
+                    .unwrap_or_else(|| "UTC".to_owned()),
                 "rule": rule.name,
             })
         }
@@ -3679,7 +4489,7 @@ pub fn parsed_effect_input_json(
                 json!({
                     "mode": "capability",
                     "capability": effect.target,
-                    "stdin": parse_field_value(stdin_expr, context),
+                    "stdin": parse_field_value_scoped(stdin_expr, context, live_facts, live_effects, live_ir),
                     "stdin_binding": stdin_expr,
                     "rule": rule.name,
                 })
@@ -3724,7 +4534,7 @@ pub fn parsed_effect_input_json(
                 "target": effect.target,
                 "source_form": "recall",
                 "pool": pool,
-                "query": parse_field_value(&query_expr, context),
+                "query": parse_field_value_scoped(&query_expr, context, live_facts, live_effects, live_ir),
                 "query_expr": query_expr,
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
@@ -3740,11 +4550,20 @@ pub fn parsed_effect_input_json(
             input.insert("pool".to_owned(), json!(pool));
             input.insert(
                 "source".to_owned(),
-                parse_field_value(&source_expr, context),
+                parse_field_value_scoped(&source_expr, context, live_facts, live_effects, live_ir),
             );
             input.insert("source_expr".to_owned(), json!(source_expr));
             if !note_expr.is_empty() {
-                input.insert("note".to_owned(), parse_field_value(&note_expr, context));
+                input.insert(
+                    "note".to_owned(),
+                    parse_field_value_scoped(
+                        &note_expr,
+                        context,
+                        live_facts,
+                        live_effects,
+                        live_ir,
+                    ),
+                );
             }
             input.insert("bindings".to_owned(), context_bindings_json(context));
             input.insert("rule".to_owned(), json!(rule.name));
@@ -3760,7 +4579,13 @@ pub fn parsed_effect_input_json(
             if !reason_expr.is_empty() {
                 input.insert(
                     "reason".to_owned(),
-                    parse_field_value(&reason_expr, context),
+                    parse_field_value_scoped(
+                        &reason_expr,
+                        context,
+                        live_facts,
+                        live_effects,
+                        live_ir,
+                    ),
                 );
             }
             input.insert("bindings".to_owned(), context_bindings_json(context));
@@ -3778,19 +4603,41 @@ pub fn parsed_effect_input_json(
             // without new plumbing. If the channel isn't declared in the IR, omit.
             if let Some(decl) = ir.channels.iter().find(|c| c.name == channel) {
                 message.insert("provider".to_owned(), Value::String(decl.provider.clone()));
+                // The channel's fixed destination rides along so the provider
+                // can echo it in the receipt (spec/std-messaging.md
+                // "MessageSendReceipt": `destination string?`; v1 addressing
+                // is fixed_destination only).
+                if let Some(destination) = &decl.destination {
+                    message.insert("destination".to_owned(), Value::String(destination.clone()));
+                }
             }
             message.insert("channel".to_owned(), Value::String(channel));
-            message.insert("text".to_owned(), parse_field_value(&text_expr, context));
+            message.insert(
+                "text".to_owned(),
+                parse_field_value_scoped(&text_expr, context, live_facts, live_effects, live_ir),
+            );
             if !markdown_expr.is_empty() {
                 message.insert(
                     "markdown".to_owned(),
-                    parse_field_value(&markdown_expr, context),
+                    parse_field_value_scoped(
+                        &markdown_expr,
+                        context,
+                        live_facts,
+                        live_effects,
+                        live_ir,
+                    ),
                 );
             }
             if !thread_expr.is_empty() {
                 message.insert(
                     "thread_id".to_owned(),
-                    parse_field_value(&thread_expr, context),
+                    parse_field_value_scoped(
+                        &thread_expr,
+                        context,
+                        live_facts,
+                        live_effects,
+                        live_ir,
+                    ),
                 );
             }
             json!({
@@ -3841,10 +4688,7 @@ pub fn parsed_effect_input_json(
             }
         }
     }
-    if matches!(
-        effect.kind.as_str(),
-        "agent.tell" | "human.ask" | "schema.coerce"
-    ) {
+    if matches!(effect.kind.as_str(), "agent.tell" | "schema.coerce") {
         if let Some(content_type) = &effect.prompt_content_type {
             if let Some(object) = input.as_object_mut() {
                 object.insert(
@@ -3946,6 +4790,80 @@ pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEff
             .map(|skill| Value::String(skill.clone()))
             .collect(),
     )
+}
+
+/// Admission-time key commitments for a `schema.coerce` effect (DR-0014
+/// amendment; spec/std-coercion.md "Idempotency And Replay"; modeled in
+/// models/maude/effect-key.maude): the effect idempotency key additionally
+/// commits to the coercion name, the DECLARED prompt template source, and
+/// the synthesized output JSON Schema — a changed prompt or schema re-runs
+/// future coercions instead of replaying a stale terminal, while an
+/// unchanged program keeps deduping. Inputs stay out of the key: the firing
+/// identity already keys them, and the run-time execution fingerprint keeps
+/// carrying the normalized-argument hash.
+pub fn schema_coerce_key_commitments(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+) -> [String; 3] {
+    let coercion_name = parsed.name.as_deref().unwrap_or("coerce");
+    let template = match coercion_name {
+        "decide" | "prompt" => parsed.prompt_template.clone().unwrap_or_default(),
+        _ => coerce_prompt_from_ir(ir, coercion_name)
+            .map(|prompt| prompt.text)
+            .unwrap_or_default(),
+    };
+    let output_type = match coercion_name {
+        "decide" => Some(IrType::Ref(
+            whipplescript_parser::inline_decide_schema_name(
+                rule_name,
+                parsed.binding.as_deref().unwrap_or_default(),
+            ),
+        )),
+        "prompt" => Some(IrType::Primitive(IrPrimitiveType::String)),
+        _ => ir
+            .coerces
+            .iter()
+            .find(|coerce| coerce.name == coercion_name)
+            .map(|coerce| coerce.output.clone()),
+    };
+    let output_schema = output_type
+        .map(|ty| {
+            crate::coerce_native::output_schema_envelope(&ty, &ir.schemas)
+                .0
+                .to_string()
+        })
+        .unwrap_or_else(|| "json".to_owned());
+    [
+        format!("coercion={coercion_name}"),
+        format!("prompt_template_hash={}", stable_hash_hex(&template)),
+        format!("output_schema_hash={}", stable_hash_hex(&output_schema)),
+    ]
+}
+
+/// The effect admission key. `schema.coerce` effects fold in the coercion
+/// commitments plus the host-supplied config fingerprint — schema.coerce
+/// keys only, so no other kind ever rekeys on a coerce config change.
+fn effect_admission_key(
+    ir: &IrProgram,
+    rule_name: &str,
+    parsed: &ParsedEffect,
+    effect_id: &str,
+    coercion_config_fingerprint: &str,
+) -> String {
+    if parsed.kind == "schema.coerce" {
+        let [name, template, schema] = schema_coerce_key_commitments(ir, rule_name, parsed);
+        idempotency_key(&[
+            effect_id,
+            "effect",
+            &name,
+            &template,
+            &schema,
+            &format!("coercion_config_fingerprint={coercion_config_fingerprint}"),
+        ])
+    } else {
+        idempotency_key(&[effect_id, "effect"])
+    }
 }
 
 pub fn coerce_prompt_from_ir(ir: &IrProgram, function_name: &str) -> Option<ParsedPrompt> {
@@ -4168,21 +5086,192 @@ pub fn ir_type_name(ty: &IrType) -> String {
     }
 }
 
+/// IR-typed JSON validation (lifted from the CLI for the std.ingress
+/// admission core, spec/std-ingress.md I3: every driver validates payloads
+/// against the DECLARATION, so the validator lives kernel-side; the CLI
+/// re-exports these). Unlike the embedded-shape mirror
+/// (`effect_handlers::validate_ingest_value`), this reads the program IR
+/// directly and carries Family B conditional required-presence.
+pub fn validate_json_for_ir_type(
+    ir: &IrProgram,
+    value: &Value,
+    ty: &IrType,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match ty {
+        IrType::Primitive(primitive) => validate_json_for_primitive(value, primitive, path, errors),
+        IrType::LiteralString(expected) => {
+            if value.as_str() != Some(expected.as_str()) {
+                errors.push(format!("{path} must be literal {expected:?}"));
+            }
+        }
+        IrType::Ref(name) => validate_json_for_ref(ir, value, name, path, errors),
+        IrType::AgentRef(agents) => match value.as_str() {
+            Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
+            Some(_) => errors.push(format!(
+                "{path} must name one of these agents: {}",
+                agents.join(", ")
+            )),
+            None => errors.push(format!("{path} must be an agent name string")),
+        },
+        IrType::Object(fields) => validate_json_for_object(ir, value, fields, path, errors),
+        IrType::Optional(inner) => {
+            if !value.is_null() {
+                validate_json_for_ir_type(ir, value, inner, path, errors);
+            }
+        }
+        IrType::Array(inner) => match value.as_array() {
+            Some(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    validate_json_for_ir_type(ir, item, inner, &format!("{path}[{index}]"), errors);
+                }
+            }
+            None => errors.push(format!("{path} must be an array")),
+        },
+        IrType::Map(inner) => match value.as_object() {
+            Some(map) => {
+                for (key, item) in map {
+                    validate_json_for_ir_type(ir, item, inner, &format!("{path}.{key}"), errors);
+                }
+            }
+            None => errors.push(format!("{path} must be an object map")),
+        },
+        IrType::Union(types) => {
+            if !types
+                .iter()
+                .any(|candidate| json_matches_ir_type(ir, value, candidate))
+            {
+                errors.push(format!(
+                    "{path} must match one of: {}",
+                    types
+                        .iter()
+                        .map(ir_type_name)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+        }
+    }
+}
+
+fn validate_json_for_primitive(
+    value: &Value,
+    primitive: &IrPrimitiveType,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let valid = match primitive {
+        IrPrimitiveType::String
+        | IrPrimitiveType::Duration
+        | IrPrimitiveType::Time
+        | IrPrimitiveType::Image
+        | IrPrimitiveType::Audio
+        | IrPrimitiveType::Pdf
+        | IrPrimitiveType::Video => value.is_string(),
+        IrPrimitiveType::Int => value.as_i64().is_some(),
+        IrPrimitiveType::Float => value.as_f64().is_some(),
+        IrPrimitiveType::Bool => value.is_boolean(),
+        IrPrimitiveType::Null => value.is_null(),
+    };
+    if !valid {
+        errors.push(format!(
+            "{path} must be {}",
+            ir_type_name(&IrType::Primitive(primitive.clone()))
+        ));
+    }
+}
+
+fn validate_json_for_ref(
+    ir: &IrProgram,
+    value: &Value,
+    name: &str,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if let Some(class) = ir.schemas.iter().find_map(|schema| match schema {
+        IrSchema::Class(class) if class.name == name => Some(class),
+        _ => None,
+    }) {
+        validate_json_for_object(ir, value, &class.fields, path, errors);
+        return;
+    }
+    if let Some(enum_decl) = ir.schemas.iter().find_map(|schema| match schema {
+        IrSchema::Enum(enum_decl) if enum_decl.name == name => Some(enum_decl),
+        _ => None,
+    }) {
+        match value.as_str() {
+            Some(variant)
+                if enum_decl
+                    .variants
+                    .iter()
+                    .any(|candidate| candidate == variant) => {}
+            Some(_) => errors.push(format!(
+                "{path} must be one of: {}",
+                enum_decl.variants.join(", ")
+            )),
+            None => errors.push(format!("{path} must be a string enum variant")),
+        }
+        return;
+    }
+    errors.push(format!("{path} references unknown type `{name}`"));
+}
+
+pub fn validate_json_for_object(
+    ir: &IrProgram,
+    value: &Value,
+    fields: &[IrClassField],
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{path} must be an object"));
+        return;
+    };
+    for key in object.keys() {
+        if !fields.iter().any(|field| field.name == *key) {
+            errors.push(format!("{path}.{key} is not declared"));
+        }
+    }
+    for field in fields {
+        let field_path = format!("{path}.{}", field.name);
+        // Family B conditional required-presence (discriminated-families-design.md
+        // §5.7): a `when <disc> is "<lit>"` field is required only when its
+        // discriminant equals the literal. An inapplicable sibling (the discriminant
+        // names a different value) is neither required nor rejected nor validated —
+        // soundness needs only positive presence, and this admits the
+        // all-keys-present webhook shape.
+        if let Some((disc, lit)) = &field.presence_condition {
+            let applicable = object
+                .get(disc)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == lit);
+            if !applicable {
+                continue;
+            }
+        }
+        match object.get(&field.name) {
+            Some(value) => validate_json_for_ir_type(ir, value, &field.ty, &field_path, errors),
+            None if matches!(field.ty, IrType::Optional(_)) => {}
+            None => errors.push(format!("{field_path} is required")),
+        }
+    }
+}
+
+pub fn json_matches_ir_type(ir: &IrProgram, value: &Value, ty: &IrType) -> bool {
+    let mut errors = Vec::new();
+    validate_json_for_ir_type(ir, value, ty, "$", &mut errors);
+    errors.is_empty()
+}
+
 pub fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
-    let mut skip_depth = 0i32;
     while index < lines.len() {
         let trimmed = lines[index].trim();
-        if skip_depth > 0 {
-            skip_depth += brace_delta(trimmed);
-            index += 1;
-            continue;
-        }
         if trimmed.starts_with("after ") {
-            skip_depth += brace_delta(trimmed).max(1);
-            index += 1;
+            index = skip_block(&lines, index);
             continue;
         }
         let record_rest = trimmed.strip_prefix("record ").or_else(|| {
@@ -4208,8 +5297,52 @@ pub fn top_level_record_blocks(body: &str) -> Vec<RecordBlock> {
                 continue;
             }
             let mut record_lines = Vec::new();
+            // Capture any field text after the opening `{` on this same line
+            // (e.g. `record Note { a "AAA"`). The token parser accepts this
+            // (structure comes from tokens, not line breaks), so `check` passes;
+            // dropping it here was a silent check/runtime divergence.
+            if let Some(open) = trimmed.find('{') {
+                let lead = trimmed[open + 1..].trim();
+                if !lead.is_empty() && lead != "}" {
+                    record_lines.push(lead.to_owned());
+                }
+            }
             let mut depth = brace_delta(trimmed);
             index += 1;
+            // Opening `{` on a later line (also parser-legal): advance to it —
+            // the depth-0 loop below otherwise produced an EMPTY payload,
+            // silently dropping every field.
+            if !trimmed.contains('{') {
+                while index < lines.len() && !lines[index].contains('{') {
+                    index += 1;
+                }
+                if index < lines.len() {
+                    let open_line = lines[index].trim();
+                    let delta = brace_delta(open_line);
+                    if delta <= 0 {
+                        if let (Some(open), Some(close)) =
+                            (open_line.find('{'), open_line.rfind('}'))
+                        {
+                            if close > open {
+                                let body = open_line[open + 1..close].trim();
+                                if !body.is_empty() {
+                                    record_lines.push(body.to_owned());
+                                }
+                            }
+                        }
+                        depth = 0;
+                    } else {
+                        if let Some(open) = open_line.find('{') {
+                            let lead = open_line[open + 1..].trim();
+                            if !lead.is_empty() {
+                                record_lines.push(lead.to_owned());
+                            }
+                        }
+                        depth = delta;
+                    }
+                    index += 1;
+                }
+            }
             while index < lines.len() && depth > 0 {
                 let line = lines[index];
                 let before = depth;
@@ -4257,17 +5390,10 @@ pub fn milestone_blocks(body: &str) -> Vec<MilestoneBlock> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
-    let mut skip_depth = 0i32;
     while index < lines.len() {
         let trimmed = lines[index].trim();
-        if skip_depth > 0 {
-            skip_depth += brace_delta(trimmed);
-            index += 1;
-            continue;
-        }
         if trimmed.starts_with("after ") {
-            skip_depth += brace_delta(trimmed).max(1);
-            index += 1;
+            index = skip_block(&lines, index);
             continue;
         }
         let Some(rest) = trimmed.strip_prefix("emit milestone ") else {
@@ -4293,6 +5419,15 @@ pub fn milestone_blocks(body: &str) -> Vec<MilestoneBlock> {
             continue;
         }
         let mut milestone_lines = Vec::new();
+        // Capture any field text after the opening `{` on this line (parity with
+        // top_level_record_blocks — the token parser accepts a field on the
+        // brace line, so dropping it was a silent check/runtime divergence).
+        if let Some(open) = trimmed.find('{') {
+            let lead = trimmed[open + 1..].trim();
+            if !lead.is_empty() && lead != "}" {
+                milestone_lines.push(lead.to_owned());
+            }
+        }
         let mut depth = brace_delta(trimmed);
         index += 1;
         while index < lines.len() && depth > 0 {
@@ -4334,17 +5469,10 @@ pub fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
-    let mut skip_depth = 0i32;
     while index < lines.len() {
         let trimmed = lines[index].trim();
-        if skip_depth > 0 {
-            skip_depth += brace_delta(trimmed);
-            index += 1;
-            continue;
-        }
         if trimmed.starts_with("after ") {
-            skip_depth += brace_delta(trimmed).max(1);
-            index += 1;
+            index = skip_block(&lines, index);
             continue;
         }
         let terminal = trimmed
@@ -4416,6 +5544,38 @@ pub fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
         let mut block_lines = Vec::new();
         let mut depth = brace_delta(trimmed);
         index += 1;
+        // Opening `{` on a later line (parser-legal): advance to it — the
+        // depth-0 loop below otherwise emitted the terminal with an EMPTY
+        // payload.
+        if !trimmed.contains('{') {
+            while index < lines.len() && !lines[index].contains('{') {
+                index += 1;
+            }
+            if index < lines.len() {
+                let open_line = lines[index].trim();
+                let delta = brace_delta(open_line);
+                if delta <= 0 {
+                    if let (Some(open), Some(close)) = (open_line.find('{'), open_line.rfind('}')) {
+                        if close > open {
+                            let body = open_line[open + 1..close].trim();
+                            if !body.is_empty() {
+                                block_lines.push(body.to_owned());
+                            }
+                        }
+                    }
+                    depth = 0;
+                } else {
+                    if let Some(open) = open_line.find('{') {
+                        let lead = open_line[open + 1..].trim();
+                        if !lead.is_empty() {
+                            block_lines.push(lead.to_owned());
+                        }
+                    }
+                    depth = delta;
+                }
+                index += 1;
+            }
+        }
         while index < lines.len() && depth > 0 {
             let line = lines[index];
             let before = depth;
@@ -4434,29 +5594,6 @@ pub fn top_level_terminal_blocks(body: &str) -> Vec<TerminalBlock> {
         });
     }
     blocks
-}
-
-/// 503 auto-fail: whether `body` contains a top-level generated `flowfail`
-/// terminal (a bare keyword line), skipping nested `after` blocks the same way
-/// `top_level_terminal_blocks` does. Emitted by flow expansion inside an
-/// `after <step> fails { flowfail }` block; routes to `fail_instance_internal`.
-pub fn body_has_top_level_flowfail(body: &str) -> bool {
-    let mut skip_depth = 0i32;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if skip_depth > 0 {
-            skip_depth += brace_delta(trimmed);
-            continue;
-        }
-        if trimmed.starts_with("after ") {
-            skip_depth += brace_delta(trimmed).max(1);
-            continue;
-        }
-        if trimmed == "flowfail" {
-            return true;
-        }
-    }
-    false
 }
 
 pub fn parse_record_header(rest: &str) -> Option<(String, Option<String>)> {
@@ -4542,14 +5679,40 @@ pub fn parse_after_header(rest: &str) -> Option<(String, String, Option<String>)
         .trim();
     let mut parts = before_body.split_whitespace();
     let binding = parts.next()?.to_owned();
-    let predicate = parts.next()?.to_owned();
+    let mut predicate = parts.next()?.to_owned();
+    // `times out` is the only two-token predicate; fold it into the canonical
+    // `times_out` so the single-token (binding, predicate, alias) plumbing
+    // below stays untouched.
+    if predicate == "times" {
+        if parts.next() != Some("out") {
+            return None;
+        }
+        predicate = "times_out".to_owned();
+    }
     // `after p reaches "<name>" [as m]` (Family C): fold the quoted milestone
     // name into the predicate string as `reaches:<name>` so the downstream
     // matcher keys on the milestone-specific `workflow.invoke.reached:<name>`
     // fact. The name lives in the predicate (not a separate slot) to reuse the
     // existing (binding, predicate, alias) plumbing untouched everywhere else.
     if predicate == "reaches" {
-        let name = parts.next()?.trim_matches('"').to_owned();
+        // The milestone name is a QUOTED string and may contain whitespace —
+        // token-splitting mangled multi-word names and silently dropped the
+        // whole arm. Take the quoted span from the raw header text instead.
+        let rest = before_body.trim().strip_prefix(&binding)?.trim_start();
+        let after_kw = rest.strip_prefix("reaches")?;
+        let (name, tail) = match after_kw.find('"') {
+            Some(open) => {
+                let quoted = &after_kw[open + 1..];
+                let close = quoted.find('"')?;
+                (quoted[..close].to_owned(), &quoted[close + 1..])
+            }
+            None => {
+                let name = after_kw.split_whitespace().next()?.to_owned();
+                let end = after_kw.find(&name)? + name.len();
+                (name, &after_kw[end..])
+            }
+        };
+        let mut parts = tail.split_whitespace();
         let alias = match (parts.next(), parts.next(), parts.next()) {
             (None, None, None) => None,
             (Some("as"), Some(alias), None) if is_identifier(alias) => Some(alias.to_owned()),
@@ -4570,9 +5733,6 @@ pub fn effect_binding_value(
     upstream_effect_id: &str,
     predicate: &str,
 ) -> Option<Value> {
-    // A human ask emits both `human.ask.issued` (an issuance ack) and
-    // `human.answer.received` (the real terminal). Both can satisfy a predicate,
-    // so prefer the answer fact when present; otherwise take the first match.
     let matches: Vec<Value> = facts
         .iter()
         .filter_map(|fact| {
@@ -4586,13 +5746,25 @@ pub fn effect_binding_value(
             Some(payload)
         })
         .collect();
-    let payload = matches
-        .iter()
-        .find(|payload| payload.get("inbox_item_id").is_some() && payload.get("choice").is_some())
-        .or_else(|| matches.first())?
-        .clone();
+    let payload = matches.first()?.clone();
     if predicate == "completes" {
         return Some(terminal_union_value(&payload));
+    }
+    // `times out` / `cancelled` bindings carry exactly the static contract
+    // (`TerminalTimedOut`/`TerminalCancelled`: summary, effect_id, run_id —
+    // timeout/cancellation expose nothing extra; the predicate is the
+    // discriminator). `summary` falls back to a `reason` field so cancellation
+    // facts without a summary still explain themselves.
+    if predicate == "times_out" || predicate == "cancelled" {
+        return Some(json!({
+            "summary": payload
+                .get("summary")
+                .cloned()
+                .or_else(|| payload.get("reason").cloned())
+                .unwrap_or(Value::Null),
+            "effect_id": payload.get("effect_id").cloned().unwrap_or(Value::Null),
+            "run_id": payload.get("run_id").cloned().unwrap_or(Value::Null),
+        }));
     }
     Some(
         payload
@@ -4614,32 +5786,34 @@ pub fn terminal_union_value(payload: &Value) -> Value {
         .get("value")
         .cloned()
         .or_else(|| payload.get("output").cloned())
-        .or_else(|| {
-            // A human answer carries no `value`/`output` field; its structured
-            // answer (the chosen option and/or free text) is the terminal value,
-            // so `case ask { Completed as decided => decided.choice }` resolves.
-            (payload.get("inbox_item_id").is_some()
-                && (payload.get("choice").is_some() || payload.get("text").is_some()))
-            .then(|| {
-                json!({
-                    "choice": payload.get("choice").cloned().unwrap_or(Value::Null),
-                    "text": payload.get("text").cloned().unwrap_or(Value::Null),
-                })
-            })
-        })
         .unwrap_or(Value::Null);
     json!({
         "tag": tag,
         "status": status,
         "value": value,
         "error": payload.get("error").cloned().or_else(|| payload.get("failure").cloned()).unwrap_or(Value::Null),
-        "summary": payload.get("summary").cloned().unwrap_or(Value::Null),
+        // Same `reason` fallback as the times_out/cancelled binding
+        // projection: a settling fact without a summary still explains itself.
+        "summary": payload
+            .get("summary")
+            .cloned()
+            .or_else(|| payload.get("reason").cloned())
+            .unwrap_or(Value::Null),
         "effect_id": payload.get("effect_id").cloned().unwrap_or(Value::Null),
         "run_id": payload.get("run_id").cloned().unwrap_or(Value::Null),
     })
 }
 
 pub fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str) -> bool {
+    // Milestone projections (`workflow.invoke.reached:<name>`, Family C) carry
+    // `status: "completed"` like any settled observation, but they are
+    // LIFECYCLE facts, not terminals: only their own `reaches:` predicate may
+    // match them. Without this fence the status fallback below let a reached
+    // fact satisfy `succeeds`, firing the success arm with a milestone
+    // payload (and aborting lowering on the missing fields).
+    if name.contains(".reached:") && !predicate.starts_with("reaches:") {
+        return false;
+    }
     let status = payload.get("status").and_then(Value::as_str);
     match predicate {
         "succeeds" => {
@@ -4656,7 +5830,10 @@ pub fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str
                     || name.ends_with(".completed")
                     || status == Some("completed"))
         }
-        "fails" => name.ends_with(".failed") || matches!(status, Some("failed" | "timed_out")),
+        // Failure only, per the documented contract (`times out` is the timeout
+        // discriminator, `completes` the catch-all): a `.timed_out` fact carries
+        // `status: "timed_out"` and must not satisfy `fails`.
+        "fails" => name.ends_with(".failed") || status == Some("failed"),
         // `reaches:<name>` (Family C): the parent's invoke effect derives a
         // `workflow.invoke.reached:<name>` fact for each child milestone it
         // observed. Match exactly that milestone (never the terminal facts), so a
@@ -4675,18 +5852,10 @@ pub fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str
                     .and_then(Value::as_str)
                     .is_some_and(|variant| variant.eq_ignore_ascii_case(predicate))
         }
+        "cancelled" => name.ends_with(".cancelled") || status == Some("cancelled"),
+        "times_out" => name.ends_with(".timed_out") || status == Some("timed_out"),
         "completes" => {
-            // `human.ask.issued` only acknowledges that the ask was dispatched
-            // (its issuing run completed); it is NOT the ask's terminal, so it
-            // must not satisfy `completes` — otherwise `after <ask> completes`
-            // would fire the moment the ask is issued, before any answer. The
-            // ask's terminal is `human.answer.received`. (Flow correlation binds
-            // the issuance via `after <ask> succeeds`, which is left intact.)
-            if name == "human.ask.issued" {
-                return false;
-            }
-            name == "human.answer.received"
-                || name.ends_with(".succeeded")
+            name.ends_with(".succeeded")
                 || name.ends_with(".failed")
                 || name.ends_with(".completed")
                 || matches!(
@@ -4699,11 +5868,108 @@ pub fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str
 }
 
 pub fn brace_delta(line: &str) -> i32 {
-    line.chars().fold(0, |depth, ch| match ch {
-        '{' => depth + 1,
-        '}' => depth - 1,
-        _ => depth,
+    // Braces inside string literals are content, not structure — without the
+    // quote toggle, `record Note { body "a } b" }` closed its block one line
+    // early (dropping the record and leaking gated statements into the
+    // unconditional body). Single-line strings cannot span lines and have no
+    // quote escape, so the toggle is exact for them; heredoc (`"""`) interior
+    // lines still reach this scanner unprotected (their `{{ }}` templates are
+    // balanced in practice).
+    let mut depth = 0i32;
+    let mut in_string = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Index just past the braced block whose header is at `lines[start]`.
+/// Handles the single-line form (braces balance on the header line — the
+/// `depth.max(1)` idiom this replaces treated it as still-open and consumed
+/// the REST of the body) and an opening `{` on a later line (the token parser
+/// is newline-insensitive).
+pub fn skip_block(lines: &[&str], start: usize) -> usize {
+    let mut index = start;
+    let mut depth = 0i32;
+    let mut opened = false;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.contains('{') {
+            opened = true;
+        }
+        depth += brace_delta(line);
+        index += 1;
+        if opened && depth <= 0 {
+            return index;
+        }
+    }
+    index
+}
+
+/// Field names of a declared class schema, for the `record <T> from <b>`
+/// bounded-projection copy. `None` when `schema` is not a declared class (the
+/// checker reports that separately; lowering then applies no base copy).
+pub fn schema_field_names(ir: &IrProgram, schema: &str) -> Option<Vec<String>> {
+    ir.schemas.iter().find_map(|candidate| match candidate {
+        IrSchema::Class(class) if class.name == schema => Some(
+            class
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect(),
+        ),
+        _ => None,
     })
+}
+
+/// `record <T> from <b> { overrides }` / `complete <name> from <b> { ... }`:
+/// copy the source binding's fields, bounded to exactly the target type's
+/// fields (the projection the parser's egress analysis already assumes), then
+/// let the listed assignments override. Without a `from` binding or a known
+/// target schema this is plain `parse_record_fields`.
+pub fn parse_record_fields_with_from(
+    body: &str,
+    context: &RuleContext,
+    from_binding: Option<&str>,
+    target_fields: Option<Vec<String>>,
+    errors: &mut Vec<String>,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> serde_json::Map<String, Value> {
+    let mut object = serde_json::Map::new();
+    if let (Some(binding), Some(fields)) = (from_binding, target_fields.as_ref()) {
+        if let Some((_, fact)) = context
+            .bindings
+            .iter()
+            .find(|(candidate, _)| candidate == binding)
+        {
+            if let Value::Object(source) = json_from_str(&fact.value_json) {
+                for (name, value) in source {
+                    if fields.contains(&name) {
+                        object.insert(name, value);
+                    }
+                }
+            }
+        }
+    }
+    for (name, value) in parse_record_fields_scoped(
+        body,
+        context,
+        from_binding,
+        errors,
+        live_facts,
+        live_effects,
+        live_ir,
+    ) {
+        object.insert(name, value);
+    }
+    object
 }
 
 pub fn parse_record_fields(
@@ -4712,13 +5978,35 @@ pub fn parse_record_fields(
     from_binding: Option<&str>,
     errors: &mut Vec<String>,
 ) -> serde_json::Map<String, Value> {
+    let empty_ir = empty_ir_program();
+    parse_record_fields_scoped(body, context, from_binding, errors, &[], &[], &empty_ir)
+}
+
+pub fn parse_record_fields_scoped(
+    body: &str,
+    context: &RuleContext,
+    from_binding: Option<&str>,
+    errors: &mut Vec<String>,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> serde_json::Map<String, Value> {
     let mut object = serde_json::Map::new();
     for assignment in collect_field_assignments(body) {
         match assignment {
             FieldAssignment::Value { name, value } => {
                 object.insert(
                     name.clone(),
-                    parse_record_field_value(&name, &value, context, from_binding, errors),
+                    parse_record_field_value(
+                        &name,
+                        &value,
+                        context,
+                        from_binding,
+                        errors,
+                        live_facts,
+                        live_effects,
+                        live_ir,
+                    ),
                 );
             }
             FieldAssignment::Shorthand { name } => {
@@ -4738,6 +6026,9 @@ pub fn parse_record_field_value(
     context: &RuleContext,
     from_binding: Option<&str>,
     errors: &mut Vec<String>,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
 ) -> Value {
     if let Some(binding) = from_binding {
         if is_identifier(value)
@@ -4770,7 +6061,7 @@ pub fn parse_record_field_value(
             }
         }
     }
-    parse_field_value(value, context)
+    parse_field_value_scoped(value, context, live_facts, live_effects, live_ir)
 }
 
 pub fn parse_record_shorthand_value(
@@ -4804,6 +6095,22 @@ pub fn parse_record_shorthand_value(
 }
 
 pub fn parse_field_value(value: &str, context: &RuleContext) -> Value {
+    let empty_ir = empty_ir_program();
+    parse_field_value_scoped(value, context, &[], &[], &empty_ir)
+}
+
+/// The scoped form: payload expressions (a `count(...)` in a `record` or
+/// `complete` field, a query in a send text) evaluate against the LIVE fact
+/// and effect sets, exactly like guards — queries are live reads of the
+/// present, everywhere (DR-0044). Callers without live sets (structural
+/// scanners) use `parse_field_value`, which passes empty sets.
+pub fn parse_field_value_scoped(
+    value: &str,
+    context: &RuleContext,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> Value {
     let value = value.trim();
     if let Some(unquoted) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
         return Value::String(interpolate_prompt(unquoted, context));
@@ -4839,8 +6146,15 @@ pub fn parse_field_value(value: &str, context: &RuleContext) -> Value {
             let mut object = serde_json::Map::new();
             object.insert("variant".to_owned(), Value::String(head.to_owned()));
             let mut nested_errors = Vec::new();
-            for (name, field_value) in parse_record_fields(inner, context, None, &mut nested_errors)
-            {
+            for (name, field_value) in parse_record_fields_scoped(
+                inner,
+                context,
+                None,
+                &mut nested_errors,
+                live_facts,
+                live_effects,
+                live_ir,
+            ) {
                 object.insert(name, field_value);
             }
             return Value::Object(object);
@@ -4856,13 +6170,17 @@ pub fn parse_field_value(value: &str, context: &RuleContext) -> Value {
     }
     if let Ok(expr) = whipplescript_parser::parse_expression(value) {
         if !matches!(expr, Expr::Literal(ExprLiteral::Ident(_))) {
-            let empty_ir = empty_ir_program();
-            return eval_expr_value(&expr, &EvalScope::rule(context, &[], &[], &empty_ir))
-                .into_json();
+            return eval_expr_value(
+                &expr,
+                &EvalScope::rule(context, live_facts, live_effects, live_ir),
+            )
+            .into_json();
         }
     }
     if matches!(value.as_bytes().first(), Some(b'{' | b'[')) {
-        if let Some(parsed) = parse_inline_object_literal(value, context) {
+        if let Some(parsed) =
+            parse_inline_object_literal_scoped(value, context, live_facts, live_effects, live_ir)
+        {
             return parsed;
         }
     }
@@ -4875,6 +6193,17 @@ pub fn parse_field_value(value: &str, context: &RuleContext) -> Value {
 }
 
 pub fn parse_inline_object_literal(value: &str, context: &RuleContext) -> Option<Value> {
+    let empty_ir = empty_ir_program();
+    parse_inline_object_literal_scoped(value, context, &[], &[], &empty_ir)
+}
+
+pub fn parse_inline_object_literal_scoped(
+    value: &str,
+    context: &RuleContext,
+    live_facts: &[FactView],
+    live_effects: &[EffectView],
+    live_ir: &IrProgram,
+) -> Option<Value> {
     let body = value.strip_prefix('{')?.strip_suffix('}')?.trim();
     let mut object = serde_json::Map::new();
     if body.is_empty() {
@@ -4883,7 +6212,10 @@ pub fn parse_inline_object_literal(value: &str, context: &RuleContext) -> Option
     for field in body.split(',') {
         let field = field.trim();
         let (name, value) = field.split_once(char::is_whitespace)?;
-        object.insert(name.to_owned(), parse_field_value(value.trim(), context));
+        object.insert(
+            name.to_owned(),
+            parse_field_value_scoped(value.trim(), context, live_facts, live_effects, live_ir),
+        );
     }
     Some(Value::Object(object))
 }
@@ -4976,7 +6308,17 @@ pub fn json_from_str(source: &str) -> Value {
 }
 
 pub fn stable_hash_hex(value: &str) -> String {
-    format!("{:016x}", stable_hash(value))
+    // Collision-resistant content digest (SHA-256/128) — `record_fact_key`
+    // routes user-authored payloads through here, where a crafted 64-bit FNV
+    // collision could alias two distinct facts into one identity. `stable_hash`
+    // (the raw u64) remains for non-adversarial uses (telemetry span ids).
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 pub fn stable_hash(value: &str) -> u64 {
@@ -5018,4 +6360,331 @@ pub fn split_args(args: &str) -> Vec<String> {
         values.push(value.to_owned());
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fact(name: &str, key: &str, value_json: &str) -> FactView {
+        FactView {
+            fact_id: format!("f_{key}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: name.to_owned(),
+            key: key.to_owned(),
+            value_json: value_json.to_owned(),
+            provenance_class: "table".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        }
+    }
+
+    /// A multi-`when` join must yield a DISTINCT context identity per binding
+    /// combination. The identity feeds the effect-id derivation, so if two
+    /// firings — (a1,b1) and (a2,b1) — shared an identity, their fan-out effects
+    /// would collide and one firing would be silently dropped (ultracode #1).
+    #[test]
+    fn join_contexts_have_distinct_identities_per_combination() {
+        let src = r#"@service
+workflow Join
+
+output result R
+class R { n int }
+class A { id string }
+class B { id string }
+class Pair { a string  b string }
+
+rule pair
+  when A as a
+  when B as b
+=> {
+  record Pair { a a.id  b b.id }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(src)
+            .ir
+            .expect("compiles");
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == "pair")
+            .expect("pair rule");
+        let facts = vec![
+            fact("A", "A:a1", r#"{"id":"a1"}"#),
+            fact("A", "A:a2", r#"{"id":"a2"}"#),
+            fact("B", "B:b1", r#"{"id":"b1"}"#),
+        ];
+        let ready = ready_contexts(&ir, rule, &facts, &[], None);
+        let identities: Vec<&str> = ready
+            .contexts
+            .iter()
+            .filter_map(|context| context.identity.as_deref())
+            .collect();
+        assert_eq!(
+            identities.len(),
+            2,
+            "two A facts join one B fact into two contexts: {identities:?}"
+        );
+        assert_ne!(
+            identities[0], identities[1],
+            "each join combination must carry a distinct identity: {identities:?}"
+        );
+        // Both bindings' keys participate in the identity.
+        for identity in &identities {
+            assert!(
+                identity.contains("a:") && identity.contains("b:"),
+                "identity composes both bindings: {identity}"
+            );
+        }
+    }
+
+    /// std.coord slice 5 regression: release disambiguation is binding-typed
+    /// over the PARSED effects. An `acquire … as <b>` line inside prompt text
+    /// or a record block is NOT an acquire effect, so a release of a
+    /// work-item binding with the same name stays `tracker.release`. The old
+    /// raw body-line scan (`starts_with("acquire ")` over every rule-body
+    /// line) wrongly rewrote both of these to `lease.release`.
+    #[test]
+    fn release_ignores_acquire_lines_in_prompts_and_record_blocks() {
+        let body = r#"
+tell helper as turn """markdown
+acquire deploy_slot for k as w
+"""
+record Note {
+  acquire "deploy_slot for k as w"
+}
+claim item as w
+release w
+"#;
+        let mut effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let acquires = lease_acquire_bindings(&effects);
+        assert!(
+            acquires.is_empty(),
+            "prompt/record text must not mint acquire bindings: {acquires:?}"
+        );
+        rewrite_lease_releases(&mut effects, &acquires);
+        let release = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("w"))
+            .expect("release parses");
+        assert_eq!(
+            release.kind, "tracker.release",
+            "a work-item release must stay tracker.release: {effects:?}"
+        );
+    }
+
+    /// A real acquire binding in the same parse rewrites its release.
+    #[test]
+    fn release_of_parsed_acquire_binding_becomes_lease_release() {
+        let body = r#"
+acquire deploy_slot for t.id until ttl as slot
+release slot
+"#;
+        let mut effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let acquires = lease_acquire_bindings(&effects);
+        rewrite_lease_releases(&mut effects, &acquires);
+        assert!(
+            effects.iter().any(|effect| effect.kind == "lease.release"),
+            "{effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| effect.kind == "tracker.release"),
+            "{effects:?}"
+        );
+    }
+
+    /// The after-block lowering parses separately (rule_lowering::lower_rule
+    /// site 2): an after-block release must still see MAIN-BODY acquires, via
+    /// the threaded pre-terminal acquire-binding set.
+    #[test]
+    fn after_block_release_sees_pre_terminal_acquires_through_threading() {
+        let pre_terminal_body = r#"
+acquire deploy_slot for t.id until ttl as slot
+"#;
+        let after_body = r#"
+release slot
+"#;
+        let pre_terminal = parse_effect_statements(
+            pre_terminal_body,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let acquire_bindings = lease_acquire_bindings(&pre_terminal);
+
+        let mut selected = parse_effect_statements(
+            after_body,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let mut after_acquires = acquire_bindings.clone();
+        after_acquires.extend(lease_acquire_bindings(&selected));
+        rewrite_lease_releases(&mut selected, &after_acquires);
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0].kind, "lease.release", "{selected:?}");
+
+        // Without the threading the same release would stay tracker.release —
+        // the property the threading exists for.
+        let mut unthreaded = parse_effect_statements(
+            after_body,
+            &RuleContext::default(),
+            &[],
+            &[],
+            &empty_ir_program(),
+        );
+        let own_only = lease_acquire_bindings(&unthreaded);
+        rewrite_lease_releases(&mut unthreaded, &own_only);
+        assert_eq!(unthreaded[0].kind, "tracker.release", "{unthreaded:?}");
+    }
+
+    /// T3 renew disambiguation (mirroring `release`): a `renew <binding>`
+    /// naming a same-parse `claim ... as <binding>` CLAIM binding flips from the
+    /// parser's default `lease.renew` to `tracker.renew`.
+    #[test]
+    fn renew_of_parsed_claim_binding_becomes_tracker_renew() {
+        let body = r#"
+claim issue ttl 60s as active_claim
+renew active_claim as renewed
+"#;
+        let mut effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        let claim_bindings = claim_item_bindings(&effects);
+        assert!(
+            claim_bindings.contains("active_claim"),
+            "{claim_bindings:?}"
+        );
+        rewrite_claim_renews(&mut effects, &claim_bindings);
+        let renew = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("active_claim"))
+            .expect("renew parses");
+        assert_eq!(
+            renew.kind, "tracker.renew",
+            "a renew of a claim binding must become tracker.renew: {effects:?}"
+        );
+    }
+
+    /// A renew naming an `acquire ... as <binding>` LEASE binding stays
+    /// `lease.renew` — the claim-renew rewrite only flips claim bindings.
+    #[test]
+    fn renew_of_acquire_binding_stays_lease_renew() {
+        let body = r#"
+acquire deploy_slot for t.id until ttl as slot
+renew slot until 300s as r
+"#;
+        let mut effects =
+            parse_effect_statements(body, &RuleContext::default(), &[], &[], &empty_ir_program());
+        // No claim in this parse, so the claim-renew rewrite is a no-op.
+        let claim_bindings = claim_item_bindings(&effects);
+        assert!(claim_bindings.is_empty(), "{claim_bindings:?}");
+        rewrite_claim_renews(&mut effects, &claim_bindings);
+        let renew = effects
+            .iter()
+            .find(|effect| effect.args.first().map(String::as_str) == Some("slot"))
+            .expect("renew parses");
+        assert_eq!(
+            renew.kind, "lease.renew",
+            "a renew of an acquire binding must stay lease.renew: {effects:?}"
+        );
+    }
+
+    /// Spec "Count And Empty" runtime semantics for `empty`: structural
+    /// emptiness for arrays/strings/queries, true for null/missing (the
+    /// optional case), and a typed error for scalars — never a coercion.
+    #[test]
+    fn eval_empty_follows_count_and_empty_spec() {
+        let ir = empty_ir_program();
+        let facts = [FactView {
+            fact_id: "f1".to_owned(),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: "Task".to_owned(),
+            key: "t1".to_owned(),
+            value_json: "{\"done\": false}".to_owned(),
+            provenance_class: "rule".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        }];
+        let scope = EvalScope::assertions(&facts, &[], &ir);
+
+        let cases = [
+            ("empty([])", Some(true)),
+            ("empty([\"a\"])", Some(false)),
+            ("empty(\"\")", Some(true)),
+            ("empty(\"x\")", Some(false)),
+            ("empty(null)", Some(true)),
+            ("empty(Task where done == false)", Some(false)),
+            ("empty(Task where done == true)", Some(true)),
+            ("empty(Missing where done == true)", Some(true)),
+            // Scalars are a typed error, not a coercion.
+            ("empty(1)", None),
+            ("empty(true)", None),
+        ];
+        for (source, expected) in cases {
+            let expr = whipplescript_parser::parse_expression(source).expect(source);
+            let value = eval_expr_value(&expr, &scope);
+            match expected {
+                Some(expected) => assert_eq!(
+                    value,
+                    EvalValue::Json(Value::Bool(expected)),
+                    "for `{source}`"
+                ),
+                None => assert!(
+                    matches!(value, EvalValue::Error(_)),
+                    "`{source}` must be a typed error, got {value:?}"
+                ),
+            }
+        }
+    }
+
+    /// A record field placed on the opening `{` line is captured by the runtime
+    /// line-scanner, matching the token parser (`check`). Regression for a silent
+    /// check/runtime divergence that dropped the field.
+    #[test]
+    fn record_field_on_the_brace_line_is_captured() {
+        let body = "record Note { a \"AAA\"\n  b \"BBB\"\n}";
+        let blocks = top_level_record_blocks(body);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0].body.contains("a \"AAA\"") && blocks[0].body.contains("b \"BBB\""),
+            "both fields captured, got: {:?}",
+            blocks[0].body
+        );
+        // Same for milestone blocks.
+        let m = milestone_blocks("emit milestone \"m\" of Note { a \"AAA\"\n  b \"BBB\"\n}");
+        assert_eq!(m.len(), 1);
+        assert!(m[0].body.contains("a \"AAA\"") && m[0].body.contains("b \"BBB\""));
+    }
+
+    /// A case branch whose `=>` and opening `{` sit on separate lines is parsed
+    /// as a real branch (the token parser is whitespace-insensitive). Regression
+    /// for a divergence that dropped the whole branch at runtime.
+    #[test]
+    fn case_branch_with_brace_on_the_next_line_is_parsed() {
+        let lines: Vec<&str> = vec![
+            "case item.status {",
+            "  \"ready\" =>",
+            "  {",
+            "    complete result { ok 1 }",
+            "  }",
+            "  \"done\" => { fail fail { reason \"d\" } }",
+            "}",
+        ];
+        let (case, _) = parse_case_block(&lines, 0).expect("case parses");
+        assert_eq!(case.branches.len(), 2, "both branches materialize");
+        assert_eq!(case.branches[0].pattern, "\"ready\"");
+        assert!(
+            case.branches[0].body.iter().any(|l| l.contains("complete")),
+            "the non-adjacent-brace branch keeps its body: {:?}",
+            case.branches[0].body
+        );
+    }
 }

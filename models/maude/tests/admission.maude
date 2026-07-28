@@ -1,0 +1,111 @@
+load ../admission.maude
+
+--- Positive: a valid candidate is admitted as a durable fact.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  candidate(k1, valid) admitted(mtKeys)
+  =>* C:Cfg fact(k1) .
+
+--- Positive: an all-valid batch admits a fact for every row.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  batch(k1, k2, valid, valid) admitted(mtKeys)
+  =>* C:Cfg fact(k1) fact(k2) .
+
+--- Positive: in replay mode the recorded outcome reproduces the fact.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  mode(replay) replayReq(k1) recorded(k1)
+  =>* C:Cfg fact(k1) .
+
+--- Positive fixpoint determinism: two independent admissions reach a single
+--- canonical normal form regardless of interleaving the admit rules commute,
+--- so the normal form carrying both facts is reachable.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  candidate(k1, valid) candidate(k2, valid) admitted(mtKeys)
+  =>! C:Cfg fact(k1) fact(k2) .
+
+--- Negative idempotency: a re-delivered key never yields two facts.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  candidate(k1, valid) candidate(k1, valid) admitted(mtKeys)
+  =>* C:Cfg fact(k1) fact(k1) .
+
+--- Negative validation gate: an invalid candidate never yields a fact.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  candidate(k1, invalid) admitted(mtKeys)
+  =>* C:Cfg fact(k1) .
+
+--- Negative batch atomicity: a batch with an invalid row admits no fact for
+--- the first row...
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  batch(k1, k2, valid, invalid) admitted(mtKeys)
+  =>* C:Cfg fact(k1) .
+
+--- ...nor for the second row.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  batch(k1, k2, valid, invalid) admitted(mtKeys)
+  =>* C:Cfg fact(k2) .
+
+--- Negative record-once replay: replay mode never invokes the source.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  mode(replay) replayReq(k1) recorded(k1)
+  =>* C:Cfg invoked(k1) .
+
+--- Positive per-row identity: an imported row admits a fact keyed by its
+--- derived (effect_key, row identity) key.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  importRow(e1, idx0, valid) admitted(mtKeys)
+  =>* C:Cfg fact(derive(e1, idx0)) .
+
+--- Positive natural-key distinctness: two rows with distinct natural keys admit
+--- two distinct facts (the derivation is injective in the row identity).
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  importRow(e1, natA, valid) importRow(e1, natB, valid) admitted(mtKeys)
+  =>! C:Cfg fact(derive(e1, natA)) fact(derive(e1, natB)) .
+
+--- Negative idempotency bite (natural key): re-importing the same (effect,
+--- natural key) never admits two facts -- the derived key collides and is
+--- absorbed by the admitted set.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  importRow(e1, natA, valid) importRow(e1, natA, valid) admitted(mtKeys)
+  =>* C:Cfg fact(derive(e1, natA)) fact(derive(e1, natA)) .
+
+--- Negative idempotency bite (row index): re-importing the same positional row
+--- index is likewise idempotent (a positional key is still a key).
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  importRow(e1, idx0, valid) importRow(e1, idx0, valid) admitted(mtKeys)
+  =>* C:Cfg fact(derive(e1, idx0)) fact(derive(e1, idx0)) .
+
+--- Negative validation gate (import): an invalid row admits no fact.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  importRow(e1, idx0, invalid) admitted(mtKeys)
+  =>* C:Cfg fact(derive(e1, idx0)) .
+
+--- Positive delivery-id admission (std.ingress I5): a valid delivery under an
+--- operator/provider id admits one fact keyed by the id.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  deliver(d1, payA, valid) admitted(mtKeys)
+  =>* C:Cfg fact(deliveryKey(d1)) .
+
+--- Positive file-occurrence distinctness (std.ingress I2a/I3 watch mode): a
+--- content change is a NEW (path, content-hash) occurrence -- both admit.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  observeFile(p1, h1, valid) observeFile(p1, h2, valid) admitted(mtKeys)
+  =>! C:Cfg fact(occKey(p1, h1)) fact(occKey(p1, h2)) .
+
+--- Negative delivery-id bite: the SAME id re-delivered with DIFFERENT payload
+--- bytes never admits two facts -- the key derives from the id alone (the id
+--- wins over the payload hash; a payload-derived key would find a solution
+--- here).
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  deliver(d1, payA, valid) deliver(d1, payB, valid) admitted(mtKeys)
+  =>* C:Cfg fact(deliveryKey(d1)) fact(deliveryKey(d1)) .
+
+--- Negative file-occurrence idempotency: an unchanged file re-observed never
+--- admits twice (same (path, content-hash) key, absorbed).
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  observeFile(p1, h1, valid) observeFile(p1, h1, valid) admitted(mtKeys)
+  =>* C:Cfg fact(occKey(p1, h1)) fact(occKey(p1, h1)) .
+
+--- Negative validation gate (delivery): an invalid delivery admits no fact,
+--- whatever its id.
+search [1] in WHIPPLESCRIPT-ADMISSION :
+  deliver(d1, payA, invalid) admitted(mtKeys)
+  =>* C:Cfg fact(deliveryKey(d1)) .

@@ -2178,42 +2178,63 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if selected.is_empty() {
             return Ok(TransportOutcome::NothingSelected);
         }
-        // Net effect per path = the NEWEST selected unit; its BEFORE is
-        // the certified precondition on the target.
-        let mut net: BTreeMap<String, &crate::selection::ChangeUnit> = BTreeMap::new();
+        // Net effect per path folds the OLDEST and NEWEST selected writes to
+        // that path: the certified precondition on the target is the oldest's
+        // `before` (the state before this branch first touched the path), and
+        // the result is the newest's `after`. Using the newest write's `before`
+        // (an intermediate state the target never held) would falsely conflict a
+        // valid multi-write cherry-pick — e.g. create p2 (before=None) then edit
+        // p2 (before="v1"): the target lacks p2, so `current(None) !=
+        // before("v1")` reports a phantom conflict.
+        struct NetUnit<'a> {
+            oldest: &'a crate::selection::ChangeUnit,
+            newest: &'a crate::selection::ChangeUnit,
+        }
+        let mut net: BTreeMap<String, NetUnit> = BTreeMap::new();
         for &index in &selected {
             let unit = &universe[index];
-            let entry = net.entry(unit.path.clone()).or_insert(unit);
-            if unit.seq > entry.seq {
-                *entry = unit;
-            }
+            net.entry(unit.path.clone())
+                .and_modify(|net_unit| {
+                    if unit.seq < net_unit.oldest.seq {
+                        net_unit.oldest = unit;
+                    }
+                    if unit.seq > net_unit.newest.seq {
+                        net_unit.newest = unit;
+                    }
+                })
+                .or_insert(NetUnit {
+                    oldest: unit,
+                    newest: unit,
+                });
         }
         let mut manifest = self.load_manifest(target.head_manifest_hash.as_deref())?;
         let mut conflicts = Vec::new();
         let mut moved = Vec::new();
-        for (path, unit) in &net {
+        for (path, net_unit) in &net {
+            let precondition = net_unit.oldest.before.as_ref();
+            let result = net_unit.newest.after.as_ref();
             let current = manifest.get(path);
-            if current == unit.after.as_ref() {
+            if current == result {
                 continue; // already there: the idempotent skip
             }
-            if current != unit.before.as_ref() {
+            if current != precondition {
                 conflicts.push(PathConflict {
                     path: path.clone(),
-                    base: unit.before.clone(),
+                    base: net_unit.oldest.before.clone(),
                     ours: current.cloned(),
-                    theirs: unit.after.clone(),
+                    theirs: net_unit.newest.after.clone(),
                     ours_side: MergeSide {
                         label: onto.to_owned(),
                         cut_id: target.head_cut_id.clone(),
                     },
                     theirs_side: MergeSide {
                         label: branch_id.to_owned(),
-                        cut_id: Some(unit.cut_id.clone()),
+                        cut_id: Some(net_unit.newest.cut_id.clone()),
                     },
                 });
                 continue;
             }
-            moved.push((path.clone(), unit.after.clone()));
+            moved.push((path.clone(), net_unit.newest.after.clone()));
         }
         if !conflicts.is_empty() {
             return Ok(TransportOutcome::Conflicted { conflicts });
@@ -2468,7 +2489,13 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 }
                 // `put` stores under the true content hash of `body`;
                 // assert the bundle's claimed id equals it so a mismatched
-                // (forged) id is refused rather than silently ignored.
+                // (forged) id is refused rather than silently ignored. NOTE
+                // (v0.1 trust assumption): the id is a 64-bit non-cryptographic
+                // hash (see chunking::content_hash_hex), so this check proves
+                // body↔id CONSISTENCY, not authenticity — a determined attacker
+                // can craft colliding bytes. Bundle import is only forgery-safe
+                // from a mutually-trusted sender until the id primitive is
+                // re-keyed to SHA-256 (tracked, deferred).
                 let stored = self.content.put(body)?;
                 if stored != blob.id {
                     return Err(StoreError::Conflict(format!(
@@ -3152,7 +3179,38 @@ impl<B: Branches, C: ContentBlobs> FileStore for BranchFileStore<B, C> {
 mod tests {
     use super::*;
 
-    fn vcs() -> NativeWorkspaceVcs {
+    /// A vcs bound to a temp directory that is removed when the binding drops,
+    /// including on a panicking assertion. `Deref`/`DerefMut` keep the 21 call
+    /// sites unchanged: `let mut vcs = vcs(); vcs.init("t0")` still works.
+    ///
+    /// Before this, every test left its directory behind — 200 of them had
+    /// accumulated in the RAM-backed /tmp.
+    struct TempVcs {
+        dir: std::path::PathBuf,
+        inner: NativeWorkspaceVcs,
+    }
+
+    impl std::ops::Deref for TempVcs {
+        type Target = NativeWorkspaceVcs;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for TempVcs {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    impl Drop for TempVcs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn vcs() -> TempVcs {
         let dir = std::env::temp_dir().join(format!(
             "whipplescript-vcs-{}-{}",
             std::process::id(),
@@ -3161,8 +3219,9 @@ mod tests {
                 .expect("clock")
                 .as_nanos(),
         ));
-        WorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
-            .expect("open vcs")
+        let inner = WorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
+            .expect("open vcs");
+        TempVcs { dir, inner }
     }
 
     /// The full integrated loop: init → branch → isolated writes → merge
@@ -4535,6 +4594,46 @@ mod tests {
             vcs.get_branch("draft_a").expect("get").expect("row").status,
             BranchStatus::Active,
             "partial adoption never closes the branch"
+        );
+    }
+
+    /// A multi-write cherry-pick onto a target that never held the intermediate
+    /// state must transport cleanly, not phantom-conflict (ultracode #10): the
+    /// precondition is the OLDEST selected write's `before`, not the newest's.
+    #[test]
+    fn transport_of_a_multi_write_path_uses_the_oldest_precondition() {
+        use crate::selection::parse;
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("draft_a", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("create");
+        // Create p2 (before=None), then edit it (before="v1"). mainline has no p2.
+        vcs.write("draft_a", "p2.md", Some("v1"), "e2", "t2")
+            .expect("create");
+        vcs.write("draft_a", "p2.md", Some("v2"), "e3", "t3")
+            .expect("edit");
+        // Transport the whole path — both writes are selected. The oldest
+        // (e2) before=None matches mainline's absent p2, so it transports the
+        // net result (v2) rather than conflicting on the intermediate "v1".
+        let outcome = vcs
+            .transport_selection(
+                "draft_a",
+                &parse("path(p2.md)").expect("parse"),
+                MAINLINE_BRANCH_ID,
+                "tp1",
+                "t4",
+            )
+            .expect("transport");
+        assert!(
+            matches!(outcome, TransportOutcome::Transported { .. }),
+            "a valid multi-write cherry-pick must not phantom-conflict: {outcome:?}"
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "p2.md")
+                .expect("read")
+                .as_deref(),
+            Some("v2"),
+            "the net result (newest after) lands on the target"
         );
     }
 

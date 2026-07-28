@@ -1,0 +1,66 @@
+--- Compute-plane executor priority queue (P8, compute-plane-design-note S6):
+--- the pool serves production > working > counterfactual so mass regeneration
+--- cannot starve live traffic of executors. Priority = Nat, 0 highest =
+--- production, 1 = working, 2 = counterfactual.
+--- Invariant I1 (no priority inversion): with all requests waiting up front,
+--- a slot never serves a request while a strictly higher-priority request is
+--- still waiting.
+--- Finite, consuming rules; the guard is an owise-equation predicate. The
+--- rule matches a WRAPPED whole state -- with a bare AC soup, extension
+--- matching would let the rule rewrite a fragment with the rest bound to
+--- none, silently bypassing the guard (verified: that variant is unsound).
+
+mod COMPUTE-PRIORITY-QUEUE is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- waiting(id, priority): a queued invocation.
+  op waiting : Nat Nat -> Fact [ctor] .
+  --- slot: one free executor slot (bounded pool = finitely many tokens).
+  op slot : -> Fact [ctor] .
+  --- running(id, priority): the invocation holds a slot.
+  op running : Nat Nat -> Fact [ctor] .
+
+  vars I J P Q : Nat .
+  var C : Cfg .
+
+  --- Does the soup hold a request waiting at strictly higher priority,
+  --- i.e. lower number, than P?
+  op hasHigherWaiting : Nat Cfg -> Bool .
+  eq hasHigherWaiting(P, waiting(I, Q) C) = if Q < P then true
+    else hasHigherWaiting(P, C) fi .
+  eq hasHigherWaiting(P, C) = false [owise] .
+
+  --- Serve the request only when nothing higher-priority waits anywhere
+  --- in the state.
+  crl [serve] : { slot waiting(I, P) C } => { running(I, P) C }
+    if hasHigherWaiting(P, C) = false .
+endm
+
+--- Mutant for bite: an unguarded pool (first-come by soup matching) CAN
+--- hand the slot to a counterfactual request while production waits.
+mod COMPUTE-PRIORITY-QUEUE-UNGUARDED is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  op waiting : Nat Nat -> Fact [ctor] .
+  op slot : -> Fact [ctor] .
+  op running : Nat Nat -> Fact [ctor] .
+
+  vars I P : Nat .
+  var C : Cfg .
+
+  rl [serve] : { slot waiting(I, P) C } => { running(I, P) C } .
+endm

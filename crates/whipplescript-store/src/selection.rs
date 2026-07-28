@@ -69,7 +69,10 @@ pub enum SelAtom {
 /// Parse a selection expression. Errors carry the offending position's
 /// remainder — enough for a CLI message.
 pub fn parse(input: &str) -> Result<SelExpr, String> {
-    let mut parser = Parser { rest: input.trim() };
+    let mut parser = Parser {
+        rest: input.trim(),
+        depth: 0,
+    };
     let expr = parser.expr()?;
     if !parser.rest.is_empty() {
         return Err(format!("unexpected trailing input: `{}`", parser.rest));
@@ -77,8 +80,16 @@ pub fn parse(input: &str) -> Result<SelExpr, String> {
     Ok(expr)
 }
 
+/// Recursion-depth ceiling for the selection grammar. Every `(` and
+/// `dependents-of(...)` nesting level descends through `prim`, so bounding it
+/// there returns an ordinary `Err` on a pathologically nested selection
+/// expression (a CLI arg) instead of overflowing the stack. Far above any real
+/// selection.
+const MAX_SELECTION_DEPTH: usize = 256;
+
 struct Parser<'a> {
     rest: &'a str,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -124,6 +135,19 @@ impl<'a> Parser<'a> {
     }
 
     fn prim(&mut self) -> Result<SelExpr, String> {
+        self.depth += 1;
+        if self.depth > MAX_SELECTION_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "selection expression is nested too deeply (limit {MAX_SELECTION_DEPTH})"
+            ));
+        }
+        let result = self.prim_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn prim_inner(&mut self) -> Result<SelExpr, String> {
         self.skip_ws();
         if self.eat('(') {
             let inner = self.expr()?;
@@ -176,18 +200,39 @@ impl<'a> Parser<'a> {
 /// A `*`/`?` glob match (segments are not special: `*` crosses `/`,
 /// matching the whole-path selection intent).
 pub fn glob_matches(pattern: &str, value: &str) -> bool {
-    fn inner(pattern: &[u8], value: &[u8]) -> bool {
-        match (pattern.first(), value.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => {
-                inner(&pattern[1..], value) || (!value.is_empty() && inner(pattern, &value[1..]))
-            }
-            (Some(b'?'), Some(_)) => inner(&pattern[1..], &value[1..]),
-            (Some(p), Some(v)) if p == v => inner(&pattern[1..], &value[1..]),
-            _ => false,
+    // Iterative two-pointer glob with single-star backtracking: O(len(pattern)
+    // * len(value)) worst case. The prior recursion was `*`-splits with no
+    // memoization, so a pattern with interleaved stars against a non-matching
+    // value (e.g. `a*a*a*...*Z` vs `aaaa...`) backtracked exponentially and hung
+    // the process on an operator/agent-supplied `path(<glob>)` atom.
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut p, mut v) = (0usize, 0usize);
+    // The last `*` seen and the value position to resume from if the tail fails.
+    let (mut star, mut resume) = (None, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            // Record this star and provisionally match zero characters.
+            star = Some(p);
+            resume = v;
+            p += 1;
+        } else if let Some(star_p) = star {
+            // Mismatch: let the last star absorb one more value byte.
+            p = star_p + 1;
+            resume += 1;
+            v = resume;
+        } else {
+            return false;
         }
     }
-    inner(pattern.as_bytes(), value.as_bytes())
+    // Trailing pattern must be all stars to match the consumed value.
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Evaluate an expression over a change-unit universe, returning the
@@ -302,6 +347,30 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_selection_errors_instead_of_overflowing_the_stack() {
+        // A pathologically nested selection expression (a CLI arg) must return
+        // a normal Err, not abort the process. Run on a production-sized stack.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let deep = format!("{}path(a){}", "(".repeat(4000), ")".repeat(4000));
+                let result = parse(&deep);
+                assert!(
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|message| message.contains("nested too deeply")),
+                    "expected a depth-limit diagnostic, got {result:?}"
+                );
+                let ok = format!("{}path(a){}", "(".repeat(64), ")".repeat(64));
+                assert!(parse(&ok).is_ok(), "64-deep nesting must parse");
+            })
+            .expect("spawn")
+            .join()
+            .expect("nested-selection parse must not crash");
+    }
+
+    #[test]
     fn atoms_select_by_provenance_dimensions() {
         let universe = vec![
             unit(0, "eff_1-f0", "src/a.md", "t1"),
@@ -360,5 +429,23 @@ mod tests {
         assert!(glob_matches("a?c", "abc"));
         assert!(!glob_matches("a?c", "ac"));
         assert!(!glob_matches("src/*.md", "src/a.txt"));
+        // Multi-star and edge forms the two-pointer matcher must still get right.
+        assert!(glob_matches("a*b*c", "axxbyyc"));
+        assert!(glob_matches("**", "anything"));
+        assert!(glob_matches("*.md", ".md"));
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "x"));
+        assert!(!glob_matches("a*b", "axxbx")); // trailing literal must anchor
+        assert!(glob_matches("a*b", "ab"));
+    }
+
+    #[test]
+    fn glob_worst_case_is_linear_not_exponential() {
+        // The classic exponential-backtracking trigger: many stars interleaved
+        // with a literal that never appears in a long value. The linear matcher
+        // returns promptly; the old recursion hung for effectively forever.
+        let pattern = "a*".repeat(30) + "Z";
+        let value = "a".repeat(60);
+        assert!(!glob_matches(&pattern, &value));
     }
 }

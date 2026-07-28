@@ -1,0 +1,400 @@
+load ../kernel.maude
+load ../package-contract.maude
+
+--- A well-formed schema-coercion package declaration can be accepted.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(goodSchemaCoercion)
+  packageDeclKeyword(goodSchemaCoercion, schemaCoercionKeyword)
+  deterministicParse(goodSchemaCoercion)
+  noKeywordConflict(goodSchemaCoercion)
+  declarativeLowering(goodSchemaCoercion)
+  noCustomControlFlow(goodSchemaCoercion)
+  noHiddenAuthority(goodSchemaCoercion)
+  noDirectFactWrite(goodSchemaCoercion)
+  lockedContractVersion(goodSchemaCoercion, v1)
+  declaredCapability(goodSchemaCoercion, schemaCoerce)
+  typedEffectContract(goodSchemaCoercion, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1) .
+
+--- The std.coercion backend contract is an ordinary typed-provider boundary:
+--- it registers schema.coerce capability metadata, but does not own scheduling,
+--- terminal status, provider runs, or direct fact writes.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(stdCoercionBackend)
+  packageDeclKeyword(stdCoercionBackend, schemaCoercionKeyword)
+  deterministicParse(stdCoercionBackend)
+  noKeywordConflict(stdCoercionBackend)
+  declarativeLowering(stdCoercionBackend)
+  noCustomControlFlow(stdCoercionBackend)
+  noHiddenAuthority(stdCoercionBackend)
+  noDirectFactWrite(stdCoercionBackend)
+  lockedContractVersion(stdCoercionBackend, v1)
+  declaredCapability(stdCoercionBackend, schemaCoerce)
+  typedEffectContract(stdCoercionBackend, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  sourceEffect(stdCoercionBackend, coerceEff)
+  =>*
+  acceptedPackageContract(stdCoercionBackend)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graph(g1, coerceEff)
+  expectsOutput(coerceEff, reviewType, v1) .
+
+--- A metadata-only declaration form can be accepted into the registry without
+--- becoming executable source syntax.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(goodMemoryMetadata)
+  packageDeclKeyword(goodMemoryMetadata, recallKeyword)
+  metadataDeclaration(goodMemoryMetadata, recallKeyword, ruleBodyScope)
+  noKeywordConflict(goodMemoryMetadata)
+  validDeclarationScope(ruleBodyScope)
+  validDeclarationFields(goodMemoryMetadata)
+  metadataOnlyLoweringTarget(goodMemoryMetadata)
+  lockedContractVersion(goodMemoryMetadata, v1)
+  =>*
+  acceptedMetadataDeclaration(goodMemoryMetadata) .
+
+--- A rule-body declaration with the capability_call lowering class can be
+--- accepted when it targets a declared capability and matching effect contract.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(goodMemoryRecall)
+  packageDeclKeyword(goodMemoryRecall, recallKeyword)
+  capabilityCallDeclaration(goodMemoryRecall, recallKeyword, ruleBodyScope, coerceEff, memoryQueryCap)
+  noKeywordConflict(goodMemoryRecall)
+  validDeclarationScope(ruleBodyScope)
+  validDeclarationFields(goodMemoryRecall)
+  noHiddenAuthority(goodMemoryRecall)
+  noDirectFactWrite(goodMemoryRecall)
+  lockedContractVersion(goodMemoryRecall, v1)
+  declaredCapability(goodMemoryRecall, memoryQueryCap)
+  typedEffectContract(goodMemoryRecall, coerceEff, jsonType, v1)
+  requiredEffectCapability(coerceEff, memoryQueryCap)
+  =>*
+  acceptedExecutableDeclaration(goodMemoryRecall)
+  registeredEffectContract(coerceEff, jsonType, memoryQueryCap, v1) .
+
+--- Metadata acceptance does not grant executable lowering or source lowering.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedMetadataDeclaration(goodMemoryMetadata)
+  sourceEffect(goodMemoryMetadata, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  =>*
+  graph(g1, coerceEff) .
+
+--- Declaration metadata with an executable lowering target is rejected by this
+--- level.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(executableMetadataDecl)
+  packageDeclKeyword(executableMetadataDecl, recallKeyword)
+  metadataDeclaration(executableMetadataDecl, recallKeyword, ruleBodyScope)
+  noKeywordConflict(executableMetadataDecl)
+  validDeclarationScope(ruleBodyScope)
+  validDeclarationFields(executableMetadataDecl)
+  lockedContractVersion(executableMetadataDecl, v1)
+  =>*
+  acceptedMetadataDeclaration(executableMetadataDecl) .
+
+--- Accepted executable declarations lower through the same core graph-template path.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedExecutableDeclaration(goodMemoryRecall)
+  sourceEffect(goodMemoryRecall, coerceEff)
+  registeredEffectContract(coerceEff, jsonType, memoryQueryCap, v1)
+  =>*
+  acceptedExecutableDeclaration(goodMemoryRecall)
+  registeredEffectContract(coerceEff, jsonType, memoryQueryCap, v1)
+  graph(g1, coerceEff)
+  expectsOutput(coerceEff, jsonType, v1) .
+
+--- Hidden authority blocks acceptance.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(hiddenAuthorityDecl)
+  packageDeclKeyword(hiddenAuthorityDecl, schemaCoercionKeyword)
+  deterministicParse(hiddenAuthorityDecl)
+  noKeywordConflict(hiddenAuthorityDecl)
+  declarativeLowering(hiddenAuthorityDecl)
+  noCustomControlFlow(hiddenAuthorityDecl)
+  noDirectFactWrite(hiddenAuthorityDecl)
+  lockedContractVersion(hiddenAuthorityDecl, v1)
+  declaredCapability(hiddenAuthorityDecl, schemaCoerce)
+  typedEffectContract(hiddenAuthorityDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(hiddenAuthorityDecl) .
+
+--- Custom control-flow semantics block acceptance.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(controlFlowDecl)
+  packageDeclKeyword(controlFlowDecl, schemaCoercionKeyword)
+  deterministicParse(controlFlowDecl)
+  noKeywordConflict(controlFlowDecl)
+  declarativeLowering(controlFlowDecl)
+  noHiddenAuthority(controlFlowDecl)
+  noDirectFactWrite(controlFlowDecl)
+  lockedContractVersion(controlFlowDecl, v1)
+  declaredCapability(controlFlowDecl, schemaCoerce)
+  typedEffectContract(controlFlowDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(controlFlowDecl) .
+
+--- A package declaration that declares no typed effect contract is rejected.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(untypedEffectDecl)
+  packageDeclKeyword(untypedEffectDecl, schemaCoercionKeyword)
+  deterministicParse(untypedEffectDecl)
+  noKeywordConflict(untypedEffectDecl)
+  declarativeLowering(untypedEffectDecl)
+  noCustomControlFlow(untypedEffectDecl)
+  noHiddenAuthority(untypedEffectDecl)
+  noDirectFactWrite(untypedEffectDecl)
+  lockedContractVersion(untypedEffectDecl, v1)
+  declaredCapability(untypedEffectDecl, schemaCoerce)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(untypedEffectDecl) .
+
+--- A package declaration that creates an effect without capability metadata is
+--- rejected.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(noCapabilityDecl)
+  packageDeclKeyword(noCapabilityDecl, schemaCoercionKeyword)
+  deterministicParse(noCapabilityDecl)
+  noKeywordConflict(noCapabilityDecl)
+  declarativeLowering(noCapabilityDecl)
+  noCustomControlFlow(noCapabilityDecl)
+  noHiddenAuthority(noCapabilityDecl)
+  noDirectFactWrite(noCapabilityDecl)
+  lockedContractVersion(noCapabilityDecl, v1)
+  declaredCapability(noCapabilityDecl, schemaCoerce)
+  typedEffectContract(noCapabilityDecl, coerceEff, reviewType, v1)
+  =>*
+  acceptedPackageContract(noCapabilityDecl) .
+
+--- A package declaration whose required capability is not declared by the
+--- package is rejected.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(undeclaredCapabilityDecl)
+  packageDeclKeyword(undeclaredCapabilityDecl, schemaCoercionKeyword)
+  deterministicParse(undeclaredCapabilityDecl)
+  noKeywordConflict(undeclaredCapabilityDecl)
+  declarativeLowering(undeclaredCapabilityDecl)
+  noCustomControlFlow(undeclaredCapabilityDecl)
+  noHiddenAuthority(undeclaredCapabilityDecl)
+  noDirectFactWrite(undeclaredCapabilityDecl)
+  lockedContractVersion(undeclaredCapabilityDecl, v1)
+  typedEffectContract(undeclaredCapabilityDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(undeclaredCapabilityDecl) .
+
+--- A package declaration without a locked contract version is rejected.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(unlockedDecl)
+  packageDeclKeyword(unlockedDecl, schemaCoercionKeyword)
+  deterministicParse(unlockedDecl)
+  noKeywordConflict(unlockedDecl)
+  declarativeLowering(unlockedDecl)
+  noCustomControlFlow(unlockedDecl)
+  noHiddenAuthority(unlockedDecl)
+  noDirectFactWrite(unlockedDecl)
+  declaredCapability(unlockedDecl, schemaCoerce)
+  typedEffectContract(unlockedDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(unlockedDecl) .
+
+--- Accepted source lowers through the normalized registry to a core graph
+--- template with typed output metadata. The kernel commits it later.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graph(g1, coerceEff)
+  expectsOutput(coerceEff, reviewType, v1) .
+
+--- An accepted package contract name alone cannot lower source without a registry
+--- entry.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  graph(g1, coerceEff)
+  expectsOutput(coerceEff, reviewType, v1) .
+
+--- Valid typed-provider output can complete and project a typed fact.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphReady(g1)
+  providerRun(coerceEff)
+  providerOutput(coerceEff, reviewType, v1, valid)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphCommitted(g1)
+  effect(coerceEff, completed)
+  providerRun(coerceEff)
+  expectsOutput(coerceEff, reviewType, v1)
+  providerOutput(coerceEff, reviewType, v1, valid)
+  typedFact(coerceEff, reviewType, v1) .
+
+--- Provider output cannot complete a typed effect without the kernel's
+--- provider-run marker.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphReady(g1)
+  providerOutput(coerceEff, reviewType, v1, valid)
+  =>*
+  effect(coerceEff, completed)
+  typedFact(coerceEff, reviewType, v1) .
+
+--- Provider output for a different contract version cannot project the
+--- registry's typed fact.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphReady(g1)
+  providerRun(coerceEff)
+  providerOutput(coerceEff, reviewType, v2, valid)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  effect(coerceEff, completed)
+  providerRun(coerceEff)
+  expectsOutput(coerceEff, reviewType, v1)
+  providerOutput(coerceEff, reviewType, v2, valid)
+  typedFact(coerceEff, reviewType, v1) .
+
+--- Invalid typed-provider output cannot project a typed fact.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphReady(g1)
+  providerRun(coerceEff)
+  providerOutput(coerceEff, reviewType, v1, invalid)
+  =>*
+  invalidTypedFact(coerceEff) .
+
+--- Invalid typed-provider output fails with a validation diagnostic.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  acceptedPackageContract(goodSchemaCoercion)
+  sourceEffect(goodSchemaCoercion, coerceEff)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphReady(g1)
+  providerRun(coerceEff)
+  providerOutput(coerceEff, reviewType, v1, invalid)
+  =>*
+  acceptedPackageContract(goodSchemaCoercion)
+  registeredEffectContract(coerceEff, reviewType, schemaCoerce, v1)
+  graphCommitted(g1)
+  effect(coerceEff, failed)
+  providerRun(coerceEff)
+  expectsOutput(coerceEff, reviewType, v1)
+  providerOutput(coerceEff, reviewType, v1, invalid)
+  validationDiagnostic(coerceEff) .
+
+--- Direct fact writes block acceptance.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(directFactDecl)
+  packageDeclKeyword(directFactDecl, schemaCoercionKeyword)
+  deterministicParse(directFactDecl)
+  noKeywordConflict(directFactDecl)
+  declarativeLowering(directFactDecl)
+  noCustomControlFlow(directFactDecl)
+  noHiddenAuthority(directFactDecl)
+  lockedContractVersion(directFactDecl, v1)
+  declaredCapability(directFactDecl, schemaCoerce)
+  typedEffectContract(directFactDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(directFactDecl) .
+
+--- Ambiguous keywords block acceptance.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(ambiguousKeywordDecl)
+  packageDeclKeyword(ambiguousKeywordDecl, sharedKeyword)
+  deterministicParse(ambiguousKeywordDecl)
+  declarativeLowering(ambiguousKeywordDecl)
+  noCustomControlFlow(ambiguousKeywordDecl)
+  noHiddenAuthority(ambiguousKeywordDecl)
+  noDirectFactWrite(ambiguousKeywordDecl)
+  lockedContractVersion(ambiguousKeywordDecl, v1)
+  declaredCapability(ambiguousKeywordDecl, schemaCoerce)
+  typedEffectContract(ambiguousKeywordDecl, coerceEff, reviewType, v1)
+  requiredEffectCapability(coerceEff, schemaCoerce)
+  =>*
+  acceptedPackageContract(ambiguousKeywordDecl) .
+
+--- std.files slice F2 coverage: the file.read typed effect contract with
+--- capability id equal to its effect kind (M3 id==kind) is accepted and
+--- registers the typed contract the admission gate reads.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(fileReadDecl)
+  packageDeclKeyword(fileReadDecl, fileReadKeyword)
+  deterministicParse(fileReadDecl)
+  noKeywordConflict(fileReadDecl)
+  declarativeLowering(fileReadDecl)
+  noCustomControlFlow(fileReadDecl)
+  noHiddenAuthority(fileReadDecl)
+  noDirectFactWrite(fileReadDecl)
+  lockedContractVersion(fileReadDecl, v1)
+  declaredCapability(fileReadDecl, fileReadCap)
+  typedEffectContract(fileReadDecl, fileReadEff, fileReadResultType, v1)
+  requiredEffectCapability(fileReadEff, fileReadCap)
+  =>*
+  acceptedPackageContract(fileReadDecl)
+  registeredEffectContract(fileReadEff, fileReadResultType, fileReadCap, v1) .
+
+--- std.files slice F2 negative (bite): a file.read contract whose capability
+--- row is MISSING (the unbound stale-store shape) is never accepted, so no
+--- registry entry exists for the admission gate to bind against.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  packageDeclCandidate(unboundFileReadDecl)
+  packageDeclKeyword(unboundFileReadDecl, fileReadKeyword)
+  deterministicParse(unboundFileReadDecl)
+  noKeywordConflict(unboundFileReadDecl)
+  declarativeLowering(unboundFileReadDecl)
+  noCustomControlFlow(unboundFileReadDecl)
+  noHiddenAuthority(unboundFileReadDecl)
+  noDirectFactWrite(unboundFileReadDecl)
+  lockedContractVersion(unboundFileReadDecl, v1)
+  typedEffectContract(unboundFileReadDecl, fileReadEff, fileReadResultType, v1)
+  requiredEffectCapability(fileReadEff, fileReadCap)
+  =>*
+  acceptedPackageContract(unboundFileReadDecl) .
+
+--- std.agent slice 3 (spec/std-agent.md "Open provider registry") positive:
+--- a provider kind contributed by a known manifest authorizes an agent
+--- binding for that kind, and the contribution row survives (registry data,
+--- not consumed).
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  agentProviderRequest(fixtureKind)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg)
+  =>*
+  authorizedProviderKind(fixtureKind, stdAgentPkg)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg) .
+
+--- std.agent slice 3 negative (bite): a provider kind contributed by NO known
+--- manifest is never authorized — even with other kinds contributed by other
+--- packages in the soup, no path reaches authorizedProviderKind for the
+--- unknown kind, under any binding of the contributing package.
+search [1] in WHIPPLESCRIPT-PACKAGE-CONTRACT :
+  agentProviderRequest(unknownRoboKind)
+  providerKindContributed(fixtureKind, stdAgentPkg)
+  providerKindContributed(ownedKind, stdAgentPkg)
+  =>*
+  authorizedProviderKind(unknownRoboKind, PP:ProviderPackageId)
+  RESIDUAL:Cfg .

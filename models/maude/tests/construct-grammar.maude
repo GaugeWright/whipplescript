@@ -1,0 +1,507 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+
+--- A memory recall construct can be accepted when all source interfaces and
+--- capability contracts resolve through the locked construct graph.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(goodMemoryRecall)
+  constructFamily(goodMemoryRecall, effectOperation)
+  constructKeyword(goodMemoryRecall, recallKeyword)
+  constructLowering(goodMemoryRecall, capabilityCall)
+  noKeywordConflict(goodMemoryRecall)
+  noHiddenRuntime(goodMemoryRecall)
+  noDirectFactWrite(goodMemoryRecall)
+  lockedConstructVersion(goodMemoryRecall, v1)
+  requiresInterface(goodMemoryRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(goodMemoryRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(goodMemoryRecall, memoryQuery)
+  constructEffectContract(goodMemoryRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  providesInterface(effectHandleInterface(memoryContext)) .
+
+--- Accepted source lowers to an effect graph template with explicit required
+--- capability metadata. Kernel graph commit enqueues the effect later.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  constructUse(goodMemoryRecall, e2)
+  =>*
+  acceptedConstruct(goodMemoryRecall)
+  acceptedConstructContract(goodMemoryRecall, e1, memoryContext, memoryQuery, v1)
+  graph(g1, e2)
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  requiredCapability(e2, memoryQuery) .
+
+--- `after recall succeeds as memory` composes through the ordinary effect
+--- handle output type.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  afterSucceeds(e2)
+  =>*
+  loweredConstructEffect(e2, goodMemoryRecall, memoryQuery, memoryContext, v1)
+  terminalBinding(e2, memoryContext)
+  providesInterface(terminalOutputInterface(memoryContext))
+  providesInterface(valueInterface(memoryContext)) .
+
+--- A resource-qualified tracker projection feeds an ordinary typed rule
+--- binding.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  ruleBinding(issueFact, issueType)
+  providesInterface(valueInterface(issueType)) .
+
+--- Two resources of the same family/type can coexist when the source selects
+--- the intended named resource.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  providesInterface(projectionInterface(githubBacklog, issueType))
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  ruleBinding(issueFact, issueType)
+  providesInterface(valueInterface(issueType)) .
+
+--- An operation is ready only when a compatible typed value is available.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, memoryContext)
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, memoryContext)
+  providesInterface(valueInterface(memoryContext))
+  operationReady(agentTellOperation) .
+
+--- Generated operation input facts can require more values than the small
+--- hand-written arity-specific rules model directly.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeeds(agentTellOperation, typeCons(issueType, typeCons(memoryContext, typeCons(jsonType, typeCons(memoryContext, noTypes)))))
+  providesInterface(valueInterface(issueType))
+  providesInterface(valueInterface(memoryContext))
+  providesInterface(valueInterface(jsonType))
+  =>*
+  C:Cfg
+  operationReady(agentTellOperation) .
+
+--- Event sources emit ordinary durable events with typed payload metadata.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(eventSourceInterface(jsonType))
+  eventSourceTick(eventSourceInterface(jsonType), event1)
+  =>*
+  providesInterface(eventSourceInterface(jsonType))
+  event(event1)
+  eventPayload(event1, jsonType) .
+
+--- Runtime execution still needs the package/provider registry. Compile-time
+--- construct acceptance alone does not grant provider authority.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  runtimeCapability(memoryQuery)
+  runtimeProvider(memoryQuery, memoryProvider)
+  runtimeBinding(memoryQuery, memoryProvider)
+  =>*
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  runtimeAuthorized(e2, memoryProvider) .
+
+--- Missing resource/interface resolution blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(missingResourceRecall)
+  constructFamily(missingResourceRecall, effectOperation)
+  constructKeyword(missingResourceRecall, recallKeyword)
+  constructLowering(missingResourceRecall, capabilityCall)
+  noKeywordConflict(missingResourceRecall)
+  noHiddenRuntime(missingResourceRecall)
+  noDirectFactWrite(missingResourceRecall)
+  lockedConstructVersion(missingResourceRecall, v1)
+  requiresInterface(missingResourceRecall, memoryPoolInterface)
+  requiresInterface(missingResourceRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(missingResourceRecall, memoryQuery)
+  constructEffectContract(missingResourceRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(missingResourceRecall) .
+
+--- Missing capability interface resolution blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(missingCapabilityRecall)
+  constructFamily(missingCapabilityRecall, effectOperation)
+  constructKeyword(missingCapabilityRecall, recallKeyword)
+  constructLowering(missingCapabilityRecall, capabilityCall)
+  noKeywordConflict(missingCapabilityRecall)
+  noHiddenRuntime(missingCapabilityRecall)
+  noDirectFactWrite(missingCapabilityRecall)
+  lockedConstructVersion(missingCapabilityRecall, v1)
+  requiresInterface(missingCapabilityRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(missingCapabilityRecall, capabilityInterface(memoryQuery))
+  constructTargetCapability(missingCapabilityRecall, memoryQuery)
+  constructEffectContract(missingCapabilityRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(missingCapabilityRecall) .
+
+--- Ambiguous syntax blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(ambiguousRecall)
+  constructFamily(ambiguousRecall, effectOperation)
+  constructKeyword(ambiguousRecall, sharedKeyword)
+  constructLowering(ambiguousRecall, capabilityCall)
+  noHiddenRuntime(ambiguousRecall)
+  noDirectFactWrite(ambiguousRecall)
+  lockedConstructVersion(ambiguousRecall, v1)
+  requiresInterface(ambiguousRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(ambiguousRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(ambiguousRecall, memoryQuery)
+  constructEffectContract(ambiguousRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(ambiguousRecall) .
+
+--- Hidden runtime behavior blocks construct acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(hiddenRuntimeRecall)
+  constructFamily(hiddenRuntimeRecall, effectOperation)
+  constructKeyword(hiddenRuntimeRecall, recallKeyword)
+  constructLowering(hiddenRuntimeRecall, capabilityCall)
+  noKeywordConflict(hiddenRuntimeRecall)
+  noDirectFactWrite(hiddenRuntimeRecall)
+  lockedConstructVersion(hiddenRuntimeRecall, v1)
+  requiresInterface(hiddenRuntimeRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(hiddenRuntimeRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(hiddenRuntimeRecall, memoryQuery)
+  constructEffectContract(hiddenRuntimeRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(hiddenRuntimeRecall) .
+
+--- Unknown lowering classes cannot be accepted as executable constructs.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedFamily(effectOperation)
+  acceptedLowering(capabilityCall)
+  loweringAllowsFamily(capabilityCall, effectOperation)
+  constructCandidate(unknownLoweringRecall)
+  constructFamily(unknownLoweringRecall, effectOperation)
+  constructKeyword(unknownLoweringRecall, recallKeyword)
+  constructLowering(unknownLoweringRecall, unknownLowering)
+  noKeywordConflict(unknownLoweringRecall)
+  noHiddenRuntime(unknownLoweringRecall)
+  noDirectFactWrite(unknownLoweringRecall)
+  lockedConstructVersion(unknownLoweringRecall, v1)
+  requiresInterface(unknownLoweringRecall, memoryPoolInterface)
+  providesInterface(memoryPoolInterface)
+  requiresInterface(unknownLoweringRecall, capabilityInterface(memoryQuery))
+  providesInterface(capabilityInterface(memoryQuery))
+  constructTargetCapability(unknownLoweringRecall, memoryQuery)
+  constructEffectContract(unknownLoweringRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  acceptedConstruct(unknownLoweringRecall) .
+
+--- Resource identity matters. A Linear backlog projection cannot satisfy a
+--- source use of the GitHub backlog projection even when both payloads are
+--- Issue-shaped.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(projectionInterface(linearBacklog, issueType))
+  projectionUse(projectionInterface(githubBacklog, issueType), issueFact)
+  =>*
+  ruleBinding(issueFact, issueType) .
+
+--- Type identity matters. A MemoryContext value cannot satisfy an operation
+--- input that requires Issue.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeedsValue(agentTellOperation, issueType)
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  operationReady(agentTellOperation) .
+
+--- Generated operation input facts also block readiness when any declared
+--- input type is missing.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  acceptedConstruct(agentTellOperation)
+  operationNeeds(agentTellOperation, typeCons(issueType, typeCons(memoryContext, typeCons(jsonType, noTypes))))
+  providesInterface(valueInterface(issueType))
+  providesInterface(valueInterface(memoryContext))
+  =>*
+  C:Cfg
+  operationReady(agentTellOperation) .
+
+--- An event source cannot bypass durable events and fire a rule directly.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  providesInterface(eventSourceInterface(jsonType))
+  eventSourceTick(eventSourceInterface(jsonType), event1)
+  =>*
+  directRuleFire(event1) .
+
+--- A source construct use cannot lower without an accepted construct contract.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  constructUse(unacceptedRecall, e2)
+  constructEffectContract(unacceptedRecall, e1, memoryContext, v1)
+  effectRequiresCapability(e1, memoryQuery)
+  =>*
+  graph(g1, e2) .
+
+--- Compile-time lowering does not itself authorize a runtime provider.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  effect(e2, queued)
+  requiredCapability(e2, memoryQuery)
+  =>*
+  runtimeAuthorized(e2, memoryProvider) .
+
+--- ====================================================================
+--- DR-0011 Two-Shape Meta-Grammar (S6b) parse coverage + bite.
+--- --------------------------------------------------------------------
+
+--- COVERAGE (a): a well-formed declaration_block parses. `memory pool`
+--- has an identifier name, a required `provider` clause, and an optional
+--- `retain` clause; a statement supplying both clauses reaches parsedUse.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(poolDecl)
+  grammarShape(poolDecl, declBlock)
+  grammarDeclBlock(poolDecl, identifierKind,
+    clauseVal(providerName, noConn, identifierKind),
+    clauseVal(retainName, noConn, durationKind))
+  stmt(poolDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(providerName, noConn, identifierKind)
+      & clauseVal(retainName, noConn, durationKind)))
+  =>*
+  parsedUse(poolDecl) Rest:Cfg .
+
+--- COVERAGE (b): a well-formed slot-only effect_operation parses. `recall`
+--- has a leading `pool` identifier slot and a `for`-connected `query`
+--- expression slot, no payload, required binding.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallUse)
+  grammarShape(recallUse, effectOp)
+  grammarEffectOp(recallUse,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallUse,
+    valT(identifierKind) ; connT(forConn) ; valT(expressionKind) ; bindT)
+  =>*
+  parsedUse(recallUse) Rest:Cfg .
+
+--- COVERAGE (c): a well-formed payload effect_operation parses. `send`
+--- has a `via`-connected `channel` slot and a payload block requiring
+--- `text` with optional `markdown`/`thread_id`, required binding. The
+--- statement supplies `text` plus the optional `markdown`.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendUse)
+  grammarShape(sendUse, effectOp)
+  grammarEffectOp(sendUse,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendUse,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(textField ++ markdownField) ; bindT)
+  =>*
+  parsedUse(sendUse) Rest:Cfg .
+
+--- BITE (a): a missing required connective cannot parse. `recall pool
+--- query` drops the `for` before the query slot, so the value token sits
+--- where the connective was expected and the slot machine is stuck.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallMissingConn)
+  grammarShape(recallMissingConn, effectOp)
+  grammarEffectOp(recallMissingConn,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallMissingConn,
+    valT(identifierKind) ; valT(expressionKind) ; bindT)
+  =>*
+  parsedUse(recallMissingConn) Rest:Cfg .
+
+--- BITE (b): an unknown payload block field cannot parse. `send` with a
+--- `bogus` field that is neither required nor optional leaves the
+--- provided set non-empty, so payload validation never completes.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendUnknownField)
+  grammarShape(sendUnknownField, effectOp)
+  grammarEffectOp(sendUnknownField,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendUnknownField,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(textField ++ bogusField) ; bindT)
+  =>*
+  parsedUse(sendUnknownField) Rest:Cfg .
+
+--- BITE (c): a missing required payload field cannot parse. `send`
+--- without `text` leaves the required-remaining set non-empty, so
+--- payload validation never completes.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(sendMissingText)
+  grammarShape(sendMissingText, effectOp)
+  grammarEffectOp(sendMissingText,
+    slot(channelName, identifierKind, viaConn),
+    withPayload(textField, (markdownField ++ threadIdField)),
+    bindRequired)
+  stmt(sendMissingText,
+    connT(viaConn) ; valT(identifierKind) ; payloadT(markdownField) ; bindT)
+  =>*
+  parsedUse(sendMissingText) Rest:Cfg .
+
+--- BITE (d): a missing required `as` binding cannot parse. `recall` with
+--- a required binding but no trailing `as <binding>` leaves the binding
+--- machine with nothing to consume.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(recallNoBinding)
+  grammarShape(recallNoBinding, effectOp)
+  grammarEffectOp(recallNoBinding,
+    (slot(poolName, identifierKind, noConn) >> slot(queryName, expressionKind, forConn)),
+    noPayload, bindRequired)
+  stmt(recallNoBinding,
+    valT(identifierKind) ; connT(forConn) ; valT(expressionKind))
+  =>*
+  parsedUse(recallNoBinding) Rest:Cfg .
+
+--- BITE (e): a statement matching neither shape cannot parse. A construct
+--- whose grammar shape is neither declaration_block nor effect_operation
+--- has no driver rule, so parsing never starts.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(mysteryUse)
+  grammarShape(mysteryUse, noShape)
+  stmt(mysteryUse, valT(identifierKind))
+  =>*
+  parsedUse(mysteryUse) Rest:Cfg .
+
+--- --------------------------------------------------------------------
+--- DR-0011 amendment (2026-07-08, decl-family migration): flag clauses,
+--- list-valued clauses, multi-word clause names (a PName constant stands
+--- for the phrase; tokenization is Rust-level).
+--- --------------------------------------------------------------------
+
+--- COVERAGE (amendment, flag): a lease-like declaration_block with a bare
+--- `shared` flag clause plus required `key`/`ttl` clauses parses.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(leaseDecl)
+  grammarShape(leaseDecl, declBlock)
+  grammarDeclBlock(leaseDecl, identifierKind,
+    (clauseVal(keyName, noConn, identifierKind) & clauseVal(ttlName, noConn, durationKind)),
+    clauseVal(sharedName, noConn, flagKind))
+  stmt(leaseDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(keyName, noConn, identifierKind)
+      & clauseVal(ttlName, noConn, durationKind)
+      & clauseVal(sharedName, noConn, flagKind)))
+  =>*
+  parsedUse(leaseDecl) Rest:Cfg .
+
+--- COVERAGE (amendment, list + multi-word name): a file-store-like
+--- declaration_block with a required `root` clause and an optional
+--- list-valued `allow read` glob clause parses.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(fileStoreDecl)
+  grammarShape(fileStoreDecl, declBlock)
+  grammarDeclBlock(fileStoreDecl, identifierKind,
+    clauseVal(rootName, noConn, scalarKind),
+    clauseVal(allowReadName, noConn, listOf(globKind)))
+  stmt(fileStoreDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(rootName, noConn, scalarKind)
+      & clauseVal(allowReadName, noConn, listOf(globKind))))
+  =>*
+  parsedUse(fileStoreDecl) Rest:Cfg .
+
+--- COVERAGE (M2 connective clause): a ledger-like declaration_block with a
+--- required `entry` clause and a required `partition by <ident>` connective
+--- clause parses -- the connective is ONE concept shared with Shape 2 slots.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(ledgerDecl)
+  grammarShape(ledgerDecl, declBlock)
+  grammarDeclBlock(ledgerDecl, identifierKind,
+    (clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)),
+    noClauseVals)
+  stmt(ledgerDecl,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)))
+  =>*
+  parsedUse(ledgerDecl) Rest:Cfg .
+
+--- BITE (amendment, flag given a value): a flag clause supplied WITH a
+--- value does not match the flagKind spec, so the clause block never
+--- completes -- `shared 3` is a parse error, not a lenient accept.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(leaseFlagValued)
+  grammarShape(leaseFlagValued, declBlock)
+  grammarDeclBlock(leaseFlagValued, identifierKind,
+    clauseVal(keyName, noConn, identifierKind),
+    clauseVal(sharedName, noConn, flagKind))
+  stmt(leaseFlagValued,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(keyName, noConn, identifierKind)
+      & clauseVal(sharedName, noConn, scalarKind)))
+  =>*
+  parsedUse(leaseFlagValued) Rest:Cfg .
+
+--- BITE (amendment, single where list required): a single glob supplied to
+--- a list-valued clause does not match listOf(glob), so the block never
+--- completes -- the list marker is enforced, not decorative.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(fileStoreSingleGlob)
+  grammarShape(fileStoreSingleGlob, declBlock)
+  grammarDeclBlock(fileStoreSingleGlob, identifierKind,
+    clauseVal(rootName, noConn, scalarKind),
+    clauseVal(allowReadName, noConn, listOf(globKind)))
+  stmt(fileStoreSingleGlob,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(rootName, noConn, scalarKind)
+      & clauseVal(allowReadName, noConn, globKind)))
+  =>*
+  parsedUse(fileStoreSingleGlob) Rest:Cfg .
+
+--- BITE (M2 connective missing): a connective clause supplied WITHOUT its
+--- connective cannot parse. `partition <tenant>` (no `by`) is
+--- clauseVal(partition, noConn, ident), which does not match the spec's
+--- clauseVal(partition, byConn, ident) -- so the required clause is never
+--- satisfied. This is the behavior change: the old parser accepted a
+--- missing `by` with a warning; the connective is now mandatory, matching
+--- Shape 2 (`recall pool query` without `for` is likewise a parse error).
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAMMAR :
+  beginParse(ledgerMissingBy)
+  grammarShape(ledgerMissingBy, declBlock)
+  grammarDeclBlock(ledgerMissingBy, identifierKind,
+    (clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, byConn, identifierKind)),
+    noClauseVals)
+  stmt(ledgerMissingBy,
+    nameT(identifierKind) ;
+    clausesT(clauseVal(entryName, noConn, identifierKind)
+      & clauseVal(partitionName, noConn, identifierKind)))
+  =>*
+  parsedUse(ledgerMissingBy) Rest:Cfg .

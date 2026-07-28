@@ -5,6 +5,9 @@
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
             );
+            CREATE UNIQUE INDEX events_instance_idempotency_key_idx
+                ON events(instance_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
             CREATE TABLE facts (
                 fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL,
@@ -154,14 +157,6 @@
                 attachment_id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
                 skill_id TEXT NOT NULL, UNIQUE(scope_type, scope_id, skill_id)
             );
-            CREATE TABLE inbox_items (
-                inbox_item_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT,
-                status TEXT NOT NULL, prompt TEXT NOT NULL, choices_json TEXT NOT NULL DEFAULT '[]',
-                freeform_allowed INTEGER NOT NULL DEFAULT 1, severity TEXT NOT NULL DEFAULT 'normal',
-                related_effects_json TEXT NOT NULL DEFAULT '[]',
-                related_artifacts_json TEXT NOT NULL DEFAULT '[]', answer_json TEXT, answered_by TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, answered_at TEXT
-            );
             CREATE TABLE package_registrations (
                 package_id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
                 manifest_json TEXT NOT NULL
@@ -187,6 +182,22 @@
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
+            CREATE TABLE inbox_items (
+                inbox_item_id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL,
+                effect_id TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                choices_json TEXT NOT NULL DEFAULT '[]',
+                freeform_allowed INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                answer_hash TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                answered_at TEXT
+            );
+            CREATE UNIQUE INDEX idx_inbox_pending_effect
+                ON inbox_items(instance_id, effect_id)
+                WHERE status = 'pending';
             CREATE TABLE tracker_events (
                 event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
@@ -196,7 +207,7 @@
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
                 labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
-                claim_summary TEXT, filed_by TEXT,
+                claim_summary TEXT, assigned_to TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );

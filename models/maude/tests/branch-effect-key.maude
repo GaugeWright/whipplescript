@@ -1,0 +1,41 @@
+load ../branch-effect-key.maude
+
+--- Silent corruption DEMONSTRATED, direction 1: under the naive key, the
+--- counterfactual branch's firing of the same version-node is absorbed into
+--- the real effect -- a reachable normal form holds only mainline's effect
+--- though both branches fired.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  ncreate(brMain, v1, n1) ncreate(brCf, v1, n1) ncreated(mtKeys)
+  =>! neffect(key(v1, n1), brMain) ncreated(KS:KeySet) .
+
+--- Silent corruption DEMONSTRATED, direction 2: the REAL firing dedupes
+--- against the counterfactual one -- production state ends up pointing at
+--- an effect a counterfactual branch executed.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  ncreate(brMain, v1, n1) ncreate(brCf, v1, n1) ncreated(mtKeys)
+  =>! neffect(key(v1, n1), brCf) ncreated(KS:KeySet) .
+
+--- Coverage: with the branch id in the key, both branches' firings of the
+--- same version-node coexist as distinct effects in every normal form.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  bcreate(brMain, v1, n1) bcreate(brCf, v1, n1) bcreated(mtKeys)
+  =>! beffect(bkey(brMain, v1, n1)) beffect(bkey(brCf, v1, n1))
+      bcreated(KS:KeySet) .
+
+--- Bite: the corruption is REJECTED -- no normal form absorbs one branch's
+--- firing into the other's effect; a one-effect outcome is unreachable.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  bcreate(brMain, v1, n1) bcreate(brCf, v1, n1) bcreated(mtKeys)
+  =>! beffect(bkey(B:Br, v1, n1)) bcreated(KS:KeySet) .
+
+--- Coverage: within ONE branch the unique index still absorbs a repeated
+--- firing -- branch-distinct keys do not forfeit idempotency.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  bcreate(brMain, v1, n1) bcreate(brMain, v1, n1) bcreated(mtKeys)
+  =>! beffect(bkey(brMain, v1, n1)) bcreated(KS:KeySet) .
+
+--- Bite: one branch-version-node never yields two effects.
+search [1] in WHIPPLESCRIPT-BRANCH-EFFECT-KEY :
+  bcreate(brMain, v1, n1) bcreate(brMain, v1, n1) bcreated(mtKeys)
+  =>* beffect(bkey(brMain, v1, n1)) beffect(bkey(brMain, v1, n1))
+      RESIDUAL:Cfg .

@@ -1,0 +1,22 @@
+--- Owned brokered agent harness, slice 3: bash command sandbox.
+--- Companion to DR-0024. The owned harness bash tool is default-deny: a command
+--- executes only when it matches the allow-list prefixes in env
+--- WHIPPLESCRIPT_HARNESS_BASH_ALLOW, and runs with the workspace as cwd. This
+--- models the core sandbox invariant: no command runs without an allow-list
+--- match. OS-level writable-root confinement is a later refinement; the command
+--- allow-list is the v0 boundary, the same model as the exec capability.
+mod WHIPPLESCRIPT-OWNED-HARNESS-SANDBOX is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op running : -> Cfg [ctor] .       --- turn is active
+  op bashAllowed : -> Cfg [ctor] .   --- the requested command matches the allow-list
+  op bashRan : -> Cfg [ctor] .       --- evidence the command executed
+
+  --- A bash command executes only when it matches the allow-list, which persists
+  --- and is not consumed. Dropping bashAllowed from the lhs would make an unlisted
+  --- command runnable, which is the bite.
+  rl [bash] : running bashAllowed => running bashAllowed bashRan .
+endm

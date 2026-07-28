@@ -1,0 +1,31 @@
+--- DR-0034: managed vs. delegated harnesses. Companion to
+--- spec/decision-records/0034-managed-vs-delegated-harnesses.md. The harness class
+--- is a two-valued sort (Managed vs Delegated), and the guarantee it selects splits
+--- the knob surface: context-assembly knobs (compaction, with-skills) are
+--- Managed-only, delegation knobs (settings / ambient config) are Delegated-only,
+--- and each is REJECTED on the other class rather than silently applied -- Decision
+--- 3. The safety property modeled here: a wrong-class knob never takes effect. There
+--- is no rule applying a delegation knob to a Managed agent, nor a context-assembly
+--- knob to a Delegated agent, so `configured` is unreachable from a mismatched pair
+--- -- the silent-no-op the flat enum allowed today is ruled out.
+mod WHIPPLESCRIPT-HARNESS-CLASS is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op managed : -> Cfg [ctor] .          --- a Managed (owned) agent
+  op delegated : -> Cfg [ctor] .        --- a Delegated (external) agent
+  op compactionKnob : -> Cfg [ctor] .   --- a context-assembly (Managed-only) knob
+  op settingsKnob : -> Cfg [ctor] .     --- a delegation (Delegated-only) knob
+  op configured : -> Cfg [ctor] .       --- the knob took effect on a compatible agent
+
+  --- A context-assembly knob applies ONLY to a Managed agent. There is no rule
+  --- consuming `compactionKnob` alongside `delegated`, so it can never configure a
+  --- Delegated agent -- applying it there is a compile error, not a no-op.
+  rl [apply-context-knob] : managed compactionKnob => managed configured .
+
+  --- A delegation knob applies ONLY to a Delegated agent. Symmetrically, there is no
+  --- rule consuming `settingsKnob` alongside `managed`.
+  rl [apply-delegation-knob] : delegated settingsKnob => delegated configured .
+endm

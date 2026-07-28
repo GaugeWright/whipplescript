@@ -36,9 +36,74 @@ impl CoerceProvider {
     /// Default API base URL (overridable for the Codex backend or a mock).
     pub fn default_base_url(self) -> &'static str {
         match self {
-            CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => "https://api.openai.com",
+            // The OpenAi (Responses) and Anthropic builders append the full
+            // `/v1/...` path themselves, so their default base is the bare host.
+            CoerceProvider::OpenAi => "https://api.openai.com",
             CoerceProvider::Anthropic => "https://api.anthropic.com",
+            // The OpenAiCompat builder appends only `/chat/completions` (the
+            // OpenAI-SDK `base_url` convention: the `/v1` version segment lives
+            // in base_url), so the default MUST carry `/v1` — otherwise the
+            // request 404s at `.../chat/completions`. Live-confirmed 2026-07-19.
+            CoerceProvider::OpenAiCompat => "https://api.openai.com/v1",
         }
+    }
+}
+
+/// Default `max_tokens` for a coerce call — owned ONCE by std.coercion
+/// (spec/std-coercion.md "Config-plane reconciliation"); both operator doors
+/// (native env + `whip auth`, DO `coerce_config_json`) inherit it.
+pub const DEFAULT_COERCE_MAX_TOKENS: u32 = 4096;
+/// Default coerce timeout in seconds, owned once alongside
+/// [`DEFAULT_COERCE_MAX_TOKENS`].
+pub const DEFAULT_COERCE_TIMEOUT_SECS: u64 = 120;
+
+/// The ONE canonical resolved coerce configuration record
+/// (spec/std-coercion.md "Config-plane reconciliation"). Both operator doors
+/// build exactly this: the native CLI resolver (env + `whip auth` + registry
+/// default — `coerce_runtime`) and the DO secrets door (`coerce_config_json`,
+/// `do_wasm::parse_coerce_config`). The kernel and both hosts see only the
+/// record, never a plane.
+pub struct ResolvedCoercionConfig {
+    /// The selected `schema_coercer` provider id as recorded on runs/terminals
+    /// and folded into the coercion-config fingerprint (e.g. `native`, or the
+    /// backend name when the operator override selects one directly).
+    pub provider_id: String,
+    /// Which provider API the call targets (config, not a separate provider —
+    /// spec/std-coercion.md "Providers").
+    pub backend: CoerceProvider,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+    /// `Some(account_id)` when the OpenAI credential is the Codex OAuth token,
+    /// so the call targets the codex backend (SSE) instead of `api.openai.com`.
+    /// A native-door affordance: the DO secrets door carries explicit API keys
+    /// only and always leaves this `None`.
+    pub codex_account_id: Option<String>,
+}
+
+// Credentials are operator-plane secrets and never enter logs/facts/evidence:
+// Debug redacts the key (only its presence is reported).
+impl std::fmt::Debug for ResolvedCoercionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCoercionConfig")
+            .field("provider_id", &self.provider_id)
+            .field("backend", &self.backend)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<none>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("codex_account_id", &self.codex_account_id)
+            .finish()
     }
 }
 
@@ -538,9 +603,11 @@ pub fn parse_response(
     wrapped: bool,
 ) -> CoerceResult {
     if !(200..300).contains(&response.status) {
-        return failed_result(
+        return failed_result_classified(
             format!("provider returned HTTP {}", response.status),
             provider_error_excerpt(&response.body),
+            "provider_error",
+            Some(response.status),
         );
     }
     match provider {
@@ -693,10 +760,29 @@ fn provider_error_excerpt(body: &Value) -> Option<String> {
 }
 
 fn failed_result(reason: String, provider_error: Option<String>) -> CoerceResult {
+    // Un-classified sites are response-shape/validation failures.
+    failed_result_classified(reason, provider_error, "invalid_output", None)
+}
+
+/// DR-0032 P3 (per-kind failure extras): coerce failures carry a coarse
+/// `error_class` — `provider_error` (non-2xx), `invalid_output` (unusable
+/// response shape/schema), `network` (transport) — and, for provider errors,
+/// the `http_status`. Both are redaction-safe (a classification and a number),
+/// which is what lets them ride the bound failure value (Decision 4).
+fn failed_result_classified(
+    reason: String,
+    provider_error: Option<String>,
+    error_class: &str,
+    http_status: Option<u16>,
+) -> CoerceResult {
     let mut error = json!({
         "reason": reason,
         "recoverable": true,
+        "error_class": error_class,
     });
+    if let Some(status) = http_status {
+        error["http_status"] = Value::from(status);
+    }
     if let Some(provider_error) = provider_error {
         error["provider_error"] = Value::String(provider_error);
     }
@@ -802,7 +888,12 @@ impl StepMachine for CoerceStepMachine<'_> {
                 })
             }
             Some(IoResult::Http(Err(CoerceTransportError::Transport(message)))) => {
-                Outcome::Settle(failed_result(format!("transport error: {message}"), None))
+                Outcome::Settle(failed_result_classified(
+                    format!("transport error: {message}"),
+                    None,
+                    "network",
+                    None,
+                ))
             }
         }
     }
@@ -1147,6 +1238,43 @@ mod tests {
             .headers
             .iter()
             .any(|(k, v)| k == "authorization" && v == "Bearer sk-test"));
+    }
+
+    #[test]
+    fn openai_compat_default_base_url_carries_v1_so_the_default_is_usable() {
+        // Regression (live-confirmed 2026-07-19 against Ollama): the OpenAiCompat
+        // builder appends only `/chat/completions`, so its default base MUST
+        // already include the `/v1` version segment — otherwise a caller relying
+        // on the default (or pointing at real OpenAI without a manual `/v1`) 404s
+        // at `.../chat/completions`. OpenAi/Anthropic keep the bare-host default
+        // because their builders add `/v1/...` themselves.
+        assert_eq!(
+            CoerceProvider::OpenAiCompat.default_base_url(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            CoerceProvider::OpenAi.default_base_url(),
+            "https://api.openai.com"
+        );
+        // Building with the default base must yield a valid `/v1/chat/completions`
+        // URL, not the broken `.../chat/completions`.
+        let schema = json!({ "type": "object" });
+        let call = CoerceCall {
+            provider: CoerceProvider::OpenAiCompat,
+            base_url: CoerceProvider::OpenAiCompat.default_base_url(),
+            api_key: "sk-test",
+            model: "gpt-4o-mini",
+            prompt: "Classify this",
+            output_schema: &schema,
+            schema_name: "WorkReview",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "",
+        };
+        assert_eq!(
+            build_request(&call).url,
+            "https://api.openai.com/v1/chat/completions"
+        );
     }
 
     #[test]

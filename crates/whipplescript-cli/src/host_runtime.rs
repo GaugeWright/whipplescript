@@ -5,10 +5,10 @@
 //! provide only opaque-reference resolvers. Secrets and resource bodies are
 //! resolved after admission and never enter the host command or receipt.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,28 +16,39 @@ use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, HumanAskRequest, ImageBlock, NoopCompactor, ToolExecutor,
-    ToolOutcome, ToolSpec, ToolStatus,
+    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
+    ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
+use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_kernel::{
     idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
-use whipplescript_parser::IrProgram;
 use whipplescript_store::{
     EffectCancellationRequest, EvidenceRecord, NewEffect, NewEvent, RuleCommit, SqliteStore,
     StoreError,
 };
 
 use crate::host_protocol::{
-    AnswerHumanAskCommand, EventPosition, ForkInstanceCommand, ForkedInstance, HumanAnswerReceipt,
-    LabeledHumanAsk, LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance, PolicyEpochRef,
-    ProtocolError, ProviderBindingRef, ResourceRef, RuntimeEvidencePointer, StartTurnCommand,
-    TurnReceipt, TurnStatus, HOST_PROTOCOL,
+    EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent, OpenInstanceCommand,
+    OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
+    RuntimeEvidencePointer, StartTurnCommand, TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
+pub use whipplescript_kernel::host_package::{
+    AuthoredAgentPackage, PackageResolver, ResolvedPackage, AGENT_PACKAGE_MANIFEST,
+    AGENT_PACKAGE_SCHEMA,
+};
 
+// Retained temporarily in source history while downstream code moves to the
+// placement-neutral kernel package implementation above. This block is never
+// compiled; keeping it isolated makes the extraction reviewable without
+// changing the native facade and DO vertical in separate semantic steps.
+#[cfg(any())]
+#[rustfmt::skip]
+mod retired_native_package_implementation {
+use super::*;
 /// Canonical manifest name for an authored agent package consumed by the
 /// persistent host facade.
 pub const AGENT_PACKAGE_MANIFEST: &str = "package.json";
@@ -390,6 +401,7 @@ impl ResolvedPackage {
 pub trait PackageResolver {
     fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String>;
 }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelProvider {
@@ -541,7 +553,7 @@ pub struct ResolvedImage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WitnessedWrite {
     pub path: String,
-    /// `"add"` (path did not exist before) or `"modify"`.
+    /// `"add"`, `"modify"`, or `"delete"`.
     pub kind: String,
     pub content_hash: String,
     pub bytes: u64,
@@ -583,85 +595,6 @@ pub trait ResourceResolver {
     fn take_turn_witness(&self) -> TurnWitness {
         TurnWitness::Unavailable
     }
-
-    /// Resolve a package-declared human question after WhippleScript has
-    /// admitted the turn's `human` resource. Implementations may further refuse
-    /// the crossing but cannot manufacture authority or answer it themselves.
-    fn request_human(
-        &self,
-        _admitted_resources: &[ResourceRef],
-        _call: &ToolCall,
-    ) -> Result<HumanAskRequest, String> {
-        Err("human interaction is not configured for this host".to_owned())
-    }
-}
-
-/// Host realization request for a command that WhippleScript has already
-/// parsed and admitted. The host may further restrict it (for example with an
-/// OS sandbox), but must not widen the command or timeout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdmittedCommand {
-    pub command: String,
-    pub workspace_root: PathBuf,
-    pub read_only_paths: Vec<PathBuf>,
-    pub timeout: Duration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandExecutionOutput {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: Option<i32>,
-}
-
-pub trait CommandExecutor: Send + Sync {
-    fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String>;
-}
-
-/// WhippleScript-owned command admission policy. `allowed_prefixes = None` is
-/// an explicit host grant for any simple command; `Some([])` is deny-all.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeCommandPolicy {
-    allowed_prefixes: Option<Vec<String>>,
-    max_timeout: Duration,
-}
-
-impl NativeCommandPolicy {
-    pub fn allow_any(max_timeout: Duration) -> Self {
-        Self {
-            allowed_prefixes: None,
-            max_timeout,
-        }
-    }
-
-    pub fn allow_prefixes(
-        prefixes: impl IntoIterator<Item = String>,
-        max_timeout: Duration,
-    ) -> Self {
-        Self {
-            allowed_prefixes: Some(
-                prefixes
-                    .into_iter()
-                    .map(|prefix| prefix.trim().to_owned())
-                    .filter(|prefix| !prefix.is_empty())
-                    .collect(),
-            ),
-            max_timeout,
-        }
-    }
-
-    fn admits(&self, command: &str) -> bool {
-        let Some(prefixes) = &self.allowed_prefixes else {
-            return true;
-        };
-        let command = command.trim();
-        prefixes.iter().any(|prefix| {
-            command == prefix
-                || command
-                    .strip_prefix(prefix)
-                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        })
-    }
 }
 
 /// WhippleScript-owned native implementation of the workspace capability used
@@ -672,10 +605,13 @@ pub struct NativeWorkspaceResolver {
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
-    command: Option<(NativeCommandPolicy, Arc<dyn CommandExecutor>)>,
     /// The per-turn workspace witness (DR-0036 §1): every mutation this
-    /// resolver performs is recorded; a native command taints the segment
-    /// because it mutates outside the mediated surface.
+    /// resolver performs is recorded. `taint` marks the segment *unwitnessed*
+    /// so the turn declines the cut honestly if an unmediated channel ever
+    /// mutates the workspace. No channel does today — `bash` runs in the
+    /// in-isolate Bashkit shell and every effect is witnessed — so `witness_taint`
+    /// is a reserved hook for a future native-OS command tool (see
+    /// spec/native-command-tool-tracker.md).
     witness: std::sync::Mutex<WitnessState>,
 }
 
@@ -687,13 +623,23 @@ struct WitnessState {
 }
 
 impl NativeWorkspaceResolver {
-    fn witness_write(&self, path: &str, existed: bool, content: &str) {
+    fn witness_write(&self, path: &str, existed: bool, content: &[u8]) {
         let mut state = self.witness.lock().expect("witness lock");
         state.writes.push(WitnessedWrite {
             path: path.to_owned(),
             kind: if existed { "modify" } else { "add" }.to_owned(),
-            content_hash: sha256_hex(content.as_bytes()),
+            content_hash: sha256_hex(content),
             bytes: content.len() as u64,
+        });
+    }
+
+    fn witness_delete(&self, path: &str) {
+        let mut state = self.witness.lock().expect("witness lock");
+        state.writes.push(WitnessedWrite {
+            path: path.to_owned(),
+            kind: "delete".to_owned(),
+            content_hash: sha256_hex(&[]),
+            bytes: 0,
         });
     }
 
@@ -702,6 +648,14 @@ impl NativeWorkspaceResolver {
         state.reads.push(path.to_owned());
     }
 
+    /// Marks the current turn segment *unwitnessed* (DR-0036 honest-decline):
+    /// `take_turn_witness` then reports `Unwitnessed` and the receipt omits the
+    /// workspace-cut claim rather than fabricating one. RESERVED HOOK: no
+    /// channel taints today (all mutations go through the mediated tool surface
+    /// / Bashkit), so this has no caller. A future native-OS command tool must
+    /// call it (or bring its own witnessing) — tracked in
+    /// spec/native-command-tool-tracker.md.
+    #[allow(dead_code)]
     fn witness_taint(&self, reason: &str) {
         let mut state = self.witness.lock().expect("witness lock");
         if state.taint.is_none() {
@@ -723,7 +677,6 @@ impl NativeWorkspaceResolver {
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
-            command: None,
             witness: std::sync::Mutex::new(WitnessState::default()),
         })
     }
@@ -734,15 +687,6 @@ impl NativeWorkspaceResolver {
             .map(|path| normalize_relative(&path))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self)
-    }
-
-    pub fn command_execution(
-        mut self,
-        policy: NativeCommandPolicy,
-        executor: Arc<dyn CommandExecutor>,
-    ) -> Self {
-        self.command = Some((policy, executor));
-        self
     }
 
     fn resolve(&self, path: &str, write: bool) -> Result<PathBuf, String> {
@@ -822,7 +766,7 @@ impl NativeWorkspaceResolver {
         let existed = resolved.exists();
         fs::write(&resolved, content)
             .map_err(|error| format!("cannot write workspace path `{path}`: {error}"))?;
-        self.witness_write(path, existed, content);
+        self.witness_write(path, existed, content.as_bytes());
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
@@ -848,7 +792,7 @@ impl NativeWorkspaceResolver {
         }
         fs::write(&resolved, &text)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
-        self.witness_write(path, true, &text);
+        self.witness_write(path, true, text.as_bytes());
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
@@ -916,53 +860,101 @@ impl NativeWorkspaceResolver {
     }
 
     fn bash(&self, arguments: &Value) -> Result<String, String> {
-        let (policy, executor) = self
-            .command
-            .as_ref()
-            .ok_or_else(|| "command execution is not configured for this workspace".to_owned())?;
         let command = string_argument(arguments, "command")?.trim();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
-        if !policy.admits(command) {
-            return Err(format!(
-                "command refused by the admitted allow-list: `{command}`"
-            ));
-        }
-        validate_simple_command(command, &self.read_only)?;
         let requested = Duration::from_secs(
             arguments
                 .get("timeout")
                 .and_then(Value::as_u64)
                 .unwrap_or(30),
         );
-        if requested.is_zero() || requested > policy.max_timeout {
-            return Err(format!(
-                "command timeout must be between 1 and {} seconds",
-                policy.max_timeout.as_secs()
-            ));
+        if requested.is_zero() || requested > Duration::from_secs(30) {
+            return Err("command timeout must be between 1 and 30 seconds".to_owned());
         }
-        // The command mutates the workspace outside the mediated tool surface:
-        // the turn's workspace cut can no longer be claimed as complete
-        // (turn-witness.maude's taint) — the receipt will decline honestly.
-        self.witness_taint("a native command ran outside the mediated tool surface");
-        let output = executor.execute(&AdmittedCommand {
-            command: command.to_owned(),
-            workspace_root: self.root.clone(),
-            read_only_paths: self
-                .read_only
-                .iter()
-                .map(|path| self.root.join(path))
-                .collect(),
-            timeout: requested,
+
+        let mut before = BTreeMap::new();
+        let mut files = Vec::new();
+        let mut load_error = None;
+        walk_workspace(&self.root, &self.root, &mut |relative, absolute| {
+            if files.len() >= 5_000 {
+                load_error = Some("bash workspace contains more than 5000 files".to_owned());
+                return false;
+            }
+            match fs::read(absolute) {
+                Ok(content) => {
+                    let relative = relative.replace('\\', "/");
+                    let path = Path::new(&relative);
+                    let writable = !self
+                        .read_only
+                        .iter()
+                        .any(|protected| path.starts_with(protected));
+                    before.insert(relative.clone(), content.clone());
+                    files.push(ShellFile {
+                        path: relative,
+                        content,
+                        writable,
+                    });
+                    true
+                }
+                Err(error) => {
+                    load_error = Some(format!(
+                        "cannot load bash workspace file `{relative}`: {error}"
+                    ));
+                    false
+                }
+            }
         })?;
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+
+        let output = WhipShell::default().execute(ShellRequest {
+            command: command.to_owned(),
+            timeout: requested,
+            files,
+        })?;
+        // Validate every result path and mutation before changing the real
+        // workspace. This preserves the same capability and read-only ceilings
+        // as the first-class file tools.
+        for (path, content) in &output.files {
+            let resolved = self.resolve(path, true)?;
+            if let Some(parent) = resolved.parent() {
+                reject_symlinks_between(&self.root, parent, path)?;
+            }
+            let _ = content;
+        }
+        let after_paths = output.files.keys().cloned().collect::<BTreeSet<_>>();
+        for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
+            let resolved = self.resolve(removed, true)?;
+            fs::remove_file(&resolved).map_err(|error| {
+                format!("cannot delete bash workspace path `{removed}`: {error}")
+            })?;
+            self.witness_delete(removed);
+        }
+        for (path, content) in &output.files {
+            if before.get(path) == Some(content) {
+                continue;
+            }
+            let resolved = self.resolve(path, true)?;
+            if let Some(parent) = resolved.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
+                reject_symlinks_between(&self.root, parent, path)?;
+            }
+            let existed = before.contains_key(path);
+            fs::write(&resolved, content)
+                .map_err(|error| format!("cannot write bash workspace path `{path}`: {error}"))?;
+            self.witness_write(path, existed, content);
+        }
+
         let mut combined = output.stdout;
         combined.push_str(&output.stderr);
         let combined = self.cap(combined);
         match output.exit_code {
-            Some(0) => Ok(combined),
-            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
-            None => Err(format!("command terminated by signal\n{combined}")),
+            0 => Ok(combined),
+            code => Err(format!("command exited with status {code}\n{combined}")),
         }
     }
 }
@@ -1027,72 +1019,12 @@ impl ResourceResolver for NativeWorkspaceResolver {
             },
         }
     }
-
-    fn request_human(
-        &self,
-        admitted_resources: &[ResourceRef],
-        call: &ToolCall,
-    ) -> Result<HumanAskRequest, String> {
-        if call.name != "ask_human" {
-            return Err("tool is not the governed human interface".to_owned());
-        }
-        if !admitted_resources
-            .iter()
-            .any(|resource| resource.kind == "human")
-        {
-            return Err("turn has no admitted human capability".to_owned());
-        }
-        let question = string_argument(&call.arguments, "question")?.trim();
-        if question.is_empty() || question.len() > 10_000 {
-            return Err("human question must contain 1 to 10000 bytes".to_owned());
-        }
-        let choices = call
-            .arguments
-            .get("choices")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|choice| !choice.is_empty() && choice.len() <= 256)
-                            .map(str::to_owned)
-                            .ok_or_else(|| {
-                                "human choices must be nonempty strings up to 256 bytes".to_owned()
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        if choices.len() > 20 {
-            return Err("human question may offer at most 20 choices".to_owned());
-        }
-        let mut unique = choices.clone();
-        unique.sort();
-        unique.dedup();
-        if unique.len() != choices.len() {
-            return Err("human question choices must be unique".to_owned());
-        }
-        let freeform_allowed = call
-            .arguments
-            .get("freeform_allowed")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if choices.is_empty() && !freeform_allowed {
-            return Err("human question must allow freeform or offer a choice".to_owned());
-        }
-        Ok(HumanAskRequest {
-            call_id: call.id.clone(),
-            question: question.to_owned(),
-            choices,
-            freeform_allowed,
-        })
-    }
 }
 
+#[cfg(any())]
+#[rustfmt::skip]
+mod retired_native_tool_schema_implementation {
+use super::*;
 /// The model-facing workspace tools owned by WhippleScript. An embedding host
 /// selects whether mutation is present; it cannot redefine their schemas or
 /// execution semantics.
@@ -1110,16 +1042,14 @@ pub fn native_workspace_tool_specs_with_command(
 pub fn native_workspace_tool_specs_with_capabilities(
     writable: bool,
     command_execution: bool,
-    human_interaction: bool,
 ) -> Vec<ToolSpec> {
-    native_workspace_tool_specs_from_registry(true, writable, command_execution, human_interaction)
+    native_workspace_tool_specs_from_registry(true, writable, command_execution)
 }
 
 pub fn native_workspace_tool_specs_from_registry(
     readable: bool,
     writable: bool,
     command_execution: bool,
-    human_interaction: bool,
 ) -> Vec<ToolSpec> {
     let mut tools = if readable {
         vec![
@@ -1201,21 +1131,6 @@ pub fn native_workspace_tool_specs_from_registry(
             }),
         ));
     }
-    if human_interaction {
-        tools.push(tool_spec(
-            "ask_human",
-            "Pause this turn for one attributable human answer under the current policy epoch.",
-            json!({
-                "type": "object", "properties": {
-                    "question": { "type": "string", "minLength": 1, "maxLength": 10000 },
-                    "choices": { "type": "array", "maxItems": 20, "items": {
-                        "type": "string", "minLength": 1, "maxLength": 256
-                    }},
-                    "freeform_allowed": { "type": "boolean" }
-                }, "required": ["question"], "additionalProperties": false
-            }),
-        ));
-    }
     tools
 }
 
@@ -1226,6 +1141,16 @@ fn tool_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
         input_schema,
     }
 }
+}
+
+/// Compatibility names for existing native embedding consumers. The schemas
+/// now come from the placement-neutral kernel module used by the DO host too.
+pub use whipplescript_kernel::host_package::{
+    workspace_tool_specs as native_workspace_tool_specs,
+    workspace_tool_specs_from_registry as native_workspace_tool_specs_from_registry,
+    workspace_tool_specs_with_capabilities as native_workspace_tool_specs_with_capabilities,
+    workspace_tool_specs_with_command as native_workspace_tool_specs_with_command,
+};
 
 fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments
@@ -1342,132 +1267,6 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
     previous[text.len()]
 }
 
-fn validate_simple_command(command: &str, read_only: &[PathBuf]) -> Result<(), String> {
-    let words = simple_command_words(command)?;
-    let executable = words
-        .first()
-        .ok_or_else(|| "command must contain an executable".to_owned())?;
-    let executable_name = Path::new(executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(executable);
-    const SHELLS: &[&str] = &[
-        "sh",
-        "bash",
-        "dash",
-        "zsh",
-        "fish",
-        "cmd",
-        "cmd.exe",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-    ];
-    if words.iter().any(|word| SHELLS.contains(&word.as_str())) {
-        return Err("nested shell execution is not permitted".to_owned());
-    }
-    if matches!(
-        executable_name,
-        "python" | "python3" | "node" | "ruby" | "perl"
-    ) && words.iter().any(|word| word == "-c" || word == "-e")
-    {
-        return Err("inline interpreter programs are not permitted".to_owned());
-    }
-
-    for word in words.iter().skip(1) {
-        let candidate = word.split_once('=').map(|(_, value)| value).unwrap_or(word);
-        if candidate.is_empty() || candidate.starts_with('-') || !looks_path_shaped(candidate) {
-            continue;
-        }
-        let relative = normalize_relative(Path::new(candidate))?;
-        if read_only
-            .iter()
-            .any(|protected| relative.starts_with(protected))
-        {
-            return Err(format!(
-                "command path argument `{candidate}` enters a read-only workspace subtree"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn looks_path_shaped(word: &str) -> bool {
-    word == "."
-        || word == ".."
-        || word.starts_with("./")
-        || word.starts_with("../")
-        || word.starts_with('/')
-        || word.starts_with('~')
-        || word.contains('/')
-        || word.contains('\\')
-}
-
-fn simple_command_words(command: &str) -> Result<Vec<String>, String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut quote: Option<char> = None;
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                } else {
-                    current.push(ch);
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '$' | '`' => {
-                    return Err("shell expansion is not permitted".to_owned());
-                }
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
-                    if !matches!(escaped, '"' | '\\') {
-                        return Err("only quote/backslash escapes are permitted".to_owned());
-                    }
-                    current.push(escaped);
-                }
-                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
-                _ => current.push(ch),
-            },
-            None => match ch {
-                '\'' | '"' => quote = Some(ch),
-                '\\' => {
-                    let escaped = chars
-                        .next()
-                        .ok_or_else(|| "command has a trailing escape".to_owned())?;
-                    current.push(escaped);
-                }
-                '\n' | '\r' => return Err("command separators are not permitted".to_owned()),
-                ch if ch.is_whitespace() => {
-                    if !current.is_empty() {
-                        words.push(std::mem::take(&mut current));
-                    }
-                }
-                '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | ';' | '|' | '&' | '('
-                | ')' | '<' | '>' => {
-                    return Err(format!(
-                        "shell operator or expansion `{ch}` is not permitted"
-                    ));
-                }
-                _ => current.push(ch),
-            },
-            Some(_) => unreachable!(),
-        }
-    }
-    if quote.is_some() {
-        return Err("command has an unterminated quote".to_owned());
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    Ok(words)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedToolCall {
     pub call_id: String,
@@ -1513,7 +1312,6 @@ pub struct TurnExecution {
     /// has no terminal receipt by construction.
     pub receipt: Option<TurnReceipt>,
     pub output: Option<LabeledTurnOutput>,
-    pub pending_human_ask: Option<LabeledHumanAsk>,
 }
 
 impl TurnExecution {
@@ -1526,39 +1324,11 @@ impl TurnExecution {
             .cloned()
             .map(RuntimeEvidencePointer::Event)
             .collect::<Vec<_>>();
-        if let Some(ask) = &self.pending_human_ask {
-            pointers.push(RuntimeEvidencePointer::HumanAsk(ask.clone()));
-        }
         if let Some(receipt) = &self.receipt {
             pointers.push(RuntimeEvidencePointer::TurnReceipt(receipt.clone()));
         }
         pointers
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HumanAnswerExecution {
-    pub answer_receipt: HumanAnswerReceipt,
-    pub turn: TurnExecution,
-}
-
-impl HumanAnswerExecution {
-    pub fn evidence_pointers(&self) -> Vec<RuntimeEvidencePointer> {
-        let mut pointers = vec![RuntimeEvidencePointer::HumanAnswer(
-            self.answer_receipt.clone(),
-        )];
-        pointers.extend(self.turn.evidence_pointers());
-        pointers
-    }
-}
-
-/// One durable human suspension recovered from WhippleScript's owned store.
-/// The original command is returned so an embedding host can resume the exact
-/// admitted turn after a process restart without inspecting runtime internals.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingHumanTurn {
-    pub command: StartTurnCommand,
-    pub ask: LabeledHumanAsk,
 }
 
 /// Out-of-band cooperative cancellation capability for one admitted host
@@ -2038,9 +1808,6 @@ impl GovernedHostRuntime {
         R: ResourceResolver + ?Sized,
     {
         self.admit_command(command, packages)?;
-        if let Some(suspended) = self.pending_execution(command)? {
-            return Ok(suspended);
-        }
         let binding = self.resolve_provider(command, secrets)?;
         let driver = NativeHttpDriver::new(binding.timeout);
         self.run_admitted_turn(command, packages, resources, binding, &driver)
@@ -2064,268 +1831,8 @@ impl GovernedHostRuntime {
         H: HostDriver,
     {
         self.admit_command(command, packages)?;
-        if let Some(suspended) = self.pending_execution(command)? {
-            return Ok(suspended);
-        }
         let binding = self.resolve_provider(command, secrets)?;
         self.run_admitted_turn(command, packages, resources, binding, driver)
-    }
-
-    /// Recover the pending human suspension, if any, for an instance. This is
-    /// the restart-safe discovery surface for embedding hosts: WhippleScript
-    /// reconstructs and re-admits the original command, then projects only the
-    /// labeled question intended for the authenticated human surface.
-    pub fn pending_human_turn<P>(
-        &self,
-        instance_ref: &str,
-        packages: &P,
-    ) -> Result<Option<PendingHumanTurn>, HostRuntimeError>
-    where
-        P: PackageResolver + ?Sized,
-    {
-        let mut pending = self
-            .kernel
-            .store()
-            .list_inbox_items(Some("pending"))
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .filter(|item| item.instance_id == instance_ref);
-        let Some(item) = pending.next() else {
-            return Ok(None);
-        };
-        if pending.next().is_some() {
-            return Err(HostRuntimeError::Incomplete(
-                "instance has more than one pending human ask".to_owned(),
-            ));
-        }
-        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
-            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
-        })?;
-        let effect = self
-            .kernel
-            .store()
-            .list_effects(instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .find(|effect| effect.effect_id == effect_id)
-            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
-        let command: StartTurnCommand =
-            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
-        if command.instance_ref != instance_ref || command.command_id != effect_id {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "pending human turn",
-            )));
-        }
-        self.admit_command(&command, packages)?;
-        let execution = self.pending_execution(&command)?.ok_or_else(|| {
-            HostRuntimeError::Incomplete("pending human ask cannot be projected".to_owned())
-        })?;
-        let ask = execution.pending_human_ask.ok_or_else(|| {
-            HostRuntimeError::Incomplete("pending human ask projection is empty".to_owned())
-        })?;
-        Ok(Some(PendingHumanTurn { command, ask }))
-    }
-
-    /// Admit an attributable human answer and resume the exact suspended turn
-    /// under its unchanged policy epoch using the native HTTP transport.
-    pub fn answer_human_ask<P, S, R>(
-        &mut self,
-        answer: &AnswerHumanAskCommand,
-        packages: &P,
-        secrets: &S,
-        resources: &R,
-    ) -> Result<HumanAnswerExecution, HostRuntimeError>
-    where
-        P: PackageResolver + ?Sized,
-        S: SecretResolver + ?Sized,
-        R: ResourceResolver + ?Sized,
-    {
-        let pending_command = self.human_answer_turn_command(answer, packages)?;
-        let binding = self.resolve_provider(&pending_command, secrets)?;
-        let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
-        if turn_command != pending_command {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human answer turn changed during admission",
-            )));
-        }
-        let driver = NativeHttpDriver::new(binding.timeout);
-        let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, &driver)?;
-        Ok(HumanAnswerExecution {
-            answer_receipt,
-            turn,
-        })
-    }
-
-    /// Sans-I/O-driver form of [`Self::answer_human_ask`].
-    pub fn answer_human_ask_with_driver<P, S, R, H>(
-        &mut self,
-        answer: &AnswerHumanAskCommand,
-        packages: &P,
-        secrets: &S,
-        resources: &R,
-        driver: &H,
-    ) -> Result<HumanAnswerExecution, HostRuntimeError>
-    where
-        P: PackageResolver + ?Sized,
-        S: SecretResolver + ?Sized,
-        R: ResourceResolver + ?Sized,
-        H: HostDriver,
-    {
-        let pending_command = self.human_answer_turn_command(answer, packages)?;
-        let binding = self.resolve_provider(&pending_command, secrets)?;
-        let (turn_command, answer_receipt) = self.admit_human_answer(answer, packages)?;
-        if turn_command != pending_command {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human answer turn changed during admission",
-            )));
-        }
-        let turn = self.run_admitted_turn(&turn_command, packages, resources, binding, driver)?;
-        Ok(HumanAnswerExecution {
-            answer_receipt,
-            turn,
-        })
-    }
-
-    /// Recover and validate the suspended turn without consuming the answer.
-    /// Provider resolution happens against this immutable command before the
-    /// inbox item is mutated, so a missing credential leaves the ask pending.
-    fn human_answer_turn_command<P>(
-        &self,
-        answer: &AnswerHumanAskCommand,
-        packages: &P,
-    ) -> Result<StartTurnCommand, HostRuntimeError>
-    where
-        P: PackageResolver + ?Sized,
-    {
-        answer.validate()?;
-        self.require_policy(&answer.policy)?;
-        let item = self
-            .kernel
-            .store()
-            .get_inbox_item(&answer.ask_ref)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| HostRuntimeError::Incomplete(answer.ask_ref.clone()))?;
-        if item.instance_id != answer.instance_ref {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human ask instance",
-            )));
-        }
-        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
-            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
-        })?;
-        let effect = self
-            .kernel
-            .store()
-            .list_effects(&answer.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .find(|effect| effect.effect_id == effect_id)
-            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
-        let turn_command: StartTurnCommand =
-            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
-        if turn_command.instance_ref != answer.instance_ref || turn_command.policy != answer.policy
-        {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human answer turn/policy",
-            )));
-        }
-        self.admit_command(&turn_command, packages)?;
-        Ok(turn_command)
-    }
-
-    fn admit_human_answer<P>(
-        &mut self,
-        answer: &AnswerHumanAskCommand,
-        packages: &P,
-    ) -> Result<(StartTurnCommand, HumanAnswerReceipt), HostRuntimeError>
-    where
-        P: PackageResolver + ?Sized,
-    {
-        answer.validate()?;
-        self.require_policy(&answer.policy)?;
-        let item = self
-            .kernel
-            .store()
-            .get_inbox_item(&answer.ask_ref)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| HostRuntimeError::Incomplete(answer.ask_ref.clone()))?;
-        if item.instance_id != answer.instance_ref {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human ask instance",
-            )));
-        }
-        let effect_id = item.effect_id.as_deref().ok_or_else(|| {
-            HostRuntimeError::Incomplete("human ask has no suspended turn".to_owned())
-        })?;
-        let effect = self
-            .kernel
-            .store()
-            .list_effects(&answer.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .find(|effect| effect.effect_id == effect_id)
-            .ok_or_else(|| HostRuntimeError::Incomplete(effect_id.to_owned()))?;
-        let turn_command: StartTurnCommand =
-            serde_json::from_str(&effect.input_json).map_err(HostRuntimeError::Json)?;
-        if turn_command.instance_ref != answer.instance_ref || turn_command.policy != answer.policy
-        {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "human answer turn/policy",
-            )));
-        }
-        self.admit_command(&turn_command, packages)?;
-        let waiting_event = self
-            .kernel
-            .store()
-            .list_events(&answer.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .rev()
-            .find(|event| {
-                event.event_type == "agent.turn.awaiting_human"
-                    && serde_json::from_str::<Value>(&event.payload_json)
-                        .ok()
-                        .and_then(|payload| {
-                            payload
-                                .get("inbox_item_id")
-                                .and_then(Value::as_str)
-                                .map(|id| id == answer.ask_ref)
-                        })
-                        .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                HostRuntimeError::Incomplete("human ask has no suspension event".to_owned())
-            })?;
-        let waiting_payload: Value =
-            serde_json::from_str(&waiting_event.payload_json).map_err(HostRuntimeError::Json)?;
-        let call_id = required_string(&waiting_payload, "call_id")?;
-        let answered = self
-            .kernel
-            .answer_brokered_human_ask(
-                &answer.instance_ref,
-                &turn_command.command_id,
-                &answer.ask_ref,
-                &call_id,
-                &answer.answer,
-                &answer.respondent_ref,
-                &answer.answer_id,
-            )
-            .map_err(HostRuntimeError::Store)?;
-        let receipt = HumanAnswerReceipt {
-            protocol: HOST_PROTOCOL.to_owned(),
-            answer_id: answer.answer_id.clone(),
-            ask_ref: answer.ask_ref.clone(),
-            turn_command_id: turn_command.command_id.clone(),
-            instance_ref: answer.instance_ref.clone(),
-            policy: answer.policy.clone(),
-            respondent_ref: answer.respondent_ref.clone(),
-            answered_at: EventPosition {
-                instance_ref: answer.instance_ref.clone(),
-                sequence: positive_sequence(answered.sequence)?,
-            },
-        };
-        receipt.validate_for(answer)?;
-        Ok((turn_command, receipt))
     }
 
     fn admit_command<P>(
@@ -2458,6 +1965,8 @@ impl GovernedHostRuntime {
                             &command.command_id,
                             "host-turn-commit",
                         ])),
+                        marks: &[],
+                        context_json: None,
                     })
                     .map_err(HostRuntimeError::Store)?;
                 false
@@ -2562,9 +2071,6 @@ impl GovernedHostRuntime {
         // resolver, so the receipt aggregates the durable segments instead of
         // trusting any single resolver instance.
         self.record_witness_segment(command, resources)?;
-        if let Some(suspended) = self.pending_execution(command)? {
-            return Ok(suspended);
-        }
         self.finish_execution(command)
     }
 
@@ -2905,7 +2411,6 @@ impl GovernedHostRuntime {
             events,
             receipt: Some(receipt),
             output,
-            pending_human_ask: None,
         })
     }
 
@@ -3027,87 +2532,6 @@ impl GovernedHostRuntime {
         Ok(projected)
     }
 
-    fn pending_execution(
-        &self,
-        command: &StartTurnCommand,
-    ) -> Result<Option<TurnExecution>, HostRuntimeError> {
-        let pending = self
-            .kernel
-            .store()
-            .list_inbox_items(Some("pending"))
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .find(|item| {
-                item.instance_id == command.instance_ref
-                    && item.effect_id.as_deref() == Some(command.command_id.as_str())
-            });
-        let Some(item) = pending else {
-            return Ok(None);
-        };
-        let events = self
-            .kernel
-            .store()
-            .list_events(&command.instance_ref)
-            .map_err(HostRuntimeError::Store)?;
-        let event = events
-            .iter()
-            .rev()
-            .find(|event| {
-                event.event_type == "agent.turn.awaiting_human"
-                    && serde_json::from_str::<Value>(&event.payload_json)
-                        .ok()
-                        .and_then(|payload| {
-                            payload
-                                .get("inbox_item_id")
-                                .and_then(Value::as_str)
-                                .map(|id| id == item.inbox_item_id)
-                        })
-                        .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                HostRuntimeError::Incomplete("pending human ask has no runtime event".to_owned())
-            })?;
-        let payload: Value =
-            serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
-        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
-        let evidence = self
-            .kernel
-            .store()
-            .list_evidence_for_subject("run", &run_id)
-            .map_err(HostRuntimeError::Store)?
-            .into_iter()
-            .find(|evidence| {
-                evidence.kind == "human.ask"
-                    && evidence.correlation_id.as_deref()
-                        == payload.get("call_id").and_then(Value::as_str)
-            })
-            .ok_or_else(|| {
-                HostRuntimeError::Incomplete("pending human ask has no evidence".to_owned())
-            })?;
-        let ask = LabeledHumanAsk {
-            protocol: HOST_PROTOCOL.to_owned(),
-            ask_ref: item.inbox_item_id,
-            command_id: command.command_id.clone(),
-            instance_ref: command.instance_ref.clone(),
-            policy: command.policy.clone(),
-            position: EventPosition {
-                instance_ref: command.instance_ref.clone(),
-                sequence: positive_sequence(event.sequence)?,
-            },
-            label_ref: self.label_ref(),
-            evidence_ref: format!("whip:evidence:{}", evidence.evidence_id),
-            question: item.prompt,
-            choices: serde_json::from_str(&item.choices_json).map_err(HostRuntimeError::Json)?,
-            freeform_allowed: item.freeform_allowed,
-        };
-        Ok(Some(TurnExecution {
-            events: self.project_events(command, &run_id)?,
-            receipt: None,
-            output: self.project_turn_output(command, None)?,
-            pending_human_ask: Some(ask),
-        }))
-    }
-
     fn stored_execution(
         &self,
         command: &StartTurnCommand,
@@ -3189,7 +2613,6 @@ impl GovernedHostRuntime {
             events: projected,
             receipt: Some(receipt),
             output,
-            pending_human_ask: None,
         }))
     }
 
@@ -3369,19 +2792,6 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
             return ToolOutcome {
                 status: ToolStatus::Error,
                 content: "tool is not declared by the pinned package".to_owned(),
-            };
-        }
-        if call.name == "ask_human" {
-            return match self.resolver.request_human(self.admitted_resources, call) {
-                Ok(request) => ToolOutcome {
-                    status: ToolStatus::Suspended,
-                    content: serde_json::to_string(&request)
-                        .unwrap_or_else(|_| "invalid human ask".to_owned()),
-                },
-                Err(message) => ToolOutcome {
-                    status: ToolStatus::Error,
-                    content: message,
-                },
             };
         }
         match self.resolver.execute_tool(self.admitted_resources, call) {
@@ -3735,40 +3145,6 @@ workflow UnsafeHostChat {
         }
     }
 
-    struct HumanPackages;
-
-    impl PackageResolver for HumanPackages {
-        fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
-            ResolvedPackage::compile(
-                version_ref,
-                r#"
-workflow HumanHostChat {
-  agent assistant {
-    provider owned
-    profile "human-review"
-    capacity 1
-  }
-
-  rule converse
-    when started
-  => {
-    tell assistant
-      with access to human {
-        ask
-      }
-      "host turn"
-  }
-}
-"#,
-                Some("HumanHostChat"),
-                "assistant",
-                "Ask only when an attributable human answer is required.",
-                native_workspace_tool_specs_with_capabilities(false, false, true),
-                4,
-            )
-        }
-    }
-
     struct Secrets {
         calls: Cell<usize>,
     }
@@ -3790,18 +3166,6 @@ workflow HumanHostChat {
                 256,
                 Duration::from_secs(1),
             ))
-        }
-    }
-
-    struct FailingSecrets;
-
-    impl SecretResolver for FailingSecrets {
-        fn resolve_provider(
-            &self,
-            _binding: &ProviderBindingRef,
-            _placement_ceiling_ref: &str,
-        ) -> Result<ResolvedProviderBinding, String> {
-            Err("provider credential is unavailable".to_owned())
         }
     }
 
@@ -3895,21 +3259,18 @@ workflow HumanHostChat {
                 ("file:/workspace".to_owned(), labeled(false)),
                 ("provider:openai".to_owned(), labeled(true)),
                 ("provider:owned".to_owned(), labeled(true)),
-                ("human:operator".to_owned(), labeled(true)),
                 ("placement:local".to_owned(), labeled(true)),
             ]),
             bindings: BTreeMap::from([
                 ("project".to_owned(), "file:/workspace".to_owned()),
                 ("model".to_owned(), "provider:openai".to_owned()),
                 ("owned".to_owned(), "provider:owned".to_owned()),
-                ("human".to_owned(), "human:operator".to_owned()),
                 ("local".to_owned(), "placement:local".to_owned()),
             ]),
             capabilities: BTreeSet::from([
                 "workspace.read".to_owned(),
                 "workspace.write".to_owned(),
                 "command.run".to_owned(),
-                "human.ask".to_owned(),
             ]),
             provider_bindings: BTreeMap::from([(
                 "model".to_owned(),
@@ -3983,34 +3344,6 @@ workflow HumanHostChat {
         }
     }
 
-    fn human_turn(instance_ref: &str, policy: &PolicyEpochRef) -> StartTurnCommand {
-        StartTurnCommand {
-            protocol: HOST_PROTOCOL.to_owned(),
-            command_id: "command-human".to_owned(),
-            run_ref: "gaugedesk:run:human".to_owned(),
-            instance_ref: instance_ref.to_owned(),
-            package_version_ref: "package:human".to_owned(),
-            policy: policy.clone(),
-            actor_ref: "operator".to_owned(),
-            input: TurnInput {
-                text: "Ask me for the missing color.".to_owned(),
-                images: Vec::new(),
-            },
-            resources: vec![ResourceRef {
-                handle: "human".to_owned(),
-                kind: "human".to_owned(),
-                selector: None,
-            }],
-            provider_binding: ProviderBindingRef {
-                binding_id: "model".to_owned(),
-                credential: CredentialRef {
-                    credential_id: "credential:model".to_owned(),
-                },
-            },
-            placement_ceiling_ref: "local".to_owned(),
-        }
-    }
-
     #[test]
     fn persistent_owned_turn_reopens_with_transcript_and_never_persists_secret() {
         let path = temp_store();
@@ -4042,7 +3375,7 @@ workflow HumanHostChat {
                 &ScriptedDriver::new(Vec::new()),
             )
             .expect_err("unknown actor must not exceed the public ceiling");
-        assert!(denied.to_string().contains("identity-ceiling violation"));
+        assert!(denied.to_string().contains("denied read in rule"));
         assert_eq!(secrets.calls.get(), 0, "denied actor resolves no secret");
         let first_driver = ScriptedDriver::new(vec![
             json!({
@@ -4147,190 +3480,6 @@ workflow HumanHostChat {
 
         let bytes = fs::read(&path).expect("store bytes");
         assert!(!String::from_utf8_lossy(&bytes).contains("secret-that-must-not-be-persisted"));
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
-        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
-    }
-
-    #[test]
-    fn governed_human_ask_suspends_without_a_terminal_and_resumes_same_epoch() {
-        let path = temp_store();
-        let workspace = std::env::temp_dir().join(format!(
-            "whip-host-human-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&workspace).expect("workspace");
-        let policy_text = signed_policy();
-        let mut runtime = GovernedHostRuntime::open(&path, 12, &policy_text).expect("runtime");
-        let open = OpenInstanceCommand {
-            protocol: HOST_PROTOCOL.to_owned(),
-            request_id: "open-human-chat".to_owned(),
-            package_version_ref: "package:human".to_owned(),
-            policy: runtime.policy_ref().clone(),
-        };
-        let instance = runtime
-            .open_instance(&open, &HumanPackages)
-            .expect("human instance");
-        let command = human_turn(&instance.instance_ref, &open.policy);
-        let secrets = Secrets {
-            calls: Cell::new(0),
-        };
-        let resources = NativeWorkspaceResolver::new(&workspace).expect("resources");
-        let ask_driver = ScriptedDriver::new(vec![json!({
-            "output": [{
-                "type": "function_call",
-                "call_id": "ask-color",
-                "name": "ask_human",
-                "arguments": "{\"question\":\"Which color?\",\"choices\":[\"blue\",\"green\"],\"freeform_allowed\":false}"
-            }],
-            "usage": { "input_tokens": 10, "output_tokens": 4 }
-        })]);
-        let suspended = runtime
-            .run_turn_with_driver(&command, &HumanPackages, &secrets, &resources, &ask_driver)
-            .expect("turn suspends");
-        assert!(suspended.receipt.is_none(), "suspension is not terminal");
-        let ask = suspended.pending_human_ask.expect("labeled human ask");
-        assert_eq!(ask.question, "Which color?");
-        assert_eq!(ask.choices, vec!["blue", "green"]);
-        assert!(!ask.freeform_allowed);
-        assert_eq!(ask.policy, command.policy);
-
-        let secret_calls = secrets.calls.get();
-        let replay = runtime
-            .run_turn_with_driver(
-                &command,
-                &HumanPackages,
-                &secrets,
-                &resources,
-                &ScriptedDriver::new(Vec::new()),
-            )
-            .expect("pending replay");
-        assert_eq!(
-            replay.pending_human_ask.as_ref().map(|ask| &ask.ask_ref),
-            Some(&ask.ask_ref)
-        );
-        assert_eq!(
-            secrets.calls.get(),
-            secret_calls,
-            "reading a pending ask must not resolve provider secrets"
-        );
-
-        drop(runtime);
-        let mut runtime = GovernedHostRuntime::open(&path, 12, &policy_text)
-            .expect("reopen runtime after suspension");
-        let recovered = runtime
-            .pending_human_turn(&instance.instance_ref, &HumanPackages)
-            .expect("discover pending ask after restart")
-            .expect("pending human turn");
-        assert_eq!(recovered.command, command);
-        assert_eq!(recovered.ask, ask);
-        assert_eq!(
-            secrets.calls.get(),
-            secret_calls,
-            "pending discovery must not resolve provider secrets"
-        );
-
-        let mut wrong_epoch = command.policy.clone();
-        wrong_epoch.epoch += 1;
-        let mismatch = AnswerHumanAskCommand {
-            protocol: HOST_PROTOCOL.to_owned(),
-            answer_id: "answer-wrong-epoch".to_owned(),
-            ask_ref: ask.ask_ref.clone(),
-            instance_ref: instance.instance_ref.clone(),
-            policy: wrong_epoch,
-            respondent_ref: "authority:alice".to_owned(),
-            answer: "blue".to_owned(),
-        };
-        assert!(runtime
-            .answer_human_ask_with_driver(
-                &mismatch,
-                &HumanPackages,
-                &secrets,
-                &resources,
-                &ScriptedDriver::new(Vec::new()),
-            )
-            .is_err());
-
-        let answer = AnswerHumanAskCommand {
-            protocol: HOST_PROTOCOL.to_owned(),
-            answer_id: "answer-color".to_owned(),
-            ask_ref: ask.ask_ref,
-            instance_ref: instance.instance_ref.clone(),
-            policy: command.policy.clone(),
-            respondent_ref: "authority:alice".to_owned(),
-            answer: "blue".to_owned(),
-        };
-        let unavailable = runtime
-            .answer_human_ask_with_driver(
-                &answer,
-                &HumanPackages,
-                &FailingSecrets,
-                &resources,
-                &ScriptedDriver::new(Vec::new()),
-            )
-            .expect_err("unavailable provider must not consume the answer");
-        assert!(matches!(unavailable, HostRuntimeError::Resolver(_)));
-        let still_pending = runtime
-            .pending_human_turn(&instance.instance_ref, &HumanPackages)
-            .expect("recover ask after provider failure")
-            .expect("provider failure leaves ask pending");
-        assert_eq!(still_pending.ask.ask_ref, answer.ask_ref);
-
-        let resumed_driver = ScriptedDriver::new(vec![json!({
-            "output_text": "Blue it is.",
-            "usage": { "input_tokens": 16, "output_tokens": 4 }
-        })]);
-        let resumed = runtime
-            .answer_human_ask_with_driver(
-                &answer,
-                &HumanPackages,
-                &secrets,
-                &resources,
-                &resumed_driver,
-            )
-            .expect("answer resumes turn");
-        resumed
-            .answer_receipt
-            .validate_for(&answer)
-            .expect("attributable answer receipt");
-        assert_eq!(
-            resumed.turn.receipt.as_ref().expect("terminal").status,
-            TurnStatus::Completed
-        );
-        assert_eq!(
-            resumed
-                .turn
-                .output
-                .as_ref()
-                .map(|output| output.assistant_text.as_str()),
-            Some("Blue it is.")
-        );
-        let request = resumed_driver.requests.borrow();
-        let body = request.first().expect("resumed model request").to_string();
-        assert!(body.contains("authority:alice"));
-        assert!(body.contains("blue"));
-        let run = runtime
-            .kernel
-            .store()
-            .list_runs(&instance.instance_ref)
-            .expect("runs")
-            .into_iter()
-            .find(|run| run.effect_id == command.command_id)
-            .expect("brokered run");
-        let metadata: Value = serde_json::from_str(&run.metadata_json).expect("run metadata");
-        assert_eq!(metadata.get("steps").and_then(Value::as_u64), Some(2));
-        assert_eq!(
-            metadata
-                .pointer("/usage/input_tokens")
-                .and_then(Value::as_u64),
-            Some(26)
-        );
-
-        let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite-shm"));
@@ -4595,21 +3744,7 @@ workflow HumanHostChat {
     }
 
     #[test]
-    fn native_command_tool_requires_governance_and_rejects_shell_bypasses() {
-        struct StubExecutor {
-            calls: std::sync::Mutex<Vec<AdmittedCommand>>,
-        }
-        impl CommandExecutor for StubExecutor {
-            fn execute(&self, command: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
-                self.calls.lock().expect("calls").push(command.clone());
-                Ok(CommandExecutionOutput {
-                    stdout: "clean\n".to_owned(),
-                    stderr: String::new(),
-                    exit_code: Some(0),
-                })
-            }
-        }
-
+    fn native_command_tool_is_governed_virtual_bash() {
         let root = std::env::temp_dir().join(format!(
             "whip-native-command-{}-{}",
             std::process::id(),
@@ -4619,17 +3754,10 @@ workflow HumanHostChat {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join(".pi")).expect("dirs");
-        let executor = Arc::new(StubExecutor {
-            calls: std::sync::Mutex::new(Vec::new()),
-        });
         let resolver = NativeWorkspaceResolver::new(&root)
             .expect("resolver")
             .read_only([PathBuf::from(".pi")])
-            .expect("read-only")
-            .command_execution(
-                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
-                executor.clone(),
-            );
+            .expect("read-only");
         let project_only = [ResourceRef {
             handle: "project".to_owned(),
             kind: "file_store".to_owned(),
@@ -4650,36 +3778,33 @@ workflow HumanHostChat {
         };
 
         assert!(resolver
-            .execute_tool(&project_only, &call("git status"))
+            .execute_tool(&project_only, &call("date +%s"))
             .is_err());
         assert_eq!(
             resolver
-                .execute_tool(&admitted, &call("git status"))
+                .execute_tool(&admitted, &call("date +%s"))
                 .expect("admitted command"),
-            "clean\n"
+            "0\n"
         );
-        for refused in [
-            "cargo test",
-            "git status; rm -rf .",
-            "git status | cat",
-            "git status $(touch bad)",
-            "sh -c 'git status'",
-            "git status .pi/SYSTEM.md",
-            "git status ../outside",
-        ] {
-            assert!(
-                resolver.execute_tool(&admitted, &call(refused)).is_err(),
-                "refused {refused}"
-            );
-        }
-        let calls = executor.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].workspace_root, root.canonicalize().expect("root"));
-        assert_eq!(calls[0].timeout, Duration::from_secs(30));
+        resolver
+            .execute_tool(&admitted, &call("printf hello | tr a-z A-Z > output.txt"))
+            .expect("pipeline");
+        assert_eq!(
+            fs::read_to_string(root.join("output.txt")).expect("virtual bash delta"),
+            "HELLO"
+        );
+        assert!(resolver
+            .execute_tool(&admitted, &call("echo tampered > .pi/SYSTEM.md"))
+            .is_err());
+        assert!(resolver
+            .execute_tool(&admitted, &call("definitely-not-a-bashkit-command"))
+            .is_err());
+        // `bash` is served entirely by the in-isolate virtual shell (Bashkit):
+        // there is no OS command executor to invoke — the seam was removed once
+        // Bashkit became the only command path (DR-0039).
         assert!(native_workspace_tool_specs_with_command(true, true)
             .iter()
             .any(|tool| tool.name == "bash"));
-        drop(calls);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4768,17 +3893,6 @@ workflow HostChat {
     /// declines the cut instead of fabricating one.
     #[test]
     fn receipt_workspace_cut_and_dynamic_guarantees_from_witnessed_turn() {
-        struct StubExecutor;
-        impl CommandExecutor for StubExecutor {
-            fn execute(&self, _: &AdmittedCommand) -> Result<CommandExecutionOutput, String> {
-                Ok(CommandExecutionOutput {
-                    stdout: "clean\n".to_owned(),
-                    stderr: String::new(),
-                    exit_code: Some(0),
-                })
-            }
-        }
-
         let path = temp_store();
         let workspace = std::env::temp_dir().join(format!(
             "whip-host-cut-{}-{}",
@@ -4811,12 +3925,7 @@ workflow HostChat {
         let instance = runtime
             .open_instance(&open, &CutPackages)
             .expect("instance");
-        let resources = NativeWorkspaceResolver::new(&workspace)
-            .expect("resolver")
-            .command_execution(
-                NativeCommandPolicy::allow_prefixes(["git".to_owned()], Duration::from_secs(60)),
-                Arc::new(StubExecutor),
-            );
+        let resources = NativeWorkspaceResolver::new(&workspace).expect("resolver");
         let secrets = Secrets {
             calls: Cell::new(0),
         };
@@ -5009,9 +4118,9 @@ workflow HostChat {
             Some(0)
         );
 
-        // Turn 4: a native command mutates outside the mediated surface, so
-        // the receipt declines the cut (turn-witness.maude) and scope
-        // guarantees report not-evaluated instead of fabricating.
+        // Turn 4: bash remains inside the same witnessed virtual workspace.
+        // Unsupported real-git behavior fails honestly as a tool result, but
+        // it does not create an unmediated mutation channel or taint the cut.
         let mut command4 = turn(&instance.instance_ref, &open.policy, 4);
         command4.resources.push(ResourceRef {
             handle: "command".to_owned(),
@@ -5041,16 +4150,12 @@ workflow HostChat {
                 ]),
             )
             .expect("turn 4");
-        assert_eq!(
-            turn4.receipt.expect("terminal").workspace_cut_ref,
-            None,
-            "an unmediated mutation channel declines the cut"
+        assert!(
+            turn4.receipt.expect("terminal").workspace_cut_ref.is_some(),
+            "virtual bash preserves the complete workspace witness"
         );
         let guarantee4 = guarantee_metadata(&runtime, &command4);
-        assert_eq!(
-            dynamic_outcome(&guarantee4, "writes_within:src").0,
-            "not_evaluated"
-        );
+        assert_eq!(dynamic_outcome(&guarantee4, "writes_within:src").0, "held");
 
         drop(runtime);
         let _ = fs::remove_dir_all(&workspace);
@@ -5122,7 +4227,8 @@ workflow Fingerprint {
   "workflow": "Method",
   "agent": "assistant",
   "system_prompt": "persona.md",
-  "capabilities": ["workspace.write", "workspace.read", "human.ask"],
+  "capabilities": ["workspace.write", "workspace.read"],
+  "agent_abilities": ["workspace.write", "workspace.read"],
   "max_steps": 8
 }}"#
             ),
@@ -5137,12 +4243,11 @@ workflow Method {
     provider owned
     profile "repo-writer"
     capacity 1
-    capabilities ["human.ask", "workspace.read", "workspace.write"]
+    capabilities ["workspace.read", "workspace.write"]
   }
   rule converse when started => {
-    tell assistant requires ["workspace.read", "workspace.write", "human.ask"]
+    tell assistant requires ["workspace.read", "workspace.write"]
       with access to project { read ["**"] write ["**"] }
-      with access to human { ask }
       "Run the method."
   }
 }
@@ -5158,7 +4263,6 @@ workflow Method {
             .expect("pinned package resolves");
         assert!(resolved.tools.iter().any(|tool| tool.name == "read"));
         assert!(resolved.tools.iter().any(|tool| tool.name == "write"));
-        assert!(resolved.tools.iter().any(|tool| tool.name == "ask_human"));
         assert!(!resolved.tools.iter().any(|tool| tool.name == "bash"));
         assert!(package.resolve("whip:agent-package:stale").is_err());
 
@@ -5170,15 +4274,16 @@ workflow Method {
 
     #[test]
     fn authored_agent_package_rejects_manifest_source_capability_drift() {
-        let manifest = AuthoredAgentPackageManifest {
-            schema: AGENT_PACKAGE_SCHEMA.to_owned(),
-            source: "method.whip".to_owned(),
-            workflow: "Method".to_owned(),
-            agent: "assistant".to_owned(),
-            system_prompt: "persona.md".to_owned(),
-            capabilities: vec!["workspace.read".to_owned()],
-            max_steps: 8,
-        };
+        let manifest = json!({
+            "schema": AGENT_PACKAGE_SCHEMA,
+            "source": "method.whip",
+            "workflow": "Method",
+            "agent": "assistant",
+            "system_prompt": "persona.md",
+            "capabilities": ["workspace.read"],
+            "agent_abilities": ["workspace.read"],
+            "max_steps": 8,
+        });
         let source = r#"
 workflow Method {
   agent assistant {
@@ -5189,13 +4294,8 @@ workflow Method {
   }
 }
 "#;
-        let error = AuthoredAgentPackage::from_parts(
-            "{}".to_owned(),
-            manifest,
-            source.to_owned(),
-            "persona".to_owned(),
-        )
-        .expect_err("registry drift must fail");
+        let error = AuthoredAgentPackage::from_documents(manifest.to_string(), source, "persona")
+            .expect_err("registry drift must fail");
         assert!(error.contains("capabilities do not match"));
     }
 
@@ -5210,6 +4310,7 @@ workflow Method {
   "agent":"assistant",
   "system_prompt":"persona.md",
   "capabilities":[],
+  "agent_abilities":[],
   "max_steps":4
 }}"#
             ),

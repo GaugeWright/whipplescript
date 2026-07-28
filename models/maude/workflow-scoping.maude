@@ -1,0 +1,71 @@
+--- Workflow-local name scoping and headerless rejection, per spec/language.md
+--- "Scope And Visibility": top-level declarations are public within the include
+--- closure (globals), declarations nested in a `workflow Foo { ... }` block are
+--- private to that workflow, and a program must declare at least one explicit
+--- `workflow`. Companion to the parser's whole-program validation pass (each
+--- workflow lowered against globals + its own locals) and the headerless reject.
+---
+--- The model mirrors the implementation's partition directly: globals(GS) is the
+--- set of top-level (program.items) names; locals(W, LS) is the set of names a
+--- workflow block (WorkflowDecl.items) declares. A reference use(W, N) resolves
+--- iff N is a global OR a local of the SAME workflow -- a name that is only a
+--- sibling's local leaks. Because locals are keyed by their owning workflow, a
+--- sibling-local name is never in another workflow's scope: this is the isolation
+--- property. The partition is given (not accumulated by rewriting) so resolution
+--- is race-free -- exactly as the parser has program.items and WorkflowDecl.items
+--- already segregated in the AST before lowering.
+mod WHIPPLESCRIPT-WORKFLOW-SCOPING is
+  protecting BOOL .
+
+  sorts Name NameSet Wf Program Cfg .
+  subsort Name < NameSet .
+
+  ops n1 n2 n3 : -> Name [ctor] .   --- declaration names
+  ops wA wB : -> Wf [ctor] .        --- workflow names
+
+  op mtNames : -> NameSet [ctor] .
+  op _,_ : NameSet NameSet -> NameSet [ctor assoc comm id: mtNames] .
+  eq [name-idem] : N:Name , N:Name = N:Name .
+
+  op memberName : Name NameSet -> Bool .
+  eq memberName(N:Name, (N:Name , NS:NameSet)) = true .
+  eq memberName(N:Name, NS:NameSet) = false [owise] .
+
+  --- Configuration is an ACU soup of tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op globals : NameSet -> Cfg [ctor] .     --- top-level program.items names
+  op locals : Wf NameSet -> Cfg [ctor] .   --- one workflow block's local names
+  op use : Wf Name -> Cfg [ctor] .         --- a rule in Wf references Name
+  op resolved : Wf Name -> Cfg [ctor] .    --- reference found in Wf's scope
+  op leaked : Wf Name -> Cfg [ctor] .      --- reference to a name outside scope
+
+  --- Headerless verdict: whether the program declares any explicit workflow.
+  op entry : Program -> Cfg [ctor] .       --- present iff >= 1 explicit workflow
+  op verdict : Program -> Cfg [ctor] .
+  ops present absent pending ok rejected : -> Program [ctor] .
+
+  var W : Wf .
+  var N : Name .
+  vars GS LS : NameSet .
+
+  --- A reference resolves when its name is a global or a local of the SAME
+  --- workflow. The shared W binds locals(W, ..) to the referencing workflow's own
+  --- block, so a sibling's locals(W', ..) can never satisfy it.
+  crl [resolve] : use(W, N) globals(GS) locals(W, LS)
+      => resolved(W, N) globals(GS) locals(W, LS)
+      if memberName(N, GS) or memberName(N, LS) .
+
+  --- A reference to a name in neither the globals nor the workflow's own locals
+  --- leaks -- this catches both sibling-local names and undeclared names.
+  crl [leak] : use(W, N) globals(GS) locals(W, LS)
+      => leaked(W, N) globals(GS) locals(W, LS)
+      if memberName(N, GS) = false /\ memberName(N, LS) = false .
+
+  --- A program with no explicit workflow is rejected; one with a workflow accepts.
+  rl [reject-headerless] : entry(absent) verdict(pending)
+      => entry(absent) verdict(rejected) .
+  rl [accept] : entry(present) verdict(pending)
+      => entry(present) verdict(ok) .
+endm

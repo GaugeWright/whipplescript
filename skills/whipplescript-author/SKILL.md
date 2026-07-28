@@ -111,11 +111,11 @@ effect requests. Workers execute effects later and record evidence.
 | Deterministic policy | `rule` with `when` and `where` | `rule name ... => { ... }` | [`language-reference.md#rules`](../../docs/language-reference.md#rules) |
 | Deterministic branching | guards, `case` | `case review.status { ... }` | [`manual.md#branch-deterministically`](../../docs/manual.md#branch-deterministically) |
 | Parallel fan-out | rules, facts, agent `capacity` | `when worker is available` | [`examples.md#coordination-recipes`](../../docs/examples.md#coordination-recipes) |
-| Fixed sequence | `flow` | `flow triage when Ticket as ticket { ... }` | [`manual.md#sequential-flows`](../../docs/manual.md#sequential-flows) |
+| Fixed sequence | `then` | `tell triage as t "..." then tell fix as f "..."` | [`language-reference.md#then-chaining`](../../docs/language-reference.md#then-chaining) |
 | Agent turn | `tell` | `tell worker as turn "..."` | [`manual.md#request-agent-work`](../../docs/manual.md#request-agent-work) |
 | Typed model decision | `coerce` or `decide` | `coerce classify(...) as result` | [`language-reference.md#coerce`](../../docs/language-reference.md#coerce) |
-| Human gate | `askHuman`, `human answered` | `askHuman as review choices [...]` | [`manual.md#gate-on-humans`](../../docs/manual.md#gate-on-humans) |
-| Backlog ownership | `queue`, `claim`, `finish`, `release` | `when backlog has ready item as item` | [`language-reference.md#work-queues`](../../docs/language-reference.md#work-queues) |
+| Human gate | `use std.tracker`, `file issue into <queue>` | `file issue into review { title "Check this" }` | [`language-reference.md#trackers`](../../docs/language-reference.md#trackers) |
+| Backlog ownership | `use std.tracker`, `tracker`, `claim`, `finish`, `release` | `when backlog has ready issue as issue` | [`language-reference.md#work-queues`](../../docs/language-reference.md#work-queues) |
 | Deadlines | `timeout`, `timer`, `cancel` | `tell worker as turn timeout 10m` | [`language-reference.md#time-and-deadlines`](../../docs/language-reference.md#time-and-deadlines) |
 | Retry policy | facts and guarded rules | `where job.attempts < 3` | [`manual.md#express-retries-as-facts`](../../docs/manual.md#express-retries-as-facts) |
 | Script capability | `exec` | `exec backup with request -> Report as x` | [`language-reference.md#exec`](../../docs/language-reference.md#exec) |
@@ -144,14 +144,14 @@ and effects.
    - default to `rule`s for independent reactions, fan-out, retries, and
      event-driven policy;
    - use `flow` only for one fixed sequence with shared bindings;
-   - use `queue` only when external work items need claim/finish/release
-     ownership;
+   - use `std.tracker` (a `tracker` backlog) only when external work items need
+     claim/finish/release ownership;
    - use `invoke` only when a subtask needs its own lifecycle.
 5. Declare agents with the narrowest useful `profile`, `capacity`, and
    `capabilities`.
-6. Put every external action behind an effect: `tell`, `coerce`, `askHuman`,
-   `call`, `exec`, `timer`, `queue.*`, or `invoke`.
-7. Sequence effect outputs only with `after` blocks or flow step order.
+6. Put every external action behind an effect: `tell`, `coerce`, `call`,
+   `exec`, `timer`, `tracker.*`, or `invoke`.
+7. Sequence effect outputs only with `after` blocks or `then` chaining.
 8. Add terminal rules: `complete output { ... }` or `fail failure { ... }`.
    Tag truly perpetual workflows `@service`.
 9. Add assertions for the intended final facts/effects.
@@ -218,10 +218,11 @@ whip --json dev examples/minimal-noop.whip --provider fixture --until idle
 
 Use this only as a syntax sanity check. For useful patterns, start with:
 
-- [`examples/human-review.whip`](../../examples/human-review.whip) for inbox
-  review.
-- [`examples/triage-flow.whip`](../../examples/triage-flow.whip) for a fixed
-  agent plus human sequence.
+- [`language-reference.md#trackers`](../../docs/language-reference.md#trackers)
+  for routing work to a person through the tracker (the `askHuman` gate and its
+  inbox were removed; humans go through the tracker and channels).
+- [`language-reference.md#then-chaining`](../../docs/language-reference.md#then-chaining)
+  for sequencing an agent turn into the next step.
 - [`examples/queue-worker-with-review.whip`](../../examples/queue-worker-with-review.whip)
   for a backlog, claim, agent turn, structured review, and release/finish.
 - [`examples/scheduled-escalation.whip`](../../examples/scheduled-escalation.whip)
@@ -260,11 +261,10 @@ rule implement
   }
 
   after turn fails as failed {
-    askHuman as escalation choices ["retry", "block"] """markdown
-    The worker failed on {{ item.title }}:
-
-    {{ failed.reason }}
-    """
+    file issue into escalations {
+      title "Worker failed on {{ item.title }}"
+      body "{{ failed.reason }}"
+    }
   }
 }
 ```
@@ -296,54 +296,62 @@ rule classify
   }
 
   after classification fails {
-    askHuman "Classify manually: {{ item.title }}"
+    file issue into triage {
+      title "Classify manually: {{ item.title }}"
+    }
   }
 }
 ```
 
-Sequential flow:
+Sequential steps (`then` chaining — the `flow` construct was removed):
 
 ```whip
-flow triage_ticket
+rule triage_ticket
   when Ticket as ticket where ticket.status == "open"
   when triager is available
-{
+=> {
   tell triager as plan timeout 10m "Propose a fix plan for {{ ticket.title }}."
-  on timeout { fail error { reason "triage timed out" } }
 
-  askHuman as signoff choices ["approve", "reject"] "Approve {{ plan.summary }}?"
+  after plan times out {
+    fail error { reason "triage timed out" }
+  }
 
-  when signoff.choice == "approve" {
-    complete result { decision "approved" }
-  } else {
-    fail error { reason "rejected" }
+  after plan succeeds as proposal {
+    // A person's decision enters as a durable input, not as a suspend: file the
+    // issue and let a separate rule react when someone finishes it.
+    file issue into signoff {
+      title "Approve fix plan for {{ ticket.title }}"
+      body "{{ proposal.summary }}"
+    }
   }
 }
 ```
 
-Queue work:
+Track work (the `std.tracker` backlog):
 
 ```whip
-queue backlog {
-  tracker builtin
+use std.tracker
+
+tracker backlog {
+  provider builtin
 }
 
-rule work_ready_item
-  when backlog has ready item as item
+rule work_ready_issue
+  when backlog has ready issue as issue
   when worker is available
 => {
-  claim item as lease
+  claim issue as active_claim
 
-  after lease succeeds {
-    tell worker as turn "Resolve {{ item.title }}."
+  after active_claim succeeds {
+    tell worker as turn "Resolve {{ issue.title }}."
   }
 
   after turn succeeds as outcome {
-    finish item { summary outcome.summary }
+    finish issue { summary outcome.summary }
   }
 
   after turn fails {
-    release item
+    release issue
   }
 }
 ```
@@ -368,7 +376,7 @@ Typed dynamic agent routing:
 
 ```whip
 class ReviewTask {
-  reviewer AgentRef<codex | claude | pi>
+  reviewer AgentRef<codex | claude>
   title string
   trackerPath string
   status "queued"
@@ -416,7 +424,7 @@ Use these commands before changing source or prompts:
 whip doctor
 whip check workflow.whip
 whip --json dev workflow.whip --provider fixture --until idle
-whip dev workflow.whip --provider fixture --until idle --stream ndjson
+whip run workflow.whip --provider fixture --until idle --stream ndjson
 whip status <instance>
 whip effects <instance>
 whip runs <instance>

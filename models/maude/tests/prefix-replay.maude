@@ -1,0 +1,39 @@
+load ../prefix-replay.maude
+
+--- The corruption pattern throughout: a "replay" that re-executes recorded
+--- work -- a pre-cut send firing twice, or a post-cut recorded outcome
+--- riding into the counterfactual so the regeneration measures the
+--- recording instead of the candidate.
+
+--- Source log for every fixture: n1 settled at seq 1 (pre-cut), n2 settled
+--- at seq 2 (post-cut); the mark's cut is seq 1; the suffix re-executes n2.
+
+--- Bite: under the sound seeder a pre-cut effect NEVER fires again, in
+--- any interleaving.
+search [1] in WHIPPLESCRIPT-PREFIX-REPLAY :
+  { sound cut(1) sfx(n2) || ev(1, n1) ; ev(2, n2) ; nilE }
+  =>* { fired(n1) RESIDUAL:Cfg || L:EventList } .
+
+--- Hazard demonstrated: the naive seeder re-fires the pre-cut effect --
+--- a replayed side effect hits the world twice.
+search [1] in WHIPPLESCRIPT-PREFIX-REPLAY :
+  { naive cut(1) sfx(n2) || ev(1, n1) ; ev(2, n2) ; nilE }
+  =>* { fired(n1) RESIDUAL:Cfg || L:EventList } .
+
+--- Bite: a post-cut recorded outcome is never seeded as settled state --
+--- the suffix must re-execute it live or the intervention measured
+--- nothing.
+search [1] in WHIPPLESCRIPT-PREFIX-REPLAY :
+  { sound cut(1) sfx(n2) || ev(1, n1) ; ev(2, n2) ; nilE }
+  =>* { settled(n2) RESIDUAL:Cfg || L:EventList } .
+
+--- Coverage: the suffix site executes live in the counterfactual.
+search [1] in WHIPPLESCRIPT-PREFIX-REPLAY :
+  { sound cut(1) sfx(n2) || ev(1, n1) ; ev(2, n2) ; nilE }
+  =>* { fired(n2) RESIDUAL:Cfg || nilE } .
+
+--- Coverage: the completed counterfactual holds the folded prefix AND the
+--- live suffix -- replayed state plus regenerated execution.
+search [1] in WHIPPLESCRIPT-PREFIX-REPLAY :
+  { sound cut(1) sfx(n2) || ev(1, n1) ; ev(2, n2) ; nilE }
+  =>* { settled(n1) fired(n2) RESIDUAL:Cfg || nilE } .

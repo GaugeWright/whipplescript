@@ -1,9 +1,12 @@
+use std.agent.codex
+use std.agent.claude
+
 @service
 workflow IncidentRouter
 
-# Optional-provider exhibit: dynamic routing across the Codex, Claude, and Pi
-# delegating providers (opt-in Cargo features), including `AgentRef<codex | claude
-# | pi>`. Most examples use the built-in `owned` harness; this one showcases
+# Optional-provider exhibit: dynamic routing across the Codex and Claude
+# delegating providers (opt-in Cargo features), including `AgentRef<codex |
+# claude>`. Most examples use the built-in `owned` harness; this one showcases
 # binding and routing to distinct agent families.
 
 class Owner {
@@ -17,7 +20,7 @@ class Incident {
   tags string[]
   metadata map<string>
   owner Owner?
-  assignee AgentRef<codex | claude | pi>
+  assignee AgentRef<codex | claude>
   status "open"
 }
 
@@ -40,12 +43,6 @@ agent claude {
   capacity 1
 }
 
-agent pi {
-  provider pi
-  profile "repo-reader"
-  capacity 1
-}
-
 # This table is intentionally small but exercises arrays, maps, optionals,
 # literal unions, nested objects, and dynamic AgentRef routing.
 table incidents as Incident [
@@ -56,7 +53,7 @@ table incidents as Incident [
     tags ["api", "slo"]
     metadata { route "ops" }
     owner { name "Ada" }
-    assignee pi
+    assignee claude
     status "open"
   }
   {
@@ -74,7 +71,7 @@ table incidents as Incident [
 assert count(Incident where status == "open") == 0
 assert count(RoutedIncident where route in ["code", "review", "ops"]) == 2
 assert exists(RoutedIncident where provider == "codex")
-assert exists(RoutedIncident where provider == "pi")
+assert exists(RoutedIncident where provider == "claude")
 
 rule route_incident
   when Incident as incident where incident.severity >= 2 and "route" in incident.metadata and incident.metadata["route"] in ["code", "review", "ops"] and (incident.owner == null or exists incident.owner)

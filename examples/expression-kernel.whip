@@ -1,0 +1,125 @@
+workflow ExpressionKernel
+
+output result KernelSweep
+
+# Golden expression-kernel fixture: every operator class in guards and
+# assertions, so the .ir snapshot pins parser precedence, snapshot
+# parenthesization, and lowering across the full expression surface —
+# arithmetic, ordering, equality, membership, boolean connectives (symbol
+# and word forms), presence proofs, indexing, literals, and fact/effect
+# projection queries. Deterministic: no providers, dev-clean.
+
+class Job {
+  id string
+  title string
+  attempts int
+  cost float
+  labels string[]
+  meta map<string>
+  note string?
+  kind "build" | "test" | "docs"
+  done bool
+}
+
+class Detail {
+  phase string
+}
+
+class Scored {
+  id string
+  score int
+  detail Detail
+  tags map<string>
+  status "scored"
+}
+
+class Retired {
+  id string
+  reason "docs" | "stale"
+  status "retired"
+}
+
+class KernelSweep {
+  scored int
+  retired int
+  state "swept"
+}
+
+table jobs as Job [
+  {
+    id "JOB-1"
+    title "compile core"
+    attempts 1
+    cost 2.5
+    labels ["ci", "core"]
+    meta { team "core" }
+    note "hot path"
+    kind "build"
+    done false
+  }
+  {
+    id "JOB-2"
+    title "docs sweep"
+    attempts 0
+    cost 0.5
+    labels ["docs"]
+    meta { team "docs" }
+    note null
+    kind "docs"
+    done false
+  }
+]
+
+# One guard spanning every binary operator class: arithmetic (+ - * /),
+# ordering (< <= > >=), equality (== !=), membership (in / not in),
+# boolean (&& !), a word-form disjunction (or), presence (exists path),
+# map indexing, and an array literal. (Indexing is map-only by design:
+# the spec's path grammar takes string-literal keys.)
+rule score_build_job
+  when Job as job where !job.done && job.kind != "docs" && job.attempts + 1 <= 5 && job.cost * 2.0 < 10.0 && job.attempts >= 1 && job.cost - 0.5 > 0.0 && job.attempts / 1 == 1 && job.kind in ["build", "test"] && "retired" not in job.labels && (exists job.note && job.note == "hot path" or job.attempts == 0) && "team" in job.meta && job.meta["team"] == "core" && exists(job.labels)
+=> {
+  done job -> record Scored {
+    id job.id
+    score 3
+    detail { phase "kernel" }
+    tags { team "core" }
+    status "scored"
+  }
+}
+
+# Word-form connectives (and / or / not) plus null equality on an optional.
+rule retire_docs_job
+  when Job as job where not job.done and (job.kind == "docs" or job.title == "unused") and job.note == null and !empty(job.labels)
+=> {
+  done job -> record Retired {
+    id job.id
+    reason "docs"
+    status "retired"
+  }
+}
+
+# Projection queries close the loop: once every job is consumed, sweep.
+rule finish_sweep
+  when Scored as scored
+  when Retired as retired where empty(Job where done == false)
+=> {
+  complete result {
+    scored 1
+    retired 1
+    state "swept"
+  }
+}
+
+assert count(Scored) == 1
+assert count(Retired) == 1
+assert count(Job where done == false) == 0
+assert exists(Scored where score <= 3 && score > 0)
+assert empty(Job where cost >= 100.0)
+assert empty(Retired where reason != "docs")
+assert count(effect kind human.ask) == 0
+assert empty(effect kind agent.tell)
+assert 2 + 3 * 2 == 8 && (2 + 3) * 2 == 10
+assert 10 - 4 / 2 == 8 && !(1 > 2)
+assert "a" in ["a", "b"] && "z" not in ["a", "b"]
+assert count(["x", "y"]) == 2 && !empty(["x", "y"])
+assert empty([]) && empty("")

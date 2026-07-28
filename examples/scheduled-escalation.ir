@@ -2,6 +2,8 @@ workflow ScheduledEscalation
 workflow_contracts
   output result ref<ReviewClosed>
   failure error ref<ReviewEscalated>
+uses
+  package std.agent
 schemas
   class ReviewRequest
     id string
@@ -14,6 +16,8 @@ schemas
   class ReviewEscalated
     id string
     reason string
+agents
+  agent reviewer harness=<fallback> provider=fixture profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 rules
   rule table_reviews
     when started
@@ -22,8 +26,8 @@ rules
     writes
       schema:ReviewRequest
     record_sources
-      schema:ReviewRequest construct=table_row span=390..498
-    body_hash 4d672f635631e569
+      schema:ReviewRequest construct=table_row span=481..589
+    body_hash f331688e26fa040401d9910e73a6878d
   rule request_review_with_deadline
     when ReviewRequest as review where review.status == "waiting"
     reads
@@ -31,19 +35,19 @@ rules
     consumes
       schema:ReviewRequest
     effects
-      answer kind=human.ask binding=answer key=2abf821e1bafa4c4
-      deadline kind=timer.wait binding=deadline key=d9ba06787e26217c
+      answer kind=agent.tell binding=answer key=eecb4dc91f23871634f4cd69cbea3f2e
+      deadline kind=timer.wait binding=deadline key=26087ebeaf3660262e29b16f9ca6e494
     terminal_outputs
-      answer span=799..819
-        Completed payload=object<{summary string, effect_id string, run_id string}> span=799..819
-        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=799..819
-        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=799..819
-        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=799..819
+      answer span=865..885
+        Completed payload=object<{summary string, effect_id string, run_id string}> span=865..885
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=865..885
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=865..885
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=865..885
     terminal_branches
-      case answer Completed binding=decided guard=- body_hash=9afcab7326beff18 span=799..819
-      case answer Failed binding=failure guard=- body_hash=8afebbdef71e8afb span=976..993
-      case answer TimedOut binding=timeout guard=- body_hash=06b434c12a44aa2e span=1119..1138
-      case answer Cancelled binding=cancel guard=- body_hash=23748543a8172b33 span=1265..1284
-    body_hash 8fff80ba89d254a7
+      case answer Completed binding=decided guard=- body_hash=f49ce0252e380558208a738da49f96e7 span=865..885
+      case answer Failed binding=failure guard=- body_hash=facd9e6a4c0e9bc76c035f3657b07899 span=1043..1060
+      case answer TimedOut binding=timeout guard=- body_hash=834f79e48c14a82456e43f12ba642f5a span=1186..1205
+      case answer Cancelled binding=cancel guard=- body_hash=5b8cf1a332bc80229610a04d05243a1c span=1332..1351
+    body_hash 0e7807679bb77d4415752ffcf1c810d6
 rule_dependencies
   table_reviews --schema:ReviewRequest--> request_review_with_deadline

@@ -1,0 +1,29 @@
+--- Context-assembly Phase 0, invariant 2: a compaction summary is recorded once
+--- and reused on replay, never regenerated. Companion to
+--- spec/context-assembly-tracker.md (Decision 7/8), the DR-0033 record-once turn
+--- rules, and owned-harness-resume (resume-from-projection). A summarizing
+--- compactor makes a model call; that call records the summary durably. On an
+--- eviction/replay the recorded summary is REUSED, never re-issued. The safety
+--- property modeled here: resume never re-runs the summarization call. There is
+--- no rule turning a resume into a fresh `summarize`/`regenerated`, so a
+--- second summarization call is unreachable.
+mod WHIPPLESCRIPT-COMPACTION-RECORD-ONCE is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op summarize : -> Cfg [ctor] .    --- a summarization model call is pending
+  op recorded : -> Cfg [ctor] .     --- the summary is durably recorded
+  op evicted : -> Cfg [ctor] .      --- the instance was evicted and is resuming
+  op reused : -> Cfg [ctor] .       --- resume reused the recorded summary
+  op regenerated : -> Cfg [ctor] .  --- BAD: resume issued a second summarization call
+
+  --- One summarization call records the summary durably (record-once).
+  rl [record] : summarize => recorded .
+
+  --- Resume REUSES the recorded summary: it consumes the evicted marker against
+  --- the existing record and never re-summarizes. Modeling resume as re-issuing a
+  --- call (evicted => summarize) is exactly what the regenerated bite forbids.
+  rl [resume-reuse] : evicted recorded => reused recorded .
+endm

@@ -1,0 +1,115 @@
+--- Certified merge as disjoint-slice composition over manifests, per
+--- spec/versioned-workspace-research-note.md 6.1-6.2 and the untie-substrate
+--- readiness tracker Phase 0 (shared program/edit model for merge + transfer).
+---
+--- Source is a set of declarations, not text: an edit carries a slice
+--- footprint -- the declarations it writes, consumes, and reads. Two merge
+--- engines are modeled over the same three-way base manifest:
+---   * the TEXT engine -- git's proxy at whole-declaration granularity: it
+---     conflicts only when both edits write the SAME declaration (the hunk
+---     collision), so edits in different files always text-accept;
+---   * the CERTIFIED engine -- the composition theorem restated over
+---     manifests: a certificate is granted only when neither edit's
+---     write-or-consume footprint intersects the other's
+---     read-or-write-or-consume footprint (the anti-dependence discipline
+---     transferred verbatim from evidence transfer); anything else
+---     escalates to a real conflict, never a fake auto-merge.
+--- Declarations d1, d3 live in file f1; d2, d4 live in file f2 (fileOf).
+--- The essential bite is the cross-file semantic conflict: eA rewrites d1
+--- while eB rewrites d2 AND reads d1 -- no same-declaration collision, so
+--- text merge silently accepts the compound state; the write-meets-read
+--- slice overlap refuses the certificate and escalates honestly.
+mod WHIPPLESCRIPT-MERGE-SLICE is
+  protecting BOOL .
+
+  sorts Decl DeclSet EId File Entry MSet Edit Cfg .
+  subsort Decl < DeclSet .
+  subsort Entry < MSet .
+
+  ops d1 d2 d3 d4 : -> Decl [ctor] .   --- declarations, the merge granule
+  ops f1 f2 : -> File [ctor] .         --- files, presentation only
+  ops e0 eA eB : -> EId [ctor] .       --- edit identities; e0 = the base
+
+  --- Declarations partition into files; text merge never sees the split,
+  --- which is exactly why cross-file interference escapes it.
+  op fileOf : Decl -> File .
+  eq fileOf(d1) = f1 .
+  eq fileOf(d3) = f1 .
+  eq fileOf(d2) = f2 .
+  eq fileOf(d4) = f2 .
+
+  op mtD : -> DeclSet [ctor] .
+  op _;_ : DeclSet DeclSet -> DeclSet [ctor assoc comm id: mtD] .
+  eq [dset-idem] : D:Decl ; D:Decl = D:Decl .
+
+  op member : Decl DeclSet -> Bool .
+  eq member(D:Decl, (D:Decl ; DS:DeclSet)) = true .
+  eq member(D:Decl, DS:DeclSet) = false [owise] .
+
+  op inter : DeclSet DeclSet -> Bool .
+  eq inter((D:Decl ; DS1:DeclSet), (D:Decl ; DS2:DeclSet)) = true .
+  eq inter(DS1:DeclSet, DS2:DeclSet) = false [owise] .
+
+  --- A manifest maps each declaration to the edit that authored its
+  --- current content; the base authored everything at the branch point.
+  op at : Decl EId -> Entry [ctor] .
+  op mtM : -> MSet [ctor] .
+  op _;_ : MSet MSet -> MSet [ctor assoc comm id: mtM] .
+
+  --- An edit: identity, written decls, consumed decls, read decls.
+  op edit : EId DeclSet DeclSet DeclSet -> Edit [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Merge attempts and their outcomes.
+  op mergeCert : Edit Edit MSet -> Cfg [ctor] .  --- the certified engine
+  op mergeText : Edit Edit MSet -> Cfg [ctor] .  --- the text-proxy engine
+  op certified : EId EId MSet -> Cfg [ctor] .    --- certificate + merged manifest
+  op escalated : EId EId -> Cfg [ctor] .         --- honest conflict, both ids
+  op textMerged : EId EId MSet -> Cfg [ctor] .   --- text engine accepted
+  op textConflict : EId EId -> Cfg [ctor] .      --- text engine collided
+
+  --- Rewrite every written declaration's entry to its writing edit.
+  op sel : Decl DeclSet EId EId -> EId .
+  eq sel(D:Decl, DS:DeclSet, I:EId, J:EId) =
+    if member(D:Decl, DS:DeclSet) then I:EId else J:EId fi .
+  op upd : MSet DeclSet EId -> MSet .
+  eq upd(mtM, DS:DeclSet, I:EId) = mtM .
+  eq upd((at(D:Decl, J:EId) ; M:MSet), DS:DeclSet, I:EId) =
+    at(D:Decl, sel(D:Decl, DS:DeclSet, I:EId, J:EId)) ;
+    upd(M:MSet, DS:DeclSet, I:EId) .
+
+  vars I1 I2 : EId .
+  vars W1 C1 R1 W2 C2 R2 : DeclSet .
+  var M : MSet .
+
+  --- The certificate: disjoint slices compose; the merged manifest carries
+  --- both edits' writes. Guard = the anti-dependence discipline, both
+  --- directions: one edit's write-or-consume footprint must not meet the
+  --- other's read-or-write-or-consume footprint.
+  crl [cert-merge] :
+      mergeCert(edit(I1, W1, C1, R1), edit(I2, W2, C2, R2), M)
+      => certified(I1, I2, upd(upd(M, W1, I1), W2, I2))
+      if inter((W1 ; C1), (W2 ; C2 ; R2)) = false /\
+         inter((W2 ; C2), (W1 ; C1 ; R1)) = false .
+
+  --- Intersecting slices are a real conflict, surfaced with both
+  --- identities -- never a fake auto-merge.
+  crl [cert-escalate] :
+      mergeCert(edit(I1, W1, C1, R1), edit(I2, W2, C2, R2), M)
+      => escalated(I1, I2)
+      if inter((W1 ; C1), (W2 ; C2 ; R2)) or
+         inter((W2 ; C2), (W1 ; C1 ; R1)) = true .
+
+  --- The text proxy sees only same-declaration write collisions. Reads and
+  --- consumes are invisible to it -- that blindness is the modeled hazard.
+  crl [text-merge] :
+      mergeText(edit(I1, W1, C1, R1), edit(I2, W2, C2, R2), M)
+      => textMerged(I1, I2, upd(upd(M, W1, I1), W2, I2))
+      if inter(W1, W2) = false .
+  crl [text-conflict] :
+      mergeText(edit(I1, W1, C1, R1), edit(I2, W2, C2, R2), M)
+      => textConflict(I1, I2)
+      if inter(W1, W2) = true .
+endm

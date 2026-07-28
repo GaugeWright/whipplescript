@@ -1,0 +1,41 @@
+load ../op-undo.maude
+
+--- The shared history: op o1 moved b1 from h0 to h1, then op o2 moved it
+--- from h1 to h2. Undoing o1 with the head at h2 crosses o2's work.
+
+--- The hazard demonstrated: the naive undoer re-points to h0, silently
+--- discarding o2's h2 -- the lost update.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  naiveReq(o1) rec(o1, b1, h0, h1) rec(o2, b1, h1, h2) br(b1, h2)
+  =>* br(b1, h0) RESIDUAL:Cfg .
+
+--- Bite: the guarded undoer NEVER applies o1's undo over o2's head -- no
+--- compensating record for o1 is ever minted.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  undoReq(o1) rec(o1, b1, h0, h1) rec(o2, b1, h1, h2) br(b1, h2)
+  =>* rec(comp(o1), b1, h1, h0) RESIDUAL:Cfg .
+
+--- Coverage: it refuses honestly instead, and the head stays at h2.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  undoReq(o1) rec(o1, b1, h0, h1) rec(o2, b1, h1, h2) br(b1, h2)
+  =>* refusedUndo(o1) br(b1, h2) RESIDUAL:Cfg .
+
+--- Coverage: with the head still at the op's after-state, the undo
+--- applies, the compensating op is appended, and the ORIGINAL record
+--- survives -- the log never shrinks.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  undoReq(o1) rec(o1, b1, h0, h1) br(b1, h1)
+  =>* rec(o1, b1, h0, h1) rec(comp(o1), b1, h1, h0) br(b1, h0) RESIDUAL:Cfg .
+
+--- Coverage: undo-of-undo returns to the after-state through the
+--- compensating record -- trivially, by the same guarded rule.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  undoReq(o1) undoReq(comp(o1)) rec(o1, b1, h0, h1) br(b1, h1)
+  =>* rec(comp(comp(o1)), b1, h0, h1) br(b1, h1) RESIDUAL:Cfg .
+
+--- Bite: a re-issued undo request cannot double-apply -- after the first
+--- undo the head is at h0, so the guard refuses the second; two identical
+--- compensating records are unreachable.
+search [1] in WHIPPLESCRIPT-OP-UNDO :
+  undoReq(o1) undoReq(o1) rec(o1, b1, h0, h1) br(b1, h1)
+  =>* rec(comp(o1), b1, h1, h0) rec(comp(o1), b1, h1, h0) RESIDUAL:Cfg .

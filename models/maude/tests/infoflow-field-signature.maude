@@ -1,0 +1,96 @@
+load ../infoflow-field-signature.maude
+
+--- Per-field flow signature soundness. A tool result field carries only the reads
+--- reaching it, at fact granularity, with the rule-level opaque box preserved. The
+--- coverage searches show the per-field reach never under-reports a real leak; the
+--- bite searches show the refinement is real -- a field independent of a
+--- confidential read does not carry it.
+
+--- ============================ COVERAGE, leak reachable =====================
+
+--- Coverage: a field whose ROOT is a direct binding of a confidential fact chain
+--- a tr root of fA with factReach fA hi carries that read, so releasing to a public sink
+--- leaks. Per-field precision does NOT drop a read the field truly depends on.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, hi) factReach(fB, lo)
+  field(tr(fA) . nilR) sink(lo)
+  =>* C:Cfg leak .
+
+--- Coverage: a field with a DERIVED root dv has opaque provenance, so it falls
+--- back to the whole-result reach. With some confidential fact chain present it is
+--- hi, so releasing to a public sink leaks -- the fail-closed conservative fallback.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, lo) factReach(fB, hi)
+  field(dv . nilR) sink(lo)
+  =>* C:Cfg leak .
+
+--- Coverage: own-reads reach EVERY field -- the opaque box I-IFC2. Even a field
+--- whose only root is a public fact chain leaks when the completing rule own-reads
+--- are confidential -- the per-field refinement never drops the rule own-reads.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(hi) factReach(fA, lo) factReach(fB, lo)
+  field(tr(fA) . nilR) sink(lo)
+  =>* C:Cfg leak .
+
+--- Coverage: D3' milestone payload egress is identical to complete-result egress.
+--- A milestone field rooted in a confidential fact chain leaks to a public sink.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, hi) factReach(fB, lo)
+  milestoneField(tr(fA) . nilR) sink(lo)
+  =>* C:Cfg leak .
+
+--- Coverage: a milestone field with a derived root falls back to whole-payload
+--- reach, so an untraceable milestone payload cannot narrow away a confidential
+--- fact chain.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, lo) factReach(fB, hi)
+  milestoneField(dv . nilR) sink(lo)
+  =>* C:Cfg leak .
+
+--- Coverage: the milestone-reached occurrence itself is a read source. A public
+--- branch on a high occurrence leaks the one-bit "reached" observation.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  milestoneReached(hi) branchSink(lo)
+  =>* C:Cfg occurrenceLeak .
+
+--- ============================ BITE, no leak ================================
+
+--- Bite, THE point of per-field: a field whose roots are ALL traceable to public
+--- fact chains does NOT carry an unrelated confidential read. fB is confidential but
+--- unreferenced, own-reads are public -- releasing a tr root of fA to a public sink does NOT
+--- leak, though the whole-result reach would. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, lo) factReach(fB, hi)
+  field(tr(fA) . nilR) sink(lo)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a cleared hi audience may receive a confidential field. The field reach
+--- is hi but the sink is hi, so no leak. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, hi) factReach(fB, lo)
+  field(tr(fA) . nilR) sink(hi)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a milestone field whose roots are all traceable to public fact chains
+--- does not carry an unrelated confidential read. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, lo) factReach(fB, hi)
+  milestoneField(tr(fA) . nilR) sink(lo)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a cleared hi audience may receive a confidential milestone field.
+--- No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  own(lo) factReach(fA, hi) factReach(fB, lo)
+  milestoneField(tr(fA) . nilR) sink(hi)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a public milestone occurrence may drive a public branch. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  milestoneReached(lo) branchSink(lo)
+  =>* occurrenceLeak RESIDUAL:Cfg .
+
+--- Bite: a high milestone occurrence may drive a high-cleared branch. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FIELD-SIGNATURE :
+  milestoneReached(hi) branchSink(hi)
+  =>* occurrenceLeak RESIDUAL:Cfg .

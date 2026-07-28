@@ -1,0 +1,41 @@
+--- Label carriage across boundaries (DR-0027 I-IFC7). A value's label must survive
+--- every persistence and communication boundary: persisting it to a store and
+--- reading it back carries the label, and sending it across an instance boundary
+--- carries the label. No boundary launders a label.
+---
+--- The soundness property (the bite): a value labeled secret is NEVER observed
+--- unlabeled (public) after a store roundtrip or an instance crossing. There is no
+--- rule that strips a label at a boundary, so the only way a read-back or delivered
+--- value can be public is if it was public to begin with.
+mod WHIPPLESCRIPT-INFOFLOW-CARRIAGE is
+  sorts Val Label Loc Inst Cfg .
+
+  ops v1 v2 : -> Val [ctor] .
+  ops secret public : -> Label [ctor] .   --- two-point lattice suffices for the carriage property
+  op loc1 : -> Loc [ctor] .
+  ops i1 i2 : -> Inst [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op writes : Loc Val Label -> Cfg [ctor] .     --- a labeled value is written to a store
+  op stored : Loc Val Label -> Cfg [ctor] .      --- the durable record (carries the label)
+  op reads : Loc -> Cfg [ctor] .                  --- a read request
+  op loaded : Val Label -> Cfg [ctor] .           --- the value read back, with its label
+  op sends : Inst Val Label -> Cfg [ctor] .       --- send across an instance boundary
+  op delivered : Inst Val Label -> Cfg [ctor] .   --- delivered, carrying the label
+
+  var L : Loc .
+  var V : Val .
+  var X : Label .
+  var I : Inst .
+
+  --- persistence carries the label: storing records the value WITH its label.
+  rl [persist] : writes(L, V, X) => stored(L, V, X) .
+
+  --- reading back carries the SAME label -- the store boundary does not launder.
+  rl [readback] : stored(L, V, X) reads(L) => stored(L, V, X) loaded(V, X) .
+
+  --- crossing an instance boundary carries the label unchanged.
+  rl [deliver] : sends(I, V, X) => delivered(I, V, X) .
+endm

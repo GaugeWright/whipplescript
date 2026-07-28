@@ -1,0 +1,37 @@
+load ../kernel.maude
+
+--- A success-dependent downstream effect cannot run while the upstream effect
+--- is still queued.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, succeeds, e2) effect(e2, blocked)
+  =>*
+  effect(e1, queued) providerRun(e1) dep(e1, succeeds, e2) effect(e2, running) .
+
+--- A success-dependent downstream effect can run after upstream completion.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, succeeds, e2) effect(e2, blocked)
+  =>*
+  effect(e1, completed) providerRun(e1) dep(e1, succeeds, e2) effect(e2, running) .
+
+--- Failure does not satisfy a success dependency.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, succeeds, e2) effect(e2, blocked)
+  =>*
+  effect(e1, failed) providerRun(e1) dep(e1, succeeds, e2) effect(e2, running) .
+
+--- Failure satisfies a failure dependency.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, fails, e2) effect(e2, blocked)
+  =>*
+  effect(e1, failed) providerRun(e1) dep(e1, fails, e2) effect(e2, running) .
+
+--- Any terminal outcome satisfies a completes dependency.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, completes, e2) effect(e2, blocked)
+  =>*
+  effect(e1, failed) providerRun(e1) dep(e1, completes, e2) effect(e2, running) .
+
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued) providerRun(e1) dep(e1, completes, e2) effect(e2, blocked)
+  =>*
+  effect(e1, completed) providerRun(e1) dep(e1, completes, e2) effect(e2, running) .

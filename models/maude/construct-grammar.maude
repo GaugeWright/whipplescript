@@ -1,0 +1,573 @@
+mod WHIPPLESCRIPT-CONSTRUCT-GRAMMAR is
+  protecting WHIPPLESCRIPT-KERNEL .
+
+  sorts
+    ConstructId ConstructFamily LoweringClass InterfaceId
+    CapabilityId ProviderId TypeId TypeList Keyword ContractVersion ResourceId .
+
+  --- Sample construct identifiers used by hand-written checks.
+  ops
+    goodMemoryRecall
+    missingResourceRecall
+    missingCapabilityRecall
+    ambiguousRecall
+    hiddenRuntimeRecall
+    unknownLoweringRecall
+    unacceptedRecall
+    agentTellOperation
+    : -> ConstructId .
+
+  ops
+    effectOperation
+    effectContract
+    declarationBlock
+    ruleProjection
+    ruleConstruct
+    assertionConstruct
+    eventSourceConstruct
+    sourceDeclaration
+    projectionReadConstruct
+    eventEmitOperation
+    resourceOperation
+    providerDeclaration
+    projectionDeclaration
+    policyClause
+    : -> ConstructFamily .
+
+  ops
+    capabilityCall
+    metadataLowering
+    eventEmitLowering
+    eventSourceLowering
+    clockSourceLowering
+    projectionViewLowering
+    resourceEffectLowering
+    coreEffectLowering
+    scheduleEmitterLowering
+    assertionCheckLowering
+    ruleTemplateLowering
+    typedEffectCall
+    unknownLowering
+    : -> LoweringClass .
+  ops recallKeyword sharedKeyword : -> Keyword .
+  ops memoryQuery trackerClaim : -> CapabilityId .
+  ops memoryProvider trackerProvider : -> ProviderId .
+  ops memoryPoolInterface issueProjectionInterface : -> InterfaceId .
+  ops projectMemory githubBacklog linearBacklog : -> ResourceId .
+  ops memoryContext issueType jsonType : -> TypeId .
+  ops v1 v2 : -> ContractVersion .
+
+  op capabilityInterface : CapabilityId -> InterfaceId .
+  op effectHandleInterface : TypeId -> InterfaceId .
+  op terminalOutputInterface : TypeId -> InterfaceId .
+  op valueInterface : TypeId -> InterfaceId .
+  op resourceInterface : ResourceId TypeId -> InterfaceId .
+  op projectionInterface : ResourceId TypeId -> InterfaceId .
+  op eventInterface : TypeId -> InterfaceId .
+  op eventSourceInterface : TypeId -> InterfaceId .
+  op operationInterface : TypeId TypeId -> InterfaceId .
+
+  --- Platform-owned construct and lowering vocabulary.
+  op acceptedFamily : ConstructFamily -> Cfg .
+  op acceptedLowering : LoweringClass -> Cfg .
+  op loweringAllowsFamily : LoweringClass ConstructFamily -> Cfg .
+
+  --- Package-owned construct instance metadata.
+  op constructCandidate : ConstructId -> Cfg .
+  op constructFamily : ConstructId ConstructFamily -> Cfg .
+  op constructKeyword : ConstructId Keyword -> Cfg .
+  op constructLowering : ConstructId LoweringClass -> Cfg .
+  op capabilityOnlyConstruct : ConstructId -> Cfg .
+  op noKeywordConflict : ConstructId -> Cfg .
+  op noHiddenRuntime : ConstructId -> Cfg .
+  op noDirectFactWrite : ConstructId -> Cfg .
+  op lockedConstructVersion : ConstructId ContractVersion -> Cfg .
+  op requiresInterface : ConstructId InterfaceId -> Cfg .
+  op providesInterface : InterfaceId -> Cfg .
+  op constructTargetCapability : ConstructId CapabilityId -> Cfg .
+  op constructEffectContract : ConstructId EffectId TypeId ContractVersion -> Cfg .
+  op effectRequiresCapability : EffectId CapabilityId -> Cfg .
+
+  --- Accepted compile-time construct graph.
+  op acceptedConstruct : ConstructId -> Cfg .
+  op acceptedConstructContract : ConstructId EffectId TypeId CapabilityId ContractVersion -> Cfg .
+  op constructUse : ConstructId EffectId -> Cfg .
+  op loweredConstructEffect : EffectId ConstructId CapabilityId TypeId ContractVersion -> Cfg .
+  op requiredCapability : EffectId CapabilityId -> Cfg .
+  op afterSucceeds : EffectId -> Cfg .
+  op terminalBinding : EffectId TypeId -> Cfg .
+  op projectionUse : InterfaceId FactId -> Cfg .
+  op ruleBinding : FactId TypeId -> Cfg .
+  op eventUse : EventId TypeId FactId -> Cfg .
+  op operationNeedsValue : ConstructId TypeId -> Cfg .
+  op operationNeeds2 : ConstructId TypeId TypeId -> Cfg .
+  op operationNeeds3 : ConstructId TypeId TypeId TypeId -> Cfg .
+  op noTypes : -> TypeList .
+  op typeCons : TypeId TypeList -> TypeList .
+  op operationNeeds : ConstructId TypeList -> Cfg .
+  op operationInputsReady : ConstructId -> Cfg .
+  op operationReady : ConstructId -> Cfg .
+  op eventSourceTick : InterfaceId EventId -> Cfg .
+  op eventPayload : EventId TypeId -> Cfg .
+  op directRuleFire : EventId -> Cfg .
+
+  --- Existing runtime package/provider registry substrate, modeled separately
+  --- from compile-time construct acceptance.
+  op runtimeCapability : CapabilityId -> Cfg .
+  op runtimeProvider : CapabilityId ProviderId -> Cfg .
+  op runtimeBinding : CapabilityId ProviderId -> Cfg .
+  op runtimeAuthorized : EffectId ProviderId -> Cfg .
+
+  vars C : ConstructId .
+  vars F : ConstructFamily .
+  vars L : LoweringClass .
+  vars I : InterfaceId .
+  vars Cap : CapabilityId .
+  vars P : ProviderId .
+  vars K : Keyword .
+  vars E ContractE : EffectId .
+  vars T T2 T3 : TypeId .
+  var Types : TypeList .
+  vars V : ContractVersion .
+  var R : ResourceId .
+  var Fact : FactId .
+  var Ev : EventId .
+
+  --- The first executable construct class is effect_operation +
+  --- capability_call. Acceptance is a compile-time graph check: the construct
+  --- must use a platform-owned family/lowering class, have unambiguous syntax,
+  --- resolve its required capability interface, and name a matching effect
+  --- contract. Some constructs also require another compile-time interface
+  --- such as a named resource or projection; that richer shape is modeled by a
+  --- second rule below.
+  rl [accept-capability-call-construct] :
+    acceptedFamily(F)
+    acceptedLowering(capabilityCall)
+    loweringAllowsFamily(capabilityCall, F)
+    constructCandidate(C)
+    capabilityOnlyConstruct(C)
+    constructFamily(C, F)
+    constructKeyword(C, K)
+    constructLowering(C, capabilityCall)
+    noKeywordConflict(C)
+    noHiddenRuntime(C)
+    noDirectFactWrite(C)
+    lockedConstructVersion(C, V)
+    requiresInterface(C, capabilityInterface(Cap))
+    providesInterface(capabilityInterface(Cap))
+    constructTargetCapability(C, Cap)
+    constructEffectContract(C, ContractE, T, V)
+    effectRequiresCapability(ContractE, Cap)
+    =>
+    acceptedConstruct(C)
+    acceptedConstructContract(C, ContractE, T, Cap, V)
+    providesInterface(effectHandleInterface(T)) .
+
+  rl [accept-interface-qualified-capability-call-construct] :
+    acceptedFamily(F)
+    acceptedLowering(capabilityCall)
+    loweringAllowsFamily(capabilityCall, F)
+    constructCandidate(C)
+    constructFamily(C, F)
+    constructKeyword(C, K)
+    constructLowering(C, capabilityCall)
+    noKeywordConflict(C)
+    noHiddenRuntime(C)
+    noDirectFactWrite(C)
+    lockedConstructVersion(C, V)
+    requiresInterface(C, I)
+    providesInterface(I)
+    requiresInterface(C, capabilityInterface(Cap))
+    providesInterface(capabilityInterface(Cap))
+    constructTargetCapability(C, Cap)
+    constructEffectContract(C, ContractE, T, V)
+    effectRequiresCapability(ContractE, Cap)
+    =>
+    acceptedConstruct(C)
+    acceptedConstructContract(C, ContractE, T, Cap, V)
+    providesInterface(effectHandleInterface(T)) .
+
+  --- Lowering is deterministic and emits an ordinary core effect graph
+  --- template. It does not enqueue or grant runtime authority; after kernel
+  --- graph commit, the effect still needs runtime provider registry
+  --- authorization before a provider can run it.
+  rl [lower-accepted-construct-use] :
+    acceptedConstruct(C)
+    acceptedConstructContract(C, ContractE, T, Cap, V)
+    constructUse(C, E)
+    =>
+    acceptedConstruct(C)
+    acceptedConstructContract(C, ContractE, T, Cap, V)
+    graph(g1, E)
+    loweredConstructEffect(E, C, Cap, T, V)
+    requiredCapability(E, Cap) .
+
+  --- The ordinary `after handle succeeds as value` composition point consumes
+  --- the effect handle type exposed by lowering. This is static composition,
+  --- not a new terminal-status semantics.
+  rl [type-after-success-binding] :
+    loweredConstructEffect(E, C, Cap, T, V)
+    afterSucceeds(E)
+    =>
+    loweredConstructEffect(E, C, Cap, T, V)
+    terminalBinding(E, T)
+    providesInterface(terminalOutputInterface(T))
+    providesInterface(valueInterface(T)) .
+
+  --- Resource-qualified projections compose by resource identity and payload
+  --- type. Two tracker resources may both expose Issue projections, but a use
+  --- of githubBacklog's projection cannot be satisfied by linearBacklog.
+  rl [resolve-resource-qualified-projection] :
+    providesInterface(projectionInterface(R, T))
+    projectionUse(projectionInterface(R, T), Fact)
+    =>
+    providesInterface(projectionInterface(R, T))
+    ruleBinding(Fact, T)
+    providesInterface(valueInterface(T)) .
+
+  --- Operations consume typed values through the ordinary binding/expression
+  --- graph. A terminal output or projection of MemoryContext does not satisfy
+  --- an operation input that requires Issue.
+  rl [type-operation-input] :
+    acceptedConstruct(C)
+    operationNeedsValue(C, T)
+    providesInterface(valueInterface(T))
+    =>
+    acceptedConstruct(C)
+    operationNeedsValue(C, T)
+    providesInterface(valueInterface(T))
+    operationReady(C) .
+
+  rl [type-operation-input2] :
+    acceptedConstruct(C)
+    operationNeeds2(C, T, T2)
+    providesInterface(valueInterface(T))
+    providesInterface(valueInterface(T2))
+    =>
+    acceptedConstruct(C)
+    operationNeeds2(C, T, T2)
+    providesInterface(valueInterface(T))
+    providesInterface(valueInterface(T2))
+    operationReady(C) .
+
+  rl [type-operation-input3] :
+    acceptedConstruct(C)
+    operationNeeds3(C, T, T2, T3)
+    providesInterface(valueInterface(T))
+    providesInterface(valueInterface(T2))
+    providesInterface(valueInterface(T3))
+    =>
+    acceptedConstruct(C)
+    operationNeeds3(C, T, T2, T3)
+    providesInterface(valueInterface(T))
+    providesInterface(valueInterface(T2))
+    providesInterface(valueInterface(T3))
+    operationReady(C) .
+
+  rl [type-operation-inputs-empty] :
+    operationNeeds(C, noTypes)
+    =>
+    operationInputsReady(C) .
+
+  rl [type-operation-inputs-cons] :
+    operationNeeds(C, typeCons(T, Types))
+    providesInterface(valueInterface(T))
+    =>
+    providesInterface(valueInterface(T))
+    operationNeeds(C, Types) .
+
+  rl [type-operation-inputs-ready] :
+    acceptedConstruct(C)
+    operationInputsReady(C)
+    =>
+    acceptedConstruct(C)
+    operationReady(C) .
+
+  --- Event sources expose runtime admission for ordinary durable events. The
+  --- source declaration is not itself an emitted event occurrence, and the
+  --- model intentionally has no rule from EventSource<T> to directRuleFire.
+  rl [event-source-runtime-admits-durable-event] :
+    providesInterface(eventSourceInterface(T))
+    eventSourceTick(eventSourceInterface(T), Ev)
+    =>
+    providesInterface(eventSourceInterface(T))
+    event(Ev)
+    eventPayload(Ev, T) .
+
+  rl [bind-durable-event] :
+    event(Ev)
+    eventPayload(Ev, T)
+    eventUse(Ev, T, Fact)
+    =>
+    event(Ev)
+    eventPayload(Ev, T)
+    ruleBinding(Fact, T)
+    providesInterface(valueInterface(T)) .
+
+  --- Runtime authorization comes from the package/provider registry, not from
+  --- importing or accepting a construct. This models the existing runtime
+  --- substrate for capability schemas, provider bindings, profiles, and
+  --- executable effect providers.
+  rl [authorize-runtime-bound-provider] :
+    effect(E, queued)
+    requiredCapability(E, Cap)
+    runtimeCapability(Cap)
+    runtimeProvider(Cap, P)
+    runtimeBinding(Cap, P)
+    =>
+    effect(E, queued)
+    requiredCapability(E, Cap)
+    runtimeAuthorized(E, P) .
+
+  --- ==================================================================
+  --- DR-0011 Two-Shape Meta-Grammar (S6b, model-first)
+  --- ------------------------------------------------------------------
+  --- The sections above model construct ACCEPTANCE (the compile-time
+  --- graph check). This section models the orthogonal step that runs
+  --- first: PARSING a source statement against a manifest `grammar`
+  --- spec that comes in exactly two shapes. A package construct is
+  --- registered with a manifest grammar; the body parser looks it up and
+  --- parses generically. We model that generic parse as rewriting: a
+  --- well-formed statement plus its grammar spec rewrites to
+  --- `parsedUse(C)`; a malformed statement gets STUCK short of it. The
+  --- two shapes are `declaration_block` and `effect_operation`. A
+  --- statement matching neither shape has no driver and cannot parse.
+  ---
+  --- This fragment is intentionally self-contained: it does not reuse
+  --- the acceptance vocabulary above. Parse success (`parsedUse`) is the
+  --- pre-acceptance milestone; acceptance is modeled separately.
+
+  --- Sample construct identifiers used by the S6b parse checks.
+  ops
+    recallUse sendUse poolDecl
+    recallMissingConn sendUnknownField sendMissingText recallNoBinding
+    mysteryUse
+    leaseDecl fileStoreDecl leaseFlagValued fileStoreSingleGlob
+    ledgerDecl ledgerMissingBy
+    : -> ConstructId .
+
+  --- The two grammar shapes plus a sentinel for a statement whose
+  --- construct matches neither shape.
+  sorts PShape PKind PConn PBind .
+  ops declBlock effectOp noShape : -> PShape .
+
+  --- The core-owned field/clause/slot kind vocabulary. The 2026-07-08
+  --- DR-0011 amendment (decl-family migration) adds two members beyond the
+  --- original six: `flagKind` -- a bare presence clause carrying no value,
+  --- e.g. lease/counter `shared` -- and `listOf(K)` -- a list-valued clause,
+  --- e.g. file store `allow read [..globs..]`. Multi-word clause names
+  --- such as "partition by", "context limit", "allow read" are
+  --- representational at this level: a PName constant stands for the whole
+  --- phrase, and the tokenization detail lives in the Rust parser.
+  ops
+    identifierKind expressionKind durationKind globKind schemaKind scalarKind
+    flagKind
+    : -> PKind .
+  op listOf : PKind -> PKind .
+
+  --- The fixed connective vocabulary (a required word consumed before a
+  --- slot value OR a clause value), plus `noConn` for a leading slot / a
+  --- plain clause with no connective. `byConn` was added by the decl-family
+  --- migration (M2, 2026-07-08): connectives are now ONE concept shared by
+  --- both shapes -- Shape 2 slots (`recall <pool> for <query>`) and Shape 1
+  --- clauses (`ledger X { entry E partition by <tenant> ... }`).
+  ops fromConn forConn intoConn toConn viaConn byConn noConn : -> PConn .
+
+  --- The trailing `as <binding>` mode.
+  ops bindRequired bindOptional bindNone : -> PBind .
+
+  --- Slot, clause, and payload-field names.
+  sort PName .
+  ops
+    poolName queryName channelName
+    textField markdownField threadIdField bogusField
+    providerName retainName
+    sharedName ttlName keyName rootName allowReadName
+    entryName partitionName
+    : -> PName .
+
+  --- effect_operation slot spec list: ordered `slot(name, kind, conn)`.
+  sorts PSlot PSpecList .
+  subsort PSlot < PSpecList .
+  op slot : PName PKind PConn -> PSlot .
+  op noSlots : -> PSpecList .
+  op _>>_ : PSpecList PSpecList -> PSpecList [assoc id: noSlots] .
+
+  --- Field-name sets (order-free): payload provided/required/optional and
+  --- decl-block clause coverage all reduce to set membership.
+  sort PFieldSet .
+  subsort PName < PFieldSet .
+  op noFields : -> PFieldSet .
+  op _++_ : PFieldSet PFieldSet -> PFieldSet [assoc comm id: noFields] .
+
+  --- A payload spec: `noPayload`, or a block carrying its required and
+  --- optional (allowed-but-not-required) field-name sets.
+  sort PPayload .
+  op noPayload : -> PPayload .
+  op withPayload : PFieldSet PFieldSet -> PPayload .
+
+  --- declaration_block clause spec/value sets: order-free `clauseVal`
+  --- triples of name, connective, kind. The connective is `noConn` for a
+  --- plain clause such as `provider <p>`, or a fixed word for a connective
+  --- clause such as `partition by <tenant>` = clauseVal(partition, byConn,
+  --- identifier). A provided clause matches a spec clause only when all
+  --- three agree, so a missing/wrong connective cannot parse -- the same
+  --- bite Shape 2 slots have.
+  sorts PClauseVal PClauseValSet .
+  subsort PClauseVal < PClauseValSet .
+  op clauseVal : PName PConn PKind -> PClauseVal .
+  op noClauseVals : -> PClauseValSet .
+  op _&_ : PClauseValSet PClauseValSet -> PClauseValSet [assoc comm id: noClauseVals] .
+
+  --- The source statement token stream (the tokens the body parser walks
+  --- after the leading keyword is matched by the driver).
+  sorts PTok PTokList .
+  subsort PTok < PTokList .
+  op connT : PConn -> PTok .            --- a connective word literal
+  op valT : PKind -> PTok .             --- a slot value of a given kind
+  op payloadT : PFieldSet -> PTok .     --- a `{ field* }` payload block
+  op bindT : -> PTok .                  --- a present `as <binding>`
+  op nameT : PKind -> PTok .            --- a declaration_block name value
+  op clausesT : PClauseValSet -> PTok . --- a declaration_block `{ clause* }`
+  op noToks : -> PTokList .
+  op _;_ : PTokList PTokList -> PTokList [assoc id: noToks] .
+
+  --- Manifest grammar spec (soup facts) + the source statement + a
+  --- parse trigger.
+  op grammarShape : ConstructId PShape -> Cfg .
+  op grammarEffectOp : ConstructId PSpecList PPayload PBind -> Cfg .
+  op grammarDeclBlock : ConstructId PKind PClauseValSet PClauseValSet -> Cfg .
+  op stmt : ConstructId PTokList -> Cfg .
+  op beginParse : ConstructId -> Cfg .
+
+  --- Parse-machine work terms.
+  op eoSlots : ConstructId PSpecList PTokList PPayload PBind -> Cfg .
+  op eoPayload : ConstructId PTokList PPayload PBind -> Cfg .
+  op eoPayloadCheck : ConstructId PFieldSet PFieldSet PFieldSet PTokList PBind -> Cfg .
+  op eoBinding : ConstructId PTokList PBind -> Cfg .
+  op eoFinish : ConstructId PTokList -> Cfg .
+  op dbName : ConstructId PKind PTokList PClauseValSet PClauseValSet -> Cfg .
+  op dbClauses : ConstructId PClauseValSet PClauseValSet PClauseValSet -> Cfg .
+
+  --- The parse accept: the statement matched its shape's template.
+  op parsedUse : ConstructId -> Cfg .
+
+  vars Cn : PConn .
+  vars Kd NK : PKind .
+  vars N Fld : PName .
+  vars Bnd : PBind .
+  vars Pay : PPayload .
+  vars SL : PSpecList .
+  vars TT : PTokList .
+  vars PR RR OPT : PFieldSet .
+  vars CV PRc RRc OPTc RQ : PClauseValSet .
+
+  --- Driver 1: an effect_operation statement starts the slot machine.
+  --- The keyword is already matched; the machine walks the remaining
+  --- tokens against the ordered slot list, then payload, then binding.
+  rl [eo-begin] :
+    beginParse(C) grammarShape(C, effectOp)
+    grammarEffectOp(C, SL, Pay, Bnd) stmt(C, TT)
+    =>
+    grammarShape(C, effectOp) grammarEffectOp(C, SL, Pay, Bnd)
+    eoSlots(C, SL, TT, Pay, Bnd) .
+
+  --- A leading slot with no connective consumes just a value of its kind.
+  rl [eo-slot-noconn] :
+    eoSlots(C, (slot(N, Kd, noConn) >> SL), (valT(Kd) ; TT), Pay, Bnd)
+    => eoSlots(C, SL, TT, Pay, Bnd) .
+
+  --- A slot with a required connective consumes that literal word first,
+  --- then a value of its kind. A statement missing the connective leaves
+  --- the value token where the connective was expected, so neither slot
+  --- rule fires and the machine is stuck.
+  rl [eo-slot-conn] :
+    eoSlots(C, (slot(N, Kd, Cn) >> SL), (connT(Cn) ; valT(Kd) ; TT), Pay, Bnd)
+    => eoSlots(C, SL, TT, Pay, Bnd) .
+
+  rl [eo-slots-done] :
+    eoSlots(C, noSlots, TT, Pay, Bnd)
+    => eoPayload(C, TT, Pay, Bnd) .
+
+  --- A `null` payload spec consumes no payload block.
+  rl [eo-payload-none] :
+    eoPayload(C, TT, noPayload, Bnd)
+    => eoBinding(C, TT, Bnd) .
+
+  --- A payload spec requires a payload block; its provided field set is
+  --- then validated against the required/optional (allowed) field sets.
+  rl [eo-payload-block] :
+    eoPayload(C, (payloadT(PR) ; TT), withPayload(RR, OPT), Bnd)
+    => eoPayloadCheck(C, PR, RR, OPT, TT, Bnd) .
+
+  --- A provided field that is required is consumed from both the provided
+  --- and required-remaining sets.
+  rl [pf-required] :
+    eoPayloadCheck(C, (Fld ++ PR), (Fld ++ RR), OPT, TT, Bnd)
+    => eoPayloadCheck(C, PR, RR, OPT, TT, Bnd) .
+
+  --- A provided field that is optional (allowed but not required) is
+  --- consumed from the provided set only.
+  rl [pf-optional] :
+    eoPayloadCheck(C, (Fld ++ PR), RR, (Fld ++ OPT), TT, Bnd)
+    => eoPayloadCheck(C, PR, RR, (Fld ++ OPT), TT, Bnd) .
+
+  --- Payload is well-formed only when every provided field was consumed
+  --- with none unknown and every required field was satisfied. An unknown
+  --- field leaves the provided set non-empty; a missing required field
+  --- leaves the required-remaining set non-empty; either way this rule
+  --- cannot fire and the machine is stuck.
+  rl [pf-done] :
+    eoPayloadCheck(C, noFields, noFields, OPT, TT, Bnd)
+    => eoBinding(C, TT, Bnd) .
+
+  --- The trailing `as <binding>`. A required binding consumes a present
+  --- `bindT`; if it is absent no rule fires and the machine is stuck.
+  rl [eo-bind-required] :
+    eoBinding(C, (bindT ; TT), bindRequired)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-optional-present] :
+    eoBinding(C, (bindT ; TT), bindOptional)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-optional-absent] :
+    eoBinding(C, TT, bindOptional)
+    => eoFinish(C, TT) .
+
+  rl [eo-bind-none] :
+    eoBinding(C, TT, bindNone)
+    => eoFinish(C, TT) .
+
+  --- A parse succeeds only when the whole token stream is consumed.
+  rl [eo-finish] :
+    eoFinish(C, noToks)
+    => parsedUse(C) .
+
+  --- Driver 2: a declaration_block statement. Match the name value of the
+  --- declared kind, then validate the order-free clause block.
+  rl [db-begin] :
+    beginParse(C) grammarShape(C, declBlock)
+    grammarDeclBlock(C, NK, RQ, OPTc) stmt(C, TT)
+    =>
+    grammarShape(C, declBlock) grammarDeclBlock(C, NK, RQ, OPTc)
+    dbName(C, NK, TT, RQ, OPTc) .
+
+  rl [db-name] :
+    dbName(C, NK, (nameT(NK) ; clausesT(CV)), RQ, OPTc)
+    => dbClauses(C, CV, RQ, OPTc) .
+
+  rl [db-clause-required] :
+    dbClauses(C, (clauseVal(N, Cn, Kd) & PRc), (clauseVal(N, Cn, Kd) & RRc), OPTc)
+    => dbClauses(C, PRc, RRc, OPTc) .
+
+  rl [db-clause-optional] :
+    dbClauses(C, (clauseVal(N, Cn, Kd) & PRc), RRc, (clauseVal(N, Cn, Kd) & OPTc))
+    => dbClauses(C, PRc, RRc, (clauseVal(N, Cn, Kd) & OPTc)) .
+
+  --- Clauses are well-formed only when every provided clause matched an
+  --- allowed spec (none unknown) and every required clause was present.
+  rl [db-clause-done] :
+    dbClauses(C, noClauseVals, noClauseVals, OPTc)
+    => parsedUse(C) .
+endm

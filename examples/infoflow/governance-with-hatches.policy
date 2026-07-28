@@ -28,9 +28,19 @@ grant provider fixture -> selfhost:llama readable by Operator from Operator
 grant file_store audit_log -> file:/srv/audit.log readable by public from public
 
 # --- Audited trusted surface (added after IT review) ---
-# The data subject is entitled to their OWN record, so releasing CRM content to
-# the customer's reply channel is an intentional, reviewed crossing.
+# The data subject is entitled to their OWN record: authorize a source-marked
+# `coerce … declassified` release of CRM content, to any audience (`to public`
+# is the audited release-to-the-world). A grant never blesses a raw flow — it
+# arms only the marked crossing (DR-0027 I-IFC3; see README, hatches section).
 grant declassify crm to public
-# Inbound email is sanitized by an upstream filter before we trust it as a note,
-# so we vouch for it at Operator integrity.
+# Inbound email may shape the CRM only through the source-marked
+# `coerce … endorsed` sanitizing judgment, which this grant vouches at
+# Operator integrity. Raw inbound influence stays denied.
 grant endorse inbox to Operator
+
+# Same invoker clearance as the strict policy (this file = strict + hatches).
+grant output result -> result readable by Operator
+
+# The schema.coerce model runs the marked crossings' judgments, so its prompt
+# sees Operator data — the coercion provider must be cleared like any principal.
+grant provider model -> selfhost:llama readable by Operator from Operator

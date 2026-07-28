@@ -1,0 +1,87 @@
+--- Effect idempotency-key derivation, per spec/execution-contract.md "Idempotency".
+--- Companion to the runtime effect-id construction in lower_rule.
+---
+--- The effect idempotency key is fixed AT CREATION from values known at commit
+--- time only: instance_id, program_version, revision_epoch, the rule_commit
+--- identity, and effect_node_id. The materialized input and resolved
+--- dependency-output hashes form a SEPARATE execution fingerprint recorded with
+--- the run; they are deliberately NOT part of the key, since they are not known
+--- when a downstream effect is created. This model abstracts instance, rule, and
+--- identity as fixed context and varies the two components that distinguish effect
+--- identity here -- the program version, which a revision bumps, and the effect
+--- node -- plus the fingerprint, to check by reachability search that:
+---   * effect creation is idempotent: one version-node key never yields two
+---     effects, even when the firing repeats, via the store unique index;
+---   * a re-fire under a NEW program version is a DISTINCT effect, so a revised
+---     effect is not wrongly deduped against the stale one;
+---   * the execution fingerprint is NOT part of identity: re-creating the same
+---     version-node with a DIFFERENT fingerprint still yields one effect.
+mod WHIPPLESCRIPT-EFFECT-KEY is
+  protecting BOOL .
+
+  sorts Version Node Fp Key KeySet Cfg .
+  subsort Key < KeySet .
+
+  ops v1 v2 : -> Version [ctor] .   --- program versions; a revision bumps the version
+  ops n1 n2 : -> Node [ctor] .      --- effect node ids: position in the committed graph
+  ops fpA fpB : -> Fp [ctor] .      --- execution fingerprints: resolved input and output
+
+  --- The key is derived from version and node ONLY -- never the fingerprint.
+  --- instance_id and rule_commit identity are fixed context, abstracted away.
+  op key : Version Node -> Key [ctor] .
+
+  --- schema.coerce key commitments, S2 rider per spec/std-coercion.md
+  --- "Idempotency And Replay": one abstract commitment stands for the four
+  --- committed values -- coercion_name, prompt_template_hash,
+  --- output_schema_hash, coercion_config_fingerprint. A coerce key JOINS the
+  --- commitment to identity, so a changed prompt/schema/backend re-runs the
+  --- coercion instead of replaying a stale terminal; the execution
+  --- fingerprint stays OUT of identity exactly as for ordinary effects.
+  sort Commit .
+  ops c1 c2 : -> Commit [ctor] .
+  op ckey : Version Node Commit -> Key [ctor] .
+
+  --- The created-key set abstracts the store unique index on
+  --- instance_id and idempotency_key. Union is idempotent, so it is a set.
+  op mtKeys : -> KeySet [ctor] .
+  op _;_ : KeySet KeySet -> KeySet [ctor assoc comm id: mtKeys] .
+  eq [set-idem] : K:Key ; K:Key = K:Key .
+
+  op member : Key KeySet -> Bool .
+  eq member(K:Key, (K:Key ; KS:KeySet)) = true .
+  eq member(K:Key, KS:KeySet) = false [owise] .
+
+  --- Configuration is an ACU soup of tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op create : Version Node Fp -> Cfg [ctor] .  --- a pending effect creation at commit time
+  op effect : Key Fp -> Cfg [ctor] .           --- a created effect: key and recorded fingerprint
+  op created : KeySet -> Cfg [ctor] .          --- the effect-key unique index
+
+  vars V : Version .
+  var N : Node .
+  var F : Fp .
+  var KS : KeySet .
+
+  --- Creation dedups on the version-node key. The fingerprint is recorded on the
+  --- effect but is NOT consulted for identity, so a repeated firing -- even one
+  --- whose resolved fingerprint differs -- never produces a second effect.
+  crl [create-new] : create(V, N, F) created(KS)
+      => effect(key(V, N), F) created(key(V, N) ; KS)
+      if member(key(V, N), KS) = false .
+  crl [create-dup] : create(V, N, F) created(KS)
+      => created(KS)
+      if member(key(V, N), KS) = true .
+
+  --- schema.coerce creation: the commitment joins the key; the fingerprint
+  --- still does not.
+  var C : Commit .
+  op ccreate : Version Node Commit Fp -> Cfg [ctor] .
+  crl [ccreate-new] : ccreate(V, N, C, F) created(KS)
+      => effect(ckey(V, N, C), F) created(ckey(V, N, C) ; KS)
+      if member(ckey(V, N, C), KS) = false .
+  crl [ccreate-dup] : ccreate(V, N, C, F) created(KS)
+      => created(KS)
+      if member(ckey(V, N, C), KS) = true .
+endm

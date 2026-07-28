@@ -1,0 +1,6 @@
+# `unwrap_used` (see [workspace.lints.clippy] in Cargo.toml) is a production
+# discipline: library and binary code must not `.unwrap()`. Test code may —
+# an unwrap in a test is an assertion, and rewriting the corpus to `.expect()`
+# adds noise without adding safety. This exempts test contexts (`#[test]` fns,
+# `#[cfg(test)]` modules, and files under `tests/`) from that lint only.
+allow-unwrap-in-tests = true

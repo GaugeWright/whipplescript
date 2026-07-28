@@ -1,0 +1,54 @@
+load ../infoflow-fact-provenance.maude
+
+--- Cross-rule fact provenance (DR-0045 v1). Coverage: the reach never
+--- under-reports (a hot source two hops upstream still denies; the label
+--- token governs external/unattributable content; producer own-reads are in
+--- the whole fact). Bite: a clean chain escapes an over-conservative label,
+--- and untrusted laundering through an unlabeled fact is caught.
+
+--- ============================ COVERAGE, leak reachable =====================
+
+--- Coverage: two-hop chain. fB's producer read a hot source; fA's producer
+--- assembled from fB (a direct fact edge). Consuming fA denies -- the hot
+--- read travels the chain.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fB, (hot . nilT)) prod(fA, (edge(fB) . cold . nilT)) consume(fA)
+  =>* C:Cfg leak .
+
+--- Coverage: the label token. fA's content is partly unaccountable (seed /
+--- input / unattributable root), and the sink is NOT cleared for fA's
+--- declared label -- the token denies exactly as Phase 0 did.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fA, (lbl(fA) . cold . nilT)) lblOk(fA, false) consume(fA)
+  =>* C:Cfg leak .
+
+--- Coverage: producer own-reads join the WHOLE fact (the opaque box): even a
+--- fact whose payload roots are all cold denies when its producer's own read
+--- set was hot -- the implicit "this fact exists because the hot read
+--- succeeded" flow stays inside the reach.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fA, (hot . cold . nilT)) consume(fA)
+  =>* C:Cfg leak .
+
+--- Coverage: the laundering closure. An UNLABELED fact (label token absent
+--- from its reach because the sink clears the empty label trivially) still
+--- denies when its computed chain carries a hot (untrusted) source -- the
+--- integrity reading of the same rule.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fB, (hot . nilT)) prod(fA, (edge(fB) . nilT)) lblOk(fA, true) consume(fA)
+  =>* C:Cfg leak .
+
+--- ============================ BITE, no leak ================================
+
+--- Bite: the relief. fA is over-labeled (the sink is NOT cleared for its
+--- declared label) but its COMPUTED chain is clean and fully attributed --
+--- no label token in the reach, so the declared label does not taint the
+--- consumption.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fB, (cold . nilT)) prod(fA, (edge(fB) . cold . nilT)) lblOk(fA, false) consume(fA)
+  =>* RESIDUAL:Cfg leak .
+
+--- Bite: a clean single-hop fact under a cleared label consumes freely.
+search [1] in WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE :
+  prod(fA, (cold . lbl(fA) . nilT)) lblOk(fA, true) consume(fA)
+  =>* RESIDUAL:Cfg leak .

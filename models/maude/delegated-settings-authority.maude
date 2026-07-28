@@ -1,0 +1,35 @@
+--- DR-0034 Decision 7 (D8-3): un-crippling delegated context must not widen
+--- authority. Companion to spec/decision-records/0034-managed-vs-delegated-harnesses.md.
+---
+--- A Delegated harness reads its own ambient config (CLAUDE.md, settings, native
+--- skills) via the `settings` knob (Decision 4). That knob steers BEHAVIOR within the
+--- granted authority; it must never expand authority. Tool grants come only from the
+--- WhippleScript profile/capabilities envelope (Decision 7): "we hand back context
+--- freedom, not authority freedom." The safety property modeled here: a tool grant is
+--- reachable ONLY from `profileGrant`. There is no rule producing `toolGranted` from
+--- `settingsKnob` or the `ambientRead` it enables, so a delegate reading its own
+--- CLAUDE.md can never self-grant a tool the program did not authorize -- the invariant
+--- that makes handing back setting_sources safe.
+mod WHIPPLESCRIPT-DELEGATED-SETTINGS-AUTHORITY is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op profileGrant : -> Cfg [ctor] .    --- authority from the profile/capabilities envelope
+  op settingsKnob : -> Cfg [ctor] .    --- the delegated `settings` (ambient-config) knob
+  op ambientRead : -> Cfg [ctor] .     --- the delegate reads its own CLAUDE.md/settings
+  op contextLoaded : -> Cfg [ctor] .   --- ambient context loaded (steers behavior)
+  op toolGranted : -> Cfg [ctor] .     --- a tool is in the allowed set (authority)
+
+  --- Authority comes from the profile envelope. This is the ONLY rule producing a
+  --- tool grant.
+  rl [grant-from-profile] : profileGrant => profileGrant toolGranted .
+
+  --- The settings knob loads ambient context; the context steers behavior. Neither
+  --- step produces a tool grant -- there is no rule from settingsKnob or ambientRead to
+  --- toolGranted. The steps consume their trigger so the reachable space is finite
+  --- and the No-solution bites below terminate.
+  rl [settings-loads-context] : settingsKnob => ambientRead .
+  rl [ambient-steers] : ambientRead => contextLoaded .
+endm

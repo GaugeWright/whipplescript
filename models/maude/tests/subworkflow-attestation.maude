@@ -1,0 +1,35 @@
+load ../subworkflow-attestation.maude
+
+--- Coverage: a package convergence-checks a tool, attests it eligible, and a
+--- downstream grant is then accepted from the contract.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION :
+  convergent(t1) grants(t1)
+  =>* C:Cfg accepted(t1) .
+
+--- Coverage: a grant to a tool with no eligibility attestation is rejected.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION :
+  grants(t1) notAttested(t1)
+  =>* C:Cfg rejected(t1) .
+
+--- Bite: the trust boundary holds. A grant to a tool the package did not attest
+--- is never accepted. The RESIDUAL soup var means an accepted state anywhere in
+--- the reachable space is a solution, so No solution proves the consumer never
+--- accepts a cross-package tool without a real eligibility attestation.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION :
+  grants(t1) notAttested(t1)
+  =>* accepted(t1) RESIDUAL:Cfg .
+
+--- Coverage: the genuine path serves BOTH consumers -- once a convergence-checked
+--- tool is attested, the grant is accepted AND the tool is published downstream.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION :
+  convergent(t1) grants(t1)
+  =>* C:Cfg accepted(t1) published(t1) .
+
+--- Bite (the report-vs-check bug class): the SECOND consumer is held to the same
+--- boundary. A tool the package did not attest is never published either, so a
+--- trusted conclusion can never arise for an un-attested tool from ANY consumer.
+--- An un-gated publish rule (publish from grants alone) would make published(t1)
+--- reachable here and turn this No solution into a solution -- the regression bite.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION :
+  grants(t1) notAttested(t1)
+  =>* published(t1) RESIDUAL:Cfg .

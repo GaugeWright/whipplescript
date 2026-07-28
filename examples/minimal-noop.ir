@@ -12,4 +12,4 @@ rules
       pattern:started
     writes
       schema:StartupSeen
-    body_hash 4c6d15b392e98296
+    body_hash 50a656eb7f79db6284376b35139c3a19

@@ -1,0 +1,83 @@
+--- Stat-cache soundness for import-back, per
+--- spec/versioned-workspace-research-note.md 10.1 item 2 and the
+--- untie-substrate readiness tracker Phase 0. The virtual working set keeps
+--- mtime/size fingerprints so turn-finalize import-back is O(touched), not
+--- O(tree). The invariant: import-back must NEVER miss a content change
+--- whose size and mtime match the cached fingerprint -- git's
+--- racy-timestamp hazard, where a write lands in the same mtime granule
+--- the cache entry was recorded in.
+---
+--- Two importers over one filesystem state. The NAIVE importer trusts any
+--- matching size+mtime fingerprint. The SOUND importer trusts a match only
+--- when the entry's mtime is STRICTLY OLDER than the cache snapshot stamp;
+--- entries inside the racy granule are re-hashed regardless -- detecting
+--- the change when content differs, and staying clean without a spurious
+--- import when it does not.
+mod WHIPPLESCRIPT-STAT-CACHE is
+  protecting BOOL .
+
+  sorts Path Content Sz Time Cfg .
+
+  op p1 : -> Path [ctor] .
+  ops cA cB : -> Content [ctor] .   --- same SIZE, different bytes
+  op sz1 : -> Sz [ctor] .
+  ops t1 t2 : -> Time [ctor] .      --- mtime granules, t1 before t2
+
+  op lt : Time Time -> Bool .
+  eq lt(t1, t2) = true .
+  eq lt(T:Time, T2:Time) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op file : Path Content Sz Time -> Cfg [ctor] .     --- the actual file
+  op stamp : Time -> Cfg [ctor] .                    --- cache snapshot granule
+  op nscan : Path -> Cfg [ctor] .                    --- naive import-back walk
+  op ncache : Path Sz Time Content -> Cfg [ctor] .   --- naive cache entry
+  op nskipped : Path -> Cfg [ctor] .                 --- naive: trusted the fp
+  op nimported : Path Content -> Cfg [ctor] .        --- naive: hashed + imported
+  op sscan : Path -> Cfg [ctor] .                    --- sound import-back walk
+  op scache : Path Sz Time Content -> Cfg [ctor] .   --- sound cache entry
+  op strusted : Path -> Cfg [ctor] .                 --- sound: fp trusted (non-racy)
+  op sclean : Path -> Cfg [ctor] .                   --- sound: re-hashed, unchanged
+  op simported : Path Content -> Cfg [ctor] .        --- sound: change detected
+
+  var P : Path .
+  vars C C2 : Content .
+  vars S S2 : Sz .
+  vars T T2 TS : Time .
+
+  --- The naive importer trusts any size+mtime match -- the modeled hazard.
+  crl [n-skip] :
+      nscan(P) file(P, C, S, T) ncache(P, S2, T2, C2)
+      => nskipped(P) file(P, C, S, T) ncache(P, S2, T2, C2)
+      if (S == S2) and (T == T2) = true .
+  crl [n-hash] :
+      nscan(P) file(P, C, S, T) ncache(P, S2, T2, C2)
+      => nimported(P, C) file(P, C, S, T) ncache(P, S2, T2, C2)
+      if (S == S2) and (T == T2) = false .
+
+  --- The sound importer trusts a fingerprint match only OUTSIDE the racy
+  --- granule: the entry's mtime must be strictly older than the snapshot
+  --- stamp.
+  crl [s-trust] :
+      sscan(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      => strusted(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      if (S == S2) and (T == T2) and lt(T2, TS) = true .
+
+  --- Inside the racy granule the fingerprint is not evidence: re-hash.
+  crl [s-rehash-changed] :
+      sscan(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      => simported(P, C) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      if (S == S2) and (T == T2) and (not lt(T2, TS)) and (C =/= C2) = true .
+  crl [s-rehash-clean] :
+      sscan(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      => sclean(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      if (S == S2) and (T == T2) and (not lt(T2, TS)) and (C == C2) = true .
+
+  --- A fingerprint mismatch is always hashed and imported.
+  crl [s-fp-miss] :
+      sscan(P) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      => simported(P, C) file(P, C, S, T) scache(P, S2, T2, C2) stamp(TS)
+      if (S == S2) and (T == T2) = false .
+endm

@@ -75,11 +75,29 @@ impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
 /// counterpart to the test-only in-memory `MemStorage`.
 pub struct DoSqlStorage<S: DoSql> {
     sql: S,
+    key_prefix: String,
 }
 
 impl<S: DoSql> DoSqlStorage<S> {
     pub fn new(sql: S) -> Self {
-        Self { sql }
+        Self {
+            sql,
+            key_prefix: String::new(),
+        }
+    }
+
+    /// Scope the flat DO file plane to one governed host instance. Runtime
+    /// instance ids contain no slash, so this prefix cannot collide with a
+    /// workspace path or another chat inside the same placement DO.
+    pub fn for_instance(sql: S, instance_id: &str) -> Self {
+        Self {
+            sql,
+            key_prefix: format!("{instance_id}/"),
+        }
+    }
+
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.key_prefix)
     }
 }
 
@@ -89,45 +107,50 @@ fn io_err(message: String) -> std::io::Error {
 
 impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
     fn read_file(&self, key: &str) -> std::io::Result<Option<String>> {
+        let key = self.key(key);
         let rows = self
             .sql
-            .query("SELECT content FROM files WHERE key = ?1", &[text(key)])
+            .query("SELECT content FROM files WHERE key = ?1", &[text(&key)])
             .map_err(io_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
     }
 
     fn write_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
             .execute(
                 "INSERT INTO files (key, content) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET content = excluded.content",
-                &[text(key), text(content)],
+                &[text(&key), text(content)],
             )
             .map_err(io_err)?;
         Ok(())
     }
 
     fn append_file(&self, key: &str, content: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
             .execute(
                 "INSERT INTO files (key, content) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET content = content || excluded.content",
-                &[text(key), text(content)],
+                &[text(&key), text(content)],
             )
             .map_err(io_err)?;
         Ok(())
     }
 
     fn file_exists(&self, key: &str) -> bool {
+        let key = self.key(key);
         self.sql
-            .query("SELECT 1 FROM files WHERE key = ?1", &[text(key)])
+            .query("SELECT 1 FROM files WHERE key = ?1", &[text(&key)])
             .map(|rows| !rows.is_empty())
             .unwrap_or(false)
     }
 
     fn delete_file(&self, key: &str) -> std::io::Result<()> {
+        let key = self.key(key);
         self.sql
-            .execute("DELETE FROM files WHERE key = ?1", &[text(key)])
+            .execute("DELETE FROM files WHERE key = ?1", &[text(&key)])
             .map_err(io_err)?;
         Ok(())
     }
@@ -143,29 +166,85 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         Self { sql }
     }
 
+    /// The `capability_bindings.provider` name bound for `capability` visible to
+    /// the program running `instance_id` — a program-scoped row wins over a
+    /// global `NULL` one; `None` when unbound (mirrors the native
+    /// `SqliteStore::capability_bound_provider`). The DO capability dispatch
+    /// reads this to route a `memory-provider`-bound effect to the real
+    /// `DoMemoryStore` instead of the fixture.
+    pub fn capability_bound_provider(
+        &self,
+        instance_id: &str,
+        capability: &str,
+    ) -> StoreResult<Option<String>> {
+        let program_id = self
+            .sql
+            .query(
+                "SELECT program_id FROM instances WHERE instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?
+            .first()
+            .map(|row| as_text(&row[0]))
+            .unwrap_or_default();
+        let rows = self
+            .sql
+            .query(
+                "SELECT provider FROM capability_bindings \
+                 WHERE capability = ?1 AND (program_id = ?2 OR program_id IS NULL) \
+                 ORDER BY (program_id IS NULL) ASC LIMIT 1",
+                &[text(capability), text(&program_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().and_then(|row| as_opt_text(&row[0])))
+    }
+
     /// The earliest future due instant (unix milliseconds) across this
     /// instance's pending timed effects — creation-anchored `timeout_seconds`
     /// deadlines and explicit `$.deadline_at` instants (DR-0033 Phase 6). The
     /// DO shell sets its single wake-up alarm from this when the instance
     /// parks; `None` means nothing is scheduled.
     pub fn next_effect_due_epoch_ms(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        // A due instant is only honest for an effect `advance_time` will actually
+        // fire. A `timer.wait` whose upstream dependency is unsatisfied is NOT
+        // fired by `due_time_effects` (its dep guard), so it must not be reported
+        // here either — otherwise the shell schedules an alarm for a creation-
+        // anchored deadline already in the past, Cloudflare runs it immediately,
+        // the re-drive re-parks with the same past due, and the alarm busy-loops
+        // (billed, zero progress) until the dependency resolves. This is the same
+        // guard `due_time_effects` applies (do_store.rs:6613); keep them in step.
+        let dependency_guard = "( e.kind != 'timer.wait' OR NOT EXISTS ( \
+             SELECT 1 FROM effect_dependencies AS dependency \
+             JOIN effects AS upstream ON upstream.effect_id = dependency.upstream_effect_id \
+              AND upstream.instance_id = dependency.instance_id \
+             WHERE dependency.instance_id = e.instance_id \
+               AND dependency.downstream_effect_id = e.effect_id AND NOT ( \
+                 (dependency.predicate = 'succeeds' AND upstream.status = 'completed') \
+                 OR (dependency.predicate = 'fails' AND upstream.status IN ('failed', 'timed_out')) \
+                 OR (dependency.predicate = 'timed_out' AND upstream.status = 'timed_out') \
+                 OR (dependency.predicate = 'cancelled' AND upstream.status = 'cancelled') \
+                 OR (dependency.predicate = 'completes' AND upstream.status IN ('completed', 'failed', 'timed_out', 'cancelled')) \
+               ) \
+           ) )";
+        let query = format!(
+            "SELECT MIN(due_epoch) FROM ( \
+               SELECT (CAST(strftime('%s', e.created_at) AS INTEGER) + e.timeout_seconds) \
+                 AS due_epoch FROM effects AS e \
+                WHERE e.instance_id = ?1 AND e.timeout_seconds IS NOT NULL \
+                  AND e.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                  AND {dependency_guard} \
+               UNION ALL \
+               SELECT CAST(strftime('%s', json_extract(e.input_json, '$.deadline_at')) \
+                 AS INTEGER) FROM effects AS e \
+                WHERE e.instance_id = ?1 \
+                  AND json_extract(e.input_json, '$.deadline_at') IS NOT NULL \
+                  AND e.status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
+                  AND {dependency_guard} \
+             )"
+        );
         let rows = self
             .sql
-            .query(
-                "SELECT MIN(due_epoch) FROM ( \
-                   SELECT (CAST(strftime('%s', created_at) AS INTEGER) + timeout_seconds) \
-                     AS due_epoch FROM effects \
-                    WHERE instance_id = ?1 AND timeout_seconds IS NOT NULL \
-                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
-                   UNION ALL \
-                   SELECT CAST(strftime('%s', json_extract(input_json, '$.deadline_at')) \
-                     AS INTEGER) FROM effects \
-                    WHERE instance_id = ?1 \
-                      AND json_extract(input_json, '$.deadline_at') IS NOT NULL \
-                      AND status NOT IN ('completed', 'failed', 'timed_out', 'cancelled') \
-                 )",
-                &[text(instance_id)],
-            )
+            .query(&query, &[text(instance_id)])
             .map_err(sql_err)?;
         Ok(rows
             .first()
@@ -360,6 +439,37 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             }
         }
         let payload = rule_commit_payload(&commit, program_version_id.as_deref(), revision_epoch)?;
+        // Replays are idempotent, collisions are bugs (native commit_rule_inner
+        // parity): a re-lowering that reproduces a committed firing
+        // byte-for-byte returns the stored commit and touches nothing — before
+        // this guard, a replayed commit appended a duplicate `rule.committed`
+        // event and then errored on the already-consumed facts, leaving the
+        // duplicate behind (no rollback on this path). A DISTINCT payload on an
+        // existing key stays a loud error.
+        if let Some(key) = commit.idempotency_key {
+            let existing = self
+                .sql
+                .query(
+                    "SELECT event_id, sequence, payload_json FROM events \
+                     WHERE instance_id = ?1 AND idempotency_key = ?2",
+                    &[text(commit.instance_id), text(key)],
+                )
+                .map_err(sql_err)?;
+            if let Some(row) = existing.first() {
+                if as_text(&row[2]) == payload {
+                    return Ok(StoredEvent {
+                        event_id: as_text(&row[0]),
+                        sequence: as_i64(&row[1]),
+                    });
+                }
+                return Err(StoreError::Conflict(format!(
+                    "rule commit idempotency key reused with a DIFFERENT payload \
+                     (rule `{}`, key `{key}`): two distinct firings derived one \
+                     commit key — this is a whip bug, please report it",
+                    commit.rule
+                )));
+            }
+        }
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -372,6 +482,27 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 idempotency_key: commit.idempotency_key,
             },
         )?;
+        for mark in commit.marks {
+            let mark_payload = serde_json::json!({
+                "mark": mark,
+                "site": commit.rule,
+                "committed_event_id": event.event_id,
+            })
+            .to_string();
+            let mark_key = format!("mark-reached:{mark}:{}", event.event_id);
+            do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: commit.instance_id,
+                    event_type: "mark.reached",
+                    payload_json: &mark_payload,
+                    source: "kernel",
+                    causation_id: Some(&event.event_id),
+                    correlation_id: None,
+                    idempotency_key: Some(&mark_key),
+                },
+            )?;
+        }
         for fact in commit.facts {
             do_insert_fact(
                 &self.sql,
@@ -658,20 +789,18 @@ fn int(n: i64) -> SqlValue {
     SqlValue::Int(n)
 }
 
-fn bool_int(value: bool) -> SqlValue {
-    SqlValue::Int(if value { 1 } else { 0 })
-}
-
-/// FNV-1a, byte-identical to the native store's `stable_hash_hex` — the DO must
-/// compute the same skill `content_hash` the native path does so a skill
-/// registered under either backend has a stable identity.
+/// SHA-256/128, byte-identical to the native store's `stable_hash_hex` — the DO
+/// must compute the same skill/file `content_hash` the native path does so
+/// content registered under either backend has a stable identity. (Swapped
+/// from FNV-1a in the collision-hardening pass; keep the two in lockstep.)
 pub(crate) fn stable_hash_hex(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        hex.push_str(&format!("{byte:02x}"));
     }
-    format!("{hash:016x}")
+    hex
 }
 
 /// Maps an 8-column skill row (`skill_id..required_capabilities`) to a `SkillView`.
@@ -685,27 +814,6 @@ fn skill_view_from_row(row: &[SqlValue]) -> SkillView {
         content_hash: as_text(&row[5]),
         description: as_text(&row[6]),
         required_capabilities_json: as_text(&row[7]),
-    }
-}
-
-/// Maps a 14-column inbox row to an `InboxItemView` (nullable columns:
-/// `effect_id`, `answer_json`, `answered_by`, `answered_at`).
-fn inbox_item_view_from_row(row: &[SqlValue]) -> InboxItemView {
-    InboxItemView {
-        inbox_item_id: as_text(&row[0]),
-        instance_id: as_text(&row[1]),
-        effect_id: as_opt_text(&row[2]),
-        status: as_text(&row[3]),
-        prompt: as_text(&row[4]),
-        choices_json: as_text(&row[5]),
-        freeform_allowed: as_i64(&row[6]) != 0,
-        severity: as_text(&row[7]),
-        related_effects_json: as_text(&row[8]),
-        related_artifacts_json: as_text(&row[9]),
-        answer_json: as_opt_text(&row[10]),
-        answered_by: as_opt_text(&row[11]),
-        created_at: as_text(&row[12]),
-        answered_at: as_opt_text(&row[13]),
     }
 }
 
@@ -737,7 +845,7 @@ fn event_view_from_row(row: &[SqlValue]) -> EventView {
     }
 }
 
-/// Maps an 8-column fact row to a `FactView` (nullable: `program_version_id`,
+/// Maps a 9-column fact row to a `FactView` (nullable: `program_version_id`,
 /// `source_span_json`).
 fn fact_view_from_row(row: &[SqlValue]) -> FactView {
     FactView {
@@ -749,6 +857,7 @@ fn fact_view_from_row(row: &[SqlValue]) -> FactView {
         value_json: as_text(&row[5]),
         provenance_class: as_text(&row[6]),
         source_span_json: as_opt_text(&row[7]),
+        source_event_id: as_opt_text(&row[8]).unwrap_or_default(),
     }
 }
 
@@ -1169,6 +1278,31 @@ fn skill_to_json(skill: &SkillView) -> Value {
 /// sequence. Shared by the `append_event` trait method and the lifecycle methods
 /// (which the native store threads through a transaction). Mirrors
 /// `append_event_on`.
+/// `do_append_event`, tolerant of an idempotency-key replay. Mirrors the
+/// native `append_event_idempotent_on`: re-appending an event that already
+/// exists (same instance, same idempotency key) returns the stored row instead
+/// of a UNIQUE-constraint error.
+fn do_append_event_idempotent<Sql: DoSql>(
+    sql: &Sql,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    if let Some(key) = event.idempotency_key {
+        let rows = sql
+            .query(
+                "SELECT event_id, sequence FROM events WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(event.instance_id), text(key)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = rows.first() {
+            return Ok(StoredEvent {
+                event_id: as_text(&row[0]),
+                sequence: as_i64(&row[1]),
+            });
+        }
+    }
+    do_append_event(sql, event)
+}
+
 fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
     let rows = sql
         .query(
@@ -1187,7 +1321,20 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
                 opt_text(event.idempotency_key),
             ],
         )
-        .map_err(sql_err)?;
+        .map_err(|error| {
+            // Name the colliding event (native `append_event_on` parity): a
+            // UNIQUE hit on the idempotency key is undebuggable from a generic
+            // store error.
+            if error.contains("UNIQUE") {
+                StoreError::Conflict(format!(
+                    "duplicate event idempotency key for `{}` (key {:?}): a second \
+                     distinct commit produced an already-used key",
+                    event.event_type, event.idempotency_key
+                ))
+            } else {
+                sql_err(error)
+            }
+        })?;
     let row = rows
         .first()
         .ok_or_else(|| sql_err("append_event returned no row".to_string()))?;
@@ -1428,9 +1575,18 @@ fn do_insert_fact<Sql: DoSql>(
         serde_json::from_str::<Value>(source_span_json)?;
     }
     sql.execute(
+        // Set-like collapse (native parity): the key is content-derived, so a
+        // conflict is a byte-identical active fact — re-recording is a no-op.
         "INSERT INTO facts (fact_id, instance_id, program_version_id, revision_epoch, name, key, \
          value_json, source_event_id, source_rule, schema_id, provenance_class, correlation_id, \
-         source_span_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         source_span_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         ON CONFLICT(instance_id, name, key) DO UPDATE SET \
+             consumed_at = NULL, fact_id = excluded.fact_id, \
+             value_json = excluded.value_json, \
+             source_event_id = excluded.source_event_id, source_rule = excluded.source_rule, \
+             program_version_id = excluded.program_version_id, \
+             revision_epoch = excluded.revision_epoch, updated_at = CURRENT_TIMESTAMP \
+         WHERE facts.consumed_at IS NOT NULL",
         &[
             text(fact.fact_id),
             text(instance_id),
@@ -2259,6 +2415,14 @@ fn rule_commit_payload(
         "effects": effects,
         "dependencies": dependencies,
         "terminal": terminal,
+        // DR-0043 slice 1 (mirrors the native payload): the firing's pinned
+        // context, kernel-serialized.
+        "context": commit
+            .context_json
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(StoreError::Json)?
+            .unwrap_or(serde_json::Value::Null),
     });
     serde_json::to_string(&payload).map_err(Into::into)
 }
@@ -3431,6 +3595,54 @@ fn do_policy_block_for_capabilities<Sql: DoSql>(
 
 /// Whether a queued effect is blocked by capability/profile policy. Mirrors
 /// `policy_block_on`.
+/// Persist a policy block observed by the claim-list filter (parity with the
+/// native `persist_policy_block_on`): flip the effect to the block's status
+/// with its reason and append an `effect.blocked` event, idempotent per
+/// (effect, reason). Recovery is automatic — `do_policy_block` re-evaluates
+/// persisted blocks each pass.
+fn do_persist_policy_block<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    effect_id: &str,
+    block: &PolicyBlock,
+) -> StoreResult<()> {
+    let changed = sql
+        .execute(
+            "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
+             updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
+             AND (status != ?1 OR policy_block_reason IS NOT ?2) \
+             AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
+            &[
+                text(block.status),
+                text(&block.reason),
+                text(instance_id),
+                text(effect_id),
+            ],
+        )
+        .map_err(sql_err)?;
+    if changed == 1 {
+        let payload = serde_json::json!({
+            "effect_id": effect_id,
+            "status": block.status,
+            "reason": block.reason,
+        })
+        .to_string();
+        do_append_event_idempotent(
+            sql,
+            NewEvent {
+                instance_id,
+                event_type: "effect.blocked",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: Some(effect_id),
+                correlation_id: None,
+                idempotency_key: Some(&format!("policy-block:{effect_id}:{}", block.reason)),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn do_policy_block<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
@@ -3462,25 +3674,35 @@ fn do_policy_block<Sql: DoSql>(
         program_id: as_text(&row[5]),
         declared_profiles_json: as_text(&row[6]),
     };
+    // A persisted policy block is re-evaluated here every pass — that is what
+    // makes it RECOVERABLE once the missing profile/capability is registered
+    // (parity with native `policy_block_on`).
     if !matches!(
         effect.status.as_str(),
-        "queued" | "blocked_by_dependency" | "blocked_by_capacity"
+        "queued"
+            | "blocked_by_dependency"
+            | "blocked_by_capacity"
+            | "blocked_by_capability"
+            | "blocked_by_profile"
     ) {
         return Ok(None);
     }
     if let Some(block) = agent_target_policy_block(&effect)? {
         return Ok(Some(block));
     }
-    // Timers, builtin-queue verbs, and coordination verbs are runtime-resolved:
-    // no provider/capability/profile applies.
-    if effect.kind == "timer.wait"
-        || effect.kind.starts_with("queue.")
-        || effect.kind.starts_with("lease.")
-        || effect.kind.starts_with("ledger.")
-        || effect.kind.starts_with("counter.")
-        || effect.kind == "signal.emit"
-        || effect.kind.starts_with("file.")
-    {
+    // Timers are resolved by the runtime itself on worker passes: no provider,
+    // capability, or profile applies. This is the ONLY runtime-resolved
+    // exemption, matching the native gate (store/lib.rs `policy_block_on`).
+    //
+    // Coordination (`lease.*`/`ledger.*`/`counter.*`), file (`file.*`), tracker
+    // (`tracker.*`), and ingress (`signal.emit`) kinds are NO LONGER exempt:
+    // the DO-plane package bootstrap (do_packages::register_embedded_std_packages,
+    // called at DurableInstance::create/attach) seeds the same
+    // capability/provider/binding rows the native store seeds at init, so the
+    // admission gate is REAL here too — an unbound kind blocks as
+    // blocked_by_capability, parity with native (the DO tracker's "DO-plane
+    // package bootstrap" row, spec/durable-object-runtime-tracker.md).
+    if effect.kind == "timer.wait" {
         return Ok(None);
     }
     if effect.kind == "exec.command" {
@@ -4543,29 +4765,81 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "correlation_id": derived.fact.correlation_id,
         })
         .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: derived.instance_id,
-                event_type: "fact.derived",
-                payload_json: &payload,
-                source: derived.source,
-                causation_id: derived.causation_id,
-                correlation_id: derived.fact.correlation_id,
-                idempotency_key: derived.idempotency_key,
-            },
-        )?;
-        let (program_version_id, revision_epoch) =
-            do_active_revision(&self.sql, derived.instance_id)?;
-        do_insert_fact(
-            &self.sql,
-            derived.instance_id,
-            derived.source,
-            &event.event_id,
-            program_version_id.as_deref(),
-            revision_epoch,
-            &derived.fact,
-        )?;
+        // Replay-tolerant (native parity): a re-derivation under an existing
+        // idempotency key is a crash-window heal; on replay the fact row is
+        // inserted only if missing entirely, never revived from consumed.
+        let mut replayed = false;
+        let event = match derived.idempotency_key {
+            Some(key) => {
+                let existing = self
+                    .sql
+                    .query(
+                        "SELECT event_id, sequence FROM events \
+                         WHERE instance_id = ?1 AND idempotency_key = ?2",
+                        &[text(derived.instance_id), text(key)],
+                    )
+                    .map_err(sql_err)?;
+                match existing.first() {
+                    Some(row) => {
+                        replayed = true;
+                        StoredEvent {
+                            event_id: as_text(&row[0]),
+                            sequence: as_i64(&row[1]),
+                        }
+                    }
+                    None => do_append_event(
+                        &self.sql,
+                        NewEvent {
+                            instance_id: derived.instance_id,
+                            event_type: "fact.derived",
+                            payload_json: &payload,
+                            source: derived.source,
+                            causation_id: derived.causation_id,
+                            correlation_id: derived.fact.correlation_id,
+                            idempotency_key: derived.idempotency_key,
+                        },
+                    )?,
+                }
+            }
+            None => do_append_event(
+                &self.sql,
+                NewEvent {
+                    instance_id: derived.instance_id,
+                    event_type: "fact.derived",
+                    payload_json: &payload,
+                    source: derived.source,
+                    causation_id: derived.causation_id,
+                    correlation_id: derived.fact.correlation_id,
+                    idempotency_key: derived.idempotency_key,
+                },
+            )?,
+        };
+        let fact_row_exists = replayed
+            && !self
+                .sql
+                .query(
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 AND key = ?3",
+                    &[
+                        text(derived.instance_id),
+                        text(derived.fact.name),
+                        text(derived.fact.key),
+                    ],
+                )
+                .map_err(sql_err)?
+                .is_empty();
+        if !fact_row_exists {
+            let (program_version_id, revision_epoch) =
+                do_active_revision(&self.sql, derived.instance_id)?;
+            do_insert_fact(
+                &self.sql,
+                derived.instance_id,
+                derived.source,
+                &event.event_id,
+                program_version_id.as_deref(),
+                revision_epoch,
+                &derived.fact,
+            )?;
+        }
         Ok(event)
     }
 
@@ -4586,6 +4860,26 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 .map_err(sql_err)?
                 .is_empty();
             if exists {
+                skipped += 1;
+                continue;
+            }
+            // Native parity: a LIVE identical row from an earlier admission is
+            // a no-op re-assertion and counts `skipped`; a CONSUMED row falls
+            // through to re-admit (DR-0044 revive) and counts `admitted`.
+            let live_conflict = !self
+                .sql
+                .query(
+                    "SELECT 1 FROM facts WHERE instance_id = ?1 AND name = ?2 \
+                     AND key = ?3 AND consumed_at IS NULL",
+                    &[
+                        text(batch.instance_id),
+                        text(batch.schema_name),
+                        text(row.key),
+                    ],
+                )
+                .map_err(sql_err)?
+                .is_empty();
+            if live_conflict {
                 skipped += 1;
                 continue;
             }
@@ -4676,7 +4970,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "SELECT candidate.effect_id, candidate.kind, candidate.target, candidate.profile, \
                  candidate.input_json, candidate.required_capabilities, \
                  COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'), \
-                 candidate.created_by_event_id \
+                 candidate.created_by_event_id, candidate.status \
                  FROM effects AS candidate \
                  LEFT JOIN instances ON instances.instance_id = candidate.instance_id \
                  LEFT JOIN program_versions AS active_versions \
@@ -4685,8 +4979,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                  ON effect_versions.version_id = candidate.program_version_id \
                  WHERE candidate.instance_id = ?1 AND candidate.kind != 'timer.wait' \
                  AND ( \
-                   candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity') \
-                   OR (candidate.kind = 'workflow.invoke' AND candidate.status = 'running') \
+                   candidate.status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile') \
+                   OR candidate.status = 'running' \
                  ) AND NOT EXISTS ( \
                    SELECT 1 FROM effect_cancellation_requests AS request \
                    WHERE request.instance_id = candidate.instance_id \
@@ -4726,10 +5020,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 required_capabilities_json: as_text(&row[5]),
                 declared_profiles_json: as_text(&row[6]),
             };
-            if do_policy_block(&self.sql, instance_id, &effect.effect_id)?.is_some() {
+            if let Some(block) = do_policy_block(&self.sql, instance_id, &effect.effect_id)? {
+                // Persist the block where it is observed (parity with native
+                // `persist_policy_block_on`): a silent skip left the effect
+                // reading `queued` with no reason forever.
+                do_persist_policy_block(&self.sql, instance_id, &effect.effect_id, &block)?;
                 continue;
             }
-            if do_capacity_block(&self.sql, instance_id, &effect.effect_id)?.is_some() {
+            let already_running = as_text(&row[8]) == "running";
+            if !already_running
+                && do_capacity_block(&self.sql, instance_id, &effect.effect_id)?.is_some()
+            {
                 continue;
             }
             claimable.push(effect);
@@ -4807,6 +5108,12 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .into_iter()
             .flatten()
         {
+            // Operator-plane rows (`"plane": "operator"`, std-telemetry.md
+            // T3) are capability-free operator-CLI configuration, never an
+            // admission-plane registration — parity with the native store.
+            if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+                continue;
+            }
             let config_json = provider
                 .get("config")
                 .map(Value::to_string)
@@ -5529,55 +5836,6 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(evidence_id)
     }
 
-    fn record_pi_rpc_evidence(&self, evidence: PiRpcEvidence<'_>) -> StoreResult<String> {
-        let inner = serde_json::from_str::<Value>(evidence.metadata_json)?;
-        let metadata = serde_json::json!({
-            "provider_id": evidence.provider_id,
-            "session_id": evidence.session_id,
-            "run_id": evidence.run_id,
-            "evidence": inner,
-        })
-        .to_string();
-        let summary = format!(
-            "Pi RPC evidence for provider `{}` session `{}`",
-            evidence.provider_id, evidence.session_id
-        );
-        let evidence_id = do_insert_evidence(
-            &self.sql,
-            EvidenceRecord {
-                instance_id: evidence.instance_id,
-                kind: "pi.rpc.evidence",
-                subject_type: "provider_session",
-                subject_id: evidence.session_id,
-                causation_id: Some(evidence.run_id),
-                correlation_id: evidence.correlation_id,
-                summary: Some(&summary),
-                metadata_json: &metadata,
-            },
-        )?;
-        do_insert_evidence_link(
-            &self.sql,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider",
-                target_id: evidence.provider_id,
-                relation: "observes",
-            },
-        )?;
-        do_insert_evidence_link(
-            &self.sql,
-            EvidenceLink {
-                evidence_id: &evidence_id,
-                instance_id: evidence.instance_id,
-                target_type: "provider_run",
-                target_id: evidence.run_id,
-                relation: "observes",
-            },
-        )?;
-        Ok(evidence_id)
-    }
-
     fn link_evidence(&self, link: EvidenceLink<'_>) -> StoreResult<()> {
         do_insert_evidence_link(&self.sql, link)
     }
@@ -5780,164 +6038,6 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(span)
     }
 
-    fn create_inbox_item(&self, item: NewInboxItem<'_>) -> StoreResult<()> {
-        serde_json::from_str::<Value>(item.choices_json)?;
-        serde_json::from_str::<Value>(item.related_effects_json)?;
-        serde_json::from_str::<Value>(item.related_artifacts_json)?;
-        self.sql
-            .execute(
-                "INSERT INTO inbox_items (inbox_item_id, instance_id, effect_id, status, \
-                 prompt, choices_json, freeform_allowed, severity, related_effects_json, \
-                 related_artifacts_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                &[
-                    text(item.inbox_item_id),
-                    text(item.instance_id),
-                    opt_text(item.effect_id),
-                    text(item.status),
-                    text(item.prompt),
-                    text(item.choices_json),
-                    bool_int(item.freeform_allowed),
-                    text(item.severity),
-                    text(item.related_effects_json),
-                    text(item.related_artifacts_json),
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(())
-    }
-
-    fn list_inbox_items(&self, status: Option<&str>) -> StoreResult<Vec<InboxItemView>> {
-        let mut sql = "SELECT inbox_item_id, instance_id, effect_id, status, prompt, \
-             choices_json, freeform_allowed, severity, related_effects_json, \
-             related_artifacts_json, answer_json, answered_by, created_at, answered_at \
-             FROM inbox_items"
-            .to_owned();
-        if status.is_some() {
-            sql.push_str(" WHERE status = ?1");
-        }
-        sql.push_str(" ORDER BY created_at, inbox_item_id");
-        let params: Vec<SqlValue> = status.map(|s| vec![text(s)]).unwrap_or_default();
-        let rows = self.sql.query(&sql, &params).map_err(sql_err)?;
-        Ok(rows.iter().map(|r| inbox_item_view_from_row(r)).collect())
-    }
-
-    fn get_inbox_item(&self, inbox_item_id: &str) -> StoreResult<Option<InboxItemView>> {
-        let rows = self
-            .sql
-            .query(
-                "SELECT inbox_item_id, instance_id, effect_id, status, prompt, choices_json, \
-                 freeform_allowed, severity, related_effects_json, related_artifacts_json, \
-                 answer_json, answered_by, created_at, answered_at FROM inbox_items \
-                 WHERE inbox_item_id = ?1",
-                &[text(inbox_item_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(rows.first().map(|r| inbox_item_view_from_row(r)))
-    }
-
-    fn answer_inbox_item(&mut self, answer: HumanAnswer<'_>) -> StoreResult<StoredEvent> {
-        let answer_value = serde_json::from_str::<Value>(answer.answer_json)?;
-        let rows = self
-            .sql
-            .query(
-                "SELECT instance_id, effect_id, prompt, status FROM inbox_items \
-                 WHERE inbox_item_id = ?1",
-                &[text(answer.inbox_item_id)],
-            )
-            .map_err(sql_err)?;
-        let row = rows
-            .first()
-            .ok_or_else(|| StoreError::Conflict("inbox item was not found".to_owned()))?;
-        let item_instance_id = as_text(&row[0]);
-        let item_effect_id = as_opt_text(&row[1]);
-        let item_prompt = as_text(&row[2]);
-        let item_status = as_text(&row[3]);
-        if item_status != "pending" {
-            return Err(StoreError::Conflict(format!(
-                "inbox item `{}` is not pending",
-                answer.inbox_item_id
-            )));
-        }
-        self.sql
-            .execute(
-                "UPDATE inbox_items SET status = 'answered', answer_json = ?2, answered_by = ?3, \
-                 answered_at = CURRENT_TIMESTAMP WHERE inbox_item_id = ?1 AND status = 'pending'",
-                &[
-                    text(answer.inbox_item_id),
-                    text(answer.answer_json),
-                    text(answer.answered_by),
-                ],
-            )
-            .map_err(sql_err)?;
-        let choice = answer_value
-            .get("choice")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let answer_text = answer_value
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let payload = serde_json::json!({
-            "inbox_item_id": answer.inbox_item_id,
-            "effect_id": item_effect_id,
-            "prompt": item_prompt,
-            "answered_by": answer.answered_by,
-            "choice": choice,
-            "text": answer_text,
-            "answer": answer_value,
-        })
-        .to_string();
-        let event = do_append_event(
-            &self.sql,
-            NewEvent {
-                instance_id: &item_instance_id,
-                event_type: "human.answer.received",
-                payload_json: &payload,
-                source: "human",
-                causation_id: Some(answer.inbox_item_id),
-                correlation_id: item_effect_id.as_deref(),
-                idempotency_key: answer.idempotency_key,
-            },
-        )?;
-        let fact_id = stable_hash_hex(&format!("{}:human-answer", answer.inbox_item_id));
-        let fact = NewFact {
-            fact_id: &fact_id,
-            name: "human.answer.received",
-            key: answer.inbox_item_id,
-            value_json: &payload,
-            schema_id: Some("HumanAnswer"),
-            provenance_class: "human",
-            correlation_id: item_effect_id.as_deref(),
-            source_span_json: None,
-        };
-        let (program_version_id, revision_epoch) =
-            do_active_revision(&self.sql, &item_instance_id)?;
-        do_insert_fact(
-            &self.sql,
-            &item_instance_id,
-            "human",
-            &event.event_id,
-            program_version_id.as_deref(),
-            revision_epoch,
-            &fact,
-        )?;
-        Ok(event)
-    }
-
-    fn cancel_pending_inbox_for_instance(&mut self, instance_id: &str) -> StoreResult<usize> {
-        let changed = self
-            .sql
-            .execute(
-                "UPDATE inbox_items SET status = 'cancelled' \
-                 WHERE instance_id = ?1 AND status = 'pending'",
-                &[text(instance_id)],
-            )
-            .map_err(sql_err)?;
-        Ok(changed as usize)
-    }
-
     fn record_skill_evidence(&self, evidence: SkillEvidence<'_>) -> StoreResult<String> {
         // Resolve each named skill (sorted by name), mirroring `skills_by_name`.
         let mut skills = Vec::new();
@@ -6069,12 +6169,31 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(rows.iter().map(|r| event_view_from_row(r)).collect())
     }
 
+    fn event_by_idempotency_key(
+        &self,
+        instance_id: &str,
+        idempotency_key: &str,
+    ) -> StoreResult<Option<StoredEvent>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, sequence FROM events \
+                 WHERE instance_id = ?1 AND idempotency_key = ?2",
+                &[text(instance_id), text(idempotency_key)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| StoredEvent {
+            event_id: as_text(&row[0]),
+            sequence: as_i64(&row[1]),
+        }))
+    }
+
     fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
         let rows = self
             .sql
             .query(
                 "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json FROM facts \
+                 provenance_class, source_span_json, source_event_id FROM facts \
                  WHERE instance_id = ?1 AND consumed_at IS NULL ORDER BY name, key",
                 &[text(instance_id)],
             )
@@ -6087,7 +6206,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 "SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, \
-                 provenance_class, source_span_json FROM facts \
+                 provenance_class, source_span_json, source_event_id FROM facts \
                  WHERE instance_id = ?1 ORDER BY name, key",
                 &[text(instance_id)],
             )
@@ -6208,6 +6327,38 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     }
 
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent> {
+        // A host reattachment after `NeedsIo` re-enters the exact running
+        // effect with the same deterministic run/lease ids. Treat that as the
+        // same run, not a second claim. Any identity drift fails closed.
+        let existing = self
+            .sql
+            .query(
+                "SELECT runs.effect_id, runs.instance_id, runs.provider, runs.worker_id, \
+                 runs.status, leases.lease_id, leases.status \
+                 FROM runs JOIN leases ON leases.run_id = runs.run_id \
+                 WHERE runs.run_id = ?1 LIMIT 1",
+                &[text(run.run_id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = existing.first() {
+            let matches = as_text(&row[0]) == run.effect_id
+                && as_text(&row[1]) == run.instance_id
+                && as_text(&row[2]) == run.provider
+                && as_text(&row[3]) == run.worker_id
+                && as_text(&row[4]) == "running"
+                && as_text(&row[5]) == run.lease_id
+                && as_text(&row[6]) == "active";
+            if !matches {
+                return Err(StoreError::Conflict(
+                    "run id was reused with different active run identity".to_owned(),
+                ));
+            }
+            return self
+                .event_by_idempotency_key(run.instance_id, run.run_id)?
+                .ok_or_else(|| {
+                    StoreError::Conflict("active run has no durable run-start event".to_owned())
+                });
+        }
         let status_rows = self
             .sql
             .query(
@@ -6249,7 +6400,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 .execute(
                     "UPDATE effects SET status = ?1, policy_block_reason = ?2, \
                      updated_at = CURRENT_TIMESTAMP WHERE instance_id = ?3 AND effect_id = ?4 \
-                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                     AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
                     &[
                         text(block.status),
                         text(&block.reason),
@@ -6310,7 +6461,10 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "reason": reason,
             })
             .to_string();
-            do_append_event(
+            // Idempotent: the same (effect, run) can be capacity-blocked again
+            // on a later worker pass after an interleaved unblock — the same
+            // durable statement, not a second event.
+            do_append_event_idempotent(
                 &self.sql,
                 NewEvent {
                     instance_id: run.instance_id,
@@ -6360,7 +6514,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 "UPDATE effects SET status = 'running', policy_block_reason = NULL, \
                  policy_block_category = NULL, updated_at = CURRENT_TIMESTAMP \
                  WHERE instance_id = ?1 AND effect_id = ?2 \
-                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity')",
+                 AND status IN ('queued', 'blocked', 'blocked_by_dependency', 'blocked_by_capacity', 'blocked_by_capability', 'blocked_by_profile')",
                 &[text(run.instance_id), text(run.effect_id)],
             )
             .map_err(sql_err)?;
@@ -6692,6 +6846,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(())
     }
 
+    fn revive_fact(&mut self, instance_id: &str, fact_id: &str) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "UPDATE facts SET consumed_at = NULL, updated_at = CURRENT_TIMESTAMP \
+                 WHERE instance_id = ?1 AND fact_id = ?2 AND consumed_at IS NOT NULL",
+                &[text(instance_id), text(fact_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
     fn cancel_effect(&mut self, cancellation: EffectCancellation<'_>) -> StoreResult<StoredEvent> {
         let payload = serde_json::json!({
             "effect_id": cancellation.effect_id,
@@ -6900,7 +7065,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
 // RuntimeStore port.
 
 const DO_ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, \
-     metadata_json, filed_by, created_at, updated_at";
+     metadata_json, assigned_to, filed_by, created_at, updated_at";
 
 /// The active-lease predicate over `tracker_leases`, with the clock inlined as
 /// `datetime('now')`. A NULL `expires_at` models a lease with no TTL.
@@ -6920,9 +7085,10 @@ fn do_issue_row(row: &[SqlValue]) -> WorkItem {
         labels: serde_json::from_str(&as_text(&row[5])).unwrap_or_default(),
         metadata: serde_json::from_str(&as_text(&row[6])).unwrap_or_else(|_| serde_json::json!({})),
         claimed_by: None,
-        filed_by: as_opt_text(&row[7]),
-        created_at: as_text(&row[8]),
-        updated_at: as_text(&row[9]),
+        assigned_to: as_opt_text(&row[7]),
+        filed_by: as_opt_text(&row[8]),
+        created_at: as_text(&row[9]),
+        updated_at: as_text(&row[10]),
     }
 }
 
@@ -6935,28 +7101,133 @@ fn do_now(sql: &impl DoSql) -> StoreResult<String> {
         .map_or_else(String::new, |row| as_text(&row[0])))
 }
 
-/// Append one immutable tracker event (INSERT only — never updated or deleted).
-fn do_tracker_append(
+/// Resolve a human `WS-N` alias to its opaque `content_id` merge identity
+/// (ADR-0002 phase B1: the DO event log is keyed by content_id, like native).
+fn do_content_id(sql: &impl DoSql, alias: &str) -> StoreResult<Option<String>> {
+    let rows = sql
+        .query(
+            "SELECT content_id FROM tracker_aliases WHERE alias = ?1",
+            &[text(alias)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+/// The issue's current head event ids — events nothing lists as a parent.
+fn do_issue_heads(sql: &impl DoSql, content_id: &str) -> StoreResult<Vec<String>> {
+    let rows = sql
+        .query(
+            "SELECT e.event_id FROM tracker_events e \
+             WHERE e.issue_id = ?1 AND e.event_id IS NOT NULL \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM tracker_events c \
+                 WHERE c.issue_id = ?1 \
+                   AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+            &[text(content_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+}
+
+/// Append one immutable content-addressed tracker event (INSERT only), keyed by
+/// the issue's opaque content_id. `event_id_override` is used only for the
+/// `issue.created` root (whose id IS the content_id). Deduped by `event_id`.
+fn do_tracker_append_raw(
     sql: &impl DoSql,
-    issue_id: Option<&str>,
+    content_id: Option<&str>,
+    event_id_override: Option<&str>,
     kind: &str,
-    payload: &serde_json::Value,
+    payload_json: &str,
     actor: Option<&str>,
     now: &str,
-) -> StoreResult<()> {
+) -> StoreResult<String> {
+    let parents = match content_id {
+        Some(id) => do_issue_heads(sql, id)?,
+        None => Vec::new(),
+    };
+    let event_id = match event_id_override {
+        Some(id) => id.to_owned(),
+        None => whipplescript_store::items::event_content_id(
+            kind,
+            content_id,
+            payload_json,
+            actor,
+            &parents,
+            now,
+        ),
+    };
+    let parents_json =
+        serde_json::to_string(&parents).map_err(|error| sql_err(error.to_string()))?;
     sql.execute(
-        "INSERT INTO tracker_events (issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO tracker_events \
+         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         &[
-            opt_text(issue_id),
+            text(&event_id),
+            text(&parents_json),
+            opt_text(content_id),
             text(kind),
-            text(&payload.to_string()),
+            text(payload_json),
             opt_text(actor),
             text(now),
         ],
     )
     .map_err(sql_err)?;
+    Ok(event_id)
+}
+
+/// Append one event for an issue given by its `WS-N` alias — resolves the alias
+/// to the opaque content_id the event log is keyed by (merge-stable).
+fn do_tracker_append(
+    sql: &impl DoSql,
+    alias: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    actor: Option<&str>,
+    now: &str,
+) -> StoreResult<()> {
+    let content_id = match alias {
+        Some(a) => Some(
+            do_content_id(sql, a)?
+                .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {a}")))?,
+        ),
+        None => None,
+    };
+    do_tracker_append_raw(
+        sql,
+        content_id.as_deref(),
+        None,
+        kind,
+        &payload.to_string(),
+        actor,
+        now,
+    )?;
     Ok(())
+}
+
+/// Load one issue's events (by content_id) into the shared `IssueEvent` shape
+/// for `analyze_issue_dag` — the DO store shares the native conflict analysis.
+fn do_load_issue_events(
+    sql: &impl DoSql,
+    content_id: &str,
+) -> StoreResult<Vec<whipplescript_store::items::IssueEvent>> {
+    let rows = sql
+        .query(
+            "SELECT event_id, parents_json, kind, payload_json FROM tracker_events \
+             WHERE issue_id = ?1 ORDER BY event_seq",
+            &[text(content_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| whipplescript_store::items::IssueEvent {
+            event_id: as_opt_text(&row[0]).unwrap_or_default(),
+            parents: serde_json::from_str(&as_text(&row[1])).unwrap_or_default(),
+            kind: as_text(&row[2]),
+            payload: serde_json::from_str(&as_text(&row[3]))
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+        .collect())
 }
 
 /// The holder of the active lease on an issue, if any.
@@ -7130,11 +7401,29 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "metadata": metadata,
             "filed_by": filed_by,
         });
-        do_tracker_append(
-            &self.sql,
-            Some(&item_id),
+        // Opaque merge identity = the content-hash of the creation event; WS-N
+        // is only a local alias for it. The event log is keyed by content_id.
+        let payload_json = payload.to_string();
+        let content_id = whipplescript_store::items::event_content_id(
             "issue.created",
-            &payload,
+            None,
+            &payload_json,
+            filed_by,
+            &[],
+            &now,
+        );
+        self.sql
+            .execute(
+                "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                &[text(&content_id), text(&item_id)],
+            )
+            .map_err(sql_err)?;
+        do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            Some(&content_id),
+            "issue.created",
+            &payload_json,
             filed_by,
             &now,
         )?;
@@ -7224,11 +7513,33 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 &[text(queue)],
             )
             .map_err(sql_err)?;
+        // A conflicted issue is not ready (ADR-0002 phase B1 slice ii): its
+        // field values are in dispute. Not expressible in the SQL predicate, so
+        // filter here via the shared DAG conflict analysis.
+        let mut ready = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let item = do_issue_row(row);
+            let conflicted = match do_content_id(&self.sql, &item.id)? {
+                Some(content_id) => whipplescript_store::items::analyze_issue_dag(
+                    &do_load_issue_events(&self.sql, &content_id)?,
+                )
+                .conflicted(),
+                None => false,
+            };
+            if !conflicted {
+                ready.push(item);
+            }
+        }
         // Ready rows have no active lease by construction; the overlay is a no-op.
-        Ok(rows.iter().map(|row| do_issue_row(row)).collect())
+        Ok(ready)
     }
 
-    fn claim_item(&mut self, item_id: &str, claimed_by: &str) -> StoreResult<ClaimOutcome> {
+    fn claim_item(
+        &mut self,
+        item_id: &str,
+        claimed_by: &str,
+        expires: Option<&str>,
+    ) -> StoreResult<ClaimOutcome> {
         let now = do_now(&self.sql)?;
         let exists = !self
             .sql
@@ -7247,32 +7558,33 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         if let Some(holder) = do_active_holder(&self.sql, item_id)? {
             return Ok(ClaimOutcome::AlreadyClaimed { holder });
         }
-        let n = self
-            .sql
-            .query(
-                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = ?1 AND kind = 'claim.acquired'",
-                &[text(item_id)],
-            )
-            .map_err(sql_err)?
-            .first()
-            .map_or(0, |row| as_i64(&row[0]));
-        let lease_id = format!("L-{item_id}-{n}");
-        let payload = serde_json::json!({
-            "lease_id": lease_id, "actor": claimed_by, "expires_at": serde_json::Value::Null
-        });
-        do_tracker_append(
+        // The lease's identity IS its `claim.acquired` event (content hash) —
+        // merge-stable across clones, matching the native store.
+        let content_id = do_content_id(&self.sql, item_id)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {item_id}")))?;
+        // `expires` is an absolute deadline (`None` = no TTL); it records a
+        // claim-TTL lease that `ready`/`claim` lazily reclaim once past-due.
+        let payload = serde_json::json!({"actor": claimed_by, "expires_at": expires});
+        let lease_id = do_tracker_append_raw(
             &self.sql,
-            Some(item_id),
+            Some(&content_id),
+            None,
             "claim.acquired",
-            &payload,
+            &payload.to_string(),
             Some(claimed_by),
             &now,
         )?;
         self.sql
             .execute(
                 "INSERT INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
-                &[text(&lease_id), text(item_id), text(claimed_by), text(&now)],
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                &[
+                    text(&lease_id),
+                    text(item_id),
+                    text(claimed_by),
+                    text(&now),
+                    opt_text(expires),
+                ],
             )
             .map_err(sql_err)?;
         Ok(ClaimOutcome::Claimed)
@@ -7402,20 +7714,654 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
     }
 
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
-        // `from` blocks `to`: append `relation.added` and fold into
-        // `tracker_relations` (mirror of the native `add_blocks` door).
+        self.add_relation(from, to, "blocks", None)
+    }
+}
+
+// -- Phase-B tracker surface over DoSql (ADR-0002 B1/B2) --------------------
+//
+// The additive surface native `WorkItemStore` exposes as inherent methods,
+// ported so the edge host is at parity: relation taxonomy, field sets +
+// conflict view, comments/evidence, and merge (export/import). The DAG/hash
+// core is shared from `whipplescript_store::items` — the DO only supplies the
+// `DoSql` glue, so both backends mint identical event ids and detect conflicts
+// identically.
+impl<Sql: DoSql> DoSqliteStore<Sql> {
+    /// Records a directed relation `kind(from -> to)`; only `blocks` gates
+    /// readiness. `dep_kind` is valid only on `blocks`. Event payload carries
+    /// content_ids (merge-stable); the projection keeps aliases.
+    pub fn add_relation(
+        &mut self,
+        from: &str,
+        to: &str,
+        kind: &str,
+        dep_kind: Option<&str>,
+    ) -> StoreResult<()> {
+        use whipplescript_store::items::{DEPENDENCY_KINDS, RELATION_KINDS};
+        if !RELATION_KINDS.contains(&kind) {
+            return Err(StoreError::Conflict(format!(
+                "unknown relation kind `{kind}`"
+            )));
+        }
+        if let Some(dk) = dep_kind {
+            if kind != "blocks" {
+                return Err(StoreError::Conflict(
+                    "dep_kind only applies to `blocks` relations".to_owned(),
+                ));
+            }
+            if !DEPENDENCY_KINDS.contains(&dk) {
+                return Err(StoreError::Conflict(format!(
+                    "unknown dependency kind `{dk}`"
+                )));
+            }
+        }
         let now = do_now(&self.sql)?;
-        let payload = serde_json::json!({"from": from, "to": to, "kind": "blocks"});
+        let from_cid = do_content_id(&self.sql, from)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {from}")))?;
+        let to_cid = do_content_id(&self.sql, to)?
+            .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
+        let payload =
+            serde_json::json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
         do_tracker_append(&self.sql, Some(to), "relation.added", &payload, None, &now)?;
         self.sql
             .execute(
                 "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
-                 VALUES (?1, ?2, 'blocks', NULL)",
-                &[text(from), text(to)],
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[text(from), text(to), text(kind), opt_text(dep_kind)],
             )
             .map_err(sql_err)?;
         Ok(())
     }
+
+    /// Sets one field of an issue (`issue.field_set`) — the mutation the conflict
+    /// engine folds. Returns `false` if the issue is unknown.
+    pub fn set_field(&mut self, item_id: &str, field: &str, value: &str) -> StoreResult<bool> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(false);
+        };
+        let payload = serde_json::json!({"field": field, "value": value});
+        do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "issue.field_set",
+            &payload.to_string(),
+            None,
+            &now,
+        )?;
+        if let Some(column) = whipplescript_store::items::projection_column(field) {
+            self.sql
+                .execute(
+                    &format!(
+                        "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                    ),
+                    &[text(item_id), text(value), text(&now)],
+                )
+                .map_err(sql_err)?;
+        }
+        Ok(true)
+    }
+
+    /// The DAG conflict view of one issue (`heads` / `state_token` /
+    /// `field_conflicts`) — shares the native analysis. `None` if unknown.
+    pub fn issue_conflicts(
+        &self,
+        item_id: &str,
+    ) -> StoreResult<Option<whipplescript_store::items::IssueConflicts>> {
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let events = do_load_issue_events(&self.sql, &content_id)?;
+        Ok(Some(whipplescript_store::items::analyze_issue_dag(&events)))
+    }
+
+    /// Adds a comment (`comment.added`); returns its content-hash id or `None`.
+    pub fn add_comment(
+        &mut self,
+        item_id: &str,
+        author: Option<&str>,
+        body: &str,
+    ) -> StoreResult<Option<String>> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let payload = serde_json::json!({"author": author, "body": body});
+        let comment_id = do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "comment.added",
+            &payload.to_string(),
+            author,
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[text(&comment_id), text(item_id), opt_text(author), text(body), text(&now)],
+            )
+            .map_err(sql_err)?;
+        Ok(Some(comment_id))
+    }
+
+    /// Attaches evidence (`evidence.added`); returns its content-hash id.
+    pub fn add_evidence(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let now = do_now(&self.sql)?;
+        let Some(content_id) = do_content_id(&self.sql, item_id)? else {
+            return Ok(None);
+        };
+        let payload = serde_json::json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+        });
+        let evidence_id = do_tracker_append_raw(
+            &self.sql,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            &now,
+        )?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_evidence \
+                 (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    text(&evidence_id),
+                    text(item_id),
+                    opt_text(kind),
+                    opt_text(reference),
+                    opt_text(note),
+                    opt_text(added_by),
+                    text(&now),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(Some(evidence_id))
+    }
+
+    /// Export every event in transport form (the unit another clone unions in).
+    pub fn export_events(&self) -> StoreResult<Vec<whipplescript_store::items::TrackerEvent>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
+                 FROM tracker_events ORDER BY event_seq",
+                &[],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::TrackerEvent {
+                event_id: as_opt_text(&row[0]).unwrap_or_default(),
+                parents: serde_json::from_str(&as_text(&row[1])).unwrap_or_default(),
+                issue_id: as_opt_text(&row[2]),
+                kind: as_text(&row[3]),
+                payload_json: as_text(&row[4]),
+                actor: as_opt_text(&row[5]),
+                created_at: as_text(&row[6]),
+            })
+            .collect())
+    }
+
+    /// Merge another clone's events (set-union deduped by event_id), re-aliasing
+    /// newly seen issues locally and warning on duplicate submissions. The DO
+    /// tracker writes projections directly, so imported events are folded here.
+    pub fn import_events(
+        &mut self,
+        events: &[whipplescript_store::items::TrackerEvent],
+    ) -> StoreResult<whipplescript_store::items::ImportReport> {
+        let mut report = whipplescript_store::items::ImportReport::default();
+        for event in events {
+            // Re-verify the content-addressed id before admitting an event from
+            // an untrusted transport (kept in lockstep with the native store):
+            // reject a tampered event whose id != SHA-256 of its own content, or
+            // a created event whose id != its issue identity.
+            let expected_id = if event.kind == "issue.created" {
+                whipplescript_store::items::event_content_id(
+                    &event.kind,
+                    None,
+                    &event.payload_json,
+                    event.actor.as_deref(),
+                    &[],
+                    &event.created_at,
+                )
+            } else {
+                whipplescript_store::items::event_content_id(
+                    &event.kind,
+                    event.issue_id.as_deref(),
+                    &event.payload_json,
+                    event.actor.as_deref(),
+                    &event.parents,
+                    &event.created_at,
+                )
+            };
+            let created_identity_ok = event.kind != "issue.created"
+                || event.issue_id.as_deref() == Some(event.event_id.as_str());
+            if expected_id != event.event_id || !created_identity_ok {
+                report.rejected += 1;
+                continue;
+            }
+            let parents_json =
+                serde_json::to_string(&event.parents).map_err(|e| sql_err(e.to_string()))?;
+            let changes = self
+                .sql
+                .execute(
+                    "INSERT OR IGNORE INTO tracker_events \
+                     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(&event.event_id),
+                        text(&parents_json),
+                        opt_text(event.issue_id.as_deref()),
+                        text(&event.kind),
+                        text(&event.payload_json),
+                        opt_text(event.actor.as_deref()),
+                        text(&event.created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changes == 1 {
+                report.imported += 1;
+            } else {
+                // Byte-identical event already held: an idempotent re-transmit
+                // (content-addressing makes re-sync free), NOT a duplicate.
+                report.skipped += 1;
+            }
+        }
+        // Re-alias every newly-seen issue (a created event with no local alias),
+        // in append order, minting this clone's own WS-N.
+        let unaliased = self
+            .sql
+            .query(
+                "SELECT issue_id FROM tracker_events \
+                 WHERE kind = 'issue.created' AND issue_id IS NOT NULL \
+                   AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                 GROUP BY issue_id ORDER BY MIN(event_seq)",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let mut new_alias: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for row in &unaliased {
+            let content_id = as_text(&row[0]);
+            let bumped = self
+                .sql
+                .query(
+                    "UPDATE tracker_counter SET next_id = next_id + 1 WHERE singleton = 1 \
+                     RETURNING next_id - 1",
+                    &[],
+                )
+                .map_err(sql_err)?;
+            let next = bumped.first().map_or(0, |row| as_i64(&row[0]));
+            let alias = format!("WS-{next}");
+            self.sql
+                .execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    &[text(&content_id), text(&alias)],
+                )
+                .map_err(sql_err)?;
+            new_alias.insert(content_id, alias);
+            report.new_issues += 1;
+        }
+        // Genuine duplicate submission: a newly-seen creation describing the same
+        // work (queue + title) as a DISTINCT issue already in the log — two
+        // independent submissions, distinct content ids. Advisory, never a
+        // silent collapse. (A re-transmit shares one id and is deduped above.)
+        if !unaliased.is_empty() {
+            let created = self
+                .sql
+                .query(
+                    "SELECT issue_id, payload_json FROM tracker_events \
+                     WHERE kind = 'issue.created' AND issue_id IS NOT NULL",
+                    &[],
+                )
+                .map_err(sql_err)?;
+            let keyed: Vec<(String, String)> = created
+                .iter()
+                .map(|row| {
+                    let cid = as_text(&row[0]);
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&as_text(&row[1])).unwrap_or(serde_json::Value::Null);
+                    let queue = payload
+                        .get("queue")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let title = payload
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    (cid, format!("{queue}\u{1e}{title}"))
+                })
+                .collect();
+            let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (cid, key) in &keyed {
+                by_key.entry(key).or_default().push(cid);
+            }
+            for (content_id, alias) in &new_alias {
+                if let Some((_, key)) = keyed.iter().find(|(c, _)| c == content_id) {
+                    if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                        report.duplicate_submissions.push(alias.clone());
+                    }
+                }
+            }
+        }
+        self.rebuild_tracker_projection()?;
+        Ok(report)
+    }
+
+    /// Rebuild the tracker projections (issues/relations/leases/comments/
+    /// evidence) by folding the content_id-keyed event log through the alias
+    /// bridge — the DO counterpart of the native `rebuild_projection`.
+    pub fn rebuild_tracker_projection(&mut self) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "DELETE FROM tracker_issues; DELETE FROM tracker_relations; \
+                 DELETE FROM tracker_leases; DELETE FROM tracker_comments; \
+                 DELETE FROM tracker_evidence;",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let alias_rows = self
+            .sql
+            .query("SELECT content_id, alias FROM tracker_aliases", &[])
+            .map_err(sql_err)?;
+        let alias_of: std::collections::HashMap<String, String> = alias_rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect();
+        let events = self
+            .sql
+            .query(
+                "SELECT event_id, issue_id, kind, payload_json, created_at, parents_json \
+                 FROM tracker_events ORDER BY event_seq",
+                &[],
+            )
+            .map_err(sql_err)?;
+        // (event_id, content_id, kind, payload_json, created_at, parents)
+        type Row = (String, Option<String>, String, String, String, Vec<String>);
+        let rows: Vec<Row> = events
+            .iter()
+            .map(|row| {
+                let parents: Vec<String> =
+                    serde_json::from_str(&as_text(&row[5])).unwrap_or_default();
+                (
+                    as_opt_text(&row[0]).unwrap_or_default(),
+                    as_opt_text(&row[1]),
+                    as_text(&row[2]),
+                    as_text(&row[3]),
+                    as_text(&row[4]),
+                    parents,
+                )
+            })
+            .collect();
+        // Fold in the same deterministic TOPOLOGICAL order as the native store
+        // (parents before children; concurrent events by event_id) so a DO log
+        // and a native log project identical columns and don't diverge on a
+        // non-causal import order.
+        for i in whipplescript_store::items::topological_event_order(
+            &rows,
+            |e| e.0.as_str(),
+            |e| e.5.as_slice(),
+        ) {
+            let (event_id, content_id, kind, payload_str, created_at, _parents) = &rows[i];
+            let payload: serde_json::Value =
+                serde_json::from_str(payload_str).unwrap_or_else(|_| serde_json::json!({}));
+            let issue_alias = content_id.as_deref().and_then(|c| alias_of.get(c).cloned());
+            do_fold_tracker_event(
+                &self.sql,
+                Some(event_id.as_str()),
+                issue_alias.as_deref(),
+                kind,
+                &payload,
+                created_at,
+                &alias_of,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// An issue's comments in chronological order.
+    pub fn comments(&self, item_id: &str) -> StoreResult<Vec<whipplescript_store::items::Comment>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT comment_id, author, body, created_at FROM tracker_comments \
+                 WHERE issue_id = ?1 ORDER BY created_at, comment_id",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Comment {
+                id: as_text(&row[0]),
+                author: as_opt_text(&row[1]),
+                body: as_text(&row[2]),
+                created_at: as_text(&row[3]),
+            })
+            .collect())
+    }
+
+    /// An issue's attached evidence in chronological order.
+    pub fn evidence(
+        &self,
+        item_id: &str,
+    ) -> StoreResult<Vec<whipplescript_store::items::Evidence>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT evidence_id, kind, reference, note, added_by, created_at \
+                 FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
+                &[text(item_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::items::Evidence {
+                id: as_text(&row[0]),
+                kind: as_opt_text(&row[1]),
+                reference: as_opt_text(&row[2]),
+                note: as_opt_text(&row[3]),
+                added_by: as_opt_text(&row[4]),
+                created_at: as_text(&row[5]),
+            })
+            .collect())
+    }
+}
+
+/// Fold one tracker event into the DO projections during a rebuild (the DO
+/// counterpart of the native `fold_event`). `issue_id` is the alias (resolved
+/// from the event's content_id); relation payloads carry content_ids that map
+/// back to aliases via `alias_of`.
+fn do_fold_tracker_event(
+    sql: &impl DoSql,
+    event_id: Option<&str>,
+    issue_id: Option<&str>,
+    kind: &str,
+    payload: &serde_json::Value,
+    created_at: &str,
+    alias_of: &std::collections::HashMap<String, String>,
+) -> StoreResult<()> {
+    let str_of = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let alias_for = |cid: Option<String>| cid.and_then(|c| alias_of.get(&c).cloned());
+    match kind {
+        "issue.created" => {
+            if let Some(issue) = issue_id {
+                let labels_json = payload
+                    .get("labels")
+                    .map_or_else(|| "[]".to_owned(), std::string::ToString::to_string);
+                let metadata_json = payload
+                    .get("metadata")
+                    .map_or_else(|| "{}".to_owned(), std::string::ToString::to_string);
+                sql.execute(
+                    "INSERT INTO tracker_issues \
+                     (issue_id, queue, title, body, status, labels_json, metadata_json, filed_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?7, ?8, ?8)",
+                    &[
+                        text(issue),
+                        text(&str_of("queue").unwrap_or_default()),
+                        text(&str_of("title").unwrap_or_default()),
+                        text(&str_of("body").unwrap_or_default()),
+                        text(&labels_json),
+                        text(&metadata_json),
+                        opt_text(str_of("filed_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "issue.field_set" => {
+            if let (Some(issue), Some(field), Some(value)) =
+                (issue_id, str_of("field"), str_of("value"))
+            {
+                if let Some(column) = whipplescript_store::items::projection_column(&field) {
+                    sql.execute(
+                        &format!(
+                            "UPDATE tracker_issues SET {column} = ?2, updated_at = ?3 WHERE issue_id = ?1"
+                        ),
+                        &[text(issue), text(&value), text(created_at)],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+        }
+        "issue.closed" | "issue.canceled" | "issue.reopened" => {
+            if let Some(issue) = issue_id {
+                let status = match kind {
+                    "issue.closed" => "closed",
+                    "issue.canceled" => "canceled",
+                    _ => "open",
+                };
+                sql.execute(
+                    "UPDATE tracker_issues SET status = ?2, \
+                     claim_summary = COALESCE(?3, claim_summary), updated_at = ?4 WHERE issue_id = ?1",
+                    &[text(issue), text(status), opt_text(str_of("summary").as_deref()), text(created_at)],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "relation.added" => {
+            if let (Some(from), Some(to)) = (alias_for(str_of("from")), alias_for(str_of("to"))) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    &[
+                        text(&from),
+                        text(&to),
+                        text(&str_of("kind").unwrap_or_else(|| "blocks".to_owned())),
+                        opt_text(str_of("dep_kind").as_deref()),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "relation.removed" => {
+            if let (Some(from), Some(to)) = (alias_for(str_of("from")), alias_for(str_of("to"))) {
+                sql.execute(
+                    "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
+                    &[text(&from), text(&to), text(&str_of("kind").unwrap_or_else(|| "blocks".to_owned()))],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "comment.added" => {
+            if let (Some(comment_id), Some(issue)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        text(comment_id),
+                        text(issue),
+                        opt_text(str_of("author").as_deref()),
+                        text(&str_of("body").unwrap_or_default()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "evidence.added" => {
+            if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_evidence \
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[
+                        text(evidence_id),
+                        text(issue),
+                        opt_text(str_of("kind").as_deref()),
+                        opt_text(str_of("reference").as_deref()),
+                        opt_text(str_of("note").as_deref()),
+                        opt_text(str_of("added_by").as_deref()),
+                        text(created_at),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "claim.acquired" => {
+            // Keyed by the acquire event's own event_id (content hash), like
+            // comments/evidence — clone-local payload ids collide on merge.
+            if let (Some(lease_id), Some(issue)) = (event_id, issue_id) {
+                sql.execute(
+                    "INSERT OR IGNORE INTO tracker_leases (lease_id, issue_id, actor, acquired_at, expires_at, released_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                    &[
+                        text(lease_id),
+                        text(issue),
+                        opt_text(str_of("actor").as_deref()),
+                        text(created_at),
+                        opt_text(payload.get("expires_at").and_then(serde_json::Value::as_str)),
+                    ],
+                )
+                .map_err(sql_err)?;
+            }
+        }
+        "claim.renewed" => {
+            sql.execute(
+                "UPDATE tracker_leases SET expires_at = ?2 WHERE lease_id = ?1",
+                &[
+                    opt_text(str_of("lease_id").as_deref()),
+                    opt_text(
+                        payload
+                            .get("expires_at")
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        "claim.released" | "claim.expired" => {
+            sql.execute(
+                "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
+                &[
+                    opt_text(str_of("lease_id").as_deref()),
+                    text(&str_of("released_at").unwrap_or_else(|| created_at.to_owned())),
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // -- Coordination over DoSql (DR-0033 chunk 5a) -----------------------------
@@ -7426,7 +8372,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
 // `coord_leases` / `coord_ledger_seq` / `coord_ledger_entries` / `coord_counters` tables. The native
 // atomic pairs used a rusqlite transaction; the DO single-writer per-invocation
 // model supplies that atomicity. Only the 9 required `*_for_owner` (+
-// `release_all_for_holder` / `current_period`) methods are ported; the 7
+// `release_all_for_holder`) methods are ported; the 7
 // shared-owner convenience forms are the trait's inherited defaults.
 
 /// Empty owner normalizes to the shared partition (mirrors `normalized_owner`).
@@ -7647,34 +8593,26 @@ impl<Sql: DoSql> Coordination for DoSqliteStore<Sql> {
             )
             .map_err(sql_err)?;
         let consumed = current.first().map(|row| as_i64(&row[0])).unwrap_or(0);
-        if consumed + amount <= cap {
-            self.sql
-                .execute(
-                    "UPDATE coord_counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
-                    &[text(owner), text(counter), text(key), int(amount)],
-                )
-                .map_err(sql_err)?;
-            return Ok(ConsumeOutcome::Ok {
-                remaining: cap - consumed - amount,
-            });
+        // Guard the workflow-authored `amount` against i64 overflow (mirrors the
+        // native store): a near-MAX amount would wrap the check and drive the
+        // counter negative (silent cap bypass). checked_add fails closed to
+        // `Over`, never charging.
+        if let Some(total) = consumed.checked_add(amount) {
+            if amount >= 0 && total <= cap {
+                self.sql
+                    .execute(
+                        "UPDATE coord_counters SET consumed = consumed + ?4 WHERE owner = ?1 AND counter = ?2 AND key = ?3",
+                        &[text(owner), text(counter), text(key), int(amount)],
+                    )
+                    .map_err(sql_err)?;
+                return Ok(ConsumeOutcome::Ok {
+                    remaining: cap - total,
+                });
+            }
         }
         Ok(ConsumeOutcome::Over {
-            remaining: cap - consumed,
+            remaining: (cap - consumed).max(0),
         })
-    }
-
-    fn current_period(&self, reset: &str) -> StoreResult<String> {
-        let format = match reset {
-            "hourly" => "%Y-%m-%dT%H",
-            "weekly" => "%Y-W%W",
-            "monthly" => "%Y-%m",
-            _ => "%Y-%m-%d",
-        };
-        let rows = self
-            .sql
-            .query("SELECT strftime(?1, 'now')", &[text(format)])
-            .map_err(sql_err)?;
-        Ok(rows.first().map(|row| as_text(&row[0])).unwrap_or_default())
     }
 
     fn list_leases_for_owner(
@@ -7763,8 +8701,13 @@ pub(crate) mod test_support {
     use rusqlite::types::{Value, ValueRef};
     use rusqlite::Connection;
 
+    // `Rc<Connection>` so the handle is `Clone` (the production `DoSql` handles
+    // are shared via `Rc`; a clone is the SAME in-memory DB, as the DO's single
+    // SQLite requires). This lets `DoInstanceDriver` require `Sql: Clone` for
+    // binding-driven provider selection (e.g. the memory provider).
+    #[derive(Clone)]
     pub(crate) struct RusqliteDoSql {
-        conn: Connection,
+        conn: std::rc::Rc<Connection>,
     }
 
     fn to_value(v: &SqlValue) -> Value {
@@ -7825,6 +8768,9 @@ pub(crate) mod test_support {
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
             );
+            CREATE UNIQUE INDEX events_instance_idempotency_key_idx
+                ON events(instance_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
             CREATE TABLE facts (
                 fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL,
@@ -7975,14 +8921,6 @@ pub(crate) mod test_support {
                 attachment_id TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
                 skill_id TEXT NOT NULL, UNIQUE(scope_type, scope_id, skill_id)
             );
-            CREATE TABLE inbox_items (
-                inbox_item_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, effect_id TEXT,
-                status TEXT NOT NULL, prompt TEXT NOT NULL, choices_json TEXT NOT NULL DEFAULT '[]',
-                freeform_allowed INTEGER NOT NULL DEFAULT 1, severity TEXT NOT NULL DEFAULT 'normal',
-                related_effects_json TEXT NOT NULL DEFAULT '[]',
-                related_artifacts_json TEXT NOT NULL DEFAULT '[]', answer_json TEXT, answered_by TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, answered_at TEXT
-            );
             CREATE TABLE package_registrations (
                 package_id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
                 manifest_json TEXT NOT NULL
@@ -8009,7 +8947,9 @@ pub(crate) mod test_support {
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
             CREATE TABLE tracker_events (
-                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
+                issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -8017,7 +8957,7 @@ pub(crate) mod test_support {
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
                 labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
-                claim_summary TEXT, filed_by TEXT,
+                claim_summary TEXT, assigned_to TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -8034,9 +8974,21 @@ pub(crate) mod test_support {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
             INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE TABLE tracker_aliases (
+                content_id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE tracker_comments (
+                comment_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT,
+                body TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_evidence (
+                evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
+                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
             CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
+            CREATE UNIQUE INDEX idx_tracker_events_id ON tracker_events(event_id);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,
@@ -8058,7 +9010,9 @@ pub(crate) mod test_support {
             "#,
         )
         .expect("schema");
-        DoSqliteStore::new(RusqliteDoSql { conn })
+        DoSqliteStore::new(RusqliteDoSql {
+            conn: std::rc::Rc::new(conn),
+        })
     }
 }
 
@@ -8170,17 +9124,17 @@ mod tests {
 
         // Claim WS-1: the first claim wins; a second contends with the holder.
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-1", "worker:x").expect("claim"),
+            WorkItems::claim_item(&mut store, "WS-1", "worker:x", None).expect("claim"),
             ClaimOutcome::Claimed
         );
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-1", "worker:y").expect("reclaim"),
+            WorkItems::claim_item(&mut store, "WS-1", "worker:y", None).expect("reclaim"),
             ClaimOutcome::AlreadyClaimed {
                 holder: "worker:x".to_owned()
             }
         );
         assert_eq!(
-            WorkItems::claim_item(&mut store, "WS-9", "worker:x").expect("missing"),
+            WorkItems::claim_item(&mut store, "WS-9", "worker:x", None).expect("missing"),
             ClaimOutcome::NotFound
         );
         // Only WS-2 remains ready now.
@@ -8211,6 +9165,64 @@ mod tests {
                 .status,
             "closed"
         );
+    }
+
+    /// DO parity (ADR-0002 phase B): the edge-host tracker is content-addressed
+    /// (events keyed by opaque content_id, not WS-N), shares the native conflict
+    /// analysis, and merges via export/import — two DO clones editing one issue
+    /// converge to a surfaced conflict, exactly like native.
+    #[test]
+    fn do_tracker_is_content_addressed_and_merges_to_a_conflict() {
+        let mut a = store();
+        let issue =
+            WorkItems::file_item(&mut a, "q", "Shared", "", &[], &serde_json::json!({}), None)
+                .expect("file");
+        assert_eq!(issue.id, "WS-1");
+
+        // Identity = content hash; no event is keyed by the WS-N alias.
+        let cid = do_content_id(&a.sql, "WS-1")
+            .unwrap()
+            .expect("alias resolves");
+        assert_eq!(cid.len(), 64, "content_id is a SHA-256");
+        let by_alias = a
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = 'WS-1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_i64(&by_alias[0][0]), 0, "no event keyed by the alias");
+
+        // A second DO clone imports A's issue and re-aliases it locally.
+        let mut b = store();
+        let report = b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(report.new_issues, 1);
+        assert_eq!(b.get_item("WS-1").unwrap().unwrap().title, "Shared");
+
+        // Independent divergent edits from the shared created event → a fork.
+        a.set_field(&issue.id, "title", "from-A").unwrap();
+        b.set_field("WS-1", "title", "from-B").unwrap();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+
+        let conflicts = b.issue_conflicts("WS-1").unwrap().unwrap();
+        assert!(conflicts.conflicted(), "the two writers disagree on title");
+        assert_eq!(conflicts.field_conflicts[0].field, "title");
+        assert_eq!(
+            conflicts.field_conflicts[0].values,
+            vec!["from-A", "from-B"]
+        );
+        assert!(
+            WorkItems::ready_items(&b, "q").unwrap().is_empty(),
+            "a conflicted issue is not ready on the edge host"
+        );
+
+        // Comments/evidence also merge and survive the rebuild the import runs.
+        a.add_comment(&issue.id, Some("worker"), "note").unwrap();
+        a.add_evidence(&issue.id, Some("log"), Some("s3://x"), None, None)
+            .unwrap();
+        b.import_events(&a.export_events().unwrap()).unwrap();
+        assert_eq!(b.comments("WS-1").unwrap().len(), 1);
+        assert_eq!(b.evidence("WS-1").unwrap().len(), 1);
     }
 
     #[test]
@@ -8406,7 +9418,7 @@ mod tests {
     /// Skills, inbox items, fact retirement, and table_exists run their real SQL
     /// and round-trip through the ported view mappers.
     #[test]
-    fn do_store_skills_inbox_and_facts_run_real_sql() {
+    fn do_store_skills_and_facts_run_real_sql() {
         let mut store = store();
 
         // register_skill validates JSON, computes content_hash, upserts by name;
@@ -8463,36 +9475,6 @@ mod tests {
             })
             .is_err());
 
-        // create_inbox_item validates its 3 JSON fields and stores freeform_allowed
-        // as an integer; the list/get views decode it back to a bool.
-        store
-            .create_inbox_item(NewInboxItem {
-                inbox_item_id: "ibx_1",
-                instance_id: "i1",
-                effect_id: Some("eff_1"),
-                status: "pending",
-                prompt: "approve?",
-                choices_json: "[\"yes\",\"no\"]",
-                freeform_allowed: false,
-                severity: "normal",
-                related_effects_json: "[]",
-                related_artifacts_json: "[]",
-            })
-            .expect("create_inbox_item");
-        let pending = store
-            .list_inbox_items(Some("pending"))
-            .expect("list pending");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].effect_id.as_deref(), Some("eff_1"));
-        assert!(!pending[0].freeform_allowed);
-        assert!(store
-            .list_inbox_items(Some("done"))
-            .expect("list done")
-            .is_empty());
-        let got = store.get_inbox_item("ibx_1").expect("get").expect("some");
-        assert_eq!(got.prompt, "approve?");
-        assert!(store.get_inbox_item("nope").expect("get missing").is_none());
-
         // retire_fact marks an unconsumed fact consumed; a second call is a no-op.
         store
             .sql
@@ -8512,7 +9494,6 @@ mod tests {
         assert!(matches!(consumed[0][0], SqlValue::Text(_)));
 
         // table_exists reflects the schema.
-        assert!(store.table_exists("inbox_items").expect("exists"));
         assert!(!store.table_exists("no_such_table").expect("absent"));
     }
 
@@ -9299,8 +10280,74 @@ mod tests {
         assert_eq!(as_text(&down_status[0][0]), "queued");
     }
 
+    /// The DO alarm scheduler (`next_effect_due_epoch_ms`) must report a due
+    /// instant ONLY for a timer.wait `advance_time` can actually fire — i.e.
+    /// not one still blocked on an unsatisfied upstream dependency. Otherwise
+    /// the shell schedules an alarm for a creation-anchored deadline already in
+    /// the past, Cloudflare runs it instantly, and the re-drive/re-park cycle
+    /// busy-loops. This mirrors the `due_time_effects` dep guard.
+    #[test]
+    fn next_due_omits_a_dependency_blocked_timer() {
+        let store = store();
+        let e = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        // An upstream coerce that has not resolved yet (still queued).
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("ask"),
+                text("i1"),
+                text("schema.coerce"),
+                text("queued"),
+                text("{}"),
+            ],
+        );
+        // A timer.wait created at t0 with a 30s timeout, blocked on the ask.
+        e(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             timeout_seconds, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("wait"),
+                text("i1"),
+                text("timer.wait"),
+                text("blocked_by_dependency"),
+                text("{}"),
+                int(30),
+                text("2026-01-01T00:00:00Z"),
+            ],
+        );
+        e(
+            "INSERT INTO effect_dependencies (instance_id, downstream_effect_id, \
+             upstream_effect_id, predicate) VALUES (?1, ?2, ?3, ?4)",
+            &[text("i1"), text("wait"), text("ask"), text("succeeds")],
+        );
+        // While the ask is unsatisfied the blocked timer contributes no due
+        // instant — no alarm to busy-loop on.
+        assert_eq!(
+            store.next_effect_due_epoch_ms("i1").expect("next due"),
+            None,
+            "a dependency-blocked timer.wait must not be reported as due"
+        );
+        // Once the upstream succeeds the timer is fireable, so its creation-
+        // anchored deadline (t0 + 30s) is reported.
+        store
+            .sql
+            .execute(
+                "UPDATE effects SET status = 'completed' WHERE effect_id = ?1",
+                &[text("ask")],
+            )
+            .expect("complete ask");
+        // 2026-01-01T00:00:00Z = 1767225600s; + 30s timeout, in milliseconds.
+        let expected = (1_767_225_600_i64 + 30) * 1000;
+        assert_eq!(
+            store.next_effect_due_epoch_ms("i1").expect("next due"),
+            Some(expected),
+            "an unblocked timer.wait reports its deadline"
+        );
+    }
+
     /// The event-plus-update lifecycle methods (transition_instance,
-    /// block_effect_binding, expire_effect, cancel_pending_inbox_for_instance) run
+    /// block_effect_binding, expire_effect) run
     /// their real event-append + update SQL and enforce their guards.
     #[test]
     fn do_store_lifecycle_transitions_run_real_sql() {
@@ -9396,28 +10443,6 @@ mod tests {
             .expect("seed eff_t");
         store.expire_effect("i1", "eff_t", None).expect("expire");
         assert!(store.expire_effect("i1", "eff_t", None).is_err());
-
-        // cancel_pending_inbox_for_instance flips only pending rows.
-        store
-            .sql
-            .execute(
-                "INSERT INTO inbox_items (inbox_item_id, instance_id, status, prompt) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                &[text("ibx_1"), text("i1"), text("pending"), text("q")],
-            )
-            .expect("seed inbox");
-        assert_eq!(
-            store
-                .cancel_pending_inbox_for_instance("i1")
-                .expect("cancel"),
-            1
-        );
-        assert_eq!(
-            store
-                .cancel_pending_inbox_for_instance("i1")
-                .expect("cancel again"),
-            0
-        );
     }
 
     /// derive_fact and admit_fact_batch append a `fact.derived` event and insert the
@@ -9587,6 +10612,43 @@ mod tests {
             .is_err());
     }
 
+    /// DO package bootstrap (spec/durable-object-runtime-tracker.md): a fresh DO
+    /// store has NO provider rows for the coordination/tracker/file/ingress/
+    /// coercion kinds, so the admission gate would block them — which is why the
+    /// old `do_policy_block_on` exempted them. `register_embedded_std_packages`
+    /// seeds the same rows native seeds, making the gate REAL on the DO too, so
+    /// the exemptions could be removed (only `timer.wait` stays waved through).
+    #[test]
+    fn do_package_bootstrap_seeds_admission_rows_for_std_effect_kinds() {
+        let store = store();
+        let gated_kinds = [
+            "lease.acquire",
+            "ledger.append",
+            "counter.consume",
+            "tracker.claim",
+            "file.read",
+            "signal.emit",
+            "schema.coerce",
+        ];
+        // Before the bootstrap: no provider row → these kinds would block.
+        for kind in gated_kinds {
+            assert!(
+                !do_effect_provider_exists(&store.sql, kind).expect("query"),
+                "unbootstrapped DO store must not know provider for `{kind}`"
+            );
+        }
+        crate::do_packages::register_embedded_std_packages(&store).expect("bootstrap");
+        // After: every std effect kind has an admission-plane provider row.
+        for kind in gated_kinds {
+            assert!(
+                do_effect_provider_exists(&store.sql, kind).expect("query"),
+                "bootstrap must seed a provider for `{kind}` so the gate admits it"
+            );
+        }
+        // Idempotent: a re-attach re-seeding is a no-op, not an error.
+        crate::do_packages::register_embedded_std_packages(&store).expect("re-bootstrap");
+    }
+
     /// renew_lease extends an active lease (guarded); expire_leases sweeps expired
     /// leases, recording an event and requeuing the run + effect. Real SQL.
     #[test]
@@ -9753,16 +10815,33 @@ mod tests {
                 text("{}"),
             ],
         );
+        // A registered admitted kind: provider + capability + global binding, so
+        // an effect of this kind passes the (now real) admission gate. (Since the
+        // DO package bootstrap, coordination/file/tracker/signal kinds go through
+        // the same gate as native — nothing is waved through but `timer.wait`.)
+        seed(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("p_demo"), text("builtin.demo"), text("builtin"), text("builtin.demo"), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, ?2, ?3)",
+            &[text("builtin.demo"), text(""), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("b_demo"), SqlValue::Null, text("builtin.demo"), text("builtin"), text("{}")],
+        );
 
-        // A queued coordination effect (timer-like builtin: no policy applies) is
-        // immediately claimable.
+        // A queued effect of the admitted kind is immediately claimable.
         seed(
             "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
                 text("eff_q"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:00Z"),
@@ -9789,7 +10868,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
                 text("2026-01-01T00:00:02Z"),
@@ -9801,7 +10880,7 @@ mod tests {
             &[
                 text("eff_down"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("blocked_by_dependency"),
                 text("{}"),
                 text("2026-01-01T00:00:03Z"),
@@ -9838,6 +10917,126 @@ mod tests {
     /// effect to running, and creates the run + lease rows. Guards (policy block,
     /// unmet dependency) are enforced. Real SQL.
     #[test]
+    fn do_claim_list_persists_policy_block_and_registration_recovers_it() {
+        // Parity with the native store: an effect whose profile is
+        // unregistered is persisted as blocked_by_profile (with reason and an
+        // effect.blocked event) by the claim-list filter, and registering the
+        // profile later makes it claimable again.
+        let store = store();
+        let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
+        seed(
+            "INSERT INTO programs (program_id, name) VALUES (?1, ?2)",
+            &[text("prog_1"), text("orders")],
+        );
+        seed(
+            "INSERT INTO program_versions (version_id, program_id, declared_profiles) \
+             VALUES (?1, ?2, ?3)",
+            &[text("ver_1"), text("prog_1"), text("[]")],
+        );
+        seed(
+            "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+             effective_authority, status, input_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("i1"),
+                text("prog_1"),
+                text("ver_1"),
+                text("root"),
+                text("{}"),
+                text("running"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("p_tell"),
+                text("agent.tell"),
+                text("builtin"),
+                text("agent.tell"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, ?2, ?3)",
+            &[text("agent.tell"), text(""), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                text("b_tell"),
+                SqlValue::Null,
+                text("agent.tell"),
+                text("builtin"),
+                text("{}"),
+            ],
+        );
+        seed(
+            "INSERT INTO effects (effect_id, instance_id, kind, status, input_json, \
+             required_capabilities, profile) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                text("eff_t"),
+                text("i1"),
+                text("agent.tell"),
+                text("queued"),
+                text("{}"),
+                text("[]"),
+                text("ghost"),
+            ],
+        );
+
+        let claimable = store.claimable_effects("i1").expect("claimable listing");
+        assert!(claimable.is_empty(), "blocked effect must not be claimable");
+        let row = store
+            .sql
+            .query(
+                "SELECT status, policy_block_reason FROM effects WHERE effect_id = ?1",
+                &[text("eff_t")],
+            )
+            .expect("read effect");
+        assert_eq!(as_text(&row[0][0]), "blocked_by_profile");
+        assert_eq!(as_text(&row[0][1]), "profile `ghost` is not registered");
+        let events = store
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'effect.blocked'",
+                &[],
+            )
+            .expect("count events");
+        assert_eq!(as_i64(&events[0][0]), 1);
+
+        // Re-observation writes nothing new.
+        let claimable = store.claimable_effects("i1").expect("claimable listing");
+        assert!(claimable.is_empty());
+        let events = store
+            .sql
+            .query(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'effect.blocked'",
+                &[],
+            )
+            .expect("count events");
+        assert_eq!(as_i64(&events[0][0]), 1);
+
+        // Registering the profile recovers the effect.
+        seed(
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, \
+             allowed_capabilities, config_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[
+                text("profile-ghost"),
+                text("ghost"),
+                text("late-registered"),
+                text("audit"),
+                text("[]"),
+                text("{}"),
+            ],
+        );
+        let claimable = store.claimable_effects("i1").expect("claimable listing");
+        assert_eq!(claimable.len(), 1);
+        assert_eq!(claimable[0].effect_id, "eff_t");
+    }
+
+    #[test]
     fn do_store_start_run_runs_real_sql() {
         let mut store = store();
         let seed = |sql: &str, params: &[SqlValue]| store.sql.execute(sql, params).expect(sql);
@@ -9863,14 +11062,31 @@ mod tests {
                 text("{}"),
             ],
         );
-        // A runtime-resolved coordination effect (no policy applies) — claimable.
+        // Register the admitted demo kind (provider + capability + global
+        // binding) so it passes the now-real admission gate (see the DO package
+        // bootstrap; only `timer.wait` is waved through).
+        seed(
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("p_demo"), text("builtin.demo"), text("builtin"), text("builtin.demo"), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_schemas (capability, description, schema_json) VALUES (?1, ?2, ?3)",
+            &[text("builtin.demo"), text(""), text("{}")],
+        );
+        seed(
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[text("b_demo"), SqlValue::Null, text("builtin.demo"), text("builtin"), text("{}")],
+        );
+        // A queued effect of the admitted kind — claimable.
         seed(
             "INSERT INTO effects (effect_id, instance_id, kind, status, input_json) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
                 text("eff_1"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{\"a\":1}"),
             ],
@@ -9895,7 +11111,7 @@ mod tests {
             &[
                 text("eff_up"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
             ],
@@ -9906,7 +11122,7 @@ mod tests {
             &[
                 text("eff_dn"),
                 text("i1"),
-                text("queue.push"),
+                text("builtin.demo"),
                 text("queued"),
                 text("{}"),
             ],
@@ -10209,6 +11425,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-1"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit_rule");
         assert!(ev.event_id.starts_with("evt_"));
@@ -10237,6 +11455,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-2"),
+                marks: &[],
+                context_json: None,
             },
             RuleCommitRevisionGuard {
                 program_version_id: "ver_WRONG",
@@ -10632,7 +11852,7 @@ mod tests {
         }];
         let effects = [NewEffect {
             effect_id: "eff_1",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -10654,6 +11874,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c1"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit");
         // Then start + complete a run for the effect (appends run_started + terminal).
@@ -10770,7 +11992,7 @@ mod tests {
 
         let effect_a = [NewEffect {
             effect_id: "eff_a",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -10792,13 +12014,15 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c_a"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit A");
         let cut = max_sequence(&store);
 
         let effect_b = [NewEffect {
             effect_id: "eff_b",
-            kind: "queue.push",
+            kind: "tracker.push",
             target: None,
             input_json: "{}",
             status: "queued",
@@ -10820,6 +12044,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("c_b"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit B");
 
@@ -11112,7 +12338,7 @@ mod tests {
                       key: &str| {
             let effects = [NewEffect {
                 effect_id,
-                kind: "queue.push",
+                kind: "tracker.push",
                 target: None,
                 input_json: "{}",
                 status: "queued",
@@ -11134,6 +12360,8 @@ mod tests {
                     dependencies: &[],
                     terminal: None,
                     idempotency_key: Some(key),
+                    marks: &[],
+                    context_json: None,
                 })
                 .expect("commit");
         };
@@ -11165,78 +12393,5 @@ mod tests {
             effect_exists(&store, "eff_c"),
             "C (post-restore) stays live"
         );
-    }
-
-    /// answer_inbox_item answers a pending item (guarded), records the
-    /// human.answer.received event + fact, and rejects a non-pending item.
-    #[test]
-    fn do_store_answer_inbox_item_runs_real_sql() {
-        let mut store = store();
-        for (sql, params) in [
-            (
-                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
-                 workflow_principal, effective_authority, status, input_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                vec![
-                    text("i1"),
-                    text("p"),
-                    text("ver_1"),
-                    int(0),
-                    text("root"),
-                    text("{}"),
-                    text("running"),
-                    text("{}"),
-                ],
-            ),
-            (
-                "INSERT INTO inbox_items (inbox_item_id, instance_id, effect_id, status, prompt) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![
-                    text("ibx_1"),
-                    text("i1"),
-                    text("eff_1"),
-                    text("pending"),
-                    text("approve?"),
-                ],
-            ),
-        ] {
-            store.sql.execute(sql, &params).expect("seed");
-        }
-
-        let ev = store
-            .answer_inbox_item(HumanAnswer {
-                inbox_item_id: "ibx_1",
-                answer_json: "{\"choice\":\"yes\",\"text\":\"ok\"}",
-                answered_by: "operator",
-                idempotency_key: Some("ans-1"),
-            })
-            .expect("answer");
-        assert!(ev.event_id.starts_with("evt_"));
-        // Item is answered; a human.answer.received fact was recorded.
-        let got = store.get_inbox_item("ibx_1").expect("get").expect("some");
-        assert_eq!(got.status, "answered");
-        assert_eq!(got.answered_by.as_deref(), Some("operator"));
-        let facts = store.list_facts("i1").expect("facts");
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].name, "human.answer.received");
-
-        // Answering it again (now non-pending) is rejected.
-        assert!(store
-            .answer_inbox_item(HumanAnswer {
-                inbox_item_id: "ibx_1",
-                answer_json: "{}",
-                answered_by: "operator",
-                idempotency_key: Some("ans-2"),
-            })
-            .is_err());
-        // An unknown item is rejected.
-        assert!(store
-            .answer_inbox_item(HumanAnswer {
-                inbox_item_id: "nope",
-                answer_json: "{}",
-                answered_by: "operator",
-                idempotency_key: None,
-            })
-            .is_err());
     }
 }

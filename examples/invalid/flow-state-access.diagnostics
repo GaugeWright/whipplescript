@@ -1,6 +1,0 @@
-error: rule `peek_flow_state` may not reference flow-state fact `FlowAwait_triage_ticket_1`: flow progression state is owned by the flow's generated rules
-   --> examples/invalid/flow-state-access.whip:78:6
-   |
-78 | rule peek_flow_state
-   |      ^^^^^^^^^^^^^^^
-   = help: drive the workflow from your own fact classes; a flow's `FlowAwait_*` state is internal

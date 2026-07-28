@@ -1,0 +1,23 @@
+load ../harness-evidence-fork.maude
+
+--- Coverage: a Managed turn records a hermetic context.bundle row.
+search [1] in WHIPPLESCRIPT-HARNESS-EVIDENCE-FORK :
+  managedTurn record
+  =>* managedTurn bundleRow .
+
+--- Coverage: a Delegated turn records a provider-assembled attestation row.
+search [1] in WHIPPLESCRIPT-HARNESS-EVIDENCE-FORK :
+  delegatedTurn record
+  =>* delegatedTurn attestationRow .
+
+--- Bite: a Delegated turn never fabricates a context.bundle. The RESIDUAL soup var
+--- makes a `bundleRow` in ANY reachable state a solution, so No solution proves the
+--- delegated path emits no hermetic provenance row.
+search [1] in WHIPPLESCRIPT-HARNESS-EVIDENCE-FORK :
+  delegatedTurn record
+  =>* bundleRow RESIDUAL:Cfg .
+
+--- Bite: a Managed turn never emits a provider-assembled attestation.
+search [1] in WHIPPLESCRIPT-HARNESS-EVIDENCE-FORK :
+  managedTurn record
+  =>* attestationRow RESIDUAL:Cfg .

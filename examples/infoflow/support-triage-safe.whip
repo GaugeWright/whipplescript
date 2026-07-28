@@ -1,3 +1,5 @@
+use std.files
+
 @service
 description "Support triage — SAFE: same job, contexts separated, passes the strict policy"
 workflow SupportTriageSafe
@@ -36,7 +38,7 @@ file store audit_log {
 }
 
 channel public_reply {
-  provider slack
+  provider fixture
   destination "#out"
 }
 
@@ -61,6 +63,11 @@ rule log_inbound
 
 # Rule 2: read the confidential CRM, derive only a bounded internal fact. The read
 # is confidential but there is NO egress sink in this rule, so nothing leaks.
+# `Reviewed` is recorded by a crm-reading rule, so governance labels it
+# Operator-readable — and because fact CONSUMPTION is a governed read at that
+# label, no later rule can quietly egress it either: even "review completed"
+# is Operator information (the occurrence bit), which is why the customer ack
+# below rides the PUBLIC chain instead of this one.
 rule review_record
   when Logged as logged
 => {
@@ -70,13 +77,15 @@ rule review_record
   }
 }
 
-# Rule 3: reply to the customer with only public, bounded content (the ticket id).
-# No confidential read in this rule, so the egress is safe.
+# Rule 3: reply to the customer with only public, bounded content (the ticket
+# id), driven by the PUBLIC fact chain (`Logged` — inbound receipt). Consuming
+# the Operator-labeled `Reviewed` here would taint the reply with everything
+# its label protects, including the fact that a review happened at all.
 rule acknowledge
-  when Reviewed as reviewed
+  when Logged as logged
 => {
   send via public_reply {
-    text "Thanks — your ticket {{ reviewed.ticket }} is being handled."
+    text "Thanks — your ticket {{ logged.ticket }} is being handled."
   } as sent
   after sent succeeds {
     complete result { ok true }

@@ -1,0 +1,74 @@
+load ../infoflow-signature.maude
+
+--- ============================ PRODUCER SIDE ============================
+
+--- Coverage: a SOUND absent claim attests. i1 is declared absent and the internals
+--- confirm noReach(i1); i2 is direct. The signature is justified, so it attests.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(abs(i1) dir(i2)) noReach(i1) reaches(i2)
+  =>* C:Cfg attestsSig .
+
+--- Coverage: a SOUND mediated claim attests. i1 flows only through c1, a cut, and c1
+--- is not attacker steered; i2 is direct, so it attests.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) dir(i2)) mediated(i1,c1) nmifOk(c1) reaches(i2)
+  =>* C:Cfg attestsSig .
+
+--- Bite: UNDER-CLAIMED INDEPENDENCE. The signature declares i1 absent but the
+--- internal check shows i1 actually reaches the result. The independence is unproven,
+--- so it must never attest. RESIDUAL makes any attested state a solution, so No
+--- solution proves the producer gate holds.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(abs(i1) dir(i2)) reaches(i1) reaches(i2)
+  =>* attestsSig RESIDUAL:Cfg .
+
+--- Bite: BYPASSED MEDIATION. The signature claims i1 is mediated by c1, but some flow
+--- path from i1 avoids c1. Mediation requires a cut, every path through c1; a bypass
+--- leaks the i1 full label, so it must never attest.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) dir(i2)) bypasses(i1,c1) nmifOk(c1) reaches(i2)
+  =>* attestsSig RESIDUAL:Cfg .
+
+--- Bite: ATTACKER-STEERED CROSSING, the NMIF guard. i1 is genuinely cut by c1, but
+--- c1 selector is attacker influenced (nmifBad). A downgrade may not be attacker
+--- steered (I-IFC3), so the mediated discount is unsound and never attests.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) dir(i2)) mediated(i1,c1) nmifBad(c1) reaches(i2)
+  =>* attestsSig RESIDUAL:Cfg .
+
+--- ============================ CONSUMER SIDE ============================
+
+--- Coverage end-to-end: a sound mediated signature whose GRANTED crossing caps i1 at
+--- a public target, with i2 absent. The result is lo, so it is released.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) abs(i2)) mediated(i1,c1) nmifOk(c1) noReach(i2)
+  clr(i1,hi) tgt(c1,lo) grant(c1)
+  =>* C:Cfg accepted .
+
+--- Bite, the FAIL-CLOSED CORE: UNGRANTED MEDIATED FALLS BACK TO DIRECT, NOT ABSENT.
+--- Same attested signature and bindings as the coverage case, but the consumer does
+--- NOT grant c1. If ungranted-mediated were wrongly treated as absent, i1 would
+--- contribute nothing and the result would be lo and accepted. The correct semantics
+--- falls back to direct: i1 contributes its full hi label, the result is hi, rejected.
+--- No accepted state is reachable.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) abs(i2)) mediated(i1,c1) nmifOk(c1) noReach(i2)
+  clr(i1,hi) tgt(c1,lo)
+  =>* accepted RESIDUAL:Cfg .
+
+--- Bite: GRANTING IS NOT A BLANK CHECK. The consumer grants c1, but the c1 TARGET is
+--- itself hi, the declassify ceiling is still secret for this audience. Even granted,
+--- i1 contributes hi, the result is hi, rejected. A grant does not release past the
+--- crossing own bounded target.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(med(i1,c1) abs(i2)) mediated(i1,c1) nmifOk(c1) noReach(i2)
+  clr(i1,hi) tgt(c1,hi) grant(c1)
+  =>* accepted RESIDUAL:Cfg .
+
+--- Bite: NO ATTESTATION, NO RELEASE. The signature is producer-unsound, absent over a
+--- real flow, so it is never attested; even though the consumer bindings would fit a
+--- lo result, the result can never be accepted. The producer gate guards the consumer.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNATURE :
+  decl(abs(i1) abs(i2)) reaches(i1) noReach(i2)
+  clr(i1,hi) clr(i2,hi)
+  =>* accepted RESIDUAL:Cfg .

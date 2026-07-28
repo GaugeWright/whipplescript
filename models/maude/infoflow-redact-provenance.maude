@@ -1,0 +1,123 @@
+--- Information-flow: redaction does not launder read provenance. DR-0027.
+--- infoflow-redaction.maude proves the projection ALGEBRA given per-field labels
+--- and assumes the whole confidentiality is the join of the field labels. But a
+--- record is often DERIVED from a resource READ whose confidentiality is not a
+--- schema field label. Lowering a release to the kept fields alone would launder
+--- that read provenance -- the under-taint reproduced in the checker.
+--- This model closes the gap. A record carries a derivedFrom PROVENANCE label -- the
+--- join of the reads that flowed in. The effective release label is the kept-field
+--- projection joined with the provenance. Redaction drops FIELDS but never the
+--- provenance, so a release leaks whenever the sink fails to dominate the join of
+--- kept-field labels and provenance -- the purely-additive redact refinement.
+--- Releasing read-derived data at a lower label is a declassification, modeled by
+--- omitting derivedFrom so a declassified read contributes noP.
+mod WHIPPLESCRIPT-INFOFLOW-REDACT-PROVENANCE is
+  protecting BOOL .
+  sorts Prin PSet Edge Rel Rec FName FSet Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
+  subsort FName < FSet .
+
+  --- compartments and the sink identity out
+  ops operator bankRole public out : -> Prin [ctor] .
+  ops customer : -> Rec [ctor] .
+  ops idF statusF ssnF : -> FName [ctor] .
+
+  --- principal sets are reader-set labels; name sets are keep lists
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
+
+  op noF : -> FSet [ctor] .
+  op _;_ : FSet FSet -> FSet [ctor assoc comm id: noF] .
+  eq F:FName ; F:FName = F:FName .
+
+  op inF : FName FSet -> Bool .
+  eq inF(F:FName, (F:FName ; G:FSet)) = true .
+  eq inF(F:FName, G:FSet) = false [owise] .
+
+  --- the delegation relation: edges P > Q meaning P acts-for Q
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  --- acts-for closure, reflexive-transitive, with a visited set so cycles terminate
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  --- coveredBy / dominates: the leak decision, as in infoflow-reader-sets
+  op coveredBy : Rel Prin PSet -> Bool .
+  eq coveredBy(REL:Rel, R:Prin, noP) = false .
+  ceq coveredBy(REL:Rel, R:Prin, (P:Prin , PS:PSet)) = true
+    if canAct(REL:Rel, P:Prin, R:Prin) .
+  ceq coveredBy(REL:Rel, R:Prin, (P:Prin , PS:PSet)) = coveredBy(REL:Rel, R:Prin, PS:PSet)
+    if canAct(REL:Rel, P:Prin, R:Prin) =/= true .
+
+  op dominates : Rel PSet PSet -> Bool .
+  eq dominates(REL:Rel, PROV:PSet, noP) = true .
+  ceq dominates(REL:Rel, PROV:PSet, (R:Prin , REQ:PSet)) = dominates(REL:Rel, PROV:PSet, REQ:PSet)
+    if coveredBy(REL:Rel, R:Prin, PROV:PSet) .
+  ceq dominates(REL:Rel, PROV:PSet, (R:Prin , REQ:PSet)) = false
+    if coveredBy(REL:Rel, R:Prin, PROV:PSet) =/= true .
+
+  --- the configuration soup
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deleg : Rel -> Cfg [ctor] .              --- the delegation context theta
+  op field : Rec FName PSet -> Cfg [ctor] .   --- record field FN reader set
+  op derivedFrom : Rec PSet -> Cfg [ctor] .   --- provenance: the reads that flowed in
+  op release : Rec FSet Prin -> Cfg [ctor] .  --- redact Rec keep KS and release to a sink
+  op sink : Prin PSet -> Cfg [ctor] .         --- sink S is readable by compartment set RS
+  op leak : -> Cfg [ctor] .                   --- violation
+
+  --- projReaders: the reader join of the KEPT fields, as in infoflow-redaction
+  op projReaders : Cfg Rec FSet -> PSet .
+  eq projReaders((field(R:Rec, FN:FName, PS:PSet) C:Cfg), R:Rec, KS:FSet)
+    = (if inF(FN:FName, KS:FSet) then PS:PSet else noP fi) , projReaders(C:Cfg, R:Rec, KS:FSet) .
+  eq projReaders(C:Cfg, R:Rec, KS:FSet) = noP [owise] .
+
+  --- prov: the record read PROVENANCE, the join of derivedFrom facts, noP if none.
+  --- It is NOT projected by the keep-set -- redaction cannot drop it.
+  op prov : Cfg Rec -> PSet .
+  eq prov((derivedFrom(R:Rec, PS:PSet) C:Cfg), R:Rec) = PS:PSet , prov(C:Cfg, R:Rec) .
+  eq prov(C:Cfg, R:Rec) = noP [owise] .
+
+  eq leak leak = leak .
+
+  --- A redaction released to a sink leaks iff the sink does NOT dominate the join of
+  --- the kept-field projection and the record read provenance. The whole config is
+  --- threaded to projReaders and prov so they sum every field and derivedFrom fact.
+  --- Dropping a field removes its projReaders contribution but NEVER the provenance,
+  --- so a record derived from a confidential read leaks even when only public fields
+  --- are kept -- the under-taint the checker must catch. A declassified read is
+  --- modeled by omitting derivedFrom.
+  crl [leak] :
+      release(R:Rec, KS:FSet, SNK:Prin) sink(SNK:Prin, RSSNK:PSet) deleg(REL:Rel) REST:Cfg
+    => release(R:Rec, KS:FSet, SNK:Prin) sink(SNK:Prin, RSSNK:PSet) deleg(REL:Rel) REST:Cfg leak
+    if dominates(REL:Rel, RSSNK:PSet,
+         (projReaders(
+            release(R:Rec, KS:FSet, SNK:Prin) sink(SNK:Prin, RSSNK:PSet) deleg(REL:Rel) REST:Cfg,
+            R:Rec, KS:FSet)
+          , prov(
+            release(R:Rec, KS:FSet, SNK:Prin) sink(SNK:Prin, RSSNK:PSet) deleg(REL:Rel) REST:Cfg,
+            R:Rec))) =/= true .
+endm

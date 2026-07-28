@@ -1,0 +1,95 @@
+--- Holdout sealing policy, per spec/improve-design-note.md section 8,
+--- settled 2026-07-04: per campaign a fraction of pinned scenarios is
+--- SEALED -- never shown to the proposer, scored only at promotion
+--- gates. A sealed scenario used in kmax promotion gates wears out: it
+--- retires from holdout duty and is refreshed from recent ambient runs.
+--- Anchor elicitation against a sealed scenario retires it immediately
+--- because the label is worth more than the seal, paid for honestly.
+--- Below the sealing floor the campaign still runs -- progressive rigor,
+--- never entry rigor: the gate passes carrying the unheld-out tag
+--- instead of fabricating rigor or refusing to start.
+---
+--- Two reflection passes feed the proposer. The SOUND pass reads only
+--- open scenarios; a sealed scenario's traces, contents, and judge
+--- rationales never reach the proposer (aggregates are not modeled as
+--- reads). The NAIVE pass reads whatever reflection material looks
+--- useful -- the modeled hazard: search pressure tunes the candidate to
+--- the very scenarios that were supposed to catch the gaming.
+mod WHIPPLESCRIPT-IMPROVE-HOLDOUT is
+  sorts Sid Cnt Cfg .
+
+  ops s1 s2 s3 : -> Sid [ctor] .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op kmax : -> Cnt .
+  op lt : Cnt Cnt -> Bool .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op sealed : Sid Cnt -> Cfg [ctor] .  --- sealed scenario with gate wear count
+  op openSc : Sid -> Cfg [ctor] .      --- open scenario: proposer-visible
+  op ambient : Sid -> Cfg [ctor] .     --- recent ambient run, refresh material
+  op wants : Sid -> Cfg [ctor] .       --- reflection material the proposer asks for
+  op readByProposer : Sid -> Cfg [ctor] . --- the proposer consumed its contents
+  op retired : Sid -> Cfg [ctor] .     --- worn out of holdout duty
+  op labeled : Sid -> Cfg [ctor] .     --- anchor-labeled, seal spent honestly
+
+  op reflect : -> Cfg [ctor] .      --- sound reflection pass
+  op naiveReflect : -> Cfg [ctor] . --- naive reflection pass (hazard)
+  op redactedReflect : -> Cfg [ctor] . --- campaign-attached redacted view:
+                                    --- aggregates only, NO scenario reads
+  op gate : -> Cfg [ctor] .         --- one pending promotion gate
+  op gated : -> Cfg [ctor] .        --- promotion gate scored
+  op anchor : -> Cfg [ctor] .       --- one anchor ask routed at a sealed scenario
+  op noSealed : -> Cfg [ctor] .     --- campaign below the sealing floor
+  op unheldOut : -> Cfg [ctor] .    --- honesty tag on the campaign's evidence
+
+  vars S S2 : Sid . vars K M : Cnt .
+
+  eq kmax = s(s(s(z))) .
+  eq lt(z, s(M)) = true .
+  eq lt(s(K), s(M)) = lt(K, M) .
+  eq lt(M, z) = false .
+
+  --- Sound reflection: open scenarios only. There is no rule handing a
+  --- sealed scenario to the proposer; that absence is the policy.
+  rl [reflect-open] :
+      reflect wants(S) openSc(S)
+      => reflect openSc(S) readByProposer(S) .
+
+  --- Naive reflection: sealed material read anyway -- the hazard.
+  rl [naive-reflect-sealed] :
+      naiveReflect wants(S) sealed(S, K)
+      => naiveReflect sealed(S, K) readByProposer(S) .
+
+  --- Campaign-attached redacted view, settled 2026-07-11: there is NO
+  --- rule handing ANY scenario -- open or sealed -- to the proposer under
+  --- redactedReflect. The proposer works from aggregates alone; that
+  --- absence is the whole policy.
+
+  --- A promotion gate scores against a sealed scenario and wears it.
+  crl [gate-sealed] :
+      gate sealed(S, K)
+      => gated sealed(S, s(K))
+      if lt(K, kmax) .
+
+  --- Wear-out at kmax gates, written in constructor form because rule
+  --- matching is syntactic modulo axioms: retire, refresh from ambient.
+  --- The cuts were already taken, so the refresh is cheap.
+  rl [wear-out] :
+      sealed(S, s(s(s(z)))) ambient(S2)
+      => retired(S) sealed(S2, z) .
+
+  --- An anchor ask against a sealed scenario retires the seal: the
+  --- label is worth more than the seal.
+  rl [anchor-retire] :
+      anchor sealed(S, K)
+      => labeled(S) retired(S) .
+
+  --- Below the floor the campaign gates anyway, honestly tagged.
+  rl [gate-unheld-out] :
+      gate noSealed
+      => gated noSealed unheldOut .
+endm

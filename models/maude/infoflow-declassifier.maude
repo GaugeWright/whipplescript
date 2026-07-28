@@ -1,0 +1,77 @@
+--- Semantic checked declassifier (DR-0030 Direction C). A declassify gated by a
+--- trusted predicate, generalizing the I-IFC3 bounded-TYPE ceiling to a trusted
+--- PREDICATE. The oracle risk (extract a secret one accepted release at a time) is
+--- not escaped but RELOCATED, and the model pins the three controls.
+---
+---   NMIF on the SELECTOR. A release to a PRIVILEGED reader requires a
+---   HIGH-INTEGRITY selector (the choice of which release is asked is trusted, not
+---   attacker steered). An attacker with a low-integrity selector cannot drive a
+---   privileged release, so there is no adaptive oracle to a privileged reader. This
+---   is the PRIMARY, structural argument.
+---
+---   The REFUSAL channel. A refusal whose decision depends on the secret is itself
+---   observable at the secret level, so a public observer reading it is a leak. A
+---   refusal that depends only on a FIXED PUBLIC budget is public and safe. So any
+---   budget must be fixed and public, never a data-dependent refuse-when-dangerous.
+---
+---   The BUDGET backstop. Releases consume a budget; an exhausted budget blocks
+---   further releases. This is the quantitative BACKSTOP for the self-inflicted
+---   trusted-but-too-many case only, not the primary argument.
+---
+--- Authority (grant, X3) and the predicate are also required: an ungranted or
+--- predicate-failing release never fires (fail-closed).
+mod WHIPPLESCRIPT-INFOFLOW-DECLASSIFIER is
+  protecting BOOL .
+  protecting NAT .
+
+  sorts Level Cfg .
+  ops lo hi : -> Level [ctor] .   --- lo = public or attacker-controllable; hi = privileged or trusted
+
+  --- can an observable at level L be seen by a party cleared at OL?
+  op leq : Level Level -> Bool .
+  eq leq(lo, L:Level) = true .
+  eq leq(hi, hi) = true .
+  eq leq(hi, lo) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- a checked-declassifier release request
+  op selectorInteg : Level -> Cfg [ctor] . --- integrity of the SELECTOR (which release is asked)
+  op releaseReq : Level -> Cfg [ctor] .    --- requested audience: hi = privileged reader, lo = public
+  op granted : -> Cfg [ctor] .             --- consumer granted the crossing authority (X3)
+  op predHolds : -> Cfg [ctor] .           --- the trusted predicate passes
+  op budget : Nat -> Cfg [ctor] .          --- remaining release budget, fixed and public
+
+  --- the refusal channel
+  op refusalAt : Level -> Cfg [ctor] .     --- level of the refusal DECISION: hi = secret-dependent, lo = counter-only
+  op observer : Level -> Cfg [ctor] .      --- a party observing the refusal, cleared at this level
+
+  --- outcomes
+  op released : Level -> Cfg [ctor] .
+  op obsOk : -> Cfg [ctor] .
+  op obsLeak : -> Cfg [ctor] .
+
+  eq obsOk obsOk = obsOk .
+  eq obsLeak obsLeak = obsLeak .
+
+  var N : Nat .  vars L OL : Level .
+
+  --- A PRIVILEGED release to a hi reader requires a HIGH-INTEGRITY selector. The
+  --- attacker cannot steer a privileged release, so no adaptive oracle reaches a
+  --- privileged reader. Needs grant, predicate, and remaining budget.
+  rl [release-priv] : selectorInteg(hi) releaseReq(hi) granted predHolds budget(s N)
+                    => selectorInteg(hi) granted predHolds budget(N) released(hi) .
+
+  --- A PUBLIC release needs no privileged selector, but still needs grant, predicate,
+  --- and budget.
+  rl [release-pub] : releaseReq(lo) granted predHolds budget(s N)
+                   => granted predHolds budget(N) released(lo) .
+
+  --- Observing a refusal: safe iff the refusal observable fits the observer clearance.
+  --- A secret-dependent refusal (hi) observed by the public (lo) is a LEAK.
+  crl [observe-ok] : refusalAt(L) observer(OL) => refusalAt(L) observer(OL) obsOk
+                   if leq(L,OL) .
+  crl [observe-bad] : refusalAt(L) observer(OL) => refusalAt(L) observer(OL) obsLeak
+                    if leq(L,OL) =/= true .
+endm

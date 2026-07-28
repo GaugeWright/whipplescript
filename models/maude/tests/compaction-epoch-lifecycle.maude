@@ -1,0 +1,32 @@
+load ../compaction-epoch-lifecycle.maude
+
+--- Coverage: the trigger begins exactly one summarizer round.
+search [1] in WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE :
+  armed
+  =>* summarizing .
+
+--- Coverage: the round applies as the single atomic prefix rewrite (prefix installed,
+--- epoch marked spent).
+search [1] in WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE :
+  armed
+  =>* prefix applied .
+
+--- Coverage: after apply, a main turn appends to the held prefix (a cache hit), never
+--- rewriting it.
+search [1] in WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE :
+  armed turnPending
+  =>* prefix tail applied .
+
+--- Bite: at-most-once-per-epoch. The RESIDUAL soup var makes `refired` in ANY
+--- reachable state a solution, so No solution proves no second summarization fires
+--- for the same epoch (there is no re-arm rule producing a fresh `armed`).
+search [1] in WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE :
+  armed
+  =>* refired RESIDUAL:Cfg .
+
+--- Bite: atomic apply / no half-rewrite. No reachable state rewrites the prefix while
+--- the summarizer round is in flight -- [append] requires a `prefix`, which only the
+--- atomic [apply] produces, so a mid-summary prefix rewrite is unreachable.
+search [1] in WHIPPLESCRIPT-COMPACTION-EPOCH-LIFECYCLE :
+  armed turnPending
+  =>* prefixDuringSummary RESIDUAL:Cfg .

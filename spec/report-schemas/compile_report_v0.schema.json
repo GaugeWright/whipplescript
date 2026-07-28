@@ -253,7 +253,7 @@
     },
     "id": {"type": "string", "minLength": 1},
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "stable_digest": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "stable_digest": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
     "string_array": {
       "type": "array",
       "uniqueItems": true,

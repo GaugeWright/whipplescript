@@ -1,0 +1,142 @@
+load ../infoflow-composition.maude
+
+--- Delegation context theta: operator > requester (operator acts-for requester).
+--- stranger acts-for no one. ledger is owned by ledgerOwn, readable by operator
+--- only (readAuth(ledgerOwn, operator)). The agent ag mixes the untrusted email
+--- msg and the secret ledger into draft, which carries BOTH stranger integrity
+--- and ledgerOwn secrecy.
+
+--- Coverage: the bank exfil attack, confidentiality. draft to a requester-audience
+--- egress leaks; requester does not act-for operator, so cannot read ledger data.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  egressSink(draft, requester)
+  =>* C:Cfg leak .
+
+--- Coverage: the injection attack, integrity, on the SAME draft. Driving an
+--- operator-required control sink is an injection; stranger does not act-for operator.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  controlSink(draft, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: declassify does NOT launder integrity. The untrusted email is
+--- declassified, but conf keeps stranger integrity; an operator control sink is
+--- still an injection.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) declassify(msg, conf, ledgerOwn) controlSink(conf, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: endorse does NOT launder secrecy. The secret ledger is endorsed to
+--- operator integrity, but bill keeps ledgerOwn secrecy; a requester egress leaks.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  endorse(ledger, bill, operator) egressSink(bill, requester)
+  =>* C:Cfg leak .
+
+--- Coverage: record dual-gate, integrity side. The dual-labeled draft recorded
+--- trips injection; stranger does not act-for operator.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  recordSink(draft, operator, requester)
+  =>* C:Cfg injection .
+
+--- Coverage: record dual-gate, confidentiality side, SAME record. The ledger
+--- secret recorded into a fact base whose audience is requester leaks. One sink,
+--- both gates fire.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  recordSink(draft, operator, requester)
+  =>* C:Cfg leak .
+
+--- Coverage: record integrity gate alone. An untrusted-only value recorded where
+--- record requires operator is an injection, no leak.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(extra, stranger) recordSink(extra, operator, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: an endorse names its crossing in the audit.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator)
+  =>* C:Cfg endorsedAt(msg, bill, operator) .
+
+--- Coverage: the trusted surface is itemized; both crossings are named.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator)
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator) declassify(ledger, conf, ledgerOwn)
+  =>* C:Cfg endorsedAt(msg, bill, operator) declassifiedAt(ledger, conf, ledgerOwn) .
+
+--- Bite: the legitimate operator briefing. The dual-labeled draft to an operator
+--- audience is safe; operator acts-for the ledger reader-authority, and egress
+--- does not gate on integrity.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  agentIn(ag, msg) agentIn(ag, ledger) agentOut(ag, draft)
+  egressSink(draft, operator)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a bounded action via endorse. The email endorsed to operator drives an
+--- operator control sink. No injection.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) endorse(msg, bill, operator) controlSink(bill, operator)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: an external send via declassify. The ledger declassified, sent to a
+--- requester audience, is safe; the released projection carries no secret.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator)
+  declassify(ledger, conf, ledgerOwn) egressSink(conf, requester)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the operator may spawn. operator influence at an operator sink is safe.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, operator) controlSink(msg, operator)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: a legitimate record passes the integrity gate.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(extra, operator) recordSink(extra, operator, operator)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: the same record passes the confidentiality gate, no secret carried.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(extra, operator) recordSink(extra, operator, operator)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a secret fact recorded into a cleared fact base is safe; operator can
+--- read the ledger.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  secretSource(extra, ledgerOwn) readAuth(ledgerOwn, operator) recordSink(extra, operator, operator)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: no silent endorse. A no-crossing program produces no endorsedAt audit.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  intSource(msg, stranger) flow(msg, extra) dataSink(extra)
+  =>* endorsedAt(BV:Binding, BW:Binding, RV:Prin) RESIDUAL:Cfg .
+
+--- Bite: no silent declassify. A no-crossing program produces no declassifiedAt.
+search [1] in WHIPPLESCRIPT-INFOFLOW-COMPOSITION :
+  deleg((operator > requester))
+  secretSource(ledger, ledgerOwn) readAuth(ledgerOwn, operator) flow(ledger, extra) dataSink(extra)
+  =>* declassifiedAt(BV:Binding, BW:Binding, OV:Prin) RESIDUAL:Cfg .

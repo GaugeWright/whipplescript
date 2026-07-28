@@ -1,0 +1,61 @@
+load ../invoke-result-typing.maude
+
+--- Coverage: a field in the child's OUTPUT contract, accessed via the succeeds
+--- alias, is accepted.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessSucceeds(fOut) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* C:Cfg accepted .
+
+--- Coverage: a field NOT in the output contract, via succeeds, is rejected.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessSucceeds(fFail) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* C:Cfg rejected .
+
+--- Coverage: a field in the FAILURE contract, via the fails alias, is accepted.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFails(fFail) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* C:Cfg accepted .
+
+--- Coverage: an output-ONLY field accessed via the fails alias is rejected —
+--- the fails binding is the failure contract, not the output (discrimination).
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFails(fOut) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* C:Cfg rejected .
+
+--- Bite: an output field via succeeds is NEVER rejected. The RESIDUAL soup var
+--- means any rejected state is a solution, so No solution proves the correct
+--- field is not wrongly rejected.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessSucceeds(fOut) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* rejected RESIDUAL:Cfg .
+
+--- Bite: a failure field via fails is NEVER rejected.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFails(fBoth) outputFields((fOut , fBoth)) failureFields((fFail , fBoth))
+  =>* rejected RESIDUAL:Cfg .
+
+--- Part (b) coverage: a field SPECIFIC to the child's declared failure class,
+--- accessed via the fails alias when the class is resolvable, is accepted. Under
+--- the old base-only binding this child-specific field would not have resolved;
+--- binding the child's failure class is what makes it check.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFails(fChild) failureFields((fChild , fReason))
+  =>* C:Cfg accepted .
+
+--- Part (b) coverage: fallback to the base — a child-class-specific field on the
+--- BASE-bound fails alias is rejected (the base has no such field).
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fChild) baseFields((fReason , fBase))
+  =>* C:Cfg rejected .
+
+--- Part (b) coverage: the base's `reason` still resolves under the fallback — the
+--- control_plane regression (`after child fails as f { fail error { reason
+--- f.reason } }` with a child-local failure class) depends on this.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fReason) baseFields((fReason , fBase))
+  =>* C:Cfg accepted .
+
+--- Part (b) bite: the base's `reason` is NEVER rejected under the fallback.
+search [1] in WHIPPLESCRIPT-INVOKE-RESULT-TYPING :
+  accessFailsBase(fReason) baseFields((fReason , fBase))
+  =>* rejected RESIDUAL:Cfg .

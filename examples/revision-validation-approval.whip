@@ -28,22 +28,6 @@ workflow RevisionValidation {
     after proposal succeeds as patch {
       done target
 
-      askHuman """markdown
-      Review this patch proposal before activating a workflow revision.
-
-      Instance:
-      {{ target.instanceId }}
-
-      Candidate path:
-      {{ patch.proposedPath }}
-
-      Run this dry-run command first:
-      {{ patch.dryRunCommand }}
-
-      If the dry-run is compatible, activate from the control plane with
-      whip revise. Do not try to activate the revision from a workflow rule.
-      """
-
       complete result {
         proposedPath patch.proposedPath
         dryRunCommand patch.dryRunCommand

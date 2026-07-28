@@ -22,8 +22,9 @@ fn checks_all_example_workflows() {
         "coerce-branch.whip",
         "clock-source.whip",
         "terminal-output-union.whip",
-        "triage-flow.whip",
+        "triage-chain.whip",
         "incident-router.whip",
+        "expression-kernel.whip",
         "scheduled-escalation.whip",
         "event-bridge.whip",
         "reusable-review-pattern.whip",
@@ -32,7 +33,6 @@ fn checks_all_example_workflows() {
         "autoresearch-lite.whip",
         "gastown-lite.whip",
         "circuit-breaker.whip",
-        "human-review.whip",
         "multi-agent-bounded-concurrency.whip",
         "messaging-demo.whip",
         "file-store-demo.whip",
@@ -163,7 +163,7 @@ fn action_expanded_chain_runs_end_to_end() {
             "--store",
             store.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -353,7 +353,7 @@ table tasks as Task [
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -454,7 +454,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -561,7 +561,7 @@ rule record_line
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             program,
             "--provider",
             "fixture",
@@ -766,7 +766,7 @@ rule record_item
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             program,
             "--provider",
             "fixture",
@@ -919,7 +919,7 @@ rule record_item
             "--store",
             dead_store_str,
             "--json",
-            "dev",
+            "run",
             dead_program,
             "--provider",
             "fixture",
@@ -952,6 +952,432 @@ rule record_item
     let _ = fs::remove_file(dead_source);
 }
 
+/// A `file` ingress source in `watch` mode (spec/std-ingress.md I2a/I3):
+/// `watch "<glob>"` admits one durable signal fact per new (path,
+/// content-hash) occurrence through the shared admission core — a dropped
+/// file admits once, an unchanged file never re-admits on a later worker
+/// pass, and a content change re-admits (a new occurrence of the same path).
+#[test]
+fn dev_file_watch_source_admits_per_content_occurrence() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let root = unique_temp_dir("file-watch-root");
+    fs::write(root.join("a.json"), r#"{"n":1}"#).expect("seed drop");
+    let source_path = temp_workflow_path("file-watch-source");
+    fs::write(
+        &source_path,
+        format!(
+            r#"
+@service
+workflow IngressWatchSource
+
+signal drop.arrived {{
+  path string
+  digest string
+}}
+
+class DropSeen {{
+  path string
+  digest string
+}}
+
+source file as drops {{
+  watch "{}/*.json"
+
+  observe as obs
+  emit drop.arrived {{
+    path obs.path
+    digest obs.content_hash
+  }}
+}}
+
+rule record_drop
+  when drop.arrived as f
+=> {{
+  record DropSeen {{
+    path f.path
+    digest f.digest
+  }}
+}}
+"#,
+            root.display()
+        ),
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "run",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let drop_facts = |instance: &str| -> Vec<(String, String)> {
+        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("drop.arrived"))
+            .map(|fact| {
+                (
+                    fact.pointer("/value/path")
+                        .and_then(Value::as_str)
+                        .expect("occurrence carries the path")
+                        .to_owned(),
+                    fact.pointer("/value/digest")
+                        .and_then(Value::as_str)
+                        .expect("occurrence carries the content hash")
+                        .to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let first = drop_facts(&instance_id);
+    assert_eq!(first.len(), 1, "the dropped file admits once: {first:?}");
+    assert!(first[0].0.ends_with("a.json"), "{first:?}");
+
+    // Unchanged content: a later worker pass re-admits nothing.
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("file_lines_admitted").and_then(Value::as_u64),
+        Some(0),
+        "an unchanged watched file never re-admits: {worker}"
+    );
+    assert_eq!(drop_facts(&instance_id).len(), 1);
+
+    // A content change is a NEW (path, content-hash) occurrence: it re-admits.
+    fs::write(root.join("a.json"), r#"{"n":2}"#).expect("change drop");
+    let worker = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "worker",
+            &instance_id,
+            "--program",
+            program,
+            "--provider",
+            "fixture",
+        ],
+    );
+    assert_eq!(
+        worker.get("file_lines_admitted").and_then(Value::as_u64),
+        Some(1),
+        "a content change re-admits one occurrence: {worker}"
+    );
+    let after_change = drop_facts(&instance_id);
+    assert_eq!(after_change.len(), 2, "{after_change:?}");
+    assert_ne!(
+        after_change[0].1, after_change[1].1,
+        "the two occurrences carry distinct content hashes"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `whip ingress serve --stdio` (spec/std-ingress.md I3, the std.ingress.stdio
+/// driver): JSONL envelopes from stdin go through the SAME admission core as
+/// `whip signal` — a valid envelope admits a durable signal fact the reacting
+/// rule fires on, a re-delivered `delivery_id` is absorbed exactly once (an
+/// observable `duplicate` result), and a malformed line is rejected before any
+/// fact.
+#[test]
+fn ingress_serve_stdio_admits_absorbs_duplicates_and_rejects_malformed() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let source_path = temp_workflow_path("ingress-stdio");
+    fs::write(
+        &source_path,
+        r#"
+@service
+workflow IngressStdio
+
+signal deploy.finished {
+  service string
+  status string
+}
+
+class DeploySeen {
+  service string
+}
+
+rule record_deploy
+  when deploy.finished as f
+=> {
+  record DeploySeen {
+    service f.service
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let program = source_path.to_str().expect("utf-8 source path");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "run",
+            program,
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Four envelopes: valid, exact duplicate delivery id, malformed JSON,
+    // undeclared signal. Exactly one admission may result.
+    let envelopes = format!(
+        "{}\n{}\nnot json at all\n{}\n",
+        json!({"instance": instance_id, "signal": "deploy.finished", "payload": {"service": "api", "status": "ok"}, "delivery_id": "dl-1"}),
+        json!({"instance": instance_id, "signal": "deploy.finished", "payload": {"service": "api", "status": "ok"}, "delivery_id": "dl-1"}),
+        json!({"instance": instance_id, "signal": "deploy.unknown", "payload": {}}),
+    );
+    let mut serve = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "ingress",
+            "serve",
+            "--stdio",
+            "--program",
+            program,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ingress serve spawns");
+    serve
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelopes.as_bytes())
+        .expect("write envelopes");
+    let output = serve.wait_with_output().expect("serve completes");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("result line is JSON"))
+        .collect();
+    let statuses: Vec<&str> = results
+        .iter()
+        .map(|result| {
+            result
+                .get("status")
+                .and_then(Value::as_str)
+                .expect("status")
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["admitted", "duplicate", "rejected", "rejected"],
+        "{results:?}"
+    );
+    assert!(
+        results[2]
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("invalid JSON envelope")),
+        "{results:?}"
+    );
+    assert!(
+        results[3]
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("not declared")),
+        "{results:?}"
+    );
+
+    // The one admitted signal fires the reacting rule on the next pass; the
+    // duplicate and the rejected lines left no facts behind.
+    run_text(
+        bin,
+        &["--store", store, "step", &instance_id, "--program", program],
+    );
+    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let count = |name: &str| -> usize {
+        facts
+            .as_array()
+            .expect("facts array")
+            .iter()
+            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some(name))
+            .count()
+    };
+    assert_eq!(
+        count("deploy.finished"),
+        1,
+        "one admission across the duplicate delivery: {facts}"
+    );
+    assert_eq!(count("DeploySeen"), 1, "the valid line fired the rule");
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(source_path);
+}
+
+/// Ingress admission must validate the payload against the instance's COMMITTED
+/// program, not an arbitrary `--program` the caller supplies: otherwise
+/// `whip signal <inst> --program attacker.whip` admits a signal against a schema
+/// the instance never ran. A tampered program (different source hash) is
+/// rejected; the genuine committed program still admits (ultracode #7).
+#[test]
+fn signal_rejects_a_program_that_is_not_the_instances_committed_version() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let committed = temp_workflow_path("signal-committed");
+    let tampered = temp_workflow_path("signal-tampered");
+    let committed_src = r#"
+@service
+workflow SigGuard
+
+signal deploy.finished {
+  service string
+}
+
+class DeploySeen {
+  service string
+}
+
+rule record_deploy
+  when deploy.finished as f
+=> {
+  record DeploySeen {
+    service f.service
+  }
+}
+"#;
+    // Same declared signal, but an extra signal changes the source hash — a
+    // stand-in for any caller-supplied program that is not the committed one.
+    let tampered_src = committed_src.replace(
+        "signal deploy.finished {",
+        "signal secret.backdoor {\n  service string\n}\n\nsignal deploy.finished {",
+    );
+    fs::write(&committed, committed_src).expect("write committed");
+    fs::write(&tampered, &tampered_src).expect("write tampered");
+
+    let store = store_path.to_str().expect("utf-8 store path");
+    let committed_path = committed.to_str().expect("utf-8 path");
+    let tampered_path = tampered.to_str().expect("utf-8 path");
+
+    let run = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "start",
+            committed_path,
+            "--input",
+            "{}",
+        ],
+    );
+    let instance_id = run
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The tampered program is refused before any admission.
+    let refused = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "signal",
+            &instance_id,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"evil"}"#,
+            "--program",
+            tampered_path,
+        ])
+        .output()
+        .expect("signal runs");
+    assert!(
+        !refused.status.success(),
+        "a tampered --program must be rejected: {refused:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("does not match"),
+        "the refusal names the mismatch: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The genuine committed program still admits.
+    let admitted = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "signal",
+            &instance_id,
+            "--name",
+            "deploy.finished",
+            "--data",
+            r#"{"service":"api"}"#,
+            "--program",
+            committed_path,
+        ])
+        .output()
+        .expect("signal runs");
+    assert!(
+        admitted.status.success(),
+        "the committed program admits: stdout={} stderr={}",
+        String::from_utf8_lossy(&admitted.stdout),
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(committed);
+    let _ = fs::remove_file(tampered);
+}
+
 /// std.files `write` (spec/std-library/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent
@@ -980,6 +1406,7 @@ class Result {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1007,7 +1434,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             create_src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -1057,6 +1484,7 @@ class Stopped {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1084,7 +1512,7 @@ rule pick
             "--store",
             mv_store_str,
             "--json",
-            "dev",
+            "run",
             mv_src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -1158,6 +1586,7 @@ class Result {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1184,7 +1613,7 @@ rule pick
                 "--store",
                 store,
                 "--json",
-                "dev",
+                "run",
                 src.to_str().expect("utf-8 source path"),
                 "--provider",
                 "fixture",
@@ -1270,6 +1699,7 @@ class Result {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1296,7 +1726,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -1448,7 +1878,7 @@ rule pick
                 "--store",
                 &store,
                 "--json",
-                "dev",
+                "run",
                 scenario_src.to_str().expect("utf-8 source path"),
                 "--provider",
                 "fixture",
@@ -1516,6 +1946,7 @@ class Seen {{
 
 file store data_files {{
   root "{path}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1551,7 +1982,7 @@ rule fan_out
             "--store",
             ok_store_str,
             "--json",
-            "dev",
+            "run",
             ok_src.to_str().expect("utf-8 source"),
             "--provider",
             "fixture",
@@ -1611,6 +2042,7 @@ class IssueRow {{
 
 file store data_files {{
   root "{path}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -1651,7 +2083,7 @@ rule pick
             "--store",
             bad_store_str,
             "--json",
-            "dev",
+            "run",
             bad_src.to_str().expect("utf-8 source"),
             "--provider",
             "fixture",
@@ -1726,6 +2158,7 @@ class IssueRow {{
 
 file store fs {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule load
@@ -1756,7 +2189,7 @@ rule dump
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source"),
             "--provider",
             "fixture",
@@ -1842,7 +2275,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -1891,158 +2324,6 @@ rule pick
     let _ = fs::remove_file(source_path);
     let _ = fs::remove_file(secret);
     let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn human_answer_fires_dependent_rule() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let example = example_path("human-review.whip");
-    let store = store_path.to_str().expect("utf-8 temp path");
-    let source = example.to_str().expect("utf-8 example path");
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            store,
-            "--json",
-            "dev",
-            source,
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-
-    let inbox = run_json(bin, &["--store", store, "--json", "inbox"]);
-    let items = inbox.as_array().expect("inbox items");
-    assert_eq!(items.len(), 1, "one pending human review item");
-    let inbox_item_id = items[0]
-        .get("inbox_item_id")
-        .and_then(Value::as_str)
-        .expect("inbox item id")
-        .to_owned();
-
-    run_text(
-        bin,
-        &[
-            "--store",
-            store,
-            "inbox",
-            "answer",
-            &inbox_item_id,
-            "--choice",
-            "accept",
-        ],
-    );
-    run_text(
-        bin,
-        &["--store", store, "step", &instance_id, "--program", source],
-    );
-
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
-    let decisions = facts
-        .as_array()
-        .expect("facts")
-        .iter()
-        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("HumanDecision"))
-        .collect::<Vec<_>>();
-    assert_eq!(decisions.len(), 1, "answer fires record_manual_review");
-    assert_eq!(
-        decisions[0]
-            .pointer("/value/decision")
-            .and_then(Value::as_str),
-        Some("accept")
-    );
-
-    let _ = fs::remove_file(store_path);
-}
-
-/// Flow carry-forward, end to end at runtime: triage-flow's pre-ask `tell` result
-/// (`plan`) is carried across the `askHuman` boundary via flow state, so after
-/// approval the `complete result { plan plan.summary }` resolves the carried turn
-/// and the workflow completes with that summary in its output. If the binding were
-/// not carried, `flowState.plan.summary` would not resolve and the output `plan`
-/// would be empty/absent.
-#[test]
-fn flow_carries_pre_ask_binding_through_human_answer() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let example = example_path("triage-flow.whip");
-    let store = store_path.to_str().expect("utf-8 temp path");
-    let source = example.to_str().expect("utf-8 example path");
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            store,
-            "--json",
-            "dev",
-            source,
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-
-    let inbox = run_json(bin, &["--store", store, "--json", "inbox"]);
-    let inbox_item_id = inbox
-        .as_array()
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("inbox_item_id"))
-        .and_then(Value::as_str)
-        .expect("inbox item id (ask ran)")
-        .to_owned();
-
-    run_text(
-        bin,
-        &[
-            "--store",
-            store,
-            "inbox",
-            "answer",
-            &inbox_item_id,
-            "--choice",
-            "approve",
-        ],
-    );
-    run_text(
-        bin,
-        &["--store", store, "step", &instance_id, "--program", source],
-    );
-
-    let log = run_json(bin, &["--store", store, "--json", "log", &instance_id]);
-    let completed = log
-        .as_array()
-        .expect("events")
-        .iter()
-        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.completed"))
-        .expect("workflow completed after approval");
-    // The output `plan` came from `flowState.plan.summary` — the carried pre-ask
-    // turn. The fixture turn summary is "fixture completed".
-    assert_eq!(
-        completed
-            .pointer("/payload/payload/plan")
-            .and_then(Value::as_str),
-        Some("fixture completed"),
-        "carried pre-ask binding resolved in the completion output: {completed}"
-    );
-
-    let _ = fs::remove_file(store_path);
 }
 
 #[test]
@@ -2098,7 +2379,7 @@ rule observe
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -2195,7 +2476,7 @@ rule run_task
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
                 "--json",
-                "dev",
+                "run",
                 source_path.to_str().expect("utf-8 source path"),
                 "--provider",
                 "fixture",
@@ -2275,7 +2556,7 @@ rule seed
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -2347,7 +2628,7 @@ rule seed
             "--store",
             exclude_store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -2440,7 +2721,7 @@ fn doctor_providers_reports_deterministic_health_posture() {
         .get("provider_health_checks")
         .and_then(Value::as_array)
         .expect("provider health checks");
-    for provider in ["codex", "claude", "pi"] {
+    for provider in ["codex", "claude"] {
         assert!(
             checks
                 .iter()
@@ -2462,7 +2743,6 @@ fn doctor_providers_reports_deterministic_health_posture() {
     assert!(!doctor_json.contains("sk-test-secret"), "{doctor_json}");
     assert!(!doctor_json.contains("ANTHROPIC_API_KEY="), "{doctor_json}");
     assert!(!doctor_json.contains("OPENAI_API_KEY="), "{doctor_json}");
-    assert!(!doctor_json.contains("PI_API_KEY="), "{doctor_json}");
 
     let _ = fs::remove_file(store_path);
 }
@@ -2636,7 +2916,7 @@ fn starts_and_inspects_two_instances_independently() {
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             example.to_str().expect("utf-8 example path"),
             "--input",
             r#"{"ticket":"one"}"#,
@@ -2648,7 +2928,7 @@ fn starts_and_inspects_two_instances_independently() {
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             example.to_str().expect("utf-8 example path"),
             "--input",
             r#"{"ticket":"two"}"#,
@@ -2753,6 +3033,7 @@ fn starts_and_inspects_two_instances_independently() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "evidence",
+            "instance",
             first_id,
             "--json",
         ],
@@ -2800,7 +3081,7 @@ rule start_work
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -2965,7 +3246,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3088,7 +3369,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3203,7 +3484,7 @@ rule seed_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3330,7 +3611,7 @@ rule noop
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3421,7 +3702,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3577,7 +3858,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -3873,7 +4154,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -4152,10 +4433,6 @@ fn running_cancel_supported_provider_acknowledges_cancellation() {
         "fixture-cancellable",
         "before_terminal",
     );
-    running_cancel_supported_provider_acknowledges_cancellation_case(
-        "pi-main",
-        "after_terminal_allowed",
-    );
 }
 
 fn running_cancel_supported_provider_acknowledges_cancellation_case(
@@ -4204,7 +4481,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -4468,7 +4745,7 @@ rule noop_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -4657,7 +4934,7 @@ rule noop
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -4776,6 +5053,7 @@ rule noop
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -4877,7 +5155,7 @@ workflow RevisionSpan {
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -5026,7 +5304,7 @@ fn step_materializes_minimal_noop_fact() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "run",
+            "start",
             example.to_str().expect("utf-8 example path"),
         ],
     );
@@ -5086,7 +5364,7 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -5172,7 +5450,7 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "owned",
@@ -5224,6 +5502,7 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5335,7 +5614,7 @@ workflow SkillCatalogueSmoke {
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow.to_str().expect("utf-8 workflow path"),
             "--provider",
             "owned",
@@ -5355,6 +5634,7 @@ workflow SkillCatalogueSmoke {
             store_path.to_str().expect("utf-8 store path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5480,7 +5760,7 @@ workflow SkillPinSmoke {
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -5500,6 +5780,7 @@ workflow SkillPinSmoke {
             store_path.to_str().expect("utf-8 store path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5579,7 +5860,7 @@ workflow ProjCtxSmoke {
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             workflow.to_str().expect("utf-8 workflow path"),
             "--provider",
             "owned",
@@ -5599,7 +5880,17 @@ workflow ProjCtxSmoke {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(bin, &["--store", store, "--json", "evidence", instance_id]);
+    let evidence = run_json(
+        bin,
+        &[
+            "--store",
+            store,
+            "--json",
+            "evidence",
+            "instance",
+            instance_id,
+        ],
+    );
     let evidence = evidence
         .get("evidence")
         .and_then(Value::as_array)
@@ -5647,7 +5938,7 @@ rule start_native_work
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "native-fixture",
@@ -5911,7 +6202,7 @@ rule start_delegated_work
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "native-fixture",
@@ -5931,6 +6222,7 @@ rule start_delegated_work
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -5995,7 +6287,7 @@ rule start_delegated_work
 #[test]
 fn dev_native_provider_unavailable_blocks_effect_recoverably() {
     // DR-0020: a native agent effect whose provider binding is unavailable
-    // (here: the `pi` sidecar cannot launch) is BLOCKED before provider execution
+    // (here: the `codex` sidecar cannot launch) is BLOCKED before provider execution
     // with a categorized reason — recoverable, not a terminal failure. The effect
     // never runs (no failed run, no agent.turn.failed event).
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -6007,7 +6299,7 @@ fn dev_native_provider_unavailable_blocks_effect_recoverably() {
 workflow NativeProviderUnavailable
 
 agent worker {
-  provider pi
+  provider codex
   profile "repo-reader"
   capacity 1
 }
@@ -6025,17 +6317,17 @@ rule start_native_work
     let store_str = store_path.to_str().expect("utf-8 temp path");
     let output = Command::new(bin)
         .env(
-            "WHIPPLESCRIPT_PI_RPC_COMMAND",
-            "__whipplescript_missing_pi_rpc_command__",
+            "WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND",
+            "__whipplescript_missing_codex_command__",
         )
         .args([
             "--store",
             store_str,
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
-            "pi",
+            "codex",
             "--until",
             "idle",
         ])
@@ -6089,8 +6381,8 @@ rule start_native_work
             .as_array()
             .expect("runs array")
             .iter()
-            .any(|run| run.get("provider").and_then(Value::as_str) == Some("pi")),
-        "no pi run should start: {runs}"
+            .any(|run| run.get("provider").and_then(Value::as_str) == Some("codex")),
+        "no codex run should start: {runs}"
     );
     let log = run_json(bin, &["--store", store_str, "--json", "log", instance_id]);
     let events = log.as_array().expect("event array");
@@ -6168,7 +6460,7 @@ rule start_work
             "--store",
             store_str,
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -6252,7 +6544,7 @@ rule start_native_work
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "native-fixture",
@@ -6366,7 +6658,7 @@ fn dev_fixture_failure_reaches_event_stream() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -6445,188 +6737,6 @@ fn dev_fixture_failure_reaches_event_stream() {
 }
 
 #[test]
-fn dev_coerce_failure_releases_human_ask_dependency() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let workflow_path = temp_workflow_path("coerce-failure");
-    fs::write(
-        &workflow_path,
-        r#"
-workflow CoerceFailure
-
-class WorkItem {
-  title string
-  body string
-}
-
-class MessageClassification {
-  summary string
-  confidence float
-}
-
-coerce classifyMessage(title string, body string) -> MessageClassification {
-  prompt "Classify"
-}
-
-rule seed
-  when started
-=> {
-  record WorkItem {
-    title "One"
-    body "Two"
-  }
-}
-
-rule classify_request
-  when WorkItem as request
-=> {
-  coerce classifyMessage(request.title, request.body) as classification
-
-  after classification fails {
-    askHuman """
-    Failed to classify {{ request.title }}
-    """
-  }
-}
-"#,
-    )
-    .expect("workflow writes");
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "dev",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--fail",
-            "--until",
-            "idle",
-        ],
-    );
-    let workers = dev
-        .get("workers")
-        .and_then(Value::as_array)
-        .expect("workers");
-    assert_eq!(
-        dev.get("schema").and_then(Value::as_str),
-        Some("whipplescript.dev_report.v0")
-    );
-    assert_eq!(
-        workers
-            .iter()
-            .map(|worker| worker
-                .get("ran_effects")
-                .and_then(Value::as_u64)
-                .unwrap_or(0))
-            .collect::<Vec<_>>(),
-        vec![1, 1, 0]
-    );
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id");
-    let facts = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "facts",
-            instance_id,
-        ],
-    );
-    let facts = facts.as_array().expect("facts array");
-    assert!(facts
-        .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.failed")));
-    assert!(facts
-        .iter()
-        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("human.ask.created")));
-
-    let _ = fs::remove_file(store_path);
-    let _ = fs::remove_file(workflow_path);
-}
-
-#[test]
-fn dev_reports_human_prompt_content_type_in_assertion_effect_matches() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let workflow_path = temp_workflow_path("human-prompt-content-type");
-    fs::write(
-        &workflow_path,
-        r#"
-workflow HumanPromptContentType
-
-@acceptance
-assert count(effect kind human.ask where status == completed) == 1
-
-rule start
-  when started
-=> {
-  askHuman """application/json
-  {
-    "question": "Approve this release?"
-  }
-  """
-}
-"#,
-    )
-    .expect("workflow writes");
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "dev",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-            "--include-tag",
-            "acceptance",
-        ],
-    );
-    assert_eq!(
-        dev.pointer("/executable_spec/status")
-            .and_then(Value::as_str),
-        Some("passed")
-    );
-    let assertions = dev
-        .get("assertions")
-        .and_then(Value::as_array)
-        .expect("assertions");
-    assert_eq!(assertions.len(), 1);
-    assert_eq!(
-        assertions[0]
-            .pointer("/reads/0/kind")
-            .and_then(Value::as_str),
-        Some("effect")
-    );
-    assert_eq!(
-        assertions[0]
-            .pointer("/reads/0/head")
-            .and_then(Value::as_str),
-        Some("kind human.ask")
-    );
-    assert_eq!(
-        assertions[0]
-            .pointer("/reads/0/matches/0/prompt_content_type")
-            .and_then(Value::as_str),
-        Some("application/json")
-    );
-
-    let _ = fs::remove_file(store_path);
-    let _ = fs::remove_file(workflow_path);
-}
-
-#[test]
 fn dev_queue_claim_success_releases_agent_turn_dependency() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -6685,7 +6795,7 @@ rule start_item
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -6726,6 +6836,1409 @@ rule start_item
     assert!(facts
         .iter()
         .any(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.finish.completed")));
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// T3 end-to-end (spec/std-tracker.md "Renew/TTL semantics"): a workflow claims
+/// a ready issue WITH a `ttl` clause, then `renew`s the claim inside the
+/// succeeds branch. The `renew active` names the CLAIM binding, so it lowers to
+/// `tracker.renew` (not the coord `lease.renew`); the claim records a finite
+/// `expires_at` (claim TTL), and the renew heartbeat runs to a `renewed`
+/// outcome. Proves the whole surface: claim `ttl`, the binding-typed renew
+/// disambiguation, and the `tracker.renew` effect kind.
+#[test]
+fn tracker_claim_ttl_then_renew_runs_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("tracker-claim-ttl-renew");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow TrackerRenewTtl
+
+tracker backlog {
+  provider builtin
+}
+
+rule seed
+  when started
+=> {
+  file issue into backlog {
+    title "Fix it"
+    body "Please"
+  }
+}
+
+rule work
+  when backlog has ready issue as item
+=> {
+  claim item ttl 1h as active
+
+  after active succeeds {
+    renew active as renewed
+  }
+
+  after renewed succeeds {
+    finish item {
+      summary "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    let fact = |name: &str| {
+        facts
+            .iter()
+            .find(|fact| fact.get("name").and_then(Value::as_str) == Some(name))
+    };
+    // The claim ran with a finite TTL: its completed fact carries a non-null
+    // `expires_at` (claim TTL wired through input -> handler -> store).
+    let claim = fact("tracker.claim.completed").expect("claim completed");
+    assert!(
+        claim
+            .pointer("/value/value/expires_at")
+            .and_then(Value::as_str)
+            .is_some(),
+        "claim TTL records a finite expiry: {claim}"
+    );
+    // The renew lowered to `tracker.renew` (the disambiguation) and completed as
+    // a heartbeat renewal.
+    let renew = fact("tracker.renew.completed").expect("renew completed");
+    assert_eq!(
+        renew
+            .pointer("/value/value/renewed")
+            .and_then(Value::as_bool),
+        Some(true),
+        "the tracker.renew heartbeat renewed the claim: {renew}"
+    );
+    assert!(
+        fact("tracker.finish.completed").is_some(),
+        "the issue finished: {facts:?}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// Regression (manual ch. 18 build): `emit milestone` in a rule that ALSO
+/// requests an effect. The kernel's line scanner used to mint a bogus
+/// `event.emit` effect from the milestone statement whose positional node
+/// fallback collided with the real effect (same effect id, double insert,
+/// UNIQUE crash on the child's first commit). And a milestone-reached fact
+/// (status "completed") used to satisfy the `succeeds` predicate, firing the
+/// parent's success arm with a milestone payload. Both fixed: the child
+/// commits milestone + timer cleanly, the parent's `reaches` arm sees the
+/// milestone, and its `succeeds` arm binds the CHILD payload.
+#[test]
+fn milestone_beside_an_effect_commits_cleanly_and_never_satisfies_succeeds() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("milestone-effect");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Parent {
+  input task Task
+  output result ParentDone
+
+  class Task {
+    title string
+  }
+
+  class ParentDone {
+    note string
+  }
+
+  class SawStart {
+    detail string
+  }
+
+  rule orchestrate
+    when Task as task
+  => {
+    invoke Child { task { title task.title } } as child
+
+    after child reaches "work_started" as m {
+      record SawStart {
+        detail m.detail
+      }
+    }
+
+    after child succeeds as ok {
+      complete result {
+        note ok.summary
+      }
+    }
+
+    after child fails as bad {
+      complete result {
+        note bad.reason
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task ChildTask
+  output result ChildResult
+
+  class ChildTask {
+    title string
+  }
+
+  class Progress {
+    detail string
+  }
+
+  class ChildResult {
+    summary string
+  }
+
+  rule work
+    when ChildTask as t
+  => {
+    emit milestone "work_started" of Progress {
+      detail t.title
+    }
+    complete result {
+      summary t.title
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8"),
+            "--root",
+            "Parent",
+            "--input",
+            r#"{"task":{"title":"ship it"}}"#,
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run starts");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let status = run_json(bin, &["--store", store, "--json", "status", instance_id]);
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "parent completes: {status}"
+    );
+    let facts = run_json(bin, &["--store", store, "--json", "facts", instance_id]);
+    let facts = facts.as_array().expect("facts array");
+    assert!(
+        facts
+            .iter()
+            .any(|fact| fact.get("name").and_then(Value::as_str) == Some("SawStart")),
+        "the reaches arm observed the milestone: {facts:?}"
+    );
+    // The success arm bound the CHILD payload (summary), not the milestone
+    // payload — the terminal payload note carries it.
+    let log = run_json(bin, &["--store", store, "--json", "log", instance_id]);
+    let note = log
+        .as_array()
+        .expect("log array")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.completed"))
+        .and_then(|event| {
+            event
+                .pointer("/payload/payload/note")
+                .and_then(Value::as_str)
+        });
+    assert_eq!(note, Some("ship it"), "succeeds bound the child payload");
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// DR-0043 slice 5 (`whip progression cancel`): the surgical operator verb —
+/// the firing's pending effect is cancelled, a durable
+/// `progression.cancelled` closure removes the firing from the open set (no
+/// re-admission on later passes, live match or recorded), the lapse arm does
+/// NOT run, and the instance keeps running.
+#[test]
+fn progression_cancel_closes_one_firing_without_killing_the_instance() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("progression-cancel");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Slow
+
+output result Done
+
+class Job {
+  id string
+}
+
+class Done {
+  note string
+}
+
+table jobs as Job [
+  {
+    id "j-1"
+  }
+]
+
+rule work
+  when Job as j
+=> {
+  timer 60s as t
+
+  after t completes {
+    complete result {
+      note j.id
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run starts");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let progressions = run_json(
+        bin,
+        &["--store", store, "--json", "progressions", &instance_id],
+    );
+    let firing_id = progressions
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.get("rule").and_then(Value::as_str) == Some("work"))
+        .and_then(|row| row.get("firing_id").and_then(Value::as_str))
+        .expect("work firing listed")
+        .to_owned();
+
+    let cancel = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "progression",
+            "cancel",
+            &instance_id,
+            &firing_id,
+            "--reason",
+            "operator says stop",
+        ])
+        .output()
+        .expect("cancel runs");
+    assert!(
+        cancel.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+
+    // Drive: nothing may re-admit the firing or re-request its timer.
+    for _ in 0..2 {
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "worker",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+    }
+
+    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("running"),
+        "the instance keeps running — this is whip cancel one level down: {status}"
+    );
+    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let timers: Vec<&str> = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+        .filter_map(|effect| effect.get("status").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        timers,
+        vec!["cancelled"],
+        "exactly one timer, cancelled, never re-requested"
+    );
+    let after = run_json(
+        bin,
+        &["--store", store, "--json", "progressions", &instance_id],
+    );
+    let state = after
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.get("firing_id").and_then(Value::as_str) == Some(firing_id.as_str()))
+        .and_then(|row| row.get("state").and_then(Value::as_str));
+    assert_eq!(
+        state,
+        Some("cancelled"),
+        "the view reads cancelled: {after}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// DR-0043 slice 4 (`during`/`until` regions), the full lapse lifecycle: an
+/// Incident lands while the region's first step is settled and its second is
+/// in flight — the lapse commits ONCE (durable `progression.region.lapsed`
+/// fact), the pinned progress view carries exactly the settled step, the
+/// in-flight step is cancelled, and the arm's typed `fail` ends the instance.
+#[test]
+fn region_lapses_once_cancels_in_flight_and_pins_the_progress_view() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("region-lapse");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Deploy
+
+output result Done
+failure error Halted
+
+class Incident {
+  sev string
+}
+
+class Done {
+  note string
+}
+
+class Halted {
+  reason string
+}
+
+rule trouble
+  when started
+=> {
+  timer 4s as spark
+
+  after spark completes {
+    record Incident {
+      sev "sev1"
+    }
+  }
+}
+
+rule ship
+  when started
+=> {
+  until exists(Incident where sev == "sev1") {
+    then plan <- timer 1s
+    then approved <- timer 30s
+    complete result {
+      note "shipped"
+    }
+  } on lapse as got {
+    fail error {
+      reason got.steps.approved
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run starts");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Phase 1: let plan (1s) settle BEFORE the incident (4s) and drive, so
+    // the region requests its 30s second step — the in-flight work the lapse
+    // must cancel.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    for _ in 0..2 {
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "worker",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+    }
+    // Phase 2: the incident lands while the 30s `approved` timer is still in
+    // flight — no step can advance, and the region lapses anyway on the next
+    // pass. That mid-effect lapse is the point of a region (DR-0043 Dec. 5).
+    std::thread::sleep(std::time::Duration::from_millis(3200));
+    for _ in 0..3 {
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "worker",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8"),
+            ])
+            .output();
+    }
+
+    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("failed"),
+        "the arm's typed fail ends the instance: {status}"
+    );
+    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let facts = facts.as_array().expect("facts array");
+    let lapses: Vec<&Value> = facts
+        .iter()
+        .filter(|fact| {
+            fact.get("name").and_then(Value::as_str) == Some("progression.region.lapsed")
+        })
+        .collect();
+    assert_eq!(lapses.len(), 1, "the lapse commits exactly once: {facts:?}");
+    let got = lapses[0].pointer("/value/got").expect("pinned view");
+    assert!(
+        got.get("plan").is_some(),
+        "the settled step is in the pinned view: {got}"
+    );
+    assert!(
+        got.get("approved").is_none(),
+        "the in-flight step is NOT in the pinned view: {got}"
+    );
+    // DR-0043 Decision 6: absence from `got` is ambiguous, so the fact also
+    // pins a per-step status map — the audit answer to "did that step fail, or
+    // never run?" without widening the arm binding's type.
+    let steps = lapses[0].pointer("/value/steps").expect("step statuses");
+    assert_eq!(
+        steps.get("plan").and_then(Value::as_str),
+        Some("completed"),
+        "the settled step reports its ledger status: {steps}"
+    );
+    assert_eq!(
+        steps.get("approved").and_then(Value::as_str),
+        Some("cancelled_by_lapse"),
+        "the in-flight step is attributed to THIS lapse commit: {steps}"
+    );
+    // …and the arm READS them: this arm's `fail error { reason
+    // got.steps.approved }` carries the status into the typed failure, so the
+    // statuses reach the language surface, not only the audit record.
+    assert_eq!(
+        status
+            .pointer("/workflow_terminal/payload/reason")
+            .and_then(Value::as_str),
+        Some("cancelled_by_lapse"),
+        "the arm reads `got.steps.<step>` at runtime: {status}"
+    );
+    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let cancelled = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .filter(|effect| {
+            effect.get("kind").and_then(Value::as_str) == Some("timer.wait")
+                && (effect.get("status").and_then(Value::as_str) == Some("cancelled")
+                    || effect
+                        .get("cancel_requested")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false))
+        })
+        .count();
+    assert!(
+        cancelled >= 1,
+        "the in-flight region step is cancelled at lapse: {effects}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// DR-0043 slice 3 (old-body completion): a firing admitted under version A
+/// completes under A's rule body even after the instance is revised to
+/// version B mid-progression — the firing owns its bindings AND its code.
+/// The continuation records v1's payload, not v2's, and the timer is never
+/// re-keyed (exactly one effect).
+#[test]
+fn revised_instance_completes_open_firing_under_the_admitting_body() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("old-body-v1");
+    let v2 = temp_workflow_path("old-body-v2");
+    let program = |body: &str| {
+        format!(
+            r#"
+workflow Rev
+
+output result Done
+
+class Job {{
+  id string
+}}
+
+class Outcome {{
+  job string
+  body string
+}}
+
+class Done {{
+  note string
+}}
+
+table jobs as Job [
+  {{
+    id "j-1"
+  }}
+]
+
+rule work
+  when Job as j
+=> {{
+  timer 2s as t
+
+  after t completes {{
+    record Outcome {{
+      job j.id
+      body "{body}"
+    }}
+  }}
+}}
+
+rule finish
+  when Outcome as o
+=> {{
+  complete result {{
+    note o.body
+  }}
+}}
+"#
+        )
+    };
+    fs::write(&v1, program("v1")).expect("v1 writes");
+    fs::write(&v2, program("v2")).expect("v2 writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            v1.to_str().expect("utf-8"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run v1");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // Revise to v2 while the timer is still pending (keep policy).
+    let revised = Command::new(bin)
+        .args([
+            "--store",
+            store,
+            "revise",
+            &instance_id,
+            v2.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("revise runs");
+    assert!(
+        revised.status.success(),
+        "revise failed: {}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    for _ in 0..3 {
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "worker",
+                &instance_id,
+                "--program",
+                v2.to_str().expect("utf-8"),
+            ])
+            .output();
+        let _ = Command::new(bin)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                v2.to_str().expect("utf-8"),
+            ])
+            .output();
+    }
+
+    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "the old firing completes after the revision: {status}"
+    );
+    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let outcome = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("Outcome"))
+        .expect("outcome recorded");
+    assert_eq!(
+        outcome.pointer("/value/body").and_then(Value::as_str),
+        Some("v1"),
+        "the continuation ran under the ADMITTING body, not the revised one: {outcome}"
+    );
+    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let timers = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+        .count();
+    assert_eq!(
+        timers, 1,
+        "the revision never re-keys the old firing's effect"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(v1);
+    let _ = fs::remove_file(v2);
+}
+
+/// DR-0043 slice 2 (bindings-as-values): a firing whose trigger fact is
+/// CONSUMED by a sibling rule still completes its continuations from the
+/// recorded context — and the effect is never re-requested (key stability:
+/// exactly one timer). Before pinning, `slow_path`'s continuation silently
+/// evaporated when `fast_path` consumed the shared trigger.
+#[test]
+fn pinned_firing_completes_after_trigger_consumption() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("pinned-consumed-trigger");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Consumed
+
+output result Done
+
+class Job {
+  id string
+}
+
+class Taken {
+  id string
+}
+
+class Worked {
+  id string
+}
+
+class Done {
+  note string
+}
+
+table jobs as Job [
+  {
+    id "j-1"
+  }
+]
+
+rule slow_path
+  when Job as j
+=> {
+  timer 1s as t
+
+  after t completes {
+    record Worked {
+      id j.id
+    }
+  }
+}
+
+rule fast_path
+  when Job as j
+=> {
+  done j -> record Taken {
+    id j.id
+  }
+}
+
+rule finish
+  when Worked as w
+  when Taken as k
+=> {
+  complete result {
+    note "both paths ran"
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+            "--wait",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "the join over both paths completes: {status}"
+    );
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    assert!(
+        facts
+            .iter()
+            .any(|fact| fact.get("name").and_then(Value::as_str) == Some("Worked")),
+        "the pinned continuation recorded Worked after its trigger was consumed: {facts:?}"
+    );
+    let effects = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "effects",
+            instance_id,
+        ],
+    );
+    let timers = effects
+        .as_array()
+        .expect("effects array")
+        .iter()
+        .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+        .count();
+    assert_eq!(
+        timers, 1,
+        "pinned re-lowering derives byte-identical effect keys — never a re-request"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// DR-0043 slice 2 (the ch. 15 defect, dead): a firing triggered by a ready-
+/// issue PROJECTION whose own `finish` retracts it still runs the rest of its
+/// continuation — `done` + the terminal — from the recorded context. This is
+/// the exact straight-line shape that used to strand the instance running
+/// forever, one step from done.
+#[test]
+fn pinned_firing_survives_its_own_projection_retraction() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("pinned-projection-retraction");
+    fs::write(
+        &workflow_path,
+        r#"
+use std.tracker
+
+workflow Relaunch
+
+output result Done
+failure error Rejected
+
+class Pending {
+  request string
+}
+
+class Done {
+  note string
+}
+
+class Rejected {
+  reason string
+}
+
+tracker approvals
+tracker answers
+
+rule ask
+  when started
+=> {
+  then req <- file issue into approvals {
+    title "Approve the relaunch?"
+    body "Answer via the answers tracker."
+  }
+  record Pending {
+    request req.id
+  }
+}
+
+rule approved
+  when Pending as p
+  when answers has ready issue as a where a.body == p.request && a.title == "approve"
+=> {
+  claim a as hold
+
+  after hold succeeds {
+    then closed <- finish a {
+      summary "applied"
+    }
+    done p
+    complete result {
+      note "relaunch approved"
+    }
+  }
+
+  after hold fails {
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store,
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The human answers: a new ready issue whose body carries the request id.
+    let question = run_json(
+        bin,
+        &["--store", store, "--json", "progressions", &instance_id],
+    );
+    assert!(question.as_array().is_some_and(|rows| !rows.is_empty()));
+    let filed = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "issue",
+            "new",
+            "--tracker",
+            "answers",
+            "--title",
+            "approve",
+            "--body",
+            "WS-1",
+        ])
+        .output()
+        .expect("issue new runs");
+    assert!(filed.status.success());
+
+    // Drive: claim -> finish (retracts the trigger projection) -> the pinned
+    // continuation's done + complete.
+    for _ in 0..5 {
+        let _ = Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args([
+                "--store",
+                store,
+                "worker",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8 workflow path"),
+            ])
+            .output();
+        let _ = Command::new(bin)
+            .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                workflow_path.to_str().expect("utf-8 workflow path"),
+            ])
+            .output();
+    }
+    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "the straight-line chain completes under pinning: {status}"
+    );
+    let items = tracker_items(bin, &items_path);
+    assert!(
+        items
+            .iter()
+            .any(|item| { item.get("status").and_then(Value::as_str) == Some("closed") }),
+        "the answer was finished before the terminal: {items:?}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// DR-0043 slice 1: every rule commit embeds the firing's pinned context
+/// (identity + bound trigger values) in the `rule.committed` payload, and
+/// `whip progressions --json` folds those commits into the open-firing view:
+/// firings grouped by (rule, identity), trigger bindings readable, per-firing
+/// effect statuses, and a terminal-closed state.
+#[test]
+fn rule_commits_embed_pinned_context_and_progressions_lists_firings() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("pinned-context-progressions");
+    fs::write(
+        &workflow_path,
+        r#"
+workflow Pinned
+
+output result Done
+
+class Job {
+  id string
+}
+
+class Done {
+  note string
+}
+
+table jobs as Job [
+  {
+    id "j-1"
+  }
+]
+
+rule work
+  when Job as j
+=> {
+  timer 1s as t
+
+  after t completes {
+    complete result {
+      note j.id
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--until",
+            "idle",
+            "--wait",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    // The rule.committed payload carries the pinned context: identity plus
+    // the bound Job fact with its full value.
+    let log = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "log",
+            instance_id,
+        ],
+    );
+    let commit = log
+        .as_array()
+        .expect("log array")
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("rule.committed")
+                && event.pointer("/payload/rule").and_then(Value::as_str) == Some("work")
+        })
+        .expect("work commit present");
+    assert!(
+        commit
+            .pointer("/payload/context/identity")
+            .and_then(Value::as_str)
+            .is_some(),
+        "commit embeds the firing identity: {commit}"
+    );
+    assert_eq!(
+        commit
+            .pointer("/payload/context/bindings/0/binding")
+            .and_then(Value::as_str),
+        Some("j"),
+        "commit embeds the bound trigger name: {commit}"
+    );
+    assert_eq!(
+        commit
+            .pointer("/payload/context/bindings/0/value/id")
+            .and_then(Value::as_str),
+        Some("j-1"),
+        "commit embeds the bound trigger VALUE: {commit}"
+    );
+
+    // The progressions view folds commits into firings.
+    let progressions = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "progressions",
+            instance_id,
+        ],
+    );
+    let rows = progressions.as_array().expect("progressions array");
+    let work = rows
+        .iter()
+        .find(|row| row.get("rule").and_then(Value::as_str) == Some("work"))
+        .expect("work firing listed");
+    assert!(
+        work.get("firing_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("fir_")),
+        "firing id printable: {work}"
+    );
+    assert_eq!(
+        work.get("state").and_then(Value::as_str),
+        Some("closed(terminal)"),
+        "completed firing reads closed: {work}"
+    );
+    assert_eq!(
+        work.pointer("/effects/0/kind").and_then(Value::as_str),
+        Some("timer.wait"),
+        "firing lists its effect with status: {work}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// Regression (manual ch. 15 build): a NESTED continuation chain — `claim` ->
+/// `tell` inside `after claim succeeds` -> `finish` inside `after turn
+/// succeeds` (exactly what `then` desugars to, and what
+/// examples/queue-worker-with-review.whip hand-writes) — must request the
+/// depth-2 `finish` and serialize its payload AFTER the turn alias exists.
+/// Two kernel bugs hid here: the bindingless `finish` resolved to the WRONG
+/// metadata node via a subset-local index (its effect id collided with the
+/// tell's and was silently dropped, stranding the issue `in_progress`
+/// forever), and when un-dropped its input froze before `outcome` was bound,
+/// leaking `{"internal":"Missing"}` into the durable payload.
+#[test]
+fn nested_after_chain_finishes_claimed_issue_with_turn_summary() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("tracker-nested-chain");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow TrackerNestedChain
+
+tracker backlog {
+  provider builtin
+}
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule seed
+  when started
+=> {
+  file issue into backlog {
+    title "Fix it"
+    body "Please"
+  }
+}
+
+rule work
+  when backlog has ready issue as item
+  when worker is available
+=> {
+  claim item as lease
+
+  after lease succeeds {
+    tell worker as turn """
+    Implement {{ item.title }}
+    """
+
+    after turn succeeds as outcome {
+      finish item {
+        summary outcome.summary
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("dev json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    let finish = facts
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.finish.completed"))
+        .expect("the depth-2 finish ran (it used to be silently dropped)");
+    let summary = finish
+        .pointer("/value/value/summary")
+        .expect("finish payload carries the summary field");
+    assert!(
+        summary.as_str().is_some_and(|value| !value.is_empty()),
+        "the summary must be the turn's resolved string, not an unresolved sentinel: {finish}"
+    );
+    let items = tracker_items(bin, &items_path);
+    assert!(
+        items
+            .iter()
+            .any(|item| { item.get("status").and_then(Value::as_str) == Some("closed") }),
+        "the claimed issue closed: {items:?}"
+    );
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(items_path);
@@ -6797,7 +8310,7 @@ rule grab
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -6934,7 +8447,7 @@ rule grab
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7057,7 +8570,7 @@ fn issue_cli_lifecycle() {
         "--json",
         "issue",
         "new",
-        "--queue",
+        "--tracker",
         "backlog",
         "--title",
         "fix login",
@@ -7135,10 +8648,22 @@ fn issue_cli_dep_add_gates_readiness() {
     };
 
     let blocker = issue_json(run(&[
-        "--json", "issue", "new", "--queue", "backlog", "--title", "blocker",
+        "--json",
+        "issue",
+        "new",
+        "--tracker",
+        "backlog",
+        "--title",
+        "blocker",
     ]));
     let blocked = issue_json(run(&[
-        "--json", "issue", "new", "--queue", "backlog", "--title", "blocked",
+        "--json",
+        "issue",
+        "new",
+        "--tracker",
+        "backlog",
+        "--title",
+        "blocked",
     ]));
     let blocker_id = blocker["id"].as_str().expect("blocker id").to_owned();
     let blocked_id = blocked["id"].as_str().expect("blocked id").to_owned();
@@ -7172,125 +8697,6 @@ fn issue_cli_dep_add_gates_readiness() {
     assert_eq!(freed[0]["id"], blocked["id"]);
 
     let _ = fs::remove_file(&items_path);
-}
-
-/// Holder-lifetime cleanup of pending human asks on cancel: a cancelled
-/// instance's `pending` inbox item is moot, so it must leave the inbox and
-/// become unanswerable — otherwise an operator could waste a decision on a dead
-/// instance. Regression for the bug where cancel left the ask `pending` and
-/// still answerable.
-#[test]
-fn cancel_retires_pending_human_asks() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let example = example_path("human-review.whip");
-
-    // Drive to idle: the workflow issues a human ask and waits, so one inbox
-    // item is pending.
-    let dev_output = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "dev",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ])
-        .output()
-        .expect("dev runs");
-    assert!(
-        dev_output.status.success(),
-        "dev failed: {}",
-        String::from_utf8_lossy(&dev_output.stderr)
-    );
-    let dev_stdout = String::from_utf8_lossy(&dev_output.stdout);
-    let dev: Value = serde_json::from_str(&dev_stdout[dev_stdout.find('{').expect("dev json")..])
-        .expect("dev json");
-    let instance_id = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-
-    let pending = pending_inbox(bin, &store_path);
-    assert_eq!(
-        pending.len(),
-        1,
-        "expected one pending ask, got {pending:?}"
-    );
-    let item_id = pending[0]
-        .get("inbox_item_id")
-        .and_then(Value::as_str)
-        .expect("inbox item id")
-        .to_owned();
-
-    let cancel = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "cancel",
-            &instance_id,
-        ])
-        .output()
-        .expect("cancel runs");
-    assert!(
-        cancel.status.success(),
-        "cancel failed: {}",
-        String::from_utf8_lossy(&cancel.stderr)
-    );
-
-    assert!(
-        pending_inbox(bin, &store_path).is_empty(),
-        "cancel must retire the dead instance's pending asks"
-    );
-
-    // The ask is no longer answerable — answering a cancelled instance's ask
-    // must fail rather than wasting a human decision on a dead instance.
-    let answer = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "inbox",
-            "answer",
-            &item_id,
-            "--choice",
-            "accept",
-        ])
-        .output()
-        .expect("answer runs");
-    assert!(
-        !answer.status.success(),
-        "answering a cancelled instance's ask must fail"
-    );
-
-    let _ = fs::remove_file(store_path);
-}
-
-/// Read pending human asks via `whip --json inbox` (run store).
-fn pending_inbox(bin: &str, store_path: &Path) -> Vec<Value> {
-    let output = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "inbox",
-        ])
-        .output()
-        .expect("inbox runs");
-    assert!(
-        output.status.success(),
-        "inbox failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8(output.stdout).expect("inbox stdout is utf-8");
-    serde_json::from_str::<Value>(&text)
-        .expect("inbox json")
-        .as_array()
-        .expect("inbox json array")
-        .clone()
 }
 
 /// A failing child invocation must drive the parent's `after child fails`
@@ -7361,7 +8767,7 @@ workflow Child {
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -7484,7 +8890,7 @@ rule route
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7578,7 +8984,7 @@ rule route
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7684,7 +9090,7 @@ rule j
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7774,7 +9180,7 @@ rule d
             "--store",
             store_path.to_str().expect("utf-8 store path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7873,7 +9279,7 @@ rule classify_request
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -7939,6 +9345,10 @@ workflow CapabilityCall
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class WorkItem {
   title string
 }
@@ -7979,7 +9389,7 @@ rule recall_before_work
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -8048,7 +9458,7 @@ fn memory_roundtrip_recalls_the_learned_item() {
             "--store",
             store_path.to_str().expect("utf-8 store"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow"),
             "--provider",
             "fixture",
@@ -8156,7 +9566,7 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
             "--store",
             store_path.to_str().expect("utf-8 store"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow"),
             "--provider",
             "fixture",
@@ -8266,7 +9676,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
             "--store",
             store_path.to_str().expect("utf-8 store"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow"),
             "--provider",
             "fixture",
@@ -8350,7 +9760,7 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
             "--store",
             store_path.to_str().expect("utf-8 store"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow"),
             "--provider",
             "fixture",
@@ -8443,6 +9853,44 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         notes,
         vec!["distinct", "dup"],
         "the surviving entries are one `dup` (the deduped duplicate) and the `distinct` one"
+    );
+
+    // The operator read surface (MEM-3): `whip memory pools|entries` lists
+    // the same store the provider wrote.
+    let pools = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "memory",
+            "pools",
+        ],
+    );
+    let pools = pools.as_array().expect("pools array");
+    assert_eq!(
+        pools
+            .iter()
+            .find(|pool| pool.get("pool").and_then(Value::as_str) == Some("project_memory"))
+            .and_then(|pool| pool.get("entries").and_then(Value::as_u64)),
+        Some(2),
+        "whip memory pools reports the deduped pool"
+    );
+    let entries = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 store"),
+            "--json",
+            "memory",
+            "entries",
+            "project_memory",
+        ],
+    );
+    assert_eq!(
+        entries.as_array().map(Vec::len),
+        Some(2),
+        "whip memory entries lists the surviving rows"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -9205,7 +10653,7 @@ rule done_now
             "--store",
             store_str,
             "--json",
-            "dev",
+            "run",
             wf.to_str().expect("present"),
             "--provider",
             "fixture",
@@ -9449,10 +10897,12 @@ signal heartbeat.tick {
   observed_at time
   occurrence_id string
   missed_count int
+  schedule_name string
 }
 
 class Beat {
   id string
+  schedule string
 }
 
 source clock as beat {
@@ -9465,6 +10915,7 @@ source clock as beat {
     observed_at tick.observed_at
     occurrence_id tick.occurrence_id
     missed_count tick.missed_count
+    schedule_name tick.schedule_name
   }
 }
 
@@ -9473,6 +10924,7 @@ rule on_beat
 => {
   record Beat {
     id tick.occurrence_id
+    schedule tick.schedule_name
   }
 }
 
@@ -9482,6 +10934,7 @@ test "interval clock fires when due" {
   run until idle
   expect rule on_beat fired
   expect Beat count where id != "" is 1
+  expect Beat count where schedule == "beat" is 1
 }
 
 test "interval clock holds before the first tick" {
@@ -9654,11 +11107,11 @@ class Ticket {
 }
 
 coerce assessUsed(title string) -> R {
-  client "X"
+  prompt "Assess"
 }
 
 coerce assessDead(title string) -> R {
-  client "X"
+  prompt "Assess"
 }
 
 rule run
@@ -9704,6 +11157,733 @@ rule run
 }
 
 #[test]
+fn lint_advises_std_coercion_import_for_coerce_programs() {
+    // spec/std-coercion.md "Manifest": import bite is an ADVISORY
+    // missing-import lint only — `coerce` without `use std.coercion` warns
+    // (exit 0), and the same program with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-coercion-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow CoercionImport
+
+output result R
+
+class R {{
+  ok bool
+}}
+
+class Ticket {{
+  title string
+}}
+
+coerce assess(title string) -> R {{
+  prompt "Assess"
+}}
+
+rule run
+  when Ticket as t
+=> {{
+  coerce assess(t.title) as a
+  after a succeeds as outcome {{
+    complete result {{
+      ok outcome.ok
+    }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.coercion\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_coercion_import".to_owned()),
+        "coerce without `use std.coercion` fires the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_coercion_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_coord_import_for_coordination_programs() {
+    // spec/std-coord.md "Manifest": import bite is an ADVISORY missing-import
+    // lint only (the M5 graduated ladder) — coordination verbs without
+    // `use std.coord` warn (exit 0), and the same program with the import is
+    // clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-coord-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow CoordImport
+
+output result Done
+failure error Busy
+
+class Ticket {{
+  id string
+}}
+
+class Done {{
+  note string
+}}
+
+class Busy {{
+  reason string
+}}
+
+lease deploy_slot {{
+  key Ticket
+  slots 1
+  ttl 60s
+}}
+
+rule seed
+  when started
+=> {{
+  record Ticket {{ id "prod" }}
+}}
+
+rule go
+  when Ticket as t
+=> {{
+  acquire deploy_slot for t.id until ttl as slot
+
+  after slot held {{
+    release slot
+    complete result {{ note "ok" }}
+  }}
+
+  after slot contended {{
+    fail error {{ reason "busy" }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.coord\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_coord_import".to_owned()),
+        "coordination verbs without `use std.coord` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_coord_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_files_import_for_file_programs() {
+    // spec/std-files.md "Manifest": import posture is an ADVISORY
+    // missing-import lint only (the M5 graduated ladder; the hard `use
+    // std.files` requirement is explicitly deferred) — file stores and verbs
+    // without `use std.files` warn (exit 0), and the same program with the
+    // import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-files-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow FilesImport
+
+output result Done
+
+class Done {{
+  note string
+}}
+
+file store docs {{
+  root "fixtures"
+  allow read ["**/*.md"]
+}}
+
+rule seed
+  when started
+=> {{
+  read text from docs at "note.md" as body
+
+  after body succeeds as file {{
+    complete result {{ note file.content }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.files\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_files_import".to_owned()),
+        "file verbs without `use std.files` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_files_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_tracker_import_for_tracker_programs() {
+    // spec/std-tracker.md "Manifest": import bite per E5 is an ADVISORY
+    // missing-import lint only (the M5 graduated ladder; the hard `use
+    // std.tracker` requirement is explicitly deferred) — tracker declarations
+    // and verbs without `use std.tracker` warn (exit 0), and the same program
+    // with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-tracker-import");
+    let program = |import: &str| {
+        format!(
+            r#"{import}workflow TrackerImport
+
+output result Done
+failure error Busy
+
+class Done {{
+  note string
+}}
+
+class Busy {{
+  reason string
+}}
+
+tracker backlog {{
+  provider builtin
+}}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+=> {{
+  claim issue as active_claim
+
+  after active_claim succeeds {{
+    finish issue {{
+      summary "done"
+    }}
+    complete result {{ note "ok" }}
+  }}
+
+  after active_claim fails {{
+    release issue
+    fail error {{ reason "busy" }}
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.tracker\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_tracker_import".to_owned()),
+        "tracker verbs without `use std.tracker` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_tracker_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lint_advises_std_ingress_import_for_signal_programs() {
+    // spec/std-ingress.md "Static checks" #2, M5 graduated ladder: the
+    // provider-kind-known check is HARD, but the `use std.ingress` import
+    // line itself is an ADVISORY missing-import lint only — signal
+    // declarations / external sources without the import warn (exit 0), and
+    // the same program with the import is clean.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-ingress-import");
+    fs::create_dir_all(&dir).expect("create dir");
+    let program = |import: &str| {
+        format!(
+            r#"{import}@service
+workflow IngressImport
+
+signal deploy.finished {{
+  service string
+}}
+
+class Seen {{
+  service string
+}}
+
+rule react
+  when deploy.finished as f
+=> {{
+  record Seen {{
+    service f.service
+  }}
+}}
+"#
+        )
+    };
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, program("")).expect("write workflow");
+    fs::write(&with, program("use std.ingress\n\n")).expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_ingress_import".to_owned()),
+        "signal declarations without `use std.ingress` fire the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_ingress_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Provider-kind-known HARD check (spec/std-ingress.md "Static checks" #2):
+/// a `source <kind> as …` header whose kind no embedded/locked manifest
+/// contributes is a `whip check` error naming the known kinds; the shipped
+/// kinds (clock via std.time, cli/stdio/file/http via std.ingress) stay
+/// green. Before embedded manifests, any bare ident was silently accepted
+/// and the source never resolved.
+#[test]
+fn check_rejects_unknown_source_provider_kind() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("source-kind-known");
+    fs::create_dir_all(&dir).expect("create dir");
+    let program = |kind: &str, clause: &str| {
+        format!(
+            r#"use std.ingress
+
+@service
+workflow SourceKind
+
+signal ingress.fed {{
+  text string
+}}
+
+class Seen {{
+  text string
+}}
+
+source {kind} as feed {{
+{clause}
+  observe as obs
+  emit ingress.fed {{
+    text "fixed"
+  }}
+}}
+
+rule react
+  when ingress.fed as f
+=> {{
+  record Seen {{
+    text f.text
+  }}
+}}
+"#
+        )
+    };
+    let unknown = dir.join("unknown-kind.whip");
+    fs::write(&unknown, program("webhook", "")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unknown.to_str().expect("utf-8")])
+        .output()
+        .expect("whip check runs");
+    assert!(
+        !output.status.success(),
+        "an unknown source provider kind must fail `whip check`"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown provider kind `webhook`") && stderr.contains("known source kinds"),
+        "stderr: {stderr}"
+    );
+
+    let known = dir.join("known-kind.whip");
+    fs::write(&known, program("file", "  path \"./inbox.txt\"\n")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", known.to_str().expect("utf-8")])
+        .output()
+        .expect("whip check runs");
+    assert!(
+        output.status.success(),
+        "a manifest-contributed kind checks clean: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// One agent workflow body, parameterized on the provider kind and leading
+/// imports (spec/std-agent.md "Open provider registry" tests).
+fn agent_provider_workflow(imports: &str, kind: &str) -> String {
+    format!(
+        r#"workflow ProviderRegistry
+
+{imports}output result Done
+
+class Done {{
+  agent string
+}}
+
+agent helper {{
+  provider {kind}
+  profile "repo-reader"
+  capacity 1
+}}
+
+rule start
+  when started
+=> {{
+  tell helper "hi"
+}}
+
+rule done
+  when helper completed turn as turn
+=> {{
+  complete result {{
+    agent turn.agent
+  }}
+}}
+"#
+    )
+}
+
+/// Open provider registry (spec/std-agent.md slice 3): agent provider kinds
+/// are registry-derived, not compiled in. A kind contributed by an embedded
+/// std manifest validates; a kind contributed by NO known manifest is a check
+/// error naming a missing package; a fixture third-party manifest contributing
+/// the kind via the package lock makes the same workflow validate.
+#[test]
+fn agent_provider_kinds_are_registry_derived() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-provider-registry");
+    fs::create_dir_all(&dir).expect("create temp dir");
+
+    // Embedded contribution: `fixture` comes from std.agent's manifest rows.
+    let known = dir.join("known.whip");
+    fs::write(&known, agent_provider_workflow("", "fixture")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", known.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "embedded std.agent must contribute `fixture`\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Unknown kind: contributed by no known manifest — error naming a missing
+    // package.
+    let unknown = dir.join("unknown.whip");
+    fs::write(&unknown, agent_provider_workflow("", "robo")).expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unknown.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        !output.status.success(),
+        "an unknown provider kind must fail check"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown provider kind `robo`") && stderr.contains("missing package"),
+        "the error names the unknown kind and the missing package: {stderr}"
+    );
+
+    // Fixture third-party contribution: a locked manifest's operator-plane
+    // `"agent_provider": true` row makes the SAME workflow validate.
+    let manifest = dir.join("robo.json");
+    fs::write(
+        &manifest,
+        r#"{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "acme.robo",
+  "name": "robopkg",
+  "version": "0.1.0",
+  "libraries": [{"id": "robopkg", "version": "0.1.0"}],
+  "capabilities": [],
+  "providers": [
+    {"id": "robo", "provider_kind": "robo", "plane": "operator",
+     "config": {"agent_provider": true}}
+  ]
+}"#,
+    )
+    .expect("write manifest");
+    let lock = dir.join("whip.lock");
+    run_text(
+        bin,
+        &[
+            "package",
+            "lock",
+            "--output",
+            lock.to_str().expect("utf-8 lock"),
+            manifest.to_str().expect("utf-8 manifest"),
+        ],
+    );
+    let output = Command::new(bin)
+        .args([
+            "check",
+            "--package-lock",
+            lock.to_str().expect("utf-8 lock"),
+            unknown.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "a locked manifest contributing `robo` must validate the workflow\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `requires [<feature.class>]` vs the provider's feature report
+/// (spec/std-agent.md slice 6): a class the selected provider's report cannot
+/// state as supported is a check ERROR; the owned harness's all-native report
+/// satisfies any taxonomy class.
+#[test]
+fn agent_requires_validates_against_provider_feature_report() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-requires-report");
+    fs::create_dir_all(&dir).expect("create temp dir");
+
+    // fixture's deterministic report states session.resume unsupported.
+    let unsupported = dir.join("unsupported.whip");
+    fs::write(
+        &unsupported,
+        agent_provider_workflow("", "fixture").replace(
+            "  profile \"repo-reader\"",
+            "  profile \"repo-reader\"\n  requires [session.resume]",
+        ),
+    )
+    .expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", unsupported.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(!output.status.success(), "unreportable class must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires feature class `session.resume`")
+            && stderr.contains("`unsupported`"),
+        "the error names the class and the stated support: {stderr}"
+    );
+
+    // owned states every class native, so the same requirement passes.
+    let satisfied = dir.join("satisfied.whip");
+    fs::write(
+        &satisfied,
+        agent_provider_workflow("", "owned").replace(
+            "  profile \"repo-reader\"",
+            "  profile \"repo-reader\"\n  requires [session.resume, turn.cancel]",
+        ),
+    )
+    .expect("write workflow");
+    let output = Command::new(bin)
+        .args(["check", satisfied.to_str().expect("utf-8")])
+        .output()
+        .expect("check runs");
+    assert!(
+        output.status.success(),
+        "owned's all-native report satisfies the requirement\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The M5 ladder's middle rung (spec/std-agent.md "Open provider registry"):
+/// a kind contributed by a known embedded package that is not imported is
+/// valid but draws the `lint.missing_agent_import` advisory; the import
+/// silences it.
+#[test]
+fn lint_missing_agent_import_is_advisory_only() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("agent-import-lint");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let without = dir.join("without-import.whip");
+    let with = dir.join("with-import.whip");
+    fs::write(&without, agent_provider_workflow("", "fixture")).expect("write workflow");
+    fs::write(
+        &with,
+        agent_provider_workflow("use std.agent\n\n", "fixture"),
+    )
+    .expect("write workflow");
+    let codes = |path: &Path| -> Vec<String> {
+        let output = Command::new(bin)
+            .args(["--json", "lint", path.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "advisory lint must exit 0");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint report JSON");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        codes(&without).contains(&"lint.missing_agent_import".to_owned()),
+        "a provider kind without its contributing import fires the advisory"
+    );
+    assert!(
+        !codes(&with).contains(&"lint.missing_agent_import".to_owned()),
+        "the import silences the advisory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coercion_status_reports_fixture_rung_and_fingerprint() {
+    // `whip coercion status` golden (spec/std-coercion.md slice 4): the
+    // fixture path reports provider `fixture`, selecting rung 4, and the
+    // literal `fixture` fingerprint — and never a credential.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("coercion-status");
+    let store = dir.join("store.sqlite3");
+    let status = |store_path: &Path| -> Value {
+        let mut command = Command::new(bin);
+        command.args([
+            "--store",
+            store_path.to_str().expect("utf-8"),
+            "--json",
+            "coercion",
+            "status",
+        ]);
+        // Hermetic: the operator-override rung must not fire from the
+        // developer's own environment.
+        for var in [
+            "WHIPPLESCRIPT_COERCE_PROVIDER",
+            "WHIPPLESCRIPT_COERCE_MODEL",
+            "WHIPPLESCRIPT_COERCE_BASE_URL",
+            "WHIPPLESCRIPT_COERCE_MAX_TOKENS",
+            "WHIPPLESCRIPT_COERCE_TIMEOUT_SECS",
+        ] {
+            command.env_remove(var);
+        }
+        let output = command.output().expect("whip coercion status runs");
+        assert!(
+            output.status.success(),
+            "status failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("status JSON")
+    };
+    // No store yet: rung 4 fixture, and the status must not create one.
+    let report = status(&store);
+    assert_eq!(report["provider_id"], "fixture", "{report}");
+    assert_eq!(report["rung"], 4, "{report}");
+    assert_eq!(report["rung_label"], "fixture", "{report}");
+    assert_eq!(report["fingerprint"], "fixture", "{report}");
+    assert!(
+        report.get("api_key").is_none() && report.get("credential").is_none(),
+        "a credential value never enters the status surface: {report}"
+    );
+    assert!(
+        !store.exists(),
+        "a status command must not create a store as a side effect"
+    );
+    // With a real (migration-seeded) store the binding row names
+    // `builtin-coerce` — still the fixture path, still rung 4.
+    drop(SqliteStore::open(&store).expect("open seeds the store"));
+    let seeded = status(&store);
+    assert_eq!(seeded["provider_id"], "fixture", "{seeded}");
+    assert_eq!(seeded["rung"], 4, "{seeded}");
+    assert_eq!(seeded["fingerprint"], "fixture", "{seeded}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn lint_flags_unused_coerce_result() {
     // A coerce that IS called but whose result binding is never used is flagged
     // (`lint.coerce_result_unused`); the same coerce with its result handled by an
@@ -9726,7 +11906,7 @@ class Ticket {{
 }}
 
 coerce assess(title string) -> R {{
-  client "X"
+  prompt "Assess"
 }}
 
 rule run
@@ -9801,7 +11981,7 @@ class Ticket {
 }
 
 coerce assessDead(title string) -> R {
-  client "X"
+  prompt "Assess"
 }
 
 rule run
@@ -9888,7 +12068,7 @@ fn lint_flags_deep_after_nesting() {
     // n levels of nested `after`, each behind its own coerce.
     let nest = |levels: usize| -> String {
         let coerces: String = (1..=levels)
-            .map(|i| format!("coerce f{i}(id string) -> R {{ client \"X\" }}\n"))
+            .map(|i| format!("coerce f{i}(id string) -> R {{ prompt \"Assess\" }}\n"))
             .collect();
         let mut body = String::from("  complete result {\n    ok true\n  }\n");
         for i in (1..=levels).rev() {
@@ -9925,6 +12105,182 @@ fn lint_flags_deep_after_nesting() {
     assert!(
         !codes(2).contains(&"lint.deep_after_nesting".to_owned()),
         "shallow nesting must not be flagged"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// DR-0043 Decision 4: re-admission either repeats a rule's external work or
+/// silently skips it, decided by the trigger's key shape. The lint fires on the
+/// two shapes where re-presentation is CERTAIN — a tracker readiness projection
+/// and a record-back cycle — and only when the rule holds no lease or claim.
+#[test]
+fn lint_flags_unprotected_readmission_hazard() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-readmission");
+
+    let codes = |name: &str, source: &str| -> Vec<String> {
+        let wf = dir.join(format!("{name}.whip"));
+        fs::write(&wf, source).expect("write workflow");
+        let output = Command::new(bin)
+            .args(["--json", "lint", wf.to_str().expect("present")])
+            .output()
+            .expect("lint runs");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
+        report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let code = "lint.readmission_unprotected_effect".to_owned();
+
+    // Shape 1 — a readiness projection re-derives whenever its row changes, so
+    // an unclaimed turn over it can be re-admitted mid-flight.
+    let tracker = |claim: &str| {
+        format!(
+            r#"use std.tracker
+use std.agent
+
+@service
+workflow Queue
+
+tracker backlog {{
+  provider builtin
+}}
+
+agent worker {{
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}}
+
+rule work_ready_item
+  when backlog has ready issue as issue
+  when worker is available
+=> {{
+{claim}  tell worker as turn """markdown
+  Do {{{{ issue.title }}}}
+  """
+
+  after turn succeeds as outcome {{
+    finish issue {{
+      summary outcome.summary
+    }}
+  }}
+}}
+"#
+        )
+    };
+    assert!(
+        codes("tracker-unprotected", &tracker("")).contains(&code),
+        "an unclaimed turn over a readiness projection is flagged"
+    );
+    assert!(
+        !codes("tracker-claimed", &tracker("  claim issue as held\n")).contains(&code),
+        "a claim is the documented protection — never flagged"
+    );
+
+    // Shape 2 — a rule that consumes its trigger and records it again brings the
+    // same entity back by construction.
+    let cycle = r#"use std.agent
+
+@service
+workflow Retry
+
+class Attempt {
+  id string
+  tries string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+rule retry_attempt
+  when Attempt as a
+  when worker is available
+=> {
+  tell worker as turn """markdown
+  Try {{ a.id }}
+  """
+
+  after turn fails {
+    done a -> record Attempt {
+      id a.id
+      tries "more"
+    }
+  }
+}
+"#;
+    assert!(
+        codes("record-back-cycle", cycle).contains(&code),
+        "a consume-and-re-record cycle is flagged"
+    );
+
+    // A seed→dispatch program records its trigger class from ANOTHER rule, once
+    // per instance. Telling that apart from an unbounded producer needs the
+    // cardinality classifier DR-0044 P2 defers, so it is deliberately silent
+    // rather than a false positive.
+    let seed_dispatch = r#"use std.agent
+
+workflow Dispatch {
+  input request Request
+  output result Done
+
+  class Request {
+    title string
+  }
+
+  class Work {
+    title string
+    status "queued"
+  }
+
+  class Done {
+    summary string
+  }
+
+  agent worker {
+    provider fixture
+    profile "repo-reader"
+    capacity 1
+  }
+
+  rule seed
+    when Request as request
+  => {
+    done request -> record Work {
+      title request.title
+      status "queued"
+    }
+  }
+
+  rule dispatch
+    when Work as work where work.status == "queued"
+    when worker is available
+  => {
+    tell worker as turn """markdown
+    Do {{ work.title }}
+    """
+
+    after turn succeeds as outcome {
+      done work
+
+      complete result {
+        summary outcome.summary
+      }
+    }
+  }
+}
+"#;
+    assert!(
+        !codes("seed-dispatch", seed_dispatch).contains(&code),
+        "a once-per-instance producer is not flagged (no cardinality analysis yet)"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -10081,7 +12437,7 @@ class Orphan {
 }
 
 coerce assess(title string) -> R {
-  client "X"
+  prompt "Assess"
 }
 
 rule run
@@ -12383,6 +14739,10 @@ workflow LockDiscovery
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class WorkItem {
   title string
 }
@@ -12724,7 +15084,7 @@ rule recall
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--provider",
             "fixture",
@@ -12851,7 +15211,7 @@ workflow WorkflowComplete {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -12944,7 +15304,7 @@ workflow ScalarComplete {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -13057,7 +15417,7 @@ workflow Other {{
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             root.to_str().expect("utf-8 workflow path"),
             "--root",
             "Selected",
@@ -13094,68 +15454,16 @@ workflow Other {{
 }
 
 #[test]
-fn status_surfaces_pending_human_asks_with_answer_command() {
-    // An instance idle on an `askHuman` shows the pending ask and the exact command
-    // (with available choices) to unblock it.
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_store_path();
-    Command::new(bin)
-        .args([
-            "--store",
-            store.to_str().expect("present"),
-            "dev",
-            example_path("triage-flow.whip").to_str().expect("present"),
-            "--until",
-            "idle",
-        ])
-        .output()
-        .expect("dev runs");
-    let instances = run_json(
-        bin,
-        &[
-            "--store",
-            store.to_str().expect("present"),
-            "--json",
-            "instances",
-        ],
-    );
-    let instance_id = instances
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|i| i.get("instance_id"))
-        .and_then(Value::as_str)
-        .expect("instance id");
-
-    let status = Command::new(bin)
-        .args([
-            "--store",
-            store.to_str().expect("present"),
-            "status",
-            instance_id,
-        ])
-        .output()
-        .expect("status runs");
-    let out = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        out.contains("pending human asks:")
-            && out.contains("whip inbox answer ")
-            && out.contains("--choice <approve|reject>"),
-        "status should surface the pending ask:\n{out}"
-    );
-}
-
-#[test]
 fn dev_reports_the_final_instance_outcome() {
-    // `whip dev` prints the final instance status so a run's result is visible without
-    // a separate `whip status`. minimal-noop completes; triage-flow goes idle on a
-    // human ask (still running) and says so.
+    // `whip run` prints the final instance status so a run's result is visible without
+    // a separate `whip status`. minimal-noop completes and says so.
     let bin = env!("CARGO_BIN_EXE_whip");
 
     let completed = Command::new(bin)
         .args([
             "--store",
             temp_store_path().to_str().expect("present"),
-            "dev",
+            "run",
             example_path("minimal-noop.whip").to_str().expect("present"),
             "--until",
             "idle",
@@ -13166,23 +15474,6 @@ fn dev_reports_the_final_instance_outcome() {
         String::from_utf8_lossy(&completed.stdout).contains("status completed"),
         "stdout:\n{}",
         String::from_utf8_lossy(&completed.stdout)
-    );
-
-    let idle = Command::new(bin)
-        .args([
-            "--store",
-            temp_store_path().to_str().expect("present"),
-            "dev",
-            example_path("triage-flow.whip").to_str().expect("present"),
-            "--until",
-            "idle",
-        ])
-        .output()
-        .expect("dev runs");
-    let idle_out = String::from_utf8_lossy(&idle.stdout);
-    assert!(
-        idle_out.contains("status running") && idle_out.contains("awaiting a human answer"),
-        "stdout:\n{idle_out}"
     );
 }
 
@@ -13228,7 +15519,7 @@ workflow WorkflowInput {
             "--input",
             r#"{"phase":{"phaseId":"p1","title":"Review parser"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -13273,7 +15564,7 @@ workflow WorkflowInput {
             store_path.to_str().expect("utf-8 temp path"),
             "--input",
             r#"{"phase":{"phaseId":"p2"}}"#,
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -13295,7 +15586,7 @@ workflow WorkflowInput {
             store_path.to_str().expect("utf-8 temp path"),
             "--input",
             r#"{"phaseId":"p3"}"#,
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -13358,7 +15649,7 @@ workflow PatternApplication {
             "--input",
             r#"{"task":{"title":"Pattern smoke"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -13456,7 +15747,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Invoke smoke"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -13609,7 +15900,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Milestone smoke"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -13740,7 +16031,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Resume smoke"}}"#,
             "--json",
-            "run",
+            "start",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -14061,7 +16352,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Revision link"}}"#,
             "--json",
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -14341,7 +16632,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Cancel smoke"}}"#,
             "--json",
-            "run",
+            "start",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -14546,7 +16837,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Needs revision"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -14615,9 +16906,9 @@ workflow Parent {
   => {
     invoke Child { task { title task.title } } as child
 
-    after child fails as failure {
+    after child times out as failure {
       record ParentBlocked {
-        reason failure.reason
+        reason failure.summary
       }
     }
   }
@@ -14659,7 +16950,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"Eventually timeout"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -14710,7 +17001,7 @@ workflow Child {
                 .get("value")
                 .and_then(|value| value.get("reason"))
                 .and_then(Value::as_str)
-                .is_some_and(|reason| reason.contains("did not reach terminal state"))
+                .is_some_and(|reason| reason.contains("child workflow timed out"))
     }));
 
     let _ = fs::remove_file(store_path);
@@ -14755,7 +17046,7 @@ workflow WorkflowFail {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--until",
             "idle",
@@ -14821,7 +17112,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -14841,7 +17132,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
                 .and_then(Value::as_u64)
                 .unwrap_or(0))
             .collect::<Vec<_>>(),
-        vec![6, 6, 0, 0]
+        vec![4, 4, 0, 0]
     );
     let instance_id = dev
         .get("instance_id")
@@ -14854,6 +17145,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -14916,7 +17208,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -14940,13 +17232,13 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
                 .and_then(Value::as_u64)
                 .unwrap_or(0))
             .collect::<Vec<_>>(),
-        vec![6, 6, 0, 0]
+        vec![4, 4, 0, 0]
     );
     let assertions = dev
         .get("assertions")
         .and_then(Value::as_array)
         .expect("assertions");
-    assert_eq!(assertions.len(), 6);
+    assert_eq!(assertions.len(), 5);
     assert!(assertions
         .iter()
         .all(|assertion| assertion.get("passed").and_then(Value::as_bool) == Some(true)));
@@ -14972,12 +17264,12 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
         .is_some_and(|reads| reads.iter().any(|read| {
             read.get("kind").and_then(Value::as_str) == Some("effect")
                 && read.get("head").and_then(Value::as_str) == Some("kind agent.tell")
-                && read.get("match_count").and_then(Value::as_u64) == Some(6)
+                && read.get("match_count").and_then(Value::as_u64) == Some(4)
                 && read
                     .get("matches")
                     .and_then(Value::as_array)
                     .is_some_and(|matches| {
-                        matches.len() == 6
+                        matches.len() == 4
                             && matches.iter().all(|matched| {
                                 matched.get("prompt_content_type").and_then(Value::as_str)
                                     == Some("markdown")
@@ -15010,14 +17302,14 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .get("summary")
             .and_then(|summary| summary.get("total"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     assert_eq!(
         executable_spec
             .get("summary")
             .and_then(|summary| summary.get("passed"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     let acceptance_group = executable_spec
         .get("tags")
@@ -15031,14 +17323,14 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .get("summary")
             .and_then(|summary| summary.get("total"))
             .and_then(Value::as_u64),
-        Some(6)
+        Some(5)
     );
     assert_eq!(
         acceptance_group
             .get("assertions")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(6)
+        Some(5)
     );
     assert!(acceptance_group
         .get("assertions")
@@ -15093,7 +17385,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .iter()
             .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("agent.turn.completed"))
             .count(),
-        6
+        4
     );
     assert_eq!(
         facts
@@ -15102,7 +17394,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
                 |fact| fact.get("name").and_then(Value::as_str) == Some("schema.coerce.succeeded")
             )
             .count(),
-        6
+        4
     );
     let result_languages = facts
         .iter()
@@ -15117,7 +17409,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         result_languages,
-        ["Arabic", "French", "German", "Hindi", "Japanese", "Spanish"]
+        ["Arabic", "French", "Hindi", "Spanish"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
@@ -15147,13 +17439,6 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
             .count(),
         2
     );
-    assert_eq!(
-        result_providers
-            .iter()
-            .filter(|provider| provider.as_str() == "pi")
-            .count(),
-        2
-    );
 
     let _ = fs::remove_file(store_path);
 }
@@ -15161,7 +17446,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
 #[test]
 fn dev_native_provider_records_policy_denial_from_source_required_capabilities() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    for provider in ["codex", "claude", "pi"] {
+    for provider in ["codex", "claude"] {
         let source_path = temp_workflow_path(&format!("native-policy-denial-e2e-{provider}"));
         fs::write(
             &source_path,
@@ -15192,7 +17477,7 @@ rule start_denied_work
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
                 "--json",
-                "dev",
+                "run",
                 source_path.to_str().expect("utf-8 source path"),
                 "--provider",
                 provider,
@@ -15269,7 +17554,7 @@ fn dev_incident_router_routes_with_agentref_metadata() {
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             example.to_str().expect("utf-8 example path"),
             "--provider",
             "fixture",
@@ -15313,10 +17598,64 @@ fn dev_incident_router_routes_with_agentref_metadata() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         providers,
-        ["codex", "pi"]
+        ["codex", "claude"]
             .into_iter()
             .map(str::to_owned)
             .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    let _ = fs::remove_file(store_path);
+}
+
+/// The expression-kernel golden fixture runs end-to-end: every operator
+/// class (arithmetic, ordering, equality, membership, boolean word/symbol
+/// forms, presence, indexing, `count`/`exists`/`empty` over literals and
+/// fact/effect queries) evaluates in guards and assertions, all assertions
+/// pass, and the workflow completes deterministically with no providers.
+#[test]
+fn dev_runs_the_expression_kernel_golden_fixture() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let example = example_path("expression-kernel.whip");
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            example.to_str().expect("utf-8 example path"),
+        ],
+    );
+    let assertions = dev
+        .get("assertions")
+        .and_then(Value::as_array)
+        .expect("assertions");
+    assert_eq!(assertions.len(), 13, "{assertions:#?}");
+    assert!(
+        assertions
+            .iter()
+            .all(|assertion| assertion.get("status").and_then(Value::as_str) == Some("passed")),
+        "{assertions:#?}"
+    );
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    assert_eq!(
+        status.pointer("/instance/status").and_then(Value::as_str),
+        Some("completed"),
+        "{status}"
     );
 
     let _ = fs::remove_file(store_path);
@@ -15410,7 +17749,7 @@ rule route
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -15511,7 +17850,7 @@ rule route
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -15588,28 +17927,24 @@ rule classify_request
           branch "completed"
           detail result.summary
         }
-        askHuman "completed branch effect"
       }
       Failed as failure => {
         record TerminalRoute {
           branch "failed"
           detail failure.reason
         }
-        askHuman "failed branch effect"
       }
       TimedOut as timeout => {
         record TerminalRoute {
           branch "timed_out"
           detail timeout.summary
         }
-        askHuman "timed_out branch effect"
       }
       Cancelled as cancel => {
         record TerminalRoute {
           branch "cancelled"
           detail cancel.summary
         }
-        askHuman "cancelled branch effect"
       }
     }
   }
@@ -15622,7 +17957,7 @@ rule classify_request
         "--store",
         store_path.to_str().expect("utf-8 temp path"),
         "--json",
-        "dev",
+        "run",
         source_path.to_str().expect("utf-8 source path"),
         "--provider",
         "fixture",
@@ -15665,14 +18000,6 @@ rule classify_request
         route.get("detail").and_then(Value::as_str),
         Some(expected_detail)
     );
-    assert_eq!(
-        facts
-            .iter()
-            .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("human.ask.created"))
-            .count(),
-        1,
-        "{facts:#?}"
-    );
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
@@ -15703,7 +18030,7 @@ fn dev_evaluates_shared_expression_kernel_for_guards_and_assertions() {
 workflow ExpressionKernelE2E
 
 class ExprTask {
-  provider "codex" | "claude" | "pi"
+  provider "codex" | "claude" | "gpt5"
   priority int
   status "queued" | "blocked"
 }
@@ -15716,9 +18043,9 @@ class ExprResult {
 
 assert count(ExprResult) == 1
 assert exists(ExprResult where provider == codex && priority >= 3)
-assert count(ExprResult where provider == pi) == 0
+assert count(ExprResult where provider == gpt5) == 0
 assert count(ExprResult where priority > 1 && provider in ["codex", "claude"]) == 1
-assert ("codex" in ["codex", "claude"]) && !("pi" in ["codex"])
+assert ("codex" in ["codex", "claude"]) && !("gpt5" in ["codex"])
 assert count([]) == 0
 
 rule seed
@@ -15731,7 +18058,7 @@ rule seed
   }
 
   record ExprTask {
-    provider "pi"
+    provider "gpt5"
     priority 1
     status "blocked"
   }
@@ -15756,7 +18083,7 @@ rule accept_task
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -15861,7 +18188,7 @@ rule seed
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -15937,7 +18264,7 @@ rule accept
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             source_path.to_str().expect("utf-8 source path"),
             "--json",
         ],
@@ -15970,6 +18297,8 @@ rule accept
             dependencies: &[],
             terminal: None,
             idempotency_key: Some("external-window-invalid-duration"),
+            marks: &[],
+            context_json: None,
         })
         .expect("commit external fact");
 
@@ -16095,7 +18424,7 @@ fn check_rejects_bad_finite_domain_expressions() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("finite-domain value to unknown `pi`"),
+        stderr.contains("finite-domain value to unknown `gpt5`"),
         "stderr:\n{stderr}"
     );
     assert!(
@@ -16161,7 +18490,7 @@ rule accept
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16257,7 +18586,7 @@ rule accept
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16330,7 +18659,7 @@ rule route
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16389,7 +18718,7 @@ rule seed
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16441,7 +18770,7 @@ class Review {
 }
 
 coerce reviewPayload(payload Payload, metadata map<string>) -> Review {
-  Return whether the payload is valid.
+  prompt "Return whether the payload is valid."
 }
 
 rule seed
@@ -16491,7 +18820,7 @@ rule review
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16538,6 +18867,7 @@ rule review
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
             "evidence",
+            "instance",
             instance_id,
         ],
     );
@@ -16598,7 +18928,7 @@ rule seed
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -16828,72 +19158,6 @@ rule seed
 }
 
 #[test]
-fn dev_stream_emits_pending_asks_for_the_workbench() {
-    // Workbench projection (pi-conformance / un-tie Phase 3): a pending human
-    // ask surfaces as a `dev.asks` stream event an external UI renders as an
-    // inbox; the pending set is re-emitted only when it changes.
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let source_path = temp_workflow_path("dev-stream-asks");
-    fs::write(
-        &source_path,
-        r#"
-workflow DevStreamAsks
-
-rule seek_approval
-  when started
-=> {
-  askHuman as approval choices ["approve", "reject"] """
-  Approve the release?
-  """
-}
-"#,
-    )
-    .expect("write source");
-
-    let output = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "dev",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-            "--stream",
-            "ndjson",
-        ])
-        .output()
-        .expect("command runs");
-
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
-    let events = stdout
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("ndjson line"))
-        .collect::<Vec<_>>();
-    let asks = events
-        .iter()
-        .filter(|event| event.get("event").and_then(Value::as_str) == Some("dev.asks"))
-        .collect::<Vec<_>>();
-    assert!(!asks.is_empty(), "a pending ask streams: {stdout}");
-    let data = asks[0].get("data").expect("data");
-    assert_eq!(data.get("count").and_then(Value::as_u64), Some(1));
-    assert!(
-        data["asks"][0]["prompt"]
-            .as_str()
-            .expect("prompt")
-            .contains("Approve the release?"),
-        "{data}"
-    );
-}
-
-#[test]
 fn dev_streams_ndjson_progress_and_final_report() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
@@ -16924,7 +19188,7 @@ rule seed
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -17931,223 +20195,6 @@ rule startNativeWork
 }
 
 #[test]
-fn accept_observes_human_inbox_requests() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let source_path = temp_workflow_path("accept-fixture-human-inbox-workflow");
-    let fixture_path = temp_workflow_path("accept-fixture-human-inbox").with_extension("json");
-    fs::write(
-        &source_path,
-        r#"
-workflow AcceptFixtureHumanInbox
-
-@acceptance
-assert count(effect kind human.ask where status == completed) == 1
-
-rule ask
-  when started
-=> {
-  askHuman """application/json
-  {
-    "question": "Approve this release?"
-  }
-  """
-}
-"#,
-    )
-    .expect("write source");
-    fs::write(
-        &fixture_path,
-        json!({
-            "schema": "whipplescript.acceptance_fixture.v0",
-            "workflow": source_path,
-            "provider": "fixture",
-            "setup": {
-                "inbox": [
-                    {
-                        "prompt": "Pre-existing release note review",
-                        "severity": "urgent",
-                        "choices": ["approve", "reject"],
-                        "freeform_allowed": false
-                    }
-                ]
-            },
-            "include_tags": ["acceptance"],
-            "expect": {
-                "dev_status": "success",
-                "workflow": "AcceptFixtureHumanInbox",
-                "status": "passed",
-                "diagnostics": 0,
-                "assertions": {
-                    "total": 1,
-                    "passed": 1,
-                    "failed": 0,
-                    "error": 0
-                },
-                "effects": [
-                    {"kind": "human.ask", "status": "completed", "count": 1}
-                ],
-                "inbox": [
-                    {"status": "pending", "severity": "normal", "count": 1},
-                    {"status": "pending", "severity": "urgent", "count": 1}
-                ],
-                "runs": [
-                    {"provider": "fixture", "status": "completed", "count": 1}
-                ]
-            }
-        })
-        .to_string(),
-    )
-    .expect("write fixture");
-
-    let report = run_json(
-        bin,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "accept",
-            fixture_path.to_str().expect("utf-8 fixture path"),
-        ],
-    );
-
-    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/summary/total")
-            .and_then(Value::as_u64),
-        Some(2)
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/0/status")
-            .and_then(Value::as_str),
-        Some("pending")
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/0/severity")
-            .and_then(Value::as_str),
-        Some("normal")
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/0/count")
-            .and_then(Value::as_u64),
-        Some(1)
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/1/status")
-            .and_then(Value::as_str),
-        Some("pending")
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/1/severity")
-            .and_then(Value::as_str),
-        Some("urgent")
-    );
-    assert_eq!(
-        report
-            .pointer("/observed/inbox/groups/1/count")
-            .and_then(Value::as_u64),
-        Some(1)
-    );
-    let assertion_match = report
-        .pointer("/observed/assertion_reads/0/matches/0")
-        .expect("human.ask assertion match");
-    let trace_sequences = assertion_match
-        .get("trace_sequences")
-        .and_then(Value::as_array)
-        .expect("trace sequences");
-    let evidence_ids = assertion_match
-        .get("evidence_ids")
-        .and_then(Value::as_array)
-        .expect("evidence ids");
-    assert_eq!(
-        assertion_match.get("trace_items").and_then(Value::as_u64),
-        Some(trace_sequences.len() as u64)
-    );
-    assert_eq!(
-        assertion_match
-            .get("evidence_items")
-            .and_then(Value::as_u64),
-        Some(evidence_ids.len() as u64)
-    );
-    assert!(trace_sequences
-        .iter()
-        .all(|sequence| sequence.as_i64().is_some_and(|sequence| sequence > 0)));
-    assert!(evidence_ids
-        .iter()
-        .all(|evidence_id| evidence_id.as_str().is_some_and(|id| !id.is_empty())));
-
-    let _ = fs::remove_file(store_path);
-    let _ = fs::remove_file(source_path);
-    let _ = fs::remove_file(fixture_path);
-}
-
-#[test]
-fn accept_rejects_invalid_setup_inbox_items() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let source_path = temp_workflow_path("accept-fixture-invalid-inbox-workflow");
-    let fixture_path = temp_workflow_path("accept-fixture-invalid-inbox").with_extension("json");
-    fs::write(
-        &source_path,
-        r#"
-workflow AcceptFixtureInvalidInbox
-
-rule noop
-  when started
-=> {}
-"#,
-    )
-    .expect("write source");
-    fs::write(
-        &fixture_path,
-        json!({
-            "schema": "whipplescript.acceptance_fixture.v0",
-            "workflow": source_path,
-            "setup": {
-                "inbox": [
-                    {
-                        "prompt": "Review this before running",
-                        "choices": {"approve": true}
-                    }
-                ]
-            },
-            "expect": {
-                "dev_status": "success"
-            }
-        })
-        .to_string(),
-    )
-    .expect("write fixture");
-
-    let output = Command::new(bin)
-        .args([
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "accept",
-            fixture_path.to_str().expect("utf-8 fixture path"),
-        ])
-        .output()
-        .expect("command runs");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("setup.inbox[0].choices must be an array"),
-        "{stderr}"
-    );
-
-    let _ = fs::remove_file(store_path);
-    let _ = fs::remove_file(source_path);
-    let _ = fs::remove_file(fixture_path);
-}
-
-#[test]
 fn accept_rejects_unsupported_setup_collections() {
     let bin = env!("CARGO_BIN_EXE_whip");
     for key in ["effects", "artifacts"] {
@@ -18563,9 +20610,6 @@ rule seed
                 ],
                 "evidence": [
                     {"kind": "agent.turn.native_event", "subject_type": "run", "count": 1}
-                ],
-                "inbox": [
-                    {"status": "pending", "severity": "normal", "count": 1}
                 ]
             }
         })
@@ -18632,10 +20676,6 @@ rule seed
     assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
         |failure| failure.contains("expected evidence[0] kind=\"agent.turn.native_event\" subject_type=\"run\" count=1, got 0")
     )));
-    assert!(failures
-        .iter()
-        .any(|failure| failure.as_str().is_some_and(|failure| failure
-            .contains("expected inbox[0] status=\"pending\" severity=\"normal\" count=1, got 0"))));
     assert!(failures.iter().any(|failure| failure.as_str().is_some_and(
         |failure| failure.contains("expected actions[0] type=\"pause\" count=1, got 0")
     )));
@@ -18865,7 +20905,7 @@ assert missing.value
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
             "--json",
-            "dev",
+            "run",
             source_path.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -18940,15 +20980,62 @@ fn example_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn temp_store_path() -> PathBuf {
+/// A store path inside a temp directory that is removed when the binding
+/// drops, panic included.
+///
+/// The directory is the unit, not the `.sqlite` file: the binary under test
+/// derives siblings next to the store it is given — the `-shm`/`-wal` sidecars
+/// and a `.memory.sqlite` — so owning only the file would leave those behind.
+/// That is exactly what happened: 131 trees had accumulated in the RAM-backed
+/// /tmp before this guard existed.
+///
+/// `Deref`/`AsRef` keep the 125 call sites unchanged: `let store =
+/// temp_store_path();` still passes to `&store`, `store.display()`, and
+/// command arguments as before. Bind it — never use it inline, since that
+/// would drop the directory at the end of the statement.
+struct TempStorePath {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for TempStorePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempStorePath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempStorePath {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
+impl Drop for TempStorePath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn temp_store_path() -> TempStorePath {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "whipplescript-control-plane-{}-{nanos}.sqlite",
+    let dir = std::env::temp_dir().join(format!(
+        "whipplescript-control-plane-{}-{nanos}",
         std::process::id()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create control-plane temp dir");
+    let path = dir.join("store.sqlite");
+    TempStorePath { dir, path }
 }
 
 fn temp_workflow_path(label: &str) -> PathBuf {
@@ -19053,7 +21140,7 @@ workflow GrandChild {
             "--input",
             r#"{"task":{"title":"deep"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -19181,7 +21268,7 @@ workflow Child {
             "--input",
             r#"{"task":{"title":"trace me"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Parent",
@@ -19318,7 +21405,7 @@ rule seed_v2
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
-            "run",
+            "start",
             v1.to_str().expect("utf-8 workflow path"),
             "--json",
         ],
@@ -19455,7 +21542,7 @@ workflow Solo {
             "--input",
             r#"{"task":{"title":"boom"}}"#,
             "--json",
-            "dev",
+            "run",
             workflow_path.to_str().expect("utf-8 workflow path"),
             "--root",
             "Solo",
@@ -19999,7 +22086,7 @@ fn branch_selective_verbs_conflicts_and_archaeology() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Per-instance effect dispatch onto branch working sets: `whip dev
+/// Per-instance effect dispatch onto branch working sets: `whip run
 /// --branch` binds the instance at birth, so its `file.write` effect
 /// resolves through the branch's COW working set — the real directory
 /// stays untouched, the content lands as a cut on the branch (keyed by
@@ -20042,6 +22129,7 @@ class Result {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -20072,7 +22160,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -20131,7 +22219,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -20212,7 +22300,7 @@ rule begin
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "owned",
@@ -20311,6 +22399,7 @@ class Result {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 rule pick
@@ -20339,7 +22428,7 @@ rule pick
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -20479,6 +22568,7 @@ signal user.message {{
 
 file store out_files {{
   root "{}"
+  allow write ["**"]
 }}
 
 agent helper {{
@@ -20524,7 +22614,7 @@ rule follow_up
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             program,
             "--provider",
             "owned",
@@ -20824,7 +22914,7 @@ rule go
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             src.to_str().expect("utf-8 source path"),
             "--provider",
             "fixture",
@@ -21197,4 +23287,352 @@ fn workstream_members_auto_admit_and_promote() {
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn lint_flags_marks_off_consumption_boundaries() {
+    // `whip lint` flags a mark whose frozen prefix carries a settled effect
+    // from a rule that never consumes its trigger (DR-0038's refire shape:
+    // a changed candidate re-derives the effect under prefix replay), and
+    // does not flag the same mark once the trigger is consumed.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = unique_temp_dir("lint-mark-boundary");
+    let program = |consume_line: &str| {
+        format!(
+            r#"use std.script
+workflow MarkLint
+
+input ticket Ticket
+
+class Ticket {{
+  id string
+}}
+
+class CheckOut {{
+  kind string
+}}
+
+class Classified {{
+  ticket string
+}}
+
+class Assessment {{
+  ticket string
+}}
+
+mark "cut" after triage
+
+rule classify
+  when Ticket as ticket
+=> {{
+  exec "python3 classify.py" -> CheckOut as chk
+{consume_line}
+  after chk succeeds as c {{
+    record Classified {{
+      ticket ticket.id
+    }}
+  }}
+}}
+
+rule triage
+  when Classified as c
+=> {{
+  record Assessment {{
+    ticket c.ticket
+  }}
+}}
+"#
+        )
+    };
+    for (label, consume_line, expected) in [
+        ("off-boundary", "", 1usize),
+        ("at-boundary", "  done ticket", 0usize),
+    ] {
+        let wf = dir.join(format!("{label}.whip"));
+        fs::write(&wf, program(consume_line)).expect("write workflow");
+        let output = Command::new(bin)
+            .args(["--json", "lint", wf.to_str().expect("present")])
+            .output()
+            .expect("whip lint runs");
+        assert!(output.status.success(), "lint exits 0 on warnings");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
+        let marks: Vec<&Value> = report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter(|finding| {
+                finding["code"].as_str() == Some("lint.mark_off_consumption_boundary")
+            })
+            .collect();
+        assert_eq!(
+            marks.len(),
+            expected,
+            "{label}: unexpected mark-boundary findings: {report}"
+        );
+        if expected == 1 {
+            let message = marks[0]["message"].as_str().expect("message");
+            assert!(
+                message.contains("`cut`") && message.contains("`classify`"),
+                "the finding names the mark and the refire site: {message}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Facts are set-like by (instance, name, key), and record keys are
+/// content-derived — so a rule re-recording a fact byte-identical to one
+/// already active (recorded by another rule or a seed table) must collapse to
+/// the existing fact, not fail the step. Regression: this previously died
+/// with `UNIQUE constraint failed: facts.instance_id, facts.name, facts.key`.
+#[test]
+fn re_recording_an_identical_active_fact_collapses_instead_of_crashing() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = std::env::temp_dir().join(format!(
+        "whip-dup-fact-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&dir).expect("mkdir");
+    let source = dir.join("dup.whip");
+    fs::write(
+        &source,
+        r#"workflow DupRecord
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Marker {
+  label string
+}
+
+rule one
+  when started
+=> {
+  record Marker { label "same" }
+}
+
+rule two
+  when Marker as m where m.label == "same"
+=> {
+  record Marker { label "same" }
+  complete result { note "done" }
+}
+"#,
+    )
+    .expect("write source");
+    let store = dir.join("dup.sqlite");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "status",
+            instance,
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|i| i.get("status"))
+            .and_then(Value::as_str),
+        Some("completed"),
+        "duplicate record must not fail the step: {status}"
+    );
+
+    // Exactly one Marker fact: the identical re-record collapsed.
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "facts",
+            instance,
+        ],
+    );
+    let markers = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("Marker"))
+        .count();
+    assert_eq!(markers, 1, "identical facts collapse to one: {facts}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `record <T> from <b> { overrides }` copies the source binding's fields
+/// (bounded to `T`'s declared fields) and overrides the listed ones — the
+/// documented projection the IFC egress analysis already assumes. Regression:
+/// the lowering previously built the payload from the listed assignments
+/// only, so a state transition like `done t -> record Task from t { status
+/// "active" }` silently dropped every copied field (and identical residues
+/// then collapsed under the set-like key).
+#[test]
+fn record_from_copies_the_source_fields_bounded_to_the_target_schema() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let dir = std::env::temp_dir().join(format!(
+        "whip-record-from-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&dir).expect("mkdir");
+    let source = dir.join("from.whip");
+    fs::write(
+        &source,
+        r#"workflow FromCopy
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Task {
+  title string
+  secret string
+  status "queued" | "active"
+}
+
+class Audit {
+  title string
+  status "queued" | "active"
+}
+
+table tasks as Task [
+  {
+    title "write docs"
+    secret "s3cr3t"
+    status "queued"
+  }
+]
+
+rule advance
+  when Task as t where t.status == "queued"
+=> {
+  done t -> record Task from t { status "active" }
+  record Audit from t { status "active" }
+}
+
+rule finish
+  when Task as t where t.status == "active"
+=> {
+  complete result { note t.title }
+}
+"#,
+    )
+    .expect("write source");
+    let store = dir.join("from.sqlite");
+
+    let dev = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let status = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "status",
+            instance,
+        ],
+    );
+    assert_eq!(
+        status
+            .get("instance")
+            .and_then(|i| i.get("status"))
+            .and_then(Value::as_str),
+        Some("completed"),
+        "the downstream rule reads the copied title: {status}"
+    );
+
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "facts",
+            instance,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    // Same-class transition: every source field carried, override applied.
+    let task = facts
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("Task"))
+        .expect("active Task fact");
+    let task_value = task.get("value").expect("task value");
+    assert_eq!(
+        task_value.get("title").and_then(Value::as_str),
+        Some("write docs")
+    );
+    assert_eq!(
+        task_value.get("secret").and_then(Value::as_str),
+        Some("s3cr3t")
+    );
+    assert_eq!(
+        task_value.get("status").and_then(Value::as_str),
+        Some("active")
+    );
+    // Cross-class projection: bounded to the TARGET schema — `secret` is not
+    // an Audit field and must not leak into the projected fact.
+    let audit = facts
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("Audit"))
+        .expect("Audit fact");
+    let audit_value = audit.get("value").expect("audit value");
+    assert_eq!(
+        audit_value.get("title").and_then(Value::as_str),
+        Some("write docs")
+    );
+    assert_eq!(
+        audit_value.get("status").and_then(Value::as_str),
+        Some("active")
+    );
+    assert!(
+        audit_value.get("secret").is_none(),
+        "projection keeps exactly the target's fields: {audit_value}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }

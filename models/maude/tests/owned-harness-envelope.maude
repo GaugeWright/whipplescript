@@ -1,0 +1,29 @@
+load ../owned-harness-envelope.maude
+
+--- Coverage (budget): with a budget token, a model step occurs.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE :
+  running budgetToken
+  =>* C:Cfg modelStepped .
+
+--- Coverage (lease): while the workspace lease is held, a tool runs.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE :
+  running workspaceLease
+  =>* C:Cfg toolRan .
+
+--- Bite (budget): with no budget token, no model step is ever reachable. The
+--- RESIDUAL soup var means any modelStepped in any reachable state is a solution,
+--- so No solution proves the budget bounds the loop.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE :
+  running
+  =>* modelStepped RESIDUAL:Cfg .
+
+--- Bite (lease): with no held lease, no tool is ever reachable.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE :
+  running
+  =>* toolRan RESIDUAL:Cfg .
+
+--- Bite (release bounds tool use): once the lease is released, no further tool
+--- execution is reachable.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-ENVELOPE :
+  running leaseReleased
+  =>* toolRan RESIDUAL:Cfg .

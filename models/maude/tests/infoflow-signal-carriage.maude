@@ -1,0 +1,63 @@
+load ../infoflow-signal-carriage.maude
+
+--- ============================ COVERAGE (violation reachable) =================
+
+--- Coverage: trust is NOT fabricated. An internal signal emitted by an UNTRUSTED
+--- rule (its payload joined an untrusted input) carries `untrusted` to the receiver,
+--- which drives a trusted control sink -> injection. Carriage propagates the real
+--- low label; it does not launder up just because the channel is internal.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  internalSig(sigA) emit(sigA, untrusted) receiver(sigA) controlSink(trusted)
+  =>* C:Cfg injection .
+
+--- Coverage: NO LAUNDERING. An external `whip signal` injection of an INTERNAL
+--- signal is refused -- the attacker cannot smuggle untrusted data in under a
+--- trusted internal signal name.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  internalSig(sigA) extInject(sigA)
+  =>* C:Cfg laundering .
+
+--- Coverage: an EXTERNAL-entry signal driving a trusted sink injects (stage a is
+--- preserved -- an external entry point is the untrusted default, hand-classified).
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  externalSig(sigB) receiver(sigB) controlSink(trusted)
+  =>* C:Cfg injection .
+
+--- Coverage: D2b invoke-selector NMIF. A selector rooted in the low-integrity
+--- inbound payload for `invoke:<childB>` cannot gate a higher-integrity branch.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  invokePayload(childB, untrusted) selectorRequires(childB, trusted)
+  =>* C:Cfg invokeSelectorReject .
+
+--- ============================ BITE (no violation) ===========================
+
+--- Bite: THE stage-(b) WIN. An internal signal emitted by a TRUSTED rule carries
+--- `trusted` to the receiver, which drives a trusted sink -- NO injection. The
+--- internal flow propagated its emitter's trust automatically; no hand-vouching of
+--- the signal name was needed. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  internalSig(sigA) emit(sigA, trusted) receiver(sigA) controlSink(trusted)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: no external injection of an internal signal means no laundering. An
+--- internal signal with only an in-system emitter never reaches the laundering
+--- state. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  internalSig(sigA) emit(sigA, trusted) receiver(sigA)
+  =>* laundering RESIDUAL:Cfg .
+
+--- Bite: a trusted invoke payload may select a trusted branch. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  invokePayload(childB, trusted) selectorRequires(childB, trusted)
+  =>* invokeSelectorReject RESIDUAL:Cfg .
+
+--- Bite: a low invoke payload may select a low branch. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  invokePayload(childB, untrusted) selectorRequires(childB, untrusted)
+  =>* invokeSelectorReject RESIDUAL:Cfg .
+
+--- Bite: the selector check is target-specific; childB's payload does not authorize
+--- or reject childC's branch. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-SIGNAL-CARRIAGE :
+  invokePayload(childB, untrusted) selectorRequires(childC, trusted)
+  =>* invokeSelectorReject RESIDUAL:Cfg .

@@ -1,0 +1,51 @@
+load ../pattern-body-surface.maude
+
+--- COVERAGE 1: a body of only allow-listed constructs is accepted.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(ruleC effectC recordC schemaC)
+  =>*
+  accepted .
+
+--- COVERAGE 2: a workflow terminal in the body is rejected.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(terminalC)
+  =>*
+  rejected .
+
+--- COVERAGE 3: a forbidden construct dominates an otherwise-allowed body.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(ruleC terminalC recordC)
+  =>*
+  rejected .
+
+--- COVERAGE 4: a workflow contract in the body is rejected.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(contractC)
+  =>*
+  rejected .
+
+--- COVERAGE 5: a nested pattern declaration is rejected.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(nestedPatternC)
+  =>*
+  rejected .
+
+--- COVERAGE 6: a nested pattern application is rejected.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(nestedApplyC)
+  =>*
+  rejected .
+
+--- BITE 1: an allow-listed-only body is NEVER rejected.
+--- `rejected` is a reachable verdict elsewhere (coverage 2-6), so this search
+--- genuinely explores the reachable set and finds no match.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(ruleC effectC recordC schemaC)
+  =>*
+  rejected .
+
+--- BITE 2: a body containing a forbidden construct is NEVER accepted.
+search [1] in PATTERN-BODY-SURFACE :
+  admit(ruleC terminalC)
+  =>*
+  accepted .

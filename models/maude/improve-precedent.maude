@@ -1,0 +1,95 @@
+--- Precedent auto-resolution for tradeoffs, per the local-utility-model
+--- settlement in spec/improve-design-note.md section 12, 2026-07-11: an
+--- answered tradeoff is a PRECEDENT (a human speech act), and the only
+--- auto-resolution authority is MONOTONE PRECEDENT DOMINANCE -- a new
+--- tradeoff auto-accepts only when its direction-adjusted delta is at
+--- least the accepted precedent's on EVERY gauge, auto-rejects only when
+--- it is at most a rejected precedent's on every gauge, and everything
+--- else asks. Authority additionally requires the precedent to be
+--- APPLICABLE (the current operating point sits within the answer-time
+--- band neighborhood) and un-revoked.
+---
+--- Two resolvers over one candidate/precedent pair. The SOUND accept
+--- resolver discharges a per-gauge dominance obligation and grants only
+--- at zero obligations with an applicable, un-revoked accepted precedent;
+--- any gauge falling short of the precedent ends in an ask. The NAIVE
+--- resolver is the interpolating-model hazard: it grants on the existence
+--- of an accepted precedent, resolving confidently BETWEEN the human's
+--- actual answers -- authority the human never delegated.
+mod WHIPPLESCRIPT-IMPROVE-PRECEDENT is
+  sorts Gid Cnt Cfg .
+
+  ops g1 g2 : -> Gid [ctor] .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+  op lte : Cnt Cnt -> Bool .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op accepted : -> Cfg [ctor] .   --- the precedent was answered ACCEPT
+  op rejectedP : -> Cfg [ctor] .  --- the precedent was answered REJECT
+  op revokedP : -> Cfg [ctor] .   --- the answer was revoked (a speech act)
+  op applicable : -> Cfg [ctor] . --- locality holds at the current point
+  op precD : Gid Cnt -> Cfg [ctor] . --- precedent's adjusted delta per gauge
+  op candD : Gid Cnt -> Cfg [ctor] . --- candidate's adjusted delta per gauge
+  op obl : Cnt -> Cfg [ctor] .    --- undischarged per-gauge obligations
+
+  op sound : -> Cfg [ctor] .      --- sound accept resolver
+  op soundR : -> Cfg [ctor] .     --- sound reject resolver
+  op naive : -> Cfg [ctor] .      --- interpolating resolver (hazard)
+  op autoAccepted : -> Cfg [ctor] .
+  op autoRejected : -> Cfg [ctor] .
+  op asked : -> Cfg [ctor] .      --- surfaced to the human, no authority
+
+  vars G : Gid . vars N DP DC K M : Cnt .
+
+  eq lt(z, s(M)) = true .
+  eq lt(s(K), s(M)) = lt(K, M) .
+  eq lt(M, z) = false .
+  eq lte(K, M) = not lt(M, K) .
+
+  --- Accept side: a gauge where the candidate is at least the accepted
+  --- precedent discharges its obligation.
+  crl [dominates] :
+      sound precD(G, DP) candD(G, DC) obl(s(N))
+      => sound obl(N)
+      if lte(DP, DC) .
+
+  --- A gauge where the candidate falls short of what the human accepted
+  --- carries no authority: ask.
+  crl [falls-short] :
+      sound precD(G, DP) candD(G, DC)
+      => asked
+      if lt(DC, DP) .
+
+  --- Grant only with every obligation discharged, an applicable
+  --- precedent, and the ACCEPT speech act present.
+  rl [grant] :
+      sound accepted applicable obl(z)
+      => autoAccepted obl(z) .
+
+  --- Reject side, dually: a candidate at most the rejected precedent on
+  --- every gauge auto-rejects; exceeding it anywhere asks.
+  crl [dominated-by] :
+      soundR precD(G, DP) candD(G, DC) obl(s(N))
+      => soundR obl(N)
+      if lte(DC, DP) .
+
+  crl [exceeds] :
+      soundR precD(G, DP) candD(G, DC)
+      => asked
+      if lt(DP, DC) .
+
+  rl [deny] :
+      soundR rejectedP applicable obl(z)
+      => autoRejected obl(z) .
+
+  --- The naive resolver: an accepted precedent exists, grant. Dominance,
+  --- applicability, and revocation unread -- the modeled hazard.
+  rl [naive-grant] :
+      naive accepted
+      => autoAccepted .
+endm

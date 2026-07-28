@@ -1,0 +1,33 @@
+load ../compute-priority-queue.maude
+
+--- Coverage 1: one slot, production(0) + counterfactual(2) waiting -- the
+--- slot goes to production; the counterfactual keeps waiting.
+search in COMPUTE-PRIORITY-QUEUE :
+  { slot waiting(1, 0) waiting(2, 2) }
+  =>! { running(1, 0) waiting(2, 2) } .
+
+--- Coverage 2: two slots serve both, production first then the rest -- the
+--- full final state is reachable (nobody starves when capacity exists).
+search in COMPUTE-PRIORITY-QUEUE :
+  { slot slot waiting(1, 0) waiting(2, 2) }
+  =>! { running(1, 0) running(2, 2) } .
+
+--- I1 no priority inversion: with production still waiting, no reachable
+--- state runs the counterfactual request.
+search in COMPUTE-PRIORITY-QUEUE :
+  { slot waiting(1, 0) waiting(2, 2) }
+  =>* { running(2, 2) RESIDUAL:Cfg } .
+
+--- I1 across all three classes: working(1) never runs while production(0)
+--- waits, even with counterfactual load present.
+search in COMPUTE-PRIORITY-QUEUE :
+  { slot waiting(1, 0) waiting(2, 1) waiting(3, 2) }
+  =>* { running(2, 1) waiting(1, 0) RESIDUAL:Cfg } .
+
+--- Bite: the unguarded mutant DOES reach the inversion (counterfactual
+--- running while production waits). Expect a solution here.
+search in COMPUTE-PRIORITY-QUEUE-UNGUARDED :
+  { slot waiting(1, 0) waiting(2, 2) }
+  =>* { running(2, 2) RESIDUAL:Cfg } .
+
+quit .

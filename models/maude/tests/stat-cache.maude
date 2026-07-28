@@ -1,0 +1,55 @@
+load ../stat-cache.maude
+
+--- Racy fixture: the cache entry was recorded in granule t1 with content
+--- cA; the tool then wrote cB -- SAME size, SAME granule t1. The stat
+--- fingerprint is identical although the bytes changed.
+
+--- The hazard demonstrated: the naive importer trusts the fingerprint and
+--- skips the changed file.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  nscan(p1) file(p1, cB, sz1, t1) ncache(p1, sz1, t1, cA)
+  =>* nskipped(p1) RESIDUAL:Cfg .
+
+--- The drop made precise: under the naive importer the changed content is
+--- NEVER imported -- the real change silently vanishes from the diff.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  nscan(p1) file(p1, cB, sz1, t1) ncache(p1, sz1, t1, cA)
+  =>* nimported(p1, cB) RESIDUAL:Cfg .
+
+--- Coverage: the sound importer re-hashes inside the racy granule and
+--- imports the change.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  sscan(p1) file(p1, cB, sz1, t1) scache(p1, sz1, t1, cA) stamp(t1)
+  =>* simported(p1, cB) RESIDUAL:Cfg .
+
+--- Bite: the sound importer never TRUSTS a racy-granule fingerprint, so
+--- the same-size-same-mtime change can never be missed.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  sscan(p1) file(p1, cB, sz1, t1) scache(p1, sz1, t1, cA) stamp(t1)
+  =>* strusted(p1) RESIDUAL:Cfg .
+
+--- Coverage: a racy-granule entry whose content is genuinely unchanged
+--- re-hashes to clean -- no spurious import.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  sscan(p1) file(p1, cA, sz1, t1) scache(p1, sz1, t1, cA) stamp(t1)
+  =>* sclean(p1) RESIDUAL:Cfg .
+
+--- Coverage: OUTSIDE the racy granule the trust path exists -- the entry
+--- is strictly older than the snapshot stamp, so import-back stays
+--- O(touched).
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  sscan(p1) file(p1, cA, sz1, t1) scache(p1, sz1, t1, cA) stamp(t2)
+  =>* strusted(p1) RESIDUAL:Cfg .
+
+--- Bite: the non-racy unchanged file is never re-hashed into an import --
+--- soundness is bought with the racy window only, not with hashing the
+--- whole tree.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  sscan(p1) file(p1, cA, sz1, t1) scache(p1, sz1, t1, cA) stamp(t2)
+  =>* simported(p1, C:Content) RESIDUAL:Cfg .
+
+--- Coverage: a fingerprint mismatch is hashed and imported by the naive
+--- importer too -- the hazard is exactly the racy window, nothing else.
+search [1] in WHIPPLESCRIPT-STAT-CACHE :
+  nscan(p1) file(p1, cB, sz1, t2) ncache(p1, sz1, t1, cA)
+  =>* nimported(p1, cB) RESIDUAL:Cfg .

@@ -1,0 +1,66 @@
+--- Workflow invoke authority attenuation (workflow encapsulation D1).
+---
+--- This is the invoke-seam analogue of turn-access-grant.maude's never-widen
+--- invariant. For a delegating workflow invoke, the child instance's authority is
+--- bounded by the automatic cap:
+---
+---   declared(child) intersect effective(parent)
+---
+--- and an explicit `invoke ... with access to { ... }` start grant can only narrow
+--- that cap further. A grant that names an authority outside either side of the cap
+--- is dropped; reachability searches assert that it never appears in childAuth.
+mod WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION is
+  protecting BOOL .
+
+  sorts Cap CapSet Cfg .
+  subsort Cap < CapSet .
+
+  ops read write exec model : -> Cap [ctor] .
+
+  op mt : -> CapSet [ctor] .
+  op _;_ : CapSet CapSet -> CapSet [ctor assoc comm id: mt] .
+  eq [cap-idem] : C:Cap ; C:Cap = C:Cap .
+
+  op member : Cap CapSet -> Bool .
+  eq member(C:Cap, (C:Cap ; S:CapSet)) = true .
+  eq member(C:Cap, S:CapSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op parentEffective : CapSet -> Cfg [ctor] . --- authority the caller may delegate
+  op childDeclared : CapSet -> Cfg [ctor] .   --- authority the target workflow declared
+  op noStartGrant : -> Cfg [ctor] .           --- no explicit `with access to` clause
+  op startGrant : CapSet -> Cfg [ctor] .      --- explicit narrowing grant
+  op childAuth : CapSet -> Cfg [ctor] .       --- computed child instance authority
+
+  vars P D G E : CapSet .
+  var C : Cap .
+
+  --- Automatic cap: declared(child) intersect effective(parent).
+  crl [auto-keep] :
+      parentEffective(P) childDeclared(C ; D) noStartGrant childAuth(E)
+    => parentEffective(P) childDeclared(D) noStartGrant childAuth(C ; E)
+    if member(C, P) = true .
+
+  crl [auto-drop] :
+      parentEffective(P) childDeclared(C ; D) noStartGrant childAuth(E)
+    => parentEffective(P) childDeclared(D) noStartGrant childAuth(E)
+    if member(C, P) = false .
+
+  --- Explicit start grant: grant intersect declared(child) intersect effective(parent).
+  crl [grant-keep] :
+      parentEffective(P) childDeclared(D) startGrant(C ; G) childAuth(E)
+    => parentEffective(P) childDeclared(D) startGrant(G) childAuth(C ; E)
+    if member(C, P) = true /\ member(C, D) = true .
+
+  crl [grant-drop-parent] :
+      parentEffective(P) childDeclared(D) startGrant(C ; G) childAuth(E)
+    => parentEffective(P) childDeclared(D) startGrant(G) childAuth(E)
+    if member(C, P) = false .
+
+  crl [grant-drop-child] :
+      parentEffective(P) childDeclared(D) startGrant(C ; G) childAuth(E)
+    => parentEffective(P) childDeclared(D) startGrant(G) childAuth(E)
+    if member(C, P) = true /\ member(C, D) = false .
+endm

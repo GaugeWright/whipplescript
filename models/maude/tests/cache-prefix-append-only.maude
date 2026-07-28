@@ -1,0 +1,23 @@
+load ../cache-prefix-append-only.maude
+
+--- Coverage: a between-compaction turn appends and REUSES the cached prefix.
+search [1] in WHIPPLESCRIPT-CACHE-PREFIX-APPEND-ONLY :
+  prefix turnPending
+  =>* prefix tail cacheHit .
+
+--- Coverage: two turns both hit the cache and the prefix is untouched throughout.
+search [1] in WHIPPLESCRIPT-CACHE-PREFIX-APPEND-ONLY :
+  prefix turnPending turnPending
+  =>* prefix tail tail cacheHit cacheHit .
+
+--- Coverage: a due compaction rewrites the prefix once (the one deliberate bust).
+search [1] in WHIPPLESCRIPT-CACHE-PREFIX-APPEND-ONLY :
+  prefix compactDue tail
+  =>* prefix prefixRewritten .
+
+--- Bite: no between-compaction turn invalidates the cache. The RESIDUAL soup var
+--- means a cacheMiss in ANY reachable state is a solution, so No solution proves
+--- the prefix is never edited mid-conversation without a compaction trigger.
+search [1] in WHIPPLESCRIPT-CACHE-PREFIX-APPEND-ONLY :
+  prefix turnPending turnPending
+  =>* cacheMiss RESIDUAL:Cfg .

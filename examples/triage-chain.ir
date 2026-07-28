@@ -1,0 +1,55 @@
+workflow TriageChain
+workflow_contracts
+  output result ref<TriageDecision>
+  failure error ref<TriageRejected>
+uses
+  package std.agent
+  package std.coercion
+schemas
+  class Ticket
+    id string
+    title string
+    severity union<literal<"low"> | literal<"normal"> | literal<"high">>
+    status literal<"open">
+  class TriageDecision
+    ticketId string
+    decision literal<"approved">
+    plan string
+  class TriageRejected
+    ticketId string
+    reason string
+  class Signoff
+    choice union<literal<"approve"> | literal<"reject">>
+agents
+  agent triager harness=<fallback> provider=fixture profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
+coerces
+  coerce reviewPlan(title string, plan string) -> ref<Signoff>
+rules
+  rule table_tickets
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Ticket
+    record_sources
+      schema:Ticket construct=table_row span=736..848
+    body_hash 6608165ee614706c80a806a4c91986b7
+  rule triage_ticket
+    when Ticket as ticket where ticket.status == "open"
+    when triager is available
+    reads
+      pattern:triager is available
+      schema:Ticket
+    consumes
+      schema:Ticket
+    effects
+      __then_plan kind=agent.tell binding=__then_plan key=b2f4e606aea9c1ba39c518de46a5e5f6
+      __then_signoff kind=schema.coerce binding=__then_signoff key=1b7b322ee80097a719e1f253b29c9dba
+    dependencies
+      __then_plan --succeeds--> __then_signoff
+    case_branches
+      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"approve" guard=- body_hash=66f7e5268ed0bc282d68fd7d13b7bb3e span=1409..1418
+      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"reject" guard=- body_hash=3a479b07acd8cfe3ac23b5c07b9061b3 span=1565..1573
+    body_hash 8960ad3ef129bca50f28aa24e31bf126
+rule_dependencies
+  table_tickets --schema:Ticket--> triage_ticket

@@ -1,0 +1,25 @@
+load ../infoflow-carriage.maude
+
+--- Coverage: a secret value written to a store and read back is still secret --
+--- the label survived the persistence boundary.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CARRIAGE :
+  writes(loc1, v1, secret) reads(loc1)
+  =>* C:Cfg loaded(v1, secret) .
+
+--- Coverage: a secret value sent across an instance boundary is delivered secret.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CARRIAGE :
+  sends(i1, v1, secret)
+  =>* C:Cfg delivered(i1, v1, secret) .
+
+--- Bite: the store boundary does not launder. A secret value read back is never
+--- observed as public. The RESIDUAL soup var makes any laundered read a solution,
+--- so No solution proves persistence preserves the label (I-IFC7).
+search [1] in WHIPPLESCRIPT-INFOFLOW-CARRIAGE :
+  writes(loc1, v1, secret) reads(loc1)
+  =>* loaded(v1, public) RESIDUAL:Cfg .
+
+--- Bite: the instance boundary does not launder. A secret value is never delivered
+--- as public.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CARRIAGE :
+  sends(i1, v1, secret)
+  =>* delivered(i1, v1, public) RESIDUAL:Cfg .

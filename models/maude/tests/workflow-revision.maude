@@ -1,0 +1,130 @@
+load ../kernel.maude
+
+--- Activating a revision advances the active program version and epoch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep)
+  =>*
+  Rest
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version2, epoch1)
+  revisionActivated(rootInstance, version1, version2, epoch1, keep)
+  event(revisionActivatedEvt) .
+
+--- A new-version scoped rule can fire after revision activation and its effect
+--- is attributed to the new version/epoch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep)
+  fact(issueFact)
+  scopedRuleV(rootInstance, version2, epoch1, guardedRule, issueFact, g1)
+  ruleReady(guardedRule, issueFact, g1)
+  graphV(g1, version2, epoch1, tellEff)
+  =>*
+  Rest
+  activeRevision(rootInstance, version2, epoch1)
+  scopedRuleFired(rootInstance, guardedRule, issueFact, g1)
+  graphCommitted(g1)
+  effect(tellEff, queued)
+  effectVersion(tellEff, version2, epoch1) .
+
+--- Old queued effects keep old attribution and may terminal-cancel under the
+--- queued cancellation policy.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, cancelQueued)
+  effect(tellEff, queued)
+  effectVersion(tellEff, version1, epoch0)
+  =>*
+  Rest
+  activeRevision(rootInstance, version2, epoch1)
+  effect(tellEff, cancelled)
+  effectVersion(tellEff, version1, epoch0)
+  revisionCancellationPolicy(rootInstance, version1, epoch0, cancelQueued) .
+
+--- Running effects receive a cancellation request under request-running policy
+--- and can still record a real terminal provider outcome later.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, requestRunning)
+  effect(tellEff, running)
+  effectVersion(tellEff, version1, epoch0)
+  requestable(tellEff)
+  providerRun(tellEff)
+  =>*
+  Rest
+  activeRevision(rootInstance, version2, epoch1)
+  cancellationRequested(tellEff)
+  effect(tellEff, completed)
+  effectVersion(tellEff, version1, epoch0)
+  providerRun(tellEff) .
+
+--- Terminal instances cannot revise.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instCompleted)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep)
+  =>*
+  Rest
+  activeRevision(rootInstance, version2, epoch1) .
+
+--- Old-version scoped rules cannot fire after a new revision is active.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version2, epoch1)
+  fact(issueFact)
+  scopedRuleV(rootInstance, version1, epoch0, guardedRule, issueFact, g1)
+  ruleReady(guardedRule, issueFact, g1)
+  graphV(g1, version1, epoch0, tellEff)
+  =>*
+  Rest
+  graphCommitted(g1)
+  effect(tellEff, queued) .
+
+--- Revision activation does not rewrite old effect attribution.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep)
+  effect(tellEff, queued)
+  effectVersion(tellEff, version1, epoch0)
+  =>*
+  Rest
+  effectVersion(tellEff, version2, epoch1) .
+
+--- A running cancellation request does not fabricate terminal cancellation.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, requestRunning)
+  effect(tellEff, running)
+  effectVersion(tellEff, version1, epoch0)
+  requestable(tellEff)
+  =>*
+  Rest
+  cancellationRequested(tellEff)
+  effect(tellEff, cancelled) .
+
+--- Parent revision alone cannot complete a child workflow invocation.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(rootInstance, rootWorkflow, instRunning)
+  activeRevision(rootInstance, version1, epoch0)
+  nextEpoch(epoch0, epoch1)
+  activateRevision(rootInstance, version1, version2, epoch0, epoch1, keep)
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instRunning)
+  childOf(childInstance, e1)
+  =>*
+  Rest
+  effect(e1, completed) .

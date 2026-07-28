@@ -159,16 +159,47 @@ mod tests {
     use crate::content::ContentStore;
     use crate::merge::{merge_manifests, MergeOutcome, MergeSide};
 
-    fn content() -> ContentStore {
-        ContentStore::open(std::env::temp_dir().join(format!(
-            "whipplescript-working-set-{}-{}.sqlite",
+    /// A content store whose temp directory dies with it, panic included.
+    /// `Deref`/`DerefMut` keep the call sites unchanged. Owning the directory
+    /// rather than the `.sqlite` file also reclaims the `-shm`/`-wal`
+    /// sidecars.
+    struct TempContent {
+        dir: std::path::PathBuf,
+        inner: ContentStore,
+    }
+
+    impl std::ops::Deref for TempContent {
+        type Target = ContentStore;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for TempContent {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    impl Drop for TempContent {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn content() -> TempContent {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-working-set-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos(),
-        )))
-        .expect("open content store")
+        ));
+        std::fs::create_dir_all(&dir).expect("create working-set temp dir");
+        let inner = ContentStore::open(dir.join("content.sqlite")).expect("open content store");
+        TempContent { dir, inner }
     }
 
     fn seeded_base(content: &ContentStore) -> BTreeMap<String, String> {
@@ -185,8 +216,8 @@ mod tests {
     fn copy_on_write_isolation() {
         let content = content();
         let base = seeded_base(&content);
-        let ours = VirtualWorkingSet::new(&content, base.clone());
-        let sibling = VirtualWorkingSet::new(&content, base.clone());
+        let ours = VirtualWorkingSet::new(&*content, base.clone());
+        let sibling = VirtualWorkingSet::new(&*content, base.clone());
 
         assert_eq!(
             ours.read_to_string(Path::new("notes/a.md")).expect("read"),
@@ -223,7 +254,7 @@ mod tests {
     fn deletes_are_tombstoned_outcomes() {
         let content = content();
         let base = seeded_base(&content);
-        let set = VirtualWorkingSet::new(&content, base.clone());
+        let set = VirtualWorkingSet::new(&*content, base.clone());
         set.remove(Path::new("notes/a.md")).expect("remove");
         assert!(!set.exists(Path::new("notes/a.md")));
         assert!(set
@@ -241,8 +272,8 @@ mod tests {
     fn append_composes_and_identical_bodies_share_blobs() {
         let content = content();
         let base = seeded_base(&content);
-        let ours = VirtualWorkingSet::new(&content, base.clone());
-        let theirs = VirtualWorkingSet::new(&content, base);
+        let ours = VirtualWorkingSet::new(&*content, base.clone());
+        let theirs = VirtualWorkingSet::new(&*content, base);
         ours.append(Path::new("notes/a.md"), b" + more")
             .expect("append");
         assert_eq!(
@@ -270,8 +301,8 @@ mod tests {
     fn working_set_manifests_feed_the_merge_engine() {
         let content = content();
         let base = seeded_base(&content);
-        let ours = VirtualWorkingSet::new(&content, base.clone());
-        let theirs = VirtualWorkingSet::new(&content, base.clone());
+        let ours = VirtualWorkingSet::new(&*content, base.clone());
+        let theirs = VirtualWorkingSet::new(&*content, base.clone());
         ours.write(Path::new("notes/a.md"), b"ours A")
             .expect("write");
         theirs

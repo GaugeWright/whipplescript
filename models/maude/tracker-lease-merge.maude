@@ -1,0 +1,114 @@
+--- Tracker claim/lease fold ACROSS the merge boundary (DR-0044 formal-
+--- verification follow-on to the cross-clone lease-destruction bug). The
+--- existing `tracker-lease.maude` proves per-store exclusivity; `tracker-
+--- merge.maude` proves the field-conflict fold is order-free. NEITHER covered
+--- the seam where the bug lived: minting a lease IDENTITY and then folding
+--- two clones' claim events through set-union. This model closes that seam,
+--- per the review rule "a merge model must cover every event kind the fold
+--- consumes, and must include identity minting whenever the projection it
+--- verifies is keyed by that identity."
+---
+--- Abstraction: after set-union, the merged log is an ACU soup of accepted
+--- events inside a `t(_)` wrapper (same discipline as tracker-merge: the fold
+--- rule must see the WHOLE soup). Events:
+---   acq(Id, Iss, Actor)  a claim.acquired event; its lease_id IS Id.
+---   rel(Id)              a claim.released/expired naming that acquire's id.
+--- The fold derives one `lease(Id, Iss, Actor)` per unreleased acquire,
+--- KEYED BY THE ACQUIRE'S OWN Id -- content-addressed, so two clones' first
+--- claims on the same issue carry DISTINCT ids and BOTH survive.
+---
+--- The bug: lease_id was minted from the clone-LOCAL alias ("L-WS-1-0" on
+--- both clones), so the projection key COLLIDED and the import fold's INSERT
+--- OR IGNORE silently dropped one lease. The negative fixture TRACKER-LEASE-
+--- MERGE-ALIAS keys the lease by ISSUE alone (the collision) and reproduces
+--- exactly that lost-lease outcome, which the good fold makes unreachable.
+mod TRACKER-LEASE-MERGE is
+  protecting BOOL .
+
+  sorts Id Iss Actor Cfg Sys .
+
+  ops i1 i2 : -> Id [ctor] .              --- content-addressed acquire ids
+  ops s1 s2 : -> Iss [ctor] .             --- issues (merge identity / content_id)
+  ops alice bob : -> Actor [ctor] .       --- claiming actors
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op acq : Id Iss Actor -> Cfg [ctor] .   --- claim.acquired; lease_id = Id
+  op rel : Id -> Cfg [ctor] .             --- claim.released/expired for lease Id
+  op lease : Id Iss Actor -> Cfg [ctor] . --- derived live lease, keyed by Id
+
+  op t : Cfg -> Sys [ctor] .
+
+  vars I I2 : Id .
+  vars S S2 : Iss .
+  vars A A2 : Actor .
+  var C : Cfg .
+
+  --- Was acquire I released anywhere in the merged log?
+  op released : Id Cfg -> Bool .
+  eq released(I, (rel(I) C)) = true .
+  eq released(I, C) = false [owise] .
+
+  --- Is there already a lease keyed by I? (the INSERT OR IGNORE guard, keyed
+  --- by the acquire's own content id)
+  op hasLease : Id Cfg -> Bool .
+  eq hasLease(I, (lease(I, S, A) C)) = true .
+  eq hasLease(I, C) = false [owise] .
+
+  --- Does any live lease name actor A? (for the lost-lease bite)
+  op hasActorLease : Actor Cfg -> Bool .
+  eq hasActorLease(A, (lease(I, S, A) C)) = true .
+  eq hasActorLease(A, C) = false [owise] .
+
+  --- Fold: an unreleased acquire with no lease yet for its id grants one.
+  crl [grant] : t(acq(I, S, A) C)
+      => t(lease(I, S, A) acq(I, S, A) C)
+    if released(I, (acq(I, S, A) C)) = false
+    /\ hasLease(I, (acq(I, S, A) C)) = false .
+endm
+
+--- Negative fixture (bite): the ALIAS-keyed fold. It keys the lease by ISSUE
+--- -- both clones' first claims mint the same L-{alias}-0 key -- and it
+--- refuses a second lease for an issue that already has one -- exactly INSERT
+--- OR IGNORE on the colliding primary key. Two distinct-actor concurrent
+--- claims on one issue lose one lease. This is the real pre-fix behaviour.
+mod TRACKER-LEASE-MERGE-ALIAS is
+  protecting BOOL .
+
+  sorts Id Iss Actor Cfg Sys .
+  ops i1 i2 : -> Id [ctor] .
+  ops s1 s2 : -> Iss [ctor] .
+  ops alice bob : -> Actor [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op acq : Id Iss Actor -> Cfg [ctor] .
+  op rel : Id -> Cfg [ctor] .
+  op lease : Id Iss Actor -> Cfg [ctor] .
+  op t : Cfg -> Sys [ctor] .
+
+  vars I I2 : Id .
+  vars S S2 : Iss .
+  vars A A2 : Actor .
+  var C : Cfg .
+
+  op released : Id Cfg -> Bool .
+  eq released(I, (rel(I) C)) = true .
+  eq released(I, C) = false [owise] .
+
+  --- The collision: a lease already exists FOR THIS ISSUE (regardless of which
+  --- acquire minted it) -- the alias key ignores the acquire id.
+  op hasLeaseForIssue : Iss Cfg -> Bool .
+  eq hasLeaseForIssue(S, (lease(I, S, A) C)) = true .
+  eq hasLeaseForIssue(S, C) = false [owise] .
+
+  op hasActorLease : Actor Cfg -> Bool .
+  eq hasActorLease(A, (lease(I, S, A) C)) = true .
+  eq hasActorLease(A, C) = false [owise] .
+
+  crl [grant] : t(acq(I, S, A) C)
+      => t(lease(I, S, A) acq(I, S, A) C)
+    if released(I, (acq(I, S, A) C)) = false
+    /\ hasLeaseForIssue(S, (acq(I, S, A) C)) = false .
+endm

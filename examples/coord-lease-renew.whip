@@ -7,6 +7,8 @@
 # completes. Renewing before expiry keeps a long-running holder's claim alive
 # without dropping and re-contending for the slot.
 
+use std.coord
+
 workflow Renewer
 
 output result Done

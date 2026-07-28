@@ -1,0 +1,56 @@
+load ../chat-fork.maude
+
+--- The corruption pattern throughout: a QUIET instance whose own line's
+--- head folds more turns than its thread remembers -- files from turns
+--- the conversation has never heard of.
+
+--- Hazard demonstrated: a shared-branch fork lets the fork's turn move
+--- the source's line. The source (quiet, thread z) then sits on a head
+--- that folds a turn it never took.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkShared(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go
+  =>* quiet(I:Iid) inst(I:Iid, N:Cnt) bound(I:Iid, B:Bid) br(B:Bid, H:Cnt) RESIDUAL:Cfg
+  such that lt(N:Cnt, H:Cnt) .
+
+--- Hazard demonstrated: a mid-turn fork births an incoherent instance --
+--- the forked branch already carries the in-flight turn's writes, the
+--- seeded thread does not.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkMid(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go
+  =>* quiet(I:Iid) inst(I:Iid, N:Cnt) bound(I:Iid, B:Bid) br(B:Bid, H:Cnt) RESIDUAL:Cfg
+  such that lt(N:Cnt, H:Cnt) .
+
+--- Hazard demonstrated: seeding the thread at an older coordinate while
+--- forking the branch at head births the same incoherence.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkStale(i1, i2, z) quiet(i1) inst(i1, s(z)) bound(i1, b1) br(b1, s(z))
+  =>* quiet(I:Iid) inst(I:Iid, N:Cnt) bound(I:Iid, B:Bid) br(B:Bid, H:Cnt) RESIDUAL:Cfg
+  such that lt(N:Cnt, H:Cnt) .
+
+--- Bite: under the sound fork (quiescence + fresh branch at head + seed
+--- at the latest turn) the corruption pattern is unreachable, however
+--- the fork and the turns interleave.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkReq(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go go
+  =>* quiet(I:Iid) inst(I:Iid, N:Cnt) bound(I:Iid, B:Bid) br(B:Bid, H:Cnt) RESIDUAL:Cfg
+  such that lt(N:Cnt, H:Cnt) .
+
+--- Bite: the sound fork never shares a line -- two instances bound to
+--- one branch are unreachable (divergent histories of "the same" run
+--- cannot exist).
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkReq(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go go
+  =>* bound(I:Iid, B:Bid) bound(I2:Iid, B:Bid) RESIDUAL:Cfg
+  such that I:Iid =/= I2:Iid .
+
+--- Coverage: the fork lands and advances its OWN line; the source's
+--- branch never moves.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkReq(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go
+  =>* inst(i2, s(z)) bound(i2, nb(i2)) br(nb(i2), s(z)) br(b1, z) RESIDUAL:Cfg .
+
+--- Coverage: the fork preserves the source -- it keeps taking turns on
+--- its own line while the fork's line stays put.
+search [1] in WHIPPLESCRIPT-CHAT-FORK :
+  forkReq(i1, i2) quiet(i1) inst(i1, z) bound(i1, b1) br(b1, z) go
+  =>* inst(i1, s(z)) br(b1, s(z)) inst(i2, z) br(nb(i2), z) RESIDUAL:Cfg .

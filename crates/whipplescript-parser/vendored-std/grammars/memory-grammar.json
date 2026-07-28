@@ -1,0 +1,34 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.memory",
+  "name": "std.memory",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.memory",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "memory.memory_pool",
+          "construct_family": "declaration_block",
+          "keyword": "memory pool",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "memory pool",
+            "clauses": [
+              {
+                "name": "context limit",
+                "kind": "scalar",
+                "required": false,
+                "list": false,
+                "unknown_hint": "the only memory pool field is `context limit <n>`",
+                "missing_summary": "add `context limit <n>` inside the memory pool block"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+load ../script-capability-seeding.maude
+
+--- Coverage: both keys turn -- import present AND operator authority exists --
+--- so the capability seeds and the exec effect is admitted.
+search [1] in WHIPPLESCRIPT-SCRIPT-CAPABILITY-SEEDING :
+  unseeded(judge) importsScript operatorAuthority(judge) execEffect(judge)
+  =>* admitted(judge) RESIDUAL:Cfg .
+
+--- Bite (forged IR): the import line is forgeable, but without the
+--- operator-plane authority the seed never happens and the effect never
+--- admits. If [seed] keyed on the import alone, this would find a solution.
+search [1] in WHIPPLESCRIPT-SCRIPT-CAPABILITY-SEEDING :
+  unseeded(judge) importsScript execEffect(judge)
+  =>* admitted(judge) RESIDUAL:Cfg .
+
+--- Bite (no import): operator authority alone does not seed either -- the
+--- program must consent via `use std.script`. If [seed] keyed on authority
+--- alone, this would find a solution.
+search [1] in WHIPPLESCRIPT-SCRIPT-CAPABILITY-SEEDING :
+  unseeded(raw) operatorAuthority(raw) execEffect(raw)
+  =>* admitted(raw) RESIDUAL:Cfg .
+
+quit .

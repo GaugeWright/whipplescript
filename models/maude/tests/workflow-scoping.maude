@@ -1,0 +1,51 @@
+load ../workflow-scoping.maude
+
+--- Coverage: a reference to a top-level global resolves from any workflow.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n1) globals(n1) locals(wA, mtNames)
+  =>* C:Cfg resolved(wA, n1) .
+
+--- Coverage: a reference to the workflow's own local resolves.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n2) globals(mtNames) locals(wA, n2)
+  =>* C:Cfg resolved(wA, n2) .
+
+--- Coverage: a shared global resolves in two different workflows -- top-level
+--- names are public across the include closure.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n1) use(wB, n1) globals(n1) locals(wA, mtNames) locals(wB, mtNames)
+  =>* C:Cfg resolved(wA, n1) resolved(wB, n1) .
+
+--- Coverage: wA referencing a name that is only wB's local LEAKS. wB declares n2
+--- locally; wA does not, and it is not global, so wA's reference is out of scope.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n2) globals(mtNames) locals(wA, n1) locals(wB, n2)
+  =>* C:Cfg leaked(wA, n2) .
+
+--- Coverage: a program with no explicit workflow is rejected as headerless.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  entry(absent) verdict(pending)
+  =>* C:Cfg verdict(rejected) .
+
+--- Coverage: a program that declares at least one workflow is accepted.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  entry(present) verdict(pending)
+  =>* C:Cfg verdict(ok) .
+
+--- Bite: a global reference is NEVER leaked. The RESIDUAL soup var means any
+--- leaked token in any reachable state is a solution, so No solution proves a
+--- global is always in scope.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n1) globals(n1) locals(wA, mtNames)
+  =>* leaked(W:Wf, N:Name) RESIDUAL:Cfg .
+
+--- Bite: a workflow's own local reference is NEVER leaked -- own locals are in
+--- scope, so wA referencing its local n2 never flags a sibling leak.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  use(wA, n2) globals(mtNames) locals(wA, n2) locals(wB, n3)
+  =>* leaked(W:Wf, N:Name) RESIDUAL:Cfg .
+
+--- Bite: a program that declares a workflow is NEVER rejected as headerless.
+search [1] in WHIPPLESCRIPT-WORKFLOW-SCOPING :
+  entry(present) verdict(pending)
+  =>* verdict(rejected) RESIDUAL:Cfg .

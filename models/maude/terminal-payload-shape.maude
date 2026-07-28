@@ -1,0 +1,62 @@
+--- Workflow terminal payload shape: class-shaped vs scalar, per spec/language.md
+--- "Workflow Contracts And Invocation". A workflow output/failure contract is
+--- either a CLASS (has fields) or a SCALAR primitive (number/string/bool). The
+--- terminal action's payload must match the contract's shape:
+---   * a class contract takes a `{ field ... }` block whose fields typecheck;
+---   * a scalar contract takes a bare scalar value whose type matches the primitive.
+--- A shape mismatch (block against a scalar contract, or a bare scalar against a
+--- class contract) is rejected, as is a scalar value whose primitive type differs
+--- from the contract. Companion to validate_workflow_terminal_payload in the
+--- parser (producer side). This model abstracts fields/values to a well-formed
+--- flag + a primitive tag and checks by search that each shape pairs correctly.
+mod WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE is
+  protecting BOOL .
+
+  sorts Prim Contract Payload Verdict Cfg .
+
+  ops numberT stringT boolT : -> Prim [ctor] .   --- scalar primitive tags
+
+  --- A contract is class-shaped or a scalar of some primitive.
+  op classContract : -> Contract [ctor] .
+  op scalarContract : Prim -> Contract [ctor] .
+
+  --- A payload is a field block (well-formed flag) or a scalar value of a primitive.
+  op blockPayload : Bool -> Payload [ctor] .     --- Bool = fields typecheck
+  op scalarPayload : Prim -> Payload [ctor] .    --- primitive of the given value
+
+  ops pending accepted rejected : -> Verdict [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op contract : Contract -> Cfg [ctor] .
+  op payload : Payload -> Cfg [ctor] .
+  op verdict : Verdict -> Cfg [ctor] .
+
+  var P : Prim .
+  var WF : Bool .
+
+  --- Class contract + a well-formed field block: accepted.
+  rl [class-ok] : contract(classContract) payload(blockPayload(true)) verdict(pending)
+      => contract(classContract) payload(blockPayload(true)) verdict(accepted) .
+
+  --- Class contract + an ill-formed field block: rejected (field typecheck failure).
+  rl [class-bad-fields] : contract(classContract) payload(blockPayload(false)) verdict(pending)
+      => contract(classContract) payload(blockPayload(false)) verdict(rejected) .
+
+  --- Class contract + a bare scalar payload: shape mismatch, rejected.
+  rl [class-vs-scalar] : contract(classContract) payload(scalarPayload(P)) verdict(pending)
+      => contract(classContract) payload(scalarPayload(P)) verdict(rejected) .
+
+  --- Scalar contract + a matching scalar value: accepted.
+  rl [scalar-ok] : contract(scalarContract(P)) payload(scalarPayload(P)) verdict(pending)
+      => contract(scalarContract(P)) payload(scalarPayload(P)) verdict(accepted) .
+
+  --- Scalar contract + a scalar of a different primitive: type mismatch, rejected.
+  crl [scalar-type-mismatch] : contract(scalarContract(P)) payload(scalarPayload(Q:Prim)) verdict(pending)
+      => contract(scalarContract(P)) payload(scalarPayload(Q:Prim)) verdict(rejected)
+      if P =/= Q:Prim .
+
+  --- Scalar contract + a field block: shape mismatch, rejected.
+  rl [scalar-vs-block] : contract(scalarContract(P)) payload(blockPayload(WF)) verdict(pending)
+      => contract(scalarContract(P)) payload(blockPayload(WF)) verdict(rejected) .
+endm

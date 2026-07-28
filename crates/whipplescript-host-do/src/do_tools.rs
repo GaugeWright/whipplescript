@@ -15,21 +15,24 @@
 //!
 //! Tool SCHEMAS mirror the native set exactly (so a program's model sees the same
 //! tools on either backend); the schemas are the contract, this is a second
-//! implementation of the same behavior. `bash` is intentionally NOT here — the
-//! in-isolate command surface is the separate bashkit initiative.
+//! implementation of the same behavior. `bash` runs through the shared
+//! placement-neutral `WhipShell` adapter over a preloaded workspace snapshot.
 //!
 //! A tool ERROR is a `ToolOutcome { status: Error, .. }`, never a Rust error: a
 //! failed tool result is informative to the model (it retries), not a turn
 //! failure (DR-0024 boundary corollary). All returned content is capped at
 //! [`DEFAULT_MAX_BYTES`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use whipplescript_kernel::effect_handlers::glob_match;
 use whipplescript_kernel::harness_loop::{
     ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
+use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::RuntimeStore;
 
@@ -46,6 +49,7 @@ const TOOL_RECALL: &str = "recall";
 const TOOL_LIST_TODOS: &str = "list_todos";
 const TOOL_ADD_TODO: &str = "add_todo";
 const TOOL_UPDATE_TODO: &str = "update_todo";
+const TOOL_BASH: &str = "bash";
 
 /// Default cap on a single tool's returned content (mirrors native).
 const DEFAULT_MAX_BYTES: usize = 50_000;
@@ -67,12 +71,25 @@ const DO_TRACKER_QUEUE: &str = "agent";
 /// so `list_todos` can distinguish agent- from rule-filed items.
 const DO_TRACKER_HOLDER: &str = "agent";
 
-/// The 8 model-facing tools the DO agent turn advertises (read/write/edit/ls/
-/// find/grep/recall + the 3 tracker todos), with schemas mirroring the native
-/// set exactly. No profile filtering in v1 — the DO turn offers the full set.
+/// The model-facing tools the DO agent turn advertises, with schemas mirroring
+/// the native set exactly. No profile filtering in v1 — the DO turn offers the
+/// full set admitted by the package.
 pub fn do_tool_specs() -> Vec<ToolSpec> {
     let mut specs = file_tool_specs();
     specs.extend(tracker_tool_specs());
+    specs.push(ToolSpec {
+        name: TOOL_BASH.into(),
+        description: "Run governed virtual bash over the placement workspace.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" },
+                "timeout": { "type": "integer", "minimum": 1, "maximum": 30 }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+    });
     specs
 }
 
@@ -247,11 +264,26 @@ fn tracker_tool_specs() -> Vec<ToolSpec> {
 /// SQLite round against the one DO SQLite.
 pub struct DoToolExecutor<Sql: DoSql> {
     sql: Rc<Sql>,
+    key_prefix: String,
 }
 
 impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn new(sql: Rc<Sql>) -> Self {
-        Self { sql }
+        Self {
+            sql,
+            key_prefix: String::new(),
+        }
+    }
+
+    pub fn for_instance(sql: Rc<Sql>, instance_id: &str) -> Self {
+        Self {
+            sql,
+            key_prefix: format!("{instance_id}/"),
+        }
+    }
+
+    fn storage_key(&self, path: &str) -> String {
+        format!("{}{path}", self.key_prefix)
     }
 
     /// A store view over the shared handle, for the content-blob (`put_content` /
@@ -274,6 +306,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             TOOL_LIST_TODOS => self.list_todos(args),
             TOOL_ADD_TODO => self.add_todo(args),
             TOOL_UPDATE_TODO => self.update_todo(args),
+            TOOL_BASH => self.bash(args),
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -282,11 +315,12 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     /// Current content of `key`, or `None` if the row does not exist.
     fn file_content(&self, key: &str) -> Result<Option<String>, String> {
+        let storage_key = self.storage_key(key);
         let rows = self
             .sql
             .query(
                 "SELECT content FROM files WHERE key = ?1",
-                &[SqlValue::Text(key.to_owned())],
+                &[SqlValue::Text(storage_key)],
             )
             .map_err(|error| format!("read of `{key}` failed: {error}"))?;
         Ok(rows.first().map(|row| as_text(&row[0])))
@@ -305,7 +339,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 "INSERT INTO files (key, content) VALUES (?1, ?2) \
                  ON CONFLICT(key) DO UPDATE SET content = excluded.content",
                 &[
-                    SqlValue::Text(key.to_owned()),
+                    SqlValue::Text(self.storage_key(key)),
                     SqlValue::Text(content.to_owned()),
                 ],
             )
@@ -315,15 +349,85 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     /// All `files` keys, sorted, capped at [`MAX_FILES_WALKED`].
     fn all_keys(&self) -> Result<Vec<String>, String> {
-        let rows = self
-            .sql
-            .query("SELECT key FROM files ORDER BY key", &[])
+        let rows = if self.key_prefix.is_empty() {
+            self.sql.query("SELECT key FROM files ORDER BY key", &[])
+        } else {
+            self.sql.query(
+                "SELECT substr(key, length(?1) + 1) FROM files WHERE key LIKE ?1 || '%' ORDER BY key",
+                &[SqlValue::Text(self.key_prefix.clone())],
+            )
+        }
             .map_err(|error| format!("list files failed: {error}"))?;
         Ok(rows
             .iter()
             .take(MAX_FILES_WALKED)
             .map(|row| as_text(&row[0]))
             .collect())
+    }
+
+    fn bash(&self, args: &Value) -> Result<String, String> {
+        let command = str_arg(args, "command")?.trim();
+        let timeout = args
+            .get("timeout")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, 30);
+        let keys = self.all_keys()?;
+        let mut before = BTreeMap::new();
+        let mut files = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(content) = self.file_content(&key)? else {
+                continue;
+            };
+            before.insert(key.clone(), content.clone().into_bytes());
+            files.push(ShellFile {
+                path: key,
+                content: content.into_bytes(),
+                writable: true,
+            });
+        }
+
+        let output = WhipShell::default().execute(ShellRequest {
+            command: command.to_owned(),
+            files,
+            timeout: Duration::from_secs(timeout),
+        })?;
+
+        // Validate the complete result before importing any delta. The v1 DO
+        // file plane is UTF-8 text; a binary result fails honestly instead of
+        // corrupting the flat SQLite representation.
+        let mut after = BTreeMap::new();
+        for (path, bytes) in output.files {
+            let content = String::from_utf8(bytes)
+                .map_err(|_| format!("bash produced binary workspace file `{path}`"))?;
+            after.insert(path, content);
+        }
+        for (path, content) in &after {
+            if before.get(path).map(Vec::as_slice) != Some(content.as_bytes()) {
+                self.store_file(path, content)?;
+            }
+        }
+        let remaining = after.keys().cloned().collect::<BTreeSet<_>>();
+        for removed in before.keys().filter(|path| !remaining.contains(*path)) {
+            let storage_key = self.storage_key(removed);
+            self.sql
+                .execute(
+                    "DELETE FROM files WHERE key = ?1",
+                    &[SqlValue::Text(storage_key)],
+                )
+                .map_err(|error| format!("delete of `{removed}` failed: {error}"))?;
+        }
+
+        let mut combined = output.stdout;
+        combined.push_str(&output.stderr);
+        if output.exit_code == 0 {
+            Ok(combined)
+        } else {
+            Err(format!(
+                "command exited with status {}\n{combined}",
+                output.exit_code
+            ))
+        }
     }
 
     fn read(&self, args: &Value) -> Result<String, String> {
@@ -597,7 +701,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         match status {
             "in_progress" => {
                 store
-                    .claim_item(id, &holder)
+                    .claim_item(id, &holder, None)
                     .map_err(|error| format!("claim: {error:?}"))?;
             }
             "completed" => {
@@ -854,6 +958,44 @@ mod tests {
     }
 
     #[test]
+    fn governed_host_instances_do_not_share_workspace_keys() {
+        let sql = Rc::new(store().sql);
+        let first = DoToolExecutor::for_instance(Rc::clone(&sql), "instance-a");
+        let second = DoToolExecutor::for_instance(sql, "instance-b");
+        assert_eq!(
+            first
+                .execute(&call(
+                    "write",
+                    json!({ "path": "same.txt", "content": "a" })
+                ))
+                .status,
+            ToolStatus::Ok,
+        );
+        assert_eq!(
+            second
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .status,
+            ToolStatus::Error,
+        );
+        second.execute(&call(
+            "write",
+            json!({ "path": "same.txt", "content": "b" }),
+        ));
+        assert_eq!(
+            first
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .content,
+            "a",
+        );
+        assert_eq!(
+            second
+                .execute(&call("read", json!({ "path": "same.txt" })))
+                .content,
+            "b",
+        );
+    }
+
+    #[test]
     fn write_captures_rc1_history_blob() {
         let exec = executor();
         exec.execute(&call(
@@ -1057,15 +1199,41 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_is_an_error_outcome() {
+    fn bash_uses_the_do_workspace_and_imports_its_delta() {
         let exec = executor();
-        let out = exec.execute(&call("bash", json!({ "command": "ls" })));
-        assert_eq!(out.status, ToolStatus::Error);
-        assert!(out.content.contains("unknown tool"));
+        exec.execute(&call(
+            "write",
+            json!({ "path": "input.txt", "content": "hello\n" }),
+        ));
+        let out = exec.execute(&call(
+            "bash",
+            json!({ "command": "cat input.txt | tr a-z A-Z > output.txt" }),
+        ));
+        assert_eq!(out.status, ToolStatus::Ok);
+        let read = exec.execute(&call("read", json!({ "path": "output.txt" })));
+        assert_eq!(read.content, "HELLO");
     }
 
     #[test]
-    fn do_tool_specs_advertises_the_eight_tools() {
+    fn bash_environment_is_closed_and_has_no_host_credentials() {
+        let out = executor().execute(&call("bash", json!({ "command": "env" })));
+        assert_eq!(out.status, ToolStatus::Ok);
+        assert!(out.content.lines().any(|line| line == "HOME=/workspace"));
+        for forbidden in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "WHIP_EXECUTOR_TOKEN",
+            "canary-provider-secret",
+        ] {
+            assert!(
+                !out.content.contains(forbidden),
+                "virtual bash inherited forbidden host material: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn do_tool_specs_advertises_virtual_bash() {
         let names: Vec<String> = do_tool_specs().into_iter().map(|s| s.name).collect();
         for expected in [
             "read",
@@ -1078,12 +1246,9 @@ mod tests {
             "list_todos",
             "add_todo",
             "update_todo",
+            "bash",
         ] {
             assert!(names.contains(&expected.to_string()), "missing {expected}");
         }
-        assert!(
-            !names.contains(&"bash".to_string()),
-            "bash must not be offered"
-        );
     }
 }

@@ -3,6 +3,7 @@
     "target": "es2022",
     "module": "es2022",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "lib": ["es2022"],
     "types": ["@cloudflare/workers-types"],
     "strict": true,
@@ -10,5 +11,6 @@
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src/**/*.ts", "src/**/*.d.ts"]
+  "include": ["src/**/*.ts", "src/**/*.d.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }

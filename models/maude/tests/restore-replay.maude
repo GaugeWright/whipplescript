@@ -1,0 +1,39 @@
+load ../restore-replay.maude
+
+--- INV-R1 coverage: folding se(1,10) ; se(2,20) ; rm(3,1) ; se(4,40) reaches
+--- EXACTLY the live head -- fact 10 (seq 1 <= target 1) survives, fact 20 (seq 2
+--- > target) is abandoned, fact 40 (appended after the marker) is live. The
+--- normal form carries precisely {live(1,10), live(4,40)}.
+search in RESTORE-REPLAY :
+  { none || se(1, 10) ; se(2, 20) ; rm(3, 1) ; se(4, 40) ; nilE }
+  =>! { live(1, 10) live(4, 40) || nilE } .
+
+--- INV-R2 bite (CRUX -- abandoned branch excluded): the abandoned fact 20 (in
+--- the (target, marker) span) is NEVER in the completed projection. It is live
+--- only transiently, before the marker folds; the drop removes it and it never
+--- returns. No normal form carries live(2, 20) -- No solution. (A =>* would find
+--- the transient pre-marker state, which is why the fold must be COMPLETE --
+--- rest = nilE, a normal form -- for the coherence claim to bite.)
+search in RESTORE-REPLAY :
+  { none || se(1, 10) ; se(2, 20) ; rm(3, 1) ; se(4, 40) ; nilE }
+  =>! { live(2, 20) RESIDUAL:Cfg || nilE } .
+
+--- INV-R3 coverage (nesting): se(1,10) ; se(2,20) ; rm(3,2) ; se(4,40) ;
+--- rm(5,1) ; se(6,60). The first restore (to 2) keeps 10 and 20; then 40 is
+--- appended; the second restore (to 1) drops 20 AND 40 -- the first restore's
+--- own post-work -- leaving 10; then 60 is appended. Live head {10, 60}.
+search in RESTORE-REPLAY :
+  { none || se(1, 10) ; se(2, 20) ; rm(3, 2) ; se(4, 40) ; rm(5, 1) ;
+    se(6, 60) ; nilE }
+  =>! { live(1, 10) live(6, 60) || nilE } .
+
+--- INV-R3 bite (CRUX -- nested restore drops the intermediate layer): fact 40,
+--- appended after the FIRST restore, is abandoned by the SECOND restore to an
+--- earlier target. No completed projection carries live(4, 40) -- No solution.
+--- Restores compose; no abandoned fact from any layer survives the fold.
+search in RESTORE-REPLAY :
+  { none || se(1, 10) ; se(2, 20) ; rm(3, 2) ; se(4, 40) ; rm(5, 1) ;
+    se(6, 60) ; nilE }
+  =>! { live(4, 40) RESIDUAL:Cfg || nilE } .
+
+quit .

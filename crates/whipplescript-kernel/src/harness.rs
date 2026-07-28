@@ -26,6 +26,11 @@ pub enum ProviderRunStatus {
     Completed,
     Failed,
     TimedOut,
+    /// A deliberate cancellation. Distinct from `Failed` so the effect settles
+    /// `cancelled` (auto-fail-exempt; observed by `after x cancelled`) — the
+    /// brokered/DO path used to collapse this into `Failed`, firing `fails`
+    /// arms and losing the cancel semantics.
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -521,25 +526,6 @@ impl AgentHarness for ClaudeCodeAgentHarness {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PiStyleAgentHarness {
-    inner: CommandAgentHarness,
-}
-
-impl PiStyleAgentHarness {
-    pub fn new(plan: CommandLaunchPlan) -> Self {
-        Self {
-            inner: CommandAgentHarness::new(plan),
-        }
-    }
-}
-
-impl AgentHarness for PiStyleAgentHarness {
-    fn run(&self, request: AgentTurnRequest) -> ProviderRunResult {
-        self.inner.run(request)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MockAgentHarness {
     result: ProviderRunResult,
 }
@@ -766,7 +752,7 @@ pub(crate) const CONTROL_PLANE_SECRET_ENV: &[&str] = &[
 
 /// Remove whip's control-plane secrets from a child command's inherited
 /// environment. Applied to every provider subprocess spawn.
-pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
+pub fn strip_control_plane_secrets(command: &mut Command) {
     strip_env_vars(command, CONTROL_PLANE_SECRET_ENV);
 }
 
@@ -774,14 +760,14 @@ pub(crate) fn strip_control_plane_secrets(command: &mut Command) {
 /// only needs its OWN family's credentials, so — least privilege — each spawn
 /// strips the OTHER families' keys: the Claude sidecar has no business seeing
 /// an OpenAI key, nor the codex app-server an Anthropic key. (The child's own
-/// family is left inherited; it may read it directly.)
-#[cfg(feature = "codex")]
-pub(crate) const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
-#[cfg(feature = "claude")]
-pub(crate) const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
+/// family is left inherited; it may read it directly.) Both are unconditional
+/// pub: the external whipplescript-provider-codex / -claude crates strip the
+/// other family's key when spawning their sidecar (DR-0024 split).
+pub const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
+pub const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
 
 /// Remove the named env vars from a child command's inherited environment.
-pub(crate) fn strip_env_vars(command: &mut Command, names: &[&str]) {
+pub fn strip_env_vars(command: &mut Command, names: &[&str]) {
     for name in names {
         command.env_remove(name);
     }
@@ -1241,21 +1227,12 @@ mod tests {
                 .arg("-c")
                 .arg("cat >/dev/null"),
         );
-        let pi = PiStyleAgentHarness::new(
-            CommandLaunchPlan::new("pi", "sh")
-                .arg("-c")
-                .arg("cat >/dev/null"),
-        );
 
         assert_eq!(
             codex.run(request.clone()).status,
             ProviderRunStatus::Completed
         );
-        assert_eq!(
-            claude.run(request.clone()).status,
-            ProviderRunStatus::Completed
-        );
-        assert_eq!(pi.run(request).status, ProviderRunStatus::Completed);
+        assert_eq!(claude.run(request).status, ProviderRunStatus::Completed);
     }
 
     fn test_request() -> AgentTurnRequest {

@@ -1,0 +1,73 @@
+--- Per-turn workspace-cut witnessing, per DR-0036 section 1: the terminal
+--- receipt's workspace cut is the runtime's own claim of the turn's
+--- COMPLETE workspace delta. A harness that cannot witness every mutation
+--- must DECLINE (no cut reference) rather than fabricate -- consumers
+--- treat absence as "unwitnessed", never as "no changes".
+---
+--- Two finishers over one turn. Mediated writes (the resolver performs
+--- them) are witnessed one-for-one. A native command is an unmediated
+--- mutation channel: the disk moves without the witness seeing it. The
+--- NAIVE finisher claims the witnessed set as THE cut regardless -- a
+--- receipt that under-reports the delta, the modeled hazard (an
+--- advancement gate reads "these are all the writes" and auto-merges work
+--- it never saw). The SOUND finisher claims a cut only while the turn is
+--- clean; once tainted it declines honestly. The turn closes when the
+--- finisher runs: no mutation channel outlives the receipt.
+mod WHIPPLESCRIPT-TURN-WITNESS is
+  sorts Cnt Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op disk : Cnt -> Cfg [ctor] .    --- actual mutations on the workspace
+  op seen : Cnt -> Cfg [ctor] .    --- mutations the witness performed itself
+  op w : -> Cfg [ctor] .           --- a pending mediated write
+  op cmd : -> Cfg [ctor] .         --- a pending native command
+  op clean : -> Cfg [ctor] .       --- no unmediated channel has run
+  op tainted : -> Cfg [ctor] .     --- an unmediated channel ran
+  op open : -> Cfg [ctor] .        --- the turn is still executing
+
+  op fin : -> Cfg [ctor] .         --- the sound finisher's trigger
+  op naiveFin : -> Cfg [ctor] .    --- the naive finisher's trigger
+  op cut : Cnt -> Cfg [ctor] .     --- receipt: "the complete delta is K writes"
+  op declined : -> Cfg [ctor] .    --- receipt: "unwitnessed", honestly absent
+
+  vars N K M : Cnt .
+
+  eq lt(z, s(M)) = true .
+  eq lt(s(K), s(M)) = lt(K, M) .
+  eq lt(M, z) = false .
+
+  --- A mediated write: the resolver performs it, so the witness sees it.
+  rl [mediated-write] :
+      open w disk(N) seen(K)
+      => open disk(s(N)) seen(s(K)) .
+
+  --- A native command mutates the workspace outside the mediated surface:
+  --- the disk moves, the witness does not, and the turn is tainted.
+  rl [command] :
+      open cmd clean disk(N)
+      => open tainted disk(s(N)) .
+
+  --- The naive finisher: claims the witnessed set as the complete cut no
+  --- matter what else ran. That blindness is the modeled hazard.
+  rl [naive-finish] :
+      open naiveFin seen(K)
+      => seen(K) cut(K) .
+
+  --- The sound finisher, clean turn: every mutation was mediated, so the
+  --- witnessed set IS the delta -- claim it (zero writes claim the
+  --- explicitly-empty cut, distinguishable from declining).
+  rl [sound-finish] :
+      open fin clean seen(K)
+      => clean seen(K) cut(K) .
+
+  --- The sound finisher, tainted turn: decline, never fabricate.
+  rl [sound-decline] :
+      open fin tainted
+      => tainted declined .
+endm

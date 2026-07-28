@@ -1,3 +1,6 @@
+use std.agent.claude
+use std.agent.codex
+
 @service
 workflow OpenClawLite
 
@@ -7,6 +10,7 @@ workflow OpenClawLite
 # context before planning and saves the new plan after, so successive runs build
 # on what came before instead of starting cold.
 use std.memory
+use std.tracker
 
 class Heartbeat {
   job string
@@ -19,23 +23,12 @@ class Plan {
   status "ready"
 }
 
-class ReviewDecision {
-  decision string
-  decidedBy string
-}
-
 tracker backlog {
   provider builtin
 }
 
 agent planner {
   provider codex
-  profile "repo-reader"
-  capacity 1
-}
-
-agent reviewer {
-  provider claude
   profile "repo-reader"
   capacity 1
 }
@@ -85,26 +78,5 @@ rule plan_recurring_work
     }
 
     call memory.write for planned
-  }
-}
-
-rule escalate_plan_for_review
-  when Plan as plan where plan.status == "ready"
-  when reviewer is available
-=> {
-  askHuman as review choices ["approve", "revise"] """markdown
-  Review the generated maintenance plan:
-
-  {{ plan.summary }}
-  """
-}
-
-# Record the reviewer's decision once the inbox item is answered.
-rule record_review_decision
-  when human answered review as answer
-=> {
-  record ReviewDecision {
-    decision answer.choice
-    decidedBy answer.answered_by
   }
 }

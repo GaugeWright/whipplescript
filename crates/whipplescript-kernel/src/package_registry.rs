@@ -134,11 +134,22 @@ pub fn verify_contract_registry_platform_vocabulary(
                 "{construct_label} uses lowering_target `{lowering_target}` incompatible with construct_family `{family}`"
             ));
         }
+        let library_id = construct
+            .get("library_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if !lowering.package_authorable
             && !registry_construct_is_embedded_std_copy(construct, embedded_manifests)
+            && !privilege_tuple_authorizes_internal_lowering(
+                library_id,
+                keyword,
+                family,
+                scope,
+                lowering_target,
+            )
         {
             return Err(format!(
-                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs (only platform-embedded std manifests may use internal lowerings)"
+                "{construct_label}.lowering_target `{lowering_target}` is platform-internal and cannot be used by package constructs (only platform-embedded std manifests or platform-catalog privilege tuples may use internal lowerings)"
             ));
         }
         if let Some(required_scope) = lowering.required_scope {
@@ -205,6 +216,34 @@ pub fn verify_contract_registry_platform_vocabulary(
         )?;
     }
     Ok(())
+}
+
+/// Authorability door, privilege-tuple leg (std.coord slice 4; M5
+/// "Authorability door"): a platform-catalog reserved-keyword privilege tuple
+/// whose `lowering_target` is a non-package-authorable class ALSO authorizes
+/// that class — for exactly that (library, keyword, family, scope, lowering)
+/// tuple and nothing else. The catalog is compiled into the platform, so a
+/// third party can never mint a tuple; a non-privileged manifest carrying the
+/// same construct row is still rejected. Second leg alongside the S6d-5
+/// embedded-copy key (`manifest_is_embedded_copy`); modeled in
+/// models/maude/std-construct-authorization.maude (`[door-privileged]`, with
+/// keyword- and library-coordinate bite fixtures).
+pub fn privilege_tuple_authorizes_internal_lowering(
+    library_id: &str,
+    keyword: &str,
+    construct_family: &str,
+    scope: &str,
+    lowering_target: &str,
+) -> bool {
+    PLATFORM_CONSTRUCT_CATALOG
+        .reserved_keyword_privilege(
+            library_id,
+            keyword,
+            construct_family,
+            scope,
+            lowering_target,
+        )
+        .is_some()
 }
 
 pub fn reserved_keyword_privilege_error(
@@ -414,6 +453,48 @@ pub struct PackageProviderContract {
     pub provider_kind: String,
 }
 
+/// A capability-free operator-plane provider row (`"plane": "operator"`,
+/// std-telemetry.md T3): configuration an operator CLI surface reads (e.g.
+/// std.telemetry's `otlp` exporter defaults), never consulted by the effect
+/// admission gate. A distinct type — not an `Option<String>` capability on
+/// [`PackageProviderContract`] — so no admission-plane code path can reach
+/// one by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorProviderContract {
+    pub id: String,
+    pub provider_kind: String,
+    /// The row's `config` object as raw JSON text (defaults the consuming
+    /// CLI reads; env/flags override).
+    pub config_json: Option<String>,
+}
+
+/// The manifest's operator-plane provider rows (the ones
+/// `package_provider_contracts` deliberately skips).
+pub fn package_operator_providers(
+    path: &Path,
+    value: &Value,
+) -> Result<Vec<OperatorProviderContract>, String> {
+    let mut rows = Vec::new();
+    for provider in value
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if provider.get("plane").and_then(Value::as_str) != Some("operator") {
+            continue;
+        }
+        rows.push(OperatorProviderContract {
+            id: required_json_string(provider, "id", "provider")
+                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
+            provider_kind: required_json_string(provider, "provider_kind", "provider")
+                .map_err(|message| format!("{} in `{}`", message, path.display()))?,
+            config_json: provider.get("config").map(|config| config.to_string()),
+        });
+    }
+    Ok(rows)
+}
+
 /// Whether `raw_json` is byte-identical to a manifest in `embedded` (in
 /// production, `EMBEDDED_STD_MANIFESTS`; parameterized so the authorability-
 /// door privilege key is unit-testable with a synthetic manifest set). The key
@@ -421,12 +502,11 @@ pub struct PackageProviderContract {
 /// platform copy compiled into the binary — unforgeable by third parties, and
 /// a same-name different-content file gains nothing.
 ///
-/// The door admits `package_authorable: false` lowering classes only for such
-/// a copy. Today neither embedded manifest declares a non-authorable lowering
-/// (every std construct is `capability_call`), so the door is exercised only
-/// by tests; it exists so future decl-family std manifests (`signal_source` /
-/// `clock_source` / `resource_effect`) can ship embedded. A privilege-tuple
-/// catalog for third parties stays deferred.
+/// The door admits `package_authorable: false` lowering classes for such a
+/// copy — the embedded leg. Its second leg is the platform-catalog privilege
+/// tuple (`privilege_tuple_authorizes_internal_lowering`, std.coord slice 4):
+/// std.coord's embedded manifest declares four `resource_effect` constructs,
+/// admitted through either leg. Third parties hold neither key.
 pub fn manifest_is_embedded_copy(raw_json: &str, embedded: &[(&str, &str)]) -> bool {
     embedded
         .iter()
@@ -490,8 +570,15 @@ pub fn package_manifest_from_json_with_embedded(
     validate_package_manifest_identity_uniqueness(path, &value)?;
     let capabilities = package_capability_contracts(path, &value)?;
     let providers = package_provider_contracts(path, &value)?;
-    let registry =
-        package_manifest_registry(path, &value, &name, &version, &capabilities, &providers)?;
+    let registry = package_manifest_registry_with_privilege(
+        path,
+        &value,
+        &name,
+        &version,
+        &capabilities,
+        &providers,
+        privileged,
+    )?;
     validate_package_manifest_consistency(
         path,
         &value,
@@ -594,7 +681,11 @@ pub fn validate_package_manifest_consistency(
     }
 
     for contract in &registry.effect_contracts {
-        if contract.effect_kind != "capability.call" {
+        // Core effect kinds are declarable only by the platform's own embedded
+        // std copies (the same privilege door as platform-internal lowerings):
+        // e.g. std.coercion's `schema.coerce` contract, which mirrors the
+        // parser-compiled one and merge-folds against it.
+        if contract.effect_kind != "capability.call" && !privileged {
             problems.push(format!(
                 "effect contract `{}` uses unsupported effect_kind `{}`; packages currently support only `capability.call`",
                 contract.id, contract.effect_kind
@@ -654,9 +745,18 @@ pub fn validate_package_manifest_consistency(
                         ));
                     }
                 }
-                if !lowering.package_authorable && !privileged {
+                if !lowering.package_authorable
+                    && !privileged
+                    && !privilege_tuple_authorizes_internal_lowering(
+                        &form.library_id,
+                        &form.keyword,
+                        &form.construct_family,
+                        &form.scope,
+                        &form.lowering_target,
+                    )
+                {
                     problems.push(format!(
-                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering (only platform-embedded std manifests may use internal lowerings)",
+                        "construct `{}` uses platform-internal lowering_target `{}`; package constructs must use an authorable platform lowering (only platform-embedded std manifests or platform-catalog privilege tuples may use internal lowerings)",
                         form.id, form.lowering_target
                     ));
                 }
@@ -1096,15 +1196,46 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                     "effect_kind",
                     "core_effect_kind",
                     "config",
+                    "plane",
                 ],
                 problems,
             );
-            validate_manifest_required_fields(
-                provider,
-                &label,
-                &["id", "provider_kind", "capability"],
-                problems,
-            );
+            // `"plane": "operator"` marks a capability-FREE provider row
+            // (std-telemetry.md T3): configuration for an operator CLI
+            // surface, never consulted by the effect admission gate. Such a
+            // row declaring a capability would be the decorative admission
+            // row M8's honesty audit forbids, so the shapes are mutually
+            // exclusive; every non-operator row still requires a capability.
+            match provider.get("plane").and_then(Value::as_str) {
+                Some("operator") => {
+                    validate_manifest_required_fields(
+                        provider,
+                        &label,
+                        &["id", "provider_kind"],
+                        problems,
+                    );
+                    if provider.get("capability").is_some() {
+                        problems.push(format!(
+                            "{label} declares `plane: operator` and a `capability`; \
+                             operator-plane provider rows are capability-free by definition"
+                        ));
+                    }
+                }
+                Some(other) => {
+                    problems.push(format!(
+                        "{label} declares unknown plane `{other}`; the only \
+                         recognized value is `operator`"
+                    ));
+                }
+                None => {
+                    validate_manifest_required_fields(
+                        provider,
+                        &label,
+                        &["id", "provider_kind", "capability"],
+                        problems,
+                    );
+                }
+            }
             validate_manifest_string_fields(
                 provider,
                 &label,
@@ -1114,9 +1245,20 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
                     "capability",
                     "effect_kind",
                     "core_effect_kind",
+                    "plane",
                 ],
                 problems,
             );
+            // Agent-provider rows (`"agent_provider": true` in config;
+            // spec/std-agent.md "Open provider registry") may carry a compiled
+            // feature report. Its classes must be DR-0015 taxonomy members and
+            // its vocabulary the DR-0004/DR-0017 one — an unknown class is a
+            // manifest validation error (Static checks item 4).
+            if let Some(config) = provider.get("config") {
+                if config.get("agent_provider").and_then(Value::as_bool) == Some(true) {
+                    validate_agent_provider_feature_report_shape(config, &label, problems);
+                }
+            }
         },
     );
     validate_manifest_array_objects(
@@ -1194,6 +1336,60 @@ pub fn validate_package_manifest_closed_shape(path: &Path, value: &Value) -> Res
             path.display(),
             problems.join("\n- ")
         ))
+    }
+}
+
+/// Validate an agent-provider row's `config.feature_report` (spec/std-agent.md
+/// slices 5/7, Static checks item 4): every entry's `class` must be a DR-0015
+/// taxonomy member, `support` and `source` must use the DR-0004/DR-0017
+/// vocabulary, and a stated support level carries `native_name` + `dispatch`.
+/// Absence of the report is fine (the row contributes only the kind).
+fn validate_agent_provider_feature_report_shape(
+    config: &Value,
+    label: &str,
+    problems: &mut Vec<String>,
+) {
+    let Some(report) = config.get("feature_report") else {
+        return;
+    };
+    let Some(entries) = report.as_array() else {
+        problems.push(format!("{label} config.feature_report must be an array"));
+        return;
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_label = format!("{label} config.feature_report[{index}]");
+        let Some(class) = entry.get("class").and_then(Value::as_str) else {
+            problems.push(format!("{entry_label} is missing string `class`"));
+            continue;
+        };
+        if !whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY.contains(&class) {
+            problems.push(format!(
+                "{entry_label} states unknown feature class `{class}` (not in the DR-0015 taxonomy)"
+            ));
+        }
+        let support = entry.get("support").and_then(Value::as_str);
+        match support {
+            Some("native" | "emulated" | "request_only" | "unsupported" | "unknown") => {}
+            Some(other) => problems.push(format!(
+                "{entry_label} states unknown support `{other}`; expected native, emulated, request_only, unsupported, or unknown"
+            )),
+            None => problems.push(format!("{entry_label} is missing string `support`")),
+        }
+        match entry.get("source").and_then(Value::as_str) {
+            Some("compiled" | "probed") => {}
+            Some(other) => problems.push(format!(
+                "{entry_label} states unknown source `{other}`; expected compiled or probed"
+            )),
+            None => problems.push(format!("{entry_label} is missing string `source`")),
+        }
+        let stated = matches!(support, Some("native" | "emulated" | "request_only"));
+        let has_native_name = entry.get("native_name").and_then(Value::as_str).is_some();
+        let has_dispatch = entry.get("dispatch").and_then(Value::as_str).is_some();
+        if stated && (!has_native_name || !has_dispatch) {
+            problems.push(format!(
+                "{entry_label} states support without native_name + dispatch"
+            ));
+        }
     }
 }
 
@@ -1880,6 +2076,15 @@ pub fn package_provider_contracts(
         .into_iter()
         .flatten()
     {
+        // Operator-plane rows (`"plane": "operator"`, std-telemetry.md T3)
+        // are capability-free by definition and must never become effect
+        // providers: skipping them HERE is what keeps them admission-inert —
+        // no downstream registry, binding, or `effect_providers` path can
+        // ever see one. They surface only through
+        // `package_operator_providers`.
+        if provider.get("plane").and_then(Value::as_str) == Some("operator") {
+            continue;
+        }
         providers.push(PackageProviderContract {
             capability: required_json_string(provider, "capability", "provider")
                 .map_err(|message| format!("{} in `{}`", message, path.display()))?,
@@ -1897,6 +2102,33 @@ pub fn package_manifest_registry(
     version: &str,
     capabilities: &BTreeMap<String, PackageCapabilityContract>,
     providers: &[PackageProviderContract],
+) -> Result<ContractRegistry, String> {
+    package_manifest_registry_with_privilege(
+        path,
+        value,
+        name,
+        version,
+        capabilities,
+        providers,
+        false,
+    )
+}
+
+/// [`package_manifest_registry`] with the embedded-copy privilege flag: a
+/// platform-embedded std manifest may declare an effect contract whose
+/// input/output schemas are the parser's contract LABELS (e.g. std.coercion's
+/// `schema.coerce.input` / `typed-provider-output`) rather than package schema
+/// fragments — the parser is the authority for those contracts, and the
+/// registry merge (`upsert_effect_contract`) refuses a manifest copy whose
+/// shape drifts from the compiled-in one.
+pub fn package_manifest_registry_with_privilege(
+    path: &Path,
+    value: &Value,
+    name: &str,
+    version: &str,
+    capabilities: &BTreeMap<String, PackageCapabilityContract>,
+    providers: &[PackageProviderContract],
+    privileged: bool,
 ) -> Result<ContractRegistry, String> {
     let mut registry = ContractRegistry::default();
     let libraries = value.get("libraries").and_then(Value::as_array);
@@ -1921,13 +2153,14 @@ pub fn package_manifest_registry(
                 .into_iter()
                 .flatten()
             {
-                registry.upsert_effect_contract(package_effect_contract(
+                registry.upsert_effect_contract(package_effect_contract_with_privilege(
                     path,
                     contract,
                     &library_id,
                     &library_version,
                     capabilities,
                     providers,
+                    privileged,
                 )?);
             }
             for construct in library
@@ -2344,6 +2577,30 @@ pub fn package_effect_contract(
     capabilities: &BTreeMap<String, PackageCapabilityContract>,
     providers: &[PackageProviderContract],
 ) -> Result<EffectContract, String> {
+    package_effect_contract_with_privilege(
+        path,
+        value,
+        library_id,
+        version,
+        capabilities,
+        providers,
+        false,
+    )
+}
+
+/// [`package_effect_contract`] with the embedded-copy privilege flag: only a
+/// platform-embedded std manifest may carry the parser's contract schema
+/// LABELS (`schema.coerce.input`, `typed-provider-output`, …) in place of
+/// package schema fragments — third-party fragments stay strictly validated.
+pub fn package_effect_contract_with_privilege(
+    path: &Path,
+    value: &Value,
+    library_id: &str,
+    version: &str,
+    capabilities: &BTreeMap<String, PackageCapabilityContract>,
+    providers: &[PackageProviderContract],
+    privileged: bool,
+) -> Result<EffectContract, String> {
     let id = required_json_string(value, "id", "effect contract")
         .map_err(|message| format!("{} in `{}`", message, path.display()))?;
     let capability_contract = capabilities.get(&id);
@@ -2351,18 +2608,20 @@ pub fn package_effect_contract(
         .or_else(|| capability_contract.and_then(|contract| contract.output_schema.clone()));
     let input_schema = json_schema_fragment(value.get("input_schema"))
         .or_else(|| capability_contract.and_then(|contract| contract.input_schema.clone()));
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "input_schema",
-        input_schema.as_deref(),
-    )?;
-    validate_package_schema_fragment_contract(
-        path,
-        &format!("effect contract `{id}`"),
-        "output_schema",
-        output_schema.as_deref(),
-    )?;
+    if !privileged {
+        validate_package_schema_fragment_contract(
+            path,
+            &format!("effect contract `{id}`"),
+            "input_schema",
+            input_schema.as_deref(),
+        )?;
+        validate_package_schema_fragment_contract(
+            path,
+            &format!("effect contract `{id}`"),
+            "output_schema",
+            output_schema.as_deref(),
+        )?;
+    }
     let source_forms = optional_json_string_array(value, "source_forms")
         .filter(|forms| !forms.is_empty())
         .unwrap_or_else(|| vec![format!("call {id}")]);

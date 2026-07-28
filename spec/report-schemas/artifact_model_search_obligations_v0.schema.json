@@ -29,7 +29,7 @@
   "additionalProperties": true,
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "stable_digest": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    "stable_digest": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
     "span": {
       "type": "object",
       "required": ["start", "end"],

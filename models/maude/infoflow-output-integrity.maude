@@ -1,0 +1,56 @@
+--- Effect-output integrity (DR-0046). A model or executor output is a WRITER
+--- whose provided integrity is its executing principal's `from` clearance;
+--- a sink requiring vouched integrity denies any output below it, whether the
+--- output is the sink's PAYLOAD or the SELECTOR of the case arm the sink sits
+--- in -- branching on model output and writing per-arm constants is the same
+--- influence. The sanctioned raise is the source-marked `endorsed` judgment
+--- under a grant targeting the executor being endorsed. The axis is locked:
+--- output tokens carry integrity only -- they can never cause a
+--- confidentiality leak.
+---
+--- Every rule condition reads only variables bound in the matched
+--- constructors, so AC-extension sub-matches evaluate identical conditions
+--- -- the input-provenance model's convention.
+mod WHIPPLESCRIPT-INFOFLOW-OUTPUT-INTEGRITY is
+  protecting BOOL .
+
+  sorts Level Cfg .
+  ops lo hi : -> Level [ctor] .   --- provided/required integrity: lo = unvouched
+
+  op geq : Level Level -> Bool .
+  eq geq(L:Level, lo) = true .
+  eq geq(hi, hi) = true .
+  eq geq(lo, hi) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- an output-influenced sink under audit: the executor's provided level,
+  --- the sink's required level, and how the output reaches the sink.
+  op payload : Level Level -> Cfg [ctor] .   --- output(provided) IS the sink(required)'s payload
+  op selector : Level Level -> Cfg [ctor] .  --- output(provided) selects the arm holding sink(required)
+  --- output routed through a source-marked `endorsed` judgment: provided
+  --- level, required level, and whether the grant targeting the executor
+  --- exists.
+  op endorsedVia : Level Level Bool -> Cfg [ctor] .
+  --- the confidentiality audit: a sink whose READERS exclude the output's
+  --- executor -- outputs are integrity-only, so this must never fire from one.
+  op confAudit : -> Cfg [ctor] .
+  op influence : -> Cfg [ctor] .
+  op confLeak : -> Cfg [ctor] .
+  eq influence influence = influence .
+
+  vars P R : Level .  var G : Bool .  var C : Cfg .
+
+  --- an unvouched output shaping a vouched sink is influence, by either path.
+  crl [deny-payload] : payload(P, R) C => payload(P, R) C influence
+    if geq(P, R) = false .
+  crl [deny-selector] : selector(P, R) C => selector(P, R) C influence
+    if geq(P, R) = false .
+  --- the endorsed judgment: the grant raises the executor; without it the
+  --- marker is a declaration, not authority.
+  crl [deny-endorsed] : endorsedVia(P, R, false) C => endorsedVia(P, R, false) C influence
+    if geq(P, R) = false .
+  --- confidentiality is a different axis: no rule produces confLeak from an
+  --- output constructor, so the confAudit searches must find nothing.
+endm

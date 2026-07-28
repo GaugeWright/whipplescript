@@ -1,0 +1,84 @@
+--- Cross-rule fact provenance (DR-0045, the value-flow engine v1). A consumed
+--- fact contributes its COMPUTED producer reach instead of only its declared
+--- label: per producing rule, the rule's own non-fact sources join the whole
+--- fact -- the opaque box that keeps implicit flows inside the reach -- and a
+--- direct upstream fact binding contributes THAT fact's reach (the cross-rule
+--- edge). Every unaccountable path -- table seed, workflow input, external
+--- arrival, unattributable payload root -- contributes the LABEL TOKEN, which
+--- stands for "the declared fact label applies" (Phase 0 semantics exactly).
+---
+--- Soundness shape, the field-signature discipline one hop further: the reach
+--- never UNDER-reports. Own reads are in the whole fact; a direct fact root
+--- contributes its producer's full reach; anything else degrades to the label
+--- token. So a source truly reaching the fact's content is always in the
+--- reach or absorbed by the token (coverage), while a fact whose real chain
+--- is clean escapes an over-conservative label, bite -- the relief -- and an
+--- untrusted chain through an UNLABELED fact finally injects as what it is:
+--- bite on the integrity axis, the laundering closure.
+---
+--- The model is axis-neutral: `leak` stands for the denied confidentiality
+--- flow or the denied integrity influence; `hot` marks a source the sink is
+--- not cleared for on the axis under test.
+mod WHIPPLESCRIPT-INFOFLOW-FACT-PROVENANCE is
+  protecting BOOL .
+
+  sorts Fact Tok TokList Cfg .
+  subsort Tok < TokList .
+
+  ops fA fB : -> Fact [ctor] .
+
+  --- reach tokens: a HOT source the sink cannot take, a COLD one it can,
+  --- the label token of fact F, and a direct upstream fact edge.
+  op hot : -> Tok [ctor] .
+  op cold : -> Tok [ctor] .
+  op lbl : Fact -> Tok [ctor] .
+  op edge : Fact -> Tok [ctor] .
+  op nilT : -> TokList [ctor] .
+  op _._ : Tok TokList -> TokList [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- ground truth per scenario: each fact's producer contributions (own reads
+  --- + payload-root contributions, already flattened to tokens and edges),
+  --- whether the sink is cleared for fact F's DECLARED label, and the egress
+  --- of fact F's content to the sink under audit.
+  op prod : Fact TokList -> Cfg [ctor] .     --- producer contributions of F
+  op lblOk : Fact Bool -> Cfg [ctor] .       --- sink cleared for F's declared label?
+  op consume : Fact -> Cfg [ctor] .          --- the audited egress of F's content
+  op leak : -> Cfg [ctor] .
+  eq leak leak = leak .
+
+  var F : Fact .  var T : Tok .  var TL TL2 : TokList .  var C : Cfg .  var B : Bool .
+
+  op prodOf : Cfg Fact -> TokList .
+  eq prodOf((prod(F, TL) C), F) = TL .
+  eq prodOf(C, F) = nilT [owise] .
+
+  op lblOkOf : Cfg Fact -> Bool .
+  eq lblOkOf((lblOk(F, B) C), F) = B .
+  eq lblOkOf(C, F) = true [owise] .
+
+  --- does consuming F's reach deny at the sink? One edge hop is expanded --
+  --- fA -> fB suffices for the two-hop scenarios; deeper chains are the
+  --- fixpoint's induction, pinned by the Rust engine tests.
+  op tokDenies : Tok Cfg -> Bool .
+  eq tokDenies(hot, C) = true .
+  eq tokDenies(cold, C) = false .
+  eq tokDenies(lbl(F), C) = not lblOkOf(C, F) .
+  eq tokDenies(edge(F), C) = listDenies(prodOf(C, F), C) .
+
+  op listDenies : TokList Cfg -> Bool .
+  eq listDenies(nilT, C) = false .
+  eq listDenies((T . TL), C) = tokDenies(T, C) or listDenies(TL, C) .
+
+  --- The consumption denial: egressing F's content denies iff any token of
+  --- F's computed reach denies at the sink. The condition reads the config
+  --- relationally (prodOf/lblOkOf); an AC-extension sub-match that drops a
+  --- table entry hits an owise default chosen PERMISSIVE (nilT / true), so a
+  --- sub-match can only UNDER-fire -- Solution searches are satisfied by the
+  --- full match and NoSolution searches cannot be spuriously broken (the
+  --- field-signature model's convention).
+  crl [deny] : consume(F) C => consume(F) C leak
+    if listDenies(prodOf((consume(F) C), F), (consume(F) C)) = true .
+endm

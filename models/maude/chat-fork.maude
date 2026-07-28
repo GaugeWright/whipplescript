@@ -1,0 +1,97 @@
+--- Chat fork over branches, per spec/versioned-workspace-research-note.md
+--- 6.1 (runtime state: stepping the same instance on a second branch IS
+--- forking it; divergent histories of "the same" run cannot exist) and the
+--- untie-substrate readiness tracker Phase 3 fork item. A chat fork births
+--- a NEW instance whose thread is seeded from the source's completed turns
+--- and whose file surface is a FRESH branch forked at the source line's
+--- head -- both taken from the same quiescent coordinate.
+---
+--- The modeled invariant is fork coherence: a quiet instance's thread
+--- must remember every turn its own line's files contain. Three naive
+--- forkers break it three ways, all landing in the same corruption
+--- pattern (thread count < own-branch turn count):
+---   fork-shared  binds the fork to the SOURCE's branch, so the fork's
+---                next turn moves the source's line under its feet;
+---   fork-mid     forks while a turn is in flight, so the branch already
+---                carries writes the seeded thread has never heard of;
+---   fork-stale   seeds the thread at an older turn while forking the
+---                branch at head -- files from forgotten turns.
+--- The sound forker requires quiescence, mints a fresh branch at head,
+--- and seeds the thread at the latest completed turn: the corruption
+--- pattern and any shared binding are unreachable.
+mod WHIPPLESCRIPT-CHAT-FORK is
+  sorts Iid Bid Cnt Cfg .
+
+  ops i1 i2 : -> Iid [ctor] .
+  op b1 : -> Bid [ctor] .
+  op nb : Iid -> Bid [ctor] .   --- the fresh branch a sound fork mints
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op inst : Iid Cnt -> Cfg [ctor] .      --- completed turns in the thread
+  op br : Bid Cnt -> Cfg [ctor] .        --- turns folded into the line's head
+  op bound : Iid Bid -> Cfg [ctor] .     --- birth binding, write-once
+  op quiet : Iid -> Cfg [ctor] .         --- no turn in flight
+  op midTurn : Iid -> Cfg [ctor] .       --- a turn is executing
+  op go : -> Cfg [ctor] .                --- turn fuel (bounds the search)
+
+  op forkReq : Iid Iid -> Cfg [ctor] .          --- sound fork request
+  op forkShared : Iid Iid -> Cfg [ctor] .       --- hazard: reuse the branch
+  op forkMid : Iid Iid -> Cfg [ctor] .          --- hazard: ignore quiescence
+  op forkStale : Iid Iid Cnt -> Cfg [ctor] .    --- hazard: seed an old turn
+
+  vars I I2 : Iid .
+  var B : Bid .
+  vars N H K M : Cnt .
+
+  eq lt(z, s(M)) = true .
+  eq lt(s(K), s(M)) = lt(K, M) .
+  eq lt(M, z) = false .
+
+  --- A turn in two beats: the writes land on the instance's own line
+  --- while it runs, then the completed turn joins the thread. The gap
+  --- between the beats is exactly where naive forking goes wrong.
+  rl [turn-writes] :
+      go quiet(I) inst(I, N) bound(I, B) br(B, H)
+      => midTurn(I) inst(I, N) bound(I, B) br(B, s(H)) .
+
+  rl [turn-completes] :
+      midTurn(I) inst(I, N)
+      => quiet(I) inst(I, s(N)) .
+
+  --- The sound fork: only at quiescence, thread seeded at the latest
+  --- completed turn, file surface a FRESH branch forked at the same
+  --- head. The source keeps its line untouched.
+  rl [fork] :
+      forkReq(I, I2) quiet(I) inst(I, N) bound(I, B) br(B, H)
+      => quiet(I) inst(I, N) bound(I, B) br(B, H)
+         quiet(I2) inst(I2, N) bound(I2, nb(I2)) br(nb(I2), H) .
+
+  --- Hazard: bind the fork to the source's OWN branch. The fork's next
+  --- turn then advances the source's line without a source turn -- two
+  --- divergent histories of "the same" run.
+  rl [fork-shared] :
+      forkShared(I, I2) quiet(I) inst(I, N) bound(I, B)
+      => quiet(I) inst(I, N) bound(I, B)
+         quiet(I2) inst(I2, N) bound(I2, B) .
+
+  --- Hazard: fork while a turn is in flight. The head already carries
+  --- the running turn's writes; the seeded thread has never heard of
+  --- them -- the fork is born incoherent.
+  rl [fork-mid] :
+      forkMid(I, I2) midTurn(I) inst(I, N) bound(I, B) br(B, H)
+      => midTurn(I) inst(I, N) bound(I, B) br(B, H)
+         quiet(I2) inst(I2, N) bound(I2, nb(I2)) br(nb(I2), H) .
+
+  --- Hazard: seed the thread at an older turn K while forking the branch
+  --- at head -- the fork's files contain turns its thread forgot.
+  rl [fork-stale] :
+      forkStale(I, I2, K) quiet(I) inst(I, N) bound(I, B) br(B, H)
+      => quiet(I) inst(I, N) bound(I, B) br(B, H)
+         quiet(I2) inst(I2, K) bound(I2, nb(I2)) br(nb(I2), H) .
+endm

@@ -3,6 +3,10 @@ workflow MemoryCurate
 
 use std.memory
 
+memory pool project_memory {
+  context limit 8
+}
+
 class Seed {
   topic string
 }

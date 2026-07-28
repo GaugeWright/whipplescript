@@ -1,0 +1,52 @@
+load ../case-family.maude
+
+--- Coverage: a declared tag with no unguarded arm and no wildcard is flagged
+--- non-exhaustive (invariant b).
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  caseOf(t1 ; t2, t1, false)
+  =>* C:Cfg rejectNonExhaustive(t2) .
+
+--- Coverage: a guarded-only arm does NOT rescue exhaustiveness -- the tag is still
+--- flagged (invariant d). The guardedOnly fact is present yet the tag is uncovered.
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  caseOf(t1 ; t2, t1, false) guardedOnly(t2)
+  =>* C:Cfg rejectNonExhaustive(t2) .
+
+--- Coverage: a binding from arm t1 read inside arm t2 is a cross-arm read (invariant a).
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  readsForeign(t1, t2)
+  =>* C:Cfg rejectCrossRead(t1, t2) .
+
+--- Coverage: a duplicate unguarded arm for a tag is redundant (invariant c).
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  dupCover(t1)
+  =>* C:Cfg rejectRedundant(t1) .
+
+--- Coverage: an arm placed after the wildcard is redundant (invariant c).
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  armAfterWild(t3)
+  =>* C:Cfg rejectRedundant(t3) .
+
+--- Bite: a case whose unguarded arms cover every declared tag is never flagged
+--- non-exhaustive. The RESIDUAL soup var makes the No-solution non-vacuous.
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  caseOf(t1 ; t2, t1 ; t2, false)
+  =>* rejectNonExhaustive(X:Tag) RESIDUAL:Cfg .
+
+--- Bite: a wildcard arm makes the case exhaustive over the remaining tags; no tag is
+--- flagged even though only t1 has an explicit arm.
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  caseOf(t1 ; t2 ; t3, t1, true)
+  =>* rejectNonExhaustive(X:Tag) RESIDUAL:Cfg .
+
+--- Bite: a same-arm read (arm t1 reading t1's own payload, incl. a guard over the
+--- bound payload -- the terminal-guard case) is fine; no cross-read is flagged.
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  readsForeign(t1, t1)
+  =>* rejectCrossRead(X:Tag, Y:Tag) RESIDUAL:Cfg .
+
+--- Bite: a clean exhaustive case with no duplicate/post-wildcard arm is never flagged
+--- redundant.
+search [1] in WHIPPLESCRIPT-CASE-FAMILY :
+  caseOf(t1 ; t2, t1 ; t2, false)
+  =>* rejectRedundant(X:Tag) RESIDUAL:Cfg .

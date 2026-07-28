@@ -1,0 +1,86 @@
+--- Telemetry export-cursor lifecycle, per spec/std-telemetry.md "T2 - cursor
+--- scoping v2" (code landed 2026-07-04 with the Q2 commit; this model formally
+--- closes T2's deferred model expectation).
+---
+--- The OTLP exporter walks the recorded provider runs once per CURSOR SCOPE,
+--- where scope-key = H(provider, endpoint, mapping_version). The cursor is a
+--- per-scope high-water mark: each advance emits exactly one export event and
+--- moves that scope's cursor only, so
+---   * emit-once per scope: one run never exports twice to one scope;
+---   * scope isolation: one scope's progress never moves another's cursor;
+---   * endpoint change re-exports: a NEW scope starts fresh and re-sends runs
+---     an old scope already exported (one idempotent re-export, by design).
+--- Per-scope `reset-cursor` is a deliberate operator re-export and is OUT of
+--- the invariant (the model has no reset rule in the scoped design).
+---
+--- The companion SHARED module is the negative fixture the spec demands: the
+--- v1 design keyed the cursor by instance only -- ONE cursor shared by every
+--- scope, an ACTIVE endpoint choosing where exports land, and a store-wide
+--- reset as the only way a new endpoint gets data. There, serving a second
+--- scope rewinds the first scope's position too, and the double-export the
+--- scoped design excludes becomes reachable -- proving the emit-once search
+--- has bite.
+mod WHIPPLESCRIPT-TELEMETRY-CURSOR is
+  sorts Scope Run Mark Cfg .
+
+  ops s1 s2 : -> Scope [ctor] .   --- cursor scopes: H(provider, endpoint, mapping_version)
+  ops r1 r2 : -> Run [ctor] .     --- recorded provider runs, in export order
+  ops m0 m1 m2 : -> Mark [ctor] . --- cursor position: runs exported so far
+
+  --- Configuration is an ACU soup of tokens. Exported events are counted --
+  --- no idempotence equation -- so a double export is two tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op run : Run -> Cfg [ctor] .            --- a recorded run (persistent store row)
+  op cur : Scope Mark -> Cfg [ctor] .     --- the per-scope cursor side-file
+  op exported : Scope Run -> Cfg [ctor] . --- one emitted OTLP export event
+
+  var S : Scope .
+
+  --- Exports walk the recorded-run order per scope. Each advance emits exactly
+  --- one export event and moves ONLY that scope's cursor; the cursor is
+  --- monotonic, so the scoped design terminates with at most one export per
+  --- scope-and-run pair.
+  rl [export-r1] : cur(S, m0) run(r1) => cur(S, m1) run(r1) exported(S, r1) .
+  rl [export-r2] : cur(S, m1) run(r2) => cur(S, m2) run(r2) exported(S, r2) .
+endm
+
+--- Negative fixture (spec/std-telemetry.md T2 model expectation): two scopes
+--- SHARE one cursor. The shared position means an endpoint change needs a
+--- store-wide reset to serve the new scope, and the other scope's position
+--- bleeds across -- after the reset serves s2 its first run, switching back
+--- to s1 finds the shared cursor mid-stream and re-emits a run s1 already
+--- exported.
+mod WHIPPLESCRIPT-TELEMETRY-CURSOR-SHARED is
+  sorts Scope Run Mark Cfg .
+
+  ops s1 s2 : -> Scope [ctor] .
+  ops r1 r2 : -> Run [ctor] .
+  ops m0 m1 m2 : -> Mark [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op run : Run -> Cfg [ctor] .
+  op scur : Mark -> Cfg [ctor] .           --- the ONE shared cursor (v1 design)
+  op active : Scope -> Cfg [ctor] .        --- which endpoint exports land on
+  op exported : Scope Run -> Cfg [ctor] .
+
+  var S : Scope .
+  var M : Mark .
+
+  --- Exports land on the ACTIVE scope but advance the shared cursor.
+  rl [sexport-r1] : active(S) scur(m0) run(r1)
+      => active(S) scur(m1) run(r1) exported(S, r1) .
+  rl [sexport-r2] : active(S) scur(m1) run(r2)
+      => active(S) scur(m2) run(r2) exported(S, r2) .
+
+  --- The operator switches the export endpoint (a new scope in v2 terms).
+  rl [switch-to-s2] : active(s1) => active(s2) .
+  rl [switch-to-s1] : active(s2) => active(s1) .
+
+  --- The store-wide reset: with one shared cursor this is the ONLY way a new
+  --- endpoint receives already-exported runs -- and it rewinds every scope.
+  rl [reset] : scur(M) => scur(m0) .
+endm

@@ -1,0 +1,62 @@
+load ../restorable-context.maude
+
+--- INV-1 coverage: a checkpoint at a quiescent point -- no inFlight -- reaches
+--- a well-formed cut binding the CURRENT positions of all three planes --
+--- transcript 5, instance 9, manifest 100.
+search in RESTORABLE-CONTEXT :
+  { checkpointReq(1) transcriptPlane(5) instancePlane(9) filePlane(100) }
+  =>! { cut(1, 5, 9, 100) transcriptPlane(5) instancePlane(9) filePlane(100) } .
+
+--- INV-3 + INV-4 coverage: a restore whose manifest hashes are ALL present
+--- applies atomically -- all three planes move from the pre positions (0, 0, 0)
+--- to the cut positions (5, 9, 100) in one step.
+search in RESTORABLE-CONTEXT :
+  { restoreReq(1) cut(1, 5, 9, 100) requires(100, 71) blob(71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) }
+  =>! { restored(1) cut(1, 5, 9, 100) requires(100, 71) blob(71)
+    transcriptPlane(5) instancePlane(9) filePlane(100) } .
+
+--- INV-4 coverage (refuse path): a restore whose manifest requires content
+--- hash 71 that the store does NOT hold is refused -- all three planes stay at
+--- the pre positions (0, 0, 0).
+search in RESTORABLE-CONTEXT :
+  { restoreReq(1) cut(1, 5, 9, 100) requires(100, 71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) }
+  =>! { refused(1) cut(1, 5, 9, 100) requires(100, 71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) } .
+
+--- INV-2 bite (no-in-flight straddle): with an effect in flight, no reachable
+--- state carries a cut -- the checkpoint guard bites. This is the wrapped-state
+--- check: with a bare soup the checkpoint would rewrite a fragment with the
+--- inFlight bound into none and this would find a solution.
+search in RESTORABLE-CONTEXT :
+  { inFlight(7) checkpointReq(1) transcriptPlane(5) instancePlane(9) filePlane(100) }
+  =>* { cut(1, PP:Nat, NN:Nat, HH:Nat) RESIDUAL:Cfg } .
+
+--- INV-3 bite (CRUX -- atomicity): even though the restore CAN apply -- blob 71
+--- is present -- no reachable state is partially restored: the file plane at the
+--- cut manifest (100) never coexists with the instance plane still at pre (0).
+search in RESTORABLE-CONTEXT :
+  { restoreReq(1) cut(1, 5, 9, 100) requires(100, 71) blob(71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) }
+  =>* { filePlane(100) instancePlane(0) RESIDUAL:Cfg } .
+
+--- INV-3 bite (CRUX -- atomicity, second mismatch): the transcript plane at the
+--- cut (5) never coexists with the file plane still at pre (0). Any 2-of-3
+--- mismatch is unreachable -- the three planes move as one.
+search in RESTORABLE-CONTEXT :
+  { restoreReq(1) cut(1, 5, 9, 100) requires(100, 71) blob(71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) }
+  =>* { transcriptPlane(5) filePlane(0) RESIDUAL:Cfg } .
+
+--- INV-4 bite (CRUX -- coherence): the manifest requires content hash 71 which
+--- the store does NOT hold. No reachable applied-restore state exists -- the
+--- file plane never moves to the cut manifest (100) and restored(1) never
+--- appears. The "transcript remembers a file the store no longer has"
+--- incoherence is unreachable.
+search in RESTORABLE-CONTEXT :
+  { restoreReq(1) cut(1, 5, 9, 100) requires(100, 71)
+    transcriptPlane(0) instancePlane(0) filePlane(0) }
+  =>* { restored(1) filePlane(100) RESIDUAL:Cfg } .
+
+quit .

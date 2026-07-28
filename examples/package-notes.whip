@@ -1,3 +1,5 @@
+use std.agent.codex
+
 # Demonstrates the external-package lock flow: `notes` is a third-party package,
 # so checking/running this workflow needs a `whip.lock` built from
 # examples/packages/notes.json (`whip package lock`). Contrast with
@@ -8,6 +10,7 @@ description "Recall notes context before agent work via a locked vendor package"
 workflow PackageNotes
 
 use notes
+use std.tracker
 
 tracker backlog {
   provider builtin

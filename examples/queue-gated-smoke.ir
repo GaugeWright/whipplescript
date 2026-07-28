@@ -3,6 +3,9 @@ source_tags
 @service workflow QueueGatedSmoke
 source_descriptions
 "The agent turn only runs after the work-item claim succeeds" workflow QueueGatedSmoke
+uses
+  package std.tracker
+  package std.agent.codex
 schemas
   class QueueGatedResult
     itemId string
@@ -36,12 +39,12 @@ rules
     writes
       schema:QueueGatedResult
     effects
-      active_claim kind=tracker.claim binding=active_claim key=3cba9b8315a66f35
-      turn kind=agent.tell binding=turn key=5d570b6e6c35c283
-      effect3 kind=tracker.finish binding=- key=e749cc2695072071
-      effect4 kind=human.ask binding=- key=eb8e38cee174b049
+      active_claim kind=tracker.claim binding=active_claim key=8a177df19d0468502d640f13673b97fd
+      turn kind=agent.tell binding=turn key=4f905a934651720bcd1b9d3ea54709a1
+      effect3 kind=tracker.finish binding=- key=b4d783a735b65dd114fee8dc0ae477be
+      effect4 kind=tracker.release binding=- key=088a13467387a0bb3cfdf0d8aaa6a934
     dependencies
       active_claim --succeeds--> turn
       turn --succeeds--> effect3
       active_claim --fails--> effect4
-    body_hash 0ce7777d170dc70d
+    body_hash cebc3e2dc4bdf7ea35c2ce61bca8f2af

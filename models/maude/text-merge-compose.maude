@@ -1,0 +1,154 @@
+--- Certified compose layer of the token-level three-way text merge, per
+--- spec/text-merge-spec.md section 7 (untie-substrate readiness tracker,
+--- merge_text item). The heuristic tier (tokenizer, CDC anchors, Myers) is
+--- deliberately NOT modeled: the architecture's point is that composition
+--- guarantees hold for ANY pair of edit scripts the aligner produces, so a
+--- worse aligner can only inflate conflict count, never break correctness.
+---
+--- Base text is a list of atoms (word atoms w*, separator atoms s*); a
+--- side's edit script is one op rep(target, replacement): replace the
+--- contiguous base sublist `target` with `replacement`. Compose rules:
+---   * disjoint ops with at least gapD word atoms strictly between their
+---     targets compose, preserving both replacements in base order;
+---   * byte-identical ops on the identical target converge (taken once);
+---   * overlapping targets escalate as an honest conflict carrying both
+---     ops verbatim -- never a picked winner;
+---   * disjoint-but-near ops (fewer than gapD word atoms between; separator
+---     atoms provide no separation) escalate too -- the proximity rule that
+--- guards word-granularity against interleaving two rewrites of the same
+--- sentence that anchor on shared filler words.
+--- The essential bites: an overlapping or near pair can NEVER reach a clean
+--- composition, and no composed output ever contains an atom absent from
+--- every input (never-fabricate: z1 exists in the signature but in no
+--- fixture, so any reachable composed list containing it would be
+--- fabrication).
+mod WHIPPLESCRIPT-TEXT-MERGE-COMPOSE is
+  protecting BOOL .
+  protecting NAT .
+
+  sorts Atom AList Rep Cfg .
+  subsort Atom < AList .
+
+  ops w1 w2 w3 w4 w5 : -> Atom [ctor] .   --- word atoms (count for the gap)
+  ops s1 s2 s3 s4 : -> Atom [ctor] .      --- separator atoms (no separation)
+  ops x1 x2 y1 y2 : -> Atom [ctor] .      --- replacement atoms, ours / theirs
+  op z1 : -> Atom [ctor] .                --- in NO input: the fabrication probe
+
+  op nilA : -> AList [ctor] .
+  op _;_ : AList AList -> AList [ctor assoc id: nilA] .
+
+  --- Word atoms count toward the proximity gap; separators do not.
+  op wordp : Atom -> Bool .
+  eq wordp(s1) = false .
+  eq wordp(s2) = false .
+  eq wordp(s3) = false .
+  eq wordp(s4) = false .
+  eq wordp(A:Atom) = true [owise] .
+
+  op wc : AList -> Nat .
+  eq wc(nilA) = 0 .
+  eq wc(A:Atom ; L:AList) =
+    (if wordp(A:Atom) then 1 else 0 fi) + wc(L:AList) .
+
+  op memb : Atom AList -> Bool .
+  eq memb(A:Atom, nilA) = false .
+  eq memb(A:Atom, (A:Atom ; L:AList)) = true .
+  eq memb(A:Atom, (B:Atom ; L:AList)) = memb(A:Atom, L:AList) [owise] .
+
+  op overlaps : AList AList -> Bool .
+  eq overlaps(nilA, L:AList) = false .
+  eq overlaps((A:Atom ; L1:AList), L2:AList) =
+    memb(A:Atom, L2:AList) or overlaps(L1:AList, L2:AList) .
+
+  --- The proximity dial (spec section 7.3); frozen here at its default.
+  op gapD : -> Nat .
+  eq gapD = 2 .
+
+  op rep : AList AList -> Rep [ctor] .     --- rep(base target, replacement)
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op compose : AList Rep Rep -> Cfg [ctor] .  --- base, ours op, theirs op
+  op composed : AList -> Cfg [ctor] .          --- clean piece list
+  op escalated : Rep Rep -> Cfg [ctor] .       --- honest conflict, both ops
+
+  vars P M S T1 T2 R1 R2 : AList .
+  var B : AList .
+
+  --- Disjoint ops separated by at least gapD word atoms compose; both
+  --- replacements land at their base positions. Two rules because the ops
+  --- are positional (ours first in base, theirs first in base).
+  crl [compose-disjoint-ours-first] :
+      compose(P ; T1 ; M ; T2 ; S, rep(T1, R1), rep(T2, R2))
+      => composed(P ; R1 ; M ; R2 ; S)
+      if T1 =/= nilA /\ T2 =/= nilA /\ wc(M) >= gapD .
+  crl [compose-disjoint-theirs-first] :
+      compose(P ; T2 ; M ; T1 ; S, rep(T1, R1), rep(T2, R2))
+      => composed(P ; R2 ; M ; R1 ; S)
+      if T1 =/= nilA /\ T2 =/= nilA /\ wc(M) >= gapD .
+
+  --- Byte-identical ops on the identical target are one change (the
+  --- token-level twin of the manifest merge's o == t rule).
+  crl [compose-converge] :
+      compose(P ; T1 ; S, rep(T1, R1), rep(T1, R1))
+      => composed(P ; R1 ; S)
+      if T1 =/= nilA .
+
+  --- Overlapping targets are a real conflict unless convergent -- never a
+  --- fake auto-merge, never a picked winner.
+  crl [compose-overlap] :
+      compose(B, rep(T1, R1), rep(T2, R2))
+      => escalated(rep(T1, R1), rep(T2, R2))
+      if overlaps(T1, T2) and (T1 =/= T2 or R1 =/= R2) = true .
+
+  --- Disjoint but nearer than gapD word atoms: the proximity escalation.
+  crl [compose-near-ours-first] :
+      compose(P ; T1 ; M ; T2 ; S, rep(T1, R1), rep(T2, R2))
+      => escalated(rep(T1, R1), rep(T2, R2))
+      if T1 =/= nilA /\ T2 =/= nilA /\ wc(M) < gapD .
+  crl [compose-near-theirs-first] :
+      compose(P ; T2 ; M ; T1 ; S, rep(T1, R1), rep(T2, R2))
+      => escalated(rep(T1, R1), rep(T2, R2))
+      if T1 =/= nilA /\ T2 =/= nilA /\ wc(M) < gapD .
+
+  --- Region-memory refinement tier (spec section 12.3): remembered
+  --- resolutions fold conflict regions one at a time; ONLY a fully
+  --- covered region set reaches the clean refinement. The pinned
+  --- invariant: partial memory never fakes a clean outcome -- the
+  --- honest residue stays conflicted. Exact-key/live-only semantics of
+  --- the memory rows themselves live in resolution-memory.maude, which
+  --- the region tier reuses unchanged.
+  sorts Region RSet Mem MemSet .
+  subsort Region < RSet .
+  subsort Mem < MemSet .
+
+  ops rA rB : -> Region [ctor] .
+  op mtR : -> RSet [ctor] .
+  op _%_ : RSet RSet -> RSet [ctor assoc comm id: mtR] .
+  op mem : Region -> Mem [ctor] .
+  op mtMem : -> MemSet [ctor] .
+  op _&_ : MemSet MemSet -> MemSet [ctor assoc comm id: mtMem] .
+
+  op covered : Region MemSet -> Bool .
+  eq covered(R:Region, (mem(R:Region) & MM:MemSet)) = true .
+  eq covered(R:Region, MM:MemSet) = false [owise] .
+
+  op refineReq : RSet MemSet -> Cfg [ctor] .
+  op refinedClean : -> Cfg [ctor] .
+  op refinedConflicted : RSet -> Cfg [ctor] .
+
+  --- A remembered region folds; the memory row is knowledge, not a
+  --- consumable, so it stays available (the daemon re-applies it to
+  --- every descendant hitting the identical triple).
+  rl [mem-fold] :
+      refineReq((R:Region % RS:RSet), (mem(R:Region) & MM:MemSet))
+      => refineReq(RS:RSet, (mem(R:Region) & MM:MemSet)) .
+  rl [mem-clean] :
+      refineReq(mtR, MM:MemSet) => refinedClean .
+  --- Any uncovered region settles the whole refinement as conflicted:
+  --- the residue is honest, never absorbed.
+  crl [mem-settle] :
+      refineReq((R:Region % RS:RSet), MM:MemSet)
+      => refinedConflicted(R:Region % RS:RSet)
+      if covered(R:Region, MM:MemSet) = false .
+endm

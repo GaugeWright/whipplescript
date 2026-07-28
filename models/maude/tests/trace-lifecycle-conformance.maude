@@ -1,0 +1,95 @@
+--- Trace-lifecycle conformance: the MODEL side of the bridge to the Rust
+--- trace-conformance checker (crates/whipplescript-kernel/src/trace.rs).
+---
+--- Every `CORPUS:` tag below names a `model_pinned=yes` row of
+--- models/effect-lifecycle-transitions.tsv (the single source of truth). Each such
+--- row's legal trace transition is proven here against kernel.maude, and its
+--- recovery guard is proven by the paired negative search. scripts/
+--- check-trace-model-conformance.sh asserts the CORPUS tag set matches the pinned
+--- rows exactly, so neither the checker, the corpus, nor the model can drift alone.
+---
+--- Searches target STABLE states (running / queued / a terminal) rather than the
+--- transient `claimed`, both because that is what the store's atomic claim reaches
+--- and because bounded reachability to a stable state terminates quickly. The trace
+--- folds the model's `blocked -> queued -> claimed`; here that fold is the multi-step
+--- path `blocked -> queued -> claimed -> running`.
+---
+--- Registered in scripts/check-formal-models.sh: 10 Solution, 3 No solution.
+
+load ../kernel.maude
+
+--- CORPUS: queued claim claimed
+--- A queued effect is claimable and progresses to running.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, queued)
+  =>* effect(e1, running) .
+
+--- CORPUS: blocked claim claimed
+--- A capacity-blocked effect recovers once capacity is available (the trace's
+--- blocked -> claim, folded through the model's capacity-release -> queued -> claim).
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByCapacity) capacityAvailable(e1)
+  =>* effect(e1, running) capacityAvailable(e1) .
+
+--- CORPUS: blocked claim claimed
+--- ...and a policy-blocked effect recovers once policy allows it.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByPolicy) policyAllows(e1)
+  =>* effect(e1, running) policyAllows(e1) .
+
+--- CORPUS-NEG: blocked claim claimed
+--- Guard: a capacity-blocked effect cannot progress without capacity (No solution).
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByCapacity)
+  =>* effect(e1, running) .
+
+--- CORPUS-NEG: blocked claim claimed
+--- Guard: a policy-blocked effect cannot progress without policy approval.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByPolicy)
+  =>* effect(e1, running) .
+
+--- CORPUS: claimed start_run running
+--- A claimed effect starts its run.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, claimed)
+  =>* effect(e1, running) .
+
+--- CORPUS: running terminal_completed completed
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running) providerRun(e1)
+  =>* effect(e1, completed) providerRun(e1) .
+
+--- CORPUS: running terminal_failed failed
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running) providerRun(e1)
+  =>* effect(e1, failed) providerRun(e1) .
+
+--- CORPUS: running terminal_timed_out timed_out
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running) providerRun(e1)
+  =>* effect(e1, timedOut) providerRun(e1) .
+
+--- CORPUS: failed retry queued
+--- `whip retry` re-queues a failed effect when retry is permitted.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, failed) retryAllowed(e1)
+  =>* effect(e1, queued) retryUsed(e1) .
+
+--- CORPUS-NEG: failed retry queued
+--- Guard: a failed effect cannot re-queue itself without retry permission.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, failed)
+  =>* effect(e1, queued) .
+
+--- CORPUS: timed_out retry queued
+--- Retry also re-queues a timed-out effect.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, timedOut) retryAllowed(e1)
+  =>* effect(e1, queued) retryUsed(e1) .
+
+--- CORPUS: running lease_expire queued
+--- Lease expiry returns a running effect to the ready set.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running) lease(e1, leaseActive)
+  =>* effect(e1, queued) lease(e1, leaseExpired) event(leaseExpiredEvt) .

@@ -1,0 +1,62 @@
+load ../infoflow-redaction.maude
+
+--- Delegation context theta: operator acts-for nothing else here (the secret field
+--- is operator-only; public acts-for no one). The `customer` record has two public
+--- fields (idF, statusF, reader set noP) and one operator-only field (ssnF).
+--- The constant field facts for every search below; only the keep-set and the sink
+--- change. This is the concrete twin of Redaction.lean's canRead_redact.
+
+--- ============================ COVERAGE (leak reachable) =====================
+
+--- Coverage: KEEPING the secret leaks to a public sink. redact customer keep
+--- {idF, ssnF} released to the public sink (reader set noP) leaks --- the projection
+--- carries ssnF's operator compartment, which the public sink covers with nothing.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACTION :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, (idF ; ssnF), out)
+  =>* C:Cfg leak .
+
+--- Coverage: keep EVERYTHING (the opaque join box, redact_keep_all) leaks to the
+--- public sink --- the whole-record label includes the operator field.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACTION :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, (idF ; statusF ; ssnF), out)
+  =>* C:Cfg leak .
+
+--- ============================ BITE (no leak) ================================
+
+--- Bite: DROPPING the secret makes the release safe. redact customer keep
+--- {idF, statusF} (ssnF dropped) released to the public sink does NOT leak --- the
+--- projection carries only public fields, so the dropped operator field is
+--- non-interfering for the release (canRead_redact: release is fixed by the kept
+--- fields alone). No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACTION :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, (idF ; statusF), out)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: keeping only one public field is likewise safe to the public sink. No
+--- solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACTION :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, idF, out)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a CLEARED sink may receive even the kept secret. redact customer keep
+--- {idF, ssnF} released to an operator-cleared sink (reader set {operator}) does NOT
+--- leak --- the sink dominates the projection. No solution. (Redaction is about
+--- lowering for an UNcleared sink; a cleared sink never needed it.)
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACTION :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, operator)
+  release(customer, (idF ; ssnF), out)
+  =>* leak RESIDUAL:Cfg .

@@ -103,6 +103,7 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
             .list_runs(instance_id)?
             .into_iter()
             .find(|run| run.effect_id == effect.effect_id && run.status == "running");
+        let expired_run_id = running_run.as_ref().map(|run| run.run_id.clone());
         let terminal_event_id = match running_run {
             Some(run) => {
                 let terminal = kernel.timeout_run(EffectCompletion {
@@ -155,10 +156,15 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
                 terminal.event_id
             }
         };
+        // `run_id`/`summary` are part of the TerminalTimedOut binding contract
+        // (`after x times out as t` reads t.summary/t.run_id); run_id is null
+        // for an effect that expired while still queued (it never ran).
         let value_json = json!({
             "effect_id": effect.effect_id,
+            "run_id": expired_run_id,
             "status": "timed_out",
             "reason": "deadline exceeded",
+            "summary": "deadline exceeded",
             "timeout_seconds": effect.timeout_seconds,
         })
         .to_string();
@@ -315,8 +321,8 @@ pub fn select_clock_occurrences(
 
 /// Builds a clock signal payload by resolving the source's `emit <signal> { … }`
 /// field mapping against the observation (`scheduled_at`/`observed_at`/
-/// `occurrence_id`/`missed_count`). Paths off the `observe` binding read the
-/// observation; literals pass through.
+/// `occurrence_id`/`missed_count`/`schedule_name`). Paths off the `observe`
+/// binding read the observation; literals pass through.
 pub fn clock_emit_payload(
     source: &IrSource,
     observation: &serde_json::Map<String, Value>,
@@ -344,12 +350,14 @@ pub fn clock_emit_payload(
     Value::Object(payload)
 }
 
-/// Fires due occurrences of `every <duration>` clock sources (spec/std-time.md):
-/// for each interval source, enumerate occurrences due since the cursor (the last
+/// Fires due occurrences of clock sources (spec/std-time.md) — all three
+/// recurrence forms: `every <duration>` (interval), `every <calendar> at
+/// <hh:mm>` (tz-aware calendar), and one-shot `at <hh:mm>` (fire-once). For
+/// each clock source, enumerate occurrences due since the cursor (the last
 /// admitted occurrence, else the instance start) up to `now`, apply the missed
 /// policy, and admit each as a durable signal fact keyed by
-/// `occurrence_id = H(source, scheduled_instant)` so re-evaluation and replay are
-/// idempotent. `at`/calendar (timezone) recurrence forms are not fired here.
+/// `occurrence_id = H(source, scheduled_instant)` so re-evaluation and replay
+/// are idempotent.
 pub fn resolve_due_clock_sources<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
@@ -413,6 +421,12 @@ pub fn resolve_due_clock_sources<S: RuntimeStore>(
                 Value::String(occurrence_id.clone()),
             );
             observation.insert("missed_count".to_owned(), json!(missed_count));
+            // `schedule_name` completes the declared `ClockObservation` schema
+            // (spec/std-time.md T2): the source's declared name.
+            observation.insert(
+                "schedule_name".to_owned(),
+                Value::String(source.name.clone()),
+            );
             let payload_json = clock_emit_payload(source, &observation).to_string();
             // Record the occurrence event, then derive its durable signal fact
             // (mirroring `whip signal`): the unique index on `occurrence_id` makes

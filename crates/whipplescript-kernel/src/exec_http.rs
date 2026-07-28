@@ -391,13 +391,22 @@ pub fn settle_exec_http_result<S: RuntimeStore>(
                     "terminal",
                 ])),
             })?;
+            // P3 per-kind extras: the command's exit code (when the process
+            // actually ran) rides the bound failure value.
+            let mut failure_value =
+                effect_failure_base("exec", &reason, &reason, ctx.effect_id, ctx.run_id);
+            if let (Some((exit_code, _, _)), Some(object)) =
+                (&detail, failure_value.as_object_mut())
+            {
+                object.insert("exit_code".to_owned(), Value::from(*exit_code));
+            }
             let fact = json!({
                 "effect_id": ctx.effect_id,
                 "run_id": ctx.run_id,
                 "status": "failed",
                 "mode": "capability",
                 "capability": ctx.capability,
-                "value": effect_failure_base("exec", &reason, &reason, ctx.effect_id, ctx.run_id),
+                "value": failure_value,
                 "error": {"message": reason},
             })
             .to_string();

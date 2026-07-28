@@ -1,0 +1,66 @@
+load ../infoflow-integrity.maude
+
+--- Delegation context theta for these fixtures: operator > manager > clerk, so
+--- operator acts-for manager and transitively clerk, and manager acts-for clerk.
+--- stranger acts-for no one but itself.
+
+--- Coverage: untrusted input cannot drive even the lowest-authority sink. A
+--- stranger-influenced value at a clerk-required control sink is an injection,
+--- because stranger does not act-for clerk.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) flow(b1, b2) controlSink(b2, clerk)
+  =>* C:Cfg injection .
+
+--- Coverage: a LOWER authority cannot drive a HIGHER sink. A clerk-influenced
+--- value at an operator-required sink is an injection; clerk does not act-for
+--- operator. A fixed chain cannot express this partial-order direction cleanly.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, clerk) flow(b1, b2) controlSink(b2, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: join box. b3 is influenced by both an operator input and a stranger
+--- input; at a manager-required sink it is an injection, because stranger does
+--- not act-for manager -- one untrusted influencer drags the decision down.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, operator) intSource(b2, stranger)
+  flow(b1, b3) flow(b2, b3) controlSink(b3, operator)
+  =>* C:Cfg injection .
+
+--- Coverage: endorsing to an INSUFFICIENT authority does not pass a higher sink.
+--- Endorsing a stranger value to clerk, then driving an operator sink, is an
+--- injection: clerk does not act-for operator.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) endorse(b1, b2, clerk) controlSink(b2, operator)
+  =>* C:Cfg injection .
+
+--- Bite: an authority drives its own sink. operator influence at an operator
+--- sink is safe; canAct is reflexive. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, operator) flow(b1, b2) controlSink(b2, operator)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: a HIGHER authority drives a LOWER sink. manager influence at a
+--- clerk-required sink is safe; manager acts-for clerk (direct edge).
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, manager) flow(b1, b2) controlSink(b2, clerk)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: TRANSITIVE trust. operator influence at a clerk sink is safe via
+--- operator > manager > clerk. No solution proves the closure follows two hops.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, operator) flow(b1, b2) controlSink(b2, clerk)
+  =>* injection RESIDUAL:Cfg .
+
+--- Bite: endorsing to a SUFFICIENT authority passes. Endorsing a stranger value
+--- to operator, then driving a manager sink, is safe: operator acts-for manager.
+search [1] in WHIPPLESCRIPT-INFOFLOW-INTEGRITY :
+  deleg((operator > manager) | (manager > clerk))
+  intSource(b1, stranger) endorse(b1, b2, operator) controlSink(b2, manager)
+  =>* injection RESIDUAL:Cfg .

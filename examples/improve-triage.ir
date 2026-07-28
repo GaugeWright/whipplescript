@@ -14,6 +14,8 @@ gauges
   gauge priority_correct judge=exec:python3 ./judge_priority.py expect=chance:ok>=0.9
   gauge ticket_echoed judge=exec:python3 ./judge_echo.py
   gauge triage_cost judge=exec:python3 ./cost_model.py inputs=priority_correct,std.latency
+marks
+  mark "assessed" after triage
 campaigns
   campaign release_tuning ascend=priority_correct reach=std.latency<=800ms guard=triage_cost:within:5%
 rules
@@ -23,4 +25,4 @@ rules
       schema:Ticket
     writes
       schema:Assessment
-    body_hash 95436c25cba01fde
+    body_hash f8450f52cbdd6ffd13c17195cfd562a9

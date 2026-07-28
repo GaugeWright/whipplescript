@@ -1,0 +1,53 @@
+load ../script-hard-off.maude
+
+--- Coverage: with the import, the operator pin, and matching bytes, the
+--- capability spawns the pinned content under the operator argv, and the
+--- executing hash is recorded (property 4 coverage rides here).
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h1) authorPayload
+  =>* spawn(judge, h1, opArgv) recorded(judge, h1) RESIDUAL:Cfg .
+
+--- Hard-off bite, missing import: no spawn from a soup with full operator
+--- authority but no `use std.script`.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) pin(judge, h1) bytes(judge, h1) authorPayload
+  =>* spawn(C:Cap, H:Hash, A:Argv) RESIDUAL:Cfg .
+
+--- Hard-off bite, missing operator authority: no spawn from a soup with the
+--- import but no manifest pin.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) imported bytes(judge, h1) authorPayload
+  =>* spawn(C:Cap, H:Hash, A:Argv) RESIDUAL:Cfg .
+
+--- Fail-closed bite: drifted bytes -- on-disk hash h2 against pin h1 --
+--- never spawn under the capability name.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h2) authorPayload
+  =>* spawn(C:Cap, H:Hash, A:Argv) RESIDUAL:Cfg .
+
+--- No-injection bite: the author payload never reaches argv -- from the
+--- fully-authorized soup WITH an author payload present, no spawn carries
+--- the author-controlled argv.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h1) authorPayload
+  =>* spawn(C:Cap, H:Hash, authorArgv) RESIDUAL:Cfg .
+
+--- Plane separation, the composite bite: give the authoring plane everything
+--- it can forge -- the import line, the exec request, its payload -- with
+--- drifted bytes on disk; no reachable spawn executes the unpinned h2.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h2) authorPayload
+  =>* spawn(C:Cap, h2, A:Argv) RESIDUAL:Cfg .
+
+--- Sloppy-fixture bite for fail-closed and plane separation: without the
+--- hash guard the drifted bytes DO spawn -- the pattern the good module
+--- excludes has a witness, so those searches bite.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF-SLOPPY :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h2) authorPayload
+  =>* spawn(judge, h2, A:Argv) RESIDUAL:Cfg .
+
+--- Sloppy-fixture bite for no-injection: with the sloppy runner the author
+--- payload DOES reach argv.
+search [1] in WHIPPLESCRIPT-SCRIPT-HARD-OFF-SLOPPY :
+  execReq(judge) imported pin(judge, h1) bytes(judge, h1) authorPayload
+  =>* spawn(judge, H:Hash, authorArgv) RESIDUAL:Cfg .

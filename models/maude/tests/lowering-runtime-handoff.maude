@@ -1,0 +1,307 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+load ../construct-graph.maude
+load ../construct-lowering.maude
+load ../lowering-runtime-handoff.maude
+
+--- A lowered effect object enters runtime as a core effect graph template.
+--- Only the kernel graph-commit rule turns it into a queued outbox effect.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  graphReady(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  graphCommitted(g1)
+  effect(e1, queued) .
+
+--- A lowered dependency object enters runtime as the existing kernel effect
+--- graph shape: upstream queued, downstream blocked, dependency edge durable.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreDependencyObj)
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  dependencyEntrypoint(coreDependencyObj, e1, succeeds, e2)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  graphReady(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  graphCommitted(g1)
+  effect(e1, queued)
+  dep(e1, succeeds, e2)
+  effect(e2, blocked) .
+
+--- Event and projection objects enter the event/fact projection lifecycle, not
+--- provider execution.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits2(g1, coreEventObj, coreProjectionObj)
+  emittedCoreObject(g1, coreEventObj, coreEventKind)
+  eventEntrypoint(coreEventObj, event1)
+  emittedCoreObject(g1, coreProjectionObj, coreProjectionKind)
+  projectionEntrypoint(coreProjectionObj, event1, issueFact)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  event(event1)
+  projection(event1, issueFact, pending) .
+
+--- Event-source objects register admission templates, not event occurrences.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEventSourceObj)
+  emittedCoreObject(g1, coreEventSourceObj, coreEventSourceKind)
+  eventSourceEntrypoint(coreEventSourceObj, event1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  eventSourceTemplate(event1) .
+
+--- Schedule objects register recurrence templates, not event occurrences.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreScheduleObj)
+  emittedCoreObject(g1, coreScheduleObj, coreScheduleKind)
+  scheduleEntrypoint(coreScheduleObj, event1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  scheduleTemplate(event1) .
+
+--- Lowering preservation alone does not prove runtime handoff safety.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- A lowered run object is not an accepted runtime entrypoint. Runs are created
+--- only by workers after claimability, policy, and provider binding.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, runtimeRunObj)
+  emittedCoreObject(g1, runtimeRunObj, runtimeRunKind)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- Event-source templates do not directly append event occurrences.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEventSourceObj)
+  emittedCoreObject(g1, coreEventSourceObj, coreEventSourceKind)
+  eventSourceEntrypoint(coreEventSourceObj, event1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  event(event1) .
+
+--- Schedule templates do not directly append event occurrences.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreScheduleObj)
+  emittedCoreObject(g1, coreScheduleObj, coreScheduleKind)
+  scheduleEntrypoint(coreScheduleObj, event1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  event(event1) .
+
+--- The platform checker must prove lowering did not materialize run state.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- The platform checker must prove lowering did not claim effects.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- The platform checker must prove lowering did not assign terminal status.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- The platform checker must prove lowering did not create cancellation state.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- The platform checker must prove lowering did not create retry or lease
+--- recovery state.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- Provider boundaries remain runtime-owned; lowering cannot authorize or run
+--- provider turns by itself.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1) .
+
+--- Handoff does not fabricate provider terminal success without a provider run.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  graphReady(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  effect(e1, completed) .
+
+--- Handoff does not create the providerRun marker consumed by runtime terminal
+--- provider transitions.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  effectEntrypoint(coreEffectObj, e1)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  graphReady(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  providerRun(e1) .
+
+--- Dependency handoff keeps downstream effects blocked until the upstream
+--- lifecycle satisfies the declared predicate.
+search [1] in WHIPPLESCRIPT-LOWERING-RUNTIME-HANDOFF :
+  loweringPreserved(g1)
+  graphEmits1(g1, coreDependencyObj)
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  dependencyEntrypoint(coreDependencyObj, e1, succeeds, e2)
+  noLoweredRunMaterialization(g1)
+  noLoweredClaimMaterialization(g1)
+  noLoweredTerminalMaterialization(g1)
+  noLoweredCancellationMaterialization(g1)
+  noLoweredRetryLeaseMaterialization(g1)
+  providerBoundaryRuntimeOwned(g1)
+  graphReady(g1)
+  =>*
+  Rest:Cfg
+  lifecycleHandoffOk(g1)
+  effect(e2, running) .

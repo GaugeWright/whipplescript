@@ -105,7 +105,7 @@ fn dev(bin: &str, store: &str, source: &str, coordination: &str) -> Value {
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source,
             "--provider",
             "fixture",

@@ -1,0 +1,61 @@
+load ../rule-autofail.maude
+
+--- Coverage: a self-terminating workflow with an unhandled failed effect
+--- reaches the failed terminal -- the workflow auto-fails instead of stalling.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effFailedUnhandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Coverage: a handled failure settles via its own terminal (the handler path
+--- is reachable, so the model is not vacuously inert).
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effFailedHandled(e1) running
+  =>* settled(e1) RESIDUAL:Cfg .
+
+--- Coverage: with one handled and one unhandled failure in the same
+--- self-terminating workflow, the unhandled one still drives the auto-fail --
+--- a settling sibling does not mask the unhandled failure.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effFailedHandled(e1) effFailedUnhandled(e2) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Coverage: a service workflow records a durable diagnostic for the unhandled
+--- failure AND stays running -- the diagnostic and running coexist.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  service effFailedUnhandled(e1) running
+  =>* diagRecorded(e1) running RESIDUAL:Cfg .
+
+--- Bite (scope): without a scope marker, an unhandled failure never auto-fails.
+--- The RESIDUAL soup var means an auto-fail in ANY reachable state would be a
+--- solution, so No solution proves [autofail] requires the selfTerminating
+--- marker rather than keying on any failed effect.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  effFailedUnhandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (handled-ness): a handled failure in a self-terminating workflow never
+--- auto-fails. If [autofail] keyed on any failed effect rather than only the
+--- unhandled disposition this would find a solution.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effFailedHandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (all-handled): when every failure is handled, nothing auto-fails even
+--- though the workflow is a terminal path.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effFailedHandled(e1) effFailedHandled(e2) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (cancel exemption): a cancelled effect never trips the net -- cancel is
+--- deliberate (the watchdog pattern), never an unhandled outcome. If the net
+--- keyed on any non-success terminal this would find a solution.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  selfTerminating effCancelled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .
+
+--- Bite (service): a service workflow NEVER reaches instanceFailed, even with
+--- an unhandled failure. If [autofail] matched the service scope this would
+--- find a solution.
+search [1] in WHIPPLESCRIPT-RULE-AUTOFAIL :
+  service effFailedUnhandled(e1) running
+  =>* instanceFailed RESIDUAL:Cfg .

@@ -1,0 +1,72 @@
+--- Tracker claim/lease exclusivity, expiry, holder-only renew, and
+--- terminal-release (ADR-0002 v1, A+blockers scope). Claims are LOCAL runtime
+--- leases, split from durable issue status: lease(issue, actor, expiresAt).
+--- A lease is ACTIVE iff it has not been stripped and expiresAt > now.
+---
+--- Invariant I1 (exclusivity): a claim on an issue becomes an active lease
+--- ONLY when the issue has NO active lease anywhere in the state. An expired
+--- lease -- such as expiresAt <= now -- does not block a fresh claim.
+--- Invariant I2 (holder-only renew): only the actor that holds a lease can
+--- extend its expiresAt.
+--- Invariant I3 (terminal-release, E7): reaching a terminal for an actor
+--- releases EVERY lease that actor holds across ALL issues at once.
+---
+--- CRITICAL: the grant guard "no active lease on this issue anywhere" is a
+--- global predicate. A guard over a bare associative-commutative soup is
+--- UNSOUND -- extension matching would rewrite a claim fragment with the rest
+--- bound to none, bypassing the guard. So the whole state is WRAPPED in the
+--- constructor { _ } and the rule captures the entire rest in C, forcing the
+--- guard to see every existing lease. The exclusivity bite is a No-solution
+--- search that verifies the guard actually bites.
+mod TRACKER-LEASE is
+  protecting NAT .
+
+  sorts Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- lease(issue, actor, expiresAt): a held runtime lease.
+  op lease : Nat Nat Nat -> Fact [ctor] .
+  --- claim(issue, actor, expiresAt): a pending claim request.
+  op claim : Nat Nat Nat -> Fact [ctor] .
+  --- renewReq(issue, actor, newExpiresAt): a pending renew request.
+  op renewReq : Nat Nat Nat -> Fact [ctor] .
+  --- now(T): the runtime clock.
+  op now : Nat -> Fact [ctor] .
+  --- terminal(actor): the actor reached a terminal state.
+  op terminal : Nat -> Fact [ctor] .
+  --- released(actor): a terminal has been processed for the actor.
+  op released : Nat -> Fact [ctor] .
+
+  vars I A E E2 T : Nat .
+  var C : Cfg .
+
+  --- Does an ACTIVE lease on issue I exist anywhere in C, given clock T?
+  op hasActiveLeaseOn : Nat Nat Cfg -> Bool .
+  eq hasActiveLeaseOn(I, T, lease(I, A, E) C) =
+    if E > T then true else hasActiveLeaseOn(I, T, C) fi .
+  eq hasActiveLeaseOn(I, T, C) = false [owise] .
+
+  --- Remove EVERY lease held by actor A from C -- one equational rewrite,
+  --- so terminal-release is atomic (no intermediate state keeps a held lease).
+  op stripLeases : Nat Cfg -> Cfg .
+  eq stripLeases(A, lease(I, A, E) C) = stripLeases(A, C) .
+  eq stripLeases(A, C) = C [owise] .
+
+  --- Grant: a claim becomes an active lease only when the issue carries no
+  --- active lease anywhere in the rest of the state. Wrapped so C is the whole
+  --- rest.
+  crl [grant] : { claim(I, A, E) now(T) C } => { lease(I, A, E) now(T) C }
+    if hasActiveLeaseOn(I, T, C) = false .
+
+  --- Renew: extends expiresAt, but only for the actor that already holds the
+  --- lease -- the request and the lease must share issue AND actor.
+  crl [renew] : renewReq(I, A, E2) lease(I, A, E) => lease(I, A, E2)
+    if E2 > E .
+
+  --- Terminal-release: strip every lease held by the terminated actor at once.
+  rl [release] : { terminal(A) C } => { released(A) stripLeases(A, C) } .
+endm

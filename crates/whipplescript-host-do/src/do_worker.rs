@@ -30,7 +30,8 @@ use whipplescript_store::{
 };
 
 use crate::do_instance::{
-    CoerceProviderConfig, DoInstanceDriver, ExecutorSidecarConfig, TurnContainerConfig,
+    do_coercion_config_fingerprint, DoInstanceDriver, ExecutorSidecarConfig,
+    ResolvedCoercionConfig, TurnContainerConfig,
 };
 use crate::do_store::{DoSql, DoSqlStorage, DoSqliteStore};
 use crate::DoFileStore;
@@ -85,9 +86,10 @@ pub fn unix_ms_to_iso8601(unix_ms: i64) -> String {
 #[derive(Default)]
 pub struct DurableEffectPorts {
     pub files: Option<Box<dyn FileStore>>,
-    pub coerce: Option<CoerceProviderConfig>,
+    pub coerce: Option<ResolvedCoercionConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
+    pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
     pub exec: Option<ExecutorSidecarConfig>,
     /// Class-B turn-container wiring (agent turns run whole in a container).
@@ -116,9 +118,10 @@ pub struct DurableInstance<Sql: DoSql> {
     instance_id: String,
     in_flight: Option<ClaimableEffect>,
     files: Box<dyn FileStore>,
-    coerce: Option<CoerceProviderConfig>,
+    coerce: Option<ResolvedCoercionConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
+    agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     exec: Option<ExecutorSidecarConfig>,
     turn: Option<TurnContainerConfig>,
 }
@@ -127,6 +130,59 @@ pub struct DurableInstance<Sql: DoSql> {
 // as `Box<dyn FileStore>` (both real handles — `JsDoSql`, `RusqliteDoSql` — own
 // their storage and are `'static`).
 impl<Sql: DoSql + 'static> DurableInstance<Sql> {
+    /// Attach the step machine to an instance and program already admitted and
+    /// registered by the governed host facade. This is the hosted-placement
+    /// counterpart to `create`: it never creates a second instance or ingests
+    /// an ungoverned start event.
+    pub fn attach(
+        sql: Sql,
+        ir: IrProgram,
+        instance_id: &str,
+        ports: DurableEffectPorts,
+    ) -> Result<Self, String> {
+        let sql = Rc::new(sql);
+        let kernel = RuntimeKernel::new(DoSqliteStore {
+            sql: Rc::clone(&sql),
+        })
+        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
+        let exists = kernel
+            .store()
+            .list_instances()
+            .map_err(|error| format!("{error:?}"))?
+            .into_iter()
+            .any(|instance| instance.instance_id == instance_id);
+        if !exists {
+            return Err(format!("no governed host instance `{instance_id}`"));
+        }
+        // DO-plane package bootstrap (see `create`): the governed host facade
+        // opens the instance without seeding std packages, so seed them here
+        // too. Idempotent (`ON CONFLICT DO UPDATE`), so a re-attach after an
+        // isolate eviction is a no-op.
+        crate::do_packages::register_embedded_std_packages(kernel.store())
+            .map_err(|error| format!("{error:?}"))?;
+        let default_files: Box<dyn FileStore> = Box::new(DoFileStore::new(
+            DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
+        ));
+        Ok(Self {
+            kernel: Some(kernel),
+            ir,
+            instance_id: instance_id.to_owned(),
+            in_flight: None,
+            files: ports.files.unwrap_or(default_files),
+            coerce: ports.coerce,
+            agent_model: ports.agent_model,
+            agent_tools: ports.agent_tools.unwrap_or_else(|| {
+                Box::new(crate::do_tools::DoToolExecutor::for_instance(
+                    Rc::clone(&sql),
+                    instance_id,
+                ))
+            }),
+            agent_tool_specs: ports.agent_tool_specs,
+            exec: ports.exec,
+            turn: ports.turn,
+        })
+    }
+
     /// Compile `program_source`, then get-or-create THE instance in the DO
     /// store (a Durable Object holds exactly one workflow instance). The first
     /// call creates + starts it; any later call — an alarm wake-up, a poke, an
@@ -151,7 +207,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let sql = Rc::new(sql);
         let mut kernel = RuntimeKernel::new(DoSqliteStore {
             sql: Rc::clone(&sql),
-        });
+        })
+        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
@@ -162,6 +219,14 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 },
                 &ir,
             )
+            .map_err(|error| format!("{error:?}"))?;
+        // DO-plane package bootstrap (spec/durable-object-runtime-tracker.md):
+        // seed the embedded std manifests so the admission gate is REAL for
+        // coordination / file / tracker / ingress / coercion kinds — the DO
+        // counterpart to native `register_locked_packages`. Must precede the
+        // first worker pass; the `do_policy_block_on` exemptions those kinds
+        // relied on are gone.
+        crate::do_packages::register_embedded_std_packages(kernel.store())
             .map_err(|error| format!("{error:?}"))?;
         // Register deploy-shipped project instructions (context-assembly
         // Phase 3 item 4) — content-addressed, idempotent by position, read by
@@ -319,6 +384,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tools: ports
                 .agent_tools
                 .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
+            agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
         })
@@ -421,6 +487,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             coerce: self.coerce.as_ref(),
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
+            agent_tool_specs: self.agent_tool_specs.as_deref(),
             exec: self.exec.as_ref(),
             turn: self.turn.as_ref(),
             ir: &self.ir,
@@ -445,7 +512,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
 
     /// Whether coerce is configured (mirrors a live worker's binding check).
     pub fn coerce_provider(&self) -> Option<CoerceProvider> {
-        self.coerce.as_ref().map(|config| config.provider)
+        self.coerce.as_ref().map(|config| config.backend)
     }
 
     /// Capture a restorable consistent-cut checkpoint (DO parity P3 — the
@@ -625,6 +692,11 @@ fn drive_fixpoint<D: InstanceDriver>(
                 *in_flight = Some(effect);
                 return DurableStepOutcome::NeedsHttp(request);
             }
+            Ok(EffectStep::Parked) => {
+                return DurableStepOutcome::Parked {
+                    next_due_unix_ms: None,
+                }
+            }
             Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
         }
     }
@@ -660,6 +732,11 @@ fn drive_fixpoint<D: InstanceDriver>(
                 *in_flight = Some(ready);
                 return DurableStepOutcome::NeedsHttp(request);
             }
+            Ok(EffectStep::Parked) => {
+                return DurableStepOutcome::Parked {
+                    next_due_unix_ms: None,
+                }
+            }
             Err(error) => return DurableStepOutcome::Failed(format!("{error:?}")),
         }
     }
@@ -675,227 +752,177 @@ mod tests {
 
     /// The worker-shell loop over an effect-free workflow: `create`, then `step`
     /// until a terminal — no HTTP round, one settle.
+
     #[test]
-    fn durable_instance_drives_an_effect_free_workflow_to_terminal() {
-        let source = "workflow MinimalNoop\n\noutput result StartupSeen\n\n\
-             class StartupSeen {\n  source string\n  state \"observed\"\n}\n\n\
-             rule observe_start\n  when started\n=> {\n\
-             \x20 record StartupSeen {\n    source \"external.started\"\n    state \"observed\"\n  }\n\n\
-             \x20 complete result {\n    source \"external.started\"\n    state \"observed\"\n  }\n}\n";
-        let mut instance = DurableInstance::create(
-            store().sql,
-            source,
-            "{}",
-            "local/MinimalNoop",
-            DurableEffectPorts::default(),
-            &[],
-            &[],
-        )
-        .expect("create");
-        assert!(
-            matches!(
-                instance.step(None, TEST_NOW_MS),
-                DurableStepOutcome::Terminal
-            ),
-            "the worker drives the instance to its terminal in one step"
-        );
-        assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("completed")
-        );
-    }
-
-    /// The alarm cycle (DR-0033 Phase 6): a timer workflow PARKS with the
-    /// timer's due instant surfaced as `next_due_unix_ms` (the shell sets the
-    /// DO alarm from it), and the alarm's re-entry `step` — a later injected
-    /// `now` — runs the due-time pass, fires the timer, and completes.
-    #[test]
-    fn timer_workflow_parks_with_next_due_then_alarm_reentry_completes() {
-        let source = "workflow TimerDemo\n\noutput result Done\n\n\
-             class Done {\n  ok int\n}\n\n\
-             rule go\n  when started\n=> {\n\
-             \x20 timer 2s as pause\n\n\
-             \x20 after pause succeeds {\n    complete result { ok 1 }\n  }\n}\n";
-        let mut instance = DurableInstance::create(
-            store().sql,
-            source,
-            "{}",
-            "local/TimerDemo",
-            DurableEffectPorts::default(),
-            &[],
-            &[],
-        )
-        .expect("create");
-
-        // First step: the timer is pending and not yet due — the instance
-        // parks and names its wake-up (creation-anchored, so within 2s of the
-        // store's clock; assert presence and sanity, not the exact instant).
-        let parked = instance.step(None, TEST_NOW_MS);
-        let next_due = match parked {
-            DurableStepOutcome::Parked { next_due_unix_ms } => {
-                next_due_unix_ms.expect("a pending timer names its wake-up")
-            }
-            other => panic!("expected a park with a wake-up, got {other:?}"),
-        };
-        assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("running")
-        );
-
-        // The alarm fires: re-enter with a `now` past the due instant. The
-        // due-time pass completes the timer, the rule pass sees it, and the
-        // workflow completes — no external poller involved.
-        let after_due = next_due + 1_000;
-        assert!(
-            matches!(instance.step(None, after_due), DurableStepOutcome::Terminal),
-            "the alarm re-entry fires the timer and completes the workflow"
-        );
-        assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("completed")
-        );
-    }
-
-    /// Clock sources on the DO (P6 tail): an interval source parks with the
-    /// NEXT occurrence as the wake-up, and the alarm re-entry admits the
-    /// signal fact through the lifted clock pass.
-    #[test]
-    fn clock_source_parks_with_next_tick_and_fires_on_alarm_reentry() {
-        let source = "workflow ClockDemo\n\noutput result Done\n\n\
-             class Done {\n  ok int\n}\n\n\
-             signal demo.tick {\n  scheduled_at time\n  observed_at time\n  occurrence_id string\n  missed_count int\n}\n\n\
-             source clock as ticker {\n  every 30s\n  missed coalesce\n\n\
-             \x20 observe as tick\n  emit demo.tick {\n    scheduled_at tick.scheduled_at\n    observed_at tick.observed_at\n    occurrence_id tick.occurrence_id\n    missed_count tick.missed_count\n  }\n}\n\n\
-             rule stop_on_tick\n  when demo.tick as tick\n=> {\n  complete result { ok 1 }\n}\n";
-        let mut instance = DurableInstance::create(
-            store().sql,
-            source,
-            "{}",
-            "local/ClockDemo",
-            DurableEffectPorts::default(),
-            &[],
-            &[],
-        )
-        .expect("create");
-
-        // First step (well before any tick is due relative to the store's
-        // wall-clock created_at): parks, naming the next 30s occurrence.
-        let parked = instance.step(None, TEST_NOW_MS);
-        let next_due = match parked {
-            DurableStepOutcome::Parked { next_due_unix_ms } => {
-                next_due_unix_ms.expect("an interval source names its next tick")
-            }
-            other => panic!("expected a park with a wake-up, got {other:?}"),
-        };
-
-        // The alarm fires: a `now` past the tick admits the signal fact and
-        // the rule finishes the workflow.
-        assert!(
-            matches!(
-                instance.step(None, next_due + 1_000),
-                DurableStepOutcome::Terminal
-            ),
-            "the alarm re-entry admits the clock tick and finishes"
-        );
-        assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("completed")
-        );
-    }
-
-    /// The worker-shell loop over a COERCE workflow: `create`, `step(None)` yields
-    /// NeedsHttp (the provider request), the shell performs the `fetch`, and
-    /// `step(response)` settles to the terminal — the real durable-object suspend/
-    /// resume across separate JS calls, over the handle.
-    #[test]
-    fn durable_instance_suspends_on_fetch_and_resumes_to_terminal() {
-        use whipplescript_kernel::coerce_native::CoerceProvider;
+    fn durable_exec_sidecar_round_survives_complete_handle_loss() {
+        use whipplescript_kernel::exec_http;
         use whipplescript_kernel::sansio::HttpResponse;
 
-        let source = "workflow CoerceScore\n\noutput result Decision\n\n\
-             class Decision {\n  score float\n}\n\n\
-             coerce scoreIt() -> Decision {\n  prompt \"\"\"\n  Score it.\n  {{ ctx.output_format }}\n  \"\"\"\n}\n\n\
-             rule go\n  when started\n=> {\n  coerce scoreIt() as review\n\
-             \x20 after review succeeds as decision {\n    complete result { score decision.score }\n  }\n\
-             \x20 after review fails {\n    complete result { score 0.0 }\n  }\n}\n";
-        let base = store();
-        for stmt in [
-            "INSERT INTO capability_schemas (capability, description, schema_json) \
-             VALUES ('schema.coerce', 'Coerce.', '{}')",
-            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
-             VALUES ('provider_coerce_builtin', 'schema.coerce', 'builtin-coerce', 'schema.coerce', '{}')",
-            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
-             VALUES ('binding_coerce_builtin', NULL, 'schema.coerce', 'builtin-coerce', '{}')",
-        ] {
-            base.sql.execute(stmt, &[]).expect("seed coerce provider");
-        }
+        let source = r#"use std.script
+workflow ExecRecovery
 
-        let ports = DurableEffectPorts {
-            coerce: Some(CoerceProviderConfig {
-                provider: CoerceProvider::Anthropic,
-                provider_name: "anthropic".to_owned(),
-                base_url: "https://api.anthropic.com".to_owned(),
-                api_key: "test-key".to_owned(),
-                model: "claude-test".to_owned(),
-                max_tokens: 1024,
+output result Report
+
+class Request {
+  text string
+}
+
+class Report {
+  verdict string
+}
+
+table requests as Request [
+  {
+    text "check"
+  }
+]
+
+rule go
+  when Request as request
+=> {
+  exec judge with request -> Report as report
+
+  after report succeeds as out {
+    complete result {
+      verdict out.verdict
+    }
+  }
+}
+"#;
+        let script_body = "read line\necho '{\"verdict\":\"pass\"}'\n";
+        let script_sha = whipplescript_kernel::exec_http::sha256_hex(script_body.as_bytes());
+        let scripts = vec![ScriptCapabilityInput {
+            name: "judge".to_owned(),
+            argv: vec!["sh".to_owned(), "{script}".to_owned()],
+            sha256: script_sha,
+            env: std::collections::BTreeMap::from([(
+                "ALLOWED_VALUE".to_owned(),
+                "env:SAFE_VALUE".to_owned(),
+            )]),
+            hermetic: false,
+            body: script_body.to_owned(),
+        }];
+        let ports = || DurableEffectPorts {
+            exec: Some(ExecutorSidecarConfig {
+                base_url: "http://executor:8080".to_owned(),
+                env_values: std::collections::BTreeMap::from([
+                    ("SAFE_VALUE".to_owned(), "visible-safe-value".to_owned()),
+                    (
+                        "UNRELATED_PROVIDER_CREDENTIAL".to_owned(),
+                        "canary-provider-secret-must-not-enter-command".to_owned(),
+                    ),
+                ]),
+                environment_epoch: "test-epoch".to_owned(),
+                timeout_ms: Some(10_000),
+                auth_token: None,
             }),
             ..DurableEffectPorts::default()
         };
-        let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/CoerceScore", ports, &[], &[])
-                .expect("create");
-
-        // First step: the coerce effect suspends on `fetch`.
+        let sql = store().sql;
+        let mut instance = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/ExecRecovery",
+            ports(),
+            &[],
+            &scripts,
+        )
+        .expect("create");
         let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
-            other => panic!("expected NeedsHttp, got {other:?}"),
+            other => panic!("expected executor request, got {other:?}"),
         };
+        drop(instance);
+
+        let mut instance = DurableInstance::create(
+            sql,
+            source,
+            "{}",
+            "local/ExecRecovery",
+            ports(),
+            &[],
+            &scripts,
+        )
+        .expect("reattach");
+        let replay = match instance.step(None, TEST_NOW_MS) {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected replayed executor request, got {other:?}"),
+        };
+        assert_eq!(replay.url, request.url);
+        assert_eq!(replay.headers, request.headers);
+        assert_eq!(replay.body, request.body);
+        assert_eq!(
+            replay.body["env"],
+            serde_json::json!({"ALLOWED_VALUE": "visible-safe-value"}),
+            "the command receives only script-declared environment references"
+        );
         assert!(
-            request.url.contains("anthropic"),
-            "request targets the provider"
+            !replay
+                .body
+                .to_string()
+                .contains("canary-provider-secret-must-not-enter-command"),
+            "an unrelated host credential must not enter the executor request"
         );
 
-        // The worker performs the fetch; feed a canned structured output back.
+        let effect_id = replay.body["effect_id"]
+            .as_str()
+            .expect("executor request effect id");
         let response = HttpResponse {
             status: 200,
             body: serde_json::json!({
-                "content": [{ "type": "tool_use", "name": "Decision", "input": { "score": 0.9 } }],
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                "protocol": exec_http::EXECUTOR_PROTOCOL,
+                "effect_id": effect_id,
+                "exit_code": 0,
+                "timed_out": false,
+                "stdout": "{\"verdict\":\"pass\"}\n",
+                "stderr": "",
             }),
         };
-        assert!(
-            matches!(
-                instance.step(Some(Ok(response)), TEST_NOW_MS),
-                DurableStepOutcome::Terminal
-            ),
-            "the resume settles the coerce and reaches the terminal"
-        );
+        assert!(matches!(
+            instance.step(Some(Ok(response)), TEST_NOW_MS),
+            DurableStepOutcome::Terminal
+        ));
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let runs = kernel
+            .store()
+            .list_runs(&instance.instance_id)
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "reattachment must not mint a second run");
+        assert_eq!(runs[0].status, "completed");
+        let effects = kernel
+            .store()
+            .list_effects(&instance.instance_id)
+            .expect("effects");
         assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("completed")
+            effects
+                .iter()
+                .filter(|effect| effect.kind == "exec.command" && effect.status == "completed")
+                .count(),
+            1,
+            "the executor round has one terminal effect"
         );
     }
 
-    /// The worker-shell loop over an AGENT workflow, driving the real
-    /// `MessagesApiClient` (the config-only, transport-free model client a live
-    /// worker builds from its secrets): `create`, `step(None)` yields NeedsHttp
-    /// carrying the REAL Anthropic messages request, the shell performs the `fetch`,
-    /// and `step(response)` parses a final reply and settles to the terminal. This
-    /// is the agent counterpart to the coerce test — the multi-round turn's first
-    /// round suspends over the handle and resumes to a terminal, over the real wire
-    /// format, not a fake model.
     #[test]
-    fn durable_instance_runs_an_agent_turn_over_fetch_with_the_real_model_client() {
-        use whipplescript_kernel::coerce_native::CoerceProvider;
-        use whipplescript_kernel::harness_model::MessagesApiClient;
+    fn durable_turn_container_round_survives_complete_handle_loss() {
         use whipplescript_kernel::sansio::HttpResponse;
 
-        let source = "workflow AgentDemo\n\noutput result Done\n\n\
+        let source = "workflow AgentContainerRecovery\n\noutput result Done\n\n\
              class Done {\n  ok int\n}\n\n\
              agent helper {\n  provider owned\n  profile \"repo-reader\"\n  capacity 1\n}\n\n\
              rule go\n  when started\n=> {\n  tell helper as reply \"\"\"\n  Do the thing.\n  \"\"\"\n\n\
              \x20 after reply succeeds {\n    complete result { ok 1 }\n  }\n\n\
              \x20 after reply fails {\n    complete result { ok 0 }\n  }\n}\n";
+        let ports = || DurableEffectPorts {
+            turn: Some(TurnContainerConfig {
+                base_url: "http://turn".to_owned(),
+                provider: serde_json::json!({"provider": "fixture"}),
+                max_steps: 8,
+                auth_token: None,
+            }),
+            ..DurableEffectPorts::default()
+        };
         let base = store();
         for stmt in [
             "INSERT INTO capability_schemas (capability, description, schema_json) \
@@ -909,59 +936,78 @@ mod tests {
         ] {
             base.sql.execute(stmt, &[]).expect("seed agent provider");
         }
-
-        let ports = DurableEffectPorts {
-            agent_model: Some(Box::new(MessagesApiClient::new(
-                CoerceProvider::Anthropic,
-                "test-key",
-                "claude-test",
-                "https://api.anthropic.com",
-                1024,
-                None,
-            ))),
-            ..DurableEffectPorts::default()
-        };
-        let mut instance =
-            DurableInstance::create(base.sql, source, "{}", "local/AgentDemo", ports, &[], &[])
-                .expect("create");
-
-        // First step: the agent turn's first model call suspends on `fetch`, and the
-        // request is the real Anthropic messages call the model client built.
+        let sql = base.sql;
+        let mut instance = DurableInstance::create(
+            sql.clone(),
+            source,
+            "{}",
+            "local/AgentContainerRecovery",
+            ports(),
+            &[],
+            &[],
+        )
+        .expect("create");
         let request = match instance.step(None, TEST_NOW_MS) {
             DurableStepOutcome::NeedsHttp(request) => request,
-            other => panic!("expected NeedsHttp, got {other:?}"),
+            other => panic!("expected turn-container request, got {other:?}"),
         };
-        assert!(
-            request.url.contains("anthropic") && request.url.ends_with("/v1/messages"),
-            "request targets the Anthropic messages endpoint: {}",
-            request.url
-        );
-        assert!(
-            request
-                .headers
-                .iter()
-                .any(|(k, _)| k == "x-api-key" || k == "anthropic-version"),
-            "request carries the Anthropic auth/version headers"
-        );
+        drop(instance);
 
-        // The worker performs the fetch; feed a canned final reply (no tool calls).
+        let mut instance = DurableInstance::create(
+            sql,
+            source,
+            "{}",
+            "local/AgentContainerRecovery",
+            ports(),
+            &[],
+            &[],
+        )
+        .expect("reattach");
+        let replay = match instance.step(None, TEST_NOW_MS) {
+            DurableStepOutcome::NeedsHttp(request) => request,
+            other => panic!("expected replayed turn-container request, got {other:?}"),
+        };
+        assert_eq!(replay.url, request.url);
+        assert_eq!(replay.headers, request.headers);
+        assert_eq!(replay.body, request.body);
+
+        let turn_id = replay.body["turn_id"].as_str().expect("turn id");
         let response = HttpResponse {
             status: 200,
             body: serde_json::json!({
-                "content": [{ "type": "text", "text": "did the thing" }],
-                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                "protocol": "whip-turn/1",
+                "turn_id": turn_id,
+                "resumed": true,
+                "outcome": {
+                    "status": "completed",
+                    "summary": "container turn complete",
+                    "steps": 2,
+                    "usage": {"input_tokens": 5, "output_tokens": 7},
+                },
             }),
         };
-        assert!(
-            matches!(
-                instance.step(Some(Ok(response)), TEST_NOW_MS),
-                DurableStepOutcome::Terminal
-            ),
-            "the resume parses the final reply, settles the turn, and reaches the terminal"
-        );
+        assert!(matches!(
+            instance.step(Some(Ok(response)), TEST_NOW_MS),
+            DurableStepOutcome::Terminal
+        ));
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let runs = kernel
+            .store()
+            .list_runs(&instance.instance_id)
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "reattachment must not mint a second run");
+        assert_eq!(runs[0].status, "completed");
+        let effects = kernel
+            .store()
+            .list_effects(&instance.instance_id)
+            .expect("effects");
         assert_eq!(
-            instance.status().expect("status").as_deref(),
-            Some("completed")
+            effects
+                .iter()
+                .filter(|effect| effect.kind == "agent.tell" && effect.status == "completed")
+                .count(),
+            1,
+            "the container round has one terminal effect"
         );
     }
 
@@ -1064,7 +1110,7 @@ mod branch_dispatch_tests {
 
         let source = "workflow BranchDispatch\n\noutput result Result\n\n\
              class Result {\n  status string\n}\n\n\
-             file store out_files {\n  root \"/ws\"\n}\n\n\
+             file store out_files {\n  root \"/ws\"\n  allow write [\"**\"]\n}\n\n\
              rule pick\n  when started\n=> {\n\
              \x20 write text to out_files at \"note.md\" {\n\
              \x20   body \"branch body\"\n    mode create\n  } as written\n\n\
@@ -1111,14 +1157,14 @@ mod branch_dispatch_tests {
             None
         );
 
-        // The plain DO file plane never saw the write.
+        // The plain DO file plane never saw the write. The files table keys on
+        // `key`, and the query must not be allowed to fail silently — a broken
+        // query would make this isolation assertion pass vacuously.
         let plain_rows = sql
-            .query("SELECT COUNT(*) FROM files WHERE path LIKE '%note.md'", &[])
-            .map(|rows| {
-                rows.first()
-                    .map(|row| crate::do_store::as_i64(&row[0]))
-                    .unwrap_or(0)
-            })
+            .query("SELECT COUNT(*) FROM files WHERE key LIKE '%note.md'", &[])
+            .expect("plain file plane queries")
+            .first()
+            .map(|row| crate::do_store::as_i64(&row[0]))
             .unwrap_or(0);
         assert_eq!(
             plain_rows, 0,
@@ -1127,5 +1173,63 @@ mod branch_dispatch_tests {
 
         // A rebind to a different branch is refused (write-once birth).
         assert!(instance.bind_branch("main", "t2").is_err());
+    }
+
+    /// DO parity for the relocated export core (std.files slice F4): the
+    /// `file.export` handler now lives in kernel::effect_handlers (it was
+    /// CLI-crate-bound, so exports could not execute on the DO plane at all),
+    /// and a plain instance drives it in-isolate — the serialized collection
+    /// lands on the DO file plane and the workflow reaches its terminal.
+    #[test]
+    fn do_instance_exports_fact_collection_through_the_relocated_core() {
+        let sql = Rc::new(store().sql);
+        let source = "workflow ExportParity\n\noutput result Result\n\n\
+             class Result {\n  status string\n}\n\n\
+             class Row {\n  id string\n}\n\n\
+             class Seeded {\n  note string\n}\n\n\
+             file store out_files {\n  root \"/ws\"\n  allow write [\"**\"]\n}\n\n\
+             rule seed\n  when started\n=> {\n\
+             \x20 record Row { id \"a\" }\n\
+             \x20 record Seeded { note \"go\" }\n}\n\n\
+             rule dump\n  when Seeded as s\n=> {\n\
+             \x20 export jsonl Row to out_files at \"rows.jsonl\" {\n\
+             \x20   mode upsert\n  } as dumped\n\n\
+             \x20 after dumped succeeds as receipt {\n\
+             \x20   complete result {\n      status \"ok\"\n    }\n  }\n}\n";
+        let mut instance = DurableInstance::create(
+            Rc::clone(&sql),
+            source,
+            "{}",
+            "local/ExportParity",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        assert!(
+            matches!(
+                instance.step(None, TEST_NOW_MS),
+                DurableStepOutcome::Terminal
+            ),
+            "the in-isolate export settles and the instance terminates"
+        );
+        assert_eq!(
+            instance.status().expect("status").as_deref(),
+            Some("completed")
+        );
+
+        // The golden serialized collection is on the DO file plane, keyed by
+        // the resolved full path — the same jsonl bytes the native handler
+        // writes (one JSON object per line, trailing newline).
+        let content = sql
+            .query(
+                "SELECT content FROM files WHERE key = ?1",
+                &[crate::do_store::text("/ws/rows.jsonl")],
+            )
+            .expect("file plane readable")
+            .first()
+            .map(|row| crate::do_store::as_text(&row[0]))
+            .expect("exported file exists");
+        assert_eq!(content, "{\"id\":\"a\"}\n");
     }
 }

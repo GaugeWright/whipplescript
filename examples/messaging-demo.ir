@@ -11,12 +11,12 @@ schemas
   class Handled
     reply string
 channels
-  channel ops_room provider=slack destination="#ops"
+  channel ops_room provider=fixture destination="#ops"
 rules
   rule acknowledge_message
     when message from ops_room as msg
     reads
       pattern:message from ops_room as msg
     effects
-      reply kind=capability.call binding=reply construct=send->messaging.send key=c01472de7e75713c
-    body_hash 9ed1304b98663a1b
+      reply kind=capability.call binding=reply construct=send->messaging.send key=ebbf62ddd92a9bb6882f32ac88a1498b
+    body_hash b1031d50a50b6011bea84b2a5b7e7775

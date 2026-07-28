@@ -1,0 +1,43 @@
+load ../terminal-payload-shape.maude
+
+--- Coverage: a class contract with a well-formed field block is accepted.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(classContract) payload(blockPayload(true)) verdict(pending)
+  =>* C:Cfg verdict(accepted) .
+
+--- Coverage: a scalar contract with a matching scalar value is accepted.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(scalarContract(numberT)) payload(scalarPayload(numberT)) verdict(pending)
+  =>* C:Cfg verdict(accepted) .
+
+--- Coverage: a class contract given a bare scalar payload is rejected (shape).
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(classContract) payload(scalarPayload(numberT)) verdict(pending)
+  =>* C:Cfg verdict(rejected) .
+
+--- Coverage: a scalar contract given a field block is rejected (shape).
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(scalarContract(numberT)) payload(blockPayload(true)) verdict(pending)
+  =>* C:Cfg verdict(rejected) .
+
+--- Coverage: a scalar contract given a scalar of a different primitive is rejected.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(scalarContract(numberT)) payload(scalarPayload(stringT)) verdict(pending)
+  =>* C:Cfg verdict(rejected) .
+
+--- Coverage: a class contract with ill-formed fields is rejected.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(classContract) payload(blockPayload(false)) verdict(pending)
+  =>* C:Cfg verdict(rejected) .
+
+--- Bite: a class contract + well-formed block is NEVER rejected. The RESIDUAL
+--- soup var means any rejected verdict in any reachable state is a solution, so
+--- No solution proves the correct shape is not wrongly rejected.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(classContract) payload(blockPayload(true)) verdict(pending)
+  =>* verdict(rejected) RESIDUAL:Cfg .
+
+--- Bite: a scalar contract + a matching scalar value is NEVER rejected.
+search [1] in WHIPPLESCRIPT-TERMINAL-PAYLOAD-SHAPE :
+  contract(scalarContract(numberT)) payload(scalarPayload(numberT)) verdict(pending)
+  =>* verdict(rejected) RESIDUAL:Cfg .

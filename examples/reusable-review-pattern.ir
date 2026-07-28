@@ -1,11 +1,14 @@
 workflow ReusableReviewPattern
 pattern_applications
   AgentReview as changeReview<ref<ChangeRequest>, ref<ReviewedChange>>
-    defined-at 587..945
-    applied-at 947..1015
+    defined-at 671..1125
+    applied-at 1127..1195
     generated rule:changeReview_review
 workflow_contracts
   output result ref<ReviewBatch>
+  failure error ref<ReviewFailure>
+uses
+  package std.agent
 schemas
   class ChangeRequest
     id string
@@ -17,6 +20,8 @@ schemas
     status literal<"reviewed">
   class ReviewBatch
     reviewed int
+  class ReviewFailure
+    reason string
 agents
   agent reviewer harness=<fallback> provider=owned profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[]
 assertions
@@ -34,8 +39,8 @@ rules
     writes
       schema:ChangeRequest
     record_sources
-      schema:ChangeRequest construct=table_row span=434..507
-    body_hash 93ea95c4d01980d5
+      schema:ChangeRequest construct=table_row span=518..591
+    body_hash 1e2d8eb96f5c5e1d8eeee67fe2c9f6a9
   rule changeReview_review
     when ChangeRequest as item
     when reviewer is available
@@ -43,17 +48,24 @@ rules
       pattern:reviewer is available
       schema:ChangeRequest
     writes
+      schema:ReviewFailure
       schema:ReviewedChange
     consumes
       schema:ChangeRequest
     effects
-      turn kind=agent.tell binding=turn key=563a15b288804fa3
-    body_hash a053de0ddffd06e0
+      turn kind=agent.tell binding=turn key=0e377cfe28b825e30313398886da4dce
+    body_hash c5861f782a35fc3e965da7890198d622
+  rule fail_on_review_failure
+    when ReviewFailure as failure
+    reads
+      schema:ReviewFailure
+    body_hash 43039c5d012c0c51c30a78dd1bc45f42
   rule finish_batch
     when ReviewedChange as reviewed where reviewed.status == "reviewed"
     reads
       schema:ReviewedChange
-    body_hash f86297ddd1b082ff
+    body_hash 9f67c4dc6503354813b32a186c7ca679
 rule_dependencies
+  changeReview_review --schema:ReviewFailure--> fail_on_review_failure
   changeReview_review --schema:ReviewedChange--> finish_batch
   table_changes --schema:ChangeRequest--> changeReview_review

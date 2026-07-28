@@ -1,0 +1,59 @@
+load ../kernel.maude
+
+--- DR-0023 action-block expansion. These searches pin the invariants the
+--- Rust `expand_action_calls` pass must hold: an acyclic call inlines into the
+--- calling rule with a hygienic, call-site-keyed binding and rule-template
+--- provenance; recursion is rejected; and inlining never runs provider work.
+
+--- Coverage: an acyclic action call inlines to a visible effect node carrying
+--- a call-site-keyed binding plus rule-template provenance.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  acyclic(runTask) actionCall(runTask, callOne, routeRule)
+  =>*
+  acyclic(runTask)
+  actionInlined(runTask, callOne, routeRule)
+  boundEffect(callOne, hbind(callOne, turnLocal))
+  actionProvenance(routeRule, runTask, callOne) .
+
+--- Coverage (hygiene): two calls of one action in one rule body both inline,
+--- each to its own call-site-keyed binding. The two bindings coexist without
+--- collision.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  acyclic(runTask)
+  actionCall(runTask, callOne, routeRule)
+  actionCall(runTask, callTwo, routeRule)
+  =>*
+  acyclic(runTask)
+  actionInlined(runTask, callOne, routeRule)
+  actionInlined(runTask, callTwo, routeRule)
+  boundEffect(callOne, hbind(callOne, turnLocal))
+  boundEffect(callTwo, hbind(callTwo, turnLocal))
+  actionProvenance(routeRule, runTask, callOne)
+  actionProvenance(routeRule, runTask, callTwo) .
+
+--- Bite: inlining is pure compile-time elaboration. Even after a call
+--- inlines, no provider effect is running. (Mirrors the pattern bite: an
+--- application alone cannot run provider work.)
+search [1] in WHIPPLESCRIPT-KERNEL :
+  acyclic(runTask) actionCall(runTask, callOne, routeRule)
+  =>*
+  effect(tellEff, running) C:Cfg .
+
+--- Bite: a recursive action carries no acyclic marker, so the inline rule
+--- never fires and the call is never elaborated. The compiler must reject it
+--- rather than expand it.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  recursive(loopAct) actionCall(loopAct, callRec, routeRule)
+  =>*
+  actionInlined(loopAct, callRec, routeRule) C:Cfg .
+
+--- Bite (hygiene): two calls never share a single hygienic binding. callTwo's
+--- inlined effect can never be bound to callOne's binding, so a collision is
+--- unreachable.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  acyclic(runTask)
+  actionCall(runTask, callOne, routeRule)
+  actionCall(runTask, callTwo, routeRule)
+  =>*
+  boundEffect(callOne, hbind(callOne, turnLocal))
+  boundEffect(callTwo, hbind(callOne, turnLocal)) C:Cfg .

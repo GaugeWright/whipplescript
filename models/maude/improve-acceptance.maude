@@ -1,0 +1,97 @@
+--- Campaign acceptance invariant, per spec/improve-design-note.md section 2
+--- and section 12: never surface a dominated candidate as adoptable. A
+--- campaign partitions the gauge vector by naming: named gauges ASCEND
+--- toward better, unnamed gauges are GUARDED within their indifference
+--- bands, --sacrifice RELEASES a gauge from the guard set, and declared
+--- bars are always hard. A candidate is proposable only if at least one
+--- ascend gauge measured better, no ascend gauge measured worse, every
+--- guarded gauge stayed within its band, and every declared bar is met.
+---
+--- Two verdict passes over one measured candidate. The SOUND judge
+--- discharges every gauge obligation before accepting; any guard
+--- regression beyond band, ascend regression, or violated bar terminates
+--- in an honest rejection. The NAIVE judge accepts on focus improvement
+--- alone -- greedy scalar ascent, the modeled hazard: "improved the
+--- gauge, broke the system" ships a candidate that regressed a guarded
+--- dimension nobody agreed to trade away.
+mod WHIPPLESCRIPT-IMPROVE-ACCEPTANCE is
+  sorts Gid Delta Cnt Cfg .
+
+  ops g1 g2 g3 : -> Gid [ctor] .
+  ops better inband worse : -> Delta [ctor] .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op ascend : Gid -> Cfg [ctor] .    --- named in the campaign: must improve
+  op guard : Gid -> Cfg [ctor] .     --- unnamed: held within its band
+  op sacrifice : Gid -> Cfg [ctor] . --- released from the guard set
+  op barMet : Gid -> Cfg [ctor] .    --- declared hard bar holds on the candidate
+  op barViol : Gid -> Cfg [ctor] .   --- declared hard bar violated
+  op meas : Gid Delta -> Cfg [ctor] . --- measured movement vs the gauge's band
+
+  op obl : Cnt -> Cfg [ctor] .    --- undischarged gauge obligations
+  op judge : -> Cfg [ctor] .      --- the sound verdict pass
+  op naive : -> Cfg [ctor] .      --- the naive verdict pass (hazard)
+  op focusUp : -> Cfg [ctor] .    --- witnessed: an ascend gauge improved
+  op proposed : -> Cfg [ctor] .   --- candidate surfaced as adoptable
+  op rejected : -> Cfg [ctor] .   --- candidate refused, honestly
+
+  var G : Gid . var D : Delta . var N : Cnt .
+
+  --- The sound judge discharges obligations one gauge at a time.
+  rl [ascend-better] :
+      judge ascend(G) meas(G, better) obl(s(N))
+      => judge focusUp obl(N) .
+
+  rl [ascend-flat] :
+      judge ascend(G) meas(G, inband) obl(s(N))
+      => judge obl(N) .
+
+  --- A candidate that regresses its own focus dimension is refused.
+  rl [ascend-worse] :
+      judge ascend(G) meas(G, worse)
+      => rejected .
+
+  rl [guard-flat] :
+      judge guard(G) meas(G, inband) obl(s(N))
+      => judge obl(N) .
+
+  rl [guard-better] :
+      judge guard(G) meas(G, better) obl(s(N))
+      => judge obl(N) .
+
+  --- The dominance invariant's teeth: a guarded gauge moved beyond its
+  --- indifference band -- the candidate is dominated, refuse it.
+  rl [guard-worse] :
+      judge guard(G) meas(G, worse)
+      => rejected .
+
+  --- A sacrificed gauge may move anywhere; the evidence card says so.
+  rl [sacrificed] :
+      judge sacrifice(G) meas(G, D) obl(s(N))
+      => judge obl(N) .
+
+  rl [bar-met] :
+      judge barMet(G) obl(s(N))
+      => judge obl(N) .
+
+  --- Declared bars are hard constraints regardless of the partition.
+  rl [bar-violated] :
+      judge barViol(G)
+      => rejected .
+
+  --- Accept only once every obligation is discharged and the focus
+  --- provably improved.
+  rl [accept] :
+      judge focusUp obl(z)
+      => proposed obl(z) .
+
+  --- The naive judge: focus improved, ship it. Guards and bars unread.
+  rl [naive-accept] :
+      naive ascend(G) meas(G, better)
+      => proposed .
+endm

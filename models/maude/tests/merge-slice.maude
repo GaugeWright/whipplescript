@@ -1,0 +1,73 @@
+load ../merge-slice.maude
+
+--- Coverage: slice-disjoint edits to the SAME file (d1 and d3 both live in
+--- f1) certified-merge, and the merged manifest preserves both edits'
+--- writes -- the case git can never grant. Overlapping READS (both read d4)
+--- do not block the certificate.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, d4), edit(eB, d3, mtD, d4),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg certified(eA, eB, at(d1, eA) ; at(d2, e0) ; at(d3, eB)) .
+
+--- The hazard demonstrated: the cross-file semantic conflict. eA rewrites
+--- d1 in file f1; eB rewrites d2 in file f2 AND reads d1. No declaration is
+--- written by both, so the text engine silently accepts the compound state.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeText(edit(eA, d1, mtD, mtD), edit(eB, d2, mtD, d1),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg textMerged(eA, eB, M:MSet) .
+
+--- Bite: the same cross-file pair can NEVER be certified -- eA's write
+--- footprint (d1) meets eB's read footprint (d1), so slice overlap refuses
+--- the certificate that text merge silently granted.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, mtD), edit(eB, d2, mtD, d1),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* certified(I1:EId, I2:EId, M:MSet) RESIDUAL:Cfg .
+
+--- Coverage: the cross-file pair escalates honestly instead.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, mtD), edit(eB, d2, mtD, d1),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg escalated(eA, eB) .
+
+--- Bite on anti-dependence via CONSUME: eA writes d1 and consumes d3; eB
+--- writes d2 and reads d3. No write-write overlap anywhere, yet the
+--- write-or-consume/read intersection (d3) denies the certificate.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, d3, mtD), edit(eB, d2, mtD, d3),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* certified(I1:EId, I2:EId, M:MSet) RESIDUAL:Cfg .
+
+--- Coverage: the consume/read pair escalates.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, d3, mtD), edit(eB, d2, mtD, d3),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg escalated(eA, eB) .
+
+--- Bite in the symmetric direction: the reader is the FIRST edit -- eA
+--- reads d2 while eB rewrites it. The guard's second conjunct refuses the
+--- certificate.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, d2), edit(eB, d2, mtD, mtD),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* certified(I1:EId, I2:EId, M:MSet) RESIDUAL:Cfg .
+
+--- Coverage: both-modified-same-declaration is the collision even the text
+--- engine sees.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeText(edit(eA, d1, mtD, mtD), edit(eB, d1, mtD, mtD),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg textConflict(eA, eB) .
+
+--- Bite: both-modified-same-declaration never certifies.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, mtD), edit(eB, d1, mtD, mtD),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* certified(I1:EId, I2:EId, M:MSet) RESIDUAL:Cfg .
+
+--- Coverage: it escalates as a trivial conflict.
+search [1] in WHIPPLESCRIPT-MERGE-SLICE :
+  mergeCert(edit(eA, d1, mtD, mtD), edit(eB, d1, mtD, mtD),
+            at(d1, e0) ; at(d2, e0) ; at(d3, e0))
+  =>* C:Cfg escalated(eA, eB) .

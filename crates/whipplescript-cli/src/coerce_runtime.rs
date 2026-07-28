@@ -1,145 +1,435 @@
-//! CLI-side wiring for native (real-LLM) `coerce`: configuration and credential
-//! resolution from the environment, the `ureq` HTTP transport, and turning a
-//! declared `coerce` function + its arguments into a rendered prompt and an
-//! output JSON Schema.
+//! CLI-side wiring for native (real-LLM) `coerce`: the registry-honest
+//! backend-selection ladder (spec/std-coercion.md "Backend selection and
+//! config precedence"), the `ureq` HTTP transport, and turning a declared
+//! `coerce` function + its arguments into a rendered prompt and an output
+//! JSON Schema.
 //!
 //! The pure request/response logic and JSON-Schema synthesis live in
-//! `whipplescript_kernel::coerce_native`; this module only supplies the parts
-//! that need the environment (credentials), the network (`ureq`), and the
-//! program IR (prompt template + output type).
+//! `whipplescript_kernel::coerce_native`; the shared model-credential layer
+//! lives in `crate::model_auth`; this module supplies selection + config
+//! resolution and the network (`ureq`).
 //!
-//! Activation is opt-in: with `WHIPPLESCRIPT_COERCE_PROVIDER` unset, coerce uses
-//! the fixture path (so `dev`/`worker`/tests are unchanged). When it is set but
-//! credentials are missing, resolution returns `Err` — a clear binding-time
-//! failure — rather than silently degrading to a fixture.
+//! Selection ladder (each rung an operator-visible choice, `whip coercion
+//! status` reports which one fired):
+//!
+//! 1. per-effect `provider` in source (must name a registered schema_coercer)
+//! 2. operator override — `WHIPPLESCRIPT_COERCE_*` env + `whip auth`
+//! 3. registry default — the `schema.coerce` capability binding row's
+//!    provider + its `effect_providers` row `config_json`
+//! 4. fixture (when nothing selects native)
+//!
+//! Env variables are thereby operator-override-over-registry-default, not the
+//! selection mechanism. Misconfiguration (unknown provider, provider set but
+//! no credential) is a loud `Err` — never a silent fixture degrade.
 
 use std::time::Duration;
 
 use serde_json::Value;
 use whipplescript_kernel::coerce_native::{
     CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest, HttpResponse,
+    ResolvedCoercionConfig, DEFAULT_COERCE_MAX_TOKENS, DEFAULT_COERCE_TIMEOUT_SECS,
 };
 
-/// Resolved configuration for a real coerce call.
-pub struct NativeCoerceConfig {
-    pub provider: CoerceProvider,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
-    pub timeout: Duration,
-    /// `Some(account_id)` when the OpenAI credential is the Codex OAuth token, so
-    /// the kernel targets the codex backend (SSE) instead of `api.openai.com`.
-    pub codex_account_id: Option<String>,
+use crate::model_auth::{
+    anthropic_oauth_rejection, codex_account_id, codex_config_model, env_nonempty,
+    resolve_credential_with_source, CredentialSource,
+};
+
+/// Rung 3's input: the `schema.coerce` capability binding row's provider name
+/// plus that provider's `effect_providers` row `config_json` — one indexed
+/// SELECT at claim time, mirroring the `capability_bound` promotion.
+pub struct CoerceRegistryDefault {
+    /// `capability_bindings.provider` for `schema.coerce`.
+    pub provider: String,
+    /// `effect_providers.config_json` for that provider (backend/model/… as a
+    /// JSON object; never credentials — those resolve through `model_auth`).
+    pub config_json: Option<String>,
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+/// Which ladder rung selected the coerce configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoerceSelectionRung {
+    /// Rung 1: per-effect `provider` in source.
+    PerEffectProvider,
+    /// Rung 2: operator override (`WHIPPLESCRIPT_COERCE_*` env + `whip auth`).
+    OperatorOverride,
+    /// Rung 3: the registry `schema.coerce` binding row.
+    RegistryDefault,
+    /// Rung 4: fixture — nothing selected native.
+    Fixture,
 }
 
-/// The `model = "..."` from `~/.codex/config.toml` (the model the codex CLI is
-/// configured to use), so the codex coerce path tracks the user's config rather
-/// than a hard-coded default. Shared with the agent-turn app-server path.
-pub(crate) fn codex_config_model() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home)
-        .join(".codex")
-        .join("config.toml");
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        // Match the top-level `model = "..."` (not `model_reasoning_effort`, etc.).
-        let Some(rest) = line.strip_prefix("model") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"');
-        if !value.is_empty() {
-            return Some(value.to_owned());
+impl CoerceSelectionRung {
+    pub fn number(self) -> u8 {
+        match self {
+            CoerceSelectionRung::PerEffectProvider => 1,
+            CoerceSelectionRung::OperatorOverride => 2,
+            CoerceSelectionRung::RegistryDefault => 3,
+            CoerceSelectionRung::Fixture => 4,
         }
     }
-    None
-}
 
-/// Resolve native coerce configuration from the environment. `Ok(None)` selects
-/// the fixture path; `Err` is a binding-time credential failure.
-pub fn resolve_native_coerce_config() -> Result<Option<NativeCoerceConfig>, String> {
-    resolve_native_coerce_config_for(None)
-}
-
-pub fn resolve_native_coerce_config_for(
-    provider_override: Option<&str>,
-) -> Result<Option<NativeCoerceConfig>, String> {
-    let Some(provider_name) = provider_override
-        .map(str::to_owned)
-        .or_else(|| env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER"))
-    else {
-        return Ok(None);
-    };
-    if provider_name.eq_ignore_ascii_case("fixture") {
-        return Ok(None);
+    pub fn label(self) -> &'static str {
+        match self {
+            CoerceSelectionRung::PerEffectProvider => "per-effect provider",
+            CoerceSelectionRung::OperatorOverride => "operator override",
+            CoerceSelectionRung::RegistryDefault => "registry default",
+            CoerceSelectionRung::Fixture => "fixture",
+        }
     }
-    let provider = parse_provider(&provider_name)?;
-    let (api_key, source) = resolve_credential_with_source(provider)
-        .ok_or_else(|| missing_credential_message(provider))?;
-    if provider == CoerceProvider::Anthropic
-        && whipplescript_kernel::coerce_native::is_anthropic_oauth_token(&api_key)
-    {
-        // Anthropic coerce uses a console API key only (decided 2026-06-23, Jack):
-        // reusing a Claude Code OAuth token for the API is a terms gray area.
-        return Err(
-            "Anthropic coerce requires a console API key (`sk-ant-api...`), not a Claude Code \
-             OAuth token (`sk-ant-oat...`); set ANTHROPIC_API_KEY or run `whip auth set anthropic <key>`"
-                .to_owned(),
+}
+
+/// A resolved coerce selection: the canonical config record (`None` = the
+/// fixture path), the rung that chose it, and — for status surfaces — where
+/// the credential came from (the label only; the key itself lives in
+/// `config.api_key` and is never reported).
+#[derive(Debug)]
+pub struct CoerceSelection {
+    pub config: Option<ResolvedCoercionConfig>,
+    pub rung: CoerceSelectionRung,
+    pub credential_source: Option<CredentialSource>,
+}
+
+/// Provider names that select the fixture path. `builtin-coerce` is the
+/// migration-0001 seeded binding's provider name for the same deterministic
+/// provider the manifest names `fixture`.
+pub(crate) fn is_fixture_provider_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("fixture") || name == "builtin-coerce"
+}
+
+/// Snapshot of the operator-override environment (`WHIPPLESCRIPT_COERCE_*`),
+/// separated from process env so the ladder itself is unit-testable.
+struct OperatorEnv {
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+impl OperatorEnv {
+    fn from_process() -> Self {
+        Self {
+            provider: env_nonempty("WHIPPLESCRIPT_COERCE_PROVIDER"),
+            model: env_nonempty("WHIPPLESCRIPT_COERCE_MODEL"),
+            base_url: env_nonempty("WHIPPLESCRIPT_COERCE_BASE_URL"),
+            max_tokens: env_nonempty("WHIPPLESCRIPT_COERCE_MAX_TOKENS")
+                .and_then(|value| value.parse().ok()),
+            timeout_secs: env_nonempty("WHIPPLESCRIPT_COERCE_TIMEOUT_SECS")
+                .and_then(|value| value.parse().ok()),
+        }
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            base_url: None,
+            max_tokens: None,
+            timeout_secs: None,
+        }
+    }
+}
+
+/// The credential/codex probes the resolution consults, injectable for tests
+/// (the real set reads env, `whip auth`, and `~/.codex`).
+struct CredentialProbes<'a> {
+    credential: &'a dyn Fn(CoerceProvider) -> Option<(String, CredentialSource)>,
+    codex_model: &'a dyn Fn() -> Option<String>,
+    codex_account: &'a dyn Fn() -> Option<String>,
+}
+
+impl CredentialProbes<'_> {
+    fn real() -> CredentialProbes<'static> {
+        CredentialProbes {
+            credential: &resolve_credential_with_source,
+            codex_model: &codex_config_model,
+            codex_account: &codex_account_id,
+        }
+    }
+}
+
+/// The coercion-config fingerprint the step machine folds into `schema.coerce`
+/// effect admission keys (DR-0014 amendment): H(provider_kind, provider_id,
+/// backend, model) over the same provider/model resolution the dispatch path
+/// uses (ladder rungs 2-4 — rung 1 is per-effect and stays out of the
+/// kernel-construction fingerprint), or the literal `"fixture"` when the
+/// fixture path is selected — so switching backend or model re-runs future
+/// coercions instead of replaying a stale terminal, while fixture runs stay
+/// deterministic. Credential resolution is deliberately NOT consulted: a
+/// missing or rotated key must fail at dispatch, never rekey admissions.
+/// The rung-3 registry default is threaded in so the fingerprint resolves
+/// provider/model through the SAME ladder the dispatch path uses.
+pub fn coercion_config_fingerprint_with_registry(
+    registry_default: Option<&CoerceRegistryDefault>,
+) -> String {
+    fingerprint_inner(
+        &OperatorEnv::from_process(),
+        registry_default,
+        &codex_config_model,
+    )
+}
+
+fn fingerprint_inner(
+    env: &OperatorEnv,
+    registry_default: Option<&CoerceRegistryDefault>,
+    codex_model: &dyn Fn() -> Option<String>,
+) -> String {
+    // Rung 2: operator override.
+    if let Some(provider_name) = &env.provider {
+        if is_fixture_provider_name(provider_name) {
+            return "fixture".to_owned();
+        }
+        let model = env.model.clone().or_else(codex_model).unwrap_or_default();
+        return whipplescript_kernel::coerce::coercion_config_fingerprint(
+            "schema_coercer",
+            provider_name,
+            provider_name,
+            &model,
         );
+    }
+    // Rung 3: registry default.
+    if let Some(default) = registry_default {
+        if !is_fixture_provider_name(&default.provider) {
+            let config = parsed_registry_config(default);
+            let backend_name = registry_backend_name(default, &config)
+                .unwrap_or_else(|_| default.provider.clone());
+            let model = env
+                .model
+                .clone()
+                .or_else(|| config_string(&config, "model"))
+                .or_else(codex_model)
+                .unwrap_or_default();
+            return whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                &default.provider,
+                &backend_name,
+                &model,
+            );
+        }
+    }
+    // Rung 4.
+    "fixture".to_owned()
+}
+
+/// Resolve the coerce configuration through the full four-rung ladder.
+/// `provider_override` is the per-effect `provider` from source (rung 1);
+/// `registry_default` is the claim-time `schema.coerce` binding row (rung 3).
+pub fn resolve_coercion_selection(
+    provider_override: Option<&str>,
+    registry_default: Option<&CoerceRegistryDefault>,
+) -> Result<CoerceSelection, String> {
+    resolve_selection_inner(
+        provider_override,
+        &OperatorEnv::from_process(),
+        registry_default,
+        &CredentialProbes::real(),
+    )
+}
+
+/// Resolve native coerce configuration from the environment only (ladder
+/// rungs 2 and 4 — no store in hand). `Ok(None)` selects the fixture path;
+/// `Err` is a binding-time configuration/credential failure. Kept for
+/// surfaces without a runtime store (the improve loop's judge/proposer
+/// transport); store-backed call sites use [`resolve_coercion_selection`].
+pub fn resolve_native_coerce_config() -> Result<Option<ResolvedCoercionConfig>, String> {
+    Ok(resolve_coercion_selection(None, None)?.config)
+}
+
+fn resolve_selection_inner(
+    provider_override: Option<&str>,
+    env: &OperatorEnv,
+    registry_default: Option<&CoerceRegistryDefault>,
+    probes: &CredentialProbes<'_>,
+) -> Result<CoerceSelection, String> {
+    // Rung 1: per-effect `provider` in source.
+    if let Some(name) = provider_override {
+        if is_fixture_provider_name(name) {
+            return Ok(fixture_selection(CoerceSelectionRung::PerEffectProvider));
+        }
+        let backend = parse_provider(name)?;
+        return native_selection(
+            CoerceSelectionRung::PerEffectProvider,
+            name,
+            backend,
+            env,
+            None,
+            probes,
+        );
+    }
+    // Rung 2: operator override (env + whip auth).
+    if let Some(name) = &env.provider {
+        if is_fixture_provider_name(name) {
+            return Ok(fixture_selection(CoerceSelectionRung::OperatorOverride));
+        }
+        let backend = parse_provider(name)?;
+        return native_selection(
+            CoerceSelectionRung::OperatorOverride,
+            name,
+            backend,
+            env,
+            None,
+            probes,
+        );
+    }
+    // Rung 3: registry default (the schema.coerce binding row).
+    if let Some(default) = registry_default {
+        if !is_fixture_provider_name(&default.provider) {
+            let config = parsed_registry_config(default);
+            let backend_name = registry_backend_name(default, &config)?;
+            let backend = parse_provider(&backend_name).map_err(|error| {
+                format!("registry schema.coerce binding is misconfigured: {error}")
+            })?;
+            return native_selection(
+                CoerceSelectionRung::RegistryDefault,
+                &default.provider,
+                backend,
+                env,
+                Some(&config),
+                probes,
+            );
+        }
+    }
+    // Rung 4: fixture.
+    Ok(fixture_selection(CoerceSelectionRung::Fixture))
+}
+
+fn fixture_selection(rung: CoerceSelectionRung) -> CoerceSelection {
+    CoerceSelection {
+        config: None,
+        rung,
+        credential_source: None,
+    }
+}
+
+/// The registry row's parsed `config_json` (an object; anything else reads as
+/// empty — the fields are optional refinements, never credentials).
+fn parsed_registry_config(default: &CoerceRegistryDefault) -> Value {
+    default
+        .config_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+}
+
+fn config_string(config: &Value, key: &str) -> Option<String> {
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn config_u64(config: &Value, key: &str) -> Option<u64> {
+    config.get(key).and_then(Value::as_u64)
+}
+
+/// The backend name a registry binding selects: the provider id `native`
+/// carries its backend in `config_json` (`backend`, or `provider` matching the
+/// DO secrets-door field name); a binding may also name a backend directly.
+fn registry_backend_name(
+    default: &CoerceRegistryDefault,
+    config: &Value,
+) -> Result<String, String> {
+    if default.provider == "native" {
+        return config_string(config, "backend")
+            .or_else(|| config_string(config, "provider"))
+            .ok_or_else(|| {
+                "registry schema.coerce binding selects provider `native` but its \
+                 effect_providers config_json names no `backend` (`openai`, `openai-generic`, \
+                 or `anthropic`)"
+                    .to_owned()
+            });
+    }
+    Ok(default.provider.clone())
+}
+
+/// Resolve one native selection: credential (loud failure when missing — a
+/// selected provider never silently degrades to a fixture), then the config
+/// fields with env overriding the registry row overriding the package-owned
+/// defaults (operator-override-over-registry-default).
+fn native_selection(
+    rung: CoerceSelectionRung,
+    provider_id: &str,
+    backend: CoerceProvider,
+    env: &OperatorEnv,
+    registry_config: Option<&Value>,
+    probes: &CredentialProbes<'_>,
+) -> Result<CoerceSelection, String> {
+    let (api_key, source) =
+        (probes.credential)(backend).ok_or_else(|| missing_credential_message(backend))?;
+    if backend == CoerceProvider::Anthropic {
+        // Anthropic coerce uses a console API key only (model_auth owns the rule).
+        if let Some(rejection) = anthropic_oauth_rejection(&api_key) {
+            return Err(rejection);
+        }
     }
     // The OpenAI Codex OAuth token routes to the codex backend (SSE) with the
     // account id from `~/.codex/auth.json`.
-    let codex_account_id = (provider == CoerceProvider::OpenAi
+    let codex_account_id = (backend == CoerceProvider::OpenAi
         && source == CredentialSource::CodexOAuth)
-        .then(codex_account_id)
+        .then(|| (probes.codex_account)())
         .flatten();
-    let base_url = env_nonempty("WHIPPLESCRIPT_COERCE_BASE_URL").unwrap_or_else(|| {
-        if codex_account_id.is_some() {
-            "https://chatgpt.com".to_owned()
-        } else {
-            provider.default_base_url().to_owned()
-        }
-    });
-    // Model is not hard-coded: `WHIPPLESCRIPT_COERCE_MODEL` wins; otherwise the
-    // codex path reads `~/.codex/config.toml`; the standard path requires the env.
-    let model = env_nonempty("WHIPPLESCRIPT_COERCE_MODEL")
-        .or_else(|| codex_account_id.as_ref().and_then(|_| codex_config_model()))
+    let empty = Value::Object(serde_json::Map::new());
+    let registry_config = registry_config.unwrap_or(&empty);
+    let base_url = env
+        .base_url
+        .clone()
+        .or_else(|| config_string(registry_config, "base_url"))
+        .unwrap_or_else(|| {
+            if codex_account_id.is_some() {
+                "https://chatgpt.com".to_owned()
+            } else {
+                backend.default_base_url().to_owned()
+            }
+        });
+    // Model is not hard-coded: `WHIPPLESCRIPT_COERCE_MODEL` wins, then the
+    // registry row's `model`, then (codex path only) `~/.codex/config.toml`.
+    let model = env
+        .model
+        .clone()
+        .or_else(|| config_string(registry_config, "model"))
+        .or_else(|| {
+            codex_account_id
+                .as_ref()
+                .and_then(|_| (probes.codex_model)())
+        })
         .ok_or_else(|| {
             if codex_account_id.is_some() {
                 "no coerce model: set WHIPPLESCRIPT_COERCE_MODEL, or set `model` in \
                  ~/.codex/config.toml"
                     .to_owned()
             } else {
-                "no coerce model: set WHIPPLESCRIPT_COERCE_MODEL to the provider model id"
+                "no coerce model: set WHIPPLESCRIPT_COERCE_MODEL (or the registry binding's \
+                 `model`) to the provider model id"
                     .to_owned()
             }
         })?;
-    let max_tokens = env_nonempty("WHIPPLESCRIPT_COERCE_MAX_TOKENS")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4096);
-    let timeout_secs = env_nonempty("WHIPPLESCRIPT_COERCE_TIMEOUT_SECS")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(120);
-    Ok(Some(NativeCoerceConfig {
-        provider,
-        base_url,
-        api_key,
-        model,
-        max_tokens,
-        timeout: Duration::from_secs(timeout_secs),
-        codex_account_id,
-    }))
+    let max_tokens = env
+        .max_tokens
+        .or_else(|| config_u64(registry_config, "max_tokens").map(|value| value as u32))
+        .unwrap_or(DEFAULT_COERCE_MAX_TOKENS);
+    let timeout_secs = env
+        .timeout_secs
+        .or_else(|| config_u64(registry_config, "timeout_secs"))
+        .unwrap_or(DEFAULT_COERCE_TIMEOUT_SECS);
+    Ok(CoerceSelection {
+        config: Some(ResolvedCoercionConfig {
+            provider_id: provider_id.to_owned(),
+            backend,
+            base_url,
+            api_key,
+            model,
+            max_tokens,
+            timeout_secs,
+            codex_account_id,
+        }),
+        rung,
+        credential_source: Some(source),
+    })
 }
 
 fn missing_credential_message(provider: CoerceProvider) -> String {
@@ -157,85 +447,16 @@ fn missing_credential_message(provider: CoerceProvider) -> String {
     }
 }
 
-/// The Codex account id (`chatgpt-account-id` header) from `~/.codex/auth.json`.
-fn codex_account_id() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".codex").join("auth.json");
-    let json: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    json.get("tokens")
-        .and_then(|tokens| tokens.get("account_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
 fn parse_provider(name: &str) -> Result<CoerceProvider, String> {
     match name {
         "openai" => Ok(CoerceProvider::OpenAi),
         "openai-generic" => Ok(CoerceProvider::OpenAiCompat),
         "anthropic" => Ok(CoerceProvider::Anthropic),
         other => Err(format!(
-            "unknown WHIPPLESCRIPT_COERCE_PROVIDER `{other}` \
+            "unknown coerce provider `{other}` \
              (expected `openai`, `openai-generic`, or `anthropic`)"
         )),
     }
-}
-
-/// Where a resolved coerce credential came from (for `whip auth status`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CredentialSource {
-    /// An environment variable (named).
-    Env(&'static str),
-    /// The `whip auth set` config file.
-    Stored,
-    /// The Codex OAuth token in `~/.codex/auth.json`.
-    CodexOAuth,
-}
-
-impl CredentialSource {
-    pub fn label(self) -> String {
-        match self {
-            CredentialSource::Env(name) => format!("env:{name}"),
-            CredentialSource::Stored => "stored (whip auth)".to_owned(),
-            CredentialSource::CodexOAuth => "~/.codex/auth.json".to_owned(),
-        }
-    }
-}
-
-/// Resolve the coerce credential and report where it came from, in precedence
-/// order: environment variable, then `whip auth` stored config, then (OpenAI
-/// only) the Codex OAuth token. `None` means no credential is available.
-pub fn resolve_credential_with_source(
-    provider: CoerceProvider,
-) -> Option<(String, CredentialSource)> {
-    match provider {
-        CoerceProvider::Anthropic => env_nonempty("ANTHROPIC_API_KEY")
-            .map(|key| (key, CredentialSource::Env("ANTHROPIC_API_KEY")))
-            .or_else(|| {
-                crate::auth::stored_credential("anthropic")
-                    .map(|key| (key, CredentialSource::Stored))
-            }),
-        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => env_nonempty("OPENAI_API_KEY")
-            .map(|key| (key, CredentialSource::Env("OPENAI_API_KEY")))
-            .or_else(|| {
-                crate::auth::stored_credential("openai").map(|key| (key, CredentialSource::Stored))
-            })
-            .or_else(|| codex_oauth_token().map(|key| (key, CredentialSource::CodexOAuth))),
-    }
-}
-
-/// Best-effort read of the Codex OAuth access token from `~/.codex/auth.json`.
-/// Tries the common shapes; returns `None` if the file or token is absent.
-fn codex_oauth_token() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::Path::new(&home).join(".codex").join("auth.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
-    json.get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(Value::as_str)
-        .or_else(|| json.get("access_token").and_then(Value::as_str))
-        .or_else(|| json.get("OPENAI_API_KEY").and_then(Value::as_str))
-        .map(str::to_owned)
 }
 
 /// The single network side effect, backed by `ureq` (synchronous — consistent
@@ -398,6 +619,314 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 7);
     }
 
+    fn no_credential(_: CoerceProvider) -> Option<(String, CredentialSource)> {
+        None
+    }
+
+    fn api_key_credential(_: CoerceProvider) -> Option<(String, CredentialSource)> {
+        Some((
+            "sk-test".to_owned(),
+            CredentialSource::Env("OPENAI_API_KEY"),
+        ))
+    }
+
+    fn no_codex_model() -> Option<String> {
+        None
+    }
+
+    fn no_codex_account() -> Option<String> {
+        None
+    }
+
+    fn test_probes(
+        credential: &'static dyn Fn(CoerceProvider) -> Option<(String, CredentialSource)>,
+    ) -> CredentialProbes<'static> {
+        CredentialProbes {
+            credential,
+            codex_model: &no_codex_model,
+            codex_account: &no_codex_account,
+        }
+    }
+
+    fn env_with_model(model: &str) -> OperatorEnv {
+        OperatorEnv {
+            model: Some(model.to_owned()),
+            ..OperatorEnv::empty()
+        }
+    }
+
+    fn registry_native_openai(model: Option<&str>) -> CoerceRegistryDefault {
+        let mut config = serde_json::Map::new();
+        config.insert("backend".to_owned(), json!("openai"));
+        if let Some(model) = model {
+            config.insert("model".to_owned(), json!(model));
+        }
+        CoerceRegistryDefault {
+            provider: "native".to_owned(),
+            config_json: Some(Value::Object(config).to_string()),
+        }
+    }
+
+    // ---- four-rung selection ladder (spec/std-coercion.md, slice 2 gate) ----
+
+    #[test]
+    fn rung1_per_effect_provider_beats_everything() {
+        let selection = resolve_selection_inner(
+            Some("openai"),
+            &env_with_model("gpt-env"),
+            Some(&registry_native_openai(Some("gpt-registry"))),
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves");
+        assert_eq!(selection.rung, CoerceSelectionRung::PerEffectProvider);
+        let config = selection.config.expect("native config");
+        assert_eq!(config.provider_id, "openai");
+        assert!(matches!(config.backend, CoerceProvider::OpenAi));
+        // A per-effect fixture override is also rung 1.
+        let fixture = resolve_selection_inner(
+            Some("fixture"),
+            &env_with_model("gpt-env"),
+            None,
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves");
+        assert_eq!(fixture.rung, CoerceSelectionRung::PerEffectProvider);
+        assert!(fixture.config.is_none());
+    }
+
+    #[test]
+    fn rung2_operator_override_beats_registry_default() {
+        let env = OperatorEnv {
+            provider: Some("anthropic".to_owned()),
+            model: Some("claude-test".to_owned()),
+            ..OperatorEnv::empty()
+        };
+        let credential = |_: CoerceProvider| {
+            Some((
+                "sk-ant-api03-x".to_owned(),
+                CredentialSource::Env("ANTHROPIC_API_KEY"),
+            ))
+        };
+        let selection = resolve_selection_inner(
+            None,
+            &env,
+            Some(&registry_native_openai(Some("gpt-registry"))),
+            &CredentialProbes {
+                credential: &credential,
+                codex_model: &no_codex_model,
+                codex_account: &no_codex_account,
+            },
+        )
+        .expect("resolves");
+        assert_eq!(selection.rung, CoerceSelectionRung::OperatorOverride);
+        let config = selection.config.expect("native config");
+        assert_eq!(config.provider_id, "anthropic");
+        assert!(matches!(config.backend, CoerceProvider::Anthropic));
+        assert_eq!(config.model, "claude-test");
+        // `WHIPPLESCRIPT_COERCE_PROVIDER=fixture` forces the fixture path even
+        // over a native registry default — still the operator's rung.
+        let forced_fixture = resolve_selection_inner(
+            None,
+            &OperatorEnv {
+                provider: Some("fixture".to_owned()),
+                ..OperatorEnv::empty()
+            },
+            Some(&registry_native_openai(Some("gpt-registry"))),
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves");
+        assert_eq!(forced_fixture.rung, CoerceSelectionRung::OperatorOverride);
+        assert!(forced_fixture.config.is_none());
+    }
+
+    #[test]
+    fn rung3_registry_default_selects_native_and_env_fields_override_it() {
+        // Registry default alone selects native (registry-honest selection).
+        let selection = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            Some(&registry_native_openai(Some("gpt-registry"))),
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves");
+        assert_eq!(selection.rung, CoerceSelectionRung::RegistryDefault);
+        let config = selection.config.expect("native config");
+        assert_eq!(config.provider_id, "native");
+        assert!(matches!(config.backend, CoerceProvider::OpenAi));
+        assert_eq!(config.model, "gpt-registry");
+        assert_eq!(config.max_tokens, DEFAULT_COERCE_MAX_TOKENS);
+        assert_eq!(config.timeout_secs, DEFAULT_COERCE_TIMEOUT_SECS);
+        // Field-level env vars are operator-override-over-registry-default:
+        // the registry still SELECTS (rung 3), the env refines the fields.
+        let refined = resolve_selection_inner(
+            None,
+            &env_with_model("gpt-env"),
+            Some(&registry_native_openai(Some("gpt-registry"))),
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves");
+        assert_eq!(refined.rung, CoerceSelectionRung::RegistryDefault);
+        assert_eq!(refined.config.expect("native config").model, "gpt-env");
+    }
+
+    #[test]
+    fn rung4_fixture_when_nothing_selects_native() {
+        // No override, no env, no registry row.
+        let bare = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            None,
+            &test_probes(&no_credential),
+        )
+        .expect("resolves");
+        assert_eq!(bare.rung, CoerceSelectionRung::Fixture);
+        assert!(bare.config.is_none());
+        // The migration-0001 seeded binding (`builtin-coerce`) IS the fixture
+        // path: nothing selects native.
+        let seeded = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            Some(&CoerceRegistryDefault {
+                provider: "builtin-coerce".to_owned(),
+                config_json: Some("{}".to_owned()),
+            }),
+            &test_probes(&no_credential),
+        )
+        .expect("resolves");
+        assert_eq!(seeded.rung, CoerceSelectionRung::Fixture);
+        assert!(seeded.config.is_none());
+    }
+
+    #[test]
+    fn misconfiguration_errors_loudly_instead_of_degrading_to_fixture() {
+        // Provider selected (rung 2), no credential: a hard error.
+        let env = OperatorEnv {
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test".to_owned()),
+            ..OperatorEnv::empty()
+        };
+        let error = resolve_selection_inner(None, &env, None, &test_probes(&no_credential))
+            .expect_err("missing credential is loud");
+        assert!(error.contains("needs a credential"), "{error}");
+        // Registry rung misconfigurations are equally loud.
+        let no_backend = CoerceRegistryDefault {
+            provider: "native".to_owned(),
+            config_json: Some("{}".to_owned()),
+        };
+        let error = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            Some(&no_backend),
+            &test_probes(&api_key_credential),
+        )
+        .expect_err("native binding without a backend is loud");
+        assert!(error.contains("names no `backend`"), "{error}");
+        let unknown = CoerceRegistryDefault {
+            provider: "gemini".to_owned(),
+            config_json: None,
+        };
+        let error = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            Some(&unknown),
+            &test_probes(&api_key_credential),
+        )
+        .expect_err("unknown registry provider is loud");
+        assert!(error.contains("misconfigured"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_oauth_rejection_regression_holds_through_the_ladder() {
+        let env = OperatorEnv {
+            provider: Some("anthropic".to_owned()),
+            model: Some("claude-test".to_owned()),
+            ..OperatorEnv::empty()
+        };
+        let oauth_credential =
+            |_: CoerceProvider| Some(("sk-ant-oat01-abc".to_owned(), CredentialSource::Stored));
+        let error = resolve_selection_inner(
+            None,
+            &env,
+            None,
+            &CredentialProbes {
+                credential: &oauth_credential,
+                codex_model: &no_codex_model,
+                codex_account: &no_codex_account,
+            },
+        )
+        .expect_err("oauth token rejected for anthropic");
+        assert!(error.contains("console API key"), "{error}");
+    }
+
+    #[test]
+    fn fingerprint_resolves_through_the_same_ladder_rungs_2_to_4() {
+        // Rung 4: fixture literal.
+        assert_eq!(
+            fingerprint_inner(&OperatorEnv::empty(), None, &no_codex_model),
+            "fixture"
+        );
+        // Registry fixture binding is still the fixture literal.
+        assert_eq!(
+            fingerprint_inner(
+                &OperatorEnv::empty(),
+                Some(&CoerceRegistryDefault {
+                    provider: "builtin-coerce".to_owned(),
+                    config_json: None,
+                }),
+                &no_codex_model
+            ),
+            "fixture"
+        );
+        // Rung 3: provider id + backend + model from the registry row — and it
+        // matches the dispatch-path resolution for the same inputs.
+        let registry = registry_native_openai(Some("gpt-registry"));
+        let fingerprint =
+            fingerprint_inner(&OperatorEnv::empty(), Some(&registry), &no_codex_model);
+        assert_eq!(
+            fingerprint,
+            whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                "native",
+                "openai",
+                "gpt-registry",
+            )
+        );
+        let dispatch = resolve_selection_inner(
+            None,
+            &OperatorEnv::empty(),
+            Some(&registry),
+            &test_probes(&api_key_credential),
+        )
+        .expect("resolves")
+        .config
+        .expect("native config");
+        assert_eq!(
+            fingerprint,
+            whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                &dispatch.provider_id,
+                "openai",
+                &dispatch.model,
+            ),
+            "fingerprint and dispatch must resolve provider/model identically"
+        );
+        // Rung 2 beats rung 3 in the fingerprint exactly as in dispatch.
+        let env = OperatorEnv {
+            provider: Some("anthropic".to_owned()),
+            model: Some("claude-test".to_owned()),
+            ..OperatorEnv::empty()
+        };
+        assert_eq!(
+            fingerprint_inner(&env, Some(&registry), &no_codex_model),
+            whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                "anthropic",
+                "anthropic",
+                "claude-test",
+            )
+        );
+    }
+
     #[test]
     fn anthropic_oauth_token_is_recognized_for_rejection() {
         // Anthropic coerce requires a console key; the resolver uses this to
@@ -455,7 +984,10 @@ mod tests {
 @service
 workflow Coerce
 
-enum Verdict { Yes No }
+enum Verdict {
+  Yes
+  No
+}
 coerce judge(summary string) -> Verdict {
   prompt """markdown
   Decide: {{ summary }}

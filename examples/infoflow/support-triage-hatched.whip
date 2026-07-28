@@ -1,0 +1,85 @@
+use std.files
+
+@service
+description "Support triage — the SAME job as the unsafe whip, with the two dangerous flows routed through source-marked crossings (DR-0027 I-IFC3)"
+workflow SupportTriageHatched
+
+use std.messaging
+
+# The unsafe whip's two flows, made sanctionable:
+#   1. CRM content to the customer  ->  `coerce release(...) declassified`
+#      (the output schema bounds what is released; the grant supplies the audience)
+#   2. inbound email into the CRM   ->  `coerce sanitize(...) endorsed`
+#      (the explicit judgment that raises the data's integrity, under the grant)
+# Under `governance-with-hatches.policy` this passes; a raw flow, or either
+# marker without its grant, is still rejected.
+
+output result Done
+class Done { ok bool }
+
+class Ticket { id string  status "open" }
+
+class Summary { note string }
+class CleanNote { note string }
+
+# Confidential customer records (governance: readable by Operator, from Operator).
+file store crm {
+  root "./.whipplescript/crm"
+  allow read ["**"]
+  allow write ["**"]
+}
+
+# Inbound email files (governance: public reader, public/untrusted integrity).
+file store inbox {
+  root "./.whipplescript/inbox"
+  allow read ["**"]
+}
+
+# Public reply back to the customer (governance: public).
+channel public_reply {
+  provider fixture
+  destination "#out"
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+coerce release(content string) -> Summary {
+  prompt """markdown
+  Summarize the customer's own record for them: {{ content }}
+  """
+}
+
+coerce sanitize(content string) -> CleanNote {
+  prompt """markdown
+  Extract the actionable note from this inbound email: {{ content }}
+  """
+}
+
+rule triage
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from crm at "customer.json" as crm_record
+  after crm_record succeeds as customer {
+    read text from inbox at "latest.eml" as inbound
+    after inbound succeeds as email {
+      coerce sanitize(email.content) as clean endorsed
+      after clean succeeds as vetted {
+        write text to crm at "notes.txt" {
+          body vetted.note
+          mode append
+        } as noted
+        after noted succeeds {
+          coerce release(customer.content) as summary declassified
+          after summary succeeds as note {
+            send via public_reply {
+              text "Here is your record: {{ note.note }}"
+            } as sent
+            after sent succeeds {
+              complete result { ok true }
+            }
+          }
+        }
+      }
+    }
+  }
+}

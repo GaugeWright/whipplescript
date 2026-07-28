@@ -1,0 +1,41 @@
+load ../subworkflow-convergence.maude
+
+--- Coverage: a cycle in the invoke-tool graph is detected as non-convergent.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  toolNode(w1) toolNode(w2) invokes(w1, w2) invokes(w2, w1)
+  =>* C:Cfg nonConvergent .
+
+--- Coverage: a @tool workflow that reads an external signal is non-convergent.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  toolNode(w1) signalReads(w1)
+  =>* C:Cfg nonConvergent .
+
+--- Coverage: a @tool workflow tagged @service is non-convergent.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  toolNode(w1) isService(w1)
+  =>* C:Cfg nonConvergent .
+
+--- Coverage: an agent granted a target that is not an eligible @tool is rejected
+--- the grant-validity invariant, agent granted Z where Z is not @tool.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  invokes(w1, w2) nonTool(w2)
+  =>* C:Cfg nonConvergent .
+
+--- Bite: an acyclic graph of convergent @tool workflows is never flagged. The
+--- RESIDUAL soup var means a nonConvergent in any reachable state is a solution,
+--- so No solution proves a valid system converges.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  toolNode(w1) toolNode(w2) toolNode(w3) invokes(w1, w2) invokes(w2, w3)
+  =>* nonConvergent RESIDUAL:Cfg .
+
+--- Bite: signals are a root-only privilege. A non-tool root reading a signal,
+--- with a separate convergent @tool, is never flagged.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  signalReads(w1) toolNode(w2) invokes(w2, w3) toolNode(w3)
+  =>* nonConvergent RESIDUAL:Cfg .
+
+--- Bite: a grant to an eligible @tool target is never flagged. With the target
+--- marked toolNode and no nonTool present, the grant-validity rule cannot fire.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE :
+  toolNode(w2) invokes(w1, w2)
+  =>* nonConvergent RESIDUAL:Cfg .

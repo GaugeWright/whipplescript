@@ -1,0 +1,44 @@
+--- The selector doctrine: a `case` discriminant is the selector for any crossing
+--- performed inside an arm. See spec/decision-records/discriminated-families-design.md
+--- sections 5.6 and 5.9, and the audit-findings E4 cross-link. This is the
+--- discriminated-families instance of DR-0030's NMIF-on-the-selector lever, proven
+--- in models/lean/Whipple/NMIF.lean as untrusted_declassify_only_public: an attacker
+--- must not steer which declassify/endorse runs.
+---
+--- The channel-2 split from section 5.6 is what this model pins:
+---   arm performs a crossing, selected by a LOW-integrity discriminant -> REJECT
+---     -- the attacker chooses which crossing fires, an adaptive oracle;
+---   arm performs a crossing, selected by a HIGH-integrity discriminant -> allowed
+---     -- the selector's integrity acts-for the release authority;
+---   arm performs an ORDINARY governed effect, selected by a low-integrity
+---     discriminant -> NOT rejected -- this is the pre-existing I-IFC5 control-flow
+---     channel, identical to a `where` guard, handled by a v1 lint, not a hard error.
+---
+--- Vacuous in source until in-arm crossings exist; E4 (endorsed/declassified on
+--- coerce) landed 2026-06-28, so the bite is now meaningful.
+mod WHIPPLESCRIPT-CASE-SELECTOR is
+  protecting BOOL .
+
+  sorts Integ Cfg .
+  ops lo hi : -> Integ [ctor] .   --- lo: attacker-influenced; hi: trusted selector
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- armCrossing i: an arm performs an in-arm crossing, declassify or endorse, and
+  --- the arm was selected by a discriminant carrying integrity i. The discriminant
+  --- IS the selector.
+  op armCrossing : Integ -> Cfg [ctor] .
+  --- armOrdinary i: an arm performs an ordinary governed effect, no crossing,
+  --- selected by a discriminant carrying integrity i.
+  op armOrdinary : Integ -> Cfg [ctor] .
+
+  --- reject marker for the NMIF-on-the-selector violation .
+  op rejectSelector : -> Cfg [ctor] .
+
+  --- NMIF on the selector: a crossing whose selecting discriminant is low-integrity
+  --- is rejected. There is NO rule for armCrossing(hi) -- a trusted selector is
+  --- allowed -- and NO rule for armOrdinary(_) -- an ordinary-effect arm is the
+  --- lint-only control-flow channel, never a hard error.
+  rl [reject-lo-selector] : armCrossing(lo) => armCrossing(lo) rejectSelector .
+endm

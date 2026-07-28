@@ -1,0 +1,81 @@
+--- Discriminated-family narrowing: the single elimination/narrowing rule shared by
+--- user enums, the terminal-outcome union, coerce/decide results, and later
+--- discriminant-string schemas. See spec/decision-records/discriminated-families-design.md
+--- sections 2.3 the one NARROW rule, 2.5 exhaustiveness and redundancy, and 6.1.
+---
+--- This model abstracts a checked case over a family with a finite declared tag set.
+--- It pins the narrowing-checker invariants that the unified compiler pass must
+--- enforce, and is held to bite -- negative fixtures reach a reject marker -- and to
+--- not over-fire -- good fixtures reach no reject marker, proven non-vacuously with a
+--- RESIDUAL soup var. The invariants modeled here:
+---   inv a, cross-arm payload read: a binding from arm ti read inside arm tj, i not j;
+---   inv b, non-exhaustive case: a declared tag with no unguarded arm and no wildcard;
+---   inv d, guarded-only coverage: a tag handled only under a where guard is still
+---     non-exhaustive. A guarded arm never adds to the covered set, so b and d are the
+---     same rule: coverage counts only unguarded arms.
+---   inv c, redundant arm: a duplicate unguarded tag, or any arm after the wildcard.
+--- A same-arm read, including a guard in arm ti reading ti's own payload -- the
+--- terminal-guard case where the bound payload type is in scope -- is NOT a violation.
+---
+--- Out of scope here, covered elsewhere by design: the Total Outcome Settlement
+--- composition of exhaustiveness and auto-fail lives in
+--- rule-autofail.maude; this model is the narrowing and
+--- exhaustiveness core only.
+mod WHIPPLESCRIPT-CASE-FAMILY is
+  protecting BOOL .
+
+  sorts Tag TagSet Cfg .
+  subsort Tag < TagSet .
+
+  ops t1 t2 t3 : -> Tag [ctor] .   --- abstract family tags
+
+  op mt : -> TagSet [ctor] .
+  op _;_ : TagSet TagSet -> TagSet [ctor assoc comm id: mt] .
+  eq [tag-idem] : T:Tag ; T:Tag = T:Tag .
+
+  op inSet : Tag TagSet -> Bool .
+  eq inSet(T:Tag, (T:Tag ; S:TagSet)) = true .
+  eq inSet(T:Tag, S:TagSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- program facts: the abstracted case .
+  --- caseOf args: declared family tags, UNGUARDED-covered tags, wildcard-present? .
+  op caseOf : TagSet TagSet Bool -> Cfg [ctor] .
+  --- guardedOnly t: a guarded arm mentions t and does NOT add to the covered set .
+  op guardedOnly : Tag -> Cfg [ctor] .
+  --- readsForeign ti tj: arm for ti reads the payload bound in arm for tj .
+  op readsForeign : Tag Tag -> Cfg [ctor] .
+  --- redundancy fixtures .
+  op dupCover : Tag -> Cfg [ctor] .       --- a second unguarded arm for the same tag
+  op armAfterWild : Tag -> Cfg [ctor] .   --- an arm placed after the wildcard arm
+
+  --- reject markers: what the unified checker derives .
+  op rejectNonExhaustive : Tag -> Cfg [ctor] .
+  op rejectCrossRead : Tag Tag -> Cfg [ctor] .
+  op rejectRedundant : Tag -> Cfg [ctor] .
+
+  vars T U : Tag .
+  var FAM COV : TagSet .
+
+  --- inv b and d, non-exhaustive: a declared tag with no unguarded arm and no
+  --- wildcard. The wildcard literal false in the LHS means a case WITH a wildcard
+  --- never matches, so a wildcard suppresses the violation. A guarded arm never
+  --- appears in COV, so a guarded-only tag is uncovered and is flagged here too.
+  crl [nonexhaustive] :
+      caseOf((T ; FAM), COV, false)
+      => caseOf((T ; FAM), COV, false) rejectNonExhaustive(T)
+      if inSet(T, COV) = false .
+
+  --- inv a, cross-arm payload read: arm ti reads tj's payload with i not j. A
+  --- same-arm read T T, including a guard reading its own arm's bound payload, is fine.
+  crl [crossread] :
+      readsForeign(T, U)
+      => readsForeign(T, U) rejectCrossRead(T, U)
+      if T =/= U .
+
+  --- inv c, redundancy: a duplicate unguarded cover, or an arm after the wildcard.
+  rl [redundant-dup] : dupCover(T) => dupCover(T) rejectRedundant(T) .
+  rl [redundant-postwild] : armAfterWild(T) => armAfterWild(T) rejectRedundant(T) .
+endm

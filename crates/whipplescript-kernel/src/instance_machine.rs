@@ -43,6 +43,10 @@ pub enum EffectStep {
     /// effect with the response (at-least-once + idempotency key — DR-0033
     /// Decision 3; see `ResumableEffectLifecycle`).
     NeedsHttp(HttpRequest),
+    /// The same durable effect remains running while awaiting externally
+    /// admitted input (currently a human answer). It is not terminalized or
+    /// released; a later host command mutates its durable snapshot and re-drives.
+    Parked,
 }
 
 /// The host-varying work the instance scheduler drives: the rule pass and effect
@@ -132,6 +136,7 @@ impl<D: InstanceDriver> StepMachine for InstanceStepMachine<D> {
                     self.in_flight = Some(effect);
                     return Outcome::NeedsIo(IoRequest::Http(request));
                 }
+                Ok(EffectStep::Parked) => return Outcome::Settle(InstanceOutcome::Parked),
                 Err(error) => return Outcome::Settle(InstanceOutcome::Failed(error)),
             }
         }
@@ -155,6 +160,7 @@ impl<D: InstanceDriver> StepMachine for InstanceStepMachine<D> {
                     self.in_flight = Some(ready);
                     return Outcome::NeedsIo(IoRequest::Http(request));
                 }
+                Ok(EffectStep::Parked) => return Outcome::Settle(InstanceOutcome::Parked),
                 Err(error) => return Outcome::Settle(InstanceOutcome::Failed(error)),
             }
         }

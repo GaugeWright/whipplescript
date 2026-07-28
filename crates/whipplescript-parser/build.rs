@@ -17,9 +17,15 @@ use serde_json::Value;
 
 /// The embedded std manifests, relative to this crate's manifest dir. Keep in
 /// sync with `EMBEDDED_STD_MANIFESTS` in crates/whipplescript-cli/src/main.rs.
+///
+/// Paths are the crate-local `vendored-std/` copies, NOT the workspace root's
+/// `std/`. A published crate tarball contains only files under the crate
+/// directory, so a `../../std/...` read builds here and fails on crates.io.
+/// The root `std/` stays the single source of truth;
+/// `scripts/check-vendored-std.sh` fails the gate if a copy drifts from it.
 const STD_MANIFESTS: &[&str] = &[
-    "../../std/manifests/memory.json",
-    "../../std/manifests/messaging.json",
+    "vendored-std/manifests/memory.json",
+    "vendored-std/manifests/messaging.json",
 ];
 
 /// The grammar-only manifests (`std/grammars/*.json`) carrying the
@@ -28,11 +34,11 @@ const STD_MANIFESTS: &[&str] = &[
 /// authorability-door glob cannot pick them up (blocker B1); NOT embedded in
 /// the CLI. See std/grammars/README.md.
 const DECL_GRAMMARS: &[&str] = &[
-    "../../std/grammars/tracker.json",
-    "../../std/grammars/coord.json",
-    "../../std/grammars/files.json",
-    "../../std/grammars/messaging-grammar.json",
-    "../../std/grammars/memory-grammar.json",
+    "vendored-std/grammars/tracker.json",
+    "vendored-std/grammars/coord.json",
+    "vendored-std/grammars/files.json",
+    "vendored-std/grammars/messaging-grammar.json",
+    "vendored-std/grammars/memory-grammar.json",
 ];
 
 /// The DR-0011 grammar vocabulary (mirrors whipplescript-core's

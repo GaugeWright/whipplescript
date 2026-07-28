@@ -1,0 +1,32 @@
+# Isolated unpublished runtime used to close DR-0047 conformance before the
+# one-time public route cutover. It owns a distinct Worker, Durable Object
+# namespace, and reverse reservation binding; it never addresses production
+# Deployment objects.
+name = "whipplescript-runtime-edge-staging"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[durable_objects.bindings]]
+name = "SESSION_ADMISSION"
+class_name = "Deployment"
+script_name = "gaugewright-edge-runtime-edge-staging"
+
+[[durable_objects.bindings]]
+name = "PUBLIC_CREDENTIALS"
+class_name = "CredentialRegistry"
+script_name = "gaugewright-edge-runtime-edge-staging"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance"]
+
+[vars]
+# Public releases do not receive subprocess or whole-turn container
+# capabilities. Provider rounds stay in the Session DO and use direct egress.

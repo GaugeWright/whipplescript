@@ -32,7 +32,15 @@ rule remember_then_recall
     recall project_memory for note as context
   }
 
+  after saved fails {
+    complete result { ok false }
+  }
+
   after context succeeds as recalled {
     complete result { ok true }
+  }
+
+  after context fails {
+    complete result { ok false }
   }
 }

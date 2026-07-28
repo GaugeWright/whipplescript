@@ -1,0 +1,60 @@
+load ../kernel.maude
+
+--- A coerce success can release the success branch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(coerceEff, queued)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, blocked)
+  =>*
+  effect(coerceEff, completed)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, running)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, blocked) .
+
+--- A coerce failure cannot release the success branch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(coerceEff, queued)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, blocked)
+  =>*
+  effect(coerceEff, failed)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, running)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, blocked) .
+
+--- A coerce failure can release the failure branch.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(coerceEff, queued)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, blocked)
+  =>*
+  effect(coerceEff, failed)
+  providerRun(coerceEff)
+  dep(coerceEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  dep(coerceEff, fails, askEff)
+  effect(askEff, running) .
+
+--- A coerce success can project a typed success fact for later rules.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(coerceEff, queued)
+  providerRun(coerceEff)
+  completionProjection(coerceEff, completed, coerceOkFact, pending)
+  =>*
+  effect(coerceEff, completed)
+  providerRun(coerceEff)
+  completionProjection(coerceEff, completed, coerceOkFact, projected)
+  fact(coerceOkFact) .

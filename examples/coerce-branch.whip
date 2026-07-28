@@ -1,5 +1,14 @@
+use std.coercion
+use std.tracker
+
 @service
 workflow CoerceBranch
+
+# Work that needs a human is filed into the tracker; an operator picks it up
+# with `whip issue`. (Human review is the tracker, not a language construct.)
+tracker review {
+  provider builtin
+}
 
 
 # `coerce` turns unstructured work into typed schema-coercion output with failure handling.
@@ -49,25 +58,18 @@ rule classify_request
   }
 
   after classification fails {
-    askHuman """markdown
-    Could not classify this request:
-
-    {{ request.title }}
-
-    Please choose a priority and summarize the work.
-    """
+    file issue into review {
+      title "Classify manually: {{ request.title }}"
+      body "Automated classification failed; choose a priority and summarize the work."
+    }
   }
 }
 
 rule route_classified
   when ClassifiedMessage as message
 => {
-  askHuman """markdown
-  Classified request needs routing:
-
-  {{ message.request.title }}
-
-  Summary:
-  {{ message.classification.summary }}
-  """
+  file issue into review {
+    title "Route classified request: {{ message.request.title }}"
+    body "{{ message.classification.summary }}"
+  }
 }

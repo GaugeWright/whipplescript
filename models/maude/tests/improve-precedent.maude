@@ -1,0 +1,61 @@
+load ../improve-precedent.maude
+
+--- The corruption pattern throughout: the system exercising tradeoff
+--- authority the human never delegated -- an auto-resolution that is not
+--- the Pareto-safe closure of an actual answered ask.
+
+--- Bite: a candidate falling short of the accepted precedent on one
+--- gauge is never auto-accepted, in any discharge order.
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  sound accepted applicable obl(s(s(z)))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  precD(g2, s(s(z))) candD(g2, s(z))
+  =>* autoAccepted RESIDUAL:Cfg .
+
+--- Coverage: a candidate at least as good as the accepted precedent on
+--- every gauge auto-accepts (the Pareto-safe closure).
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  sound accepted applicable obl(s(s(z)))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  precD(g2, s(s(z))) candD(g2, s(s(z)))
+  =>* autoAccepted RESIDUAL:Cfg .
+
+--- Bite: a revoked precedent grants nothing, however dominant the
+--- candidate -- revocation is a speech act the resolver must honor.
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  sound revokedP applicable obl(s(z))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  =>* autoAccepted RESIDUAL:Cfg .
+
+--- Bite: a stale precedent (locality failed: no applicable atom) grants
+--- nothing -- preferences were only ever claimed near the answer-time
+--- operating point.
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  sound accepted obl(s(z))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  =>* autoAccepted RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive interpolating resolver grants on the
+--- fixture the sound resolver refuses (candidate short on g2).
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  naive accepted applicable obl(s(s(z)))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  precD(g2, s(s(z))) candD(g2, s(z))
+  =>* autoAccepted RESIDUAL:Cfg .
+
+--- Coverage: the reject dual -- a candidate at most the rejected
+--- precedent on every gauge auto-rejects.
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  soundR rejectedP applicable obl(s(s(z)))
+  precD(g1, s(s(z))) candD(g1, s(z))
+  precD(g2, s(z)) candD(g2, z)
+  =>* autoRejected RESIDUAL:Cfg .
+
+--- Bite: a candidate exceeding the rejected precedent anywhere is never
+--- auto-rejected -- it might be the improvement the human was waiting
+--- for; ask.
+search [1] in WHIPPLESCRIPT-IMPROVE-PRECEDENT :
+  soundR rejectedP applicable obl(s(s(z)))
+  precD(g1, s(z)) candD(g1, s(s(z)))
+  precD(g2, s(z)) candD(g2, z)
+  =>* autoRejected RESIDUAL:Cfg .

@@ -1,0 +1,221 @@
+mod WHIPPLESCRIPT-PACKAGE-CONTRACT is
+  protecting WHIPPLESCRIPT-KERNEL .
+
+  sorts PackageDeclId CapabilityId TypeId Keyword DeclarationScope ContractVersion OutputValidity .
+
+  --- Sample package declaration identifiers used by the hand-written checks.
+  ops
+    goodSchemaCoercion
+    stdCoercionBackend
+    goodMemoryMetadata
+    goodMemoryRecall
+    executableMetadataDecl
+    hiddenAuthorityDecl
+    controlFlowDecl
+    untypedEffectDecl
+    noCapabilityDecl
+    undeclaredCapabilityDecl
+    directFactDecl
+    ambiguousKeywordDecl
+    unlockedDecl
+    : -> PackageDeclId .
+
+  --- std.files slice F2 fixture (spec/std-files.md): the file.read
+  --- typed_effect_call contract with capability id equal to its effect kind
+  --- per M3 id==kind, plus a copy whose capability row is missing (the
+  --- unbound stale-store shape the admission gate must refuse).
+  ops fileReadDecl unboundFileReadDecl : -> PackageDeclId .
+  op fileReadKeyword : -> Keyword .
+  op fileReadCap : -> CapabilityId .
+  op fileReadResultType : -> TypeId .
+  op fileReadEff : -> EffectId .
+
+  ops schemaCoercionKeyword trackerKeyword sharedKeyword recallKeyword : -> Keyword .
+  ops topLevelScope ruleBodyScope workflowBodyScope expressionScope : -> DeclarationScope .
+  ops schemaCoerce memoryQueryCap deployWrite : -> CapabilityId .
+  ops reviewType jsonType : -> TypeId .
+  ops v1 v2 : -> ContractVersion .
+  ops valid invalid : -> OutputValidity .
+
+  --- Package declaration acceptance facts. These are deliberately declarative: package
+  --- metadata supplies facts, and the checker accepts only combinations that
+  --- preserve the kernel contract.
+  op packageDeclCandidate : PackageDeclId -> Cfg .
+  op packageDeclKeyword : PackageDeclId Keyword -> Cfg .
+  op deterministicParse : PackageDeclId -> Cfg .
+  op noKeywordConflict : PackageDeclId -> Cfg .
+  op declarativeLowering : PackageDeclId -> Cfg .
+  op noCustomControlFlow : PackageDeclId -> Cfg .
+  op noHiddenAuthority : PackageDeclId -> Cfg .
+  op noDirectFactWrite : PackageDeclId -> Cfg .
+  op lockedContractVersion : PackageDeclId ContractVersion -> Cfg .
+  op declaredCapability : PackageDeclId CapabilityId -> Cfg .
+  op typedEffectContract : PackageDeclId EffectId TypeId ContractVersion -> Cfg .
+  op requiredEffectCapability : EffectId CapabilityId -> Cfg .
+  op acceptedPackageContract : PackageDeclId -> Cfg .
+  op registeredEffectContract : EffectId TypeId CapabilityId ContractVersion -> Cfg .
+  op metadataDeclaration : PackageDeclId Keyword DeclarationScope -> Cfg .
+  op validDeclarationScope : DeclarationScope -> Cfg .
+  op validDeclarationFields : PackageDeclId -> Cfg .
+  op metadataOnlyLoweringTarget : PackageDeclId -> Cfg .
+  op acceptedMetadataDeclaration : PackageDeclId -> Cfg .
+  op capabilityCallDeclaration : PackageDeclId Keyword DeclarationScope EffectId CapabilityId -> Cfg .
+  op acceptedExecutableDeclaration : PackageDeclId -> Cfg .
+
+  --- Source lowering and typed-provider execution facts. The accepted package
+  --- contract can lower a source form into a core effect graph template, but
+  --- the kernel still owns graph commit, provider runs, and terminal status.
+  --- Typed provider output is validated before a typed fact is projected.
+  op sourceEffect : PackageDeclId EffectId -> Cfg .
+  op expectsOutput : EffectId TypeId ContractVersion -> Cfg .
+  op providerOutput : EffectId TypeId ContractVersion OutputValidity -> Cfg .
+  op typedFact : EffectId TypeId ContractVersion -> Cfg .
+  op validationDiagnostic : EffectId -> Cfg .
+  op invalidTypedFact : EffectId -> Cfg .
+
+  --- Open provider registry (spec/std-agent.md slice 3): agent provider kinds
+  --- are registry data contributed by package manifests. A kind is authorized
+  --- for an agent binding only when some known manifest contributes it; there
+  --- is no compiled-in kind set and no other rule producing authorization.
+  sorts AgentProviderKind ProviderPackageId .
+  ops ownedKind fixtureKind unknownRoboKind : -> AgentProviderKind .
+  ops stdAgentPkg roboPkg : -> ProviderPackageId .
+  op providerKindContributed : AgentProviderKind ProviderPackageId -> Cfg .
+  op agentProviderRequest : AgentProviderKind -> Cfg .
+  op authorizedProviderKind : AgentProviderKind ProviderPackageId -> Cfg .
+
+  vars X : PackageDeclId .
+  var K : Keyword .
+  var S : DeclarationScope .
+  var E : EffectId .
+  var T : TypeId .
+  var Cap : CapabilityId .
+  var V : ContractVersion .
+  var CfgRest : Cfg .
+  var PK : AgentProviderKind .
+  var PP : ProviderPackageId .
+
+  --- Acceptance requires every static contract. Missing any premise means the
+  --- declaration is not accepted and therefore cannot lower source. Acceptance
+  --- normalizes library metadata into a registry entry instead of keeping the
+  --- source-side premises live.
+  rl [accept-package-effect-contract] :
+    packageDeclCandidate(X)
+    packageDeclKeyword(X, K)
+    deterministicParse(X)
+    noKeywordConflict(X)
+    declarativeLowering(X)
+    noCustomControlFlow(X)
+    noHiddenAuthority(X)
+    noDirectFactWrite(X)
+    lockedContractVersion(X, V)
+    declaredCapability(X, Cap)
+    typedEffectContract(X, E, T, V)
+    requiredEffectCapability(E, Cap)
+    =>
+    acceptedPackageContract(X)
+    registeredEffectContract(E, T, Cap, V) .
+
+  --- Metadata-only declaration forms can be accepted into the contract
+  --- registry for tooling, but they do not grant parser or lowering authority.
+  rl [accept-metadata-declaration] :
+    packageDeclCandidate(X)
+    packageDeclKeyword(X, K)
+    metadataDeclaration(X, K, S)
+    noKeywordConflict(X)
+    validDeclarationScope(S)
+    validDeclarationFields(X)
+    metadataOnlyLoweringTarget(X)
+    lockedContractVersion(X, V)
+    =>
+    acceptedMetadataDeclaration(X) .
+
+  --- Executable declaration forms are accepted only through a closed lowering
+  --- class. The first class is a rule-body declaration that lowers to a normal
+  --- capability.call effect contract; it grants no direct fact writes or
+  --- custom control-flow semantics.
+  rl [accept-capability-call-declaration] :
+    packageDeclCandidate(X)
+    packageDeclKeyword(X, K)
+    capabilityCallDeclaration(X, K, ruleBodyScope, E, Cap)
+    noKeywordConflict(X)
+    validDeclarationScope(ruleBodyScope)
+    validDeclarationFields(X)
+    noHiddenAuthority(X)
+    noDirectFactWrite(X)
+    lockedContractVersion(X, V)
+    declaredCapability(X, Cap)
+    typedEffectContract(X, E, T, V)
+    requiredEffectCapability(E, Cap)
+    =>
+    acceptedExecutableDeclaration(X)
+    registeredEffectContract(E, T, Cap, V) .
+
+  --- Lowering is data-driven. It emits a core graph template and expected
+  --- output contract; it does not enqueue, run, or complete the effect.
+  rl [lower-accepted-package-effect] :
+    acceptedPackageContract(X)
+    sourceEffect(X, E)
+    registeredEffectContract(E, T, Cap, V)
+    =>
+    acceptedPackageContract(X)
+    registeredEffectContract(E, T, Cap, V)
+    graph(g1, E)
+    expectsOutput(E, T, V) .
+
+  rl [lower-accepted-executable-declaration] :
+    acceptedExecutableDeclaration(X)
+    sourceEffect(X, E)
+    registeredEffectContract(E, T, Cap, V)
+    =>
+    acceptedExecutableDeclaration(X)
+    registeredEffectContract(E, T, Cap, V)
+    graph(g1, E)
+    expectsOutput(E, T, V) .
+
+  --- Typed provider output is the generic core boundary for coerce-like
+  --- effects: valid output can complete and project a typed fact only for a
+  --- kernel-owned provider run; invalid output fails that provider run instead.
+  rl [typed-provider-valid-output] :
+    effect(E, running)
+    providerRun(E)
+    expectsOutput(E, T, V)
+    providerOutput(E, T, V, valid)
+    =>
+    effect(E, completed)
+    providerRun(E)
+    expectsOutput(E, T, V)
+    providerOutput(E, T, V, valid)
+    typedFact(E, T, V) .
+
+  rl [typed-provider-invalid-output] :
+    effect(E, running)
+    providerRun(E)
+    expectsOutput(E, T, V)
+    providerOutput(E, T, V, invalid)
+    =>
+    effect(E, failed)
+    providerRun(E)
+    expectsOutput(E, T, V)
+    providerOutput(E, T, V, invalid)
+    validationDiagnostic(E) .
+
+  rl [detect-invalid-typed-fact] :
+    providerOutput(E, T, V, invalid)
+    typedFact(E, T, V)
+    CfgRest
+    =>
+    invalidTypedFact(E) .
+
+  --- Provider-kind authorization consumes the request cell (a verdict rule
+  --- must consume, or searches diverge): the request is settled exactly once,
+  --- and only against a manifest contribution for the SAME kind. An agent
+  --- binding whose kind no manifest contributes can never reach
+  --- authorizedProviderKind — the negative fixture below proves the bite.
+  rl [authorize-contributed-provider-kind] :
+    agentProviderRequest(PK)
+    providerKindContributed(PK, PP)
+    =>
+    authorizedProviderKind(PK, PP)
+    providerKindContributed(PK, PP) .
+endm

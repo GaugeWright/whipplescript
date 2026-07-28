@@ -176,6 +176,18 @@ async function runFake(request) {
 
 async function runLive(request) {
   const runId = request.run_id;
+  // Policy-free transport (spec/std-agent.md slice 4): the sidecar carries NO
+  // compiled-in tool-policy defaults. The whip client computes the policy from
+  // the std.agent profile table and sends it explicitly; a run/start without
+  // explicit arrays is refused rather than silently defaulted.
+  if (!Array.isArray(request.allowed_tools) || !Array.isArray(request.disallowed_tools)) {
+    emitError(
+      runId,
+      "missing_tool_policy",
+      "run/start requires explicit allowed_tools and disallowed_tools arrays (the sidecar is policy-free transport)"
+    );
+    return;
+  }
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const abortController = new AbortController();
   activeRuns.set(runId, { abortController, cancelled: false, sessionId: null });
@@ -183,8 +195,8 @@ async function runLive(request) {
     abortController,
     cwd: request.cwd || cwd(),
     model: request.model || undefined,
-    allowedTools: request.allowed_tools || ["Read", "Glob", "Grep"],
-    disallowedTools: request.disallowed_tools || ["Bash", "Edit", "Write"],
+    allowedTools: request.allowed_tools,
+    disallowedTools: request.disallowed_tools,
     permissionMode: request.permission_mode || "default",
     allowDangerouslySkipPermissions: Boolean(request.allow_dangerously_skip_permissions),
     mcpServers: request.mcp_servers || undefined,

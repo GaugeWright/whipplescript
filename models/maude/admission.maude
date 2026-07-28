@@ -1,0 +1,152 @@
+--- Admission & idempotency contract operational / replay-determinism half.
+--- Companion to spec/admission-and-idempotency.md. The concurrency / exactly-once
+--- recovery half is modeled in TLA+ models/tla/ControlPlaneLifecycle.tla.
+---
+--- This model checks, by reachability search, that:
+---   * admission is a validation gate: an invalid candidate admits no fact;
+---   * admission is idempotent: one identity key never yields two facts, even
+---     under re-delivery the store unique-index property, abstracted as a key set;
+---   * fact-batch admission is all-or-nothing: a batch with any invalid row
+---     admits no fact for any row;
+---   * replay is record-once: in replay mode a recorded outcome is reproduced and
+---     the source is never invoked.
+mod WHIPPLESCRIPT-ADMISSION is
+  protecting BOOL .
+
+  sorts Key Validity Mode KeySet Cfg .
+  subsort Key < KeySet .
+
+  ops k1 k2 : -> Key [ctor] .
+  ops valid invalid : -> Validity [ctor] .
+  ops live replay : -> Mode [ctor] .
+
+  --- The admitted-key set abstracts the store unique index on
+  --- instance_id, fact_identity_key. Union is idempotent, so it is a set.
+  op mtKeys : -> KeySet [ctor] .
+  op _;_ : KeySet KeySet -> KeySet [ctor assoc comm id: mtKeys] .
+  eq [set-idem] : K:Key ; K:Key = K:Key .
+
+  op member : Key KeySet -> Bool .
+  eq member(K:Key, (K:Key ; KS:KeySet)) = true .
+  eq member(K:Key, KS:KeySet) = false [owise] .
+
+  --- Configuration is an ACU soup of tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op candidate : Key Validity -> Cfg [ctor] .          --- pending single admission
+  op batch : Key Key Validity Validity -> Cfg [ctor] . --- a two-row batch admission
+  op fact : Key -> Cfg [ctor] .                        --- an admitted durable fact
+  op rejected : Key -> Cfg [ctor] .                    --- a rejected admission
+  op admitted : KeySet -> Cfg [ctor] .                 --- the unique-index key set
+  op mode : Mode -> Cfg [ctor] .
+  op replayReq : Key -> Cfg [ctor] .                   --- a request to (re)produce a fact
+  op recorded : Key -> Cfg [ctor] .                    --- a recorded prior outcome
+  op invoked : Key -> Cfg [ctor] .                     --- the external source was invoked
+
+  vars K K2 : Key .
+  var KS : KeySet .
+  vars V V2 : Validity .
+
+  --- Validation gate + idempotency: a valid candidate admits exactly one fact
+  --- per key; a re-delivered key is absorbed with no new fact; invalid is rejected.
+  crl [admit-valid] : candidate(K, valid) admitted(KS)
+      => fact(K) admitted(K ; KS)
+      if member(K, KS) = false .
+  crl [admit-dup] : candidate(K, valid) admitted(KS)
+      => admitted(KS)
+      if member(K, KS) = true .
+  rl  [reject] : candidate(K, invalid) admitted(KS)
+      => rejected(K) admitted(KS) .
+
+  --- Fact-batch admission is atomic: all rows valid -> all facts; any row
+  --- invalid -> no fact for any row a partial batch is unreachable.
+  crl [batch-ok] : batch(K, K2, valid, valid) admitted(KS)
+      => fact(K) fact(K2) admitted(K ; K2 ; KS)
+      if member(K, KS) = false /\ member(K2, KS) = false .
+  rl  [batch-bad-first]  : batch(K, K2, invalid, V2) admitted(KS)
+      => rejected(K) admitted(KS) .
+  rl  [batch-bad-second] : batch(K, K2, V, invalid) admitted(KS)
+      => rejected(K) admitted(KS) .
+
+  --- Record-once replay: in replay mode the recorded outcome is reproduced and
+  --- the source is never invoked; only live mode may invoke the source.
+  rl [replay-recorded] : mode(replay) replayReq(K) recorded(K)
+      => mode(replay) fact(K) recorded(K) .
+  rl [live-invoke] : mode(live) replayReq(K) recorded(K)
+      => mode(live) invoked(K) fact(K) recorded(K) .
+
+  --- Per-row fact-batch identity, per spec admission-and-idempotency.
+  --- Each imported row admission key is derived from the effect idempotency
+  --- key and the row identity. The row identity is either the positional row
+  --- index or a schema-declared natural key. The derived key flows through the
+  --- same admitted-set idempotency as any other admission, so re-importing the
+  --- same effect plus row identity never admits a duplicate fact. Natural keys
+  --- are content stable, so two distinct natural keys are two distinct facts;
+  --- a row index is positional. derive is a free constructor, so distinct
+  --- arguments give distinct keys and equal arguments give the same key, which
+  --- is what makes admission idempotent across re-import.
+  sorts EffectKey RowKey .
+  op e1 : -> EffectKey [ctor] .
+  ops idx0 idx1 : -> RowKey [ctor] .   --- positional row identities (row_index)
+  ops natA natB : -> RowKey [ctor] .   --- schema natural-key row identities
+  op derive : EffectKey RowKey -> Key [ctor] .
+  op importRow : EffectKey RowKey Validity -> Cfg [ctor] .
+
+  vars E : EffectKey .
+  var  R : RowKey .
+
+  crl [import-admit] : importRow(E, R, valid) admitted(KS)
+      => fact(derive(E, R)) admitted(derive(E, R) ; KS)
+      if member(derive(E, R), KS) = false .
+  crl [import-dup] : importRow(E, R, valid) admitted(KS)
+      => admitted(KS)
+      if member(derive(E, R), KS) = true .
+  rl  [import-reject] : importRow(E, R, invalid) admitted(KS)
+      => rejected(derive(E, R)) admitted(KS) .
+
+  --- std.ingress driver delivery identity, spec/std-ingress.md I3/I5: every
+  --- ingress driver derives a DELIVERY KEY that flows through the same
+  --- admitted-set idempotency as any other admission. Two key forms beyond
+  --- the positional row index:
+  ---   * deliveryKey: an operator/provider-supplied delivery id -- the
+  ---     whip signal --delivery-id flag or the stdio envelope delivery_id.
+  ---     The key is derived from the id ALONE, never the payload bytes, so
+  ---     a re-delivery under the same id is absorbed even when the payload
+  ---     differs -- the id wins over the derived payload hash.
+  ---   * occKey: a path plus content-hash file occurrence, watch mode. An
+  ---     unchanged file re-observed collides on the same key and is
+  ---     absorbed; a content change is a distinct key and admits anew.
+  sorts DeliveryId FilePath ContentHash Payload .
+  ops d1 d2 : -> DeliveryId [ctor] .
+  op p1 : -> FilePath [ctor] .
+  ops h1 h2 : -> ContentHash [ctor] .
+  ops payA payB : -> Payload [ctor] .
+  op deliveryKey : DeliveryId -> Key [ctor] .
+  op occKey : FilePath ContentHash -> Key [ctor] .
+  op deliver : DeliveryId Payload Validity -> Cfg [ctor] .
+  op observeFile : FilePath ContentHash Validity -> Cfg [ctor] .
+
+  var D : DeliveryId .
+  var P : FilePath .
+  var H : ContentHash .
+  var PL : Payload .
+
+  crl [deliver-admit] : deliver(D, PL, valid) admitted(KS)
+      => fact(deliveryKey(D)) admitted(deliveryKey(D) ; KS)
+      if member(deliveryKey(D), KS) = false .
+  crl [deliver-dup] : deliver(D, PL, valid) admitted(KS)
+      => admitted(KS)
+      if member(deliveryKey(D), KS) = true .
+  rl  [deliver-reject] : deliver(D, PL, invalid) admitted(KS)
+      => rejected(deliveryKey(D)) admitted(KS) .
+
+  crl [occ-admit] : observeFile(P, H, valid) admitted(KS)
+      => fact(occKey(P, H)) admitted(occKey(P, H) ; KS)
+      if member(occKey(P, H), KS) = false .
+  crl [occ-dup] : observeFile(P, H, valid) admitted(KS)
+      => admitted(KS)
+      if member(occKey(P, H), KS) = true .
+  rl  [occ-reject] : observeFile(P, H, invalid) admitted(KS)
+      => rejected(occKey(P, H)) admitted(KS) .
+endm

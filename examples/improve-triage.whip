@@ -47,6 +47,11 @@ campaign release_tuning {
   guard triage_cost within 5 percent
 }
 
+# A named cut point: every run stamps `mark.reached` when `triage`
+# commits, so `whip pin <instance> at assessed --as <name>` freezes the
+# prefix and `whip suppose` re-executes only the suffix.
+mark "assessed" after triage
+
 rule triage
   when Ticket as ticket
 => {

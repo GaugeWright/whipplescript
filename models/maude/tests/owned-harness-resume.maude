@@ -1,0 +1,14 @@
+load ../owned-harness-resume.maude
+
+--- Coverage: a crashed turn with its persisted transcript resumes and reaches a
+--- terminal.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-RESUME :
+  crashed transcript
+  =>* C:Cfg terminal .
+
+--- Bite: with no persisted transcript, a crashed turn can never resume. The
+--- RESIDUAL soup var means a resumed in any reachable state is a solution, so No
+--- solution proves resume requires the projection.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-RESUME :
+  crashed
+  =>* resumed RESIDUAL:Cfg .

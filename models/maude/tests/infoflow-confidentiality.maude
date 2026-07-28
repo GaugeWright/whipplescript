@@ -1,0 +1,74 @@
+load ../infoflow-confidentiality.maude
+
+--- Delegation context theta: operator > bankRole and operator > emailRole, so
+--- operator acts-for both compartments, while bankRole and emailRole are
+--- INCOMPARABLE. public acts-for no one. Owners: bank data readable by bankRole,
+--- email data readable by emailRole.
+
+--- Coverage: INCOMPARABLE compartments. Bank-owned secret reaching an
+--- email-cleared sink leaks, because emailRole does not act-for bankRole. A
+--- single global lattice cannot express this; the partial order can.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  flow(b1, b2) egressSink(b2, emailRole)
+  =>* C:Cfg leak .
+
+--- Coverage: a too-low party. Bank-owned secret reaching a public sink leaks;
+--- public does not act-for bankRole.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  flow(b1, b2) egressSink(b2, public)
+  =>* C:Cfg leak .
+
+--- Coverage: join box. b3 carries both bank and email secrets; reaching a
+--- bank-cleared sink leaks on the email token, because bankRole does not act-for
+--- emailRole. Mixing two compartments exceeds either single-compartment reader.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  secretSource(b2, emailRole) readAuth(emailRole, emailRole)
+  flow(b1, b3) flow(b2, b3) egressSink(b3, bankRole)
+  =>* C:Cfg leak .
+
+--- Coverage: declassifying one path does not sanitize the source for its OTHER
+--- uses. b1 is declassified to public into b2, but b1 also flows raw into b3
+--- which reaches a public sink. The raw second path still leaks.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  declassify(b1, b2, bankRole) flow(b1, b3) egressSink(b3, public)
+  =>* C:Cfg leak .
+
+--- Bite: a higher authority reads everything. Bank secret reaching an operator
+--- sink is safe; operator acts-for bankRole. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  flow(b1, b2) egressSink(b2, operator)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the cleared compartment reads its own. Bank secret to a bankRole sink is
+--- safe; bankRole acts-for bankRole (reflexive).
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  flow(b1, b2) egressSink(b2, bankRole)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the core property. Bank secret reaching a public sink THROUGH a
+--- declassify is safe; the released projection carries no secret.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, bankRole) readAuth(bankRole, bankRole)
+  declassify(b1, b2, bankRole) egressSink(b2, public)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: the other compartment. Email secret reaching an operator sink is safe;
+--- operator acts-for emailRole too.
+search [1] in WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY :
+  deleg((operator > bankRole) | (operator > emailRole))
+  secretSource(b1, emailRole) readAuth(emailRole, emailRole)
+  flow(b1, b2) egressSink(b2, operator)
+  =>* leak RESIDUAL:Cfg .

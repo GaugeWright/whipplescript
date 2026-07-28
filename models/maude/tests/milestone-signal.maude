@@ -1,0 +1,30 @@
+load ../milestone-signal.maude
+
+--- Coverage: a parent reaching an undeclared milestone m3 is rejected -- the child
+--- declared only m1, m2 (terminal-only observation invariant).
+search [1] in WHIPPLESCRIPT-MILESTONE-SIGNAL :
+  declared(m1 ; m2) parentReaches(m3)
+  =>* C:Cfg rejectUndeclared(m3) .
+
+--- Coverage: a declared, emitted milestone the parent reaches is observed.
+search [1] in WHIPPLESCRIPT-MILESTONE-SIGNAL :
+  declared(m1) emitted(m1) parentReaches(m1)
+  =>* C:Cfg reached(m1) .
+
+--- Bite: reaching a DECLARED milestone is not rejected. RESIDUAL makes the
+--- No-solution non-vacuous.
+search [1] in WHIPPLESCRIPT-MILESTONE-SIGNAL :
+  declared(m1 ; m2) parentReaches(m1)
+  =>* rejectUndeclared(X:Name) RESIDUAL:Cfg .
+
+--- Bite: terminal-only observation at runtime -- a parent that reaches a milestone
+--- the child did not emit observes nothing.
+search [1] in WHIPPLESCRIPT-MILESTONE-SIGNAL :
+  declared(m1) parentReaches(m1)
+  =>* reached(X:Name) RESIDUAL:Cfg .
+
+--- Bite: idempotent delivery -- a single emission yields a single observation, never
+--- a double reached.
+search [1] in WHIPPLESCRIPT-MILESTONE-SIGNAL :
+  declared(m1) emitted(m1) parentReaches(m1)
+  =>* reached(m1) reached(m1) RESIDUAL:Cfg .

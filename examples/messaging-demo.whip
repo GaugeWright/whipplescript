@@ -11,7 +11,7 @@ use std.messaging
 # `when message from` name it. Under the fixture provider, outbound `send`
 # records a receipt and inbound messages are injected with `whip message`.
 channel ops_room {
-  provider slack
+  provider fixture
   destination "#ops"
 }
 

@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::body::{self, BodyMode, BodyStmt};
-use crate::flow_expand::{print_statement_rn, rename_text};
+use crate::body::{self, BodyStmt};
+use crate::body_print::{print_statement_rn, rename_text};
 use crate::{ActionDecl, Diagnostic, Item, SourceSpan};
 
 /// Inlines every action call in each rule body. Diagnostics (undeclared action,
@@ -160,7 +160,7 @@ fn expand_one_call(
     }
 
     let (mut ast, body_diagnostics) =
-        body::parse_rule_body(&action.body.text, action.body.span.start, BodyMode::Rule);
+        body::parse_rule_body(&action.body.text, action.body.span.start);
     diagnostics.extend(body_diagnostics);
     if !validate_body(&ast.statements, name, span, diagnostics) {
         return None;
@@ -353,9 +353,8 @@ fn statement_label(statement: &BodyStmt) -> &'static str {
         BodyStmt::Done { .. } => "done",
         BodyStmt::Effect(_) => "effect",
         BodyStmt::After(_) => "after",
+        BodyStmt::Region(_) => "during/until",
         BodyStmt::Case(_) => "case",
-        BodyStmt::Branch(_) => "when/else branch",
-        BodyStmt::Handler(_) => "handler",
         BodyStmt::Terminal(_) => "complete/fail",
         BodyStmt::Cancel { .. } => "cancel",
         BodyStmt::Milestone { .. } => "milestone",

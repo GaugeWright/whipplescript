@@ -1,6 +1,8 @@
 workflow EventBridge
 source_tags
 @service workflow EventBridge
+uses
+  package std.ingress
 schemas
   class DeploymentNotice
     service string
@@ -15,12 +17,12 @@ rules
     reads
       pattern:deploy.finished as deployed
     effects
-      sent kind=signal.emit binding=sent key=b31e0a273c6f6e01
-    body_hash b1f148a3cc2e40ba
+      sent kind=signal.emit binding=sent key=336d78eb82c8acff052578c4e09eea7f
+    body_hash 287d30b5de3a7b198214908233fcc710
   rule note_acknowledged
     when deploy.acknowledged as ack
     reads
       pattern:deploy.acknowledged as ack
     writes
       schema:DeploymentNotice
-    body_hash 9ac93312b1e2e0f6
+    body_hash 36be943a73c1f73ab86fae7f962f78af

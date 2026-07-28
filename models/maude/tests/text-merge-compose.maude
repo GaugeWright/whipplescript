@@ -1,0 +1,80 @@
+load ../text-merge-compose.maude
+
+--- Base fixture throughout: w1 s1 w2 s2 w3 s3 w4 s4 w5 -- five word atoms
+--- separated by non-word atoms.
+
+--- Coverage: far-apart disjoint ops (three word atoms between w1 and w5)
+--- compose cleanly and BOTH replacements survive at their base positions.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w1, x1), rep(w5, y1))
+  =>* composed(x1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; y1) RESIDUAL:Cfg .
+
+--- Coverage: the positional mirror -- ours targets the LATER span -- lands
+--- both replacements the same way (spec symmetry, clean case).
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w5, x1), rep(w1, y1))
+  =>* composed(y1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; x1) RESIDUAL:Cfg .
+
+--- Coverage: byte-identical ops on the identical target converge to one
+--- change.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w3, x1), rep(w3, x1))
+  =>* composed(w1 ; s1 ; w2 ; s2 ; x1 ; s3 ; w4 ; s4 ; w5) RESIDUAL:Cfg .
+
+--- Coverage: overlapping targets (both rewrite w3) escalate honestly with
+--- both ops carried verbatim.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep((w2 ; s2 ; w3), (x1 ; x2)), rep((w3 ; s3 ; w4), y1))
+  =>* escalated(rep((w2 ; s2 ; w3), (x1 ; x2)), rep((w3 ; s3 ; w4), y1))
+      RESIDUAL:Cfg .
+
+--- Coverage: disjoint-but-near ops (zero word atoms between w2 and w3,
+--- fewer than gapD = 2) escalate under the proximity rule -- the guard
+--- against interleaving two rewrites of one sentence.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w2, x1), rep(w3, y1))
+  =>* escalated(rep(w2, x1), rep(w3, y1)) RESIDUAL:Cfg .
+
+--- Bite: the overlapping pair can NEVER reach a clean composition -- the
+--- certificate the compose layer must refuse.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep((w2 ; s2 ; w3), (x1 ; x2)), rep((w3 ; s3 ; w4), y1))
+  =>* composed(L:AList) RESIDUAL:Cfg .
+
+--- Bite: the near pair never composes either -- proximity is enforced, not
+--- advisory.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w2, x1), rep(w3, y1))
+  =>* composed(L:AList) RESIDUAL:Cfg .
+
+--- Bite, never-fabricate: no reachable composition contains z1, the atom
+--- present in no input -- output only selects and orders input atoms.
+search in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  compose(w1 ; s1 ; w2 ; s2 ; w3 ; s3 ; w4 ; s4 ; w5,
+          rep(w1, x1), rep(w5, y1))
+  =>* composed(P:AList ; z1 ; S:AList) RESIDUAL:Cfg .
+
+--- Coverage, memory tier: full region memory refines both regions and
+--- reaches the clean outcome.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), (mem(rA) & mem(rB)))
+  =>* refinedClean RESIDUAL:Cfg .
+
+--- Coverage, memory tier: partial memory folds what it knows and settles
+--- the honest residue as conflicted.
+search [1] in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), mem(rA))
+  =>* refinedConflicted(rB) RESIDUAL:Cfg .
+
+--- Bite, memory tier: partial memory can NEVER fake a clean refinement
+--- -- spec section 12.3's pinned invariant.
+search in WHIPPLESCRIPT-TEXT-MERGE-COMPOSE :
+  refineReq((rA % rB), mem(rA))
+  =>* refinedClean RESIDUAL:Cfg .

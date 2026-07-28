@@ -1,3 +1,4 @@
+use std.coord
 use std.script
 workflow AutoResearchLite
 
@@ -36,6 +37,7 @@ counter experiment_budget {
   key ResearchProject
   cap 3
   reset daily
+  timezone "America/New_York"
 }
 
 table projects as ResearchProject [
@@ -76,6 +78,13 @@ rule run_budgeted_experiment
       hypothesisId hypothesis.id
       score result.score
       decision "keep"
+    }
+  }
+
+  after metric fails as f {
+    done hypothesis
+    fail error {
+      reason f.reason
     }
   }
 }

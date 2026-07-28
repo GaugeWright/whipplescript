@@ -1,0 +1,34 @@
+load ../settle-stopping.maude
+
+--- The corruption pattern throughout: a certificate minted below the
+--- evidence threshold -- the run-until-N ritual's lucky streak wearing an
+--- anytime-valid guarantee it never earned.
+
+--- Bite: a stream whose contrary evidence keeps the level below K never
+--- certifies under the sound rule, in any interleaving.
+search [1] in WHIPPLESCRIPT-SETTLE-STOPPING :
+  sound open level(z) thresh(s(s(s(z)))) stream(strong ; contrary ; strong ; contrary ; nilO)
+  =>* certified RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive point-estimate certifier mints a
+--- certificate from the very same stream on the first lucky pass.
+search [1] in WHIPPLESCRIPT-SETTLE-STOPPING :
+  naive open passes(z) stream(strong ; contrary ; strong ; contrary ; nilO)
+  =>* certified RESIDUAL:Cfg .
+
+--- Coverage: sustained evidence crosses the threshold and certifies --
+--- and the crossing needs no exhaustion (anytime validity).
+search [1] in WHIPPLESCRIPT-SETTLE-STOPPING :
+  sound open level(z) thresh(s(s(s(z)))) stream(strong ; strong ; strong ; strong ; nilO)
+  =>* certified RESIDUAL:Cfg .
+
+--- Coverage: exhaustion below the threshold is an honest undetermined.
+search [1] in WHIPPLESCRIPT-SETTLE-STOPPING :
+  sound open level(z) thresh(s(s(s(z)))) stream(strong ; contrary ; nilO)
+  =>* undetermined RESIDUAL:Cfg .
+
+--- Bite: undetermined and certified are mutually exclusive outcomes of
+--- one settle -- an exhausted-below-K stream cannot also certify.
+search [1] in WHIPPLESCRIPT-SETTLE-STOPPING :
+  sound open level(z) thresh(s(s(s(z)))) stream(strong ; contrary ; nilO)
+  =>* certified undetermined RESIDUAL:Cfg .

@@ -1,0 +1,49 @@
+load ../effect-key.maude
+
+--- Coverage: a single effect creation yields one durable effect.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  create(v1, n1, fpA) created(mtKeys)
+  =>* C:Cfg effect(key(v1, n1), fpA) .
+
+--- Coverage of cross-revision distinctness: the SAME effect node re-fired under a
+--- NEW program version is a DISTINCT effect; the normal form carries both, so a
+--- revised effect is never deduped against the stale one.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  create(v1, n1, fpA) create(v2, n1, fpA) created(mtKeys)
+  =>! C:Cfg effect(key(v1, n1), fpA) effect(key(v2, n1), fpA) .
+
+--- Coverage: two distinct nodes in one version are two distinct effects.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  create(v1, n1, fpA) create(v1, n2, fpA) created(mtKeys)
+  =>! C:Cfg effect(key(v1, n1), fpA) effect(key(v1, n2), fpA) .
+
+--- Bite on idempotency: the same version-node firing repeated never yields two
+--- effects; the unique index on the key absorbs the re-fire.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  create(v1, n1, fpA) create(v1, n1, fpA) created(mtKeys)
+  =>* effect(key(v1, n1), F1:Fp) effect(key(v1, n1), F2:Fp) RESIDUAL:Cfg .
+
+--- Bite that the fingerprint is NOT identity: re-creating the same version-node
+--- with a DIFFERENT fingerprint still yields one effect; the second creation is
+--- deduped, so an fpA-keyed and an fpB-keyed effect never coexist for one key.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  create(v1, n1, fpA) create(v1, n1, fpB) created(mtKeys)
+  =>* effect(key(v1, n1), fpA) effect(key(v1, n1), fpB) RESIDUAL:Cfg .
+
+--- Coverage of the S2 coerce commitments: the SAME version-node under a
+--- CHANGED commitment (prompt/schema/backend moved) is a DISTINCT effect --
+--- the coercion re-runs instead of replaying a stale terminal.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c2, fpA) created(mtKeys)
+  =>! C:Cfg effect(ckey(v1, n1, c1), fpA) effect(ckey(v1, n1, c2), fpA) .
+
+--- Bite: an UNCHANGED commitment repeated dedups to one effect.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c1, fpA) created(mtKeys)
+  =>* effect(ckey(v1, n1, c1), F1:Fp) effect(ckey(v1, n1, c1), F2:Fp) RESIDUAL:Cfg .
+
+--- Bite: the execution fingerprint stays OUT of coerce identity too -- same
+--- commitment, different fingerprint still yields exactly one effect.
+search [1] in WHIPPLESCRIPT-EFFECT-KEY :
+  ccreate(v1, n1, c1, fpA) ccreate(v1, n1, c1, fpB) created(mtKeys)
+  =>* effect(ckey(v1, n1, c1), fpA) effect(ckey(v1, n1, c1), fpB) RESIDUAL:Cfg .

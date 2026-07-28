@@ -1,0 +1,23 @@
+load ../delegated-settings-authority.maude
+
+--- Coverage: the profile envelope grants a tool.
+search [1] in WHIPPLESCRIPT-DELEGATED-SETTINGS-AUTHORITY :
+  profileGrant
+  =>* profileGrant toolGranted .
+
+--- Coverage: the settings knob loads ambient context that steers behavior.
+search [1] in WHIPPLESCRIPT-DELEGATED-SETTINGS-AUTHORITY :
+  settingsKnob
+  =>* contextLoaded .
+
+--- Bite: the settings knob never grants a tool. The RESIDUAL soup var makes a
+--- `toolGranted` in ANY reachable state a solution, so No solution proves ambient
+--- config cannot self-grant authority.
+search [1] in WHIPPLESCRIPT-DELEGATED-SETTINGS-AUTHORITY :
+  settingsKnob
+  =>* toolGranted RESIDUAL:Cfg .
+
+--- Bite: ambient context, once read, still grants no tool.
+search [1] in WHIPPLESCRIPT-DELEGATED-SETTINGS-AUTHORITY :
+  ambientRead
+  =>* toolGranted RESIDUAL:Cfg .

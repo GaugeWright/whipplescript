@@ -3,6 +3,10 @@ source_tags
 @service workflow MultiAgentBoundedConcurrency
 source_descriptions
 "Two agents with bounded capacity handing work to each other through a queue" workflow MultiAgentBoundedConcurrency
+uses
+  package std.tracker
+  package std.agent.claude
+  package std.agent.codex
 trackers
   tracker backlog provider=builtin
 agents
@@ -16,13 +20,13 @@ rules
       pattern:backlog has ready issue as issue
       pattern:implementer is available
     effects
-      active_claim kind=tracker.claim binding=active_claim key=31e03c41bb5953eb
-      turn kind=agent.tell binding=turn key=5b6982b2c1404341
-      effect3 kind=tracker.finish binding=- key=0d29a2e9d4b3995b
+      active_claim kind=tracker.claim binding=active_claim key=cb7e25b5f2da26b1bc15c393c7d59caa
+      turn kind=agent.tell binding=turn key=1f5a5a19ebbebe916906b261da56ffe7
+      effect3 kind=tracker.finish binding=- key=f5f36187e872a4bca8c5e26289b35ad1
     dependencies
       active_claim --succeeds--> turn
       turn --succeeds--> effect3
-    body_hash aeb5bf8302a9f2d9
+    body_hash e0b3cad0b8480cc134e269c1076ed780
   rule review_completed_turn
     when implementer completed turn as turn
     when reviewer is available
@@ -30,5 +34,5 @@ rules
       pattern:implementer completed turn as turn
       pattern:reviewer is available
     effects
-      effect1 kind=agent.tell binding=- key=00a9ca48408507d3
-    body_hash a64e9c44db33e30d
+      effect1 kind=agent.tell binding=- key=18c5693fb6fb791e064a38034c5245c4
+    body_hash 9a8cb3cd3f112aaf951130a43f0338bb

@@ -99,6 +99,12 @@ pub struct ScenarioRow {
     pub workflow: Option<String>,
     pub input_json: String,
     pub program_hash: Option<String>,
+    /// Mark-pinned scenarios: the named cut point and its event-sequence
+    /// coordinate in the source instance's log, plus the source store the
+    /// prefix replays from. All None = a whole-run (input-replay) pin.
+    pub mark: Option<String>,
+    pub cut_sequence: Option<i64>,
+    pub store_path: Option<String>,
     pub pinned_at: String,
     pub retired: bool,
     /// Cumulative promotion-gate exposure across ALL campaigns.
@@ -182,6 +188,9 @@ impl ImproveStore {
                    workflow TEXT,
                    input_json TEXT NOT NULL,
                    program_hash TEXT,
+                   mark TEXT,
+                   cut_sequence INTEGER,
+                   store_path TEXT,
                    pinned_at TEXT NOT NULL DEFAULT (datetime('now')),
                    retired INTEGER NOT NULL DEFAULT 0
                  );
@@ -205,6 +214,16 @@ impl ImproveStore {
                  );",
             )
             .map_err(StoreError::from)?;
+        // Idempotent widening for stores created before mark-pinned
+        // scenarios (the ensure-* pattern): ALTER fails harmlessly when the
+        // column already exists.
+        for alter in [
+            "ALTER TABLE scenarios ADD COLUMN mark TEXT",
+            "ALTER TABLE scenarios ADD COLUMN cut_sequence INTEGER",
+            "ALTER TABLE scenarios ADD COLUMN store_path TEXT",
+        ] {
+            let _ = connection.execute(alter, []);
+        }
         Ok(Self { connection })
     }
 
@@ -361,6 +380,7 @@ impl ImproveStore {
     // Scenarios (the pinned regression corpus)
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn pin_scenario(
         &mut self,
         name: &str,
@@ -368,14 +388,26 @@ impl ImproveStore {
         workflow: Option<&str>,
         input_json: &str,
         program_hash: Option<&str>,
+        mark: Option<&str>,
+        cut_sequence: Option<i64>,
+        store_path: Option<&str>,
     ) -> StoreResult<()> {
         let inserted = self
             .connection
             .execute(
                 "INSERT OR IGNORE INTO scenarios (name, instance_id, workflow, input_json,
-                   program_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, instance_id, workflow, input_json, program_hash],
+                   program_hash, mark, cut_sequence, store_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    name,
+                    instance_id,
+                    workflow,
+                    input_json,
+                    program_hash,
+                    mark,
+                    cut_sequence,
+                    store_path
+                ],
             )
             .map_err(StoreError::from)?;
         if inserted == 0 {
@@ -390,6 +422,7 @@ impl ImproveStore {
         self.connection
             .query_row(
                 "SELECT s.name, s.instance_id, s.workflow, s.input_json, s.program_hash,
+                   s.mark, s.cut_sequence, s.store_path,
                    s.pinned_at, s.retired, COALESCE(w.wear, 0)
                  FROM scenarios s LEFT JOIN scenario_wear w ON w.scenario = s.name
                  WHERE s.name = ?1",
@@ -407,6 +440,7 @@ impl ImproveStore {
             .connection
             .prepare(
                 "SELECT s.name, s.instance_id, s.workflow, s.input_json, s.program_hash,
+                   s.mark, s.cut_sequence, s.store_path,
                    s.pinned_at, s.retired, COALESCE(w.wear, 0)
                  FROM scenarios s LEFT JOIN scenario_wear w ON w.scenario = s.name
                  ORDER BY s.pinned_at, s.name",
@@ -525,6 +559,26 @@ impl ImproveStore {
         Ok(rows)
     }
 
+    /// All events of one type across every campaign, in append order —
+    /// the workspace-wide precedent lookup (`preference.answered` /
+    /// `preference.revoked` events live in campaign records but carry
+    /// authority across campaigns).
+    pub fn list_events_of_type(&self, event_type: &str) -> StoreResult<Vec<CampaignEventRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT campaign_id, seq, event_type, payload_json, created_at
+                 FROM campaign_events WHERE event_type = ?1 ORDER BY campaign_id, seq",
+            )
+            .map_err(StoreError::from)?;
+        let rows = statement
+            .query_map(params![event_type], campaign_event_from_row)
+            .map_err(StoreError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
     /// Fold every campaign's event log into a head-line summary.
     pub fn list_campaigns(&self) -> StoreResult<Vec<CampaignSummary>> {
         // The fold reads payloads only for `campaign.opened` (the spec) and
@@ -581,9 +635,12 @@ fn scenario_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScenarioRow> {
         workflow: row.get(2)?,
         input_json: row.get(3)?,
         program_hash: row.get(4)?,
-        pinned_at: row.get(5)?,
-        retired: row.get::<_, i64>(6)? != 0,
-        wear: row.get(7)?,
+        mark: row.get(5)?,
+        cut_sequence: row.get(6)?,
+        store_path: row.get(7)?,
+        pinned_at: row.get(8)?,
+        retired: row.get::<_, i64>(9)? != 0,
+        wear: row.get(10)?,
     })
 }
 
@@ -684,9 +741,18 @@ mod tests {
     fn scenario_pin_wear_and_retirement() {
         let mut store = ImproveStore::open_in_memory().expect("open");
         store
-            .pin_scenario("subject-line", "inst-1", Some("Triage"), "{}", None)
+            .pin_scenario(
+                "subject-line",
+                "inst-1",
+                Some("Triage"),
+                "{}",
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("pin");
-        let dup = store.pin_scenario("subject-line", "inst-2", None, "{}", None);
+        let dup = store.pin_scenario("subject-line", "inst-2", None, "{}", None, None, None, None);
         assert!(dup.is_err(), "duplicate pin must be refused");
         assert_eq!(
             store.bump_scenario_wear("subject-line", 3).expect("wear"),

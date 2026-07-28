@@ -1,0 +1,101 @@
+--- Family B: discriminant-string schemas with value-conditioned field presence.
+--- See spec/decision-records/discriminated-families-design.md sections 5.7, 5.8, 6.3.
+--- A schema field typed as a string-literal union acts as a discriminant; a sibling
+--- field annotated `T when d == "v"` is present exactly when the discriminant holds.
+--- case on the discriminant narrows the present-field set per arm.
+---
+--- Invariants pinned and bitten here:
+---   inv a, cross-arm sibling: reading a when-conditioned field outside its tag arm
+---     is rejected;
+---   inv b, when-literal in union: a when literal not in the discriminant's declared
+---     union is rejected;
+---   inv c, when references the discriminant: a when clause referencing a
+---     non-discriminant field is rejected. A cycle is precluded by the v1 rule of a
+---     single literal-union discriminant with no nested discriminants;
+---   inv d, conditional required-presence at admission: a payload asserting d == v but
+---     omitting a `when d == v` field is rejected;
+---   inv e, out-of-range discriminant at admission: a discriminant value outside the
+---     declared union is rejected.
+--- Bite controls show the soundness-minimal admission rule from section 5.7:
+---   same-arm read is fine; an inapplicable present sibling -- the all-keys-present
+---   webhook shape -- is NOT rejected, since narrowing soundness needs only positive
+---   presence, not absence of inapplicable siblings; an in-range discriminant is fine.
+mod WHIPPLESCRIPT-DISCRIMINANT-SCHEMA is
+  protecting BOOL .
+
+  sorts Val ValSet Field FieldSet Cfg .
+  subsort Val < ValSet .
+  subsort Field < FieldSet .
+
+  ops v1 v2 v3 : -> Val [ctor] .       --- discriminant literals; v3 is out-of-range
+  ops f1 f2 : -> Field [ctor] .         --- conditioned sibling fields
+
+  op mtV : -> ValSet [ctor] .
+  op _,_ : ValSet ValSet -> ValSet [ctor assoc comm id: mtV] .
+  eq [v-idem] : V:Val , V:Val = V:Val .
+
+  op mtF : -> FieldSet [ctor] .
+  op _._ : FieldSet FieldSet -> FieldSet [ctor assoc comm id: mtF] .
+  eq [f-idem] : F:Field . F:Field = F:Field .
+
+  op inV : Val ValSet -> Bool .
+  eq inV(V:Val, (V:Val , VS:ValSet)) = true .
+  eq inV(V:Val, VS:ValSet) = false [owise] .
+
+  op inF : Field FieldSet -> Bool .
+  eq inF(F:Field, (F:Field . FS:FieldSet)) = true .
+  eq inF(F:Field, FS:FieldSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- schema and runtime facts .
+  op union : ValSet -> Cfg [ctor] .          --- the discriminant's declared literal union
+  op whenField : Field Val -> Cfg [ctor] .   --- field present when discriminant == Val
+  op disc : Val -> Cfg [ctor] .              --- the runtime discriminant value
+  op present : FieldSet -> Cfg [ctor] .      --- fields actually present in the payload
+  op accessIn : Field Val -> Cfg [ctor] .    --- a read of Field inside the arm for disc == Val
+  op whenRefsNonDisc : Field -> Cfg [ctor] . --- a when clause referencing a non-discriminant field
+
+  --- reject markers .
+  op rejectCrossSibling : Field Val -> Cfg [ctor] .
+  op rejectWhenLiteral : Val -> Cfg [ctor] .
+  op rejectMissingRequired : Field Val -> Cfg [ctor] .
+  op rejectOutOfRange : Val -> Cfg [ctor] .
+  op rejectWhenRef : Field -> Cfg [ctor] .
+
+  vars F : Field .
+  vars AV CV V : Val .
+  var VS : ValSet .
+  var FS : FieldSet .
+
+  --- inv a: a when-conditioned field read inside the wrong arm. F is present only when
+  --- disc == CV, but is read in the arm for disc == AV with AV =/= CV.
+  crl [cross-sibling] :
+      accessIn(F, AV) whenField(F, CV)
+      => accessIn(F, AV) whenField(F, CV) rejectCrossSibling(F, AV)
+      if AV =/= CV .
+
+  --- inv b: a when literal not in the discriminant's declared union.
+  crl [when-literal] :
+      union(VS) whenField(F, V)
+      => union(VS) whenField(F, V) rejectWhenLiteral(V)
+      if inV(V, VS) = false .
+
+  --- inv d: conditional required-presence -- disc == V but a `when d == V` field is
+  --- absent from the payload. Positive obligation only; inapplicable siblings for
+  --- other values are not required and not rejected.
+  crl [missing-required] :
+      disc(V) whenField(F, V) present(FS)
+      => disc(V) whenField(F, V) present(FS) rejectMissingRequired(F, V)
+      if inF(F, FS) = false .
+
+  --- inv e: a runtime discriminant value outside the declared union.
+  crl [out-of-range] :
+      union(VS) disc(V)
+      => union(VS) disc(V) rejectOutOfRange(V)
+      if inV(V, VS) = false .
+
+  --- inv c: a when clause referencing a non-discriminant field.
+  rl [when-ref] : whenRefsNonDisc(F) => whenRefsNonDisc(F) rejectWhenRef(F) .
+endm

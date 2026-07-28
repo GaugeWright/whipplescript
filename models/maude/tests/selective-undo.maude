@@ -1,0 +1,43 @@
+load ../selective-undo.maude
+
+--- The history for every fixture: e1 wrote p1; e2 and e3 wrote p2; e3 read
+--- both e1's and e2's writes. Undoing p1 therefore selects only e1 while
+--- the retained e3 read e1's output; undoing p2 selects e2 AND e3, so
+--- e3's read of e2 stays inside the selection.
+
+--- The hazard demonstrated: the naive path filter accepts the p1 undo even
+--- though the plan strands e3 -- the accepted proposal coexists with a
+--- history in which the stranding test is TRUE.
+search [1] in WHIPPLESCRIPT-SELECTIVE-UNDO :
+  undoReq(p1) hist(wrote(e1, p1) ; wrote(e2, p2) ; wrote(e3, p2),
+                   readOf(e3, e1) ; readOf(e3, e2))
+  =>* proposal(naivePlan, p1) hist(WS:WSet, RS:RSet)
+  such that strands(selByPath(p1, WS:WSet), RS:RSet) = true .
+
+--- Bite: the dependency-closure planner NEVER accepts the p1 undo -- a
+--- later retained edit read the undone writes.
+search [1] in WHIPPLESCRIPT-SELECTIVE-UNDO :
+  undoReq(p1) hist(wrote(e1, p1) ; wrote(e2, p2) ; wrote(e3, p2),
+                   readOf(e3, e1) ; readOf(e3, e2))
+  =>* proposal(checkedPlan, p1) RESIDUAL:Cfg .
+
+--- Coverage: it refuses honestly instead.
+search [1] in WHIPPLESCRIPT-SELECTIVE-UNDO :
+  undoReq(p1) hist(wrote(e1, p1) ; wrote(e2, p2) ; wrote(e3, p2),
+                   readOf(e3, e1) ; readOf(e3, e2))
+  =>* rejected(p1) RESIDUAL:Cfg .
+
+--- Coverage: the p2 undo selects e2 and e3 together; e3's read of e2 lies
+--- INSIDE the selection, so nothing is stranded and the closure-shaped
+--- check accepts.
+search [1] in WHIPPLESCRIPT-SELECTIVE-UNDO :
+  undoReq(p2) hist(wrote(e1, p1) ; wrote(e2, p2) ; wrote(e3, p2),
+                   readOf(e3, e1) ; readOf(e3, e2))
+  =>* proposal(checkedPlan, p2) RESIDUAL:Cfg .
+
+--- Bite against over-refusal: the p2 undo is never rejected -- the check
+--- is the dependency closure, not the mere existence of reads.
+search [1] in WHIPPLESCRIPT-SELECTIVE-UNDO :
+  undoReq(p2) hist(wrote(e1, p1) ; wrote(e2, p2) ; wrote(e3, p2),
+                   readOf(e3, e1) ; readOf(e3, e2))
+  =>* rejected(p2) RESIDUAL:Cfg .

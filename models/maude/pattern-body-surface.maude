@@ -1,0 +1,49 @@
+--- Pattern-body surface: the allow-list that decides which constructs may
+--- appear inside a pattern body.
+---
+--- A pattern is a compile-time reuse fragment, not a workflow. Its body MAY
+--- declare workflow building blocks such as rules, effects, records, and
+--- local schemas, but MUST NOT contain workflow-level terminals such as
+--- complete and fail, workflow contracts, nested pattern declarations, or
+--- nested pattern applications.
+---
+--- The model classifies a body, a multiset of constructs, into a single
+--- verdict: accepted iff every construct is on the allow-list, otherwise
+--- rejected as soon as a forbidden construct is seen. This mirrors
+--- pattern_body_admission in the parser.
+
+mod PATTERN-BODY-SURFACE is
+  sorts Construct Body Cfg .
+  subsort Construct < Body .
+
+  --- Empty body and an associative-commutative multiset of constructs.
+  op none : -> Body [ctor] .
+  op __ : Body Body -> Body [ctor assoc comm id: none] .
+
+  --- Allow-listed building blocks.
+  ops ruleC effectC recordC schemaC : -> Construct [ctor] .
+
+  --- Forbidden constructs.
+  ops terminalC contractC nestedPatternC nestedApplyC : -> Construct [ctor] .
+
+  --- Admission: reduce a body to a verdict.
+  op admit : Body -> Cfg [ctor] .
+  ops accepted rejected : -> Cfg [ctor] .
+
+  var B : Body .
+
+  --- Consume allow-listed constructs and keep admitting the rest.
+  rl [ruleOk]   : admit(ruleC B)   => admit(B) .
+  rl [effectOk] : admit(effectC B) => admit(B) .
+  rl [recordOk] : admit(recordC B) => admit(B) .
+  rl [schemaOk] : admit(schemaC B) => admit(B) .
+
+  --- An emptied body, only allow-listed constructs remained, is accepted.
+  rl [accept] : admit(none) => accepted .
+
+  --- Any forbidden construct rejects the whole body immediately.
+  rl [rejectTerminal]       : admit(terminalC B)       => rejected .
+  rl [rejectContract]       : admit(contractC B)       => rejected .
+  rl [rejectNestedPattern]  : admit(nestedPatternC B)  => rejected .
+  rl [rejectNestedApply]    : admit(nestedApplyC B)    => rejected .
+endm

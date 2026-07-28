@@ -1,0 +1,25 @@
+load ../owned-harness-tracker.maude
+
+--- Coverage: with the tracker capability, a write files an item.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-TRACKER :
+  running trackerEnabled
+  =>* C:Cfg trackerItem .
+
+--- Coverage: the workflow observes a filed item and derives a fact from it (the
+--- participation -> workflow-reaction path).
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-TRACKER :
+  running trackerEnabled
+  =>* C:Cfg fact .
+
+--- Bite (gating): with no tracker capability, no item is ever filed.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-TRACKER :
+  running
+  =>* trackerItem RESIDUAL:Cfg .
+
+--- Bite (refined I3): with no capability the model files nothing, so the workflow
+--- has nothing to observe and no fact arises. Facts in this subsystem flow only
+--- from gated agent participation that the workflow then observes -- never from
+--- the model fabricating a fact.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-TRACKER :
+  running
+  =>* fact RESIDUAL:Cfg .

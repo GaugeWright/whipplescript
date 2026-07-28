@@ -28,5 +28,16 @@ grant provider fixture -> selfhost:llama readable by Operator from Operator
 grant file_store audit_log -> file:/srv/audit.log readable by public from public
 
 # A recorded fact derived from CRM is Operator-only: only cleared subscribers of
-# the fact-base / session-event stream may read it (H2 -- record is a governed sink).
-grant factbase fact:Reviewed -> internal:reviewed readable by Operator from Operator
+# the fact-base / session-event stream may read it (H2 -- record is a governed
+# sink, and DR-0045 makes consumption a read at the same label). Its INTEGRITY
+# is deliberately public: the review pipeline is paced by inbound mail, so the
+# computed provenance of anything derived from the pipeline carries the inbox's
+# untrusted influence -- claiming `from Operator` here would deny the workflow's
+# own honest structure. Integrity claims belong on stores that only vouched
+# data may shape (the crm), not on pipeline-state facts.
+grant factbase fact:Reviewed -> internal:reviewed readable by Operator from public
+
+# The workflow's own output is an egress at the invoker boundary (DR-0030 X2):
+# `complete result` returns to whoever invoked the workflow. The operator runs
+# these workflows, so the result may carry Operator-readable data.
+grant output result -> result readable by Operator

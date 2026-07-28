@@ -1,0 +1,571 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+load ../construct-graph.maude
+load ../construct-lowering.maude
+load ../lowering-runtime-handoff.maude
+load ../lowering-class-lifecycle.maude
+
+--- Metadata lowering is accepted only as a no-output, no-authority class.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(metadataLowering)
+  classAllowsFamily(metadataLowering, declarationBlock)
+  classDeterministic(metadataLowering)
+  classContractPinned(metadataLowering)
+  classNoRuntimeInputs(metadataLowering)
+  classNoHiddenAuthority(metadataLowering)
+  classNoPackageScheduler(metadataLowering)
+  classNoPackageLifecycle(metadataLowering)
+  classNoDirectFactWrite(metadataLowering)
+  classNoDirectRuleFire(metadataLowering)
+  classNoAuthorityNeeded(metadataLowering)
+  classAllowsNoOutput(metadataLowering)
+  classCoreOutputs0(metadataLowering)
+  nodeUsesLoweringClass(projectionNode, metadataLowering)
+  nodeConstructFamily(projectionNode, declarationBlock)
+  nodeClassOutput0(projectionNode, metadataLowering)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(metadataLowering)
+  nodeClassLifecycleAccepted(projectionNode)
+  nodeClassOutputAccepted(projectionNode, metadataLowering)
+  nodeCoreObjects0(projectionNode) .
+
+--- capability_call lowers effect operations to effect graph templates with
+--- capability-scoped authority and runtime-boundary output validation.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(capabilityCall)
+  classAllowsFamily(capabilityCall, effectOperation)
+  classDeterministic(capabilityCall)
+  classContractPinned(capabilityCall)
+  classNoRuntimeInputs(capabilityCall)
+  classNoHiddenAuthority(capabilityCall)
+  classNoPackageScheduler(capabilityCall)
+  classNoPackageLifecycle(capabilityCall)
+  classNoDirectFactWrite(capabilityCall)
+  classNoDirectRuleFire(capabilityCall)
+  classCapabilityScoped(capabilityCall)
+  classOutputBoundaryValidated(capabilityCall)
+  classAllowsOutput(capabilityCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(capabilityCall, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  nodeUsesLoweringClass(memoryNode, capabilityCall)
+  nodeConstructFamily(memoryNode, effectOperation)
+  nodeClassOutput1(memoryNode, capabilityCall, coreEffectObj, coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(capabilityCall)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  nodeCoreObjects1(memoryNode, coreEffectObj)
+  allowedCoreObjectKind(coreEffectKind)
+  objectEntrypointAccepted(capabilityCall, coreEffectKind, effectGraphTemplate) .
+
+--- event_emit lowers rule-body event emission to durable event records.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(eventEmitLowering)
+  classAllowsFamily(eventEmitLowering, eventEmitOperation)
+  classDeterministic(eventEmitLowering)
+  classContractPinned(eventEmitLowering)
+  classNoRuntimeInputs(eventEmitLowering)
+  classNoHiddenAuthority(eventEmitLowering)
+  classNoPackageScheduler(eventEmitLowering)
+  classNoPackageLifecycle(eventEmitLowering)
+  classNoDirectFactWrite(eventEmitLowering)
+  classNoDirectRuleFire(eventEmitLowering)
+  classEventPayloadTyped(eventEmitLowering)
+  classEventAdmissionOwned(eventEmitLowering)
+  classAllowsOutput(eventEmitLowering, coreEventKind, eventRecord)
+  classCoreOutputs1(eventEmitLowering, coreEventKind, eventRecord)
+  entrypointMatchesObjectKind(coreEventKind, eventRecord)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(eventEmitLowering)
+  objectEntrypointAccepted(eventEmitLowering, coreEventKind, eventRecord) .
+
+--- event_source lowers external ingress surfaces to event-admission policy
+--- templates, not direct event occurrences or rule execution.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(eventSourceLowering)
+  classAllowsFamily(eventSourceLowering, sourceDeclaration)
+  classDeterministic(eventSourceLowering)
+  classContractPinned(eventSourceLowering)
+  classNoRuntimeInputs(eventSourceLowering)
+  classNoHiddenAuthority(eventSourceLowering)
+  classNoPackageScheduler(eventSourceLowering)
+  classNoPackageLifecycle(eventSourceLowering)
+  classNoDirectFactWrite(eventSourceLowering)
+  classNoDirectRuleFire(eventSourceLowering)
+  classEventPayloadTyped(eventSourceLowering)
+  classEventAdmissionOwned(eventSourceLowering)
+  classAllowsOutput(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint)
+  classCoreOutputs1(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreEventSourceKind, eventSourceTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(eventSourceLowering)
+  objectEntrypointAccepted(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint) .
+
+--- projection_view lowers to projection records, not direct fact writes.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(projectionViewLowering)
+  classAllowsFamily(projectionViewLowering, projectionDeclaration)
+  classDeterministic(projectionViewLowering)
+  classContractPinned(projectionViewLowering)
+  classNoRuntimeInputs(projectionViewLowering)
+  classNoHiddenAuthority(projectionViewLowering)
+  classNoPackageScheduler(projectionViewLowering)
+  classNoPackageLifecycle(projectionViewLowering)
+  classNoDirectFactWrite(projectionViewLowering)
+  classNoDirectRuleFire(projectionViewLowering)
+  classProjectionSourceTyped(projectionViewLowering)
+  classAllowsOutput(projectionViewLowering, coreProjectionKind, eventProjection)
+  classCoreOutputs1(projectionViewLowering, coreProjectionKind, eventProjection)
+  entrypointMatchesObjectKind(coreProjectionKind, eventProjection)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(projectionViewLowering)
+  objectEntrypointAccepted(projectionViewLowering, coreProjectionKind, eventProjection) .
+
+--- resource_effect lowers resource operations to ordinary effect graph
+--- templates with capability-scoped authority.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(resourceEffectLowering)
+  classAllowsFamily(resourceEffectLowering, resourceOperation)
+  classDeterministic(resourceEffectLowering)
+  classContractPinned(resourceEffectLowering)
+  classNoRuntimeInputs(resourceEffectLowering)
+  classNoHiddenAuthority(resourceEffectLowering)
+  classNoPackageScheduler(resourceEffectLowering)
+  classNoPackageLifecycle(resourceEffectLowering)
+  classNoDirectFactWrite(resourceEffectLowering)
+  classNoDirectRuleFire(resourceEffectLowering)
+  classCapabilityScoped(resourceEffectLowering)
+  classOutputBoundaryValidated(resourceEffectLowering)
+  classAllowsOutput(resourceEffectLowering, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(resourceEffectLowering, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(resourceEffectLowering)
+  objectEntrypointAccepted(resourceEffectLowering, coreEffectKind, effectGraphTemplate) .
+
+--- schedule_emitter lowers recurrence policy to schedule-admission templates.
+--- Clock reads are runtime-owned; lowering itself has no runtime inputs.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(scheduleEmitterLowering)
+  classAllowsFamily(scheduleEmitterLowering, declarationBlock)
+  classDeterministic(scheduleEmitterLowering)
+  classContractPinned(scheduleEmitterLowering)
+  classNoRuntimeInputs(scheduleEmitterLowering)
+  classNoHiddenAuthority(scheduleEmitterLowering)
+  classNoPackageScheduler(scheduleEmitterLowering)
+  classNoPackageLifecycle(scheduleEmitterLowering)
+  classNoDirectFactWrite(scheduleEmitterLowering)
+  classNoDirectRuleFire(scheduleEmitterLowering)
+  classEventPayloadTyped(scheduleEmitterLowering)
+  classEventAdmissionOwned(scheduleEmitterLowering)
+  classAllowsOutput(scheduleEmitterLowering, coreScheduleKind, scheduleTemplateEntrypoint)
+  classCoreOutputs1(scheduleEmitterLowering, coreScheduleKind, scheduleTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreScheduleKind, scheduleTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(scheduleEmitterLowering)
+  objectEntrypointAccepted(scheduleEmitterLowering, coreScheduleKind, scheduleTemplateEntrypoint) .
+
+--- rule_template lowers static rule definitions to rule templates. It does not
+--- fire rules during lowering.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(ruleTemplateLowering)
+  classAllowsFamily(ruleTemplateLowering, ruleConstruct)
+  classDeterministic(ruleTemplateLowering)
+  classContractPinned(ruleTemplateLowering)
+  classNoRuntimeInputs(ruleTemplateLowering)
+  classNoHiddenAuthority(ruleTemplateLowering)
+  classNoPackageScheduler(ruleTemplateLowering)
+  classNoPackageLifecycle(ruleTemplateLowering)
+  classNoDirectFactWrite(ruleTemplateLowering)
+  classNoDirectRuleFire(ruleTemplateLowering)
+  classNoAuthorityNeeded(ruleTemplateLowering)
+  classAllowsOutput(ruleTemplateLowering, coreRuleKind, ruleTemplate)
+  classCoreOutputs1(ruleTemplateLowering, coreRuleKind, ruleTemplate)
+  entrypointMatchesObjectKind(coreRuleKind, ruleTemplate)
+  nodeUsesLoweringClass(memoryNode, ruleTemplateLowering)
+  nodeConstructFamily(memoryNode, ruleConstruct)
+  nodeClassOutput1(memoryNode, ruleTemplateLowering, coreRuleObj, coreRuleKind, ruleTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(ruleTemplateLowering)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, ruleTemplateLowering)
+  nodeCoreObjects1(memoryNode, coreRuleObj)
+  objectEntrypointAccepted(ruleTemplateLowering, coreRuleKind, ruleTemplate) .
+
+--- assertion_check lowers source assertions to assertion check templates.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(assertionCheckLowering)
+  classAllowsFamily(assertionCheckLowering, assertionConstruct)
+  classDeterministic(assertionCheckLowering)
+  classContractPinned(assertionCheckLowering)
+  classNoRuntimeInputs(assertionCheckLowering)
+  classNoHiddenAuthority(assertionCheckLowering)
+  classNoPackageScheduler(assertionCheckLowering)
+  classNoPackageLifecycle(assertionCheckLowering)
+  classNoDirectFactWrite(assertionCheckLowering)
+  classNoDirectRuleFire(assertionCheckLowering)
+  classNoAuthorityNeeded(assertionCheckLowering)
+  classAllowsOutput(assertionCheckLowering, coreAssertionKind, assertionCheck)
+  classCoreOutputs1(assertionCheckLowering, coreAssertionKind, assertionCheck)
+  entrypointMatchesObjectKind(coreAssertionKind, assertionCheck)
+  nodeUsesLoweringClass(projectionNode, assertionCheckLowering)
+  nodeConstructFamily(projectionNode, assertionConstruct)
+  nodeClassOutput1(projectionNode, assertionCheckLowering, coreAssertionObj, coreAssertionKind, assertionCheck)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(assertionCheckLowering)
+  nodeClassLifecycleAccepted(projectionNode)
+  nodeClassOutputAccepted(projectionNode, assertionCheckLowering)
+  nodeCoreObjects1(projectionNode, coreAssertionObj)
+  objectEntrypointAccepted(assertionCheckLowering, coreAssertionKind, assertionCheck) .
+
+--- typed_effect_call uses the same effect lifecycle profile as
+--- capability_call; it is not accepted just because it is named.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(typedEffectCall)
+  classAllowsFamily(typedEffectCall, effectOperation)
+  classDeterministic(typedEffectCall)
+  classContractPinned(typedEffectCall)
+  classNoRuntimeInputs(typedEffectCall)
+  classNoHiddenAuthority(typedEffectCall)
+  classNoPackageScheduler(typedEffectCall)
+  classNoPackageLifecycle(typedEffectCall)
+  classNoDirectFactWrite(typedEffectCall)
+  classNoDirectRuleFire(typedEffectCall)
+  classCapabilityScoped(typedEffectCall)
+  classOutputBoundaryValidated(typedEffectCall)
+  classAllowsOutput(typedEffectCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(typedEffectCall, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(typedEffectCall)
+  objectEntrypointAccepted(typedEffectCall, coreEffectKind, effectGraphTemplate) .
+
+--- Generated lifecycle facts can accept and project more node-owned outputs
+--- than the small hand-written arity-specific rules model directly.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(typedEffectCall)
+  classAllowsFamily(typedEffectCall, effectOperation)
+  classDeterministic(typedEffectCall)
+  classContractPinned(typedEffectCall)
+  classNoRuntimeInputs(typedEffectCall)
+  classNoHiddenAuthority(typedEffectCall)
+  classNoPackageScheduler(typedEffectCall)
+  classNoPackageLifecycle(typedEffectCall)
+  classNoDirectFactWrite(typedEffectCall)
+  classNoDirectRuleFire(typedEffectCall)
+  classCapabilityScoped(typedEffectCall)
+  classOutputBoundaryValidated(typedEffectCall)
+  classAllowsOutput(typedEffectCall, coreEffectKind, effectGraphTemplate)
+  classAllowsOutput(typedEffectCall, coreRuleKind, ruleTemplate)
+  classAllowsOutput(typedEffectCall, coreAssertionKind, assertionCheck)
+  classCoreOutputs(typedEffectCall, classOutputCons(coreEffectKind, effectGraphTemplate, classOutputCons(coreRuleKind, ruleTemplate, classOutputCons(coreAssertionKind, assertionCheck, noClassOutputs))))
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreRuleKind, ruleTemplate)
+  entrypointMatchesObjectKind(coreAssertionKind, assertionCheck)
+  nodeUsesLoweringClass(memoryNode, typedEffectCall)
+  nodeConstructFamily(memoryNode, effectOperation)
+  nodeClassOutput(memoryNode, typedEffectCall, nodeClassOutputCons(coreEffectObj, coreEffectKind, effectGraphTemplate, nodeClassOutputCons(coreRuleObj, coreRuleKind, ruleTemplate, nodeClassOutputCons(coreAssertionObj, coreAssertionKind, assertionCheck, noNodeClassOutputs))))
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(typedEffectCall)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, typedEffectCall)
+  nodeCoreObjects(memoryNode, coreObjectCons(coreAssertionObj, coreObjectCons(coreRuleObj, coreObjectCons(coreEffectObj, noCoreObjects))))
+  objectEntrypointAccepted(typedEffectCall, coreEffectKind, effectGraphTemplate)
+  objectEntrypointAccepted(typedEffectCall, coreRuleKind, ruleTemplate)
+  objectEntrypointAccepted(typedEffectCall, coreAssertionKind, assertionCheck) .
+
+--- Unknown lowering classes are inert unless the platform registers a complete
+--- lifecycle profile.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classDeterministic(unknownLowering)
+  classContractPinned(unknownLowering)
+  classNoRuntimeInputs(unknownLowering)
+  classNoHiddenAuthority(unknownLowering)
+  classNoPackageScheduler(unknownLowering)
+  classNoPackageLifecycle(unknownLowering)
+  classNoDirectFactWrite(unknownLowering)
+  classNoDirectRuleFire(unknownLowering)
+  classNoAuthorityNeeded(unknownLowering)
+  classAllowsNoOutput(unknownLowering)
+  classCoreOutputs0(unknownLowering)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(unknownLowering) .
+
+--- capability_call cannot be accepted without capability scoping.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(capabilityCall)
+  classDeterministic(capabilityCall)
+  classContractPinned(capabilityCall)
+  classNoRuntimeInputs(capabilityCall)
+  classNoHiddenAuthority(capabilityCall)
+  classNoPackageScheduler(capabilityCall)
+  classNoPackageLifecycle(capabilityCall)
+  classNoDirectFactWrite(capabilityCall)
+  classNoDirectRuleFire(capabilityCall)
+  classOutputBoundaryValidated(capabilityCall)
+  classAllowsOutput(capabilityCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(capabilityCall, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(capabilityCall) .
+
+--- capability_call cannot be accepted without runtime-boundary output
+--- validation.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(capabilityCall)
+  classDeterministic(capabilityCall)
+  classContractPinned(capabilityCall)
+  classNoRuntimeInputs(capabilityCall)
+  classNoHiddenAuthority(capabilityCall)
+  classNoPackageScheduler(capabilityCall)
+  classNoPackageLifecycle(capabilityCall)
+  classNoDirectFactWrite(capabilityCall)
+  classNoDirectRuleFire(capabilityCall)
+  classCapabilityScoped(capabilityCall)
+  classAllowsOutput(capabilityCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(capabilityCall, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(capabilityCall) .
+
+--- Event-source classes cannot be accepted unless event admission remains
+--- kernel/runtime-owned.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(eventSourceLowering)
+  classDeterministic(eventSourceLowering)
+  classContractPinned(eventSourceLowering)
+  classNoRuntimeInputs(eventSourceLowering)
+  classNoHiddenAuthority(eventSourceLowering)
+  classNoPackageScheduler(eventSourceLowering)
+  classNoPackageLifecycle(eventSourceLowering)
+  classNoDirectFactWrite(eventSourceLowering)
+  classNoDirectRuleFire(eventSourceLowering)
+  classEventPayloadTyped(eventSourceLowering)
+  classAllowsOutput(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint)
+  classCoreOutputs1(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreEventSourceKind, eventSourceTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(eventSourceLowering) .
+
+--- Event-source classes cannot masquerade as concrete event emissions.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(eventSourceLowering)
+  classAllowsFamily(eventSourceLowering, sourceDeclaration)
+  classDeterministic(eventSourceLowering)
+  classContractPinned(eventSourceLowering)
+  classNoRuntimeInputs(eventSourceLowering)
+  classNoHiddenAuthority(eventSourceLowering)
+  classNoPackageScheduler(eventSourceLowering)
+  classNoPackageLifecycle(eventSourceLowering)
+  classNoDirectFactWrite(eventSourceLowering)
+  classNoDirectRuleFire(eventSourceLowering)
+  classEventPayloadTyped(eventSourceLowering)
+  classEventAdmissionOwned(eventSourceLowering)
+  classAllowsOutput(eventSourceLowering, coreEventSourceKind, eventSourceTemplateEntrypoint)
+  classCoreOutputs1(eventSourceLowering, coreEventKind, eventRecord)
+  entrypointMatchesObjectKind(coreEventKind, eventRecord)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(eventSourceLowering) .
+
+--- Projection classes cannot directly emit fact records.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(projectionViewLowering)
+  classDeterministic(projectionViewLowering)
+  classContractPinned(projectionViewLowering)
+  classNoRuntimeInputs(projectionViewLowering)
+  classNoHiddenAuthority(projectionViewLowering)
+  classNoPackageScheduler(projectionViewLowering)
+  classNoPackageLifecycle(projectionViewLowering)
+  classNoDirectFactWrite(projectionViewLowering)
+  classNoDirectRuleFire(projectionViewLowering)
+  classProjectionSourceTyped(projectionViewLowering)
+  classAllowsOutput(projectionViewLowering, coreProjectionKind, eventProjection)
+  classCoreOutputs1(projectionViewLowering, coreFactKind, factRecord)
+  entrypointMatchesObjectKind(coreFactKind, factRecord)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(projectionViewLowering) .
+
+--- Metadata classes cannot smuggle executable effect output through a node.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(metadataLowering)
+  classDeterministic(metadataLowering)
+  classContractPinned(metadataLowering)
+  classNoRuntimeInputs(metadataLowering)
+  classNoHiddenAuthority(metadataLowering)
+  classNoPackageScheduler(metadataLowering)
+  classNoPackageLifecycle(metadataLowering)
+  classNoDirectFactWrite(metadataLowering)
+  classNoDirectRuleFire(metadataLowering)
+  classNoAuthorityNeeded(metadataLowering)
+  classAllowsNoOutput(metadataLowering)
+  classCoreOutputs0(metadataLowering)
+  nodeUsesLoweringClass(memoryNode, metadataLowering)
+  nodeClassOutput1(memoryNode, metadataLowering, coreEffectObj, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  nodeClassOutputAccepted(memoryNode, metadataLowering) .
+
+--- A core object kind and runtime entrypoint kind must match.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(capabilityCall)
+  classDeterministic(capabilityCall)
+  classContractPinned(capabilityCall)
+  classNoRuntimeInputs(capabilityCall)
+  classNoHiddenAuthority(capabilityCall)
+  classNoPackageScheduler(capabilityCall)
+  classNoPackageLifecycle(capabilityCall)
+  classNoDirectFactWrite(capabilityCall)
+  classNoDirectRuleFire(capabilityCall)
+  classCapabilityScoped(capabilityCall)
+  classOutputBoundaryValidated(capabilityCall)
+  classAllowsOutput(capabilityCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(capabilityCall, coreEffectKind, eventProjection)
+  entrypointMatchesObjectKind(coreProjectionKind, eventProjection)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(capabilityCall) .
+
+--- Even a valid class cannot be used by a construct family it does not accept.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  loweringClassLifecycleOk(capabilityCall)
+  nodeUsesLoweringClass(memoryNode, capabilityCall)
+  nodeConstructFamily(memoryNode, declarationBlock)
+  classAllowsFamily(capabilityCall, effectOperation)
+  =>*
+  Rest:Cfg
+  nodeClassLifecycleAccepted(memoryNode) .
+
+--- Direct rule-firing authority is required to be absent.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(eventEmitLowering)
+  classDeterministic(eventEmitLowering)
+  classContractPinned(eventEmitLowering)
+  classNoRuntimeInputs(eventEmitLowering)
+  classNoHiddenAuthority(eventEmitLowering)
+  classNoPackageScheduler(eventEmitLowering)
+  classNoPackageLifecycle(eventEmitLowering)
+  classNoDirectFactWrite(eventEmitLowering)
+  classEventPayloadTyped(eventEmitLowering)
+  classEventAdmissionOwned(eventEmitLowering)
+  classAllowsOutput(eventEmitLowering, coreEventKind, eventRecord)
+  classCoreOutputs1(eventEmitLowering, coreEventKind, eventRecord)
+  entrypointMatchesObjectKind(coreEventKind, eventRecord)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(eventEmitLowering) .
+
+--- Package-owned scheduler authority is required to be absent.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(scheduleEmitterLowering)
+  classDeterministic(scheduleEmitterLowering)
+  classContractPinned(scheduleEmitterLowering)
+  classNoRuntimeInputs(scheduleEmitterLowering)
+  classNoHiddenAuthority(scheduleEmitterLowering)
+  classNoPackageLifecycle(scheduleEmitterLowering)
+  classNoDirectFactWrite(scheduleEmitterLowering)
+  classNoDirectRuleFire(scheduleEmitterLowering)
+  classEventPayloadTyped(scheduleEmitterLowering)
+  classEventAdmissionOwned(scheduleEmitterLowering)
+  classAllowsOutput(scheduleEmitterLowering, coreScheduleKind, scheduleTemplateEntrypoint)
+  classCoreOutputs1(scheduleEmitterLowering, coreScheduleKind, scheduleTemplateEntrypoint)
+  entrypointMatchesObjectKind(coreScheduleKind, scheduleTemplateEntrypoint)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(scheduleEmitterLowering) .
+
+--- rule_template cannot masquerade as concrete event emission.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(ruleTemplateLowering)
+  classAllowsFamily(ruleTemplateLowering, ruleConstruct)
+  classDeterministic(ruleTemplateLowering)
+  classContractPinned(ruleTemplateLowering)
+  classNoRuntimeInputs(ruleTemplateLowering)
+  classNoHiddenAuthority(ruleTemplateLowering)
+  classNoPackageScheduler(ruleTemplateLowering)
+  classNoPackageLifecycle(ruleTemplateLowering)
+  classNoDirectFactWrite(ruleTemplateLowering)
+  classNoDirectRuleFire(ruleTemplateLowering)
+  classNoAuthorityNeeded(ruleTemplateLowering)
+  classAllowsOutput(ruleTemplateLowering, coreRuleKind, ruleTemplate)
+  classCoreOutputs1(ruleTemplateLowering, coreEventKind, eventRecord)
+  entrypointMatchesObjectKind(coreEventKind, eventRecord)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(ruleTemplateLowering) .
+
+--- assertion_check cannot smuggle executable effects into the lowered IR.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(assertionCheckLowering)
+  classAllowsFamily(assertionCheckLowering, assertionConstruct)
+  classDeterministic(assertionCheckLowering)
+  classContractPinned(assertionCheckLowering)
+  classNoRuntimeInputs(assertionCheckLowering)
+  classNoHiddenAuthority(assertionCheckLowering)
+  classNoPackageScheduler(assertionCheckLowering)
+  classNoPackageLifecycle(assertionCheckLowering)
+  classNoDirectFactWrite(assertionCheckLowering)
+  classNoDirectRuleFire(assertionCheckLowering)
+  classNoAuthorityNeeded(assertionCheckLowering)
+  classAllowsOutput(assertionCheckLowering, coreAssertionKind, assertionCheck)
+  classCoreOutputs1(assertionCheckLowering, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(assertionCheckLowering) .
+
+--- Runtime-owned run state is not an accepted lowering-class output.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(typedEffectCall)
+  classDeterministic(typedEffectCall)
+  classContractPinned(typedEffectCall)
+  classNoRuntimeInputs(typedEffectCall)
+  classNoHiddenAuthority(typedEffectCall)
+  classNoPackageScheduler(typedEffectCall)
+  classNoPackageLifecycle(typedEffectCall)
+  classNoDirectFactWrite(typedEffectCall)
+  classNoDirectRuleFire(typedEffectCall)
+  classCapabilityScoped(typedEffectCall)
+  classOutputBoundaryValidated(typedEffectCall)
+  classAllowsOutput(typedEffectCall, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(typedEffectCall, runtimeRunKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(typedEffectCall) .
+
+--- Hidden authority blocks the lifecycle profile.
+search [1] in WHIPPLESCRIPT-LOWERING-CLASS-LIFECYCLE :
+  classRegistered(resourceEffectLowering)
+  classDeterministic(resourceEffectLowering)
+  classContractPinned(resourceEffectLowering)
+  classNoRuntimeInputs(resourceEffectLowering)
+  classNoPackageScheduler(resourceEffectLowering)
+  classNoPackageLifecycle(resourceEffectLowering)
+  classNoDirectFactWrite(resourceEffectLowering)
+  classNoDirectRuleFire(resourceEffectLowering)
+  classCapabilityScoped(resourceEffectLowering)
+  classOutputBoundaryValidated(resourceEffectLowering)
+  classAllowsOutput(resourceEffectLowering, coreEffectKind, effectGraphTemplate)
+  classCoreOutputs1(resourceEffectLowering, coreEffectKind, effectGraphTemplate)
+  entrypointMatchesObjectKind(coreEffectKind, effectGraphTemplate)
+  =>*
+  Rest:Cfg
+  loweringClassLifecycleOk(resourceEffectLowering) .

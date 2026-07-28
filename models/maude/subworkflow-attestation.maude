@@ -1,0 +1,66 @@
+--- Cross-package @tool attestation, the trust boundary. DR-0025. A package that
+--- exports a @tool workflow attests in its contract that the workflow is
+--- convergence-eligible. A downstream consumer checks a tool grant against that
+--- attestation WITHOUT recompiling the package source. The soundness property:
+--- the producer attests a tool eligible only after convergence-checking it, and
+--- the consumer accepts a cross-package grant only for an attested-eligible tool.
+--- So an accepted cross-package grant is always backed by a real convergence
+--- check; a tool the package did not attest is never accepted.
+---
+--- The marker notAttested records a granted tool the consumer sees no eligibility
+--- claim for. accepted and rejected record the consumer's grant decision.
+---
+--- MULTI-CONSUMER BOUNDARY (the report-vs-check bug class, 2026-06-27). The
+--- attestation is a trusted artifact with MORE THAN ONE consumer. The original
+--- model had a single consumer (grant acceptance). The report-vs-check bug was a
+--- SECOND consumer (a guarantee derived from the same artifact) that did not gate
+--- on the attestation while the first one did. So we model a second consumer here,
+--- published, that surfaces the tool downstream (the analogue of the guarantee
+--- report), and require it to gate on the SAME attestation. The boundary property
+--- is then: EVERY consumer's trusted output requires the attestation -- a trusted
+--- conclusion can never arise for an un-attested tool from ANY consumer. The bite
+--- below would fail the moment an un-gated consumer rule is added.
+mod WHIPPLESCRIPT-SUBWORKFLOW-ATTESTATION is
+  sorts Tool Cfg .
+
+  ops t1 t2 : -> Tool [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op convergent : Tool -> Cfg [ctor] .       --- tool passed the convergence check at package build
+  op attestsEligible : Tool -> Cfg [ctor] .  --- the package contract attests the tool eligible
+  op notAttested : Tool -> Cfg [ctor] .       --- the consumer sees no eligibility claim for the tool
+  op grants : Tool -> Cfg [ctor] .            --- a downstream agent is granted the tool
+  op accepted : Tool -> Cfg [ctor] .          --- consumer 1 (enforce): accepts the grant
+  op rejected : Tool -> Cfg [ctor] .          --- consumer 1 (enforce): rejects the grant
+  op published : Tool -> Cfg [ctor] .         --- consumer 2 (report): surfaces the tool downstream
+
+  var T : Tool .
+
+  --- idempotent markers so the rewrite system reaches a finite fixpoint: without
+  --- these the guarded rules below re-fire and add duplicate markers without
+  --- bound, exploding the search state space.
+  eq attestsEligible(T) attestsEligible(T) = attestsEligible(T) .
+  eq accepted(T) accepted(T) = accepted(T) .
+  eq rejected(T) rejected(T) = rejected(T) .
+  eq published(T) published(T) = published(T) .
+
+  --- producer: a package attests a tool eligible only after convergence-checking
+  --- it. attestsEligible can arise no other way, so it always trails convergence.
+  rl [attest] : convergent(T) => convergent(T) attestsEligible(T) .
+
+  --- consumer 1 (enforce): a grant to an attested-eligible tool is accepted,
+  --- checked from the contract without recompiling the source.
+  rl [accept] : grants(T) attestsEligible(T) => grants(T) attestsEligible(T) accepted(T) .
+
+  --- consumer 1 (enforce): a grant to a tool with no eligibility attestation is
+  --- rejected.
+  rl [reject] : grants(T) notAttested(T) => grants(T) notAttested(T) rejected(T) .
+
+  --- consumer 2 (report): surfacing the tool downstream ALSO gates on the same
+  --- attestation -- the second consumer is held to the identical boundary. There
+  --- is deliberately NO rule that publishes from grants(T) alone; adding one would
+  --- be the report-vs-check bug, and the bite below would catch it.
+  rl [publish] : grants(T) attestsEligible(T) => grants(T) attestsEligible(T) published(T) .
+endm

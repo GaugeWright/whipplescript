@@ -1,0 +1,86 @@
+use std.agent
+use std.coercion
+
+workflow TriageChain
+
+output result TriageDecision
+failure error TriageRejected
+
+class Ticket {
+  id string
+  title string
+  severity "low" | "normal" | "high"
+  status "open"
+}
+
+class TriageDecision {
+  ticketId string
+  decision "approved"
+  plan string
+}
+
+class TriageRejected {
+  ticketId string
+  reason string
+}
+
+class Signoff {
+  choice "approve" | "reject"
+}
+
+agent triager {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+coerce reviewPlan(title string, plan string) -> Signoff """markdown
+Approve or reject this triage plan for "{{ title }}":
+
+{{ plan }}
+
+{{ ctx.output_format }}
+"""
+
+# Static table data makes the chain runnable without external setup.
+table tickets as Ticket [
+  {
+    id "T-100"
+    title "Checkout returns 500 for expired sessions"
+    severity "high"
+    status "open"
+  }
+]
+
+# A `then` chain is for one fixed sequence with shared bindings: each step's
+# result stays in scope for every later step, and a step that fails or times
+# out auto-fails the instance (the rule-level net) — no per-step ceremony.
+rule triage_ticket
+  when Ticket as ticket where ticket.status == "open"
+  when triager is available
+=> {
+  then plan <- tell triager timeout 10m """markdown
+  Propose an owner and a short fix plan for this ticket.
+
+  {{ ticket.title }}
+  """
+  then signoff <- coerce reviewPlan(ticket.title, plan.summary)
+
+  case signoff.choice {
+    "approve" => {
+      done ticket
+      complete result {
+        ticketId ticket.id
+        decision "approved"
+        plan plan.summary
+      }
+    }
+    "reject" => {
+      done ticket
+      fail error {
+        ticketId ticket.id
+        reason "triage rejected"
+      }
+    }
+  }
+}

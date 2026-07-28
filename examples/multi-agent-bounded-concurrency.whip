@@ -1,3 +1,7 @@
+use std.tracker
+use std.agent.claude
+use std.agent.codex
+
 @service
 description "Two agents with bounded capacity handing work to each other through a queue"
 workflow MultiAgentBoundedConcurrency

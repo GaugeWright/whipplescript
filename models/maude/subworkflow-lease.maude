@@ -1,0 +1,48 @@
+--- Re-entrant workspace lease for synchronous sub-workflow tools. DR-0025,
+--- amends DR-0024 slice 2. A brokered turn holds the workspace lease for its
+--- whole unit of work, keyed on the ROOT of that unit rather than on the turn.
+--- When the turn synchronously invokes a sub-workflow tool, the child runs its
+--- own turn under the SAME work-unit root, so it re-acquires the lease the
+--- still-running parent holds instead of contending with it.
+---
+--- The property: a descendant of the lease holder never blocks on the lease its
+--- own root holds, so a parent blocking on a same-workspace child cannot
+--- deadlock. A DIFFERENT work-unit still blocks while the lease is held, which is
+--- the cross-work-unit exclusion the lease exists for and is recoverable, not a
+--- deadlock.
+---
+--- The marker deadlock records a work-unit blocked on a lease its own root holds.
+--- Under per-work-unit keying it is unreachable; under the old per-turn keying a
+--- descendant turn carries a different holder id and could not re-enter.
+mod WHIPPLESCRIPT-SUBWORKFLOW-LEASE is
+  sorts Unit Cfg .
+
+  ops r1 r2 : -> Unit [ctor] .            --- two distinct work-unit roots
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op leaseHeld : Unit -> Cfg [ctor] .     --- workspace lease held, keyed on a work-unit root
+  op wants : Unit -> Cfg [ctor] .         --- a turn of this work-unit wants the lease
+  op running : Unit -> Cfg [ctor] .       --- a turn of this work-unit acquired and runs
+  op blocked : Unit -> Cfg [ctor] .       --- a turn of this work-unit is blocked, lease contended
+  op deadlock : -> Cfg [ctor] .           --- a work-unit blocked on a lease its own root holds
+
+  vars U V : Unit .
+
+  --- A turn whose work-unit root already holds the lease re-enters it
+  --- idempotently. Parent and its descendants share one lease, so a descendant
+  --- never blocks on the lease its own root holds.
+  rl [reenter] : leaseHeld(U) wants(U) => leaseHeld(U) running(U) .
+
+  --- A turn of a different work-unit blocks while the lease is held. This is the
+  --- cross-work-unit exclusion the lease exists for. The block is recoverable: a
+  --- different root holds it and will release.
+  crl [contend] : leaseHeld(U) wants(V) => leaseHeld(U) blocked(V) if U =/= V .
+
+  --- Deadlock sentinel: a work-unit blocked on a lease its own root holds. With
+  --- per-work-unit keying this is unreachable because reenter always applies to
+  --- a same-unit waiter first. It would be reachable under per-turn keying, where
+  --- a descendant turn has a different holder id than the parent.
+  rl [self-deadlock] : leaseHeld(U) blocked(U) => leaseHeld(U) blocked(U) deadlock .
+endm

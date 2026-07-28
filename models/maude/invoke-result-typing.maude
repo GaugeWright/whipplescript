@@ -1,0 +1,88 @@
+--- Typed workflow invoke results, per spec/language.md "Workflow Contracts And
+--- Invocation". A parent that `invoke`s a child and observes its terminal binds
+--- the observing alias to a type that depends on the OUTCOME PREDICATE:
+---   * `after child succeeds as r` -> r carries the child's OUTPUT contract, so
+---     `r.<field>` is checked against the output's fields;
+---   * `after child fails as f`     -> f carries the child's FAILURE contract when
+---     the child declares a SOLE, shared, resolvable failure class; otherwise f
+---     falls back to the DR-0032 failure BASE (TerminalFailed). Either way f does
+---     NOT carry the OUTPUT, so an output-only field on f is rejected.
+--- This model abstracts each contract to its field set and checks by search that
+--- a field access resolves against the predicate-selected contract only. Companion
+--- to the succeeds-arm AND fails-arm resolution in analyze_rule. The fails arm
+--- helper invoke_failure_class binds the child's declared failure class when it is
+--- resolvable; an unresolvable/child-local/multiple failure keeps the base. Runtime
+--- carries the child payload; this is the static typing that makes `f.<field>`
+--- checked against the child's failure shape (or the base) instead of opaque.
+mod WHIPPLESCRIPT-INVOKE-RESULT-TYPING is
+  protecting BOOL .
+
+  sorts Field FieldSet Cfg .
+  subsort Field < FieldSet .
+
+  ops fOut fFail fBoth : -> Field [ctor] .   --- output-only, failure-only, shared
+  --- Part (b) fallback dimension: `fChild` is specific to the child's DECLARED
+  --- failure class (resolvable case only), `fReason` is shared by the child class
+  --- and the base (`reason`), `fBase` is a base-ONLY extra (e.g. effect_id).
+  ops fChild fReason fBase : -> Field [ctor] .
+
+  op mtFields : -> FieldSet [ctor] .
+  op _,_ : FieldSet FieldSet -> FieldSet [ctor assoc comm id: mtFields] .
+  eq [field-idem] : F:Field , F:Field = F:Field .
+
+  op memberField : Field FieldSet -> Bool .
+  eq memberField(F:Field, (F:Field , FS:FieldSet)) = true .
+  eq memberField(F:Field, FS:FieldSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The child's contracts, each a field set. `baseFields` is the DR-0032
+  --- TerminalFailed base a fails binding falls back to when the child's failure
+  --- class is unresolvable / child-local / not sole.
+  op outputFields : FieldSet -> Cfg [ctor] .
+  op failureFields : FieldSet -> Cfg [ctor] .
+  op baseFields : FieldSet -> Cfg [ctor] .
+
+  --- A pending field access through the succeeds- or fails-bound alias.
+  --- `accessFails` = fails binding typed to the child's failure class (resolvable);
+  --- `accessFailsBase` = fails binding fell back to the base (unresolvable).
+  op accessSucceeds : Field -> Cfg [ctor] .
+  op accessFails : Field -> Cfg [ctor] .
+  op accessFailsBase : Field -> Cfg [ctor] .
+
+  ops accepted rejected : -> Cfg [ctor] .
+
+  var F : Field .
+  vars OS FS : FieldSet .
+
+  --- A succeeds-alias access resolves against the OUTPUT contract only.
+  crl [succeeds-ok] : accessSucceeds(F) outputFields(OS)
+      => accepted outputFields(OS)
+      if memberField(F, OS) .
+  crl [succeeds-bad] : accessSucceeds(F) outputFields(OS)
+      => rejected outputFields(OS)
+      if memberField(F, OS) = false .
+
+  --- A fails-alias access resolves against the FAILURE contract only, so an
+  --- output-only field on the fails binding is rejected (predicate discrimination).
+  crl [fails-ok] : accessFails(F) failureFields(FS)
+      => accepted failureFields(FS)
+      if memberField(F, FS) .
+  crl [fails-bad] : accessFails(F) failureFields(FS)
+      => rejected failureFields(FS)
+      if memberField(F, FS) = false .
+
+  --- Fallback: when the child's failure class is unresolvable, the fails binding
+  --- is the base, so a field resolves against the BASE contract only. A child-
+  --- class-specific field (fChild) is therefore rejected under the fallback, while
+  --- the base's `reason` still resolves (the control_plane regression relies on
+  --- this: a child-local `CFail` falls back to the base, whose `reason` field
+  --- keeps `f.reason` compiling).
+  crl [fails-base-ok] : accessFailsBase(F) baseFields(FS)
+      => accepted baseFields(FS)
+      if memberField(F, FS) .
+  crl [fails-base-bad] : accessFailsBase(F) baseFields(FS)
+      => rejected baseFields(FS)
+      if memberField(F, FS) = false .
+endm

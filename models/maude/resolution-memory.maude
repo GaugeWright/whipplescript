@@ -1,0 +1,72 @@
+--- Structured conflict surface + resolution memory, per
+--- spec/versioned-workspace-research-note.md 7.3 (rerere without the
+--- fragile hidden cache) and the untie-substrate readiness tracker
+--- Phase 2. Three invariants:
+---  1. A conflict-bearing cut is a LEGAL, tagged state -- work proceeds
+---     atop it -- but it is NEVER adoptable while a conflict is open.
+---  2. A resolution is stored keyed by the content-addressed conflict
+---     TRIPLE (base, ours, theirs); the daemon auto-applies it to a
+---     descendant conflict only on an EXACT triple match.
+---  3. A differing component (same sides, different base) never
+---     auto-applies -- content addressing is the key, not similarity.
+---
+--- Open conflicts are counted per branch (open(B, N)) so the adoption
+--- guard is a local match, not a global-absence query.
+mod WHIPPLESCRIPT-RESOLUTION-MEMORY is
+  sorts Kid Bid Content Triple Res Cnt Work Cfg .
+
+  ops k1 k2 k3 : -> Kid [ctor] .
+  ops b1 b2 b3 : -> Bid [ctor] .
+  ops c0 c1 c2 c3 : -> Content [ctor] .
+  op triple : Content Content Content -> Triple [ctor] .
+  op r1 : -> Res [ctor] .
+  op w1 : -> Work [ctor] .
+
+  op z : -> Cnt [ctor] .
+  op s_ : Cnt -> Cnt [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op conflict : Kid Bid Triple -> Cfg [ctor] . --- an open conflict object
+  op open : Bid Cnt -> Cfg [ctor] .            --- open-conflict count
+  op memory : Triple Res -> Cfg [ctor] .       --- stored resolution
+  op resolved : Kid Res -> Cfg [ctor] .
+  op resolveReq : Kid Res -> Cfg [ctor] .      --- an authored resolution
+  op adoptReq : Bid -> Cfg [ctor] .
+  op adopted : Bid -> Cfg [ctor] .
+  op writeReq : Bid Work -> Cfg [ctor] .
+  op wrote : Bid Work -> Cfg [ctor] .
+
+  var K : Kid .
+  var B : Bid .
+  var T : Triple .
+  var R : Res .
+  var N : Cnt .
+  var W : Work .
+
+  --- An authored per-item resolution: closes the conflict, stores the
+  --- content-addressed memory (an ordinary workspace-plane fact, not a
+  --- hidden cache).
+  rl [manual-resolve] :
+      resolveReq(K, R) conflict(K, B, T) open(B, s N)
+      => resolved(K, R) memory(T, R) open(B, N) .
+
+  --- The reconciliation daemon's propagation: an identical
+  --- content-addressed pair recurs on a descendant, the stored
+  --- resolution applies. Exact triple match ONLY -- the rule shares T.
+  rl [auto-resolve] :
+      conflict(K, B, T) memory(T, R) open(B, s N)
+      => resolved(K, R) memory(T, R) open(B, N) .
+
+  --- Adoption is gated on ZERO open conflicts: a conflict-bearing cut is
+  --- never adoptable.
+  rl [adopt] :
+      adoptReq(B) open(B, z)
+      => adopted(B) open(B, z) .
+
+  --- Conflicts do not block: work proceeds atop the tagged state.
+  rl [work-proceeds] :
+      writeReq(B, W)
+      => wrote(B, W) .
+endm

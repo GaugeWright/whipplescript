@@ -16,7 +16,11 @@ class Report {
   summary string
 }
 
-workflow Router(request: ScoreRequest) -> Report {
+class RouteFailed {
+  reason string
+}
+
+workflow Router(request: ScoreRequest) -> Report ! RouteFailed {
   rule dispatch
     when ScoreRequest as request
   => {
@@ -26,6 +30,12 @@ workflow Router(request: ScoreRequest) -> Report {
       complete result {
         id r.id
         summary r.summary
+      }
+    }
+
+    after scored fails as f {
+      fail error {
+        reason f.reason
       }
     }
   }

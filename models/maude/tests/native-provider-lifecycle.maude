@@ -1,0 +1,52 @@
+load ../kernel.maude
+
+--- A running cancellation request can receive an acknowledgement without
+--- changing the terminal effect status.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(tellEff, running)
+  effectVersion(tellEff, version1, epoch0)
+  requestable(tellEff)
+  revisionCancellationPolicy(rootInstance, version1, epoch0, requestRunning)
+  =>*
+  Rest
+  effect(tellEff, running)
+  cancellationAcknowledged(tellEff) .
+
+--- Provider terminal evidence can recover a running provider run to its real
+--- terminal outcome after an append-window restart.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(tellEff, running)
+  providerRun(tellEff)
+  providerEvidence(tellEff, completed)
+  =>*
+  Rest
+  effect(tellEff, completed)
+  providerEvidence(tellEff, completed) .
+
+--- Required artifact capture failure can force a running provider run to the
+--- failed terminal outcome represented by runtime recovery.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(tellEff, running)
+  providerRun(tellEff)
+  requiredArtifactCaptureFailure(tellEff)
+  =>*
+  Rest
+  effect(tellEff, failed)
+  requiredArtifactCaptureFailure(tellEff) .
+
+--- A single provider effect cannot hold two terminal statuses at once.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(tellEff, running)
+  providerRun(tellEff)
+  =>*
+  Rest
+  effect(tellEff, completed)
+  effect(tellEff, failed) .
+
+--- Cancellation acknowledgement alone does not fabricate terminal cancellation.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(tellEff, running)
+  cancellationRequested(tellEff)
+  =>*
+  Rest
+  effect(tellEff, cancelled) .

@@ -1,0 +1,18 @@
+load ../compaction-record-once.maude
+
+--- Coverage: one summarization call records the summary durably.
+search [1] in WHIPPLESCRIPT-COMPACTION-RECORD-ONCE :
+  summarize
+  =>* recorded .
+
+--- Coverage: after eviction, resume reuses the recorded summary (the record persists).
+search [1] in WHIPPLESCRIPT-COMPACTION-RECORD-ONCE :
+  summarize evicted
+  =>* reused recorded .
+
+--- Bite: resume never regenerates the summary. The RESIDUAL soup var means a
+--- regenerated in ANY reachable state is a solution, so No solution proves the
+--- summarization call is never re-issued on replay.
+search [1] in WHIPPLESCRIPT-COMPACTION-RECORD-ONCE :
+  summarize evicted
+  =>* regenerated RESIDUAL:Cfg .

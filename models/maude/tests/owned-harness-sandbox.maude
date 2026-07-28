@@ -1,0 +1,13 @@
+load ../owned-harness-sandbox.maude
+
+--- Coverage: a command matching the allow-list executes.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-SANDBOX :
+  running bashAllowed
+  =>* C:Cfg bashRan .
+
+--- Bite (default-deny): with no allow-list match, no command is ever reachable.
+--- The RESIDUAL soup var means a bashRan in any reachable state is a solution, so
+--- No solution proves the sandbox refuses unlisted commands.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-SANDBOX :
+  running
+  =>* bashRan RESIDUAL:Cfg .

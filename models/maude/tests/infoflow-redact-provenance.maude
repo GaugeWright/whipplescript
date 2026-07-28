@@ -1,0 +1,55 @@
+load ../infoflow-redact-provenance.maude
+
+--- Redaction does not launder read provenance. The record customer has public
+--- fields idF and statusF and an operator-only field ssnF. A derivedFrom fact
+--- marks customer as derived from a confidential operator resource read. The key
+--- property: dropping fields cannot remove the read provenance, so a redacted
+--- egress of confidential-read-derived data leaks even when only public fields are
+--- kept -- the concrete twin of the checker purely-additive redact refinement.
+
+--- ============================ COVERAGE (leak reachable) =====================
+
+--- Coverage, THE under-taint that must be caught: keep only the public fields idF
+--- and statusF, but the record was derived from a confidential read
+--- derivedFrom operator. Released to a public sink it STILL leaks -- redaction
+--- dropped the secret field but not the read provenance. This is the leak
+--- reproduced in the checker before the fix.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACT-PROVENANCE :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP)
+  derivedFrom(customer, operator)
+  sink(out, noP)
+  release(customer, (idF ; statusF), out)
+  =>* C:Cfg leak .
+
+--- Coverage: keeping the secret FIELD leaks to a public sink even with public
+--- provenance -- the field-level case, consistent with infoflow-redaction.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACT-PROVENANCE :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, (idF ; ssnF), out)
+  =>* C:Cfg leak .
+
+--- ============================ BITE (no leak) ================================
+
+--- Bite: redaction HELPS when there is no confidential provenance. Dropping the
+--- secret field with NO derivedFrom -- a public-provenance record, or a declassified
+--- read, contributes noP -- released to a public sink does NOT leak. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACT-PROVENANCE :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP) field(customer, ssnF, operator)
+  sink(out, noP)
+  release(customer, (idF ; statusF), out)
+  =>* leak RESIDUAL:Cfg .
+
+--- Bite: a CLEARED sink may receive even confidential-provenance data. The record
+--- is derived from an operator read but released to an operator-cleared sink with
+--- reader set operator; the sink dominates the provenance, so no leak. No solution.
+search [1] in WHIPPLESCRIPT-INFOFLOW-REDACT-PROVENANCE :
+  deleg(emptyR)
+  field(customer, idF, noP) field(customer, statusF, noP)
+  derivedFrom(customer, operator)
+  sink(out, operator)
+  release(customer, (idF ; statusF), out)
+  =>* leak RESIDUAL:Cfg .

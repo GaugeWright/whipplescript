@@ -16,9 +16,3 @@ error: unknown agent field `mystery` on agent `worker`
 7 |   mystery "field"
   |   ^^^^^^^
   = help: supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, `compaction`, and `settings`
-error: agent `worker` is missing a profile
-  --> examples/invalid/bad-agent.whip:3:7
-  |
-3 | agent worker {
-  |       ^^^^^^
-  = help: add `profile "profile-name"` inside the agent block

@@ -1,0 +1,31 @@
+--- Context-assembly Phase 0, invariant 5: provenance completeness. Companion to
+--- spec/context-assembly-tracker.md (Decision 5) and spec/agent-harness.md,
+--- which requires that every injected context bundle must record provenance in
+--- the evidence store. Assembly is provenance-gated: a bundle records a durable
+--- evidence row
+--- before it is placed into the sent system prompt, and there is no path from an
+--- unrecorded bundle to the prompt. The safety property modeled here: a bundle
+--- with no provenance source (`untracked`) never reaches `assembled`. There is
+--- deliberately no rule assembling a staged/untracked bundle directly, so every
+--- assembled bundle carries evidence.
+mod WHIPPLESCRIPT-PROVENANCE-COMPLETENESS is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op staged : -> Cfg [ctor] .      --- a bundle staged for assembly
+  op recorded : -> Cfg [ctor] .    --- its provenance has been recorded
+  op evidence : -> Cfg [ctor] .    --- the durable provenance row
+  op assembled : -> Cfg [ctor] .   --- the bundle placed in the sent system prompt
+  op untracked : -> Cfg [ctor] .   --- fixture: a bundle with no provenance source
+
+  --- Recording a staged bundle's provenance emits a durable evidence row and
+  --- marks it recorded...
+  rl [record] : staged => recorded evidence .
+
+  --- ...and only a recorded bundle is assembled into the prompt. There is no rule
+  --- assembling `staged`/`untracked` directly -- assembly is provenance-gated,
+  --- which is what the untracked bite proves.
+  rl [assemble] : recorded => assembled .
+endm

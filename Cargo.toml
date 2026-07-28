@@ -5,14 +5,16 @@ members = [
     "crates/whipplescript-host-do",
     "crates/whipplescript-kernel",
     "crates/whipplescript-parser",
+    "crates/whipplescript-provider-claude",
+    "crates/whipplescript-provider-codex",
     "crates/whipplescript-store",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.3.1"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 homepage = "https://github.com/jamesjscully/whipplescript"
 repository = "https://github.com/jamesjscully/whipplescript"
 readme = "README.md"
@@ -29,3 +31,9 @@ unwrap_used = "deny"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Dependencies are built without debug info. They dominate target/debug/deps,
+# and debug info measured ~78% of binary size (whipplescript, 2026-07-25).
+# Local crates keep full debuggability: panics and the debugger still work here.
+[profile.dev.package."*"]
+debug = false

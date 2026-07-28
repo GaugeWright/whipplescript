@@ -1,0 +1,104 @@
+--- Information-flow control, the confidentiality lattice, PARTY-RELATIVE. The
+--- anti-exfiltration direction, dual of infoflow-integrity. Upgrades the earlier
+--- single-owner diamond to the decentralized / asymmetric-delegation model of
+--- DR-0027 I-IFC1: confidentiality is "who may read", principals are ordered by
+--- an ACTS-FOR relation, the delegation context theta, a general partial order.
+---
+--- Each owner o protects its secret with a reader-authority r: the secret is
+--- readable by a party p iff p acts-for r -- p has at least r's authority. A leak
+--- is a carried owner-secret reaching a sink audience p that cannot read it.
+---
+--- THE DENY-PROPERTY (R8 framing): a value protected by reader-authority r is
+--- DENIED to every sink audience that does not act-for r -- universally, not as
+--- an enumerated blocklist. The acts-for comparison below is the ALGORITHM that
+--- enforces this denial; the sanctioned exceptions are the source-marked
+--- declassified crossings (infoflow-declassifier.maude).
+--- Different owners' reader authorities may be INCOMPARABLE, which is exactly
+--- "protected from whom": a bank-cleared party cannot read email-owned data.
+---
+--- Modeling note: an owner's reader set is the up-set of a single reader-authority
+--- r (all p with p acts-for r), which keeps the check pairwise (one canAct, like
+--- the integrity dual). General reader sets as unions of up-sets are a later
+--- refinement.
+---
+--- Grounding in whipplescript constructs:
+---   secretSource(B, o)   B read from a resource owned by o at its classification.
+---   flow                 a binding use / payload field / agent join box.
+---   readAuth(o, r)       governance: o's secret is readable by parties acting-for r.
+---   declassify(B1,B2,o)  o's explicit, authority-scoped release: B2 is the public
+---                        projection, carrying none of o's secret.
+---   egressSink(B, p)     an outbound sink whose audience is party p.
+---   deleg(REL)           the delegation context theta as acts-for edges P > Q.
+mod WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY is
+  protecting BOOL .
+  sorts Prin PSet Edge Rel Binding Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
+
+  ops operator bankRole emailRole public : -> Prin [ctor] .
+  ops b1 b2 b3 b4 : -> Binding [ctor] .
+
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
+
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deleg : Rel -> Cfg [ctor] .                  --- the delegation context theta
+  op secretSource : Binding Prin -> Cfg [ctor] .  --- B carries owner o's secret
+  op secretOf : Binding Prin -> Cfg [ctor] .      --- derived secret token
+  op flow : Binding Binding -> Cfg [ctor] .
+  op readAuth : Prin Prin -> Cfg [ctor] .         --- owner o readable by parties acting-for r
+  op declassify : Binding Binding Prin -> Cfg [ctor] . --- o releases B2 as public
+  op egressSink : Binding Prin -> Cfg [ctor] .    --- outbound sink, audience party p
+  op leak : -> Cfg [ctor] .                       --- violation
+
+  vars B B1 B2 : Binding .  vars O P R : Prin .  var REL : Rel .
+
+  eq secretOf(B, O) secretOf(B, O) = secretOf(B, O) .
+  eq leak leak = leak .
+
+  --- seed secrets at sources
+  rl [seed] : secretSource(B, O) => secretSource(B, O) secretOf(B, O) .
+
+  --- secrecy propagates along every flow edge (the agent join box is the same)
+  rl [prop] : secretOf(B1, O) flow(B1, B2) => secretOf(B1, O) flow(B1, B2) secretOf(B2, O) .
+
+  --- declassify has NO rule: there is no flow into B2 and no rule crosses a secret
+  --- over a declassify, so B2 is the public projection carrying none of o's secret.
+  --- Adding such a rule would make the declassified-path bite satisfiable.
+  --- (Grant-authorization of the declassify is the NMIF increment, modeled next.)
+
+  --- violation: a carried owner-secret reaching a sink audience p who cannot read
+  --- it, p does not act-for o's reader authority r. Fires for too-low parties and
+  --- for incomparable ones, an email-cleared party reaching bank-owned data.
+  crl [exfil] : secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R)
+    => secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R) leak
+    if canAct(REL, P, R) =/= true .
+endm

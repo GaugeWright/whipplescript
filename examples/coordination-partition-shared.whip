@@ -1,6 +1,8 @@
 # Coordination resources are partitioned by workflow owner unless the resource
 # explicitly opts into `shared`. Check with any root below; the compiler validates
 # all workflows in the bundle.
+use std.coord
+
 class CoordKey {
   id string
 }

@@ -4,7 +4,9 @@ source_tags
 source_descriptions
 "Recall package memory before agent work and save context after each turn" workflow PackageMemory
 uses
+  package std.agent.codex
   package std.memory
+  package std.tracker
 trackers
   tracker backlog provider=builtin
 agents
@@ -17,19 +19,19 @@ rules
       pattern:backlog has ready issue as issue
       pattern:worker is available
     effects
-      active_claim kind=tracker.claim binding=active_claim key=28311b7c0b560273
-      context kind=capability.call binding=context key=9696aa64918eb021
-      turn kind=agent.tell binding=turn key=83acbd93f42dc1c9
-      effect4 kind=tracker.finish binding=- key=53a870d661110802
+      active_claim kind=tracker.claim binding=active_claim key=8e4023a226a3e51307305685c0520211
+      context kind=capability.call binding=context key=23ec796cc03e594c94d1d3c20b972b99
+      turn kind=agent.tell binding=turn key=50072dc64ba255bcede1ac13249e159b
+      effect4 kind=tracker.finish binding=- key=878e0432d3deeb7e40e6456950d922a2
     dependencies
       active_claim --succeeds--> context
       context --succeeds--> turn
       turn --succeeds--> effect4
-    body_hash f0e94788734c7cf8
+    body_hash 8e749da2051a32498d7dc1e8f34b4072
   rule save_completed_context
     when worker completed turn as turn
     reads
       pattern:worker completed turn as turn
     effects
-      effect1 kind=capability.call binding=- key=dfd40d56735bedd4
-    body_hash 7840fe4c22b67919
+      effect1 kind=capability.call binding=- key=6e048737d6a84059431a12848009f090
+    body_hash e6452c91659b0b9dd7c06573ebc8e5f3

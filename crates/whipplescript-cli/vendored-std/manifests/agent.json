@@ -1,0 +1,737 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.agent",
+  "name": "std.agent",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.agent",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "agent.turn",
+      "description": "Run one governed agent turn (the shipped grandfathered capability id for the agent.tell effect; spec/std-agent.md 'Effect operations')."
+    }
+  ],
+  "providers": [
+    {
+      "id": "owned",
+      "provider_kind": "owned",
+      "plane": "operator",
+      "config": {
+        "agent_provider": true,
+        "description": "The owned brokered harness (DR-0024 default): WhippleScript is the agent runtime and brokers every tool.",
+        "feature_report": [
+          {
+            "class": "context.compact",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "context.compact",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "context.auto_compact",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "context.auto_compact",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "session.resume",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "session.resume",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "session.fork",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "session.fork",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "session.clone",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "session.clone",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "session.export",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "session.export",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "turn.cancel",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "turn.cancel",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "turn.steer",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "turn.steer",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "turn.follow_up",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "turn.follow_up",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "subagent.spawn",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "subagent.spawn",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "subagent.observe",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "subagent.observe",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "subagent.steer",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "subagent.steer",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "skill.attach",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "skill.attach",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "plugin.load",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "plugin.load",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "hook.lifecycle",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "hook.lifecycle",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "native.command.dispatch",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "native.command.dispatch",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "permission.policy",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "permission.policy",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "model.select",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "model.select",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "reasoning.select",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "reasoning.select",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "goal.track",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "goal.track",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "command.list",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "command.list",
+            "dispatch": "brokered"
+          },
+          {
+            "class": "feature.report",
+            "support": "native",
+            "source": "compiled",
+            "native_name": "feature.report",
+            "dispatch": "brokered"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture",
+      "provider_kind": "fixture",
+      "plane": "operator",
+      "config": {
+        "agent_provider": true,
+        "description": "Deterministic in-process reference provider (DR-0009 'Fixture And Test Providers').",
+        "feature_report": [
+          {
+            "class": "context.compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "context.auto_compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.resume",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.fork",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.clone",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.export",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.cancel",
+            "support": "request_only",
+            "source": "compiled",
+            "native_name": "fixture.cancel",
+            "dispatch": "in_process"
+          },
+          {
+            "class": "turn.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.follow_up",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.spawn",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.observe",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "skill.attach",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "plugin.load",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "hook.lifecycle",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "native.command.dispatch",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "permission.policy",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "model.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "reasoning.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "goal.track",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "command.list",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "feature.report",
+            "support": "unsupported",
+            "source": "compiled"
+          }
+        ]
+      }
+    },
+    {
+      "id": "native-fixture",
+      "provider_kind": "native-fixture",
+      "plane": "operator",
+      "config": {
+        "agent_provider": true,
+        "description": "Deterministic delegated-adapter fixture: exercises the delegated seam with fixture terminals.",
+        "feature_report": [
+          {
+            "class": "context.compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "context.auto_compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.resume",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.fork",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.clone",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.export",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.cancel",
+            "support": "request_only",
+            "source": "compiled",
+            "native_name": "fixture.cancel",
+            "dispatch": "in_process"
+          },
+          {
+            "class": "turn.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.follow_up",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.spawn",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.observe",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "skill.attach",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "plugin.load",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "hook.lifecycle",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "native.command.dispatch",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "permission.policy",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "model.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "reasoning.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "goal.track",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "command.list",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "feature.report",
+            "support": "unsupported",
+            "source": "compiled"
+          }
+        ]
+      }
+    },
+    {
+      "id": "command",
+      "provider_kind": "command",
+      "plane": "operator",
+      "config": {
+        "agent_provider": true,
+        "description": "Generic subprocess adapter (native-only).",
+        "feature_report": [
+          {
+            "class": "context.compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "context.auto_compact",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.resume",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.fork",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.clone",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "session.export",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.cancel",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "turn.follow_up",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.spawn",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.observe",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "subagent.steer",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "skill.attach",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "plugin.load",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "hook.lifecycle",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "native.command.dispatch",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "permission.policy",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "model.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "reasoning.select",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "goal.track",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "command.list",
+            "support": "unsupported",
+            "source": "compiled"
+          },
+          {
+            "class": "feature.report",
+            "support": "unsupported",
+            "source": "compiled"
+          }
+        ]
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-agent-repo-reader",
+      "name": "repo-reader",
+      "description": "Read-only workspace access. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": true,
+          "write_files": false,
+          "bash": false,
+          "tracker_file": false,
+          "tracker_claim": false,
+          "tracker_finish": false,
+          "tracker_release": false,
+          "workflow_invoke": true
+        },
+        "codex_mapped": true,
+        "capabilities": [
+          "repo.read"
+        ],
+        "claude_allowed_tools": [
+          "Read",
+          "Glob",
+          "Grep"
+        ]
+      }
+    },
+    {
+      "id": "profile-agent-repo-writer",
+      "name": "repo-writer",
+      "description": "Full workspace read/write, bash, and tracker work. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": true,
+          "write_files": true,
+          "bash": true,
+          "tracker_file": true,
+          "tracker_claim": true,
+          "tracker_finish": true,
+          "tracker_release": true,
+          "workflow_invoke": true
+        },
+        "codex_mapped": true,
+        "capabilities": [
+          "repo.read",
+          "repo.write",
+          "command.run"
+        ],
+        "claude_allowed_tools": [
+          "Read",
+          "Glob",
+          "Grep",
+          "Edit",
+          "Write"
+        ]
+      }
+    },
+    {
+      "id": "profile-agent-internet-research",
+      "name": "internet-research",
+      "description": "No workspace access; research via granted web tools. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": false,
+          "write_files": false,
+          "bash": false,
+          "tracker_file": false,
+          "tracker_claim": false,
+          "tracker_finish": false,
+          "tracker_release": false,
+          "workflow_invoke": true
+        },
+        "codex_mapped": false,
+        "capabilities": []
+      }
+    },
+    {
+      "id": "profile-agent-issue-triager",
+      "name": "issue-triager",
+      "description": "Read the repo and work the tracker; no writes, no bash. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": true,
+          "write_files": false,
+          "bash": false,
+          "tracker_file": true,
+          "tracker_claim": true,
+          "tracker_finish": true,
+          "tracker_release": true,
+          "workflow_invoke": true
+        },
+        "codex_mapped": false,
+        "capabilities": [
+          "repo.read"
+        ]
+      }
+    },
+    {
+      "id": "profile-agent-release-operator",
+      "name": "release-operator",
+      "description": "Full operator authority for release work. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": true,
+          "write_files": true,
+          "bash": true,
+          "tracker_file": true,
+          "tracker_claim": true,
+          "tracker_finish": true,
+          "tracker_release": true,
+          "workflow_invoke": true
+        },
+        "codex_mapped": false,
+        "capabilities": [
+          "repo.read",
+          "repo.write",
+          "command.run"
+        ]
+      }
+    },
+    {
+      "id": "profile-agent-no-repo",
+      "name": "no-repo",
+      "description": "No workspace access at all. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": true,
+        "owned_tools": {
+          "read_files": false,
+          "write_files": false,
+          "bash": false,
+          "tracker_file": false,
+          "tracker_claim": false,
+          "tracker_finish": false,
+          "tracker_release": false,
+          "workflow_invoke": true
+        },
+        "codex_mapped": false,
+        "capabilities": []
+      }
+    },
+    {
+      "id": "profile-agent-permissive",
+      "name": "permissive",
+      "description": "Operator/dev-only non-canonical row; never valid hosted. (std.agent preset table row; enforcement flows through the compiled preset leg, so this row is audit/visibility data.)",
+      "enforcement_mode": "audit",
+      "allowed_capabilities": [],
+      "config": {
+        "canonical": false,
+        "owned_tools": {
+          "read_files": true,
+          "write_files": true,
+          "bash": true,
+          "tracker_file": true,
+          "tracker_claim": true,
+          "tracker_finish": true,
+          "tracker_release": true,
+          "workflow_invoke": true
+        },
+        "codex_mapped": false,
+        "capabilities": [
+          "repo.read",
+          "repo.write",
+          "command.run"
+        ]
+      }
+    }
+  ]
+}

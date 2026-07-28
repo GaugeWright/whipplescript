@@ -1,6 +1,11 @@
 workflow GastownLite
 source_tags
 @service workflow GastownLite
+uses
+  package std.coercion
+  package std.coord
+  package std.tracker
+  package std.agent
 schemas
   class Workspace
     name string
@@ -35,15 +40,15 @@ rules
     writes
       schema:WorkspaceReady
     record_sources
-      schema:WorkspaceReady construct=table_row span=884..923
-    body_hash be140b933c7ae3a2
+      schema:WorkspaceReady construct=table_row span=946..985
+    body_hash bfd2f6ca2d247b96c0d0d1e60c19be7b
   rule file_ticket
     when started
     reads
       pattern:started
     effects
-      effect1 kind=tracker.file binding=- key=d1b74731af37a848
-    body_hash 8fa8a12919dc7ccb
+      effect1 kind=tracker.file binding=- key=90768f06f63ae017024a1498eeb15901
+    body_hash b283b4d3475099aa263f93579a6bb2f5
   rule implement_ready_ticket
     when backlog has ready issue as issue
     when WorkspaceReady as ready
@@ -55,30 +60,28 @@ rules
     writes
       schema:MergeRecord
     effects
-      claimed kind=tracker.claim binding=claimed key=0a6face830b3191e
-      slot kind=lease.acquire binding=slot key=7e41121b2b82c668
-      turn kind=agent.tell binding=turn key=0f484580de9b735e
-      effect4 kind=tracker.release binding=- key=aed137f183034383
-      effect5 kind=human.ask binding=- key=22a2e9667ad9099f
-      review kind=schema.coerce binding=review key=6b1a67e24724727a
-      log_entry kind=ledger.append binding=log_entry key=486742921bd48ea1
-      effect8 kind=tracker.finish binding=- key=c02fb4f193f8720d
-      effect9 kind=tracker.release binding=- key=fe5eb51b72fd3d06
-      effect10 kind=human.ask binding=- key=d025b57c989c4a71
+      claimed kind=tracker.claim binding=claimed key=ea89cbaf03db98ca1752806578c92108
+      slot kind=lease.acquire binding=slot key=b49f59f40d86864795918debcb703c8f
+      turn kind=agent.tell binding=turn key=703adb3084d862acbb29fb95914ee41b
+      effect4 kind=tracker.release binding=- key=774301c99cf55083c80f3daf2b382776
+      review kind=schema.coerce binding=review key=2b7bcdf94cc0b6f1a9949e8c06121470
+      log_entry kind=ledger.append binding=log_entry key=cff8c48b12170d938db4dca84b4c53ec
+      effect7 kind=tracker.finish binding=- key=73f2857ebc87383ff27d61a0e0b5a419
+      effect8 kind=tracker.release binding=- key=341e2484f8794650a07e0e655bd1d536
+      effect9 kind=tracker.release binding=- key=656c54c42411e2993e0713acd35295cb
     dependencies
       claimed --succeeds--> slot
       slot --completes--> turn
       slot --completes--> effect4
-      slot --completes--> effect5
       turn --succeeds--> review
       review --succeeds--> log_entry
+      log_entry --succeeds--> effect7
       log_entry --succeeds--> effect8
       log_entry --succeeds--> effect9
-      log_entry --succeeds--> effect10
     case_branches
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=104d5324dd84bda4 span=2258..2265
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=fb9e3c965f9df749 span=2442..2450
-      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=e73625310a0c4637 span=2492..2501
-    body_hash 6f028d2403a11cdd
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"merge" guard=- body_hash=46c8bd9b93a57f4ec41bfcb56bd31ff3 span=2224..2231
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"revise" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2408..2416
+      case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2458..2467
+    body_hash 02c957e883c9a832daf0dfbfbbab9259
 rule_dependencies
   table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

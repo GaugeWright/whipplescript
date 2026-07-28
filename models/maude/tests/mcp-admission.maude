@@ -1,0 +1,105 @@
+load ../mcp-admission.maude
+
+--- Coverage: rung 0 (unattested, zero setup) is a COMPLETE path. An enumerated
+--- name grant inside offered/profile exposes exactly those tools, with no pin,
+--- no attestation, and no classification anywhere in the configuration.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r0) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(mt) names(getIssue ; createIssue) role(mt) exposed(mt)
+  =>* phase(done) exposed(getIssue ; createIssue) RESIDUAL:Cfg .
+
+--- Coverage: the intersection is fail-closed on both sides. A granted name the
+--- server does not offer, and a granted name the profile does not permit, are
+--- both dropped without failing the turn.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r0) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue) profile(getIssue ; mergePR)
+  classified(mt) names(getIssue ; createIssue ; mergePR) role(mt) exposed(mt)
+  =>* phase(done) exposed(getIssue) RESIDUAL:Cfg .
+
+--- Coverage: at rung 3 a role-shaped grant resolves through the admin's
+--- classification.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r3) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(getIssue ; createIssue) names(mt) role(getIssue ; createIssue) exposed(mt)
+  =>* phase(done) exposed(getIssue ; createIssue) RESIDUAL:Cfg .
+
+--- Coverage: a role grant below rung 2 is denied EXPLICITLY. The denial term in
+--- the final state is what distinguishes a setup error from an empty success.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r1) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue) profile(getIssue ; createIssue)
+  classified(mt) names(mt) role(getIssue) exposed(mt)
+  =>* phase(done) denied(roleUnavailable) RESIDUAL:Cfg .
+
+--- Coverage: drift at rung 1 is denied EXPLICITLY, not silently narrowed.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r1) minRung(r0) drift(mergePR)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(mt) names(getIssue) role(mt) exposed(mt)
+  =>* phase(done) denied(pinDrift) RESIDUAL:Cfg .
+
+--- Coverage (invariant 5, name-grant rung-invariance): with nothing drifted, the
+--- SAME enumerated-name grant exposes the SAME set at rung 0 and at rung 3.
+--- Climbing the ladder adds failure modes; it never silently redefines a grant.
+--- Paired with the rung-0 search at the top of this file, which asserts the same
+--- exposed set from the same grant.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r3) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(mt) names(getIssue ; createIssue) role(mt) exposed(mt)
+  =>* phase(done) exposed(getIssue ; createIssue) RESIDUAL:Cfg .
+
+--- Bite (invariant 1): a tool the grant never names is NEVER exposed, even
+--- though the server offers it and the profile permits it. The RESIDUAL soup var
+--- means mergePR in ANY reachable exposed set would be a solution, so No
+--- solution proves the grant is the binding term.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r0) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(mt) names(getIssue ; createIssue) role(mt) exposed(mt)
+  =>* exposed(mergePR ; E:ToolSet) RESIDUAL:Cfg .
+
+--- Bite (invariant 2): under drift at rung 1, NOTHING is ever exposed. This is
+--- the check that drift does not degrade into "expose whatever still matches"
+--- getIssue has not drifted and would otherwise sail through.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r1) minRung(r0) drift(mergePR)
+  offered(getIssue ; createIssue ; mergePR) profile(getIssue ; createIssue ; mergePR)
+  classified(mt) names(getIssue) role(mt) exposed(mt)
+  =>* exposed(T:Tool ; E:ToolSet) RESIDUAL:Cfg .
+
+--- Bite (invariant 3): a role-shaped grant below rung 2 exposes nothing at all.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r1) minRung(r0) drift(mt)
+  offered(getIssue ; createIssue) profile(getIssue ; createIssue)
+  classified(getIssue ; createIssue) names(mt) role(getIssue ; createIssue) exposed(mt)
+  =>* exposed(T:Tool ; E:ToolSet) RESIDUAL:Cfg .
+
+--- Bite (invariant 4): an UNCLASSIFIED tool is never admitted through a role,
+--- even at the top rung with the server offering it and the profile permitting
+--- it. This is the getEnv case: the reference server annotates it read-only, so
+--- an attested-annotations rung could otherwise sweep it into a read role.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r3) minRung(r0) drift(mt)
+  offered(getIssue ; getEnv) profile(getIssue ; getEnv)
+  classified(getIssue) names(mt) role(getIssue ; getEnv) exposed(mt)
+  =>* exposed(getEnv ; E:ToolSet) RESIDUAL:Cfg .
+
+--- Bite (invariant 6): under an envelope requiring rung 2, a rung-1 server
+--- exposes nothing  the envelope gate runs before any tool is considered.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r1) minRung(r2) drift(mt)
+  offered(getIssue ; createIssue) profile(getIssue ; createIssue)
+  classified(getIssue ; createIssue) names(getIssue ; createIssue) role(mt) exposed(mt)
+  =>* exposed(T:Tool ; E:ToolSet) RESIDUAL:Cfg .
+
+--- Bite: the envelope gate is not bypassable by climbing only part-way  a
+--- rung-0 server under a rung-3 envelope exposes nothing either.
+search [1] in WHIPPLESCRIPT-MCP-ADMISSION :
+  phase(checkEnvelope) rung(r0) minRung(r3) drift(mt)
+  offered(getIssue) profile(getIssue)
+  classified(mt) names(getIssue) role(mt) exposed(mt)
+  =>* exposed(T:Tool ; E:ToolSet) RESIDUAL:Cfg .

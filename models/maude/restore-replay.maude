@@ -1,0 +1,82 @@
+--- Restore-marker replay fold -- the refinement that makes RC-4 restore
+--- coherent on an APPEND-ONLY event log. A restore cannot delete the events it
+--- rewinds past (append-only is a load-bearing store invariant), so the REPLAY
+--- must exclude the abandoned branch: folding the log to rebuild the instance
+--- projection has to skip every event that a later restore marker orphaned,
+--- else an unbounded rebuild would resurrect exactly the work the restore
+--- discarded -- the incoherence spec/decision-records/restorable-context.md
+--- warns about (a projection that remembers writes the restore undid).
+---
+--- The log is modeled as an ordered LIST of events folded left-to-right into a
+--- live projection (a soup of live(seq, factId)):
+---   se(Seq, Fid)       a state event at sequence Seq producing fact Fid.
+---   rm(Seq, Target)    a restore marker at sequence Seq rewinding to Target:
+---                      every live fact with sequence > Target is abandoned.
+--- Sequences are GLOBAL-monotonic (append-only): the marker and any post-restore
+--- events keep climbing, so the fold -- not sequence order -- is what excludes
+--- the branch. New events appended AFTER a marker are live; the (Target, marker)
+--- span is dead.
+---
+--- INV-R1 fold coverage: folding a log with a restore reaches EXACTLY the live
+---   head -- events <= Target plus events after the marker; nothing in the
+---   abandoned span.
+--- INV-R2 abandoned-branch bite (CRUX): a state event in the (Target, marker)
+---   span is NEVER present in the completed projection. It is live only
+---   transiently, before the marker is folded; the marker drops it and it never
+---   returns. The rebuild is coherent.
+--- INV-R3 nesting: restores compose -- a second restore to an even earlier
+---   Target drops the first restore's post-work too; no abandoned fact from any
+---   layer survives.
+---
+--- House rule -- wrapped state. `drop(Target, P)` is a GLOBAL predicate over the
+--- whole projection: it must see EVERY live fact to remove the abandoned ones. A
+--- guard/drop over a bare associative-commutative soup would let extension
+--- matching rewrite a fragment with the rest bound to none, so an abandoned fact
+--- in the unmatched remainder would survive. The state is therefore WRAPPED in
+--- { _ || _ } (projection soup on the left, remaining event list on the right)
+--- and [take-restore] binds the ENTIRE projection in P, forcing drop to see all
+--- of it. The bites are No-solution searches proving the drop actually bites.
+mod RESTORE-REPLAY is
+  protecting NAT .
+  protecting BOOL .
+
+  sorts Fact Cfg Event EventList State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- A live fact in the folded projection: fact Fid entered at sequence Seq.
+  op live : Nat Nat -> Fact [ctor] .
+
+  --- Events, and an ordered list of them (deterministic fold order).
+  op se : Nat Nat -> Event [ctor] .
+  op rm : Nat Nat -> Event [ctor] .
+  op nilE : -> EventList [ctor] .
+  op _;_ : Event EventList -> EventList [ctor] .
+
+  --- The fold state: projection soup P, remaining events L.
+  op {_||_} : Cfg EventList -> State [ctor] .
+
+  vars S F T K : Nat .
+  var P : Cfg .
+  var L : EventList .
+
+  --- Drop every live fact whose sequence is strictly greater than Target -- the
+  --- abandoned branch. Recurses over the WHOLE projection soup so no live fact
+  --- escapes the cut; a fact at exactly Target survives (the cut is inclusive).
+  op drop : Nat Cfg -> Cfg .
+  eq drop(T, live(S, F) P) =
+    if S > T then drop(T, P) else (live(S, F) drop(T, P)) fi .
+  eq drop(T, P) = P [owise] .
+
+  --- Fold a state event: it enters the projection as a live fact.
+  rl [take-state] :
+    { P || se(S, F) ; L } => { P live(S, F) || L } .
+
+  --- Fold a restore marker: rewind the projection to Target, dropping every
+  --- live fact after it. The marker itself contributes no fact. P binds the
+  --- entire projection so drop sees all of it (wrapped-state discipline).
+  rl [take-restore] :
+    { P || rm(S, T) ; L } => { drop(T, P) || L } .
+endm

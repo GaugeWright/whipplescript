@@ -1,0 +1,30 @@
+load ../pattern-recursion.maude
+
+--- Coverage: a self-applying pattern is rejected as unbounded recursion.
+search [1] in WHIPPLESCRIPT-PATTERN-RECURSION :
+  applies(pa, pa) reaches(mtPairs) rejected(mtPats)
+  =>* C:Cfg rejected(pa & QS:PatSet) .
+
+--- Coverage: a mutual application cycle rejects both patterns in the cycle.
+search [1] in WHIPPLESCRIPT-PATTERN-RECURSION :
+  applies(pa, pb) applies(pb, pa) reaches(mtPairs) rejected(mtPats)
+  =>* C:Cfg rejected(pa & pb & QS:PatSet) .
+
+--- Coverage: an acyclic chain still builds transitive reachability, so the
+--- closure is real -- pa reaches pc through pb.
+search [1] in WHIPPLESCRIPT-PATTERN-RECURSION :
+  applies(pa, pb) applies(pb, pc) reaches(mtPairs) rejected(mtPats)
+  =>* C:Cfg reaches(pair(pa, pc) ; PS:PairSet) .
+
+--- Bite: an acyclic application chain is NEVER rejected. The RESIDUAL soup var
+--- means any rejection at all in any reachable state would be a solution, so
+--- No solution proves non-recursive nesting is not wrongly flagged.
+search [1] in WHIPPLESCRIPT-PATTERN-RECURSION :
+  applies(pa, pb) applies(pb, pc) reaches(mtPairs) rejected(mtPats)
+  =>* rejected(P:Pat & QS:PatSet) RESIDUAL:Cfg .
+
+--- Bite: a self-loop on pa never rejects an unrelated pattern pc. Only the
+--- pattern on the cycle is flagged, never a bystander.
+search [1] in WHIPPLESCRIPT-PATTERN-RECURSION :
+  applies(pa, pa) applies(pb, pc) reaches(mtPairs) rejected(mtPats)
+  =>* rejected(pc & QS:PatSet) RESIDUAL:Cfg .

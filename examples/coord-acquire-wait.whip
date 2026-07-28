@@ -6,6 +6,8 @@
 # every worker pass until the slot frees (then `held`) or 30 seconds elapse
 # (then `contended`). Without `wait`, a busy slot routes straight to `contended`.
 
+use std.coord
+
 class Ticket {
   id string
 }

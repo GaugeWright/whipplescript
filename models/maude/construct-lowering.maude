@@ -1,0 +1,440 @@
+mod WHIPPLESCRIPT-CONSTRUCT-LOWERING is
+  protecting WHIPPLESCRIPT-CONSTRUCT-GRAPH .
+
+  sorts CoreObjectId CoreObjectKind CoreObjectList DependencyId EdgeRef EdgeRefList .
+
+  ops
+    coreFactObj
+    coreEventObj
+    coreEventSourceObj
+    coreClockSourceObj
+    coreScheduleObj
+    coreEffectObj
+    coreDependencyObj
+    coreRuleObj
+    coreProjectionObj
+    coreAssertionObj
+    coreDiagnosticObj
+    extraCoreObj
+    : -> CoreObjectId .
+
+  ops dep1 dep2 : -> DependencyId .
+
+  ops
+    coreFactKind
+    coreEventKind
+    coreEventSourceKind
+    coreClockSourceKind
+    coreScheduleKind
+    coreEffectKind
+    coreRuleKind
+    coreDependencyKind
+    coreProjectionKind
+    coreAssertionKind
+    coreDiagnosticKind
+    : -> CoreObjectKind .
+
+  --- Node-level lowering obligations.
+  op loweredByPlatform : GraphNode -> Cfg .
+  op loweringCoreOnly : GraphNode -> Cfg .
+  op sourceSpanPreserved : GraphNode -> Cfg .
+  op nodeResourcePreserved : GraphNode -> Cfg .
+  op noExtraCapability : GraphNode -> Cfg .
+  op noPackageScheduler : GraphNode -> Cfg .
+  op noPackageLifecycle : GraphNode -> Cfg .
+  op nodeVersionPreserved : GraphNode -> Cfg .
+  op nodeCardinalityPreserved : GraphNode -> Cfg .
+  op nodeProvenancePreserved : GraphNode -> Cfg .
+  op terminalBindingPreserved : GraphNode -> Cfg .
+  op nodeClassLifecycleAccepted : GraphNode -> Cfg .
+  op nodeClassOutputAccepted : GraphNode LoweringClass -> Cfg .
+  op nodeNeedsEdges : GraphNode EdgeRefList -> Cfg .
+  op requiredEdgeLoweringsPreserved : GraphNode -> Cfg .
+  op nodeLoweringSafetyOk : GraphNode -> Cfg .
+  op loweringPreservedNode : GraphId GraphNode -> Cfg .
+
+  --- Edge-level lowering obligations.
+  op coreRelationForEdge : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeTypePreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeResourcePreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeCapabilityPreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeVersionPreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeSpanPreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeCardinalityPreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeProvenancePreserved : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeLoweringPreserved : GraphNode PortId GraphNode PortId -> Cfg .
+
+  --- Effect-dependency lowering obligations.
+  op effectDependencyAccepted : GraphId DependencyId -> Cfg .
+  op dependencyEndpointPreserved : DependencyId -> Cfg .
+  op dependencyPredicatePreserved : DependencyId -> Cfg .
+  op dependencySpanPreserved : DependencyId -> Cfg .
+  op dependencyProvenancePreserved : DependencyId -> Cfg .
+  op dependencyLoweringPreserved : DependencyId -> Cfg .
+
+  op loweringPreserved : GraphId -> Cfg .
+  op loweringDeterministic : GraphId -> Cfg .
+  op loweredIrReportComplete : GraphId -> Cfg .
+  op allowedCoreObjectKind : CoreObjectKind -> Cfg .
+  op emittedCoreObject : GraphId CoreObjectId CoreObjectKind -> Cfg .
+  op nodeCoreObjects0 : GraphNode -> Cfg .
+  op nodeCoreObjects1 : GraphNode CoreObjectId -> Cfg .
+  op nodeCoreObjects2 : GraphNode CoreObjectId CoreObjectId -> Cfg .
+  op edgeCoreObjects0 : GraphNode PortId GraphNode PortId -> Cfg .
+  op edgeCoreObjects1 : GraphNode PortId GraphNode PortId CoreObjectId -> Cfg .
+  op dependencyCoreObjects0 : DependencyId -> Cfg .
+  op dependencyCoreObjects1 : DependencyId CoreObjectId -> Cfg .
+  op graphEmits0 : GraphId -> Cfg .
+  op graphEmits1 : GraphId CoreObjectId -> Cfg .
+  op graphEmits2 : GraphId CoreObjectId CoreObjectId -> Cfg .
+  op graphEmits3 : GraphId CoreObjectId CoreObjectId CoreObjectId -> Cfg .
+  op noCoreObjects : -> CoreObjectList .
+  op coreObjectCons : CoreObjectId CoreObjectList -> CoreObjectList .
+  op noEdges : -> EdgeRefList .
+  op edgeId : GraphNode PortId GraphNode PortId -> EdgeRef .
+  op edgeCons : EdgeRef EdgeRefList -> EdgeRefList .
+  op graphEmits : GraphId CoreObjectList -> Cfg .
+  op nodeCoreObjects : GraphNode CoreObjectList -> Cfg .
+  op edgeCoreObjects : GraphNode PortId GraphNode PortId CoreObjectList -> Cfg .
+  op dependencyCoreObjects : DependencyId CoreObjectList -> Cfg .
+  op coreObjectOwnedByNode : GraphId CoreObjectId GraphNode -> Cfg .
+  op coreObjectOwnedByEdge : GraphId CoreObjectId GraphNode PortId GraphNode PortId -> Cfg .
+  op coreObjectOwnedByDependency : GraphId CoreObjectId DependencyId -> Cfg .
+  op coreObjectOwnerUnique : GraphId CoreObjectId -> Cfg .
+  op inconsistentCoreObjectOwner : GraphId CoreObjectId -> Cfg .
+  op coreObjectAccounted : GraphId CoreObjectId -> Cfg .
+  op coreObjectCoverageOk : GraphId -> Cfg .
+  op noRuntimeInputsDuringLowering : GraphId -> Cfg .
+  op graphLoweringBoundaryOk : GraphId -> Cfg .
+
+  vars G : GraphId .
+  vars N N2 N3 Provider : GraphNode .
+  var Nodes : GraphNodeList .
+  vars Req Req2 Req3 Prov Prov2 Prov3 : PortId .
+  var Reqs : PortIdList .
+  var EdgeRefs : EdgeRefList .
+  vars O O2 O3 : CoreObjectId .
+  var Objects : CoreObjectList .
+  vars K K2 K3 : CoreObjectKind .
+  vars L : LoweringClass .
+  vars Dep Dep2 : DependencyId .
+
+  rl [preserve-edge-lowering] :
+    edgeAccepted(N, Req, Provider, Prov)
+    coreRelationForEdge(N, Req, Provider, Prov)
+    edgeTypePreserved(N, Req, Provider, Prov)
+    edgeResourcePreserved(N, Req, Provider, Prov)
+    edgeCapabilityPreserved(N, Req, Provider, Prov)
+    edgeVersionPreserved(N, Req, Provider, Prov)
+    edgeSpanPreserved(N, Req, Provider, Prov)
+    edgeCardinalityPreserved(N, Req, Provider, Prov)
+    edgeProvenancePreserved(N, Req, Provider, Prov)
+    =>
+    edgeLoweringPreserved(N, Req, Provider, Prov) .
+
+  rl [preserve-dependency-lowering] :
+    effectDependencyAccepted(G, Dep)
+    dependencyEndpointPreserved(Dep)
+    dependencyPredicatePreserved(Dep)
+    dependencySpanPreserved(Dep)
+    dependencyProvenancePreserved(Dep)
+    =>
+    dependencyLoweringPreserved(Dep) .
+
+  rl [accept-node-lowering-safety] :
+    loweredByPlatform(N)
+    loweringCoreOnly(N)
+    sourceSpanPreserved(N)
+    nodeResourcePreserved(N)
+    noExtraCapability(N)
+    noPackageScheduler(N)
+    noPackageLifecycle(N)
+    nodeVersionPreserved(N)
+    nodeCardinalityPreserved(N)
+    nodeProvenancePreserved(N)
+    terminalBindingPreserved(N)
+    nodeClassLifecycleAccepted(N)
+    nodeClassOutputAccepted(N, L)
+    =>
+    nodeLoweringSafetyOk(N) .
+
+  eq coreObjectOwnedByNode(G, O, N) coreObjectOwnedByNode(G, O, N2)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq coreObjectOwnedByEdge(G, O, N, Req, Provider, Prov) coreObjectOwnedByEdge(G, O, N2, Req2, N3, Prov2)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq coreObjectOwnedByNode(G, O, N) coreObjectOwnedByEdge(G, O, N2, Req, Provider, Prov)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq coreObjectOwnedByNode(G, O, N) coreObjectOwnedByDependency(G, O, Dep)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq coreObjectOwnedByEdge(G, O, N, Req, Provider, Prov) coreObjectOwnedByDependency(G, O, Dep)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq coreObjectOwnedByDependency(G, O, Dep) coreObjectOwnedByDependency(G, O, Dep2)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq inconsistentCoreObjectOwner(G, O) coreObjectOwnedByNode(G, O, N)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq inconsistentCoreObjectOwner(G, O) coreObjectOwnedByEdge(G, O, N, Req, Provider, Prov)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  eq inconsistentCoreObjectOwner(G, O) coreObjectOwnedByDependency(G, O, Dep)
+    = inconsistentCoreObjectOwner(G, O) .
+
+  rl [preserve-node-lowering-0] :
+    nodeAccepted(G, N)
+    nodeNeeds0(N)
+    nodeLoweringSafetyOk(N)
+    =>
+    loweringPreservedNode(G, N) .
+
+  rl [preserve-node-lowering-1] :
+    nodeAccepted(G, N)
+    nodeNeeds1(N, Req)
+    edgeLoweringPreserved(N, Req, Provider, Prov)
+    nodeLoweringSafetyOk(N)
+    =>
+    loweringPreservedNode(G, N) .
+
+  rl [preserve-node-lowering-2] :
+    nodeAccepted(G, N)
+    nodeNeeds2(N, Req, Req2)
+    edgeLoweringPreserved(N, Req, Provider, Prov)
+    edgeLoweringPreserved(N, Req2, N2, Prov2)
+    nodeLoweringSafetyOk(N)
+    =>
+    loweringPreservedNode(G, N) .
+
+  rl [preserve-node-lowering-3] :
+    nodeAccepted(G, N)
+    nodeNeeds3(N, Req, Req2, Req3)
+    edgeLoweringPreserved(N, Req, Provider, Prov)
+    edgeLoweringPreserved(N, Req2, N2, Prov2)
+    edgeLoweringPreserved(N, Req3, N3, Prov3)
+    nodeLoweringSafetyOk(N)
+    =>
+    loweringPreservedNode(G, N) .
+
+  --- Generated artifacts use explicit edge-ref lists so aggregate required
+  --- ports cannot collapse multiple provider edges into one required-port fact.
+  rl [preserve-generated-required-edge-lowerings-empty] :
+    nodeNeedsEdges(N, noEdges)
+    =>
+    requiredEdgeLoweringsPreserved(N) .
+
+  rl [preserve-generated-required-edge-lowerings-cons] :
+    nodeNeedsEdges(N, edgeCons(edgeId(N, Req, Provider, Prov), EdgeRefs))
+    edgeLoweringPreserved(N, Req, Provider, Prov)
+    =>
+    edgeLoweringPreserved(N, Req, Provider, Prov)
+    nodeNeedsEdges(N, EdgeRefs) .
+
+  rl [preserve-generated-node-lowering] :
+    nodeAccepted(G, N)
+    requiredEdgeLoweringsPreserved(N)
+    nodeLoweringSafetyOk(N)
+    =>
+    loweringPreservedNode(G, N) .
+
+  rl [account-node-core-object-1] :
+    graphContainsNode(G, N)
+    nodeCoreObjects1(N, O)
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByNode(G, O, N)
+    coreObjectOwnerUnique(G, O)
+    =>
+    graphContainsNode(G, N)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O) .
+
+  rl [account-node-core-object-2] :
+    graphContainsNode(G, N)
+    nodeCoreObjects2(N, O, O2)
+    emittedCoreObject(G, O, K)
+    emittedCoreObject(G, O2, K2)
+    allowedCoreObjectKind(K)
+    allowedCoreObjectKind(K2)
+    coreObjectOwnedByNode(G, O, N)
+    coreObjectOwnedByNode(G, O2, N)
+    coreObjectOwnerUnique(G, O)
+    coreObjectOwnerUnique(G, O2)
+    =>
+    graphContainsNode(G, N)
+    allowedCoreObjectKind(K)
+    allowedCoreObjectKind(K2)
+    coreObjectAccounted(G, O)
+    coreObjectAccounted(G, O2) .
+
+  rl [account-node-core-object-generated-cons] :
+    graphContainsNode(G, N)
+    nodeCoreObjects(N, coreObjectCons(O, Objects))
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByNode(G, O, N)
+    coreObjectOwnerUnique(G, O)
+    =>
+    graphContainsNode(G, N)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O)
+    nodeCoreObjects(N, Objects) .
+
+  rl [account-edge-core-object-1] :
+    graphContainsNode(G, N)
+    edgeAccepted(N, Req, Provider, Prov)
+    edgeCoreObjects1(N, Req, Provider, Prov, O)
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByEdge(G, O, N, Req, Provider, Prov)
+    coreObjectOwnerUnique(G, O)
+    =>
+    graphContainsNode(G, N)
+    edgeAccepted(N, Req, Provider, Prov)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O) .
+
+  rl [account-edge-core-object-generated-cons] :
+    graphContainsNode(G, N)
+    edgeAccepted(N, Req, Provider, Prov)
+    edgeCoreObjects(N, Req, Provider, Prov, coreObjectCons(O, Objects))
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByEdge(G, O, N, Req, Provider, Prov)
+    coreObjectOwnerUnique(G, O)
+    =>
+    graphContainsNode(G, N)
+    edgeAccepted(N, Req, Provider, Prov)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O)
+    edgeCoreObjects(N, Req, Provider, Prov, Objects) .
+
+  rl [account-dependency-core-object-1] :
+    effectDependencyAccepted(G, Dep)
+    dependencyLoweringPreserved(Dep)
+    dependencyCoreObjects1(Dep, O)
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByDependency(G, O, Dep)
+    coreObjectOwnerUnique(G, O)
+    =>
+    effectDependencyAccepted(G, Dep)
+    dependencyLoweringPreserved(Dep)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O) .
+
+  rl [account-dependency-core-object-generated-cons] :
+    effectDependencyAccepted(G, Dep)
+    dependencyLoweringPreserved(Dep)
+    dependencyCoreObjects(Dep, coreObjectCons(O, Objects))
+    emittedCoreObject(G, O, K)
+    allowedCoreObjectKind(K)
+    coreObjectOwnedByDependency(G, O, Dep)
+    coreObjectOwnerUnique(G, O)
+    =>
+    effectDependencyAccepted(G, Dep)
+    dependencyLoweringPreserved(Dep)
+    allowedCoreObjectKind(K)
+    coreObjectAccounted(G, O)
+    dependencyCoreObjects(Dep, Objects) .
+
+  rl [core-object-coverage-0] :
+    graphEmits0(G)
+    =>
+    coreObjectCoverageOk(G) .
+
+  rl [core-object-coverage-1] :
+    graphEmits1(G, O)
+    coreObjectAccounted(G, O)
+    =>
+    coreObjectCoverageOk(G) .
+
+  rl [core-object-coverage-2] :
+    graphEmits2(G, O, O2)
+    coreObjectAccounted(G, O)
+    coreObjectAccounted(G, O2)
+    =>
+    coreObjectCoverageOk(G) .
+
+  rl [core-object-coverage-3] :
+    graphEmits3(G, O, O2, O3)
+    coreObjectAccounted(G, O)
+    coreObjectAccounted(G, O2)
+    coreObjectAccounted(G, O3)
+    =>
+    coreObjectCoverageOk(G) .
+
+  rl [core-object-coverage-generated-empty] :
+    graphEmits(G, noCoreObjects)
+    =>
+    coreObjectCoverageOk(G) .
+
+  rl [core-object-coverage-generated-cons] :
+    graphEmits(G, coreObjectCons(O, Objects))
+    coreObjectAccounted(G, O)
+    =>
+    coreObjectAccounted(G, O)
+    graphEmits(G, Objects) .
+
+  rl [preserve-graph-lowering-boundary] :
+    loweringDeterministic(G)
+    loweredIrReportComplete(G)
+    coreObjectCoverageOk(G)
+    noRuntimeInputsDuringLowering(G)
+    =>
+    graphLoweringBoundaryOk(G) .
+
+  rl [preserve-graph-lowering-0] :
+    acceptedProgram(G)
+    graphLoweringBoundaryOk(G)
+    graphNodes0(G)
+    =>
+    loweringPreserved(G) .
+
+  rl [preserve-graph-lowering-1] :
+    acceptedProgram(G)
+    graphLoweringBoundaryOk(G)
+    graphNodes1(G, N)
+    loweringPreservedNode(G, N)
+    =>
+    loweringPreserved(G) .
+
+  rl [preserve-graph-lowering-2] :
+    acceptedProgram(G)
+    graphLoweringBoundaryOk(G)
+    graphNodes2(G, N, N2)
+    loweringPreservedNode(G, N)
+    loweringPreservedNode(G, N2)
+    =>
+    loweringPreserved(G) .
+
+  rl [preserve-graph-lowering-3] :
+    acceptedProgram(G)
+    graphLoweringBoundaryOk(G)
+    graphNodes3(G, N, N2, N3)
+    loweringPreservedNode(G, N)
+    loweringPreservedNode(G, N2)
+    loweringPreservedNode(G, N3)
+    =>
+    loweringPreserved(G) .
+
+  --- Generated artifacts can contain more nodes than the small hand-written
+  --- fixtures above. Reduce the graph node list while preserving already
+  --- established per-node lowering facts, then finish at the empty list.
+  rl [preserve-generated-graph-lowering-empty] :
+    acceptedProgram(G)
+    graphLoweringBoundaryOk(G)
+    graphNodes(G, noGraphNodes)
+    =>
+    loweringPreserved(G) .
+
+  rl [preserve-generated-graph-lowering-cons] :
+    graphNodes(G, graphNodeCons(N, Nodes))
+    loweringPreservedNode(G, N)
+    =>
+    loweringPreservedNode(G, N)
+    graphNodes(G, Nodes) .
+endm

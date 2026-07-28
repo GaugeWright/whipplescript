@@ -1,6 +1,9 @@
 workflow CoerceBranch
 source_tags
 @service workflow CoerceBranch
+uses
+  package std.coercion
+  package std.tracker
 schemas
   enum Priority { Low, Normal, Urgent }
   class MessageClassification
@@ -10,6 +13,8 @@ schemas
   class ClassifiedMessage
     request ref<WorkItem>
     classification ref<MessageClassification>
+trackers
+  tracker review provider=builtin
 coerces
   coerce classifyMessage(title string, body string) -> ref<MessageClassification>
 rules
@@ -20,17 +25,17 @@ rules
     writes
       schema:ClassifiedMessage
     effects
-      classification kind=schema.coerce binding=classification key=7c8df348bec42460
-      effect2 kind=human.ask binding=- key=9cb792d395f3f9ce
+      classification kind=schema.coerce binding=classification key=44afbf47e063e5764d019b64e8b18e22
+      effect2 kind=tracker.file binding=- key=4276d9a1e676a740490eadaae19fa52c
     dependencies
       classification --fails--> effect2
-    body_hash e5b9747dd84b9c04
+    body_hash 9f955c4d5e83568d940f713ee54928a5
   rule route_classified
     when ClassifiedMessage as message
     reads
       schema:ClassifiedMessage
     effects
-      effect1 kind=human.ask binding=- key=f81bef02f1cb4990
-    body_hash 4bbde6eaaf7ce5f0
+      effect1 kind=tracker.file binding=- key=156eb35678c182e9d002e61ccea00108
+    body_hash 730386b76fd397c24a45d6c2353028be
 rule_dependencies
   classify_request --schema:ClassifiedMessage--> route_classified

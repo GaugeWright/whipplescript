@@ -1,0 +1,23 @@
+load ../skills-never-grant.maude
+
+--- Coverage: profile caps flow into the effective authority (skill present, no effect).
+search [1] in WHIPPLESCRIPT-SKILLS-NEVER-GRANT :
+  profile(read ; bash) skillTools(mt) effective(mt)
+  =>! profile(mt) skillTools(mt) effective(read ; bash) .
+
+--- Coverage: a skill's allowed-tools are consumed as provenance (never granted).
+search [1] in WHIPPLESCRIPT-SKILLS-NEVER-GRANT :
+  skillTools(write)
+  =>! skillTools(mt) .
+
+--- Bite: a tool a skill lists but the profile does not permit never enters the
+--- effective authority. The RESIDUAL soup var means `write` in ANY reachable
+--- effective set is a solution, so No solution proves the skill cannot widen.
+search [1] in WHIPPLESCRIPT-SKILLS-NEVER-GRANT :
+  profile(read) skillTools(write) effective(mt)
+  =>* effective(write ; E:CapSet) RESIDUAL:Cfg .
+
+--- Bite: with an empty profile a skill grants nothing, whatever it lists.
+search [1] in WHIPPLESCRIPT-SKILLS-NEVER-GRANT :
+  profile(mt) skillTools(read ; write) effective(mt)
+  =>* effective(C:Cap ; E:CapSet) RESIDUAL:Cfg .

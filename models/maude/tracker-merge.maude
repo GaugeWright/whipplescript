@@ -1,0 +1,123 @@
+--- Tracker phase-B1 DAG / conflict fold (ADR-0002 "Phase B1"). Phase A folded
+--- a LINEAR accepted-event log; B1 folds a content-addressed event DAG that two
+--- clones' logs merge into (merge = set-union, deduped by content-hash id), so
+--- an issue's history can FORK and the fold must surface per-field conflicts
+--- instead of silently picking a winner.
+---
+--- Abstraction: events are `ev(id, field, value)` tokens in an ACU soup, all
+--- held inside a `t(_)` top wrapper so a fold rule matches the WHOLE soup (a
+--- bare `ev(E,F,V) C` LHS would let `C` collapse to `none` and match a single
+--- event with the rest as ambient context, hiding the other heads from the
+--- maximality guard). The fold is thus a pure function of the SET -- confluence
+--- is structural: merge order cannot change the result. The content-hash parent
+--- DAG is taken as a transitively-closed strict ancestor order `bef(a, b)` ("a
+--- is an ancestor of b"); the Rust derives `bef` from parent links, the model
+--- checks the CONFLICT LOGIC over it. A `bef`-maximal setter of a field (none
+--- strictly after it) is a current head for that field:
+---   * one head, or several AGREEING heads -> the field converges (`val`);
+---   * two heads DISAGREE (different values) -> `conflict` (no converged
+---     value; the issue is not ready);
+---   * heads on DIFFERENT fields            -> both converge, no false conflict.
+--- `resolve(rid, F, V)` appends an event AFTER both conflicting heads (they
+--- become its ancestors), so it is the unique head -> conflict clears.
+mod TRACKER-MERGE is
+  protecting BOOL .
+
+  sorts EvId Field Val Cfg Sys .
+
+  ops f1 f2 : -> Field [ctor] .            --- two fields (e.g. status, priority)
+  ops v1 v2 : -> Val [ctor] .              --- two values
+  ops e0 e1 e2 er : -> EvId [ctor] .       --- content-hash event ids
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op ev : EvId Field Val -> Cfg [ctor] .   --- accepted event: field := value
+  op bef : EvId EvId -> Cfg [ctor] .        --- strict ancestor order (closed)
+  op val : Field Val -> Cfg [ctor] .        --- derived: field's converged value
+  op conflict : Field -> Cfg [ctor] .       --- derived: field is conflicted
+
+  --- The whole log lives inside `t(_)`, so fold rules see the entire soup.
+  op t : Cfg -> Sys [ctor] .
+
+  vars E E2 : EvId .
+  var F : Field .
+  vars V V2 : Val .
+  vars C C2 : Cfg .
+
+  --- E is superseded for F: some F-setter is strictly after it (E is not a head
+  --- for F). A single existential match over the whole soup.
+  op superseded : EvId Field Cfg -> Bool .
+  eq superseded(E, F, (ev(E2, F, V2) bef(E, E2) C)) = true .
+  eq superseded(E, F, C) = false [owise] .
+
+  --- Does a head of F disagree with value V? Recurses over the candidate-events
+  --- arg, checking maximality against the FIXED full-soup arg.
+  op disagreeingHead : EvId Field Val Cfg Cfg -> Bool .
+  eq disagreeingHead(E, F, V, (ev(E2, F, V2) C), C2) =
+     if (E2 =/= E) and (V2 =/= V) and (superseded(E2, F, C2) == false)
+     then true
+     else disagreeingHead(E, F, V, C, C2) fi .
+  eq disagreeingHead(E, F, V, C, C2) = false [owise] .
+
+  op hasConflict : Field Cfg -> Bool .
+  eq hasConflict(F, (conflict(F) C)) = true .
+  eq hasConflict(F, C) = false [owise] .
+
+  op hasVal : Field Val Cfg -> Bool .
+  eq hasVal(F, V, (val(F, V) C)) = true .
+  eq hasVal(F, V, C) = false [owise] .
+
+  --- Conflict: two DISTINCT heads of F carry DIFFERENT values.
+  crl [conflict] : t(ev(E, F, V) ev(E2, F, V2) C)
+      => t(conflict(F) ev(E, F, V) ev(E2, F, V2) C)
+    if E =/= E2 /\ V =/= V2
+    /\ superseded(E, F, (ev(E, F, V) ev(E2, F, V2) C)) = false
+    /\ superseded(E2, F, (ev(E, F, V) ev(E2, F, V2) C)) = false
+    /\ hasConflict(F, C) = false .
+
+  --- Value: a head of F with NO disagreeing head converges the field. Agreeing
+  --- concurrent heads collapse to one `val` (idempotent via hasVal).
+  crl [value] : t(ev(E, F, V) C)
+      => t(val(F, V) ev(E, F, V) C)
+    if superseded(E, F, (ev(E, F, V) C)) = false
+    /\ disagreeingHead(E, F, V, (ev(E, F, V) C), (ev(E, F, V) C)) = false
+    /\ hasVal(F, V, C) = false .
+endm
+
+--- Negative fixture (bite): a SLOPPY fold that resolves a fork by keeping ONE
+--- head's value and NEVER flags a conflict -- exactly the "silently pick one
+--- concurrent scalar write" the ADR forbids. The conflict-soundness search
+--- proves this hides a real divergence (a value with no conflict despite two
+--- disagreeing heads), which the good fold makes unreachable.
+mod TRACKER-MERGE-TIEBREAK is
+  protecting BOOL .
+
+  sorts EvId Field Val Cfg Sys .
+  ops f1 f2 : -> Field [ctor] .
+  ops v1 v2 : -> Val [ctor] .
+  ops e0 e1 e2 er : -> EvId [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op ev : EvId Field Val -> Cfg [ctor] .
+  op bef : EvId EvId -> Cfg [ctor] .
+  op val : Field Val -> Cfg [ctor] .
+  op conflict : Field -> Cfg [ctor] .
+  op t : Cfg -> Sys [ctor] .
+
+  vars E E2 : EvId .
+  var F : Field .
+  vars V V2 : Val .
+  var C : Cfg .
+
+  op hasVal : Field Val Cfg -> Bool .
+  eq hasVal(F, V, (val(F, V) C)) = true .
+  eq hasVal(F, V, C) = false [owise] .
+
+  --- Bad fold: whenever two setters of F exist, keep ONE value (no ancestry, no
+  --- conflict). Reaches a val with no conflict even when the fork is real.
+  crl [tiebreak] : t(ev(E, F, V) ev(E2, F, V2) C)
+      => t(val(F, V) ev(E, F, V) ev(E2, F, V2) C)
+    if E =/= E2 /\ hasVal(F, V, C) = false .
+endm

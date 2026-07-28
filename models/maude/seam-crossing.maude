@@ -1,0 +1,48 @@
+--- The store-seam crossing, per the untie-substrate readiness tracker
+--- Phase 5 and spec/store-seam-contract-draft.md: two stores (the policy
+--- authority's admission log and whip's event log), three disciplines.
+--- A side-effect crosses the seam only as an ADMITTED command, and a
+--- crossing is IDEMPOTENT: the admission log may re-deliver (crash,
+--- retry, at-least-once transport), but each admitted command folds into
+--- whip's log exactly once, keyed by its command id.
+---
+--- Two crossers over one seam. The NAIVE crosser applies whatever
+--- arrives: a re-delivered command applies twice (duplicate facts -- the
+--- modeled hazard) and an UNADMITTED command crosses on arrival (the
+--- authority bypass). The SOUND crosser requires admission and dedupes
+--- by command id: exactly-once folding over at-least-once delivery.
+mod WHIPPLESCRIPT-SEAM-CROSSING is
+  sorts Cid Cfg .
+
+  ops c1 c2 : -> Cid [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op admitted : Cid -> Cfg [ctor] .   --- the authority's admission record
+  op deliver : Cid -> Cfg [ctor] .    --- one arrival at the seam (may repeat)
+  op crossed : Cid -> Cfg [ctor] .    --- dedup key: this command has folded
+  op fact : Cid -> Cfg [ctor] .       --- the fold's effect in whip's log
+  op naive : -> Cfg [ctor] .          --- selects the naive crosser
+  op sound : -> Cfg [ctor] .          --- selects the sound crosser
+
+  var C : Cid .
+
+  --- The naive crosser: applies every arrival, admitted or not.
+  rl [naive-cross] :
+      naive deliver(C)
+      => naive fact(C) .
+
+  --- The sound crosser, first arrival: admission is required, and the
+  --- pending admission CONVERTS to the recorded crossing (one admission,
+  --- one fold -- the dedup key is the command id). The fact lands once.
+  rl [sound-cross] :
+      sound deliver(C) admitted(C)
+      => sound crossed(C) fact(C) .
+
+  --- The sound crosser, re-delivery: the recorded crossing absorbs the
+  --- duplicate arrival. Nothing folds twice.
+  rl [sound-dedup] :
+      sound deliver(C) crossed(C)
+      => sound crossed(C) .
+endm

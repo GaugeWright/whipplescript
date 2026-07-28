@@ -11,26 +11,36 @@ readme.workspace = true
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
 chrono-tz = "0.10.4"
-whipplescript-core = { version = "0.4.0", path = "../whipplescript-core" }
-whipplescript-parser = { version = "0.4.0", path = "../whipplescript-parser" }
-whipplescript-store = { version = "0.4.0", path = "../whipplescript-store", default-features = false }
+whipplescript-core = { version = "0.3.1", path = "../whipplescript-core" }
+whipplescript-parser = { version = "0.3.1", path = "../whipplescript-parser" }
+whipplescript-store = { version = "0.3.1", path = "../whipplescript-store", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pure-Rust, wasm-clean: script-pin verification + delta-kernel content keys
 # for the exec-over-HTTP path (compute plane P8).
 sha2 = "0.10"
+# Placement-neutral governed bash. Default features are disabled so the kernel
+# does not acquire Bashkit's separate LLM-tool wrapper; WhippleScript owns the
+# model-facing contract through `WhipShell`.
+bashkit = { version = "=0.13.0", default-features = false, features = ["jq"] }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["rt", "time"] }
 
 [features]
 # `native` pulls in the rusqlite-backed store (whipplescript-store/native); the
 # kernel itself is store-backend-agnostic (RuntimeKernel<S: RuntimeStore>), so a
 # wasm consumer builds with `--no-default-features` to drop rusqlite (DR-0033
-# Phase 5). The delegating provider adapters are optional (DR-0024): the owned
-# brokered harness is the built-in path; Codex/Claude stdio sidecars are opt-in
-# and native-only. Default-on preserves current behavior.
-default = ["native", "codex", "claude"]
+# Phase 5). Provider adapters are optional and EXTERNAL (DR-0024 provider-crate
+# split): the owned brokered harness is the built-in path; Codex and Claude now
+# live in the whipplescript-provider-codex / -claude crates (kernel-independent).
+# The kernel has zero compile-time knowledge of any external provider.
+default = ["native"]
 native = ["whipplescript-store/native"]
-codex = []
-claude = []
+# Exposes deterministic legacy-envelope construction only to downstream test
+# targets. Production embeddings must use an external governance signature.
+test-support = []
 
 [lib]
 path = "src/lib.rs"

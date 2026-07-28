@@ -1,0 +1,35 @@
+load ../seam-crossing.maude
+
+--- Hazard demonstrated: the naive crosser folds a re-delivered command
+--- twice -- duplicate facts in whip's log from one admitted decision.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  naive admitted(c1) deliver(c1) deliver(c1)
+  =>* fact(c1) fact(c1) RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive crosser folds an UNADMITTED command --
+--- the authority bypass.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  naive deliver(c2)
+  =>* fact(c2) RESIDUAL:Cfg .
+
+--- Bite: under the sound crosser, at-least-once delivery folds exactly
+--- once -- two facts for one command are unreachable.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  sound admitted(c1) deliver(c1) deliver(c1)
+  =>* fact(c1) fact(c1) RESIDUAL:Cfg .
+
+--- Bite: an unadmitted command never crosses.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  sound deliver(c2)
+  =>* fact(c2) RESIDUAL:Cfg .
+
+--- Coverage: an admitted command crosses, and the duplicate arrival is
+--- absorbed by the recorded crossing.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  sound admitted(c1) deliver(c1) deliver(c1)
+  =>* fact(c1) crossed(c1) RESIDUAL:Cfg .
+
+--- Coverage: distinct admitted commands each fold once.
+search [1] in WHIPPLESCRIPT-SEAM-CROSSING :
+  sound admitted(c1) admitted(c2) deliver(c1) deliver(c2)
+  =>* fact(c1) fact(c2) RESIDUAL:Cfg .

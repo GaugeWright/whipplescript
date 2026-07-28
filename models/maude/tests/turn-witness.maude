@@ -1,0 +1,43 @@
+load ../turn-witness.maude
+
+--- The corruption pattern throughout: a receipt claiming "the complete
+--- delta is K writes" while the workspace actually moved N > K times --
+--- an advancement gate auto-merging work the witness never saw.
+
+--- Hazard demonstrated: the naive finisher claims the mediated write as
+--- the whole cut even though a native command also mutated the disk.
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open naiveFin w cmd clean disk(z) seen(z)
+  =>* cut(K:Cnt) disk(N:Cnt) RESIDUAL:Cfg
+  such that lt(K:Cnt, N:Cnt) .
+
+--- Bite: the sound finisher never under-reports -- once the command
+--- taints the turn it declines, and a cut claimed before the command ran
+--- is impossible because the finish closes the turn.
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open fin w cmd clean disk(z) seen(z)
+  =>* cut(K:Cnt) disk(N:Cnt) RESIDUAL:Cfg
+  such that lt(K:Cnt, N:Cnt) .
+
+--- Bite: claiming and declining are mutually exclusive -- one receipt,
+--- one honest answer.
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open fin w cmd clean disk(z) seen(z)
+  =>* cut(K:Cnt) declined RESIDUAL:Cfg .
+
+--- Coverage: a clean turn's claimed cut is the complete delta.
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open fin w w clean disk(z) seen(z)
+  =>* cut(s(s(z))) disk(s(s(z))) RESIDUAL:Cfg .
+
+--- Coverage: a tainted turn declines honestly (the receipt says
+--- "unwitnessed", not "no changes").
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open fin w cmd clean disk(z) seen(z)
+  =>* declined RESIDUAL:Cfg .
+
+--- Coverage: a clean turn with NO writes claims the explicitly-empty
+--- cut -- distinguishable from declining.
+search [1] in WHIPPLESCRIPT-TURN-WITNESS :
+  open fin clean disk(z) seen(z)
+  =>* cut(z) RESIDUAL:Cfg .

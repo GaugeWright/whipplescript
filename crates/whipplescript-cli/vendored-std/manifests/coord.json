@@ -1,0 +1,226 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.coord",
+  "name": "std.coord",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.coord",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "lease.acquire",
+          "effect_kind": "lease.acquire",
+          "source_forms": ["acquire"],
+          "input_schema": "lease.acquire.input",
+          "output_schema": "LeaseAcquireOutcome",
+          "required_capabilities": ["lease.acquire"],
+          "provider_kinds": ["builtin-coordination"],
+          "projected_facts": ["effect.output"],
+          "validation": "none"
+        },
+        {
+          "id": "lease.release",
+          "effect_kind": "lease.release",
+          "source_forms": ["release"],
+          "input_schema": "lease.release.input",
+          "required_capabilities": ["lease.release"],
+          "provider_kinds": ["builtin-coordination"],
+          "validation": "none"
+        },
+        {
+          "id": "ledger.append",
+          "effect_kind": "ledger.append",
+          "source_forms": ["append"],
+          "input_schema": "ledger.append.input",
+          "required_capabilities": ["ledger.append"],
+          "provider_kinds": ["builtin-coordination"],
+          "validation": "none"
+        },
+        {
+          "id": "counter.consume",
+          "effect_kind": "counter.consume",
+          "source_forms": ["consume"],
+          "input_schema": "counter.consume.input",
+          "output_schema": "CounterConsumeOutcome",
+          "required_capabilities": ["counter.consume"],
+          "provider_kinds": ["builtin-coordination"],
+          "projected_facts": ["effect.output"],
+          "validation": "none"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "coord.lease",
+          "construct_family": "declaration_block",
+          "keyword": "lease",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "coord.ledger",
+          "construct_family": "declaration_block",
+          "keyword": "ledger",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "coord.counter",
+          "construct_family": "declaration_block",
+          "keyword": "counter",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "lease.acquire",
+          "construct_family": "effect_operation",
+          "keyword": "acquire",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle", "type": "LeaseAcquireOutcome" }],
+          "lowering_target": "resource_effect"
+        },
+        {
+          "id": "lease.release",
+          "construct_family": "effect_operation",
+          "keyword": "release",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "resource_effect"
+        },
+        {
+          "id": "ledger.append",
+          "construct_family": "effect_operation",
+          "keyword": "append",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "resource_effect"
+        },
+        {
+          "id": "counter.consume",
+          "construct_family": "effect_operation",
+          "keyword": "consume",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Resource" }],
+          "provides": [{ "kind": "EffectHandle", "type": "CounterConsumeOutcome" }],
+          "lowering_target": "resource_effect"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "lease.acquire",
+      "description": "Atomically attempt to reserve a slot on a declared lease (held / contended)."
+    },
+    {
+      "id": "lease.release",
+      "description": "Release a lease slot held by an acquire in the same progression."
+    },
+    {
+      "id": "lease.renew",
+      "description": "Extend a held lease's TTL before it expires (renew names its acquire binding)."
+    },
+    {
+      "id": "ledger.append",
+      "description": "Append an entry to a declared append-only, partitioned, retention-pruned ledger."
+    },
+    {
+      "id": "counter.consume",
+      "description": "Atomically consume from a capped, periodically-reset counter (ok / over)."
+    }
+  ],
+  "providers": [
+    {
+      "id": "builtin-coordination-lease-acquire",
+      "provider_kind": "builtin-coordination",
+      "capability": "lease.acquire",
+      "effect_kind": "lease.acquire",
+      "config": {}
+    },
+    {
+      "id": "builtin-coordination-lease-release",
+      "provider_kind": "builtin-coordination",
+      "capability": "lease.release",
+      "effect_kind": "lease.release",
+      "config": {}
+    },
+    {
+      "id": "builtin-coordination-lease-renew",
+      "provider_kind": "builtin-coordination",
+      "capability": "lease.renew",
+      "effect_kind": "lease.renew",
+      "config": {}
+    },
+    {
+      "id": "builtin-coordination-ledger-append",
+      "provider_kind": "builtin-coordination",
+      "capability": "ledger.append",
+      "effect_kind": "ledger.append",
+      "config": {}
+    },
+    {
+      "id": "builtin-coordination-counter-consume",
+      "provider_kind": "builtin-coordination",
+      "capability": "counter.consume",
+      "effect_kind": "counter.consume",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-coordination-user",
+      "name": "coordination-user",
+      "description": "Allow the workspace-scoped coordination effects (lease / ledger / counter).",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": [
+        "lease.acquire",
+        "lease.release",
+        "lease.renew",
+        "ledger.append",
+        "counter.consume"
+      ],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-coord-lease-acquire",
+      "program_id": null,
+      "capability": "lease.acquire",
+      "provider": "builtin-coordination",
+      "config": {}
+    },
+    {
+      "id": "binding-coord-lease-release",
+      "program_id": null,
+      "capability": "lease.release",
+      "provider": "builtin-coordination",
+      "config": {}
+    },
+    {
+      "id": "binding-coord-lease-renew",
+      "program_id": null,
+      "capability": "lease.renew",
+      "provider": "builtin-coordination",
+      "config": {}
+    },
+    {
+      "id": "binding-coord-ledger-append",
+      "program_id": null,
+      "capability": "ledger.append",
+      "provider": "builtin-coordination",
+      "config": {}
+    },
+    {
+      "id": "binding-coord-counter-consume",
+      "program_id": null,
+      "capability": "counter.consume",
+      "provider": "builtin-coordination",
+      "config": {}
+    }
+  ]
+}

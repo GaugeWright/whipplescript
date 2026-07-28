@@ -1,0 +1,136 @@
+--- Information-flow control, BOTH lattices composed, PARTY-RELATIVE. The capstone
+--- upgraded to the decentralized / asymmetric-delegation model (DR-0027 I-IFC1).
+--- Combines the party-relative integrity and confidentiality models over ONE
+--- dataflow graph, with the agent turn an explicit JOIN NODE.
+---
+--- Integrity: a control sink requires authority R; influence by W is acceptable
+--- iff W acts-for R. Confidentiality: an owner o's secret has reader-authority r;
+--- a sink audience p may read iff p acts-for r. acts-for is the reflexive-
+--- transitive closure of the delegation context theta, computed by canAct.
+---
+--- The escape hatches are AXIS-LOCKED: endorse raises integrity but PRESERVES
+--- secrecy; declassify releases confidentiality but PRESERVES integrity. The
+--- fact-base write record is DUAL-GATED: it injects on integrity and leaks on
+--- confidentiality. Every endorse / declassify emits an audit fact, so the audit
+--- set is the trusted surface.
+---
+--- Grounding: the bank-plus-email assistant. msg is an untrusted email at
+--- stranger integrity; ledger is the bank read, owned by ledgerOwn and readable
+--- by operator; the agent ag mixes them into draft, which carries BOTH stranger
+--- integrity and ledgerOwn secrecy.
+mod WHIPPLESCRIPT-INFOFLOW-COMPOSITION is
+  protecting BOOL .
+  sorts Prin PSet Edge Rel Binding Agent Cfg .
+  subsort Prin < PSet .
+  subsort Edge < Rel .
+
+  ops operator requester stranger ledgerOwn : -> Prin [ctor] .
+  ops msg ledger draft bill conf extra : -> Binding [ctor] .
+  op ag : -> Agent [ctor] .
+
+  op noP : -> PSet [ctor] .
+  op _,_ : PSet PSet -> PSet [ctor assoc comm id: noP] .
+  eq P:Prin , P:Prin = P:Prin .
+
+  op _>_ : Prin Prin -> Edge [ctor] .
+  op emptyR : -> Rel [ctor] .
+  op _|_ : Rel Rel -> Rel [ctor assoc comm id: emptyR] .
+  eq E:Edge | E:Edge = E:Edge .
+
+  op inSet : Prin PSet -> Bool .
+  eq inSet(P:Prin, (P:Prin , S:PSet)) = true .
+  eq inSet(P:Prin, S:PSet) = false [owise] .
+
+  op succs : Prin Rel -> PSet .
+  eq succs(P:Prin, (P:Prin > Q:Prin) | R:Rel) = Q:Prin , succs(P:Prin, R:Rel) .
+  eq succs(P:Prin, R:Rel) = noP [owise] .
+
+  op canAct : Rel Prin Prin -> Bool .
+  op reach : Rel PSet Prin PSet -> Bool .
+  eq canAct(R:Rel, W:Prin, T:Prin) = reach(R:Rel, W:Prin, T:Prin, noP) .
+  eq reach(R:Rel, (T:Prin , F:PSet), T:Prin, V:PSet) = true .
+  eq reach(R:Rel, noP, T:Prin, V:PSet) = false .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, F:PSet, T:Prin, V:PSet)
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) .
+  ceq reach(R:Rel, (P:Prin , F:PSet), T:Prin, V:PSet)
+    = reach(R:Rel, (F:PSet , succs(P:Prin, R:Rel)), T:Prin, (P:Prin , V:PSet))
+    if P:Prin =/= T:Prin /\ inSet(P:Prin, V:PSet) =/= true .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op deleg : Rel -> Cfg [ctor] .
+  op intSource : Binding Prin -> Cfg [ctor] .
+  op secretSource : Binding Prin -> Cfg [ctor] .
+  op readAuth : Prin Prin -> Cfg [ctor] .            --- owner o readable by acts-for r
+  op flow : Binding Binding -> Cfg [ctor] .
+  op agentIn : Agent Binding -> Cfg [ctor] .
+  op agentOut : Agent Binding -> Cfg [ctor] .
+  op endorse : Binding Binding Prin -> Cfg [ctor] .  --- raise integrity to R, keep secrecy
+  op declassify : Binding Binding Prin -> Cfg [ctor] . --- release owner O, keep integrity
+  op controlSink : Binding Prin -> Cfg [ctor] .      --- requires authority R (integrity)
+  op egressSink : Binding Prin -> Cfg [ctor] .       --- audience party P (confidentiality)
+  op recordSink : Binding Prin Prin -> Cfg [ctor] .  --- dual: needs integrity R, fact audience P
+  op dataSink : Binding -> Cfg [ctor] .
+  op influencedBy : Binding Prin -> Cfg [ctor] .
+  op secretOf : Binding Prin -> Cfg [ctor] .
+  op endorsedAt : Binding Binding Prin -> Cfg [ctor] .     --- audit, integrity upgrade
+  op declassifiedAt : Binding Binding Prin -> Cfg [ctor] . --- audit, confidentiality release
+  op injection : -> Cfg [ctor] .
+  op leak : -> Cfg [ctor] .
+
+  vars B B1 B2 : Binding .  var A : Agent .
+  vars W R O P : Prin .  var REL : Rel .
+
+  eq influencedBy(B, W) influencedBy(B, W) = influencedBy(B, W) .
+  eq secretOf(B, O) secretOf(B, O) = secretOf(B, O) .
+  eq endorsedAt(B1, B2, R) endorsedAt(B1, B2, R) = endorsedAt(B1, B2, R) .
+  eq declassifiedAt(B1, B2, O) declassifiedAt(B1, B2, O) = declassifiedAt(B1, B2, O) .
+  eq injection injection = injection .
+  eq leak leak = leak .
+
+  --- seed both axes
+  rl [seed-i] : intSource(B, W) => intSource(B, W) influencedBy(B, W) .
+  rl [seed-c] : secretSource(B, O) => secretSource(B, O) secretOf(B, O) .
+
+  --- both propagate along flow
+  rl [prop-i] : influencedBy(B1, W) flow(B1, B2) => influencedBy(B1, W) flow(B1, B2) influencedBy(B2, W) .
+  rl [prop-c] : secretOf(B1, O) flow(B1, B2) => secretOf(B1, O) flow(B1, B2) secretOf(B2, O) .
+
+  --- the agent join node: both axes flow from every input to the output
+  rl [agent-i] : influencedBy(B1, W) agentIn(A, B1) agentOut(A, B2)
+    => influencedBy(B1, W) agentIn(A, B1) agentOut(A, B2) influencedBy(B2, W) .
+  rl [agent-c] : secretOf(B1, O) agentIn(A, B1) agentOut(A, B2)
+    => secretOf(B1, O) agentIn(A, B1) agentOut(A, B2) secretOf(B2, O) .
+
+  --- endorse raises integrity to R and PRESERVES secrecy; emits audit
+  rl [endorse-seed] : endorse(B1, B2, R) => endorse(B1, B2, R) influencedBy(B2, R) endorsedAt(B1, B2, R) .
+  rl [endorse-carry-c] : secretOf(B1, O) endorse(B1, B2, R)
+    => secretOf(B1, O) endorse(B1, B2, R) secretOf(B2, O) .
+
+  --- declassify releases confidentiality (B2 carries no secret) and PRESERVES
+  --- integrity; emits audit
+  rl [declassify-seed] : declassify(B1, B2, O) => declassify(B1, B2, O) declassifiedAt(B1, B2, O) .
+  rl [declassify-carry-i] : influencedBy(B1, W) declassify(B1, B2, O)
+    => influencedBy(B1, W) declassify(B1, B2, O) influencedBy(B2, W) .
+
+  --- integrity violation: influencer W not acting-for the required authority R
+  crl [inject] : influencedBy(B, W) controlSink(B, R) deleg(REL)
+    => influencedBy(B, W) controlSink(B, R) deleg(REL) injection
+    if canAct(REL, W, R) =/= true .
+
+  --- confidentiality violation: owner-secret reaching audience P who cannot read it
+  crl [exfil] : secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R)
+    => secretOf(B, O) egressSink(B, P) deleg(REL) readAuth(O, R) leak
+    if canAct(REL, P, R) =/= true .
+
+  --- record is dual-gated: integrity on the influencer, confidentiality on the
+  --- fact audience
+  crl [record-inject] : influencedBy(B, W) recordSink(B, R, P) deleg(REL)
+    => influencedBy(B, W) recordSink(B, R, P) deleg(REL) injection
+    if canAct(REL, W, R) =/= true .
+  crl [record-exfil] : secretOf(B, O) recordSink(B, R, P) deleg(REL) readAuth(O, R2:Prin)
+    => secretOf(B, O) recordSink(B, R, P) deleg(REL) readAuth(O, R2:Prin) leak
+    if canAct(REL, P, R2:Prin) =/= true .
+endm

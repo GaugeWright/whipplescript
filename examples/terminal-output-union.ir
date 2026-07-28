@@ -1,6 +1,8 @@
 workflow TerminalOutputUnion
 source_tags
 @service workflow TerminalOutputUnion
+uses
+  package std.coercion
 schemas
   class WorkItem
     title string
@@ -21,16 +23,16 @@ rules
     writes
       schema:TerminalRoute
     effects
-      classification kind=schema.coerce binding=classification key=3a637785dc84fa12
+      classification kind=schema.coerce binding=classification key=104f45c477e9fd48ce4d802c2541c179
     terminal_outputs
-      classification span=557..576
-        Completed payload=ref<Classification> span=557..576
-        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=557..576
-        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=557..576
-        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=557..576
+      classification span=575..594
+        Completed payload=ref<Classification> span=575..594
+        Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=575..594
+        TimedOut payload=object<{summary string, effect_id string, run_id string}> span=575..594
+        Cancelled payload=object<{summary string, effect_id string, run_id string}> span=575..594
     terminal_branches
-      case classification Completed binding=result guard=- body_hash=68cc197fa99f85c2 span=557..576
-      case classification Failed binding=failure guard=- body_hash=2380b8f08533fbed span=698..715
-      case classification TimedOut binding=timeout guard=- body_hash=41b33e02ef29fa29 span=834..853
-      case classification Cancelled binding=cancel guard=- body_hash=52481a247ffe13d7 span=976..995
-    body_hash aea55cbe2812a73e
+      case classification Completed binding=result guard=- body_hash=2dbfa43d23d498d62cc717fb1af91c96 span=575..594
+      case classification Failed binding=failure guard=- body_hash=4b0ebf17545561b1b967fd0cef32a705 span=716..733
+      case classification TimedOut binding=timeout guard=- body_hash=6efd7d079729f26b830c1d681dbe3264 span=852..871
+      case classification Cancelled binding=cancel guard=- body_hash=3353cbabc3861a36efb7f47cbacc508c span=994..1013
+    body_hash 55196a5bf82860483faccd7b5e004f11

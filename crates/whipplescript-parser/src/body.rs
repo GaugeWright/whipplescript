@@ -91,20 +91,17 @@ pub struct BodyAst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BodyStmt {
     Record(RecordStmt),
-    /// `done x` / `done x -> record ...`; `consume` sets `deprecated_consume`.
+    /// `done x` / `done x -> record ...` — marks a fact terminal, optionally
+    /// replacing it with a record.
     Done {
         binding: String,
         replacement: Option<RecordStmt>,
-        deprecated_consume: bool,
         span: SourceSpan,
     },
     Effect(EffectStmt),
     After(AfterBlock),
+    Region(RegionBlock),
     Case(CaseBlock),
-    /// Flow-only deterministic branch: `when <expr> { ... } [else { ... }]`.
-    Branch(BranchBlock),
-    /// Flow-only failure handler attached to the preceding effect step.
-    Handler(HandlerBlock),
     Terminal(TerminalStmt),
     Cancel {
         binding: String,
@@ -226,9 +223,6 @@ pub enum BodyEffectKind {
         /// without passing through a bounded type. Authorization lives in governance.
         declassified: bool,
     },
-    AskHuman {
-        choices: Vec<String>,
-    },
     /// Bare free-text model prompt: `prompt "<text>" [using <provider>] as x`.
     /// It lowers through the same model/backend path as `coerce`, but its
     /// completed value is a plain string.
@@ -274,6 +268,10 @@ pub enum BodyEffectKind {
     },
     TrackerClaim {
         item: String,
+        /// `ttl <duration>`: the claim-TTL, in seconds. `Some(n)` records a
+        /// timed lease (`expires_at = now + n`) that `ready`/`claim` reclaim
+        /// once past-due; `None` is the untimed backstop lease (T3).
+        ttl_seconds: Option<u64>,
     },
     TrackerRelease {
         item: String,
@@ -320,6 +318,10 @@ pub enum BodyEffectKind {
     Notify {
         target_expr: String,
         event: String,
+        /// S6: `emit signal <name> to <target> from <binding> { overrides }` —
+        /// copy the source binding's same-named fields (bounded to the signal's
+        /// declared fields), with the block overriding; mirrors `record … from`.
+        from: Option<String>,
         fields: Vec<FieldAssign>,
     },
     /// `read <format> from <store> at <path> as <binding>` (std.files): a typed
@@ -466,6 +468,31 @@ pub struct Prompt {
     pub content_type: Option<String>,
 }
 
+/// DR-0043 Decision 5: a `during <cond> { … } on lapse [as x] { … }` region
+/// (`until <cond>` is the negated polarity). The region's steps commit only
+/// while the condition holds — checked atomically inside each advancing
+/// commit — and the first advancing commit under a broken condition commits
+/// the lapse arm instead, exactly once. Statements after the region are the
+/// point of no return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegionBlock {
+    /// `until` negates: the region runs while the condition is FALSE and
+    /// lapses when it becomes true.
+    pub until: bool,
+    /// The condition's raw expression text (guard grammar; pure queries).
+    pub condition: String,
+    pub body: Vec<BodyStmt>,
+    /// `on lapse as <binding>`: the synthesized optional progress view.
+    pub lapse_binding: Option<String>,
+    pub lapse_body: Vec<BodyStmt>,
+    /// Source extent of the region BODY content (inside its braces), for the
+    /// compile-path variant splices.
+    pub body_span: SourceSpan,
+    /// Source extent of the lapse-arm content (inside its braces).
+    pub lapse_span: SourceSpan,
+    pub span: SourceSpan,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AfterBlock {
     pub binding: String,
@@ -478,6 +505,25 @@ pub struct AfterBlock {
     pub milestone: Option<String>,
     pub body: Vec<BodyStmt>,
     pub span: SourceSpan,
+}
+
+impl AfterPredicate {
+    /// The kernel text-scanner's spelling of this predicate (what
+    /// `after <binding> <predicate>` looks like in body text).
+    pub fn kernel_str(&self) -> &'static str {
+        match self {
+            AfterPredicate::Succeeds => "succeeds",
+            AfterPredicate::Fails => "fails",
+            AfterPredicate::Completes => "completes",
+            AfterPredicate::Cancelled => "cancelled",
+            AfterPredicate::TimedOut => "times out",
+            AfterPredicate::Reaches => "reaches",
+            AfterPredicate::Held => "held",
+            AfterPredicate::Contended => "contended",
+            AfterPredicate::Ok => "ok",
+            AfterPredicate::Over => "over",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,28 +587,6 @@ pub struct CaseBranch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BranchBlock {
-    pub condition_source: String,
-    pub condition: Expr,
-    pub then_body: Vec<BodyStmt>,
-    pub else_body: Option<Vec<BodyStmt>>,
-    pub span: SourceSpan,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HandlerBlock {
-    pub kind: HandlerKind,
-    pub body: Vec<BodyStmt>,
-    pub span: SourceSpan,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HandlerKind {
-    OnFails,
-    OnTimeout,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalStmt {
     pub kind: TerminalKind,
     pub name: String,
@@ -585,21 +609,6 @@ pub struct TerminalStmt {
 pub enum TerminalKind {
     Complete,
     Fail,
-    /// Generated-only (`flowfail`): the workflow auto-fails with a generic,
-    /// untyped reason (no `failure` contract / payload). Emitted by flow
-    /// expansion for an effect whose failure is unhandled in a self-terminating
-    /// flow (the 503 auto-fail trigger); never written by authors — rejected in
-    /// user rules by `validate_flowfail_generated_only`. Lowers to the kernel
-    /// `fail_instance_internal` terminal. Carries no name or fields.
-    FailInternal,
-}
-
-/// Whether flow-only statements (`when/else`, `on fails`, `on timeout`) are
-/// permitted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BodyMode {
-    Rule,
-    Flow,
 }
 
 /// A field assignment extracted from a record/payload body without braces.
@@ -624,7 +633,6 @@ pub fn split_field_assignments(source: &str) -> Vec<SplitFieldAssignment> {
         base: 0,
         tokens,
         pos: 0,
-        mode: BodyMode::Rule,
         diagnostics,
     };
     let mut assignments = Vec::new();
@@ -892,6 +900,33 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             i += 2;
             continue;
         }
+        if c == '#' || (c == '/' && bytes.get(i + 1) == Some(&b'/')) {
+            // Full-line `#` / `//` comments are legal in rule bodies (ruling
+            // 2026-07-21), matching the top-level lexer's two markers: a line
+            // whose first non-whitespace characters open a comment is skipped
+            // to its end. A comment after code on the same line falls through
+            // (trailing comments stay top-level-only; a mid-line `/` is the
+            // division operator).
+            let mut k = i;
+            let mut line_leading = true;
+            while k > 0 {
+                let prev = bytes[k - 1] as char;
+                if prev == '\n' {
+                    break;
+                }
+                if prev != ' ' && prev != '\t' {
+                    line_leading = false;
+                    break;
+                }
+                k -= 1;
+            }
+            if line_leading {
+                while i < bytes.len() && bytes[i] as char != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+        }
         match c {
             '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '+' | '-' | '*' | '/' | '<' | '>'
             | '!' | ':' | ';' => {
@@ -918,6 +953,38 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
         }
     }
     tokens
+}
+
+/// Blanks full-line `#` comments in rule-body TEXT, byte-preservingly: every
+/// byte of a comment line except its newline becomes a space, so all spans
+/// and offsets downstream still point at the original source. Raw-string
+/// (`"""`) interiors are untouched -- a markdown heading inside a prompt is
+/// content, not a comment. The compile path runs this once per rule body
+/// before action/`then` expansion, so the kernel and every line-based
+/// analysis see comment-free text, while `whip fmt` (which re-emits the raw
+/// body text) preserves the comments.
+pub fn blank_full_line_comments(text: &str) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.split_inclusive('\n') {
+        let (content, has_newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, true),
+            None => (line, false),
+        };
+        let lead = content.trim_start();
+        if !in_fence && (lead.starts_with('#') || lead.starts_with("//")) {
+            out.resize(out.len() + content.len(), b' ');
+        } else {
+            out.extend_from_slice(content.as_bytes());
+            if content.matches("\"\"\"").count() % 2 == 1 {
+                in_fence = !in_fence;
+            }
+        }
+        if has_newline {
+            out.push(b'\n');
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn dedent_prompt(raw: &str) -> String {
@@ -952,7 +1019,11 @@ fn dedent_prompt(raw: &str) -> String {
 // Parser
 // ---------------------------------------------------------------------------
 
-pub fn parse_rule_body(source: &str, base: usize, mode: BodyMode) -> (BodyAst, Vec<Diagnostic>) {
+/// Parses exactly ONE statement from the front of `source` (used by `then`
+/// expansion to consume the chained effect statement without parsing — and
+/// spuriously diagnosing — the remainder of the enclosing block). Returns the
+/// statement and only the diagnostics that single parse produced.
+pub fn parse_first_statement(source: &str, base: usize) -> (Option<BodyStmt>, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     let tokens = lex_body(source, base, &mut diagnostics);
     let mut parser = BodyParser {
@@ -960,7 +1031,20 @@ pub fn parse_rule_body(source: &str, base: usize, mode: BodyMode) -> (BodyAst, V
         base,
         tokens,
         pos: 0,
-        mode,
+        diagnostics,
+    };
+    let statement = parser.parse_statement();
+    (statement, parser.diagnostics)
+}
+
+pub fn parse_rule_body(source: &str, base: usize) -> (BodyAst, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
+    let tokens = lex_body(source, base, &mut diagnostics);
+    let mut parser = BodyParser {
+        source,
+        base,
+        tokens,
+        pos: 0,
         diagnostics,
     };
     let statements = parser.parse_statements(false);
@@ -972,7 +1056,6 @@ struct BodyParser<'a> {
     base: usize,
     tokens: Vec<Token>,
     pos: usize,
-    mode: BodyMode,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -1129,15 +1212,21 @@ impl<'a> BodyParser<'a> {
             Some(Tok::Ident(value)) => value,
             _ => {
                 let span = self.span_here();
+                let package_verbs = EFFECT_OPERATION_GRAMMAR
+                    .iter()
+                    .map(|spec| spec.keyword)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 self.error(
                     span,
                     "expected a rule body statement".to_owned(),
-                    Some(
-                        "statements start with record, done, tell, coerce, askHuman, claim, \
-                         release, finish, file, call, recall, invoke, emit, after, case, complete, \
-                         fail, timer, cancel, decide, prompt, or exec"
-                            .to_owned(),
-                    ),
+                    Some(format!(
+                        "statements start with record, done, consume, during, until, tell, \
+                         coerce, prompt, decide, call, invoke, read, write, import, export, \
+                         after, case, complete, fail, timer, cancel, exec, file, claim, \
+                         release, finish, acquire, renew, append, emit, redact, or a package \
+                         effect verb ({package_verbs})"
+                    )),
                 );
                 self.recover();
                 return None;
@@ -1151,13 +1240,15 @@ impl<'a> BodyParser<'a> {
         match keyword.as_str() {
             "record" => self.parse_record_statement().map(BodyStmt::Record),
             // `consume <counter> for <key> ...` is the counter verb
-            // (spec/coordination.md); bare `consume <binding>` stays the
-            // deprecated done-alias.
+            // (spec/coordination.md). The bare `consume <binding>` alias for
+            // `done` was removed after its deprecation window (shipped v0.2).
             "consume" if self.looks_like_counter_consume() => self.parse_counter_consume(),
-            "done" | "consume" => self.parse_done_statement(),
+            "consume" => self.removed_consume_alias(),
+            "done" => self.parse_done_statement(),
+            "during" => self.parse_region(false),
+            "until" => self.parse_region(true),
             "tell" => self.parse_tell(),
             "coerce" => self.parse_coerce_call(),
-            "askHuman" => self.parse_ask_human(),
             "prompt" => self.parse_prompt_effect(),
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
@@ -1169,7 +1260,6 @@ impl<'a> BodyParser<'a> {
             "after" => self.parse_after(),
             "case" => self.parse_case(),
             "complete" | "fail" => self.parse_terminal(),
-            "flowfail" => self.parse_flow_fail(),
             "timer" => self.parse_timer(),
             "cancel" => self.parse_cancel(),
             "exec" => self.parse_exec(),
@@ -1182,14 +1272,16 @@ impl<'a> BodyParser<'a> {
             "append" => self.parse_ledger_append(),
             "emit" => self.parse_emit_signal(),
             "redact" => self.parse_redact(),
-            "when" if self.mode == BodyMode::Flow => self.parse_branch(),
-            "on" if self.mode == BodyMode::Flow => self.parse_handler(),
             "when" | "on" => {
                 let span = self.span_here();
                 self.error(
                     span,
-                    format!("`{keyword}` blocks are only valid inside `flow` bodies"),
-                    Some("use a guarded rule, or move this into a flow".to_owned()),
+                    format!("`{keyword}` blocks are not rule body statements"),
+                    Some(
+                        "branch with `case`, guard the rule's `when` clause, or chain \
+                         effects with `then <binding> <- <effect>`"
+                            .to_owned(),
+                    ),
                 );
                 self.pos += 1;
                 self.recover();
@@ -1201,7 +1293,7 @@ impl<'a> BodyParser<'a> {
                     span,
                     format!("unknown rule body statement `{other}`"),
                     Some(
-                        "statements start with record, done, tell, coerce, askHuman, claim, \
+                        "statements start with record, done, tell, coerce, claim, \
                          release, finish, file, call, recall, invoke, emit, after, case, complete, \
                          fail, timer, cancel, decide, prompt, or exec"
                             .to_owned(),
@@ -1239,10 +1331,7 @@ impl<'a> BodyParser<'a> {
 
     fn parse_done_statement(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
-        let keyword = match self.advance()?.tok {
-            Tok::Ident(value) => value,
-            _ => return None,
-        };
+        self.pos += 1; // `done`
         let binding = self.ident_text("fact binding after `done`")?;
         let replacement = if matches!(self.peek().map(|t| &t.tok), Some(Tok::Arrow)) {
             self.pos += 1;
@@ -1259,9 +1348,28 @@ impl<'a> BodyParser<'a> {
         Some(BodyStmt::Done {
             binding,
             replacement,
-            deprecated_consume: keyword == "consume",
             span: self.span_from(start),
         })
+    }
+
+    /// The bare `consume <binding>` alias for `done` was removed after its
+    /// deprecation window (one release; shipped in v0.2). Emit a clear
+    /// diagnostic instead of the generic unknown-statement error. The live
+    /// counter verb `consume <counter> for ...` is dispatched ahead of this by
+    /// `looks_like_counter_consume`, so only the removed alias reaches here.
+    fn removed_consume_alias(&mut self) -> Option<BodyStmt> {
+        let span = self.span_here();
+        self.error(
+            span,
+            "`consume` was removed; use `done`",
+            Some("replace `consume` with `done`".to_owned()),
+        );
+        // Swallow the whole statement (binding and any `-> record { ... }`) so
+        // the removed alias yields ONE diagnostic, not a cascade from the
+        // leftover binding being re-scanned as an unknown statement.
+        self.pos += 1; // past `consume`
+        self.recover();
+        None
     }
 
     /// Parse `{ field value ... }`. Values are expressions; in `from` blocks a
@@ -1452,9 +1560,7 @@ impl<'a> BodyParser<'a> {
         binding: &mut Option<String>,
         requires: &mut Vec<String>,
         timeout_seconds: &mut Option<u64>,
-        choices: Option<&mut Vec<String>>,
     ) -> bool {
-        let mut choices = choices;
         loop {
             if self.consume_ident("as") {
                 match self.ident_text("binding name after `as`") {
@@ -1496,15 +1602,6 @@ impl<'a> BodyParser<'a> {
                     }
                 }
                 continue;
-            }
-            if let Some(target) = choices.as_deref_mut() {
-                if self.consume_ident("choices") {
-                    match self.parse_string_array() {
-                        Some(values) => *target = values,
-                        None => return false,
-                    }
-                    continue;
-                }
             }
             return true;
         }
@@ -1607,7 +1704,7 @@ impl<'a> BodyParser<'a> {
         mut skills: Option<&mut Vec<String>>,
     ) -> bool {
         loop {
-            if !self.parse_effect_modifiers(binding, requires, timeout_seconds, None) {
+            if !self.parse_effect_modifiers(binding, requires, timeout_seconds) {
                 return false;
             }
             if self.at_ident("with") {
@@ -1796,7 +1893,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         // optional trailing source-crossing markers (I-IFC3); must come last.
@@ -1826,40 +1923,6 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_ask_human(&mut self) -> Option<BodyStmt> {
-        let start = self.pos;
-        self.pos += 1; // askHuman
-        let mut binding = None;
-        let mut requires = Vec::new();
-        let mut timeout_seconds = None;
-        let mut choices = Vec::new();
-        if !self.parse_effect_modifiers(
-            &mut binding,
-            &mut requires,
-            &mut timeout_seconds,
-            Some(&mut choices),
-        ) {
-            return None;
-        }
-        let prompt = self.parse_prompt()?;
-        if !self.parse_effect_modifiers(
-            &mut binding,
-            &mut requires,
-            &mut timeout_seconds,
-            Some(&mut choices),
-        ) {
-            return None;
-        }
-        Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::AskHuman { choices },
-            binding,
-            requires,
-            timeout_seconds,
-            prompt: Some(prompt),
-            span: self.span_from(start),
-        }))
-    }
-
     fn parse_prompt_effect(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         self.pos += 1; // prompt
@@ -1872,7 +1935,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -1925,7 +1988,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -1961,7 +2024,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
@@ -2053,7 +2116,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         match spec.binding {
@@ -2138,7 +2201,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2264,7 +2327,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2334,7 +2397,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2460,7 +2523,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2572,8 +2635,7 @@ impl<'a> BodyParser<'a> {
             let mut binding = None;
             let mut requires = Vec::new();
             let mut timeout_seconds = None;
-            if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None)
-            {
+            if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
                 return None;
             }
             if binding.is_none() {
@@ -2620,7 +2682,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2796,7 +2858,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2864,7 +2926,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -2910,7 +2972,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
@@ -2983,7 +3045,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         if binding.is_none() {
@@ -3042,17 +3104,29 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         let target_expr = self.dotted_path_text("target instance after `to`")?;
-        let fields = self.parse_field_block(false)?;
+        // S6: optional `from <binding>` projection (the `record … from`
+        // precedent) — shorthand fields become allowed inside the block.
+        let from = if self.consume_ident("from") {
+            Some(self.ident_text("binding name after `from`")?)
+        } else {
+            None
+        };
+        let fields = if from.is_some() && !self.at_sym('{') {
+            Vec::new()
+        } else {
+            self.parse_field_block(from.is_some())?
+        };
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::Notify {
                 target_expr,
                 event,
+                from,
                 fields,
             },
             binding,
@@ -3193,7 +3267,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         match &parse_target {
@@ -3252,7 +3326,7 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
@@ -3274,19 +3348,46 @@ impl<'a> BodyParser<'a> {
             self.error(
                 span,
                 "`claim <issue> with ...` is not supported".to_owned(),
-                Some("declare a `tracker` and write `claim <issue> [as x]`".to_owned()),
+                Some("declare a `tracker` and write `claim <issue> [ttl <dur>] [as x]`".to_owned()),
             );
             self.pos += 1;
             let _ = self.advance();
         }
+        // `ttl <duration>`: the claim-TTL clause (spec/std-tracker.md, T3). It
+        // takes a duration value, e.g. `claim issue ttl 30m as c`.
+        let mut ttl_seconds = None;
+        if self.at_ident("ttl") {
+            self.pos += 1; // ttl
+            let span = self.span_here();
+            let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
+                self.error(
+                    span,
+                    "expected a duration after `ttl`".to_owned(),
+                    Some("use `<n><unit>` with unit s, m, h, or d, e.g. `ttl 30m`".to_owned()),
+                );
+                return None;
+            };
+            self.pos += 1;
+            match parse_short_duration_seconds(&value) {
+                Some(seconds) if seconds > 0 => ttl_seconds = Some(seconds),
+                _ => {
+                    self.error(
+                        span,
+                        format!("invalid ttl duration `{value}`"),
+                        Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
+                    );
+                    return None;
+                }
+            }
+        }
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds, None) {
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::TrackerClaim { item },
+            kind: BodyEffectKind::TrackerClaim { item, ttl_seconds },
             binding,
             requires,
             timeout_seconds,
@@ -3318,17 +3419,133 @@ impl<'a> BodyParser<'a> {
         } else {
             Vec::new()
         };
+        // `as <binding>` after the payload — required for `then x <- finish
+        // item { … }`, whose desugar re-serializes the finish with a synthetic
+        // handle and observes it with `after`.
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
         Some(BodyStmt::Effect(EffectStmt {
             kind: BodyEffectKind::TrackerFinish { item, fields },
-            binding: None,
-            requires: Vec::new(),
-            timeout_seconds: None,
+            binding,
+            requires,
+            timeout_seconds,
             prompt: None,
             span: self.span_from(start),
         }))
     }
 
     // -- blocks --------------------------------------------------------------
+
+    /// `during <cond> { … } on lapse [as x] { … }` / `until <cond> { … }`
+    /// (DR-0043 Decision 5). The arm is mandatory; the parser accepts the arm
+    /// on the region's closing line (`}} on lapse {{`) or on its own line —
+    /// tokens carry no line structure.
+    fn parse_region(&mut self, until: bool) -> Option<BodyStmt> {
+        let start = self.pos;
+        let keyword = if until { "until" } else { "during" };
+        self.pos += 1;
+        let cond_start = self.pos;
+        while self.pos < self.tokens.len() && !self.at_sym('{') {
+            self.pos += 1;
+        }
+        if !self.at_sym('{') {
+            let span = self.span_here();
+            self.error(
+                span,
+                format!("expected `{{` to open the `{keyword}` region"),
+                Some(format!(
+                    "write `{keyword} <condition> {{ … }} on lapse {{ … }}`"
+                )),
+            );
+            return None;
+        }
+        let condition = if self.pos > cond_start {
+            let from = self.tokens[cond_start].start;
+            let to = self.tokens[self.pos - 1].end;
+            self.source[from..to].trim().to_owned()
+        } else {
+            String::new()
+        };
+        if condition.is_empty() {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                format!("`{keyword}` requires a condition"),
+                Some("the condition is a pure query expression, like a guard".to_owned()),
+            );
+            return None;
+        }
+        let body_open = self.pos;
+        self.pos += 1; // {
+        let body_content_start = self
+            .tokens
+            .get(self.pos)
+            .map(|token| self.base + token.start)
+            .unwrap_or_else(|| self.base + self.tokens[body_open].end);
+        let body = self.parse_statements(true);
+        // parse_statements consumed the closing `}` (token before self.pos).
+        let body_content_end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| self.base + token.start)
+            .unwrap_or(body_content_start);
+        let body_span = SourceSpan {
+            start: body_content_start,
+            end: body_content_end,
+        };
+        if !(self.consume_ident("on") && self.consume_ident("lapse")) {
+            let span = self.span_here();
+            self.error(
+                span,
+                format!("a `{keyword}` region requires its `on lapse {{ … }}` arm"),
+                Some(
+                    "a reactive condition with no declared consequence would lapse silently; \
+                     write `on lapse { … }` (optionally `on lapse as <view> { … }`)"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        }
+        let lapse_binding = if self.consume_ident("as") {
+            Some(self.ident_text("progress-view binding after `as`")?)
+        } else {
+            None
+        };
+        if !self.consume_sym('{') {
+            let span = self.span_here();
+            self.error(span, "expected `{` to open the `on lapse` arm", None);
+            return None;
+        }
+        let lapse_open = self.pos - 1;
+        let lapse_content_start = self
+            .tokens
+            .get(self.pos)
+            .map(|token| self.base + token.start)
+            .unwrap_or_else(|| self.base + self.tokens[lapse_open].end);
+        let lapse_body = self.parse_statements(true);
+        let lapse_content_end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| self.base + token.start)
+            .unwrap_or(lapse_content_start);
+        Some(BodyStmt::Region(RegionBlock {
+            until,
+            condition,
+            body,
+            lapse_binding,
+            lapse_body,
+            body_span,
+            lapse_span: SourceSpan {
+                start: lapse_content_start,
+                end: lapse_content_end,
+            },
+            span: self.span_from(start),
+        }))
+    }
 
     fn parse_after(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
@@ -3520,71 +3737,6 @@ impl<'a> BodyParser<'a> {
         }))
     }
 
-    fn parse_branch(&mut self) -> Option<BodyStmt> {
-        let start = self.pos;
-        self.pos += 1; // when
-        let (condition_source, condition) = self.parse_value_expression()?;
-        if !self.consume_sym('{') {
-            let span = self.span_here();
-            self.error(span, "expected `{` to open the branch body", None);
-            return None;
-        }
-        let then_body = self.parse_statements(true);
-        let else_body = if self.consume_ident("else") {
-            if !self.consume_sym('{') {
-                let span = self.span_here();
-                self.error(span, "expected `{` after `else`", None);
-                return None;
-            }
-            Some(self.parse_statements(true))
-        } else {
-            None
-        };
-        Some(BodyStmt::Branch(BranchBlock {
-            condition_source,
-            condition,
-            then_body,
-            else_body,
-            span: self.span_from(start),
-        }))
-    }
-
-    fn parse_handler(&mut self) -> Option<BodyStmt> {
-        let start = self.pos;
-        self.pos += 1; // on
-        let kind = match self.advance().map(|t| t.tok) {
-            Some(Tok::Ident(word)) => match word.as_str() {
-                "fails" => HandlerKind::OnFails,
-                "timeout" => HandlerKind::OnTimeout,
-                other => {
-                    let span = self.span_from(start);
-                    self.error(
-                        span,
-                        format!("unknown handler `on {other}`"),
-                        Some("use `on fails` or `on timeout`".to_owned()),
-                    );
-                    return None;
-                }
-            },
-            _ => {
-                let span = self.span_here();
-                self.error(span, "expected `fails` or `timeout` after `on`", None);
-                return None;
-            }
-        };
-        if !self.consume_sym('{') {
-            let span = self.span_here();
-            self.error(span, "expected `{` to open the handler body", None);
-            return None;
-        }
-        let body = self.parse_statements(true);
-        Some(BodyStmt::Handler(HandlerBlock {
-            kind,
-            body,
-            span: self.span_from(start),
-        }))
-    }
-
     fn parse_terminal(&mut self) -> Option<BodyStmt> {
         let start = self.pos;
         let keyword = match self.advance()?.tok {
@@ -3624,28 +3776,13 @@ impl<'a> BodyParser<'a> {
             span: self.span_from(start),
         }))
     }
-
-    /// Generated-only `flowfail` (no name, no payload): the 503 auto-fail
-    /// terminal. Parses the bare keyword and produces a `FailInternal` terminal.
-    fn parse_flow_fail(&mut self) -> Option<BodyStmt> {
-        let start = self.pos;
-        self.advance()?; // consume `flowfail`
-        Some(BodyStmt::Terminal(TerminalStmt {
-            kind: TerminalKind::FailInternal,
-            name: String::new(),
-            from: None,
-            fields: Vec::new(),
-            scalar: None,
-            span: self.span_from(start),
-        }))
-    }
 }
 
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "record", "done", "consume", "tell", "coerce", "askHuman", "prompt", "claim", "release",
-    "renew", "finish", "file", "call", "recall", "send", "invoke", "read", "write", "import",
-    "export", "after", "case", "complete", "fail", "flowfail", "timer", "cancel", "decide", "exec",
-    "when", "on", "else", "redact",
+    "record", "done", "consume", "tell", "coerce", "prompt", "claim", "release", "renew", "finish",
+    "file", "call", "recall", "send", "invoke", "read", "write", "import", "export", "after",
+    "case", "complete", "fail", "timer", "cancel", "decide", "exec", "when", "on", "else", "then",
+    "redact",
 ];
 
 #[cfg(test)]
@@ -3653,9 +3790,41 @@ mod tests {
     use super::*;
 
     fn parse_ok(source: &str) -> BodyAst {
-        let (ast, diagnostics) = parse_rule_body(source, 0, BodyMode::Rule);
+        let (ast, diagnostics) = parse_rule_body(source, 0);
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
         ast
+    }
+
+    #[test]
+    fn full_line_comments_tokenize_as_nothing() {
+        let ast = parse_ok(
+            "# leading comment\nrecord Done {\n  note \"x\"\n}\n  # indented comment with braces { } and \"quotes\"\n// slash comments match the top-level lexer\ndone item\n",
+        );
+        assert_eq!(ast.statements.len(), 2, "comments contribute no statements");
+    }
+
+    #[test]
+    fn trailing_hash_still_errors() {
+        let (_, diagnostics) = parse_rule_body("done item # trailing\n", 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unexpected character `#`")),
+            "trailing comments stay illegal: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn blank_full_line_comments_is_byte_preserving_and_fence_aware() {
+        let text = "  # a comment\n  tell a as t \"\"\"markdown\n  # heading is content\n  \"\"\"\n  # after fence\n";
+        let blanked = blank_full_line_comments(text);
+        assert_eq!(blanked.len(), text.len(), "byte length preserved");
+        assert!(!blanked.contains("# a comment"));
+        assert!(!blanked.contains("# after fence"));
+        assert!(
+            blanked.contains("# heading is content"),
+            "fence interior untouched: {blanked}"
+        );
     }
 
     #[test]
@@ -3715,8 +3884,7 @@ mod tests {
 
     #[test]
     fn rejects_redact_keeping_nothing() {
-        let (_, diagnostics) =
-            parse_rule_body("redact customer keep [] as safe", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("redact customer keep [] as safe", 0);
         assert!(
             diagnostics
                 .iter()
@@ -3758,7 +3926,6 @@ mod tests {
         let BodyStmt::Done {
             binding,
             replacement,
-            deprecated_consume,
             ..
         } = &ast.statements[0]
         else {
@@ -3766,19 +3933,40 @@ mod tests {
         };
         assert_eq!(binding, "task");
         assert!(replacement.is_some());
-        assert!(!deprecated_consume);
     }
 
     #[test]
-    fn flags_consume_as_deprecated() {
-        let ast = parse_ok("consume task");
-        let BodyStmt::Done {
-            deprecated_consume, ..
-        } = &ast.statements[0]
-        else {
-            panic!("expected done");
-        };
-        assert!(deprecated_consume);
+    fn consume_done_alias_is_removed() {
+        // The bare `consume <binding>` alias for `done` was removed; it now
+        // errors with a migration hint rather than parsing as a done terminal.
+        let (ast, diagnostics) = parse_rule_body("consume task", 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("`consume` was removed")),
+            "expected a removed-alias diagnostic, got {diagnostics:?}"
+        );
+        assert!(
+            !matches!(ast.statements.first(), Some(BodyStmt::Done { .. })),
+            "removed alias must not parse as a done terminal"
+        );
+    }
+
+    #[test]
+    fn counter_consume_verb_still_parses() {
+        // The live counter verb `consume <counter> for ...` is unaffected.
+        let ast = parse_ok("consume budget for t.id amount 1 as spend");
+        assert!(
+            matches!(
+                ast.statements.first(),
+                Some(BodyStmt::Effect(EffectStmt {
+                    kind: BodyEffectKind::CounterConsume { .. },
+                    ..
+                }))
+            ),
+            "counter consume must still parse, got {:?}",
+            ast.statements.first()
+        );
     }
 
     #[test]
@@ -3853,8 +4041,7 @@ mod tests {
 
     #[test]
     fn reports_unsupported_with_context_modifier() {
-        let (_, diagnostics) =
-            parse_rule_body("tell coder with context memory \"go\"", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("tell coder with context memory \"go\"", 0);
         assert!(
             diagnostics
                 .iter()
@@ -3888,11 +4075,7 @@ mod tests {
         );
 
         // `invoke ... with skills` is NOT accepted (skills are tell-scoped).
-        let (_, diagnostics) = parse_rule_body(
-            "invoke Build { x task.x } with skills [\"a\"]",
-            0,
-            BodyMode::Rule,
-        );
+        let (_, diagnostics) = parse_rule_body("invoke Build { x task.x } with skills [\"a\"]", 0);
         assert!(
             !diagnostics.is_empty(),
             "invoke must reject a turn-scoped skills pin"
@@ -3901,7 +4084,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_statement() {
-        let (_, diagnostics) = parse_rule_body("frobnicate task", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("frobnicate task", 0);
         assert!(diagnostics.iter().any(|d| d
             .message
             .contains("unknown rule body statement `frobnicate`")));
@@ -3920,6 +4103,7 @@ mod tests {
             target_expr,
             event,
             fields,
+            ..
         } = &effect.kind
         else {
             panic!("expected signal delivery effect");
@@ -3931,7 +4115,7 @@ mod tests {
 
     #[test]
     fn rejects_emit_without_signal_delivery_shape() {
-        let (_, diagnostics) = parse_rule_body("emit event.name", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("emit event.name", 0);
         assert!(diagnostics
             .iter()
             .any(|d| d.message.contains("was removed from the language")));
@@ -3979,7 +4163,7 @@ mod tests {
 
     #[test]
     fn rejects_times_without_out() {
-        let (_, diagnostics) = parse_rule_body("after job times { cancel job }", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("after job times { cancel job }", 0);
         assert!(diagnostics
             .iter()
             .any(|d| d.message.contains("expected `out` after `times`")));
@@ -3987,8 +4171,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_after_predicate() {
-        let (_, diagnostics) =
-            parse_rule_body("after job explodes { cancel job }", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("after job explodes { cancel job }", 0);
         assert!(diagnostics.iter().any(|d| d
             .message
             .contains("unsupported `after` predicate `explodes`")));
@@ -4125,29 +4308,16 @@ mod tests {
     }
 
     #[test]
-    fn flow_mode_parses_branch_and_handler() {
-        let (ast, diagnostics) = parse_rule_body(
-            "tell worker as turn \"go\"\non fails {\n  fail error {\n    reason \"boom\"\n  }\n}\nwhen turn.summary == \"ok\" {\n  complete result {\n    ok true\n  }\n} else {\n  fail error {\n    reason \"bad\"\n  }\n}",
-            0,
-            BodyMode::Flow,
-        );
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert!(matches!(ast.statements[1], BodyStmt::Handler(_)));
-        assert!(matches!(ast.statements[2], BodyStmt::Branch(_)));
-    }
-
-    #[test]
     fn rule_mode_rejects_flow_statements() {
-        let (_, diagnostics) = parse_rule_body("on fails {\n  cancel x\n}", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("on fails {\n  cancel x\n}", 0);
         assert!(diagnostics
             .iter()
-            .any(|d| d.message.contains("only valid inside `flow` bodies")));
+            .any(|d| d.message.contains("not rule body statements")));
     }
 
     #[test]
     fn unknown_effect_modifier_is_rejected_with_span() {
-        let (_, diagnostics) =
-            parse_rule_body("tell worker as turn frobnicate \"go\"", 0, BodyMode::Rule);
+        let (_, diagnostics) = parse_rule_body("tell worker as turn frobnicate \"go\"", 0);
         assert!(
             diagnostics
                 .iter()
@@ -4254,7 +4424,6 @@ mod tests {
         let (_, diagnostics) = parse_rule_body(
             "invoke Child { task task }\n  with access to {\n  }\n  as child",
             0,
-            BodyMode::Rule,
         );
         assert!(
             diagnostics
@@ -4276,7 +4445,7 @@ mod tests {
 
     #[test]
     fn spans_are_absolute() {
-        let (ast, _) = parse_rule_body("record Item {\n  id \"a\"\n}", 100, BodyMode::Rule);
+        let (ast, _) = parse_rule_body("record Item {\n  id \"a\"\n}", 100);
         let BodyStmt::Record(record) = &ast.statements[0] else {
             panic!("expected record");
         };

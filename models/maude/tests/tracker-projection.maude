@@ -1,0 +1,46 @@
+load ../tracker-projection.maude
+
+--- Log L (fixed order):
+---   created(1) ; created(2) ; addBlocks(1,2) ; closedEv(1) ; created(3)
+---   ; acquired(3) ; nil
+--- Folds to: 1 closed, 2 open blocked by the now-closed 1 (so unblocked),
+--- 3 open but leased. Ready-set = { ready(2) }.
+
+--- Coverage 1 (rebuild from empty): folding the whole log from an empty
+--- projection reaches the expected projected state and ready-set.
+search in TRACKER-PROJECTION :
+  proj(none,
+    created(1) ; created(2) ; addBlocks(1, 2) ; closedEv(1) ; created(3)
+    ; acquired(3) ; nil)
+  =>! proj(ready(2) pstatus(1, closed) pstatus(2, open) pstatus(3, open)
+    pblocks(1, 2) pleased(3), nil) .
+
+--- Coverage 2 (rebuild == live): a LIVE projection that already applied the
+--- first three events, with the remaining log, reaches the SAME final state as
+--- the from-empty rebuild above -- the fold is start-point independent.
+search in TRACKER-PROJECTION :
+  proj(pstatus(1, open) pstatus(2, open) pblocks(1, 2),
+    closedEv(1) ; created(3) ; acquired(3) ; nil)
+  =>! proj(ready(2) pstatus(1, closed) pstatus(2, open) pstatus(3, open)
+    pblocks(1, 2) pleased(3), nil) .
+
+--- Bite 1: no fold marks the CLOSED issue 1 ready.
+search in TRACKER-PROJECTION :
+  proj(none,
+    created(1) ; created(2) ; addBlocks(1, 2) ; closedEv(1) ; created(3)
+    ; acquired(3) ; nil)
+  =>* proj(ready(1) RESIDUAL:Cfg, LL:EvList) .
+
+--- Bite 2: with an ACTIVE (open) blocker 1, the blocked issue 2 is never ready.
+search in TRACKER-PROJECTION :
+  proj(none, created(1) ; created(2) ; addBlocks(1, 2) ; nil)
+  =>* proj(ready(2) RESIDUAL:Cfg, LL:EvList) .
+
+--- Bite 3: the actively-LEASED issue 3 is never ready.
+search in TRACKER-PROJECTION :
+  proj(none,
+    created(1) ; created(2) ; addBlocks(1, 2) ; closedEv(1) ; created(3)
+    ; acquired(3) ; nil)
+  =>* proj(ready(3) RESIDUAL:Cfg, LL:EvList) .
+
+quit .

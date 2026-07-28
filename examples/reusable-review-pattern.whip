@@ -1,6 +1,9 @@
+use std.agent
+
 workflow ReusableReviewPattern
 
 output result ReviewBatch
+failure error ReviewFailure
 
 # Patterns remove repeated rule shape while keeping the lowered workflow explicit.
 class ChangeRequest {
@@ -17,6 +20,10 @@ class ReviewedChange {
 
 class ReviewBatch {
   reviewed int
+}
+
+class ReviewFailure {
+  reason string
 }
 
 agent reviewer {
@@ -50,6 +57,12 @@ pattern AgentReview<Input, Output> {
         status "reviewed"
       }
     }
+
+    after turn fails as f {
+      record ReviewFailure {
+        reason f.reason
+      }
+    }
   }
 }
 
@@ -58,6 +71,14 @@ apply AgentReview<ChangeRequest, ReviewedChange> as changeReview {
 
 assert count(ChangeRequest where status == "queued") == 0
 assert count(ReviewedChange where status == "reviewed") == 1
+
+rule fail_on_review_failure
+  when ReviewFailure as failure
+=> {
+  fail error {
+    reason failure.reason
+  }
+}
 
 rule finish_batch
   when ReviewedChange as reviewed where reviewed.status == "reviewed"

@@ -1,0 +1,47 @@
+load ../owned-harness-loop.maude
+
+--- Coverage (leaf-ness positive): a gate-open kind (started) derives its fact, so
+--- the search and the leaf-ness bites below have teeth.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  obs(started)
+  =>* C:Cfg fact(started) .
+
+--- Coverage (brokering): with the kernel mediation capability, a requested tool
+--- is brokered and a tool result is reachable.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  running brokerEnabled toolReqPending
+  =>* C:Cfg obs(toolRes) .
+
+--- Coverage (single terminal): a running turn reaches a terminal fact.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  running
+  =>* C:Cfg termFact(completed) .
+
+--- Bite (leaf-ness, model_request): an interior observation never derives a
+--- rule-matchable fact. The RESIDUAL soup var means any fact in any reachable
+--- state is a solution, so No solution proves the gate stays closed.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  obs(modelReq)
+  =>* fact(modelReq) RESIDUAL:Cfg .
+
+--- Bite (leaf-ness, tool_requested): same, for tool calls.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  obs(toolReq)
+  =>* fact(toolReq) RESIDUAL:Cfg .
+
+--- Bite (leaf-ness, tool_result): same, for tool results.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  obs(toolRes)
+  =>* fact(toolRes) RESIDUAL:Cfg .
+
+--- Bite (brokering): with no kernel mediation capability, a requested tool can
+--- never reach a tool result -- the model cannot touch the tool directly.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  running toolReqPending
+  =>* obs(toolRes) RESIDUAL:Cfg .
+
+--- Bite (single terminal): a running turn cannot hold two terminal facts at once;
+--- the terminal transition consumes `running`.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-LOOP :
+  running
+  =>* termFact(completed) termFact(failed) RESIDUAL:Cfg .

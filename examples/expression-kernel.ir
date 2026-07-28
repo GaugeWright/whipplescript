@@ -1,0 +1,103 @@
+workflow ExpressionKernel
+workflow_contracts
+  output result ref<KernelSweep>
+schemas
+  class Job
+    id string
+    title string
+    attempts int
+    cost float
+    labels array<string>
+    meta map<string>
+    note optional<string>
+    kind union<literal<"build"> | literal<"test"> | literal<"docs">>
+    done bool
+  class Detail
+    phase string
+  class Scored
+    id string
+    score int
+    detail ref<Detail>
+    tags map<string>
+    status literal<"scored">
+  class Retired
+    id string
+    reason union<literal<"docs"> | literal<"stale">>
+    status literal<"retired">
+  class KernelSweep
+    scored int
+    retired int
+    state literal<"swept">
+assertions
+  assert count(Scored) == 1
+    reads
+      fact:Scored
+  assert count(Retired) == 1
+    reads
+      fact:Retired
+  assert count(Job where done == false) == 0
+    reads
+      fact:Job where done == false
+  assert exists(Scored where (score <= 3) && (score > 0))
+    reads
+      fact:Scored where (score <= 3) && (score > 0)
+  assert empty(Job where cost >= 100.0)
+    reads
+      fact:Job where cost >= 100.0
+  assert empty(Retired where reason != "docs")
+    reads
+      fact:Retired where reason != "docs"
+  assert count(effect kind human.ask) == 0
+    reads
+      effect:kind human.ask
+  assert empty(effect kind agent.tell)
+    reads
+      effect:kind agent.tell
+  assert ((2 + (3 * 2)) == 8) && (((2 + 3) * 2) == 10)
+  assert ((10 - (4 / 2)) == 8) && !(1 > 2)
+  assert ("a" in ["a", "b"]) && ("z" not in ["a", "b"])
+  assert (count(["x", "y"]) == 2) && !empty(["x", "y"])
+  assert empty([]) && empty("")
+rules
+  rule table_jobs
+    when started
+    reads
+      pattern:started
+    writes
+      schema:Job
+    record_sources
+      schema:Job construct=table_row span=932..1108
+      schema:Job construct=table_row span=1111..1272
+    body_hash 4385cd5299f163017fd5c8698f259e58
+  rule score_build_job
+    when Job as job where (((((((((((!job.done && (job.kind != "docs")) && ((job.attempts + 1) <= 5)) && ((job.cost * 2.0) < 10.0)) && (job.attempts >= 1)) && ((job.cost - 0.5) > 0.0)) && ((job.attempts / 1) == 1)) && (job.kind in ["build", "test"])) && ("retired" not in job.labels)) && ((exists(job.note) && (job.note == "hot path")) || (job.attempts == 0))) && ("team" in job.meta)) && (job.meta["team"] == "core")) && exists(job.labels)
+    reads
+      schema:Job
+    writes
+      schema:Scored
+    consumes
+      schema:Job
+    body_hash e558b9e9a197e430631c016e9aa3aa67
+  rule retire_docs_job
+    when Job as job where ((!job.done && ((job.kind == "docs") || (job.title == "unused"))) && (job.note == null)) && !empty(job.labels)
+    reads
+      schema:Job
+    writes
+      schema:Retired
+    consumes
+      schema:Job
+    body_hash 7adb278f5ca0b14216b47fc7eb95a9b9
+  rule finish_sweep
+    when Scored as scored
+    when Retired as retired where empty(Job where done == false)
+    reads
+      schema:Retired
+      schema:Scored
+    projection_reads
+      fact:Job where done == false
+    body_hash 59cf959273386483297f7d46b51c03be
+rule_dependencies
+  retire_docs_job --schema:Retired--> finish_sweep
+  score_build_job --schema:Scored--> finish_sweep
+  table_jobs --schema:Job--> retire_docs_job
+  table_jobs --schema:Job--> score_build_job

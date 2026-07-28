@@ -1,0 +1,1012 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+load ../construct-graph.maude
+
+--- A graph with a provider node and a consumer node is accepted when the
+--- required port resolves through one compatible, versioned, resource-scoped
+--- edge and the consumer's capability/lowering obligations are closed.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes2(g1, projectionNode, memoryNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  nodeRequiresCapability(memoryNode, memoryQuery)
+  declaredCapability(memoryQuery)
+  loweredEffectRequiresCapability(memoryNode, e1, memoryQuery)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  uniqueResolution(memoryNode, reqIssue)
+  uniqueResolvedPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A node with no required ports can be accepted when its authority and
+--- lowering obligations are still explicit.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Adding an unrelated accepted node does not change an already explicit edge.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes3(g1, projectionNode, memoryNode, unrelatedNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  graphContainsNode(g1, unrelatedNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  nodeRequiresCapability(memoryNode, memoryQuery)
+  declaredCapability(memoryQuery)
+  loweredEffectRequiresCapability(memoryNode, e1, memoryQuery)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  uniqueResolution(memoryNode, reqIssue)
+  uniqueResolvedPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  nodeFamilyAccepted(unrelatedNode)
+  nodeLoweringAccepted(unrelatedNode)
+  nodeShapeUnique(unrelatedNode)
+  noHiddenNodeBehavior(unrelatedNode)
+  nodeFactsConsistent(unrelatedNode)
+  nodeNeeds0(unrelatedNode)
+  nodeProduces1(unrelatedNode, provUnrelated)
+  noCapabilityRequirements(unrelatedNode)
+  loweringOutput(unrelatedNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(unrelatedNode)
+  providesPort(unrelatedNode, provUnrelated)
+  producedPortAllowed(unrelatedNode, provUnrelated)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A provided port must be allowed by the node's construct family and lowering
+--- class before the node can be accepted.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, projectionNode)
+  graphContainsNode(g1, projectionNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Missing edge resolution blocks graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Ambiguous exactly-one resolution blocks graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  providesPort(projectionNode, provIssue)
+  providesPort(unrelatedNode, provUnrelated)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolvesPort(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provUnrelated, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  resourceCompatible(reqIssue, provUnrelated)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A contradictory normalized artifact with two visible resolutions cannot
+--- satisfy exactly-one just by asserting uniqueResolution and
+--- resolutionFactsConsistent. The validator must provide the per-edge unique
+--- resolution witness.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  nodeProduces1(projectionNode, provIssue)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeProduces1(unrelatedNode, provUnrelated)
+  providesPort(unrelatedNode, provUnrelated)
+  producedPortAllowed(unrelatedNode, provUnrelated)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolvesPort(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  uniqueResolution(memoryNode, reqIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provUnrelated, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  resourceCompatible(reqIssue, provUnrelated)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Multi-resolution contradictions are visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  uniqueResolution(memoryNode, reqIssue)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolvesPort(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  =>*
+  C:Cfg
+  inconsistentResolutionFacts(memoryNode, reqIssue) .
+
+--- An optional-one requirement may be satisfied by no visible provider when
+--- the resolver records an explicit absent resolution.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolutionAbsent(memoryNode, reqIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, optionalOne)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- An optional-one requirement may also resolve through one compatible
+--- provider, using the same exactly-one discipline for the chosen edge.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes2(g1, projectionNode, memoryNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  uniqueResolution(memoryNode, reqIssue)
+  uniqueResolvedPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, optionalOne)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A many requirement can accept multiple compatible providers only when the
+--- resolver supplies deterministic ordering evidence.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes3(g1, projectionNode, memoryNode, unrelatedNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  graphContainsNode(g1, unrelatedNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  nodeFamilyAccepted(unrelatedNode)
+  nodeLoweringAccepted(unrelatedNode)
+  nodeShapeUnique(unrelatedNode)
+  noHiddenNodeBehavior(unrelatedNode)
+  nodeFactsConsistent(unrelatedNode)
+  nodeNeeds0(unrelatedNode)
+  nodeProduces1(unrelatedNode, provUnrelated)
+  noCapabilityRequirements(unrelatedNode)
+  loweringOutput(unrelatedNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(unrelatedNode)
+  providesPort(unrelatedNode, provUnrelated)
+  producedPortAllowed(unrelatedNode, provUnrelated)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolvesPort(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  manyResolutionOrderClosed(memoryNode, reqIssue)
+  resolutionOrder(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionOrder(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, many)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provUnrelated, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  resourceCompatible(reqIssue, provUnrelated)
+  =>*
+  C:Cfg
+  graphAccepted(g1)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeAccepted(memoryNode, reqIssue, unrelatedNode, provUnrelated) .
+
+--- A many requirement cannot accept providers without deterministic ordering
+--- evidence.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes2(g1, projectionNode, memoryNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, many)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A named-many requirement additionally needs a stable resource key for each
+--- selected provider.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes3(g1, projectionNode, memoryNode, unrelatedNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  graphContainsNode(g1, unrelatedNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  nodeFamilyAccepted(unrelatedNode)
+  nodeLoweringAccepted(unrelatedNode)
+  nodeShapeUnique(unrelatedNode)
+  noHiddenNodeBehavior(unrelatedNode)
+  nodeFactsConsistent(unrelatedNode)
+  nodeNeeds0(unrelatedNode)
+  nodeProduces1(unrelatedNode, provUnrelated)
+  noCapabilityRequirements(unrelatedNode)
+  loweringOutput(unrelatedNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(unrelatedNode)
+  providesPort(unrelatedNode, provUnrelated)
+  producedPortAllowed(unrelatedNode, provUnrelated)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  resolvesPort(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  manyResolutionOrderClosed(memoryNode, reqIssue)
+  resolutionOrder(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionOrder(memoryNode, reqIssue, unrelatedNode, provUnrelated)
+  namedResolutionKeyed(memoryNode, reqIssue, projectionNode, provIssue, githubBacklog)
+  namedResolutionKeyed(memoryNode, reqIssue, unrelatedNode, provUnrelated, linearBacklog)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, namedMany)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provUnrelated, valueKind, issueType, compilePhase, v1, exactlyOne)
+  portResource(provIssue, githubBacklog)
+  portResource(provUnrelated, linearBacklog)
+  kindCompatible(valueKind, valueKind)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  resourceCompatible(reqIssue, provUnrelated)
+  =>*
+  C:Cfg
+  graphAccepted(g1)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeAccepted(memoryNode, reqIssue, unrelatedNode, provUnrelated) .
+
+--- A named-many requirement cannot accept providers when the resource keys are
+--- not recorded by the resolver.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes2(g1, projectionNode, memoryNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(projectionNode)
+  nodeLoweringAccepted(projectionNode)
+  nodeShapeUnique(projectionNode)
+  noHiddenNodeBehavior(projectionNode)
+  nodeFactsConsistent(projectionNode)
+  nodeNeeds0(projectionNode)
+  nodeProduces1(projectionNode, provIssue)
+  noCapabilityRequirements(projectionNode)
+  loweringOutput(projectionNode, coreFactOut)
+  allowedLoweringOutput(coreFactOut)
+  singleLoweringOutput(projectionNode)
+  providesPort(projectionNode, provIssue)
+  producedPortAllowed(projectionNode, provIssue)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provIssue)
+  manyResolutionOrderClosed(memoryNode, reqIssue)
+  resolutionOrder(memoryNode, reqIssue, projectionNode, provIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, namedMany)
+  port(provIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  portResource(provIssue, githubBacklog)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Wrong type blocks graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  providesPort(projectionNode, provMemory)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provMemory)
+  uniqueResolution(memoryNode, reqIssue)
+  uniqueResolvedPort(memoryNode, reqIssue, projectionNode, provMemory)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provMemory, valueKind, memoryContext, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provMemory)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Runtime-only ports cannot satisfy compile-time requirements.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  providesPort(projectionNode, provRuntimeIssue)
+  resolvesPort(memoryNode, reqIssue, projectionNode, provRuntimeIssue)
+  uniqueResolution(memoryNode, reqIssue)
+  uniqueResolvedPort(memoryNode, reqIssue, projectionNode, provRuntimeIssue)
+  resolutionFactsConsistent(memoryNode, reqIssue)
+  port(reqIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provRuntimeIssue, valueKind, issueType, runtimePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  versionCompatible(v1, v1)
+  resourceCompatible(reqIssue, provRuntimeIssue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Incompatible contract versions block graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqV2Issue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  providesPort(projectionNode, provV1Issue)
+  resolvesPort(memoryNode, reqV2Issue, projectionNode, provV1Issue)
+  uniqueResolution(memoryNode, reqV2Issue)
+  uniqueResolvedPort(memoryNode, reqV2Issue, projectionNode, provV1Issue)
+  resolutionFactsConsistent(memoryNode, reqV2Issue)
+  port(reqV2Issue, valueKind, issueType, compilePhase, v2, exactlyOne)
+  port(provV1Issue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  resourceCompatible(reqV2Issue, provV1Issue)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Resource identity mismatch blocks graph acceptance even when type matches.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds1(memoryNode, reqGithubIssue)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  providesPort(projectionNode, provLinearIssue)
+  resolvesPort(memoryNode, reqGithubIssue, projectionNode, provLinearIssue)
+  uniqueResolution(memoryNode, reqGithubIssue)
+  uniqueResolvedPort(memoryNode, reqGithubIssue, projectionNode, provLinearIssue)
+  resolutionFactsConsistent(memoryNode, reqGithubIssue)
+  port(reqGithubIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  port(provLinearIssue, valueKind, issueType, compilePhase, v1, exactlyOne)
+  kindCompatible(valueKind, valueKind)
+  typeAssignable(issueType, issueType)
+  phaseCompatible(compilePhase, compilePhase)
+  versionCompatible(v1, v1)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Hidden capability requirements block graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds0(memoryNode)
+  nodeProduces0(memoryNode)
+  nodeRequiresCapability(memoryNode, memoryQuery)
+  loweredEffectRequiresCapability(memoryNode, e1, memoryQuery)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Contradictory normalized facts are visible to the checker; the artifact
+--- validator must not certify nodeFactsConsistent for this node.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  noCapabilityRequirements(memoryNode)
+  nodeRequiresCapability(memoryNode, memoryQuery)
+  =>*
+  inconsistentNodeFacts(memoryNode) .
+
+--- A node cannot be accepted when the normalized artifact does not provide
+--- node fact consistency evidence.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeNeeds0(memoryNode)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Contradictory resolution facts are also visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  uniqueResolution(memoryNode, reqIssue)
+  resolutionAbsent(memoryNode, reqIssue)
+  =>*
+  inconsistentResolutionFacts(memoryNode, reqIssue) .
+
+--- Forbidden lowering output blocks graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, directRuleFireOut)
+  singleLoweringOutput(scheduleNode)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- Non-unique lowering output blocks deterministic graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  loweringOutput(scheduleNode, coreFactOut)
+  allowedLoweringOutput(coreEventOut)
+  allowedLoweringOutput(coreFactOut)
+  =>*
+  C:Cfg
+  graphAccepted(g1) .
+
+--- A node that is not in the graph cannot be accepted into that graph.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes0(g1)
+  nodeFamilyAccepted(memoryNode)
+  nodeLoweringAccepted(memoryNode)
+  nodeShapeUnique(memoryNode)
+  noHiddenNodeBehavior(memoryNode)
+  nodeFactsConsistent(memoryNode)
+  nodeNeeds0(memoryNode)
+  nodeProduces0(memoryNode)
+  noCapabilityRequirements(memoryNode)
+  loweringOutput(memoryNode, coreEffectOut)
+  allowedLoweringOutput(coreEffectOut)
+  singleLoweringOutput(memoryNode)
+  =>*
+  C:Cfg
+  nodeAccepted(g1, memoryNode) .
+
+--- An accepted graph becomes an accepted program only when the implementation
+--- adequacy contract is also satisfied.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  checkerFactsAccounted(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- Graph acceptance is not enough when checker facts lack accountable
+--- implementation derivations.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- Accountable derivations are not enough when the normalized fact set has
+--- not passed contradiction checks.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsAccounted(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- Namespace/import instability blocks accepted-program status even when the
+--- graph itself is otherwise accepted.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  checkerFactsAccounted(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- The executable lowering boundary must be declared before a graph can be an
+--- accepted program.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  checkerFactsAccounted(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- Runtime lifecycle boundaries must be explicit; accepted construct graphs do
+--- not give packages a private lifecycle.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  loweringOutput(scheduleNode, coreEventOut)
+  allowedLoweringOutput(coreEventOut)
+  singleLoweringOutput(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  checkerFactsAccounted(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .
+
+--- Adequacy facts cannot substitute for graph acceptance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-GRAPH :
+  graphNodes1(g1, scheduleNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeFamilyAccepted(scheduleNode)
+  nodeLoweringAccepted(scheduleNode)
+  nodeShapeUnique(scheduleNode)
+  noHiddenNodeBehavior(scheduleNode)
+  nodeFactsConsistent(scheduleNode)
+  nodeNeeds0(scheduleNode)
+  nodeProduces0(scheduleNode)
+  noCapabilityRequirements(scheduleNode)
+  sourceAndLockDeterministic(g1)
+  registryClosed(g1)
+  checkerFactsConsistent(g1)
+  checkerFactsAccounted(g1)
+  namespaceStable(g1)
+  constructIdentityStable(g1)
+  authorityScoped(g1)
+  phaseSeparated(g1)
+  cardinalityChecked(g1)
+  versionReplayPinned(g1)
+  diagnosticsComplete(g1)
+  loweringBoundaryDeclared(g1)
+  lifecycleBoundaryDeclared(g1)
+  =>*
+  C:Cfg
+  acceptedProgram(g1) .

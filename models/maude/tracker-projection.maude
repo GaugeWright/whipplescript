@@ -1,0 +1,93 @@
+--- Tracker ready-list PROJECTION as a pure fold over an append-only accepted-
+--- event log (ADR-0002 v1). The event-sourced provider keeps append-only
+--- accepted events plus disposable projections; this model abstracts the
+--- projection as event tokens folded into a projected fact-set, then a derived
+--- ready-set. Determinism: folding the same fixed-order log yields the same
+--- projected state and ready-set regardless of where the fold starts, so a
+--- REBUILD from empty equals the LIVE state reached by incremental
+--- application.
+---
+--- Events -- issue.created, issue.field_set(status), issue.closed,
+--- claim.acquired, claim.released, relation.added(blocks) -- are applied one
+--- at a time off the head of a fixed log, so each step is forced; the projected
+--- fact-set is unique at the empty log. Ready derivation reuses the readiness
+--- fold: open AND no active blocker AND not leased. Ready facts are derived
+--- only once the log is drained, so a mid-fold state never claims readiness.
+--- The bites tie the projection to readiness: no fold ever marks a closed,
+--- actively-blocked, or actively-leased issue ready.
+mod TRACKER-PROJECTION is
+  protecting NAT .
+
+  sorts Ev EvList Fact Cfg State Status .
+  subsort Fact < Cfg .
+
+  ops open closed canceled : -> Status [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Append-only event log: head ; tail, terminated by nil.
+  op nil : -> EvList [ctor] .
+  op _;_ : Ev EvList -> EvList [ctor] .
+
+  op created : Nat -> Ev [ctor] .          --- issue.created(id), status open
+  op fieldSet : Nat Status -> Ev [ctor] .  --- issue.field_set(id, status)
+  op closedEv : Nat -> Ev [ctor] .         --- issue.closed(id)
+  op acquired : Nat -> Ev [ctor] .         --- claim.acquired(id)
+  op releasedEv : Nat -> Ev [ctor] .       --- claim.released(id)
+  op addBlocks : Nat Nat -> Ev [ctor] .    --- relation.added(blocks from to)
+
+  --- Projected facts and the fold state proj(projected, remainingLog).
+  op pstatus : Nat Status -> Fact [ctor] .
+  op pblocks : Nat Nat -> Fact [ctor] .
+  op pleased : Nat -> Fact [ctor] .        --- issue currently under a lease
+  op ready : Nat -> Fact [ctor] .          --- derived readiness fact
+  op proj : Cfg EvList -> State [ctor] .
+
+  vars Id B To A E : Nat .
+  vars S S2 : Status .
+  vars C Full : Cfg .
+  var L : EvList .
+
+  --- Fold: apply the head event to the projected fact-set, advance the log.
+  rl [ev-created] : proj(C, created(Id) ; L) => proj(pstatus(Id, open) C, L) .
+  rl [ev-closed]  : proj(pstatus(Id, S) C, closedEv(Id) ; L)
+                    => proj(pstatus(Id, closed) C, L) .
+  rl [ev-field]   : proj(pstatus(Id, S) C, fieldSet(Id, S2) ; L)
+                    => proj(pstatus(Id, S2) C, L) .
+  rl [ev-blocks]  : proj(C, addBlocks(B, To) ; L) => proj(pblocks(B, To) C, L) .
+  rl [ev-acquire] : proj(C, acquired(Id) ; L) => proj(pleased(Id) C, L) .
+  rl [ev-release] : proj(pleased(Id) C, releasedEv(Id) ; L) => proj(C, L) .
+
+  --- Readiness fold, reused from tracker-readiness: an issue is active while
+  --- open. Here closed and canceled are terminal.
+  op isActive : Status -> Bool .
+  eq isActive(open) = true .
+  eq isActive(closed) = false .
+  eq isActive(canceled) = false .
+
+  op pIssueActive : Nat Cfg -> Bool .
+  eq pIssueActive(B, pstatus(B, S) C) = isActive(S) .
+  eq pIssueActive(B, C) = false [owise] .
+
+  op blockedByActive : Nat Cfg Cfg -> Bool .
+  eq blockedByActive(Id, pblocks(B, Id) C, Full) =
+    if pIssueActive(B, Full) then true else blockedByActive(Id, C, Full) fi .
+  eq blockedByActive(Id, C, Full) = false [owise] .
+
+  op leasedP : Nat Cfg -> Bool .
+  eq leasedP(Id, pleased(Id) C) = true .
+  eq leasedP(Id, C) = false [owise] .
+
+  op hasReady : Nat Cfg -> Bool .
+  eq hasReady(Id, ready(Id) C) = true .
+  eq hasReady(Id, C) = false [owise] .
+
+  --- Derive ready(Id) ONLY once the log is drained (nil): open, no active
+  --- blocker, not leased, not yet ready.
+  crl [derive-ready] : proj(pstatus(Id, open) C, nil)
+                       => proj(ready(Id) pstatus(Id, open) C, nil)
+    if blockedByActive(Id, C, pstatus(Id, open) C) = false
+    /\ leasedP(Id, C) = false
+    /\ hasReady(Id, C) = false .
+endm

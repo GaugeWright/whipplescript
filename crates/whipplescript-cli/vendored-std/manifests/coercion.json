@@ -1,0 +1,65 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.coercion",
+  "name": "std.coercion",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.coercion",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "schema.coerce",
+          "effect_kind": "schema.coerce",
+          "source_forms": ["coerce", "decide", "prompt"],
+          "input_schema": "schema.coerce.input",
+          "output_schema": "typed-provider-output",
+          "required_capabilities": ["schema.coerce"],
+          "provider_kinds": ["schema_coercer"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "schema.coerce",
+      "description": "Coerce unstructured data into a typed value through a schema_coercer provider."
+    }
+  ],
+  "providers": [
+    {
+      "id": "fixture",
+      "provider_kind": "schema_coercer",
+      "capability": "schema.coerce",
+      "config": {}
+    },
+    {
+      "id": "native",
+      "provider_kind": "schema_coercer",
+      "capability": "schema.coerce",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-coercion-user",
+      "name": "coercion-user",
+      "description": "Allow schema coercion.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["schema.coerce"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-coercion-default",
+      "program_id": null,
+      "capability": "schema.coerce",
+      "provider": "schema_coercer",
+      "config": { "provider_id": "fixture" }
+    }
+  ]
+}

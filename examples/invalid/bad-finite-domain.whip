@@ -8,11 +8,11 @@ enum ReviewStatus {
 class Task {
   status ReviewStatus
   provider "codex" | "claude"
-  route "pi" | "coerce"
+  route "gpt5" | "coerce"
 }
 
 rule invalid_guard_literal
-  when Task as task where task.provider == "pi"
+  when Task as task where task.provider == "gpt5"
 => {
 }
 

@@ -1,3 +1,6 @@
+use std.tracker
+use std.agent.codex
+
 @service
 description "The agent turn only runs after the work-item claim succeeds"
 workflow QueueGatedSmoke
@@ -53,8 +56,6 @@ rule implement_ready_item
   }
 
   after active_claim fails {
-    askHuman """markdown
-    The work-item claim failed, so the worker turn must not start.
-    """
+    release issue
   }
 }

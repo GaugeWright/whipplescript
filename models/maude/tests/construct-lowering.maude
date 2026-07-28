@@ -1,0 +1,810 @@
+load ../kernel.maude
+load ../construct-grammar.maude
+load ../construct-graph.maude
+load ../construct-lowering.maude
+
+--- An accepted construct edge is preserved when lowering emits a corresponding
+--- core relation and keeps type, resource, capability, version, span,
+--- cardinality, and provenance.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  =>*
+  C:Cfg
+  edgeLoweringPreserved(memoryNode, reqIssue, projectionNode, provIssue) .
+
+--- A graph lowers only when the accepted-program boundary holds and every node
+--- and required edge preserves its contract into ordinary core IR.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes2(g1, projectionNode, memoryNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, memoryNode)
+  nodeAccepted(g1, projectionNode)
+  nodeNeeds0(projectionNode)
+  loweredByPlatform(projectionNode)
+  loweringCoreOnly(projectionNode)
+  sourceSpanPreserved(projectionNode)
+  nodeResourcePreserved(projectionNode)
+  noExtraCapability(projectionNode)
+  noPackageScheduler(projectionNode)
+  noPackageLifecycle(projectionNode)
+  nodeVersionPreserved(projectionNode)
+  nodeCardinalityPreserved(projectionNode)
+  nodeProvenancePreserved(projectionNode)
+  terminalBindingPreserved(projectionNode)
+  nodeClassLifecycleAccepted(projectionNode)
+  nodeClassOutputAccepted(projectionNode, projectionViewLowering)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits3(g1, coreFactObj, coreEffectObj, coreDependencyObj)
+  nodeCoreObjects1(projectionNode, coreFactObj)
+  nodeCoreObjects1(memoryNode, coreEffectObj)
+  edgeCoreObjects1(memoryNode, reqIssue, projectionNode, provIssue, coreDependencyObj)
+  emittedCoreObject(g1, coreFactObj, coreFactKind)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  allowedCoreObjectKind(coreFactKind)
+  allowedCoreObjectKind(coreEffectKind)
+  allowedCoreObjectKind(coreDependencyKind)
+  coreObjectOwnedByNode(g1, coreFactObj, projectionNode)
+  coreObjectOwnedByNode(g1, coreEffectObj, memoryNode)
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnerUnique(g1, coreFactObj)
+  coreObjectOwnerUnique(g1, coreEffectObj)
+  coreObjectOwnerUnique(g1, coreDependencyObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Generated lowered-IR facts can account for multiple core objects owned by
+--- the same accepted edge.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits(g1, coreObjectCons(coreDependencyObj, coreObjectCons(coreProjectionObj, noCoreObjects)))
+  graphContainsNode(g1, memoryNode)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCoreObjects(memoryNode, reqIssue, projectionNode, provIssue, coreObjectCons(coreDependencyObj, coreObjectCons(coreProjectionObj, noCoreObjects)))
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  emittedCoreObject(g1, coreProjectionObj, coreProjectionKind)
+  allowedCoreObjectKind(coreDependencyKind)
+  allowedCoreObjectKind(coreProjectionKind)
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnedByEdge(g1, coreProjectionObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnerUnique(g1, coreDependencyObj)
+  coreObjectOwnerUnique(g1, coreProjectionObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  graphLoweringBoundaryOk(g1) .
+
+--- Generated lowered-IR facts can account for multiple core objects owned by
+--- the same effect dependency.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits(g1, coreObjectCons(coreDependencyObj, coreObjectCons(coreDiagnosticObj, noCoreObjects)))
+  effectDependencyAccepted(g1, dep1)
+  dependencyLoweringPreserved(dep1)
+  dependencyCoreObjects(dep1, coreObjectCons(coreDependencyObj, coreObjectCons(coreDiagnosticObj, noCoreObjects)))
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  emittedCoreObject(g1, coreDiagnosticObj, coreDiagnosticKind)
+  allowedCoreObjectKind(coreDependencyKind)
+  allowedCoreObjectKind(coreDiagnosticKind)
+  coreObjectOwnedByDependency(g1, coreDependencyObj, dep1)
+  coreObjectOwnedByDependency(g1, coreDiagnosticObj, dep1)
+  coreObjectOwnerUnique(g1, coreDependencyObj)
+  coreObjectOwnerUnique(g1, coreDiagnosticObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  graphLoweringBoundaryOk(g1) .
+
+--- Generated lowered-IR facts can account for multiple core objects owned by
+--- the same node.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits(g1, coreObjectCons(coreEffectObj, coreObjectCons(coreRuleObj, coreObjectCons(coreAssertionObj, noCoreObjects))))
+  graphContainsNode(g1, memoryNode)
+  nodeCoreObjects(memoryNode, coreObjectCons(coreEffectObj, coreObjectCons(coreRuleObj, coreObjectCons(coreAssertionObj, noCoreObjects))))
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  emittedCoreObject(g1, coreRuleObj, coreRuleKind)
+  emittedCoreObject(g1, coreAssertionObj, coreAssertionKind)
+  allowedCoreObjectKind(coreEffectKind)
+  allowedCoreObjectKind(coreRuleKind)
+  allowedCoreObjectKind(coreAssertionKind)
+  coreObjectOwnedByNode(g1, coreEffectObj, memoryNode)
+  coreObjectOwnedByNode(g1, coreRuleObj, memoryNode)
+  coreObjectOwnedByNode(g1, coreAssertionObj, memoryNode)
+  coreObjectOwnerUnique(g1, coreEffectObj)
+  coreObjectOwnerUnique(g1, coreRuleObj)
+  coreObjectOwnerUnique(g1, coreAssertionObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  graphLoweringBoundaryOk(g1) .
+
+--- Graph acceptance alone is not enough for lowering preservation.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  graphAccepted(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- A required graph edge must lower to a core relation.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, memoryNode)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot widen or rewrite resource identity on a required edge.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, memoryNode)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot introduce undeclared capabilities.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Edge contract versions must survive lowering.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, memoryNode)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Node source spans must survive lowering for diagnostics and traceability.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Terminal output bindings must remain tied to their source node.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- A complete lowered IR report is required for the model to cover the result.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot emit unaccounted core IR objects.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits1(g1, extraCoreObj)
+  emittedCoreObject(g1, extraCoreObj, coreEffectKind)
+  allowedCoreObjectKind(coreEffectKind)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot create package-owned lifecycle semantics such as retry,
+--- claim, cancellation, terminal status, or replay.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering must be deterministic for the same accepted graph and lowerer
+--- version.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot depend on runtime provider output, clock state, tracker
+--- readiness/projection state, memory retrieval, ambient credentials,
+--- filesystem order, or network state.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering cannot create package-owned scheduling semantics.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Lowering output must be ordinary core IR, not package-owned runtime behavior.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Node lowering cannot bypass an accepted lowering-class lifecycle profile.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, scheduleNode)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  coreObjectCoverageOk(g1)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- A core object cannot be owned by both a node lowering and an edge lowering.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds1(memoryNode, reqIssue)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits1(g1, coreEffectObj)
+  nodeCoreObjects1(memoryNode, coreEffectObj)
+  edgeCoreObjects1(memoryNode, reqIssue, projectionNode, provIssue, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  allowedCoreObjectKind(coreEffectKind)
+  coreObjectOwnedByNode(g1, coreEffectObj, memoryNode)
+  coreObjectOwnedByEdge(g1, coreEffectObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnerUnique(g1, coreEffectObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- A core object cannot be owned by two node lowerings, even if uniqueness is
+--- asserted by a bad artifact.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes2(g1, projectionNode, scheduleNode)
+  graphContainsNode(g1, projectionNode)
+  graphContainsNode(g1, scheduleNode)
+  nodeAccepted(g1, projectionNode)
+  nodeNeeds0(projectionNode)
+  loweredByPlatform(projectionNode)
+  loweringCoreOnly(projectionNode)
+  sourceSpanPreserved(projectionNode)
+  nodeResourcePreserved(projectionNode)
+  noExtraCapability(projectionNode)
+  noPackageScheduler(projectionNode)
+  noPackageLifecycle(projectionNode)
+  nodeVersionPreserved(projectionNode)
+  nodeCardinalityPreserved(projectionNode)
+  nodeProvenancePreserved(projectionNode)
+  terminalBindingPreserved(projectionNode)
+  nodeClassLifecycleAccepted(projectionNode)
+  nodeClassOutputAccepted(projectionNode, projectionViewLowering)
+  nodeAccepted(g1, scheduleNode)
+  nodeNeeds0(scheduleNode)
+  loweredByPlatform(scheduleNode)
+  loweringCoreOnly(scheduleNode)
+  sourceSpanPreserved(scheduleNode)
+  nodeResourcePreserved(scheduleNode)
+  noExtraCapability(scheduleNode)
+  noPackageScheduler(scheduleNode)
+  noPackageLifecycle(scheduleNode)
+  nodeVersionPreserved(scheduleNode)
+  nodeCardinalityPreserved(scheduleNode)
+  nodeProvenancePreserved(scheduleNode)
+  terminalBindingPreserved(scheduleNode)
+  nodeClassLifecycleAccepted(scheduleNode)
+  nodeClassOutputAccepted(scheduleNode, scheduleEmitterLowering)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits1(g1, coreEffectObj)
+  nodeCoreObjects1(projectionNode, coreEffectObj)
+  nodeCoreObjects1(scheduleNode, coreEffectObj)
+  emittedCoreObject(g1, coreEffectObj, coreEffectKind)
+  allowedCoreObjectKind(coreEffectKind)
+  coreObjectOwnedByNode(g1, coreEffectObj, projectionNode)
+  coreObjectOwnedByNode(g1, coreEffectObj, scheduleNode)
+  coreObjectOwnerUnique(g1, coreEffectObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Generated node lowering can preserve more required ports than the small
+--- hand-written arity-specific rules model directly.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  nodeAccepted(g1, memoryNode)
+  nodeNeedsEdges(memoryNode,
+    edgeCons(edgeId(memoryNode, reqIssue, projectionNode, provIssue),
+    edgeCons(edgeId(memoryNode, reqMemory, projectionNode, provMemory),
+    edgeCons(edgeId(memoryNode, reqRepo, projectionNode, provRepo),
+    edgeCons(edgeId(memoryNode, reqRuntime, projectionNode, provRuntimeIssue),
+    noEdges)))))
+  edgeLoweringPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeLoweringPreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeLoweringPreserved(memoryNode, reqRepo, projectionNode, provRepo)
+  edgeLoweringPreserved(memoryNode, reqRuntime, projectionNode, provRuntimeIssue)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  =>*
+  C:Cfg
+  loweringPreservedNode(g1, memoryNode) .
+
+--- A core object cannot be owned by two edge lowerings, even if uniqueness is
+--- asserted by a bad artifact.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  acceptedProgram(g1)
+  graphNodes1(g1, memoryNode)
+  graphContainsNode(g1, memoryNode)
+  nodeAccepted(g1, memoryNode)
+  nodeNeeds2(memoryNode, reqIssue, reqMemory)
+  edgeAccepted(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeAccepted(memoryNode, reqMemory, projectionNode, provMemory)
+  coreRelationForEdge(memoryNode, reqIssue, projectionNode, provIssue)
+  coreRelationForEdge(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeTypePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeTypePreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeResourcePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeResourcePreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeCapabilityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCapabilityPreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeVersionPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeVersionPreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeSpanPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeSpanPreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeCardinalityPreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeCardinalityPreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  edgeProvenancePreserved(memoryNode, reqIssue, projectionNode, provIssue)
+  edgeProvenancePreserved(memoryNode, reqMemory, projectionNode, provMemory)
+  loweredByPlatform(memoryNode)
+  loweringCoreOnly(memoryNode)
+  sourceSpanPreserved(memoryNode)
+  nodeResourcePreserved(memoryNode)
+  noExtraCapability(memoryNode)
+  noPackageScheduler(memoryNode)
+  noPackageLifecycle(memoryNode)
+  nodeVersionPreserved(memoryNode)
+  nodeCardinalityPreserved(memoryNode)
+  nodeProvenancePreserved(memoryNode)
+  terminalBindingPreserved(memoryNode)
+  nodeClassLifecycleAccepted(memoryNode)
+  nodeClassOutputAccepted(memoryNode, capabilityCall)
+  loweringDeterministic(g1)
+  loweredIrReportComplete(g1)
+  graphEmits1(g1, coreDependencyObj)
+  edgeCoreObjects1(memoryNode, reqIssue, projectionNode, provIssue, coreDependencyObj)
+  edgeCoreObjects1(memoryNode, reqMemory, projectionNode, provMemory, coreDependencyObj)
+  emittedCoreObject(g1, coreDependencyObj, coreDependencyKind)
+  allowedCoreObjectKind(coreDependencyKind)
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqMemory, projectionNode, provMemory)
+  coreObjectOwnerUnique(g1, coreDependencyObj)
+  noRuntimeInputsDuringLowering(g1)
+  =>*
+  C:Cfg
+  loweringPreserved(g1) .
+
+--- Duplicate node-vs-edge lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByNode(g1, coreEffectObj, memoryNode)
+  coreObjectOwnedByEdge(g1, coreEffectObj, memoryNode, reqIssue, projectionNode, provIssue)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreEffectObj) .
+
+--- Duplicate node-vs-node lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByNode(g1, coreEffectObj, memoryNode)
+  coreObjectOwnedByNode(g1, coreEffectObj, projectionNode)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreEffectObj) .
+
+--- Duplicate edge-vs-edge lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqMemory, projectionNode, provMemory)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreDependencyObj) .
+
+--- Duplicate node-vs-dependency lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByNode(g1, coreDependencyObj, memoryNode)
+  coreObjectOwnedByDependency(g1, coreDependencyObj, dep1)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreDependencyObj) .
+
+--- Duplicate edge-vs-dependency lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByEdge(g1, coreDependencyObj, memoryNode, reqIssue, projectionNode, provIssue)
+  coreObjectOwnedByDependency(g1, coreDependencyObj, dep1)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreDependencyObj) .
+
+--- Duplicate dependency-vs-dependency lowered-object ownership is visible to the checker.
+search [1] in WHIPPLESCRIPT-CONSTRUCT-LOWERING :
+  coreObjectOwnedByDependency(g1, coreDependencyObj, dep1)
+  coreObjectOwnedByDependency(g1, coreDependencyObj, dep2)
+  =>*
+  C:Cfg
+  inconsistentCoreObjectOwner(g1, coreDependencyObj) .

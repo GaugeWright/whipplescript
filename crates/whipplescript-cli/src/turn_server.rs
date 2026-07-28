@@ -347,7 +347,6 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
                 steps: 0,
                 observations: Vec::new(),
                 usage: json!({"input_tokens": 0, "output_tokens": 0}),
-                pending_human_ask: None,
             }
         }
     };
@@ -381,7 +380,6 @@ fn status_name(status: &TurnStatus) -> &'static str {
         TurnStatus::Failed => "failed",
         TurnStatus::TimedOut => "timed_out",
         TurnStatus::Cancelled => "cancelled",
-        TurnStatus::Suspended => "awaiting_human",
     }
 }
 
@@ -576,6 +574,14 @@ mod tests {
             websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    #[test]
+    fn every_turn_status_has_an_explicit_wire_name() {
+        assert_eq!(status_name(&TurnStatus::Completed), "completed");
+        assert_eq!(status_name(&TurnStatus::Failed), "failed");
+        assert_eq!(status_name(&TurnStatus::TimedOut), "timed_out");
+        assert_eq!(status_name(&TurnStatus::Cancelled), "cancelled");
     }
 
     #[test]

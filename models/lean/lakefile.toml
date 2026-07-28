@@ -1,0 +1,5 @@
+name = "whipple-proofs"
+defaultTargets = ["Whipple"]
+
+[[lean_lib]]
+name = "Whipple"

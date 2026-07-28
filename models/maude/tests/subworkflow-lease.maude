@@ -1,0 +1,28 @@
+load ../subworkflow-lease.maude
+
+--- Coverage: a descendant of the lease holder re-enters the lease its own root
+--- holds and runs, rather than blocking.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-LEASE :
+  leaseHeld(r1) wants(r1)
+  =>* C:Cfg running(r1) .
+
+--- Coverage: a turn of a different work-unit blocks while the lease is held
+--- the cross-work-unit exclusion, recoverable.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-LEASE :
+  leaseHeld(r1) wants(r2)
+  =>* C:Cfg blocked(r2) .
+
+--- Coverage: the deadlock sentinel has teeth. Seeded with a same-unit block
+--- which the per-turn mis-keying would produce, the deadlock marker is reachable.
+--- This proves the bite below is not vacuous from a dead rule.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-LEASE :
+  leaseHeld(r1) blocked(r1)
+  =>* C:Cfg deadlock .
+
+--- Bite: the re-entrant lease is deadlock-free. A descendant of the holder never
+--- self-deadlocks. The RESIDUAL soup var means a deadlock in any reachable state
+--- is a solution, so No solution proves a parent blocking on a same-workspace
+--- child cannot deadlock.
+search [1] in WHIPPLESCRIPT-SUBWORKFLOW-LEASE :
+  leaseHeld(r1) wants(r1)
+  =>* deadlock RESIDUAL:Cfg .

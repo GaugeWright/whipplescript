@@ -1,0 +1,39 @@
+load ../workflow-authority-attenuation.maude
+
+--- ============================ COVERAGE ======================================
+
+--- Coverage: without an explicit start grant, the child receives the automatic
+--- cap: declared(child) intersect effective(parent).
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read ; write) childDeclared(read ; model) noStartGrant childAuth(mt)
+  =>! parentEffective(read ; write) childDeclared(mt) noStartGrant childAuth(read) .
+
+--- Coverage: an explicit start grant that is inside the automatic cap is honored.
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read ; write ; exec) childDeclared(read ; write) startGrant(read) childAuth(mt)
+  =>! parentEffective(read ; write ; exec) childDeclared(read ; write) startGrant(mt) childAuth(read) .
+
+--- Coverage: a mixed explicit grant keeps the in-cap authority and drops the
+--- out-of-cap request.
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read ; write) childDeclared(read ; exec) startGrant(read ; exec) childAuth(mt)
+  =>! parentEffective(read ; write) childDeclared(read ; exec) startGrant(mt) childAuth(read) .
+
+--- ============================ BITE ==========================================
+
+--- Bite: the automatic cap never grants an authority the parent lacks.
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read) childDeclared(read ; write) noStartGrant childAuth(mt)
+  =>* childAuth(write ; E:CapSet) RESIDUAL:Cfg .
+
+--- Bite: an explicit start grant cannot widen beyond the parent effective
+--- authority, even if the child declares the requested authority.
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read) childDeclared(read ; write) startGrant(write) childAuth(mt)
+  =>* childAuth(write ; E:CapSet) RESIDUAL:Cfg .
+
+--- Bite: an explicit start grant cannot widen beyond the child declaration, even
+--- if the parent has the requested authority.
+search [1] in WHIPPLESCRIPT-WORKFLOW-AUTHORITY-ATTENUATION :
+  parentEffective(read ; exec) childDeclared(read) startGrant(exec) childAuth(mt)
+  =>* childAuth(exec ; E:CapSet) RESIDUAL:Cfg .

@@ -134,13 +134,29 @@ pub struct OwnedLowering {
     pub errors: Vec<String>,
     /// Effect ids targeted by `cancel <binding>` operations in live scopes.
     pub cancels: Vec<String>,
-    /// 503 auto-fail: a generated `flowfail` terminal fired (an unhandled effect
-    /// failure in a self-terminating flow). The string is the failure reason. This
-    /// routes to the kernel `fail_instance_internal` terminal (a generic failed
-    /// status with no typed `failure` payload) rather than the typed terminal
-    /// commit path. Set only inside an `after <step> fails { flowfail }` block when
-    /// the upstream effect actually failed.
+    /// Auto-fail (R1): an unhandled effect failure in a self-terminating
+    /// workflow. The string is the failure reason. This routes to the kernel
+    /// `fail_instance_internal` terminal (a generic failed status with no typed
+    /// `failure` payload) rather than the typed terminal commit path. Set by
+    /// the rule-level net: an effect at terminal `failed`/`timed_out` with no
+    /// observing `after` block on its binding.
     pub internal_fail: Option<String>,
+    /// Auto-fail (R1) in a `@service` workflow: a service can never auto-fail,
+    /// so each unhandled effect failure is surfaced as a durable diagnostic
+    /// (recorded idempotently per effect in rule_pass) and the service keeps
+    /// running.
+    pub unhandled_failures: Vec<OwnedUnhandledFailure>,
+}
+
+/// One unhandled effect failure observed by the rule-level auto-fail net in a
+/// `@service` workflow (see `OwnedLowering::unhandled_failures`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedUnhandledFailure {
+    pub rule: String,
+    pub binding: String,
+    pub effect_id: String,
+    /// The effect's terminal status (`failed` | `timed_out`).
+    pub status: String,
 }
 
 /// A record of how a `case`/`decide` scrutinee resolved during lowering, surfaced

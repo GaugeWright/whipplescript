@@ -1,0 +1,49 @@
+--- Script hard-off Layer 2 (S6d-6, spec/std-script.md): import-conditional
+--- per-program capability seeding, the runtime backstop behind the Layer 1
+--- check-time gate. Every exec.command effect requires a bound script.*
+--- capability (script.<name> for the capability form, script.raw for the raw
+--- form); the capability row for a program is seeded ONLY when BOTH keys
+--- turn:
+---   key a: the program's REGISTERED IR imports std.script, and
+---   key b: the authority source exists on the operator plane -- a
+---     script-manifest entry for script.<name>; dev profile + allowlist for
+---     script.raw.
+--- An exec effect with no bound capability blocks at the store admission
+--- gate (blocked_by_capability) before any provider run.
+---
+--- The two-key property is what resists forged IR: an attacker who
+--- fabricates IR can forge the `use std.script` line (key a), but cannot
+--- conjure the operator-plane authority (key b), so the seed never happens
+--- and the effect blocks. Layer 1 alone cannot provide this, because the
+--- use line is itself part of the forgeable IR.
+mod WHIPPLESCRIPT-SCRIPT-CAPABILITY-SEEDING is
+  protecting BOOL .
+
+  sorts Cap Cfg .
+
+  --- Sample script capabilities: a manifest-named script and the raw form.
+  ops judge raw : -> Cap [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op importsScript : -> Cfg [ctor] .    --- registered IR imports std.script (key a)
+  op operatorAuthority : Cap -> Cfg [ctor] . --- operator-plane source exists (key b)
+  op unseeded : Cap -> Cfg [ctor] .     --- seeding not yet decided for this capability
+  op bound : Cap -> Cfg [ctor] .        --- capability row seeded for the program
+  op execEffect : Cap -> Cfg [ctor] .   --- an exec.command effect requiring the capability
+  op admitted : Cap -> Cfg [ctor] .     --- the effect passed store admission
+
+  var N : Cap .
+
+  --- Two-key seeding: the capability row exists only when the import AND the
+  --- operator authority are both present. Both premises stay in the soup --
+  --- one import + one authority source seed any number of decisions.
+  rl [seed] : unseeded(N) importsScript operatorAuthority(N)
+    => bound(N) importsScript operatorAuthority(N) .
+
+  --- Store admission: an exec effect is admitted only against a bound
+  --- capability. There is no other admission rule -- an unbound effect stays
+  --- blocked (blocked_by_capability, surfaced as security.script_disabled).
+  rl [admit] : execEffect(N) bound(N) => admitted(N) bound(N) .
+endm

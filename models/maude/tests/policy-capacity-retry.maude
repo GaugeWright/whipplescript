@@ -1,0 +1,37 @@
+load ../kernel.maude
+
+--- Policy-blocked work cannot start before policy allows it.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByPolicy)
+  =>*
+  effect(e1, running) .
+
+--- Policy approval releases a policy-blocked effect.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByPolicy) policyAllows(e1)
+  =>*
+  effect(e1, running) policyAllows(e1) .
+
+--- Capacity-blocked work cannot start before capacity is available.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByCapacity)
+  =>*
+  effect(e1, running) .
+
+--- Capacity availability releases a capacity-blocked effect.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, blockedByCapacity) capacityAvailable(e1)
+  =>*
+  effect(e1, running) capacityAvailable(e1) .
+
+--- A running effect with an active lease can expire and become queued again.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running) lease(e1, leaseActive)
+  =>*
+  effect(e1, queued) lease(e1, leaseExpired) event(leaseExpiredEvt) .
+
+--- Retry reuses the same effect identity after failure.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, failed) retryAllowed(e1)
+  =>*
+  effect(e1, running) retryUsed(e1) .

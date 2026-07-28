@@ -1,0 +1,54 @@
+load ../effect-error.maude
+
+--- Bite static-narrow cross-kind: reading exec's extra rExit at a site narrowed to
+--- coerceK whose schema has no rExit is rejected.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  read(coerceK, rExit)
+  =>* C:Cfg rejectFieldNotInSchema(coerceK, rExit) .
+
+--- Bite extras-behind-narrowing the load-bearing one: an UN-narrowed read of a
+--- non-base extra is rejected -- an extra is reachable only through narrowing.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  baseRead(rExit)
+  =>* C:Cfg rejectExtraUnnarrowed(rExit) .
+
+--- Bite observer-only: constructing an EffectError of any kind is rejected.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  constructs(execK)
+  =>* C:Cfg rejectConstruct(execK) .
+
+--- Bite base-present: a failure value that omits a base field reason is rejected.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  missingBase(coerceK, reason)
+  =>* C:Cfg rejectMissingBase(coerceK, reason) .
+
+--- Coverage static-narrow: exec's own extra rExit at an execK-narrowed site is
+--- well-typed -- never rejected. RESIDUAL makes the No-solution non-vacuous.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  read(execK, rExit)
+  =>* rejectFieldNotInSchema(K:Kind, F:Field) RESIDUAL:Cfg .
+
+--- Coverage base-present: a base field reason at any narrowed site is well-typed --
+--- base is in every kind's schema, so it is never rejected.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  read(coerceK, reason)
+  =>* rejectFieldNotInSchema(K:Kind, F:Field) RESIDUAL:Cfg .
+
+--- Coverage additivity: an un-narrowed read of a BASE field is well-typed. This is
+--- what makes base reads total and proves adding an extra variant later cannot
+--- change an existing un-narrowed base read.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  baseRead(reason)
+  =>* rejectExtraUnnarrowed(F:Field) RESIDUAL:Cfg .
+
+--- Bite static-narrow P3 variants: rStatus is coerce's extra; a tellK-narrowed
+--- read of it is rejected (tell's schema has rClass but no rStatus).
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  read(tellK, rStatus)
+  =>* C:Cfg rejectFieldNotInSchema(tellK, rStatus) .
+
+--- Coverage P3 variants: coerce's own extras are well-typed under coerceK
+--- narrowing -- never rejected. RESIDUAL makes the No-solution non-vacuous.
+search [1] in WHIPPLESCRIPT-EFFECT-ERROR :
+  read(coerceK, rClass)
+  =>* rejectFieldNotInSchema(K:Kind, F:Field) RESIDUAL:Cfg .

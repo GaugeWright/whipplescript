@@ -3,6 +3,10 @@ source_tags
 @service workflow QueueWorkerWithReview
 source_descriptions
 "Claim ready work items, implement them, review each turn, and escalate failed reviews to a human" workflow QueueWorkerWithReview
+uses
+  package std.coercion
+  package std.tracker
+  package std.agent
 schemas
   enum ReviewStatus { Accept, Revise, Blocked }
   class WorkReview
@@ -29,16 +33,14 @@ rules
     writes
       schema:ReviewedWork
     effects
-      active_claim kind=tracker.claim binding=active_claim key=4f1eba1192865a81
-      turn kind=agent.tell binding=turn key=1d124f49240816a7
-      review kind=schema.coerce binding=review key=d8e8ca8d5f1369f1
-      effect4 kind=tracker.finish binding=- key=8707324facb2e308
-      effect5 kind=tracker.release binding=- key=0e796dff366d7f0d
-      effect6 kind=human.ask binding=- key=631378576107ef4f
+      active_claim kind=tracker.claim binding=active_claim key=f9b8e615dc6b0001a3b1a9d844181da3
+      turn kind=agent.tell binding=turn key=646546e2b1b8aa39e978f44def9967a2
+      review kind=schema.coerce binding=review key=c11847c6fd4d8d7e6daf04ebfb49ff68
+      effect4 kind=tracker.finish binding=- key=28a4c3372ca9812f259710ce95997e91
+      effect5 kind=tracker.release binding=- key=23385968a426d985a6f3faf2c50da4bc
     dependencies
       active_claim --succeeds--> turn
       turn --succeeds--> review
       review --succeeds--> effect4
       review --fails--> effect5
-      review --fails--> effect6
-    body_hash 7cb189b7fa690d35
+    body_hash 13505c8a19a1cbf39e44638654974327

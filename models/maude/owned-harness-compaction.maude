@@ -1,0 +1,23 @@
+--- Owned brokered agent harness, slice 5: context compaction projection.
+--- Companion to DR-0024 boundary corollary and spec/owned-harness-tool-taxonomy.md.
+--- The model context is a projection over the durable stream; when it grows,
+--- compaction elides OLD entries to references while preserving the RECENT
+--- window verbatim. Compaction touches only the projected context; the durable
+--- record is append-only and untouched. The safety property modeled here: a
+--- recent entry is never elided by compaction.
+mod WHIPPLESCRIPT-OWNED-HARNESS-COMPACTION is
+  sorts Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op compacting : -> Cfg [ctor] .   --- a compaction pass is in progress
+  op oldEntry : -> Cfg [ctor] .     --- an entry outside the recent window
+  op recentEntry : -> Cfg [ctor] .  --- an entry in the preserved recent window
+  op elided : -> Cfg [ctor] .       --- an entry replaced by a reference
+
+  --- Compaction elides only OLD entries. There is no rule that elides a
+  --- recentEntry, so the recent window survives. Letting [elide] match a
+  --- recentEntry would make the bite satisfiable.
+  rl [elide] : compacting oldEntry => compacting elided .
+endm

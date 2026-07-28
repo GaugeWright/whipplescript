@@ -1,6 +1,8 @@
 workflow Ralph
 source_tags
 @service workflow Ralph
+uses
+  package std.agent
 agents
   agent ralph harness=<fallback> provider=fixture profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[]
 rules
@@ -11,8 +13,8 @@ rules
       pattern:ralph is available
       pattern:started
     effects
-      effect1 kind=agent.tell binding=- key=d5d61cc9eb100ae8
-    body_hash ebc862f53cab99ae
+      effect1 kind=agent.tell binding=- key=f66f41a3a63d6b9d16f2fdfd1429e12e
+    body_hash 668d232e0954356a2b32d2b0b6dac1ec
   rule again
     when ralph completed turn
     when ralph is available
@@ -20,5 +22,5 @@ rules
       pattern:ralph completed turn
       pattern:ralph is available
     effects
-      effect1 kind=agent.tell binding=- key=686b18038554fcbb
-    body_hash ebc862f53cab99ae
+      effect1 kind=agent.tell binding=- key=7026ee67ac4b241c29d45c20e8a42378
+    body_hash 668d232e0954356a2b32d2b0b6dac1ec

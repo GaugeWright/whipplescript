@@ -1,0 +1,18 @@
+load ../catalogue-determinism.maude
+
+--- Coverage: three skills discovered in one order converge to the sorted catalogue.
+search [1] in WHIPPLESCRIPT-CATALOGUE-DETERMINISM :
+  pending(sc) pending(sa) pending(sb) cat(nil)
+  =>! cat(sa : sb : sc : nil) .
+
+--- Coverage: a DIFFERENT discovery order converges to the SAME catalogue.
+search [1] in WHIPPLESCRIPT-CATALOGUE-DETERMINISM :
+  pending(sb) pending(sc) pending(sa) cat(nil)
+  =>! cat(sa : sb : sc : nil) .
+
+--- Bite: no mis-ordered catalogue is a terminal. The unique normal form is the
+--- sorted list, so a search for any other terminal order returns No solution --
+--- placement order is not observable in the catalogue bytes.
+search [1] in WHIPPLESCRIPT-CATALOGUE-DETERMINISM :
+  pending(sc) pending(sa) pending(sb) cat(nil)
+  =>! cat(sb : sa : sc : nil) RESIDUAL:Cfg .

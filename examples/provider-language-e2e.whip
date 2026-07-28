@@ -1,3 +1,7 @@
+use std.coercion
+use std.agent.claude
+use std.agent.codex
+
 @fixture
 @acceptance
 description "Fixture-backed provider x language acceptance workflow"
@@ -6,7 +10,7 @@ workflow ProviderLanguageE2E
 
 
 class LanguageTask {
-  provider AgentRef<codex | claude | pi>
+  provider AgentRef<codex | claude>
   language string
   expectedScript string
   prompt string
@@ -66,12 +70,6 @@ agent claude {
   capacity 2
 }
 
-agent pi {
-  provider pi
-  profile "repo-writer"
-  capacity 2
-}
-
 @acceptance
 description "Codex completes both assigned language tasks"
 assert count(LanguageE2EResult where provider == "codex") == 2
@@ -79,17 +77,14 @@ assert count(LanguageE2EResult where provider == "codex") == 2
 description "Claude completes both assigned language tasks"
 assert count(LanguageE2EResult where provider == "claude") == 2
 @acceptance
-description "Pi completes both assigned language tasks"
-assert count(LanguageE2EResult where provider == "pi") == 2
-@acceptance
 description "All seeded language tasks are consumed"
 assert count(LanguageTask where status == "queued") == 0
 @acceptance
 description "All agent turns complete"
-assert count(effect kind agent.tell where status == completed) == 6
+assert count(effect kind agent.tell where status == completed) == 4
 @acceptance
 description "All language reviews complete"
-assert count(effect kind schema.coerce where status == completed) == 6
+assert count(effect kind schema.coerce where status == completed) == 4
 
 @fixture
 description "Static provider x language task rows"
@@ -130,23 +125,6 @@ table language_tasks as LanguageTask [
     status "queued"
   }
 
-  {
-    provider pi
-    language "Japanese"
-    expectedScript "Kana and kanji"
-    prompt "Write a four-line original poem about a quiet train station."
-    artifactPath "target/dogfood/language/pi-japanese.txt"
-    status "queued"
-  }
-
-  {
-    provider pi
-    language "German"
-    expectedScript "Latin"
-    prompt "Write a four-line original poem about snow on rooftops."
-    artifactPath "target/dogfood/language/pi-german.txt"
-    status "queued"
-  }
 ]
 
 description "Route one queued language task to its selected provider"

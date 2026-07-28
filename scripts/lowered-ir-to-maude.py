@@ -206,11 +206,9 @@ def validate_construct_graph_admission(
 
 
 def stable_hash_hex(value: str) -> str:
-    hash_value = 0xCBF29CE484222325
-    for byte in value.encode("utf-8"):
-        hash_value ^= byte
-        hash_value = (hash_value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return f"{hash_value:016x}"
+    # Mirrors the Rust stable_hash: SHA-256 truncated to 128 bits (the
+    # FNV-collision hardening swap). Extend every mirror together.
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
 def canonical_json(value: Any) -> str:
@@ -218,7 +216,7 @@ def canonical_json(value: Any) -> str:
 
 
 def is_stable_digest(value: str) -> bool:
-    return len(value) == 16 and all(ch in "0123456789abcdef" for ch in value)
+    return len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
 
 
 def required_string(value: dict[str, Any], field: str, label: str) -> str:
@@ -240,9 +238,9 @@ def validate_report_entry_identity(
     ir_hash = required_string(entry, "ir_hash", label)
     source_hash = required_string(entry, "source_hash", label)
     if not is_stable_digest(ir_hash):
-        raise SystemExit(f"{label}.ir_hash must be a 16-character lowercase hex digest")
+        raise SystemExit(f"{label}.ir_hash must be a 32-character lowercase hex digest")
     if not is_stable_digest(source_hash):
-        raise SystemExit(f"{label}.source_hash must be a 16-character lowercase hex digest")
+        raise SystemExit(f"{label}.source_hash must be a 32-character lowercase hex digest")
     expected_ir_hash = stable_hash_hex(snapshot)
     if ir_hash != expected_ir_hash:
         raise SystemExit(

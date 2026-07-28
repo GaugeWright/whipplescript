@@ -1,0 +1,135 @@
+--- Per-tool flow SIGNATURE, the X2 refinement of the opaque join box (DR-0029).
+--- The join box is the default: every output carries the join of EVERY input. A
+--- signature only ever DEPARTS from that default, per input-to-result edge, in one
+--- of three states.
+---
+---   direct        the result carries the input full label. This is the join-box
+---                 default; an unlisted edge is direct. Listing only departures is
+---                 fail-closed: a dropped contract entry reverts to direct, never to
+---                 absent.
+---   absent        the input provably does NOT flow to the result, a non-interference
+---                 claim the PRODUCER must prove on its internals (v1 whole-result).
+---   mediated(C)   the input flows to the result ONLY through an internal crossing C,
+---                 a declassify or endorse. A conditional discount, valid only when
+---                 the consumer GRANTS C (X3); the result then carries C bounded
+---                 TARGET label, not the input label (v2 conditional feature).
+---
+--- The check is TWO-SIDED, mirroring infoflow-package.
+---
+---   producer: attests a signature ONLY when every declared edge is justified by the
+---             internal IFC check. absent(i) requires noReach(i), no flow at all.
+---             mediated(i,C) requires mediated(i,C), meaning EVERY path from i to the
+---             result traverses C, a CUT and not mere reachance, AND nmifOk(C), the
+---             crossing is not attacker steered (I-IFC3). An under-claimed independence
+---             over a real flow, a BYPASSED mediation where some path avoids C, or an
+---             attacker-steered crossing is unsound and never attested.
+---
+---   consumer: derives the result label by applying the signature to its bound input
+---             labels and checks it fits the envelope. Per edge the contribution is:
+---             direct gives the input full label; absent gives nothing (lo); mediated
+---             and GRANTED gives C target label, the bounded ceiling; mediated and
+---             UNGRANTED FALLS BACK to direct, the full label. The ungranted fallback
+---             is the fail-closed core: ungranted is NEVER treated as absent. The
+---             result fits when the join of all contributions is releasable to the
+---             consumer audience. A granted crossing whose TARGET still exceeds the
+---             envelope is rejected, since a grant is not a blank check.
+---
+--- Soundness: a tool result is released to an audience ONLY when the producer attested
+--- a signature justified by its internals AND the consumer-derived result label fits
+--- the envelope, with every mediated discount backed by a granted crossing. Anything
+--- else is rejected. This refines the infoflow-package whole-surface boolean gate to a
+--- per-edge, label-carrying signature.
+mod WHIPPLESCRIPT-INFOFLOW-SIGNATURE is
+  protecting BOOL .
+
+  sorts Port Crossing Level Edge EdgeSet Fact Cfg .
+  subsort Edge < EdgeSet .
+  subsort Fact < Cfg .
+
+  ops i1 i2 : -> Port [ctor] .
+  op c1 : -> Crossing [ctor] .
+
+  --- a two-point confidentiality lattice. lo is releasable to the consumer audience,
+  --- hi is secret. The audience here wants a public (lo) release; the result fits
+  --- when its derived level is lo.
+  ops lo hi : -> Level [ctor] .
+  op join : Level Level -> Level [assoc comm] .
+  eq join(lo, L:Level) = L:Level .
+  eq join(hi, L:Level) = hi .
+
+  --- the declared signature, a set of per-edge departures from the join box.
+  op dir : Port -> Edge [ctor] .            --- explicit direct, same as omitting it
+  op abs : Port -> Edge [ctor] .            --- declared absent, a non-interference claim
+  op med : Port Crossing -> Edge [ctor] .   --- declared mediated by a crossing
+  op mtEdges : -> EdgeSet [ctor] .
+  op __ : EdgeSet EdgeSet -> EdgeSet [ctor assoc comm id: mtEdges] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- the signature, carried as one config element.
+  op decl : EdgeSet -> Cfg [ctor] .
+
+  --- producer ground truth, what the internal IFC check found.
+  op reaches : Port -> Fact [ctor] .            --- input flows to result by SOME path
+  op noReach : Port -> Fact [ctor] .            --- input provably does not flow
+  op mediated : Port Crossing -> Fact [ctor] .  --- EVERY path from input traverses C, a cut
+  op bypasses : Port Crossing -> Fact [ctor] .  --- SOME path from input avoids C
+  op nmifOk : Crossing -> Fact [ctor] .         --- crossing selector is high integrity
+  op nmifBad : Crossing -> Fact [ctor] .        --- crossing is attacker steered
+
+  --- consumer bindings.
+  op clr : Port Level -> Fact [ctor] .     --- consumer binds the input port to this level
+  op tgt : Crossing Level -> Fact [ctor] . --- the crossing declassify TARGET, its ceiling
+  op grant : Crossing -> Fact [ctor] .     --- consumer grants the crossing (X3 authority)
+
+  --- markers.
+  op attestsSig : -> Cfg [ctor] .   --- producer attested the signature as justified
+  op accepted : -> Cfg [ctor] .     --- consumer released the result
+  op rejected : -> Cfg [ctor] .     --- consumer rejected, fail-closed
+
+  eq attestsSig attestsSig = attestsSig .
+  eq accepted accepted = accepted .
+  eq rejected rejected = rejected .
+
+  vars P : Port .  var C : Crossing .  var L : Level .
+  var E : Edge .  var ES : EdgeSet .  var G : Cfg .
+
+  --- producer side. Is every declared edge justified by the internals?
+  op sound : EdgeSet Cfg -> Bool .
+  eq sound(mtEdges, G) = true .
+  eq sound((E ES), G) = edgeSound(E, G) and sound(ES, G) .
+
+  op edgeSound : Edge Cfg -> Bool .
+  eq edgeSound(dir(P), G) = true .                           --- direct is always sound, conservative
+  eq edgeSound(abs(P), noReach(P) G) = true .                --- absent needs proven non-interference
+  eq edgeSound(med(P,C), mediated(P,C) nmifOk(C) G) = true . --- mediated needs a CUT and NMIF
+  eq edgeSound(E, G) = false [owise] .                       --- bypassed, nmif-bad, under-claimed: unsound
+
+  --- consumer side. Derive the result label under the signature and the grants.
+  op contrib : Edge Cfg -> Level .
+  eq contrib(abs(P), G) = lo .                       --- absent contributes nothing
+  eq contrib(dir(P), clr(P,L) G) = L .              --- direct contributes the full label
+  eq contrib(med(P,C), grant(C) tgt(C,L) G) = L .   --- mediated and GRANTED, the bounded target
+  eq contrib(med(P,C), clr(P,L) G) = L [owise] .    --- mediated and UNGRANTED, fall back to direct
+
+  op resultLevel : EdgeSet Cfg -> Level .
+  eq resultLevel(mtEdges, G) = lo .
+  eq resultLevel((E ES), G) = join(contrib(E, G), resultLevel(ES, G)) .
+
+  --- rules.
+  --- producer: attest the signature ONLY when every declared edge is justified. An
+  --- unsound declaration produces no attestation, so it can never be accepted.
+  crl [attest-sig] : decl(ES) G => decl(ES) G attestsSig
+    if sound(ES, G) .
+
+  --- consumer: release the result when the package is attested AND the derived result
+  --- label fits the public audience (lo). Mediated discounts are folded in by contrib:
+  --- granted gives the target, ungranted falls back to direct.
+  crl [accept] : decl(ES) attestsSig G => decl(ES) attestsSig G accepted
+    if resultLevel(ES, G) == lo .
+
+  --- consumer: reject when the derived result label exceeds the envelope.
+  crl [reject] : decl(ES) attestsSig G => decl(ES) attestsSig G rejected
+    if resultLevel(ES, G) =/= lo .
+endm

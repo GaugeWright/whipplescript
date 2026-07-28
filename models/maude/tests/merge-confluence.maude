@@ -1,0 +1,66 @@
+load ../merge-confluence.maude
+
+--- Fixture 1: three pairwise-disjoint edits -- eA writes d1, eB writes d2,
+--- eC writes d3; eA and eB also both READ d4 (read-read overlap is not
+--- interference). Coverage: all fold orders converge on one cut with every
+--- write preserved and nothing escalated.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, d4) ; edit(eB, d2, mtD, d4) ;
+            edit(eC, d3, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator(mtE, at(d1, eA) ; at(d2, eB) ; at(d3, eC) ; at(d4, e0))
+      conflictGroup(mtE) .
+
+--- Bite on order-independence: NO fold order reaches a different final
+--- cut. Confluence is exhaustive over the (nondeterministic) fold orders,
+--- not sampled.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, d4) ; edit(eB, d2, mtD, d4) ;
+            edit(eC, d3, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator(mtE, M:MSet) conflictGroup(GS:EditSet)
+  such that (M:MSet == at(d1, eA) ; at(d2, eB) ; at(d3, eC) ; at(d4, e0))
+            = false .
+
+--- Fixture 2: an overlap CHAIN plus an independent edit. eA writes d1;
+--- eB writes d2 and reads d1, overlapping eA; eC writes d3 and reads d2,
+--- overlapping eB; eA and eC are pairwise DISJOINT -- connected only
+--- through eB. eD writes d4, disjoint from everything. Coverage: the whole
+--- chain escalates jointly as one overlap-graph component while eD folds.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, mtD) ; edit(eB, d2, mtD, d1) ;
+            edit(eC, d3, mtD, d2) ; edit(eD, d4, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator(mtE, at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, eD))
+      conflictGroup(edit(eA, d1, mtD, mtD) ; edit(eB, d2, mtD, d1) ;
+                    edit(eC, d3, mtD, d2)) .
+
+--- Bite on joint escalation: no order folds eC into the cut, even though
+--- eC is pairwise disjoint from eA -- first-come-first-served escalation
+--- of only the directly-overlapping pair would wrongly admit it.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, mtD) ; edit(eB, d2, mtD, d1) ;
+            edit(eC, d3, mtD, d2) ; edit(eD, d4, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator(mtE, (at(d3, eC) ; M:MSet)) conflictGroup(GS:EditSet) .
+
+--- Bite: nor does the chain's head eA ever land.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, mtD) ; edit(eB, d2, mtD, d1) ;
+            edit(eC, d3, mtD, d2) ; edit(eD, d4, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator(mtE, (at(d1, eA) ; M:MSet)) conflictGroup(GS:EditSet) .
+
+--- Bite on progress: the mediator never wedges -- no normal form retains a
+--- pending edit.
+search [1] in WHIPPLESCRIPT-MERGE-CONFLUENCE :
+  mediator((edit(eA, d1, mtD, mtD) ; edit(eB, d2, mtD, d1) ;
+            edit(eC, d3, mtD, d2) ; edit(eD, d4, mtD, mtD)),
+           at(d1, e0) ; at(d2, e0) ; at(d3, e0) ; at(d4, e0))
+  conflictGroup(mtE)
+  =>! mediator((E:Edit ; ES:EditSet), M:MSet) conflictGroup(GS:EditSet) .

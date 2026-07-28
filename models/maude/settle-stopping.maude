@@ -1,0 +1,89 @@
+--- Settle stopping and certification, per the experimentation research
+--- note section 4.3 and section 11: `whip settle` names a decision and
+--- the system STOPS ITSELF -- at the gauge's bar, when evidence is
+--- exhausted (an honest `undetermined`), never at an operator-chosen N.
+--- `--certify` upgrades the stopping rule to an ANYTIME-VALID sequential
+--- test: a certificate exists only when accumulated evidence strength
+--- crosses the threshold K (the log-domain abstraction of an e-process
+--- crossing 1/alpha; Ville's inequality makes the first crossing valid at
+--- any stopping time, which is why crossing-once suffices).
+---
+--- Two certifiers over one observation stream. The SOUND certifier
+--- accumulates evidence level (a strong observation raises it, a contrary
+--- one lowers it, floored at zero) and certifies exactly at level >= K;
+--- exhaustion below K ends in undetermined, never a certificate. The
+--- NAIVE certifier is the run-until-N ritual: it certifies whenever the
+--- point estimate favors the bar at the moment sampling happens to stop
+--- -- a lucky early pass mints a certificate no evidence supports.
+mod WHIPPLESCRIPT-SETTLE-STOPPING is
+  sorts Cnt Obs ObsList Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+
+  ops strong contrary : -> Obs [ctor] .
+  op nilO : -> ObsList [ctor] .
+  op _;_ : Obs ObsList -> ObsList [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op level : Cnt -> Cfg [ctor] .     --- accumulated evidence strength
+  op thresh : Cnt -> Cfg [ctor] .    --- K, the certification threshold
+  op stream : ObsList -> Cfg [ctor] . --- remaining observations
+  op passes : Cnt -> Cfg [ctor] .    --- naive point-estimate bookkeeping
+  op sound : -> Cfg [ctor] .
+  op naive : -> Cfg [ctor] .
+  op open : -> Cfg [ctor] .          --- the undecided decision (consumed once)
+  op certified : -> Cfg [ctor] .     --- an anytime-valid certificate
+  op undetermined : -> Cfg [ctor] .  --- honest exhaustion below K
+
+  var K N : Cnt .
+  var L : ObsList .
+
+  --- Sound: fold observations into the evidence level.
+  rl [take-strong] :
+      sound level(N) stream(strong ; L)
+      => sound level(s(N)) stream(L) .
+
+  rl [take-contrary-floor] :
+      sound level(z) stream(contrary ; L)
+      => sound level(z) stream(L) .
+
+  rl [take-contrary] :
+      sound level(s(N)) stream(contrary ; L)
+      => sound level(N) stream(L) .
+
+  --- Certify exactly at the threshold crossing -- valid at ANY point in
+  --- the stream (anytime validity), so the rule needs no exhaustion. The
+  --- verdict consumes the single `open` cell: one settle, one outcome.
+  rl [certify] :
+      sound open level(s(N)) thresh(s(N))
+      => sound certified level(s(N)) thresh(s(N)) .
+
+  --- Exhaustion below the threshold is an honest undetermined.
+  crl [exhausted] :
+      sound open level(N) thresh(K) stream(nilO)
+      => sound undetermined level(N) thresh(K) stream(nilO)
+      if lt(N, K) .
+
+  op lt : Cnt Cnt -> Bool .
+  eq lt(z, s(N)) = true .
+  eq lt(s(K), s(N)) = lt(K, N) .
+  eq lt(N, z) = false .
+
+  --- Naive: the point-estimate certifier. Any strong observation bumps
+  --- the tally, and a certificate is minted the moment the tally is
+  --- positive -- evidence strength and contrary observations unread.
+  rl [naive-take] :
+      naive passes(N) stream(strong ; L)
+      => naive passes(s(N)) stream(L) .
+
+  rl [naive-skip] :
+      naive passes(N) stream(contrary ; L)
+      => naive passes(N) stream(L) .
+
+  rl [naive-certify] :
+      naive open passes(s(N))
+      => naive certified passes(s(N)) .
+endm

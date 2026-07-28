@@ -1,0 +1,58 @@
+load ../kernel.maude
+
+--- A coding-agent turn gated by a tracker claim cannot start before the
+--- claim effect succeeds.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, queued)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Once the tracker claim succeeds, the agent turn can be released and run.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, completed)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Claim failure does not release the success-gated agent turn.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, failed)
+  providerRun(claimEff)
+  dep(claimEff, succeeds, tellEff)
+  effect(tellEff, running) .
+
+--- Claim failure can release an explicit failure handler, such as human review.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  fact(issueFact)
+  effect(claimEff, queued)
+  providerRun(claimEff)
+  dep(claimEff, fails, askEff)
+  effect(askEff, blocked)
+  =>*
+  fact(issueFact)
+  effect(claimEff, failed)
+  providerRun(claimEff)
+  dep(claimEff, fails, askEff)
+  effect(askEff, running) .

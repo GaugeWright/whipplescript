@@ -1,6 +1,9 @@
 workflow IncidentRouter
 source_tags
 @service workflow IncidentRouter
+uses
+  package std.agent.codex
+  package std.agent.claude
 schemas
   class Owner
     name string
@@ -11,7 +14,7 @@ schemas
     tags array<string>
     metadata map<string>
     owner optional<ref<Owner>>
-    assignee agentref<codex | claude | pi>
+    assignee agentref<codex | claude>
     status literal<"open">
   class RoutedIncident
     id string
@@ -21,7 +24,6 @@ schemas
 agents
   agent codex harness=<fallback> provider=codex profile=repo-writer capacity=1 skills=[] capabilities=[] tools=[] class=delegated
   agent claude harness=<fallback> provider=claude profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[] class=delegated
-  agent pi harness=<fallback> provider=pi profile=repo-reader capacity=1 skills=[] capabilities=[] tools=[] class=delegated
 assertions
   assert count(Incident where status == "open") == 0
     reads
@@ -32,9 +34,9 @@ assertions
   assert exists(RoutedIncident where provider == "codex")
     reads
       fact:RoutedIncident where provider == "codex"
-  assert exists(RoutedIncident where provider == "pi")
+  assert exists(RoutedIncident where provider == "claude")
     reads
-      fact:RoutedIncident where provider == "pi"
+      fact:RoutedIncident where provider == "claude"
 rules
   rule table_incidents
     when started
@@ -43,9 +45,9 @@ rules
     writes
       schema:Incident
     record_sources
-      schema:Incident construct=table_row span=1015..1196
-      schema:Incident construct=table_row span=1199..1380
-    body_hash 8e0268dfb39ee011
+      schema:Incident construct=table_row span=977..1162
+      schema:Incident construct=table_row span=1165..1346
+    body_hash 60b8ba8fab7d4962f85022c3bf4b083d
   rule route_incident
     when Incident as incident where (((incident.severity >= 2) && ("route" in incident.metadata)) && (incident.metadata["route"] in ["code", "review", "ops"])) && ((incident.owner == null) || exists(incident.owner))
     when incident.assignee is available
@@ -57,7 +59,7 @@ rules
     consumes
       schema:Incident
     effects
-      turn kind=agent.tell binding=turn key=bace924c779e81b8
-    body_hash 487aac506570c011
+      turn kind=agent.tell binding=turn key=6829f6e8695ccf81b32c4506c7101d5a
+    body_hash b9000802d8c287072122169bdfd63899
 rule_dependencies
   table_incidents --schema:Incident--> route_incident

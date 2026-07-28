@@ -17,15 +17,28 @@ use serde_json::{json, Map, Value};
 use crate::coerce_native::{
     CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest, HttpResponse,
 };
+use crate::exec_http::sha256_hex;
 use crate::harness_loop::{
     ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient, ModelCallMachine,
     ModelReply, ToolCall, ToolSpec,
 };
+use crate::idempotency_key;
 use crate::sansio::run_to_completion;
 
 /// Cap on a provider control-plane error string crossing into a turn failure
 /// (matches the coerce path; DR-0024 lets operational errors cross redaction).
 const PROVIDER_ERROR_CAP: usize = 300;
+const OPENAI_PROMPT_CACHE_KEY_MAX_BYTES: usize = 64;
+
+fn openai_request_key(cache_key: Option<&str>) -> Option<String> {
+    cache_key.map(|key| {
+        if key.len() <= OPENAI_PROMPT_CACHE_KEY_MAX_BYTES {
+            key.to_owned()
+        } else {
+            sha256_hex(key.as_bytes())
+        }
+    })
+}
 
 /// The context window (tokens) of a provider model, for the conversation-compaction
 /// trigger (context-assembly Phase 4). This is a **model capability**, derived from
@@ -148,11 +161,9 @@ pub struct MessagesApiClient {
     model: String,
     base_url: String,
     max_tokens: u64,
-    /// Stable per-turn-thread cache key (Decision 7). The durable-object host
-    /// constructs this client once per object (not per turn), so it has no
-    /// per-effect id at construction and passes `None` for now; the Anthropic
-    /// `cache_control` breakpoint still applies. Wiring the per-turn key through
-    /// the DO agent path is a later-phase follow-up.
+    /// Stable per-turn/effect cache scope (Decision 7). It remains the provider
+    /// prompt-cache scope, while each distinct model round derives its own
+    /// deterministic idempotency key from this scope and the exact model input.
     cache_key: Option<String>,
     codex: Option<CodexBackend>,
 }
@@ -212,7 +223,7 @@ impl MessagesApiClient {
 impl HttpModelClient for MessagesApiClient {
     fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
         if let Some(codex) = &self.codex {
-            return build_codex_request(
+            let mut request = build_codex_request(
                 &self.base_url,
                 &self.api_key,
                 &self.model,
@@ -222,8 +233,13 @@ impl HttpModelClient for MessagesApiClient {
                 messages,
                 tools,
             );
+            set_round_idempotency_key(
+                &mut request,
+                round_idempotency_key(self.cache_key.as_deref(), messages, tools),
+            );
+            return request;
         }
-        build_request(
+        let mut request = build_request(
             self.provider,
             &self.base_url,
             &self.api_key,
@@ -232,19 +248,76 @@ impl HttpModelClient for MessagesApiClient {
             self.cache_key.as_deref(),
             messages,
             tools,
-        )
+        );
+        set_round_idempotency_key(
+            &mut request,
+            round_idempotency_key(self.cache_key.as_deref(), messages, tools),
+        );
+        // The Durable Object host owns an incremental provider transport. Ask
+        // OpenAI's Responses API for SSE so the host can publish text deltas
+        // while still assembling the terminal response through
+        // `assemble_codex_responses_sse`. The native client uses
+        // `RealHarnessModelClient`, so its synchronous transport is unchanged.
+        if self.provider == CoerceProvider::OpenAi {
+            request.body["stream"] = json!(true);
+            request
+                .headers
+                .push(("accept".to_owned(), "text/event-stream".to_owned()));
+        }
+        request
     }
 
     fn parse_response(
         &self,
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
+        let response = response.map(|mut response| {
+            if self.provider == CoerceProvider::OpenAi {
+                if let Some(raw) = response.body.as_str() {
+                    response.body = assemble_codex_responses_sse(raw);
+                }
+            }
+            response
+        });
         map_transport_response(self.provider, response)
     }
 
     fn context_window(&self) -> u64 {
         model_context_window(self.provider, &self.model)
     }
+}
+
+fn round_idempotency_key(
+    scope: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> Option<String> {
+    let scope = scope?.trim();
+    if scope.is_empty() {
+        return None;
+    }
+    let tools = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    let input = json!({ "messages": messages, "tools": tools }).to_string();
+    Some(idempotency_key(&[scope, &input, "model-round"]))
+}
+
+fn set_round_idempotency_key(request: &mut HttpRequest, key: Option<String>) {
+    let Some(key) = key else {
+        return;
+    };
+    request
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("idempotency-key"));
+    request.headers.push(("Idempotency-Key".to_owned(), key));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -342,6 +415,7 @@ fn build_openai_compat_request(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
+    let request_key = openai_request_key(cache_key);
     let msgs = openai_compat_messages(messages);
     let tool_defs: Vec<Value> = tools
         .iter()
@@ -364,7 +438,7 @@ fn build_openai_compat_request(
     if !tool_defs.is_empty() {
         body["tools"] = json!(tool_defs);
     }
-    if let Some(key) = cache_key {
+    if let Some(key) = request_key.as_deref() {
         // Honored by OpenAI and ignored by endpoints that don't cache — harmless.
         body["prompt_cache_key"] = json!(key);
     }
@@ -372,7 +446,7 @@ fn build_openai_compat_request(
         ("authorization".into(), format!("Bearer {api_key}")),
         ("content-type".into(), "application/json".into()),
     ];
-    if let Some(key) = cache_key {
+    if let Some(key) = request_key.as_deref() {
         headers.push(("Idempotency-Key".into(), key.to_owned()));
     }
     HttpRequest {
@@ -599,6 +673,7 @@ fn build_openai_request(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
+    let request_key = openai_request_key(cache_key);
     let input = openai_input(messages);
     let tool_defs: Vec<Value> = tools
         .iter()
@@ -616,7 +691,7 @@ fn build_openai_request(
         "input": input,
         "tools": tool_defs,
     });
-    if let Some(key) = cache_key {
+    if let Some(key) = request_key.as_deref() {
         // Stable per-turn-thread cache key (Decision 7): the run/effect id, held
         // constant across the turn's model steps so the server serves the growing
         // request prefix from cache instead of re-reading it each round.
@@ -626,7 +701,7 @@ fn build_openai_request(
         ("authorization".into(), format!("Bearer {api_key}")),
         ("content-type".into(), "application/json".into()),
     ];
-    if let Some(key) = cache_key {
+    if let Some(key) = request_key.as_deref() {
         // Same run/effect id as an `Idempotency-Key` header (DR-0033): OpenAI
         // dedupes a resumed duplicate against it. This is idempotency, distinct
         // from `prompt_cache_key` above (caching) — both ride together.
@@ -857,6 +932,60 @@ fn parse_openai_response(body: &Value) -> ModelReply {
     }
 }
 
+/// Collapse a Codex Responses-API SSE stream into the response-shaped value
+/// consumed by the provider-neutral model loop. Hosts call this after transport;
+/// credential brokers remain byte relays and do not take ownership of provider
+/// response semantics.
+pub fn assemble_codex_responses_sse(raw: &str) -> Value {
+    let mut completed: Option<Value> = None;
+    let mut deltas = String::new();
+    let mut done_items: Vec<Value> = Vec::new();
+    for line in raw.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => completed = event.get("response").cloned(),
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    deltas.push_str(delta);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    done_items.push(item.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut completed = completed.unwrap_or(Value::Null);
+    let output_missing = completed
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|output| output.is_empty())
+        .unwrap_or(true);
+    if output_missing && !done_items.is_empty() {
+        completed["output"] = Value::Array(done_items);
+    }
+    if !deltas.is_empty() {
+        let usage = completed.get("usage").cloned().unwrap_or(Value::Null);
+        let mut assembled = serde_json::json!({ "output_text": deltas, "usage": usage });
+        if let Some(output) = completed.get("output") {
+            assembled["output"] = output.clone();
+        }
+        return assembled;
+    }
+    completed
+}
+
 /// Pull a capped, single-line control-plane error message from a provider body.
 fn provider_error_excerpt(body: &Value) -> String {
     let message = body
@@ -880,6 +1009,46 @@ mod tests {
     use super::*;
     use crate::harness_loop::ToolResultMsg;
     use std::cell::RefCell;
+
+    #[test]
+    fn codex_sse_assembly_preserves_text_tools_and_usage() {
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
+        );
+        let body = assemble_codex_responses_sse(raw);
+        assert_eq!(body["output_text"], "hello");
+        assert_eq!(body["output"][0]["call_id"], "c1");
+        assert_eq!(body["usage"]["input_tokens"], 3);
+    }
+
+    #[test]
+    fn messages_client_settles_an_openai_sse_response() {
+        let client = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            "broker",
+            "gpt-4.1",
+            "https://api.openai.com",
+            4096,
+            None,
+        );
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+        let reply = client
+            .parse_response(Ok(HttpResponse {
+                status: 200,
+                body: Value::String(raw.to_owned()),
+            }))
+            .unwrap();
+
+        assert_eq!(reply.text, "hello");
+        assert_eq!(reply.tool_calls[0].id, "c1");
+        assert_eq!(reply.usage["output_tokens"], 2);
+    }
 
     #[test]
     fn context_window_is_derived_from_the_model_not_configured() {
@@ -1264,6 +1433,27 @@ mod tests {
             .headers
             .iter()
             .any(|(k, _)| k == "Idempotency-Key"));
+
+        let oversized =
+            "public:sess_fc7e73f97ff14436be95709aca8246a9:edge-production-pre-cutover-1";
+        assert!(oversized.len() > OPENAI_PROMPT_CACHE_KEY_MAX_BYTES);
+        let bounded = build_openai_request(
+            "https://api.openai.com",
+            "k",
+            "m",
+            Some(oversized),
+            &convo(),
+            &tool_specs(),
+        );
+        let bounded_key = bounded.body["prompt_cache_key"]
+            .as_str()
+            .expect("bounded prompt cache key");
+        assert_eq!(bounded_key.len(), OPENAI_PROMPT_CACHE_KEY_MAX_BYTES);
+        assert_eq!(bounded_key, sha256_hex(oversized.as_bytes()));
+        assert!(bounded
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Idempotency-Key" && v == bounded_key));
     }
 
     #[test]
@@ -1360,6 +1550,54 @@ mod tests {
         assert_eq!(
             client.parse_response(Err(CoerceTransportError::Timeout)),
             Err(HarnessModelError::Timeout)
+        );
+
+        let openai = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            "openai-key",
+            "gpt-test",
+            "https://api.openai.com",
+            4096,
+            None,
+        );
+        let request = openai.build_request(&convo(), &tool_specs());
+        assert_eq!(request.body["stream"], json!(true));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "accept" && value == "text/event-stream"));
+
+        let scoped = MessagesApiClient::new(
+            CoerceProvider::OpenAi,
+            "whipplescript-model-broker",
+            "gpt-test",
+            "https://api.openai.com",
+            4096,
+            Some("effect-42".to_owned()),
+        );
+        let first = scoped.build_request(&convo(), &tool_specs());
+        let replay = scoped.build_request(&convo(), &tool_specs());
+        let mut next_messages = convo();
+        next_messages.push(ChatMessage::user_text("next round"));
+        let next = scoped.build_request(&next_messages, &tool_specs());
+        let key = |request: &HttpRequest| {
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+                .map(|(_, value)| value.clone())
+                .expect("idempotency key")
+        };
+        assert_eq!(key(&first), key(&replay), "a replay keeps the round key");
+        assert_ne!(
+            key(&first),
+            key(&next),
+            "a distinct model round gets a distinct key"
+        );
+        assert_eq!(
+            first.body["prompt_cache_key"],
+            json!("effect-42"),
+            "the turn cache scope remains stable across rounds"
         );
     }
 

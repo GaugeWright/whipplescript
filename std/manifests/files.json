@@ -1,0 +1,192 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.files",
+  "name": "std.files",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.files",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "file.read",
+          "effect_kind": "file.read",
+          "source_forms": ["read"],
+          "input_schema": "file.read.input",
+          "output_schema": "FileReadResult",
+          "required_capabilities": ["file.read"],
+          "provider_kinds": ["local"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "file.write",
+          "effect_kind": "file.write",
+          "source_forms": ["write"],
+          "input_schema": "file.write.input",
+          "output_schema": "FileWriteResult",
+          "required_capabilities": ["file.write"],
+          "provider_kinds": ["local"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "file.import",
+          "effect_kind": "file.import",
+          "source_forms": ["import"],
+          "input_schema": "file.import.input",
+          "output_schema": "FileImportResult",
+          "required_capabilities": ["file.import"],
+          "provider_kinds": ["local"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "file.export",
+          "effect_kind": "file.export",
+          "source_forms": ["export"],
+          "input_schema": "file.export.input",
+          "output_schema": "FileExportResult",
+          "required_capabilities": ["file.export"],
+          "provider_kinds": ["local"],
+          "projected_facts": ["effect.output"],
+          "validation": "runtime_boundary"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "files.file_store",
+          "construct_family": "declaration_block",
+          "keyword": "file store",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "file.read",
+          "construct_family": "effect_operation",
+          "keyword": "read",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "file.read" }],
+          "provides": [{ "kind": "EffectHandle", "type": "FileReadResult" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "file.write",
+          "construct_family": "effect_operation",
+          "keyword": "write",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "file.write" }],
+          "provides": [{ "kind": "EffectHandle", "type": "FileWriteResult" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "file.import",
+          "construct_family": "effect_operation",
+          "keyword": "import",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "file.import" }],
+          "provides": [{ "kind": "EffectHandle", "type": "FileImportResult" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "file.export",
+          "construct_family": "effect_operation",
+          "keyword": "export",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "file.export" }],
+          "provides": [{ "kind": "EffectHandle", "type": "FileExportResult" }],
+          "lowering_target": "typed_effect_call"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "file.read",
+      "description": "Read a text/markdown body from a declared file store, path-policy checked."
+    },
+    {
+      "id": "file.write",
+      "description": "Write a text/markdown body into a declared file store with an explicit mode."
+    },
+    {
+      "id": "file.import",
+      "description": "Import structured rows (jsonl/json/csv) from a declared file store as typed facts, all-or-nothing."
+    },
+    {
+      "id": "file.export",
+      "description": "Export a typed fact collection to a declared file store as jsonl/json/csv."
+    }
+  ],
+  "providers": [
+    {
+      "id": "local-file-read",
+      "provider_kind": "local",
+      "capability": "file.read",
+      "effect_kind": "file.read",
+      "config": {}
+    },
+    {
+      "id": "local-file-write",
+      "provider_kind": "local",
+      "capability": "file.write",
+      "effect_kind": "file.write",
+      "config": {}
+    },
+    {
+      "id": "local-file-import",
+      "provider_kind": "local",
+      "capability": "file.import",
+      "effect_kind": "file.import",
+      "config": {}
+    },
+    {
+      "id": "local-file-export",
+      "provider_kind": "local",
+      "capability": "file.export",
+      "effect_kind": "file.export",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-files",
+      "name": "files",
+      "description": "Allow the declared-store file effects (read / write / import / export).",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": ["file.read", "file.write", "file.import", "file.export"],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-files-read",
+      "program_id": null,
+      "capability": "file.read",
+      "provider": "local",
+      "config": {}
+    },
+    {
+      "id": "binding-files-write",
+      "program_id": null,
+      "capability": "file.write",
+      "provider": "local",
+      "config": {}
+    },
+    {
+      "id": "binding-files-import",
+      "program_id": null,
+      "capability": "file.import",
+      "provider": "local",
+      "config": {}
+    },
+    {
+      "id": "binding-files-export",
+      "program_id": null,
+      "capability": "file.export",
+      "provider": "local",
+      "config": {}
+    }
+  ]
+}

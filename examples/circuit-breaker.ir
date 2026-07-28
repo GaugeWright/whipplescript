@@ -3,6 +3,7 @@ workflow_contracts
   output result ref<Done>
   failure error ref<Tripped>
 uses
+  package std.coord
   package std.script
 schemas
   class Done
@@ -22,7 +23,7 @@ rules
       pattern:started
     writes
       schema:CallRequested
-    body_hash 878ad577f963a784
+    body_hash 75dac0cf5dea239568628c18a2661a68
   rule call_dependency
     when CallRequested as c
     reads
@@ -30,15 +31,15 @@ rules
     writes
       schema:CallFailed
     effects
-      attempt kind=exec.command binding=attempt key=f648634d3a590b18
-    body_hash 1f0a290aa22a7e40
+      attempt kind=exec.command binding=attempt key=7f2920067f157013103ade588175fb8c
+    body_hash d08a4d71357d35eb37a4a4a7a8215d20
   rule strike_breaker
     when CallFailed as f
     reads
       schema:CallFailed
     effects
-      strike kind=counter.consume binding=strike key=dfba1b3628ecd68f
-    body_hash 525acda830301bab
+      strike kind=counter.consume binding=strike key=9d22029fced3ecba5df4deff7a248957
+    body_hash b160a0346b0ed67f63c24940c0c1f40e
 rule_dependencies
   call_dependency --schema:CallFailed--> strike_breaker
   seed --schema:CallRequested--> call_dependency

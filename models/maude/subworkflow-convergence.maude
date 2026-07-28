@@ -1,0 +1,59 @@
+--- Sub-workflows as agent tools, the convergence invariant. DR-0025.
+--- An agent may invoke a curated set of @tool workflows synchronously. The whole
+--- invoke tree must converge so a turn never blocks forever; non-termination is a
+--- root-only privilege. This abstracts the two static checks:
+---
+---   acyclicity: the invoke-tool graph must be acyclic. A cycle means unbounded
+---   recursion depth, so the system is not provably convergent.
+---
+---   convergent class: a @tool workflow must be locally convergent. A @tool node
+---   that reads external signals, or is @service, cannot be shown to terminate.
+---   The same property on a NON-tool node (the root) is fine -- signals are a
+---   root-only privilege.
+---
+--- The marker nonConvergent records any reason the system is not provably
+--- convergent. A valid system never reaches it.
+mod WHIPPLESCRIPT-SUBWORKFLOW-CONVERGENCE is
+  sorts Node Cfg .
+
+  ops w1 w2 w3 : -> Node [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op toolNode : Node -> Cfg [ctor] .      --- a @tool workflow, model-invokable
+  op invokes : Node Node -> Cfg [ctor] .  --- caller invokes target as a tool
+  op nonTool : Node -> Cfg [ctor] .       --- a granted invoke target that is NOT an eligible @tool
+  op reaches : Node Node -> Cfg [ctor] .  --- transitive closure of invokes
+  op signalReads : Node -> Cfg [ctor] .   --- workflow has external signal readiness
+  op isService : Node -> Cfg [ctor] .     --- workflow is @service, non-terminating
+  op nonConvergent : -> Cfg [ctor] .      --- the system is not provably convergent
+
+  vars W V X : Node .
+
+  --- idempotent facts so the closure reaches a finite fixpoint
+  eq reaches(W, V) reaches(W, V) = reaches(W, V) .
+  eq nonConvergent nonConvergent = nonConvergent .
+
+  --- transitive closure of the invoke-tool graph
+  rl [seed] : invokes(W, V) => invokes(W, V) reaches(W, V) .
+  rl [trans] : reaches(W, X) invokes(X, V) => reaches(W, X) invokes(X, V) reaches(W, V) .
+
+  --- a cycle in the invoke-tool graph breaks convergence: removing the cycle
+  --- requirement would make the acyclicity bite satisfiable.
+  rl [cycle] : reaches(W, W) => reaches(W, W) nonConvergent .
+
+  --- a @tool workflow that reads external signals cannot be shown to terminate.
+  --- The same signalReads on a non-tool node never triggers this -- root-only.
+  rl [signal-tool] : toolNode(W) signalReads(W) => toolNode(W) signalReads(W) nonConvergent .
+
+  --- a @tool workflow tagged @service is non-terminating by construction.
+  rl [service-tool] : toolNode(W) isService(W) => toolNode(W) isService(W) nonConvergent .
+
+  --- an agent grant is the source of an invoke edge: granting tool V to an agent
+  --- in workflow W means W can invoke V. If the granted target is not an eligible
+  --- @tool workflow, the invoke is into something the convergence check never
+  --- vetted, so the system is not provably convergent. This is the grant-validity
+  --- invariant: agent A granted Z, where Z is not @tool, is rejected.
+  rl [grant-nontool] : invokes(W, V) nonTool(V) => invokes(W, V) nonTool(V) nonConvergent .
+endm

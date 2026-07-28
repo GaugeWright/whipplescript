@@ -1,0 +1,25 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.telemetry",
+  "name": "std.telemetry",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.telemetry",
+      "version": "0.1.0",
+      "standard": true
+    }
+  ],
+  "capabilities": [],
+  "providers": [
+    {
+      "id": "otlp",
+      "provider_kind": "otlp-exporter",
+      "plane": "operator",
+      "config": {
+        "endpoint": "http://127.0.0.1:4318/v1/traces",
+        "protocol": "http/json"
+      }
+    }
+  ]
+}

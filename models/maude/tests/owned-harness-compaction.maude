@@ -1,0 +1,13 @@
+load ../owned-harness-compaction.maude
+
+--- Coverage: compaction elides an old entry to a reference.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-COMPACTION :
+  compacting oldEntry
+  =>* C:Cfg elided .
+
+--- Bite: a recent-window entry is never elided by compaction. The RESIDUAL soup
+--- var means an elided in any reachable state is a solution, so No solution
+--- proves the recent window survives compaction.
+search [1] in WHIPPLESCRIPT-OWNED-HARNESS-COMPACTION :
+  compacting recentEntry
+  =>* elided RESIDUAL:Cfg .

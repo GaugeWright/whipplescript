@@ -1,0 +1,124 @@
+load ../kernel.maude
+
+--- Applying a pattern elaborates to an ordinary rule with provenance. It does
+--- not create a workflow instance or runtime effect by itself.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  patternApp(reviewPattern, phaseReviewApplication, guardedRule, issueFact, g1)
+  =>*
+  patternElaborated(reviewPattern, phaseReviewApplication, guardedRule, issueFact, g1)
+  rule(guardedRule, issueFact, g1)
+  ruleProvenance(guardedRule, reviewPattern, phaseReviewApplication) .
+
+--- Pattern application alone cannot run provider work.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  patternApp(reviewPattern, phaseReviewApplication, guardedRule, issueFact, g1)
+  =>*
+  effect(tellEff, running) Rest:Cfg .
+
+--- A workflow can complete only through a declared output contract.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(childInstance, reviewWorkflow, instRunning)
+  workflowOutput(reviewWorkflow, reviewOutput)
+  fact(coerceOkFact)
+  completeWorkflow(childInstance, reviewOutput, coerceOkFact)
+  =>*
+  instance(childInstance, reviewWorkflow, instCompleted)
+  workflowOutput(reviewWorkflow, reviewOutput)
+  terminalPayload(childInstance, coerceOkFact)
+  fact(coerceOkFact)
+  event(workflowCompletedEvt) .
+
+--- A mismatched output name cannot complete the workflow.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(childInstance, reviewWorkflow, instRunning)
+  workflowOutput(reviewWorkflow, reviewOutput)
+  fact(coerceOkFact)
+  completeWorkflow(childInstance, reviewFailure, coerceOkFact)
+  =>*
+  instance(childInstance, reviewWorkflow, instCompleted) Rest:Cfg .
+
+--- A failed workflow terminal action must name a declared failure contract.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(childInstance, reviewWorkflow, instRunning)
+  workflowFailure(reviewWorkflow, blockedFailure)
+  fact(coerceBadFact)
+  failWorkflow(childInstance, blockedFailure, coerceBadFact)
+  =>*
+  instance(childInstance, reviewWorkflow, instFailed)
+  workflowFailure(reviewWorkflow, blockedFailure)
+  terminalPayload(childInstance, coerceBadFact)
+  fact(coerceBadFact)
+  event(workflowFailedEvt) .
+
+--- Terminal instances cannot fire more scoped effectful rules.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  instance(childInstance, reviewWorkflow, instCompleted)
+  fact(issueFact)
+  scopedRule(childInstance, guardedRule, issueFact, g1)
+  ruleReady(guardedRule, issueFact, g1)
+  graph(g1, tellEff)
+  =>*
+  graphCommitted(g1) effect(tellEff, queued) Rest:Cfg .
+
+--- Invoking a workflow starts a child instance behind the invocation effect.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  invokeWorkflow(e1, rootInstance, reviewWorkflow, childInstance)
+  =>*
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instRunning)
+  childOf(childInstance, e1) .
+
+--- The parent invocation cannot succeed before the child completes explicitly.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instRunning)
+  childOf(childInstance, e1)
+  =>*
+  effect(e1, completed) invocationOutput(e1, coerceOkFact) Rest:Cfg .
+
+--- An invocation effect is not a provider run and cannot be generically
+--- completed without a child terminal event.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instRunning)
+  childOf(childInstance, e1)
+  =>*
+  effect(e1, completed) Rest:Cfg .
+
+--- A completed child resolves the parent invocation with the declared payload.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instCompleted)
+  childOf(childInstance, e1)
+  terminalPayload(childInstance, coerceOkFact)
+  =>*
+  effect(e1, completed)
+  instance(childInstance, reviewWorkflow, instCompleted)
+  childOf(childInstance, e1)
+  terminalPayload(childInstance, coerceOkFact)
+  invocationOutput(e1, coerceOkFact) .
+
+--- A failed child resolves the parent invocation on the failure path.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instFailed)
+  childOf(childInstance, e1)
+  terminalPayload(childInstance, coerceBadFact)
+  =>*
+  effect(e1, failed)
+  instance(childInstance, reviewWorkflow, instFailed)
+  childOf(childInstance, e1)
+  terminalPayload(childInstance, coerceBadFact)
+  invocationFailure(e1, coerceBadFact) .
+
+--- A cancelled child resolves the parent invocation as cancelled.
+search [1] in WHIPPLESCRIPT-KERNEL :
+  effect(e1, running)
+  instance(childInstance, reviewWorkflow, instCancelled)
+  childOf(childInstance, e1)
+  =>*
+  effect(e1, cancelled)
+  instance(childInstance, reviewWorkflow, instCancelled)
+  childOf(childInstance, e1)
+  invocationCancellation(e1) .

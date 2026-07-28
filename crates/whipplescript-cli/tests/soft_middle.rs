@@ -36,7 +36,7 @@ fn temp_path(label: &str, extension: &str) -> PathBuf {
 }
 
 fn dev_until_idle(bin: &str, store: &str, source: &str, extra: &[&str]) -> Value {
-    let mut args = vec!["--store", store, "--json", "dev", source];
+    let mut args = vec!["--store", store, "--json", "run", source];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--provider", "fixture", "--until", "idle"]);
     run_json(bin, &args)
@@ -118,6 +118,82 @@ assert exists(Item where status == "open")
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
+}
+
+/// A `where` guard on a bindingless trigger (`when started`) is enforced at
+/// runtime, not silently dropped. Bindingless triggers previously skipped guard
+/// evaluation entirely, so a false guard still fired the rule — the exact
+/// silent-no-op class this suite pins. The same `count(... where ...)` guard is
+/// exercised to keep it aligned with the bound-trigger B1c coverage above.
+#[test]
+fn started_trigger_guard_is_enforced() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+
+    // True guard (exactly two "done") fires the started rule and completes;
+    // false guard (not three) must NOT fire, so the instance never completes.
+    for (label, guard, expected_completed) in [
+        (
+            "true-guard",
+            r#"count(Item where status == "done") == 2"#,
+            true,
+        ),
+        (
+            "false-guard",
+            r#"count(Item where status == "done") == 3"#,
+            false,
+        ),
+    ] {
+        let store = temp_path(&format!("started-guard-{label}"), "sqlite");
+        let source = temp_path(&format!("started-guard-{label}"), "whip");
+        fs::write(&source, started_guard_program(guard)).expect("write source");
+        let store_str = store.to_str().expect("utf-8");
+        let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+        let instance = dev
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .expect("instance id");
+        let completed = instance_status(bin, store_str, instance) == "completed";
+        assert_eq!(
+            completed, expected_completed,
+            "{label}: started-guard enforcement wrong (completed={completed})"
+        );
+        let _ = fs::remove_file(store);
+        let _ = fs::remove_file(source);
+    }
+}
+
+fn started_guard_program(guard: &str) -> String {
+    format!(
+        r#"
+workflow StartedGuard
+
+output result Report
+
+class Item {{
+  id string
+  status string
+}}
+
+class Report {{
+  ok int
+}}
+
+table items as Item [
+  {{ id "a" status "done" }}
+  {{ id "b" status "done" }}
+  {{ id "c" status "open" }}
+]
+
+rule finish
+  when started
+  where {guard}
+=> {{
+  complete result {{
+    ok 1
+  }}
+}}
+"#
+    )
 }
 
 /// Templates in record/payload string fields render against bindings.
@@ -341,19 +417,252 @@ rule go
     let _ = fs::remove_file(source);
 }
 
-/// 503 auto-fail: an effect whose failure is unhandled in a self-terminating flow
-/// drives the workflow to a `failed` terminal (instead of stalling forever) via the
-/// generic internal-failure path — no author `on fails` handler, no typed `failure`
-/// payload. Modeled in models/maude/flow-autofail.maude.
+/// Nested `after` blocks fire (the recursion in lower_rule): a hand-written
+/// two-deep pipeline — effect, `after` requesting a second effect, nested
+/// `after` reaching the terminal — completes with both bindings resolved.
+/// Before the fix this checked clean and silently stalled forever.
 #[test]
-fn unhandled_flow_failure_auto_fails_the_workflow() {
+fn nested_after_blocks_fire_to_the_terminal() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("autofail", "sqlite");
-    let source = temp_path("autofail", "whip");
+    let store = temp_path("nested-after", "sqlite");
+    let source = temp_path("nested-after", "whip");
     fs::write(
         &source,
         r#"
-workflow AutoFail
+workflow NestedAfter
+
+output result Done
+
+class Done {
+  first string
+  second string
+}
+
+class Trigger {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule pipeline
+  when Trigger as t
+=> {
+  tell worker as a "one"
+
+  after a succeeds {
+    tell worker as b "two"
+
+    after b succeeds {
+      complete result {
+        first a.summary
+        second b.summary
+      }
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// `then` sugar (R2): a chained pipeline completes end to end, with each
+/// binding carrying the success payload of its step.
+#[test]
+fn then_chain_pipeline_completes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("then-chain", "sqlite");
+    let source = temp_path("then-chain", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow ThenChain
+
+output result Done
+
+class Done {
+  first string
+  second string
+}
+
+class Trigger {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule pipeline
+  when Trigger as t
+=> {
+  then a <- tell worker "one"
+  then b <- tell worker "two"
+  complete result {
+    first a.summary
+    second b.summary
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let completed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.completed"))
+        .expect("workflow.completed event");
+    assert!(
+        completed
+            .pointer("/payload/payload/first")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the chained binding resolves to the success payload: {completed}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// `then` sugar (R2 + R1): a failing chained step auto-fails the instance with
+/// the AUTHOR's binding name in the reason (never the synthetic `__then_*`
+/// handle), and `whip check` stays quiet — the sugar is an explicit opt-in to
+/// auto-fail, so R1a's unhandled-failure warning must not fire.
+#[test]
+fn then_chain_failure_auto_fails_with_author_binding() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("then-fail", "sqlite");
+    let source = temp_path("then-fail", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow ThenFail
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Trigger {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule pipeline
+  when Trigger as t
+=> {
+  then a <- tell worker "one"
+  complete result {
+    note a.summary
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let check = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "check",
+            source.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("check runs");
+    let check_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(
+        !check_output.contains("failure is unhandled"),
+        "a then-chain opts into auto-fail; R1a must stay quiet:\n{check_output}"
+    );
+
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let transitioned = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("instance.transitioned")
+                && event.pointer("/payload/status").and_then(Value::as_str) == Some("failed")
+        })
+        .expect("instance.transitioned failed event");
+    assert_eq!(
+        transitioned
+            .pointer("/payload/reason")
+            .and_then(Value::as_str),
+        Some("unhandled failure of `a` in rule `pipeline`"),
+        "the reason names the author binding, not the synthetic handle"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Auto-fail (R1) at RULE level: an effect whose failure has no observing
+/// `after` block in a plain rule of a self-terminating workflow drives the
+/// instance to `failed` with the generic reason, instead of stalling forever.
+#[test]
+fn unhandled_rule_effect_failure_auto_fails_the_workflow() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("rule-autofail", "sqlite");
+    let source = temp_path("rule-autofail", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow RuleAutoFail
 
 output result Decision
 failure error Blocked
@@ -380,13 +689,15 @@ table seed as Trigger [
   { id "t" }
 ]
 
-flow f
+rule r
   when Trigger as t
-{
+=> {
   tell worker as turn "do it"
 
-  complete result {
-    ok "done"
+  after turn succeeds {
+    complete result {
+      ok "done"
+    }
   }
 }
 "#,
@@ -399,8 +710,6 @@ flow f
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    // The `tell` has no `on fails` handler. Without auto-fail its failure would
-    // leave the instance stuck `running`; auto-fail drives it to `failed`.
     assert_eq!(instance_status(bin, store_str, instance), "failed");
     let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
     let transitioned = log
@@ -416,27 +725,26 @@ flow f
         .pointer("/payload/reason")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    assert!(
-        reason.contains("unhandled failure"),
-        "generic auto-fail reason expected, got: {reason}"
+    assert_eq!(
+        reason, "unhandled failure of `turn` in rule `r`",
+        "the R1 generic reason names the binding and rule"
     );
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
 }
 
-/// A self-terminating flow whose effect failure IS handled by an author `on fails`
-/// handler must fail through the typed terminal (a `workflow.failed` with the
-/// declared payload), NOT the generic auto-fail path.
+/// Auto-fail (R1): an `after <binding> fails` observer keeps the rule-level net
+/// out — the failure routes through the author's typed terminal.
 #[test]
-fn handled_flow_failure_does_not_auto_fail() {
+fn handled_rule_effect_failure_does_not_auto_fail() {
     let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("handledfail", "sqlite");
-    let source = temp_path("handledfail", "whip");
+    let store = temp_path("rule-handledfail", "sqlite");
+    let source = temp_path("rule-handledfail", "whip");
     fs::write(
         &source,
         r#"
-workflow HandledFail
+workflow RuleHandledFail
 
 output result Decision
 failure error Blocked
@@ -463,18 +771,21 @@ table seed as Trigger [
   { id "t" }
 ]
 
-flow f
+rule r
   when Trigger as t
-{
+=> {
   tell worker as turn "do it"
-  on fails {
-    fail error {
-      reason "handled"
+
+  after turn succeeds {
+    complete result {
+      ok "done"
     }
   }
 
-  complete result {
-    ok "done"
+  after turn fails {
+    fail error {
+      reason "handled"
+    }
   }
 }
 "#,
@@ -489,8 +800,6 @@ flow f
         .expect("instance id");
     assert_eq!(instance_status(bin, store_str, instance), "failed");
     let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
-    // The typed handler fires a workflow.failed with the declared Blocked payload;
-    // the generic auto-fail transition must NOT appear.
     let failed = log
         .as_array()
         .expect("log")
@@ -502,7 +811,7 @@ flow f
             .pointer("/payload/payload/reason")
             .and_then(Value::as_str),
         Some("handled"),
-        "the author on-fails handler payload must fire: {failed}"
+        "the author after-fails handler payload must fire: {failed}"
     );
     assert!(
         !log.as_array().expect("log").iter().any(|event| {
@@ -515,6 +824,306 @@ flow f
         }),
         "a handled failure must not also auto-fail: {log}"
     );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Auto-fail (R1): `after <binding> completes` observes every terminal, so it
+/// counts as an observer — the case arm decides, and the net stays out.
+#[test]
+fn completes_observer_prevents_rule_auto_fail() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("rule-completes", "sqlite");
+    let source = temp_path("rule-completes", "whip");
+    fs::write(
+        &source,
+        r#"
+workflow RuleCompletes
+
+output result Decision
+
+class Trigger {
+  id string
+}
+
+class Decision {
+  ok string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  tell worker as turn "do it"
+
+  after turn completes {
+    complete result {
+      ok "observed"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    // The tell failed, but `after turn completes` fired and completed the
+    // workflow — the net must not override the author's observer.
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Auto-fail (R1): a `@service` workflow can never auto-fail — an unhandled
+/// effect failure records ONE durable diagnostic (idempotent per effect across
+/// worker passes) and the service keeps running.
+#[test]
+fn service_unhandled_failure_records_diagnostic_and_keeps_running() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("service-diag", "sqlite");
+    let source = temp_path("service-diag", "whip");
+    fs::write(
+        &source,
+        r#"
+@service
+workflow ServiceDiag
+
+class Trigger {
+  id string
+}
+
+class Seen {
+  note string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  tell worker as turn "do it"
+
+  after turn succeeds {
+    record Seen { note "ok" }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "running");
+    let count_diagnostics = || {
+        run_json(
+            bin,
+            &["--store", store_str, "--json", "diagnostics", instance],
+        )
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.get("code").and_then(Value::as_str) == Some("workflow.unhandled_failure")
+        })
+        .count()
+    };
+    assert_eq!(count_diagnostics(), 1, "one durable diagnostic per failure");
+    // Another worker pass re-observes the same failure; the diagnostic must not
+    // duplicate (idempotent per effect).
+    let _ = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "step",
+            instance,
+            "--program",
+            source.to_str().expect("utf-8"),
+        ],
+    );
+    assert_eq!(instance_status(bin, store_str, instance), "running");
+    assert_eq!(count_diagnostics(), 1, "re-observation must not duplicate");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Auto-fail (R1): `cancelled` is exempt — effect-level cancel is deliberate
+/// (the watchdog pattern depends on it), so a cancelled effect never trips the
+/// net even with no observer on its binding. (Coerce settlement is the fixture
+/// path that emits a real cancelled terminal.)
+#[test]
+fn cancelled_effect_is_exempt_from_rule_auto_fail() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("rule-cancel-exempt", "sqlite");
+    let source = temp_path("rule-cancel-exempt", "whip");
+    fs::write(
+        &source,
+        r#"
+use std.coercion
+
+workflow CancelExempt
+
+output result Decision
+
+class Trigger {
+  id string
+}
+
+class Decision {
+  ok string
+}
+
+class Verdict {
+  priority string
+}
+
+coerce judge(id string) -> Verdict {
+  prompt "Classify {{ id }}"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  coerce judge(t.id) as verdict
+
+  after verdict succeeds {
+    complete result {
+      ok "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(
+        bin,
+        store_str,
+        source.to_str().expect("utf-8"),
+        &["--cancel"],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    // The cancelled tell leaves the instance running (no observer fires), but
+    // it must NOT auto-fail — cancellation is deliberate.
+    assert_eq!(instance_status(bin, store_str, instance), "running");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    assert!(
+        !log.as_array().expect("log").iter().any(|event| {
+            event
+                .pointer("/payload/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("unhandled failure")
+        }),
+        "a cancelled effect must not trip the auto-fail net: {log}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// Auto-fail (R1): a timed-out effect with no observer trips the net the same
+/// as a failed one — `timed_out` is a terminal failure for the net's purposes.
+/// (Coerce settlement is the fixture path that emits a real timed-out terminal.)
+#[test]
+fn timed_out_effect_auto_fails_without_observer() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("rule-timeout-autofail", "sqlite");
+    let source = temp_path("rule-timeout-autofail", "whip");
+    fs::write(
+        &source,
+        r#"
+use std.coercion
+
+workflow TimeoutAutoFail
+
+output result Decision
+
+class Trigger {
+  id string
+}
+
+class Decision {
+  ok string
+}
+
+class Verdict {
+  priority string
+}
+
+coerce judge(id string) -> Verdict {
+  prompt "Classify {{ id }}"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  coerce judge(t.id) as verdict
+
+  after verdict succeeds {
+    complete result {
+      ok "done"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(
+        bin,
+        store_str,
+        source.to_str().expect("utf-8"),
+        &["--timeout"],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
@@ -554,7 +1163,7 @@ agent worker {
 }
 
 channel alerts {
-  provider slack
+  provider fixture
   destination "#ops"
 }
 
@@ -604,6 +1213,57 @@ rule notify
             .and_then(Value::as_str),
         Some("alerts")
     );
+
+    // The named `fixture` provider returns the FULL typed MessageSendReceipt
+    // (spec/std-messaging.md "MessageSendReceipt"), not the generic fixture
+    // `{summary, target}` stand-in: the succeeded fact's value carries every
+    // receipt field, deterministically (fixture accepted_at stays empty).
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("channel").and_then(Value::as_str),
+        Some("alerts")
+    );
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("fixture")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    assert_eq!(
+        receipt.get("destination").and_then(Value::as_str),
+        Some("#ops"),
+        "the channel's fixed destination is echoed in the receipt"
+    );
+    let message_id = receipt
+        .get("message_id")
+        .and_then(Value::as_str)
+        .expect("message_id");
+    let provider_message_id = receipt
+        .get("provider_message_id")
+        .and_then(Value::as_str)
+        .expect("provider_message_id");
+    assert!(!message_id.is_empty());
+    assert!(!provider_message_id.is_empty());
+    assert_ne!(
+        message_id, provider_message_id,
+        "the provider correlation handle is minted distinct from the durable id"
+    );
+    assert_eq!(
+        receipt.get("accepted_at").and_then(Value::as_str),
+        Some(""),
+        "the fixture acknowledges nothing; accepted_at stays deterministic-empty"
+    );
+    assert!(receipt.get("thread_id").is_some());
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
@@ -657,6 +1317,84 @@ fn send_via_local_channel_delivers_to_local_mailbox() {
     assert_eq!(
         record.get("provider").and_then(Value::as_str),
         Some("local")
+    );
+
+    // The local receipt is the full MessageSendReceipt: binding-resolved
+    // provider id, real provider-acknowledged instant, correlation handle
+    // distinct from the durable message id (spec/std-messaging.md).
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("std.messaging.local")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    let accepted_at = receipt
+        .get("accepted_at")
+        .and_then(Value::as_str)
+        .expect("accepted_at");
+    assert!(
+        !accepted_at.is_empty(),
+        "the local provider reports a real provider-acknowledged instant"
+    );
+    assert_ne!(
+        receipt.get("message_id").and_then(Value::as_str),
+        receipt.get("provider_message_id").and_then(Value::as_str),
+    );
+    // The mailbox row mirrors the receipt correlation.
+    assert_eq!(
+        record.get("provider_message_id").and_then(Value::as_str),
+        receipt.get("provider_message_id").and_then(Value::as_str),
+    );
+    assert_eq!(
+        record.get("accepted_at").and_then(Value::as_str),
+        Some(accepted_at)
+    );
+
+    // `whip mailbox outbound` lists the delivered row (the operator door,
+    // spec/std-messaging.md open question 1).
+    let listed = run_json(
+        bin,
+        &["--store", store_str, "--json", "mailbox", "outbound"],
+    );
+    let messages = listed
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("mailbox messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].get("message_id").and_then(Value::as_str),
+        record.get("message_id").and_then(Value::as_str),
+    );
+    // Channel filtering: a non-matching filter lists nothing.
+    let filtered = run_json(
+        bin,
+        &[
+            "--store",
+            store_str,
+            "--json",
+            "mailbox",
+            "outbound",
+            "--channel",
+            "nope",
+        ],
+    );
+    assert_eq!(
+        filtered
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
     );
 
     let _ = fs::remove_file(store);
@@ -800,6 +1538,29 @@ fn inbound_local_channel_admits_messages_from_inbox_idempotently() {
         "no duplicate Received facts after the idempotent re-poll"
     );
 
+    // `whip mailbox inbound <channel>` lists the received rows with their
+    // admission ordinals (the operator read door over the local inbox).
+    let listed = run_json(
+        bin,
+        &[
+            "--store", store_str, "--json", "mailbox", "inbound", "inbox",
+        ],
+    );
+    let messages = listed
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("inbound messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].get("ordinal").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        messages[0].get("text").and_then(Value::as_str),
+        Some("first message")
+    );
+    assert_eq!(
+        messages[1].get("thread_id").and_then(Value::as_str),
+        Some("t7")
+    );
+
     let _ = fs::remove_file(&store);
     let _ = fs::remove_file(&inbox);
 }
@@ -821,7 +1582,7 @@ fn send_via_stdio_channel_writes_marker_to_stdout() {
         .args([
             "--store",
             store_str,
-            "dev",
+            "run",
             source.to_str().expect("utf-8"),
             "--provider",
             "fixture",
@@ -848,6 +1609,345 @@ fn send_via_stdio_channel_writes_marker_to_stdout() {
     let _ = fs::remove_file(store);
 }
 
+/// A desktop-channel workflow source shared by the desktop provider tests:
+/// outbound-only `send via` with `after … succeeds` and `fails as` branches.
+fn desktop_workflow_source() -> String {
+    r##"
+@service
+workflow DesktopNotify
+
+use std.messaging
+
+output result Done
+failure error NotifyFailed
+
+class Trigger { id string }
+class Done { ok string }
+class NotifyFailed { why string }
+
+channel alerts {
+  provider desktop
+  destination "Ops Alerts"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule notify
+  when Trigger as t
+=> {
+  send via alerts {
+    text "disk almost full"
+  } as sent
+
+  after sent succeeds {
+    complete result {
+      ok "notified"
+    }
+  }
+  after sent fails as f {
+    fail error {
+      why f.reason
+    }
+  }
+}
+"##
+    .to_owned()
+}
+
+/// std.messaging.desktop (spec/std-messaging.md slice 4): a `send via` on a
+/// channel declaring `provider desktop` spawns the notifier subprocess
+/// (`WHIPPLESCRIPT_DESKTOP_NOTIFIER` resolves it — here a fake that records
+/// its argv), the workflow completes, and the receipt names the desktop
+/// provider with no correlation handle. Outbound-only is enforced at CHECK
+/// time (`when message from` a desktop channel is a check error — covered by
+/// the parser suite), so this test is pure send.
+#[test]
+fn send_via_desktop_channel_spawns_notifier_and_completes() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("send-desktop", "sqlite");
+    let source = temp_path("send-desktop", "whip");
+    let notifier = temp_path("fake-notifier", "sh");
+    let argv_log = temp_path("fake-notifier-argv", "log");
+    fs::write(&source, desktop_workflow_source()).expect("write source");
+    fs::write(
+        &notifier,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+            argv_log.display()
+        ),
+    )
+    .expect("write notifier");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let store_str = store.to_str().expect("utf-8");
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
+        .args([
+            "--store",
+            store_str,
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find(['{']).expect("json")..]).expect("dev json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "completed");
+
+    // The fake notifier ran with the notify-send argument shape:
+    // `<title> <body>` — title = the channel's fixed destination, body = text.
+    let argv = fs::read_to_string(&argv_log).expect("notifier argv recorded");
+    assert_eq!(argv, "Ops Alerts\ndisk almost full\n");
+
+    // Receipt: desktop provider id, accepted, no correlation handle.
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let receipt = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded"))
+        .and_then(|fact| fact.pointer("/value/value"))
+        .expect("send receipt value")
+        .clone();
+    assert_eq!(
+        receipt.get("provider").and_then(Value::as_str),
+        Some("std.messaging.desktop")
+    );
+    assert_eq!(
+        receipt.get("status").and_then(Value::as_str),
+        Some("accepted")
+    );
+    assert_eq!(
+        receipt.get("provider_message_id").and_then(Value::as_str),
+        Some(""),
+        "desktop has no provider correlation handle"
+    );
+    assert_eq!(
+        receipt.get("destination").and_then(Value::as_str),
+        Some("Ops Alerts")
+    );
+    assert!(receipt
+        .get("accepted_at")
+        .and_then(Value::as_str)
+        .is_some_and(|at| !at.is_empty()));
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(notifier);
+    let _ = fs::remove_file(argv_log);
+}
+
+/// A nonzero notifier exit settles `capability.call.failed` with the DR-0032
+/// EffectError base and routes to `fails as` (spec/std-messaging.md slice 4:
+/// failure is not a receipt).
+#[test]
+fn desktop_notifier_failure_settles_capability_call_failed() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("desktop-fail", "sqlite");
+    let source = temp_path("desktop-fail", "whip");
+    let notifier = temp_path("fake-notifier-fail", "sh");
+    fs::write(&source, desktop_workflow_source()).expect("write source");
+    fs::write(
+        &notifier,
+        "#!/bin/sh\necho 'no notification daemon' >&2\nexit 3\n",
+    )
+    .expect("write notifier");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    let store_str = store.to_str().expect("utf-8");
+    let output = Command::new(bin)
+        .env("WHIPPLESCRIPT_DESKTOP_NOTIFIER", &notifier)
+        .args([
+            "--store",
+            store_str,
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("dev runs");
+    assert!(
+        output.status.success(),
+        "dev failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find(['{']).expect("json")..]).expect("dev json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    // The `fails as` branch drove the typed failure terminal.
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", instance]);
+    let failed = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.failed"))
+        .expect("capability.call.failed fact")
+        .clone();
+    // DR-0032 EffectError base rides `value`; the notifier's stderr and exit
+    // status are in the reason.
+    assert_eq!(
+        failed.pointer("/value/value/kind").and_then(Value::as_str),
+        Some("capability.call")
+    );
+    let reason = failed
+        .pointer("/value/value/reason")
+        .and_then(Value::as_str)
+        .expect("failure reason");
+    assert!(
+        reason.contains("no notification daemon") && reason.contains("3"),
+        "failure carries the notifier stderr + exit status: {reason}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(notifier);
+}
+
+/// `whip message` slice-3 upgrades (spec/std-messaging.md local provider
+/// notes): `--by` records the claimed-actor identity, `received_at` is a real
+/// instant (it was `""`), and the message id is minted per DELIVERY — sending
+/// identical text twice is TWO distinct messages (the old content-keyed id
+/// silently deduped the second).
+#[test]
+fn whip_message_mints_distinct_ids_per_delivery() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("message-mint", "sqlite");
+    let source = temp_path("message-mint", "whip");
+    fs::write(
+        &source,
+        r#"
+@service
+workflow Minted
+
+use std.messaging
+
+channel room {
+  provider fixture
+}
+
+output result Done
+class Done { n string }
+
+rule react
+  when message from room as msg
+=> {
+  record Seen {
+    text msg.text
+  }
+}
+
+class Seen { text string }
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    // The SAME text, twice.
+    for _ in 0..2 {
+        let output = Command::new(bin)
+            .args([
+                "--store",
+                store_str,
+                "message",
+                &instance,
+                "--channel",
+                "room",
+                "--text",
+                "ship it",
+                "--by",
+                "alice",
+                "--program",
+                source_str,
+            ])
+            .output()
+            .expect("message runs");
+        assert!(
+            output.status.success(),
+            "whip message failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", &instance]);
+    let messages: Vec<&Value> = facts
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("message.room"))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        2,
+        "identical text re-sent is a DISTINCT delivery: {facts}"
+    );
+    let ids: Vec<&str> = messages
+        .iter()
+        .filter_map(|fact| fact.pointer("/value/message_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "delivery-ordinal-minted ids are distinct");
+    for message in &messages {
+        assert_eq!(
+            message.pointer("/value/sender").and_then(Value::as_str),
+            Some("alice"),
+            "--by records the claimed-actor identity"
+        );
+        assert!(
+            message
+                .pointer("/value/received_at")
+                .and_then(Value::as_str)
+                .is_some_and(|at| !at.is_empty()),
+            "received_at is a real instant"
+        );
+    }
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 /// Inbound messaging (spec/messaging.md): `whip message` injects a `Message` on a
 /// declared channel and a `when message from <channel> as msg` rule fires, binding
 /// the envelope. The fixture-parity counterpart of outbound `send`; live providers
@@ -866,7 +1966,7 @@ workflow Inbound
 use std.messaging
 
 channel release_room {
-  provider slack
+  provider fixture
 }
 
 output result Decision
@@ -1013,431 +2113,9 @@ fn run_text(bin: &str, args: &[&str]) {
     );
 }
 
-/// The ask + timer escalation race: the timer fires, the rule cancels the
-/// losing ask, and the workflow fails on the deadline branch.
+/// Rules fan out per matched fact: two tickets, two progressions.
 #[test]
-fn timer_fires_and_cancel_settles_the_race() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("timer-race", "sqlite");
-    let source = temp_path("timer-race", "whip");
-    fs::write(
-        &source,
-        r#"
-workflow TimerRace
-
-output result Done
-failure error TimedOut
-
-class Done {
-  decision string
-}
-
-class TimedOut {
-  reason string
-}
-
-rule begin
-  when started
-=> {
-  askHuman as signoff "Approve the plan?"
-  timer 3s as deadline
-
-  after deadline succeeds {
-    cancel signoff
-    fail error {
-      reason "no answer within deadline"
-    }
-  }
-}
-
-rule approve
-  when human answered signoff as answer where answer.choice == "approve"
-=> {
-  complete result {
-    decision answer.choice
-  }
-}
-"#,
-    )
-    .expect("write source");
-
-    let store_str = store.to_str().expect("utf-8");
-    let source_str = source.to_str().expect("utf-8");
-    let dev = dev_until_idle(bin, store_str, source_str, &[]);
-    let instance = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-    // The `timer 3s` gives `dev_until_idle` ample margin to settle to a waiting
-    // instance before the deadline fires (a `timer 1s` raced the dev loop on
-    // slower machines). Then sleep past the deadline so the timer is due.
-    assert_eq!(instance_status(bin, store_str, &instance), "running");
-
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    run_text(
-        bin,
-        &[
-            "--store",
-            store_str,
-            "worker",
-            &instance,
-            "--provider",
-            "fixture",
-        ],
-    );
-    run_text(
-        bin,
-        &[
-            "--store",
-            store_str,
-            "step",
-            &instance,
-            "--program",
-            source_str,
-        ],
-    );
-    assert_eq!(instance_status(bin, store_str, &instance), "failed");
-
-    let effects = run_json(bin, &["--store", store_str, "--json", "effects", &instance]);
-    let timer = effects
-        .as_array()
-        .expect("effects")
-        .iter()
-        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
-        .expect("timer effect");
-    assert_eq!(
-        timer.get("status").and_then(Value::as_str),
-        Some("completed")
-    );
-
-    let _ = fs::remove_file(store);
-    let _ = fs::remove_file(source);
-}
-
-/// A `timeout` clause expires a never-run effect to `timed_out` and the
-/// failure branch fires.
-#[test]
-fn timeout_clause_expires_queued_effect() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("deadline", "sqlite");
-    let source = temp_path("deadline", "whip");
-    fs::write(
-        &source,
-        r#"
-workflow Deadline
-
-failure error TooSlow
-
-class TooSlow {
-  reason string
-}
-
-agent worker {
-  provider fixture
-  profile "repo-writer"
-  capacity 1
-}
-
-rule begin
-  when started
-  when worker is available
-=> {
-  tell worker as turn timeout 1s "do something slow"
-
-  after turn fails as failed {
-    fail error {
-      reason "agent missed the deadline"
-    }
-  }
-}
-"#,
-    )
-    .expect("write source");
-
-    let store_str = store.to_str().expect("utf-8");
-    let source_str = source.to_str().expect("utf-8");
-    let started = run_json(bin, &["--store", store_str, "--json", "run", source_str]);
-    let instance = started
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-    run_text(
-        bin,
-        &[
-            "--store",
-            store_str,
-            "step",
-            &instance,
-            "--program",
-            source_str,
-        ],
-    );
-
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    run_text(
-        bin,
-        &[
-            "--store",
-            store_str,
-            "worker",
-            &instance,
-            "--provider",
-            "fixture",
-        ],
-    );
-    run_text(
-        bin,
-        &[
-            "--store",
-            store_str,
-            "step",
-            &instance,
-            "--program",
-            source_str,
-        ],
-    );
-    assert_eq!(instance_status(bin, store_str, &instance), "failed");
-
-    let effects = run_json(bin, &["--store", store_str, "--json", "effects", &instance]);
-    let tell = effects
-        .as_array()
-        .expect("effects")
-        .iter()
-        .find(|effect| effect.get("kind").and_then(Value::as_str) == Some("agent.tell"))
-        .expect("tell effect");
-    assert_eq!(
-        tell.get("status").and_then(Value::as_str),
-        Some("timed_out")
-    );
-
-    let _ = fs::remove_file(store);
-    let _ = fs::remove_file(source);
-}
-
-const TRIAGE_FLOW: &str = r#"
-workflow TicketTriage
-
-input ticket Ticket
-output result TriageDecision
-failure error TriageBlocked
-
-class Ticket {
-  id string
-  title string
-}
-
-class TriageDecision {
-  decision string
-  decidedBy string
-}
-
-class TriageBlocked {
-  reason string
-}
-
-agent triager {
-  provider fixture
-  profile "repo-reader"
-  capacity 1
-}
-
-flow triage
-  when Ticket as ticket
-{
-  tell triager as turn """markdown
-  Suggest a fix plan for {{ ticket.title }}.
-  """
-
-  askHuman as signoff """markdown
-  Plan for {{ ticket.title }}: {{ turn.summary }} — approve or reject.
-  """
-
-  when signoff.choice == "approve" {
-    complete result {
-      decision signoff.choice
-      decidedBy signoff.answered_by
-    }
-  } else {
-    fail error {
-      reason "rejected"
-    }
-  }
-}
-"#;
-
-fn drive_triage_flow(choice: &str) -> String {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path(&format!("flow-{choice}"), "sqlite");
-    let source = temp_path(&format!("flow-{choice}"), "whip");
-    fs::write(&source, TRIAGE_FLOW).expect("write source");
-    let store_str = store.to_str().expect("utf-8").to_owned();
-    let source_str = source.to_str().expect("utf-8").to_owned();
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            &store_str,
-            "--input",
-            r#"{"ticket":{"id":"T-1","title":"Fix login"}}"#,
-            "--json",
-            "dev",
-            &source_str,
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
-    let instance = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-
-    let inbox = run_json(bin, &["--store", &store_str, "--json", "inbox"]);
-    let item = inbox
-        .as_array()
-        .expect("inbox")
-        .first()
-        .and_then(|item| item.get("inbox_item_id"))
-        .and_then(Value::as_str)
-        .expect("pending ask")
-        .to_owned();
-    run_text(
-        bin,
-        &[
-            "--store", &store_str, "inbox", "answer", &item, "--choice", choice, "--by", "alice",
-        ],
-    );
-    run_text(
-        bin,
-        &[
-            "--store",
-            &store_str,
-            "step",
-            &instance,
-            "--program",
-            &source_str,
-        ],
-    );
-    let status = instance_status(bin, &store_str, &instance);
-
-    let _ = fs::remove_file(store);
-    let _ = fs::remove_file(source);
-    status
-}
-
-/// A flow chains tell -> askHuman -> branch with compiler-generated
-/// correlation; approval completes the workflow.
-#[test]
-fn flow_approve_path_completes() {
-    assert_eq!(drive_triage_flow("approve"), "completed");
-}
-
-/// The flow's else branch fails the workflow on rejection.
-#[test]
-fn flow_reject_path_fails() {
-    assert_eq!(drive_triage_flow("reject"), "failed");
-}
-
-/// A hand-written `after <ask> completes { case <ask> { Completed as decided => ...
-/// decided.choice } }` must resolve the human answer's fields at runtime. The
-/// scheduled-escalation example answers before its deadline, so the Completed
-/// branch fires and the workflow completes carrying the answered choice — a
-/// regression guard for the human-ask terminal binding (the answer fact, not the
-/// `human.ask.issued` ack, must back the case scrutinee).
-#[test]
-fn human_ask_case_completed_branch_resolves_answer_choice() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store = temp_path("human-case", "sqlite");
-    let store_str = store.to_str().expect("utf-8").to_owned();
-    // Reuse the scheduled-escalation example (its `case answer { Completed
-    // decided => ... decided.choice }` is exactly the path under test), but push
-    // the deadline far into the future so the human answer wins the race and the
-    // Completed branch fires deterministically.
-    let example = format!(
-        "{}/../../examples/scheduled-escalation.whip",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let source_path = temp_path("human-case", "whip");
-    let source = source_path.to_str().expect("utf-8").to_owned();
-    let text = fs::read_to_string(&example)
-        .expect("read example")
-        .replace("2026-06-11T18:00:00Z", "2999-01-01T00:00:00Z");
-    fs::write(&source_path, text).expect("write source");
-
-    let dev = run_json(
-        bin,
-        &[
-            "--store",
-            &store_str,
-            "--json",
-            "dev",
-            &source,
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
-    let instance = dev
-        .get("instance_id")
-        .and_then(Value::as_str)
-        .expect("instance id")
-        .to_owned();
-
-    let inbox = run_json(bin, &["--store", &store_str, "--json", "inbox"]);
-    let item = inbox
-        .as_array()
-        .expect("inbox")
-        .first()
-        .and_then(|item| item.get("inbox_item_id"))
-        .and_then(Value::as_str)
-        .expect("pending ask")
-        .to_owned();
-    run_text(
-        bin,
-        &[
-            "--store", &store_str, "inbox", "answer", &item, "--choice", "approve", "--by", "alice",
-        ],
-    );
-    run_text(
-        bin,
-        &[
-            "--store",
-            &store_str,
-            "step",
-            &instance,
-            "--program",
-            &source,
-        ],
-    );
-
-    // Answering before the deadline takes the Completed branch and completes.
-    assert_eq!(instance_status(bin, &store_str, &instance), "completed");
-    // `decided.choice` resolved to the answered choice in the completion output.
-    let log = run_json(bin, &["--store", &store_str, "--json", "log", &instance]);
-    let decision = log
-        .as_array()
-        .expect("log")
-        .iter()
-        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.completed"))
-        .and_then(|event| event.get("payload"))
-        .and_then(|payload| payload.get("payload"))
-        .and_then(|payload| payload.get("decision"))
-        .and_then(Value::as_str);
-    assert_eq!(decision, Some("approve"));
-
-    let _ = fs::remove_file(store);
-    let _ = fs::remove_file(source_path);
-}
-
-/// Flows fan out per matched fact: two tickets, two progressions.
-#[test]
-fn flow_fans_out_per_matched_fact() {
+fn rule_fans_out_per_matched_fact() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store = temp_path("flow-fan", "sqlite");
     let source = temp_path("flow-fan", "whip");
@@ -1474,16 +2152,18 @@ table tickets as Ticket [
   }
 ]
 
-flow plan_ticket
+rule plan_ticket
   when Ticket as ticket
-{
+=> {
   tell triager as turn """markdown
   Plan {{ ticket.title }}.
   """
 
-  record Plan {
-    id ticket.id
-    plan turn.summary
+  after turn succeeds {
+    record Plan {
+      id ticket.id
+      plan turn.summary
+    }
   }
 }
 "#,
@@ -1559,7 +2239,7 @@ fn exec_is_gated_by_operator_grants() {
             "--store",
             store.to_str().expect("utf-8"),
             "--json",
-            "dev",
+            "run",
             source.to_str().expect("utf-8"),
             "--provider",
             "fixture",
@@ -1705,6 +2385,52 @@ rule go
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("raw `exec \"...\"` is not allowed"));
     let _ = fs::remove_file(source);
+}
+
+/// DQ-1 authority-split namespace: the I/O-boundary packages hard-error at
+/// check when their constructs appear without the `use std.<pkg>` import —
+/// the import line is uniformly load-bearing, never decoration. (The ambient
+/// packages — agent, coercion, coord, tracker, time, workflow, memory — need
+/// no import; every non-`use` example in this suite already exercises that.)
+#[test]
+fn authority_packages_require_their_import() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    for (label, body, expected) in [
+        (
+            "signal-no-ingress",
+            "signal go.now {\n  x string\n}\n\nrule j\n  when go.now as g\n=> {\n  complete result { note g.x }\n}",
+            "requires `use std.ingress`",
+        ),
+        (
+            "channel-no-messaging",
+            "channel updates\n\nrule j\n  when started\n=> {\n  complete result { note \"ok\" }\n}",
+            "requires `use std.messaging`",
+        ),
+        (
+            "filestore-no-files",
+            "file store docs {\n  root \"./docs\"\n  allow read [\"**\"]\n}\n\nrule j\n  when started\n=> {\n  complete result { note \"ok\" }\n}",
+            "requires `use std.files`",
+        ),
+    ] {
+        let source = temp_path(label, "whip");
+        fs::write(
+            &source,
+            format!(
+                "workflow Gate\n\noutput result Done\n\nclass Done {{\n  note string\n}}\n\n{body}\n"
+            ),
+        )
+        .expect("write source");
+        let output = Command::new(bin)
+            .args(["check", source.to_str().expect("utf-8")])
+            .output()
+            .expect("check runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "{label}: expected `{expected}`\nstderr:\n{stderr}"
+        );
+        let _ = fs::remove_file(source);
+    }
 }
 
 #[test]
@@ -2027,7 +2753,7 @@ fn unknown_statements_and_modifiers_are_rejected() {
         (
             "flow-only",
             "on fails {\n    record Seen {\n      id \"x\"\n    }\n  }",
-            "only valid inside `flow` bodies",
+            "not rule body statements",
         ),
     ] {
         let source = temp_path(label, "whip");
@@ -2221,6 +2947,303 @@ fn timer_until_future_deadline_stays_queued() {
     let _ = fs::remove_file(source);
 }
 
+/// DR-0032 P3 (per-kind failure extras): an exec failure binding exposes
+/// `f.exit_code`, and the value is the command's real exit status.
+#[test]
+fn exec_failure_binding_exposes_exit_code() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("exec-exit-code", "sqlite");
+    let source = temp_path("exec-exit-code", "whip");
+    fs::write(
+        &source,
+        r#"
+use std.script
+
+workflow ExecExit
+
+output result Done
+failure error Broken
+
+class Done {
+  note string
+}
+
+class Broken {
+  reason string
+  code int
+}
+
+class Trigger {
+  id string
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  exec "false" as x
+
+  after x succeeds {
+    complete result { note "ok" }
+  }
+
+  after x fails as f {
+    fail error {
+      reason f.reason
+      code f.exit_code
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_with_exec_allow(bin, store_str, source.to_str().expect("utf-8"), "false");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let failed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.failed"))
+        .expect("workflow.failed event");
+    assert_eq!(
+        failed
+            .pointer("/payload/payload/code")
+            .and_then(Value::as_i64),
+        Some(1),
+        "f.exit_code binds the real exit status: {failed}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// DR-0032 P3: coerce and tell failure bindings expose `f.error_class` (a
+/// coarse, redaction-safe classification).
+#[test]
+fn coerce_and_tell_failure_bindings_expose_error_class() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("error-class", "sqlite");
+    let source = temp_path("error-class", "whip");
+    fs::write(
+        &source,
+        r#"
+use std.coercion
+
+workflow ErrorClass
+
+output result Done
+failure error Broken
+
+class Done {
+  note string
+}
+
+class Broken {
+  reason string
+  klass string
+}
+
+class Trigger {
+  id string
+}
+
+class Verdict {
+  priority string
+}
+
+coerce judge(id string) -> Verdict {
+  prompt "Classify {{ id }}"
+}
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  coerce judge(t.id) as v
+
+  after v succeeds {
+    complete result { note "ok" }
+  }
+
+  after v fails as f {
+    fail error {
+      reason f.reason
+      klass f.error_class
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source.to_str().expect("utf-8"), &["--fail"]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let failed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.failed"))
+        .expect("workflow.failed event");
+    assert_eq!(
+        failed
+            .pointer("/payload/payload/klass")
+            .and_then(Value::as_str),
+        Some("provider_error"),
+        "f.error_class binds the classification: {failed}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// DR-0032 P3 (typed invoke failure at runtime): when the child declares a
+/// sole shared failure contract, the parent's `after child fails as f` binds
+/// the child's typed failure fields (merged under the EffectError base), so
+/// `f.<child field>` resolves at runtime, matching the static typing.
+#[test]
+fn invoke_failure_binding_carries_child_typed_fields() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("invoke-child-fail", "sqlite");
+    let source = temp_path("invoke-child-fail", "whip");
+    fs::write(
+        &source,
+        r#"
+class ChildBroken {
+  reason string
+  code string
+}
+
+workflow Parent {
+  input task ParentTask
+  output result Done
+  failure error Broken
+
+  class ParentTask {
+    id string
+  }
+
+  class Done {
+    note string
+  }
+
+  class Broken {
+    reason string
+    child_code string
+  }
+
+  rule r
+    when ParentTask as t
+  => {
+    invoke Child {
+      task { id t.id }
+    } as child
+
+    after child succeeds {
+      complete result { note "ok" }
+    }
+
+    after child fails as f {
+      fail error {
+        reason f.reason
+        child_code f.code
+      }
+    }
+  }
+}
+
+workflow Child {
+  input task ChildTask
+  output result ChildDone
+  failure error ChildBroken
+
+  class ChildTask {
+    id string
+  }
+
+  class ChildDone {
+    note string
+  }
+
+  rule go
+    when ChildTask as task
+  => {
+    fail error {
+      reason "child says no"
+      code "E42"
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let output = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "--input",
+            r#"{"task":{"id":"t1"}}"#,
+            "--json",
+            "run",
+            source.to_str().expect("utf-8"),
+            "--root",
+            "Parent",
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("dev json");
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    assert_eq!(instance_status(bin, store_str, instance), "failed");
+    let log = run_json(bin, &["--store", store_str, "--json", "log", instance]);
+    let failed = log
+        .as_array()
+        .expect("log")
+        .iter()
+        .rev()
+        .find(|event| event.get("event_type").and_then(Value::as_str) == Some("workflow.failed"))
+        .expect("workflow.failed event");
+    assert_eq!(
+        failed
+            .pointer("/payload/payload/child_code")
+            .and_then(Value::as_str),
+        Some("E42"),
+        "f.code binds the child's typed failure field: {failed}"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 fn dev_with_exec_allow(bin: &str, store: &str, source: &str, allow: &str) -> Value {
     let mut command = Command::new(bin);
     command
@@ -2228,7 +3251,7 @@ fn dev_with_exec_allow(bin: &str, store: &str, source: &str, allow: &str) -> Val
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source,
             "--provider",
             "fixture",
@@ -2632,7 +3655,7 @@ fn dev_with_coordination(bin: &str, store: &str, source: &str, coordination: &st
             "--store",
             store,
             "--json",
-            "dev",
+            "run",
             source,
             "--provider",
             "fixture",
@@ -3562,6 +4585,335 @@ fn otel_export_rekeys_cursor_per_endpoint() {
     let _ = fs::remove_file(coordination);
 }
 
+/// A workflow with a schema-typed effect run: the coerce output (`Verdict`)
+/// is the effect-run output content the T4 allowlist can declassify.
+const COERCE_OTEL_SOURCE: &str = r#"
+workflow CoerceOtel
+
+output result Done
+failure error Failed
+
+class Done {
+  note string
+}
+
+class Failed {
+  reason string
+}
+
+class Verdict {
+  label string
+  score float
+}
+
+coerce judge(text string) -> Verdict {
+  prompt """markdown
+  Judge this text: {{ text }}
+
+  {{ ctx.output_format }}
+  """
+}
+
+rule seed
+  when started
+=> {
+  coerce judge("hello world") as v
+
+  after v succeeds {
+    complete result {
+      note v.label
+    }
+  }
+  after v fails {
+    fail error {
+      reason "could not judge"
+    }
+  }
+}
+"#;
+
+/// Stand up an instance with one completed schema-typed (coerce) run, for the
+/// T4 content-allowlist tests below.
+fn otel_allowlist_fixture(bin: &str, label: &str) -> (PathBuf, PathBuf, String) {
+    let store = temp_path(label, "sqlite");
+    let source = temp_path(label, "whip");
+    fs::write(&source, COERCE_OTEL_SOURCE).expect("write source");
+    let dev = dev_until_idle(
+        bin,
+        store.to_str().expect("utf-8"),
+        source.to_str().expect("utf-8"),
+        &[],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    (store, source, instance)
+}
+
+/// Run `otel-export --dry-run` and parse the printed OTLP payload.
+fn otel_dry_run_payload(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success(),
+        "otel-export --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout[stdout.find('{').expect("payload json")..])
+        .expect("payload parses")
+}
+
+/// Collect every `whipplescript.field.*` attribute key/value across the
+/// payload's spans.
+fn otel_field_attributes(payload: &Value) -> Vec<(String, String)> {
+    payload
+        .pointer("/resourceSpans/0/scopeSpans/0/spans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|span| span.get("attributes").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|attr| {
+            let key = attr.get("key").and_then(Value::as_str)?;
+            key.starts_with("whipplescript.field.").then(|| {
+                (
+                    key.to_owned(),
+                    attr.pointer("/value/stringValue")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// T4: an allowlisted `<Schema>.<field>` exports as span attribute
+/// `whipplescript.field.<Schema>.<field>` on the producing run's span; the
+/// env carrier works too, and the flag wins over the env.
+#[test]
+fn otel_export_allowlisted_field_exports_as_attribute() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-allow");
+    let store_str = store.to_str().expect("utf-8");
+
+    let flagged = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&flagged));
+    assert_eq!(
+        fields.len(),
+        1,
+        "exactly the allowlisted field exports: {fields:?}"
+    );
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.label");
+    assert!(
+        !fields[0].1.is_empty(),
+        "the coerce output value rides the attribute"
+    );
+
+    // The env variable is the second carrier.
+    let from_env = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST", "Verdict.score")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&from_env));
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.score");
+
+    // The flag wins over the env.
+    let both = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.score",
+        ])
+        .env("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST", "Verdict.label")
+        .output()
+        .expect("otel-export runs");
+    let fields = otel_field_attributes(&otel_dry_run_payload(&both));
+    assert_eq!(fields.len(), 1, "flag replaces env entirely: {fields:?}");
+    assert_eq!(fields[0].0, "whipplescript.field.Verdict.score");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: a field that is NOT on the allowlist never exports, and with no
+/// allowlist at all no content attribute exists anywhere in the payload.
+#[test]
+fn otel_export_non_allowlisted_field_never_exports() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-deny");
+    let store_str = store.to_str().expect("utf-8");
+
+    let partial = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let keys = otel_field_attributes(&otel_dry_run_payload(&partial))
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert!(
+        !keys.iter().any(|key| key.contains("score")),
+        "non-allowlisted `Verdict.score` must never export: {keys:?}"
+    );
+    assert_eq!(keys, ["whipplescript.field.Verdict.label"]);
+
+    let structural = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let stdout = String::from_utf8_lossy(&structural.stdout);
+    assert!(
+        !stdout.contains("whipplescript.field."),
+        "no allowlist => no content attributes at all"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: an unknown schema/field or a malformed entry is a config error (exit 2,
+/// no payload), and an allowlist whose program schemas are unreachable is
+/// refused (fail closed).
+#[test]
+fn otel_export_rejects_bad_allowlist_entries() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-badlist");
+    let store_str = store.to_str().expect("utf-8");
+
+    let cases: [(&str, &str, &str); 4] = [
+        ("Nope.field", &instance, "does not name a declared schema"),
+        ("Verdict.nope", &instance, "does not name a declared schema"),
+        ("Verdictlabel", &instance, "malformed"),
+        // Valid shape, but no reachable program/schema info: fail closed.
+        ("Verdict.label", "no-such-instance", "refused"),
+    ];
+    for (entry, target, expected) in cases {
+        let out = Command::new(bin)
+            .args([
+                "--store",
+                store_str,
+                "otel-export",
+                target,
+                "--dry-run",
+                "--telemetry-allowlist",
+                entry,
+            ])
+            .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+            .output()
+            .expect("otel-export runs");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{entry}` against `{target}` must be a config error"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "`{entry}`: expected `{expected}` in: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("resourceSpans"),
+            "a config error must abort before emitting any payload: {stdout}"
+        );
+    }
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// T4: with no allowlist the export is byte-identical to the structural
+/// export — an allowlisted run differs ONLY by the added content attributes.
+#[test]
+fn otel_export_no_allowlist_is_byte_identical_structural() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let (store, source, instance) = otel_allowlist_fixture(bin, "otel-ident");
+    let store_str = store.to_str().expect("utf-8");
+
+    let structural = Command::new(bin)
+        .args(["--store", store_str, "otel-export", &instance, "--dry-run"])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let structural_payload = otel_dry_run_payload(&structural);
+
+    let allowlisted = Command::new(bin)
+        .args([
+            "--store",
+            store_str,
+            "otel-export",
+            &instance,
+            "--dry-run",
+            "--telemetry-allowlist",
+            "Verdict.label,Verdict.score",
+        ])
+        .env_remove("WHIPPLESCRIPT_TELEMETRY_ALLOWLIST")
+        .output()
+        .expect("otel-export runs");
+    let mut stripped = otel_dry_run_payload(&allowlisted);
+    assert_eq!(
+        otel_field_attributes(&stripped).len(),
+        2,
+        "the allowlisted run carries both content attributes before stripping"
+    );
+
+    // Dropping the content attributes from the allowlisted payload must give
+    // back the structural payload byte-for-byte.
+    if let Some(spans) = stripped
+        .pointer_mut("/resourceSpans/0/scopeSpans/0/spans")
+        .and_then(Value::as_array_mut)
+    {
+        for span in spans {
+            if let Some(attributes) = span.get_mut("attributes").and_then(Value::as_array_mut) {
+                attributes.retain(|attr| {
+                    !attr
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| key.starts_with("whipplescript.field."))
+                });
+            }
+        }
+    }
+    assert_eq!(
+        structural_payload.to_string(),
+        stripped.to_string(),
+        "no-allowlist spans must be byte-identical to the structural export"
+    );
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
 const EVENT_SOURCE: &str = r#"
 workflow EventDemo
 
@@ -3766,6 +5118,76 @@ fn signal_rejects_bad_payload_and_unknown_signal() {
         assert!(stderr.contains(expected), "{label}: {stderr}");
     }
     assert_eq!(instance_status(bin, store_str, &instance), "running");
+
+    let _ = fs::remove_file(store);
+    let _ = fs::remove_file(source);
+}
+
+/// I5 (spec/std-ingress.md): `whip signal --delivery-id` — the operator's
+/// delivery id WINS over the derived payload hash, and the same id twice
+/// admits once ACROSS PROCESS RUNS: the second invocation is a fresh process
+/// against the same store, and the duplicate is absorbed with an observable
+/// diagnostic instead of a second fact (or a store conflict).
+#[test]
+fn signal_delivery_id_admits_once_across_process_runs() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("signal-delivery", "sqlite");
+    let source = temp_path("signal-delivery", "whip");
+    fs::write(&source, EVENT_SOURCE).expect("write source");
+
+    let store_str = store.to_str().expect("utf-8");
+    let source_str = source.to_str().expect("utf-8");
+    let dev = dev_until_idle(bin, store_str, source_str, &[]);
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+
+    let deliver = |payload: &str| -> Value {
+        run_json(
+            bin,
+            &[
+                "--store",
+                store_str,
+                "--json",
+                "signal",
+                &instance,
+                "--name",
+                "deploy.finished",
+                "--data",
+                payload,
+                "--program",
+                source_str,
+                "--delivery-id",
+                "provider-evt-42",
+            ],
+        )
+    };
+
+    let first = deliver(r#"{"service":"api","status":"ok"}"#);
+    assert!(first.get("event_id").and_then(Value::as_str).is_some());
+    assert_eq!(first.get("duplicate"), None, "{first}");
+
+    // Same delivery id, DIFFERENT payload bytes: the delivery id wins over the
+    // derived payload hash, so this is the same delivery — absorbed once.
+    let second = deliver(r#"{"service":"api","status":"retried"}"#);
+    assert_eq!(second.get("duplicate").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        second.get("event_id").and_then(Value::as_str),
+        first.get("event_id").and_then(Value::as_str),
+        "the duplicate names the original admission: {second}"
+    );
+
+    // Exactly one durable signal fact landed.
+    let facts = run_json(bin, &["--store", store_str, "--json", "facts", &instance]);
+    let admitted = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .filter(|fact| fact.get("name").and_then(Value::as_str) == Some("deploy.finished"))
+        .count();
+    assert_eq!(admitted, 1, "same delivery id twice admits once: {facts}");
 
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(source);
@@ -4197,7 +5619,7 @@ fn cross_package_tool_grant_resolves_and_runs() {
             "--store",
             store.to_str().expect("utf-8"),
             "--json",
-            "dev",
+            "run",
             consumer.to_str().expect("utf-8"),
             "--package-lock",
             lock.to_str().expect("utf-8"),
@@ -4262,7 +5684,9 @@ fn cross_package_tool_grant_resolves_and_runs() {
     let _ = fs::remove_dir_all(workspace);
 }
 
-const IFC_BAD_WHIP: &str = r#"@service
+const IFC_BAD_WHIP: &str = r#"use std.files
+
+@service
 workflow IfcCheck
 
 output result R
@@ -4300,7 +5724,9 @@ const IFC_ENVELOPE: &str = r#"{ "resources": {
   "outbox": { "confidential": false }
 } }"#;
 
-const XPKG_TOOL: &str = r#"@tool
+const XPKG_TOOL: &str = r#"use std.files
+
+@tool
 workflow LeakyTool
 output result R
 class R { ok bool }
@@ -4352,7 +5778,9 @@ workflow ConsumerFlow {
 }
 "#;
 
-const IFC_CEILING_WHIP: &str = r#"@service
+const IFC_CEILING_WHIP: &str = r#"use std.files
+
+@service
 workflow CeilingDemo
 output result R
 class R { ok bool }
@@ -4393,7 +5821,7 @@ fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
         .expect("command runs");
     let bob_err = String::from_utf8_lossy(&bob.stderr);
     assert!(
-        !bob.status.success() && bob_err.contains("identity-ceiling"),
+        !bob.status.success() && bob_err.contains("denied read in rule"),
         "a Requester principal should be capped below Operator data\nstderr:\n{bob_err}"
     );
 
@@ -4406,7 +5834,7 @@ fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
         .expect("command runs");
     let alice_err = String::from_utf8_lossy(&alice.stderr);
     assert!(
-        !alice_err.contains("identity-ceiling"),
+        !alice_err.contains("denied read in rule"),
         "an Operator principal should be cleared\nstderr:\n{alice_err}"
     );
 
@@ -4414,7 +5842,7 @@ fn ifc_principal_ceiling_caps_an_agent_to_the_users_clearance() {
     let _ = fs::remove_file(&envelope);
 }
 
-/// Runtime IFC admission (E3): `whip dev` refuses to RUN a whip that violates
+/// Runtime IFC admission (E3): `whip run` refuses to RUN a whip that violates
 /// information flow under a governed envelope, before any side effect — enforcement
 /// at run time, not only at `whip check` time.
 #[test]
@@ -4430,7 +5858,7 @@ fn ifc_runtime_admission_refuses_a_violating_whip() {
         .args([
             "--store",
             store.to_str().expect("utf-8"),
-            "dev",
+            "run",
             whip.to_str().expect("utf-8"),
             "--root",
             "IfcCheck",
@@ -4442,7 +5870,7 @@ fn ifc_runtime_admission_refuses_a_violating_whip() {
     assert!(
         !governed.status.success()
             && stderr.contains("refusing to run")
-            && stderr.contains("information-flow violation"),
+            && stderr.contains("denied flow in rule"),
         "expected runtime admission to refuse the violating whip\nstderr:\n{stderr}"
     );
 
@@ -4511,7 +5939,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     let stderr = String::from_utf8_lossy(&governed.stderr);
     assert!(
         !governed.status.success()
-            && stderr.contains("cross-package information-flow violation")
+            && stderr.contains("denied import of tool")
             && stderr.contains("secretz")
             && stderr.contains("invoke:package-leaky/LeakyTool"),
         "expected a cross-package violation naming secretz and the invoke door\nstderr:\n{stderr}"
@@ -4537,7 +5965,7 @@ fn ifc_cross_package_rejects_imported_tool_with_ungoverned_surface() {
     let missing_invoke_stderr = String::from_utf8_lossy(&missing_invoke.stderr);
     assert!(
         !missing_invoke.status.success()
-            && missing_invoke_stderr.contains("cross-package information-flow violation")
+            && missing_invoke_stderr.contains("denied import of tool")
             && missing_invoke_stderr.contains("invoke:package-leaky/LeakyTool"),
         "missing package invoke grant should still fail\nstderr:\n{missing_invoke_stderr}"
     );
@@ -4591,7 +6019,7 @@ fn ifc_check_rejects_confidential_to_uncleared_flow_under_envelope() {
         "expected check to fail under governance\nstderr:\n{governed_stderr}"
     );
     assert!(
-        governed_stderr.contains("information-flow violation"),
+        governed_stderr.contains("denied flow in rule"),
         "expected an IFC violation\nstderr:\n{governed_stderr}"
     );
 
@@ -4707,7 +6135,7 @@ fn ifc_check_enforces_and_rejects_tampered_signed_envelope() {
         .expect("command runs");
     assert!(!enforced.status.success(), "signed envelope should enforce");
     assert!(
-        String::from_utf8_lossy(&enforced.stderr).contains("information-flow violation"),
+        String::from_utf8_lossy(&enforced.stderr).contains("denied flow in rule"),
         "stderr: {}",
         String::from_utf8_lossy(&enforced.stderr)
     );
@@ -4836,10 +6264,11 @@ fn ifc_governance_agent_loop_drafts_and_signs() {
     let _ = fs::remove_file(&out);
 }
 
-/// End-to-end whip agent loop (DR-0026/0028): the unprivileged whip agent can
+/// End-to-end whip infoflow loop (DR-0026/0028; renamed from `whip agent`,
+/// spec/std-agent.md "Operator CLI"): the unprivileged whip agent can
 /// `check` a whip but is refused if it tries to `sign` governance.
 #[test]
-fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
+fn ifc_whip_infoflow_loop_checks_and_refuses_to_sign() {
     use std::io::Write;
     let bin = env!("CARGO_BIN_EXE_whip");
     let whip = temp_path("whip-agent-whip", "whip");
@@ -4848,7 +6277,7 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
     let script = format!("check {whip_arg}\nsign anything\nquit\n");
 
     let mut child = Command::new(bin)
-        .args(["agent"])
+        .args(["infoflow"])
         .env_remove("WHIPPLESCRIPT_IFC_ENVELOPE")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -4861,7 +6290,7 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
         .write_all(script.as_bytes())
         .expect("write script");
     let output = child.wait_with_output().expect("wait");
-    assert!(output.status.success(), "whip agent loop should succeed");
+    assert!(output.status.success(), "whip infoflow loop should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("no information-flow violations"),
@@ -4869,8 +6298,242 @@ fn ifc_whip_agent_loop_checks_and_refuses_to_sign() {
     );
     assert!(
         stdout.contains("cannot sign governance"),
-        "whip agent must refuse to sign: {stdout}"
+        "whip infoflow must refuse to sign: {stdout}"
     );
 
     let _ = fs::remove_file(&whip);
+}
+
+/// `whip agent` is a one-way rename to `whip infoflow` (spec/std-agent.md
+/// "Operator CLI"): no alias — the old name errors with a pointer, freeing the
+/// `whip agent` namespace for std.agent.
+#[test]
+fn whip_agent_errors_with_infoflow_pointer() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let output = Command::new(bin).args(["agent"]).output().expect("run");
+    assert!(
+        !output.status.success(),
+        "`whip agent` must fail after the infoflow rename"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("whip infoflow"),
+        "`whip agent` must point at `whip infoflow`: {stderr}"
+    );
+}
+
+#[test]
+fn whip_script_list_and_verify_recheck_manifest_pins() {
+    // SC6 (spec/std-script.md "operator surface polish"): read-only views
+    // over the pinned script manifest. `verify` re-hashes each entry with
+    // structured expected/actual fields and exits 1 on any mismatch; `list`
+    // shows the pins. Bootstrap trick: pin a wrong hash first and re-pin
+    // from the reported actual_sha256 so the test hardcodes no digest.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let script = temp_path("sc6-script", "py");
+    let manifest = temp_path("sc6-manifest", "json");
+    fs::write(&script, "#!/usr/bin/env python3\nprint(\"{}\")\n").expect("write script");
+    let manifest_with = |sha: &str| {
+        serde_json::json!({
+            "sc6_probe": {
+                "argv": ["python3", script.to_str().expect("utf-8")],
+                "sha256": sha
+            }
+        })
+        .to_string()
+    };
+    fs::write(&manifest, manifest_with(&"0".repeat(64))).expect("write manifest");
+
+    let mismatch = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "verify",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        !mismatch.status.success(),
+        "a wrong pin must fail verify: {}",
+        String::from_utf8_lossy(&mismatch.stdout)
+    );
+    let report: Value = serde_json::from_slice(&mismatch.stdout).expect("verify emits json");
+    let row = &report
+        .get("scripts")
+        .and_then(Value::as_array)
+        .expect("rows")[0];
+    assert_eq!(row.get("status").and_then(Value::as_str), Some("mismatch"));
+    assert_eq!(
+        row.get("expected_sha256").and_then(Value::as_str),
+        Some("0".repeat(64).as_str()),
+        "structured expected field"
+    );
+    let actual = row
+        .get("actual_sha256")
+        .and_then(Value::as_str)
+        .expect("structured actual field")
+        .to_owned();
+    assert_eq!(actual.len(), 64);
+
+    fs::write(&manifest, manifest_with(&actual)).expect("re-pin manifest");
+    let verified = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "verify",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        verified.status.success(),
+        "a correct pin must verify: {}",
+        String::from_utf8_lossy(&verified.stdout)
+    );
+
+    let listed = Command::new(bin)
+        .args([
+            "--json",
+            "script",
+            "list",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("runs");
+    assert!(listed.status.success());
+    let rows: Value = serde_json::from_slice(&listed.stdout).expect("list emits json");
+    assert_eq!(
+        rows.as_array().expect("rows")[0]
+            .get("sha256")
+            .and_then(Value::as_str),
+        Some(actual.as_str())
+    );
+
+    let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(&manifest);
+}
+
+#[test]
+fn tampered_script_capability_fails_with_structured_hash_evidence() {
+    // SC6's evidence half: the runtime hash-mismatch refusal records
+    // machine-readable expected_sha256/actual_sha256 on the failed fact and
+    // terminal, replacing message-text-only evidence.
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store = temp_path("sc6-evidence", "sqlite");
+    let source = temp_path("sc6-evidence", "whip");
+    let script = temp_path("sc6-evidence-script", "py");
+    let manifest = temp_path("sc6-evidence-manifest", "json");
+    fs::write(&script, "#!/usr/bin/env python3\nprint(\"{}\")\n").expect("write script");
+    fs::write(
+        &manifest,
+        serde_json::json!({
+            "sc6_judge": {
+                "argv": ["python3", script.to_str().expect("utf-8")],
+                "sha256": "1".repeat(64)
+            }
+        })
+        .to_string(),
+    )
+    .expect("write manifest");
+    fs::write(
+        &source,
+        r#"
+use std.script
+workflow Sc6Evidence
+
+output result Report
+failure trouble Report
+
+class Request {
+  text string
+}
+
+class Report {
+  message string
+}
+
+table requests as Request [
+  {
+    text "tampered"
+  }
+]
+
+rule go
+  when Request as request
+=> {
+  exec sc6_judge with request -> Report as report
+
+  after report succeeds as out {
+    complete result {
+      message out.message
+    }
+  }
+  after report fails as f {
+    fail trouble {
+      message f.reason
+    }
+  }
+}
+"#,
+    )
+    .expect("write source");
+
+    let dev = dev_until_idle(
+        bin,
+        store.to_str().expect("utf-8"),
+        source.to_str().expect("utf-8"),
+        &[
+            "--exec-profile",
+            "hosted",
+            "--script-manifest",
+            manifest.to_str().expect("utf-8"),
+        ],
+    );
+    let instance = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+    let facts = run_json(
+        bin,
+        &[
+            "--store",
+            store.to_str().expect("utf-8"),
+            "--json",
+            "facts",
+            instance,
+        ],
+    );
+    let failed = facts
+        .as_array()
+        .expect("facts array")
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("exec.command.failed"))
+        .expect("hash mismatch fails the exec effect");
+    let evidence = failed
+        .pointer("/value/error/evidence")
+        .expect("structured evidence on the failed fact");
+    assert_eq!(
+        evidence.get("kind").and_then(Value::as_str),
+        Some("script.hash_mismatch")
+    );
+    assert_eq!(
+        evidence.get("expected_sha256").and_then(Value::as_str),
+        Some("1".repeat(64).as_str())
+    );
+    assert_eq!(
+        evidence
+            .get("actual_sha256")
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(64)
+    );
+
+    let _ = fs::remove_file(&store);
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&script);
+    let _ = fs::remove_file(&manifest);
 }

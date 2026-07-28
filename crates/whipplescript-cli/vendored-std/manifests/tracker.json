@@ -1,0 +1,228 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.tracker",
+  "name": "std.tracker",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.tracker",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "tracker.file",
+          "effect_kind": "tracker.file",
+          "source_forms": ["file"],
+          "input_schema": "tracker.file.input",
+          "required_capabilities": ["tracker.file"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "none"
+        },
+        {
+          "id": "tracker.claim",
+          "effect_kind": "tracker.claim",
+          "source_forms": ["claim"],
+          "input_schema": "tracker.claim.input",
+          "output_schema": "TrackerClaim",
+          "required_capabilities": ["tracker.claim"],
+          "provider_kinds": ["builtin-tracker"],
+          "projected_facts": ["effect.output"],
+          "validation": "none"
+        },
+        {
+          "id": "tracker.renew",
+          "effect_kind": "tracker.renew",
+          "source_forms": ["renew"],
+          "input_schema": "tracker.renew.input",
+          "required_capabilities": ["tracker.renew"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "none"
+        },
+        {
+          "id": "tracker.release",
+          "effect_kind": "tracker.release",
+          "source_forms": ["release"],
+          "input_schema": "tracker.release.input",
+          "required_capabilities": ["tracker.release"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "none"
+        },
+        {
+          "id": "tracker.finish",
+          "effect_kind": "tracker.finish",
+          "source_forms": ["finish"],
+          "input_schema": "tracker.finish.input",
+          "required_capabilities": ["tracker.finish"],
+          "provider_kinds": ["builtin-tracker"],
+          "validation": "none"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "tracker.tracker",
+          "construct_family": "declaration_block",
+          "keyword": "tracker",
+          "scope": "top_level",
+          "lowering_target": "metadata_only"
+        },
+        {
+          "id": "tracker.file",
+          "construct_family": "effect_operation",
+          "keyword": "file",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.file" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.claim",
+          "construct_family": "effect_operation",
+          "keyword": "claim",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.claim" }],
+          "provides": [{ "kind": "EffectHandle", "type": "TrackerClaim" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.renew",
+          "construct_family": "effect_operation",
+          "keyword": "renew",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.renew" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.release",
+          "construct_family": "effect_operation",
+          "keyword": "release",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.release" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "typed_effect_call"
+        },
+        {
+          "id": "tracker.finish",
+          "construct_family": "effect_operation",
+          "keyword": "finish",
+          "scope": "rule_body",
+          "requires": [{ "kind": "Capability", "name": "tracker.finish" }],
+          "provides": [{ "kind": "EffectHandle" }],
+          "lowering_target": "typed_effect_call"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "tracker.file",
+      "description": "File a new issue into a declared tracker's durable backlog."
+    },
+    {
+      "id": "tracker.claim",
+      "description": "Atomically claim an open issue (claimed / already_claimed / not_found)."
+    },
+    {
+      "id": "tracker.renew",
+      "description": "Extend a held issue claim before it expires (renew names its claim binding; effect kind arrives with slice T3)."
+    },
+    {
+      "id": "tracker.release",
+      "description": "Release a claimed issue back to ready without finishing it."
+    },
+    {
+      "id": "tracker.finish",
+      "description": "Close a claimed issue with a completion summary."
+    }
+  ],
+  "providers": [
+    {
+      "id": "builtin-tracker-file",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.file",
+      "effect_kind": "tracker.file",
+      "config": {}
+    },
+    {
+      "id": "builtin-tracker-claim",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.claim",
+      "effect_kind": "tracker.claim",
+      "config": {}
+    },
+    {
+      "id": "builtin-tracker-renew",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.renew",
+      "effect_kind": "tracker.renew",
+      "config": {}
+    },
+    {
+      "id": "builtin-tracker-release",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.release",
+      "effect_kind": "tracker.release",
+      "config": {}
+    },
+    {
+      "id": "builtin-tracker-finish",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.finish",
+      "effect_kind": "tracker.finish",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-tracker",
+      "name": "tracker",
+      "description": "Allow the workspace-scoped tracker backlog effects (file / claim / renew / release / finish).",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": [
+        "tracker.file",
+        "tracker.claim",
+        "tracker.renew",
+        "tracker.release",
+        "tracker.finish"
+      ],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-tracker-file",
+      "program_id": null,
+      "capability": "tracker.file",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-claim",
+      "program_id": null,
+      "capability": "tracker.claim",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-renew",
+      "program_id": null,
+      "capability": "tracker.renew",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-release",
+      "program_id": null,
+      "capability": "tracker.release",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-finish",
+      "program_id": null,
+      "capability": "tracker.finish",
+      "provider": "builtin-tracker",
+      "config": {}
+    }
+  ]
+}

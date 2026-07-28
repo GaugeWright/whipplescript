@@ -33,6 +33,8 @@ use whipplescript_store::files::FileStore;
 
 pub mod do_branches;
 pub mod do_instance;
+pub mod do_memory;
+pub mod do_packages;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
 pub mod do_store;
 /// The in-isolate agent-turn tool executor over the DO file plane (P4).
@@ -40,6 +42,275 @@ pub mod do_tools;
 #[cfg(target_arch = "wasm32")]
 pub mod do_wasm;
 pub mod do_worker;
+/// GaugeDesk-compatible governance verification for hosted placements.
+pub mod governance;
+/// Placement-neutral projection of one governed hosted turn into the public
+/// host protocol's body-free pointers and terminal receipt.
+pub mod host_projection;
+
+#[cfg(test)]
+mod governed_host_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
+
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use serde_json::json;
+    use whipplescript_kernel::coerce_native::CoerceProvider;
+    use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+    use whipplescript_kernel::harness_model::MessagesApiClient;
+    use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
+    use whipplescript_kernel::host_package::{
+        AuthoredAgentPackage, PackageResolver, AGENT_PACKAGE_SCHEMA,
+    };
+    use whipplescript_kernel::host_policy::{
+        HostGovernancePolicy, PlacementPolicy, ProviderBindingPolicy, ResourcePolicy,
+    };
+    use whipplescript_kernel::host_protocol::{
+        CredentialRef, OpenInstanceCommand, ProviderBindingRef, StartTurnCommand, TurnInput,
+        HOST_PROTOCOL,
+    };
+    use whipplescript_kernel::sansio::HttpResponse;
+    use whipplescript_store::RuntimeStore;
+
+    use crate::do_store::{test_support, DoSql, DoSqliteStore};
+    use crate::do_worker::{DurableEffectPorts, DurableInstance, DurableStepOutcome};
+    use crate::governance::{GaugeDeskGovernanceRoot, GAUGEDESK_ATTESTATION_ALGORITHM};
+
+    fn package() -> AuthoredAgentPackage {
+        AuthoredAgentPackage::from_documents(
+            json!({
+                "schema": AGENT_PACKAGE_SCHEMA,
+                "source": "method.whip",
+                "workflow": "Method",
+                "agent": "assistant",
+                "system_prompt": "persona.md",
+                "capabilities": [],
+                "agent_abilities": [],
+                "max_steps": 4,
+            })
+            .to_string(),
+            r#"
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "repo-reader"
+    capacity 1
+    capabilities []
+  }
+  rule converse when started => { tell assistant "Answer without tools." }
+}
+"#,
+            "Be helpful.",
+        )
+        .expect("package")
+    }
+
+    fn signed_policy() -> (GaugeDeskGovernanceRoot, String) {
+        let principal = ResourcePolicy {
+            principal: true,
+            ..ResourcePolicy::default()
+        };
+        let policy = HostGovernancePolicy {
+            resources: BTreeMap::from([
+                ("provider:openai".to_owned(), principal.clone()),
+                ("placement:do".to_owned(), principal),
+            ]),
+            bindings: BTreeMap::from([
+                ("model".to_owned(), "provider:openai".to_owned()),
+                ("do".to_owned(), "placement:do".to_owned()),
+            ]),
+            parties: BTreeMap::from([("operator".to_owned(), "public".to_owned())]),
+            provider_bindings: BTreeMap::from([(
+                "model".to_owned(),
+                ProviderBindingPolicy {
+                    provider: "openai".to_owned(),
+                    model: "gpt-test".to_owned(),
+                    base_url: "https://provider.invalid".to_owned(),
+                    credential_ref: "credential:model".to_owned(),
+                },
+            )]),
+            placements: BTreeMap::from([(
+                "do".to_owned(),
+                PlacementPolicy {
+                    kind: "durable_object".to_owned(),
+                    provider_bindings: BTreeSet::from(["model".to_owned()]),
+                    command_network: false,
+                },
+            )]),
+            ..HostGovernancePolicy::default()
+        };
+        let signer = "authority:gaugedesk";
+        let key = SigningKey::from_slice(&[7u8; 32]).expect("test key");
+        let public_key = hex::encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let unsigned = policy.to_json().expect("policy");
+        let signing_bytes = external_signing_bytes(
+            &unsigned,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+        )
+        .expect("bytes");
+        let signature: Signature = key.sign(&signing_bytes);
+        let signed = SignedEnvelope::from_external_signature(
+            &unsigned,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+            &hex::encode(signature.to_bytes()),
+        )
+        .expect("signed")
+        .to_json();
+        (GaugeDeskGovernanceRoot::new(signer, public_key), signed)
+    }
+
+    #[test]
+    fn gaugedesk_host_protocol_admits_the_same_package_on_the_do_store() {
+        let (root, signed) = signed_policy();
+        let verified = root.verify_epoch(7, &signed).expect("verified");
+        let sql = Rc::new(test_support::store().sql);
+        for statement in [
+            "INSERT INTO capability_schemas (capability, description, schema_json) \
+             VALUES ('agent.tell', 'Run an agent turn.', '{}')",
+            "INSERT INTO effect_providers (provider_id, effect_kind, provider, capability, config_json) \
+             VALUES ('provider_agent_tell_builtin', 'agent.tell', 'builtin-agent-harness', 'agent.tell', '{}')",
+            "INSERT INTO capability_bindings (binding_id, program_id, capability, provider, config_json) \
+             VALUES ('binding_agent_tell_builtin', NULL, 'agent.tell', 'builtin-agent-harness', '{}')",
+            "INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) \
+             VALUES ('profile_repo_reader', 'repo-reader', 'reads', 'enforce', '[\"agent.tell\"]', '{}')",
+        ] {
+            sql.execute(statement, &[]).expect("seed hosted agent policy");
+        }
+        let mut host = GovernedHostFacade::from_verified_store(
+            DoSqliteStore::new(Rc::clone(&sql)),
+            7,
+            verified.envelope,
+        )
+        .expect("host");
+        let package = package();
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-do-1".to_owned(),
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+        };
+        let opened = host.open_instance(&open, &package).expect("opened");
+        let turn = StartTurnCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: "turn-do-1".to_owned(),
+            run_ref: "gaugedesk:run:do:1".to_owned(),
+            instance_ref: opened.instance_ref,
+            package_version_ref: package.version_ref().to_owned(),
+            policy: host.policy_ref().clone(),
+            actor_ref: "operator".to_owned(),
+            input: TurnInput {
+                text: "hello from GaugeDesk".to_owned(),
+                images: Vec::new(),
+            },
+            resources: Vec::new(),
+            provider_binding: ProviderBindingRef {
+                binding_id: "model".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "credential:model".to_owned(),
+                },
+            },
+            placement_ceiling_ref: "do".to_owned(),
+        };
+        assert!(host
+            .begin_turn(
+                &turn,
+                &package,
+                ProviderRealization {
+                    provider: "openai",
+                    model: "gpt-test",
+                    base_url: "https://provider.invalid",
+                },
+            )
+            .expect("admitted"));
+        let effects = host
+            .kernel()
+            .store()
+            .list_effects(&turn.instance_ref)
+            .expect("effects");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].effect_id, turn.command_id);
+
+        let resolved = package
+            .resolve_package(package.version_ref())
+            .expect("package IR");
+        let ports = DurableEffectPorts {
+            agent_model: Some(Box::new(MessagesApiClient::new(
+                CoerceProvider::OpenAi,
+                "test-key",
+                "gpt-test",
+                "https://provider.invalid",
+                1024,
+                None,
+            ))),
+            ..DurableEffectPorts::default()
+        };
+        let mut attached =
+            DurableInstance::attach(Rc::clone(&sql), resolved.program, &turn.instance_ref, ports)
+                .expect("attach hosted instance");
+        let first_step = attached.step(None, 1_767_225_600_000);
+        let instance_status = attached.status().expect("instance status");
+        let after_step = host
+            .kernel()
+            .store()
+            .list_effects(&turn.instance_ref)
+            .expect("effects after step");
+        assert!(
+            matches!(first_step, DurableStepOutcome::NeedsHttp(_)),
+            "an admitted hosted turn must be claimed and driven, got {first_step:?}; status: {instance_status:?}; effects: {after_step:?}"
+        );
+        let resumed = attached.step(
+            Some(Ok(HttpResponse {
+                status: 200,
+                body: json!({
+                    "choices": [{
+                        "message": { "role": "assistant", "content": "done" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 3, "completion_tokens": 0 }
+                }),
+            })),
+            1_767_225_600_000,
+        );
+        assert!(
+            matches!(
+                resumed,
+                DurableStepOutcome::Parked {
+                    next_due_unix_ms: None
+                }
+            ),
+            "the hosted turn settles and leaves the reusable instance open, got {resumed:?}"
+        );
+        let projection = crate::host_projection::project_host_turn(
+            host.kernel_mut().store_mut(),
+            &turn.instance_ref,
+            &turn.command_id,
+        )
+        .expect("runtime projection");
+        let receipt = projection.receipt.expect("terminal receipt");
+        assert_eq!(receipt.command_id, turn.command_id);
+        assert!(receipt.guarantee_report_ref.starts_with("whip:evidence:"));
+        assert_eq!(
+            projection.usage_observation,
+            Some(crate::host_projection::HostedUsageObservation {
+                usage_ref: receipt.usage_ref.clone(),
+                input_tokens: 3,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+            })
+        );
+        assert!(projection.runtime_evidence_pointers.iter().any(|pointer| {
+            matches!(
+                pointer,
+                whipplescript_kernel::host_protocol::RuntimeEvidencePointer::TurnReceipt(_)
+            )
+        }));
+    }
+}
 
 // -- HTTP: the fetch host driver ------------------------------------------
 

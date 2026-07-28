@@ -9,7 +9,7 @@
 //!
 //! What is wired: the rule pass (`advance_rules`), ready-effect discovery
 //! (`next_ready_effect`), and `run_effect` dispatch of the lifted store-only
-//! handler cores over the DO store — `event.emit`, `human.ask`, the
+//! handler cores over the DO store — `event.emit`, the
 //! `queue.*` family (via `WorkItems`), the lease/ledger/counter coordination family
 //! (via `Coordination`), and the `file.*` family (via the `FileStore` seam). The
 //! HTTP effects (coerce/agent) will suspend with `EffectStep::NeedsHttp` and be
@@ -18,8 +18,10 @@
 //! clearly rather than silently skipping.
 
 use whipplescript_kernel::coerce::{CoerceRequest, CoerceResult, CoerceStatus};
+#[cfg(test)]
+use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::coerce_native::{
-    build_coerce_call_parts, build_request, parse_response, CoerceCall, CoerceProvider,
+    build_coerce_call_parts, build_request, parse_response, CoerceCall,
 };
 use whipplescript_kernel::context_assembly::{
     render_project_context, BundleKind, BundleProvenance, ProjectInstruction,
@@ -27,8 +29,8 @@ use whipplescript_kernel::context_assembly::{
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
     run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
-    run_file_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
-    run_human_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
+    run_file_effect_generic, run_file_export_effect_generic, run_file_import_effect_generic,
+    run_file_write_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
     CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
 };
 use whipplescript_kernel::exec_http::{
@@ -37,8 +39,8 @@ use whipplescript_kernel::exec_http::{
 };
 use whipplescript_kernel::harness_loop::{
     provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, NoopCompactor,
-    ToolExecutor, TurnStatus,
+    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, ImageBlock,
+    NoopCompactor, ToolExecutor, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -53,18 +55,31 @@ use whipplescript_store::files::FileStore;
 use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
-/// live worker reads them from its bindings). Everything else the coerce HTTP
-/// effect needs is host-neutral in the kernel — `build_coerce_call_parts` +
-/// `build_request` + `parse_response` + `settle_coerce_result` — so this config is
-/// the whole of what the DO adds.
-pub struct CoerceProviderConfig {
-    pub provider: CoerceProvider,
-    /// The provider name recorded on runs/terminals.
-    pub provider_name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
+/// live worker reads them from its bindings). This is the ONE canonical resolved
+/// coerce config record (spec/std-coercion.md "Config-plane reconciliation"),
+/// shared with the native door — the DO builds it from `coerce_config_json`
+/// (`do_wasm::parse_coerce_config`). Everything else the coerce HTTP effect
+/// needs is host-neutral in the kernel — `build_coerce_call_parts` +
+/// `build_request` + `parse_response` + `settle_coerce_result` — so this config
+/// is the whole of what the DO adds.
+pub use whipplescript_kernel::coerce_native::ResolvedCoercionConfig;
+
+/// The coercion-config fingerprint this DO's kernel folds into `schema.coerce`
+/// effect admission keys (DR-0014 amendment) — derived from `coerce_config_json`
+/// exactly as the native host derives it from its resolved config (same
+/// combinator, same "fixture" literal when coerce is unconfigured), so an
+/// identical config yields the identical fingerprint on either host.
+pub fn do_coercion_config_fingerprint(coerce: Option<&ResolvedCoercionConfig>) -> String {
+    coerce
+        .map(|cfg| {
+            whipplescript_kernel::coerce::coercion_config_fingerprint(
+                "schema_coercer",
+                &cfg.provider_id,
+                &cfg.provider_id,
+                &cfg.model,
+            )
+        })
+        .unwrap_or_else(|| "fixture".to_owned())
 }
 
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, DoSql, DoSqliteStore};
@@ -96,6 +111,170 @@ pub struct TurnContainerConfig {
     pub auth_token: Option<String>,
 }
 
+/// `agent.tell` effects have two admitted producers. Authored workflow effects
+/// carry the historical `{ "prompt": ... }` shape; the governed host facade
+/// stores the complete `StartTurnCommand`, whose user text is nested at
+/// `{ "input": { "text": ... } }`. Decode both explicitly at this adapter
+/// edge and never turn an absent field into a valid empty model request.
+fn agent_prompt(input: &serde_json::Value) -> Result<String, StoreError> {
+    input
+        .pointer("/input/text")
+        .or_else(|| input.get("prompt"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            StoreError::Conflict(
+                "agent.tell input omitted both host input.text and workflow prompt".to_owned(),
+            )
+        })
+}
+
+/// Refuse a turn whose grants name a resource this placement cannot serve.
+///
+/// Neither durable-object agent path can honor an external MCP server
+/// (`spec/mcp-support-design-note.md` §12 slice 3). The in-isolate path would
+/// need tool calls to suspend on `NeedsHttp` the way model calls already do,
+/// and that stepped-tool-executor seam is shared with the still-unported web
+/// tools, so it rides the DO tracker. The Class-B container path runs a real
+/// process and could host MCP, but its turn server does not build those tools
+/// today either (its selector is `tools: "file"|"none"`).
+///
+/// Until then the honest behavior is a REFUSAL, not a quieter turn. The DO
+/// assembles its tool list from `do_tool_specs()` without ever reading
+/// `access_grants`, so without this guard a program that grants
+/// `github { create_issue }` runs here with that tool simply absent — the model
+/// routes around the gap and returns a plausible wrong answer.
+///
+/// The DO cannot consult the operator's MCP registry, so it cannot tell an MCP
+/// server from a file store by NAME. It does not have to: the lowering already
+/// distinguishes them. A grant naming a declared `file store` carries a
+/// `store_policy` snapshot (`rule_lowering::effect_access_grants_json`); no
+/// other grant kind does. So the placement decides structurally:
+///
+///   * `store_policy` present -> a declared file store; the DO serves it.
+///   * `tracker` / `command`  -> the DO has the todo tools and Bashkit.
+///   * only memory verbs      -> a memory pool; the DO serves it.
+///   * anything else          -> not honorable here. Refuse.
+///
+/// The last line is what a verb-only check would miss: the MCP role vocabulary
+/// is deliberately `read`/`write`, so a rung-2/3 grant (`github { read }`)
+/// reads exactly like a file-store grant on its verbs alone. It also refuses
+/// `web { … }`, which the isolate cannot serve either.
+fn refuse_mcp_grants_on_this_placement(input: &serde_json::Value) -> Result<(), StoreError> {
+    const MEMORY_OPERATIONS: &[&str] = &["recall", "learn", "curate"];
+    // Both admitted `agent.tell` input shapes carry grants: the workflow shape
+    // at the top level and the governed-host shape nested under `input`.
+    let grant_lists = [
+        input.pointer("/access_grants"),
+        input.pointer("/input/access_grants"),
+    ];
+    let mut unsupported = Vec::new();
+    for grants in grant_lists.into_iter().flatten() {
+        let Some(grants) = grants.as_array() else {
+            continue;
+        };
+        for grant in grants {
+            let resource = grant
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            // A grant whose shape we cannot read is refused, not skipped: the
+            // stated posture is fail-closed, and an unreadable grant is exactly
+            // when guessing is least safe.
+            let Some(operations) = grant.get("operations").and_then(|o| o.as_array()) else {
+                unsupported.push(format!("{resource} (unreadable grant)"));
+                continue;
+            };
+            let names: Vec<&str> = operations
+                .iter()
+                .filter_map(|operation| {
+                    operation
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let is_file_store = grant.get("store_policy").is_some();
+            let is_builtin_resource = matches!(resource, "tracker" | "command");
+            let is_memory_pool = names.iter().all(|name| MEMORY_OPERATIONS.contains(name));
+            if is_file_store || is_builtin_resource || is_memory_pool {
+                continue;
+            }
+            unsupported.push(format!("{resource} {{ {} }}", names.join(" ")));
+        }
+    }
+    unsupported.sort();
+    unsupported.dedup();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::Conflict(format!(
+        "this turn grants {}, which this placement cannot honor: external MCP tool \
+         servers are native-only for now (spec/mcp-support-design-note.md slice 3). \
+         Run this workflow natively, or drop the grant.",
+        unsupported.join(", ")
+    )))
+}
+
+fn resolve_host_images<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+    command_id: &str,
+    command: &serde_json::Value,
+) -> Result<Vec<ImageBlock>, StoreError> {
+    let refs = command
+        .get("input")
+        .and_then(|input| input.get("images"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    refs.iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let selector = image
+                .get("selector")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| StoreError::Conflict("host image ref has no selector".to_owned()))?;
+            if image.get("handle").and_then(serde_json::Value::as_str) != Some("turn_images")
+                || image.get("kind").and_then(serde_json::Value::as_str) != Some("image")
+                || selector != index.to_string()
+            {
+                return Err(StoreError::Conflict(
+                    "host image ref is outside the admitted turn-image capability".to_owned(),
+                ));
+            }
+            let rows = sql
+                .query(
+                    "SELECT media_type, data_base64 FROM host_turn_images \
+                     WHERE instance_id = ?1 AND command_id = ?2 AND selector = ?3",
+                    &[
+                        crate::do_store::SqlValue::Text(instance_id.to_owned()),
+                        crate::do_store::SqlValue::Text(command_id.to_owned()),
+                        crate::do_store::SqlValue::Text(selector.to_owned()),
+                    ],
+                )
+                .map_err(StoreError::Conflict)?;
+            let row = rows.first().ok_or_else(|| {
+                StoreError::Conflict("admitted host image body is unavailable".to_owned())
+            })?;
+            let text = |value: &crate::do_store::SqlValue| match value {
+                crate::do_store::SqlValue::Text(value) => Ok(value.clone()),
+                _ => Err(StoreError::Conflict(
+                    "admitted host image body has an invalid SQL shape".to_owned(),
+                )),
+            };
+            Ok(ImageBlock {
+                media_type: text(&row[0])?,
+                data_base64: text(&row[1])?,
+            })
+        })
+        .collect()
+}
+
 /// Drives a workflow instance's rule pass + effect discovery on the durable object.
 pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// One held kernel over the DO's SQLite (backs runtime + coordination +
@@ -106,7 +285,7 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub files: &'a dyn FileStore,
     /// Projected coerce provider credentials, or `None` if coerce is not configured
     /// on this DO (a `coerce.call` then errors rather than degrading silently).
-    pub coerce: Option<&'a CoerceProviderConfig>,
+    pub coerce: Option<&'a ResolvedCoercionConfig>,
     /// The DO agent model client (builds the messages request + parses the reply);
     /// `None` if agent turns are not configured. A live worker's impl reads creds
     /// from its bindings; tests inject a fake.
@@ -114,6 +293,7 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// Executes tool calls the model requests within a turn (nested effects). A live
     /// DO brokers these as HTTP to a sidecar; tests inject a fake.
     pub agent_tools: &'a dyn ToolExecutor,
+    pub agent_tool_specs: Option<&'a [whipplescript_kernel::harness_loop::ToolSpec]>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
     /// `None` if no sidecar is configured (an `exec.command` then errors).
     pub exec: Option<&'a ExecutorSidecarConfig>,
@@ -150,7 +330,7 @@ impl CapabilityContract for DoCapabilityContract {
     }
 }
 
-impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
+impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
         step_instance_generic(&mut self.kernel, self.instance_id, self.ir, None, None)?;
         let terminal = self
@@ -228,23 +408,51 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "event.emit" => {
                 run_event_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
             }
-            "human.ask" => {
-                run_human_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
-            }
             "signal.emit" => run_notify_effect_generic(
                 &mut self.kernel,
                 self.instance_id,
                 effect,
                 &DoDeliveryGovernance,
             )?,
-            "capability.call" => run_capability_effect_generic(
-                &mut self.kernel,
-                self.instance_id,
-                effect,
-                &config,
-                &DoCapabilityContract,
-                &FixtureCapabilityProvider,
-            )?,
+            "capability.call" => {
+                // Binding-driven provider selection (spec/std-memory.md; the DO
+                // package bootstrap seeds the std.memory binding): a
+                // `memory-provider`-bound capability routes to the real
+                // DoMemoryStore-backed provider, everything else to the fixture.
+                let bound = effect
+                    .target
+                    .as_deref()
+                    .filter(|target| !target.is_empty())
+                    .map(|target| {
+                        self.kernel
+                            .store()
+                            .capability_bound_provider(self.instance_id, target)
+                    })
+                    .transpose()?
+                    .flatten();
+                if bound.as_deref() == Some("memory-provider") {
+                    let provider = crate::do_memory::DoMemoryCapabilityProvider {
+                        sql: self.kernel.store().sql.clone(),
+                    };
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &provider,
+                    )?
+                } else {
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &FixtureCapabilityProvider,
+                    )?
+                }
+            }
             // The agent turn: multi-round sans-IO. Each round drives the
             // BrokeredTurnMachine one provider call, persisting its snapshot so an
             // eviction between fetches loses nothing (snapshot/restore); on the final
@@ -257,11 +465,16 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "agent.tell" if self.turn.is_some() => {
                 let cfg = self.turn.expect("guarded by arm pattern");
                 let input = json_from_str(&effect.input_json);
-                let prompt = input
-                    .get("prompt")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
+                let prompt = agent_prompt(&input)?;
+                // Fail closed before any provider work: a grant this placement
+                // cannot honor must stop the turn, not shrink it silently.
+                refuse_mcp_grants_on_this_placement(&input)?;
+                let user_images = resolve_host_images(
+                    &self.kernel.store().sql,
+                    self.instance_id,
+                    &effect.effect_id,
+                    &input,
+                )?;
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
@@ -290,6 +503,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 "turn_id": effect.effect_id,
                                 "provider": cfg.provider,
                                 "user": prompt,
+                                "images": user_images,
                                 "tools": "file",
                                 "max_steps": cfg.max_steps,
                             }),
@@ -331,7 +545,6 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                         .get("usage")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({})),
-                                    pending_human_ask: None,
                                 }
                             }
                             Ok(response) => BrokeredTurnOutcome {
@@ -348,7 +561,6 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
-                                pending_human_ask: None,
                             },
                             Err(transport) => BrokeredTurnOutcome {
                                 status: TurnStatus::Failed,
@@ -356,7 +568,6 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
-                                pending_human_ask: None,
                             },
                         };
                         let result = provider_result_from_brokered_turn(&outcome);
@@ -388,11 +599,42 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     )
                 })?;
                 let input = json_from_str(&effect.input_json);
-                let prompt = input
-                    .get("prompt")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_owned();
+                let prompt = agent_prompt(&input)?;
+                // Fail closed before any provider work: a grant this placement
+                // cannot honor must stop the turn, not shrink it silently.
+                refuse_mcp_grants_on_this_placement(&input)?;
+                let agent = effect.target.as_deref().unwrap_or("agent");
+                let loaded = do_load_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
+                // Image bodies are message-scoped. A restored machine already
+                // contains the exact first-round input in its snapshot, so
+                // resumption must not retain or replay the broker cache.
+                let resolved_images = if loaded.is_some() {
+                    Vec::new()
+                } else {
+                    resolve_host_images(
+                        &self.kernel.store().sql,
+                        self.instance_id,
+                        &effect.effect_id,
+                        &input,
+                    )?
+                };
+                let mut resume_from = if loaded.is_none() {
+                    self.kernel
+                        .snapshot_agent_thread(self.instance_id, agent, None)?
+                } else {
+                    Vec::new()
+                };
+                if loaded.is_none() && !resume_from.is_empty() {
+                    resume_from.push(ChatMessage::User {
+                        text: prompt.clone(),
+                        images: resolved_images.clone(),
+                    });
+                }
+                let user_images = if resume_from.is_empty() {
+                    resolved_images
+                } else {
+                    Vec::new()
+                };
                 // Store-backed project instructions (context-assembly Phase 3
                 // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
                 // content registered at deploy resolves from the store — the
@@ -429,17 +671,19 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // P4: the DO agent turn advertises the in-isolate tool set
                     // (read/write/edit/ls/find/grep/recall + the tracker todos),
                     // brokered by the `DoToolExecutor` over the DO file plane.
-                    tools: crate::do_tools::do_tool_specs(),
+                    tools: self
+                        .agent_tool_specs
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_else(crate::do_tools::do_tool_specs),
                     max_steps: 8,
-                    resume_from: Vec::new(),
-                    user_images: Vec::new(),
+                    resume_from,
+                    user_images,
                     context_bundles,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
-                let loaded = do_load_agent_snapshot(&self.kernel.store().sql, &effect.effect_id)?;
                 if loaded.is_none() {
                     self.kernel.start_run(RunStart {
                         instance_id: self.instance_id,
@@ -518,7 +762,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
-                            agent: "agent",
+                            agent,
                             profile: None,
                             input_json: &effect.input_json,
                             skill_names: &[],
@@ -565,14 +809,11 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // provider call after a worker eviction. Derived here where the
                 // effect identity (instance_id + effect_id) is in scope.
                 let idem_key = idempotency_key(&[self.instance_id, &effect.effect_id, "coerce"]);
-                let request = CoerceRequest {
+                let request = CoerceRequest::with_evidence_hashes(
                     function_name,
-                    arguments_json: arguments.to_string(),
+                    arguments.to_string(),
                     output_type,
-                    generated_coerce_source_hash: "do".to_owned(),
-                    input_schema_hash: "do".to_owned(),
-                    output_schema_hash: "do".to_owned(),
-                };
+                );
                 match incoming {
                     // Prepare: build the provider request and suspend on `fetch`.
                     None => {
@@ -580,14 +821,14 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             instance_id: self.instance_id,
                             effect_id: &effect.effect_id,
                             run_id: &run_id,
-                            provider: &cfg.provider_name,
+                            provider: &cfg.provider_id,
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
                             metadata_json: "{}",
                         })?;
                         let call = CoerceCall {
-                            provider: cfg.provider,
+                            provider: cfg.backend,
                             base_url: &cfg.base_url,
                             api_key: &cfg.api_key,
                             model: &cfg.model,
@@ -604,7 +845,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // and settle it through the shared kernel seam.
                     resumed => {
                         let result = match resumed {
-                            Some(Ok(response)) => parse_response(cfg.provider, &response, wrapped),
+                            Some(Ok(response)) => parse_response(cfg.backend, &response, wrapped),
                             other => CoerceResult {
                                 status: CoerceStatus::Failed,
                                 value_json: None,
@@ -623,7 +864,7 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             instance_id: self.instance_id,
                             effect_id: &effect.effect_id,
                             run_id: &run_id,
-                            provider: &cfg.provider_name,
+                            provider: &cfg.provider_id,
                             worker_id: "whip-worker",
                             lease_id: &lease_id,
                             lease_expires_at: "2030-01-01T00:00:00Z",
@@ -830,8 +1071,19 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
             }
-            "tracker.file" | "tracker.claim" | "tracker.release" | "tracker.finish" => {
-                run_queue_effect_generic(&mut self.kernel, self.instance_id, effect, &config)?
+            "tracker.file" | "tracker.claim" | "tracker.renew" | "tracker.release"
+            | "tracker.finish" => {
+                // The DO worker uses "now" as its clock stub (like coordination
+                // below); deterministic/real-clock injection — hence a live claim
+                // `ttl` deadline — is a native/scenario concern for now. The renew
+                // heartbeat and untimed claims are unaffected.
+                run_queue_effect_generic(
+                    &mut self.kernel,
+                    self.instance_id,
+                    effect,
+                    "now",
+                    &config,
+                )?
             }
             "lease.acquire" | "lease.release" | "lease.renew" | "ledger.append"
             | "counter.consume" => {
@@ -854,11 +1106,85 @@ impl<Sql: DoSql> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 self.instance_id,
                 effect,
             )?,
+            // std.files slice F4: the export core moved from the CLI into
+            // kernel::effect_handlers (it was already generic over the
+            // FileStore seam), so exports now run on the DO plane like their
+            // three siblings — closing the export exception to DO parity.
+            "file.export" => run_file_export_effect_generic(
+                &mut self.kernel,
+                self.files,
+                self.instance_id,
+                effect,
+            )?,
             other => {
-                return Err(StoreError::Conflict(format!(
-                    "effect kind `{other}` is not yet executable on the durable object \
-                     (its handler core is not lifted / HTTP wiring pending — chunk 5b)"
-                )))
+                // No DO handler for this kind (e.g. `workflow.invoke` — its
+                // handler core is not lifted; HTTP wiring pending, chunk 5b).
+                // FAIL the effect with its settling fact instead of erroring
+                // the step: an error here re-poisons every subsequent pass,
+                // wedging the instance with no terminal, while a failed effect
+                // routes through `after x fails` or the auto-fail net.
+                let run_id =
+                    idempotency_key(&[self.instance_id, &effect.effect_id, "do-unsupported-run"]);
+                let summary = format!(
+                    "effect kind `{other}` is not executable on the durable object placement"
+                );
+                self.kernel.start_run(RunStart {
+                    instance_id: self.instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "durable-object",
+                    worker_id: "do-worker",
+                    lease_id: &idempotency_key(&[
+                        self.instance_id,
+                        &effect.effect_id,
+                        "do-unsupported-lease",
+                    ]),
+                    lease_expires_at: "2030-01-01T00:00:00Z",
+                    metadata_json: "{}",
+                })?;
+                let event = self
+                    .kernel
+                    .fail_run(whipplescript_store::EffectCompletion {
+                        instance_id: self.instance_id,
+                        effect_id: &effect.effect_id,
+                        run_id: &run_id,
+                        provider: "durable-object",
+                        worker_id: "do-worker",
+                        status: "failed",
+                        exit_code: None,
+                        summary: Some(&summary),
+                        metadata_json: "{}",
+                        idempotency_key: Some(&idempotency_key(&[
+                            self.instance_id,
+                            &effect.effect_id,
+                            "terminal",
+                        ])),
+                    })?;
+                let value_json = serde_json::json!({
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "summary": summary,
+                    "value": {
+                        "reason": summary,
+                        "summary": summary,
+                        "error_class": "unsupported_placement",
+                    },
+                })
+                .to_string();
+                self.kernel.derive_fact(
+                    self.instance_id,
+                    "effect.failed",
+                    &effect.effect_id,
+                    &value_json,
+                    Some(&event.event_id),
+                    Some(&idempotency_key(&[
+                        self.instance_id,
+                        &effect.effect_id,
+                        "unsupported-failed-fact",
+                    ])),
+                )?;
+                event
             }
         };
         Ok(EffectStep::Done(event))
@@ -922,6 +1248,163 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_placement_refuses_an_mcp_grant_instead_of_dropping_it() {
+        // An MCP grant reaches the DO as an ordinary access grant whose
+        // operations are tool names. The placement has no MCP client and never
+        // reads access_grants when building its tool list, so without this
+        // guard the turn would run with `create_issue` simply missing.
+        let granted = serde_json::json!({
+            "input": { "text": "File the bug." },
+            "access_grants": [
+                { "resource": "github",
+                  "operations": [ { "operation": "create_issue" } ] }
+            ]
+        });
+        let error = match refuse_mcp_grants_on_this_placement(&granted) {
+            Err(StoreError::Conflict(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(error.contains("github { create_issue }"), "{error}");
+        assert!(error.contains("native-only"), "{error}");
+
+        // The sharp case: the MCP role vocabulary is deliberately `read`/`write`,
+        // so on verbs alone a role grant is indistinguishable from a file-store
+        // grant. It is caught because a real file-store grant carries a
+        // `store_policy` snapshot and this one does not.
+        let role_granted = serde_json::json!({
+            "input": { "text": "Read the issues." },
+            "access_grants": [
+                { "resource": "github", "operations": [ { "operation": "read" } ] }
+            ]
+        });
+        assert!(refuse_mcp_grants_on_this_placement(&role_granted).is_err());
+
+        // The governed-host shape nests grants under `input`; that path is
+        // guarded too, not only the workflow shape.
+        let nested = serde_json::json!({
+            "input": {
+                "text": "File the bug.",
+                "access_grants": [
+                    { "resource": "github",
+                      "operations": [ { "operation": "create_issue" } ] }
+                ]
+            }
+        });
+        assert!(refuse_mcp_grants_on_this_placement(&nested).is_err());
+
+        // The resources this placement DOES honor still pass: a declared file
+        // store (carrying its policy snapshot), the tracker, Bashkit, a memory
+        // pool — and a tracker verb this guard does not enumerate.
+        let builtin = serde_json::json!({
+            "input": { "text": "Work." },
+            "access_grants": [
+                { "resource": "project",
+                  "store_policy": { "root": ".", "allow_read": ["**"], "allow_write": ["**"] },
+                  "operations": [ { "operation": "read" }, { "operation": "write" } ] },
+                { "resource": "tracker", "operations": [ { "operation": "list" } ] },
+                { "resource": "command", "operations": [ { "operation": "run" } ] },
+                { "resource": "notes", "operations": [ { "operation": "recall" } ] }
+            ]
+        });
+        assert!(
+            refuse_mcp_grants_on_this_placement(&builtin).is_ok(),
+            "a placement-honored grant set must not be refused"
+        );
+
+        // `web` is refused: the isolate has no web tools either.
+        let web = serde_json::json!({
+            "input": { "text": "Research." },
+            "access_grants": [
+                { "resource": "web", "operations": [
+                    { "operation": "search" }, { "operation": "fetch" } ] }
+            ]
+        });
+        assert!(refuse_mcp_grants_on_this_placement(&web).is_err());
+
+        // An unreadable grant shape fails CLOSED, matching the stated posture.
+        let malformed = serde_json::json!({
+            "input": { "text": "Work." },
+            "access_grants": [ { "resource": "github" } ]
+        });
+        assert!(refuse_mcp_grants_on_this_placement(&malformed).is_err());
+
+        // A turn with no grants at all is unaffected.
+        let plain = serde_json::json!({ "input": { "text": "Work." } });
+        assert!(refuse_mcp_grants_on_this_placement(&plain).is_ok());
+    }
+
+    #[test]
+    fn agent_prompt_reads_the_governed_host_turn_shape() {
+        let input = serde_json::json!({
+            "protocol": "whipplescript.host.v1",
+            "command_id": "command-1",
+            "input": {
+                "text": "the exact GaugeDesk user turn",
+                "images": [],
+            },
+        });
+        assert_eq!(
+            agent_prompt(&input).expect("host text"),
+            "the exact GaugeDesk user turn"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_keeps_authored_effects_and_refuses_missing_text() {
+        assert_eq!(
+            agent_prompt(&serde_json::json!({"prompt": "authored turn"})).expect("authored prompt"),
+            "authored turn"
+        );
+        assert!(agent_prompt(&serde_json::json!({"input": {}})).is_err());
+        assert!(agent_prompt(&serde_json::json!({"prompt": "  "})).is_err());
+    }
+
+    #[test]
+    fn governed_host_images_resolve_only_from_the_admitted_broker_cache() {
+        let store = store();
+        store
+            .sql
+            .execute(
+                "CREATE TABLE host_turn_images (instance_id TEXT, command_id TEXT, \
+                 selector TEXT, media_type TEXT, data_base64 TEXT)",
+                &[],
+            )
+            .expect("image table");
+        store
+            .sql
+            .execute(
+                "INSERT INTO host_turn_images VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    crate::do_store::SqlValue::Text("instance-1".into()),
+                    crate::do_store::SqlValue::Text("turn-1".into()),
+                    crate::do_store::SqlValue::Text("0".into()),
+                    crate::do_store::SqlValue::Text("image/png".into()),
+                    crate::do_store::SqlValue::Text("aGVsbG8=".into()),
+                ],
+            )
+            .expect("image body");
+        let command = serde_json::json!({
+            "input": { "images": [{
+                "handle": "turn_images", "kind": "image", "selector": "0"
+            }] }
+        });
+        assert_eq!(
+            resolve_host_images(&store.sql, "instance-1", "turn-1", &command)
+                .expect("resolved image"),
+            vec![ImageBlock {
+                media_type: "image/png".into(),
+                data_base64: "aGVsbG8=".into(),
+            }]
+        );
+        let wrong = serde_json::json!({
+            "input": { "images": [{
+                "handle": "other", "kind": "image", "selector": "0"
+            }] }
+        });
+        assert!(resolve_host_images(&store.sql, "instance-1", "turn-1", &wrong).is_err());
+    }
+
     // The DO drives an effect-free workflow's rule pass to its terminal through the
     // InstanceStepMachine, over `RuntimeKernel<DoSqliteStore>` — proving the whole
     // instance scheduler runs on the durable-object store.
@@ -973,6 +1456,7 @@ mod tests {
             coerce: None,
             agent_model: None,
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -1116,6 +1600,8 @@ mod tests {
                 dependencies: &[],
                 terminal: None,
                 idempotency_key: Some("commit-go"),
+                marks: &[],
+                context_json: None,
             })
             .expect("commit exec effects");
 
@@ -1132,6 +1618,7 @@ mod tests {
             coerce: None,
             agent_model: None,
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -1283,13 +1770,15 @@ mod tests {
             .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
             .expect("start event");
 
-        let cfg = CoerceProviderConfig {
-            provider: CoerceProvider::Anthropic,
-            provider_name: "anthropic".to_owned(),
+        let cfg = ResolvedCoercionConfig {
+            provider_id: "anthropic".to_owned(),
+            backend: CoerceProvider::Anthropic,
             base_url: "https://api.anthropic.com".to_owned(),
             api_key: "test-key".to_owned(),
             model: "claude-test".to_owned(),
-            max_tokens: 1024,
+            max_tokens: whipplescript_kernel::coerce_native::DEFAULT_COERCE_MAX_TOKENS,
+            timeout_secs: whipplescript_kernel::coerce_native::DEFAULT_COERCE_TIMEOUT_SECS,
+            codex_account_id: None,
         };
         let driver = DoInstanceDriver {
             kernel,
@@ -1297,6 +1786,7 @@ mod tests {
             coerce: Some(&cfg),
             agent_model: None,
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -1409,6 +1899,7 @@ mod tests {
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -1534,6 +2025,7 @@ mod tests {
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -1687,6 +2179,7 @@ mod tests {
             // No in-DO model configured: the container owns the turn.
             agent_model: None,
             agent_tools: &NoTools,
+            agent_tool_specs: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,

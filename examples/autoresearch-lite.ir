@@ -3,6 +3,7 @@ workflow_contracts
   output result ref<ResearchResult>
   failure error ref<ResearchStopped>
 uses
+  package std.coord
   package std.script
 schemas
   class ResearchProject
@@ -29,8 +30,8 @@ rules
     writes
       schema:ResearchProject
     record_sources
-      schema:ResearchProject construct=table_row span=677..709
-    body_hash 5aff8984f3a70a7b
+      schema:ResearchProject construct=table_row span=721..753
+    body_hash 1ca63914a8e9d3d4221c2122c45bca37
   rule table_hypotheses
     when started
     reads
@@ -38,8 +39,8 @@ rules
     writes
       schema:Hypothesis
     record_sources
-      schema:Hypothesis construct=table_row span=748..880
-    body_hash d72cc951a42a0e91
+      schema:Hypothesis construct=table_row span=792..924
+    body_hash 9295d0f379a2ee2edc5819a1dcea4233
   rule run_budgeted_experiment
     when Hypothesis as hypothesis where hypothesis.status == "queued"
     reads
@@ -47,10 +48,10 @@ rules
     consumes
       schema:Hypothesis
     effects
-      budget kind=counter.consume binding=budget key=e8558d7a02f1000a
-      metric kind=exec.command binding=metric key=5a9942dfd9bd2b72
+      budget kind=counter.consume binding=budget key=40a647a96303801f2652699a5f494e3d
+      metric kind=exec.command binding=metric key=5bb1c65c9c5f791e31c058d5f6c6a97e
     dependencies
       budget --completes--> metric
-    body_hash 7b190d3b04f76f83
+    body_hash c48222fe2596671a93061d32141e8ef4
 rule_dependencies
   table_hypotheses --schema:Hypothesis--> run_budgeted_experiment

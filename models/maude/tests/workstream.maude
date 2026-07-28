@@ -1,0 +1,49 @@
+load ../workstream.maude
+
+--- Coverage: a member's certified push auto-admits into its stream's line.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, sline(s1)) push(b1, sline(s1), cert) stream(s1, active)
+  =>* C:Cfg admitted(b1, sline(s1)) .
+
+--- Coverage: membership gates POSITIVELY too -- a branch that joins the
+--- stream first can then auto-admit.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, main) join(b1, s1) push(b1, sline(s1), cert) stream(s1, active)
+  =>* C:Cfg admitted(b1, sline(s1)) .
+
+--- Coverage: archiving a stream with a member converges on the member
+--- re-homed to mainline, rebase-down pass recorded, line dead.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, sline(s1)) archive(s1) stream(s1, active)
+  =>! homed(b1, main) rebased(b1) stream(s1, archived) .
+
+--- Bite membership-gates-autosync: a NON-member's certified push at the
+--- stream line never admits -- b1 homes to mainline, not to s1.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, main) push(b1, sline(s1), cert) stream(s1, active)
+  =>* admitted(b1, sline(s1)) RESIDUAL:Cfg .
+
+--- Bite on the certificate upgrade: a member's UNCERTIFIED push never
+--- auto-admits -- clean-merge-without-certificate is not admission.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, sline(s1)) push(b1, sline(s1), nocert) stream(s1, active)
+  =>* admitted(b1, sline(s1)) RESIDUAL:Cfg .
+
+--- Bite single-valued membership: joining two streams never yields two
+--- homes -- the second join gives up the first.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, main) join(b1, s1) join(b1, s2)
+  stream(s1, active) stream(s2, active)
+  =>* homed(b1, sline(s1)) homed(b1, sline(s2)) RESIDUAL:Cfg .
+
+--- Bite archive-rehomes-members: no normal form leaves a member homed to
+--- an archived stream's line.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, sline(s1)) homed(b2, sline(s1)) archive(s1) stream(s1, active)
+  =>! homed(B:Branch, sline(s1)) stream(s1, archived) RESIDUAL:Cfg .
+
+--- Bite: once a stream is archived, even a still-homed member's certified
+--- push never admits into the dead line.
+search [1] in WHIPPLESCRIPT-WORKSTREAM :
+  homed(b1, sline(s1)) push(b1, sline(s1), cert) stream(s1, archived)
+  =>* admitted(b1, sline(s1)) RESIDUAL:Cfg .
