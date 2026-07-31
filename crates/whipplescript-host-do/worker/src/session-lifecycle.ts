@@ -54,6 +54,27 @@ export interface Rejection {
   rejected: string;
 }
 
+/**
+ * A stored lifecycle event this build does not recognize — typically a row
+ * appended by a newer worker before a rollback. The fold fails closed on it
+ * (DR-0054 Phase A): reducing an unknown row to `undefined` would silently
+ * poison every later state in the log, so the reader surfaces the row's type
+ * for diagnosis instead of guessing. Nothing is deleted; the log is intact
+ * and folds again once a build that knows the event is deployed.
+ */
+export class UnknownLifecycleEventError extends Error {
+  readonly eventType: string;
+
+  constructor(eventType: string) {
+    super(
+      `unrecognized session lifecycle event type "${eventType}"; ` +
+        "this build refuses to fold past it (fail closed, DR-0054)",
+    );
+    this.name = "UnknownLifecycleEventError";
+    this.eventType = eventType;
+  }
+}
+
 export const initialLifecycleState: LifecycleState = {
   phase: "init",
   openedAtMs: 0,
@@ -183,6 +204,12 @@ export function evolve(
         sessionOccurred: true,
       };
   }
+  // Statically unreachable over the union, but a stored row is not bound by
+  // it: an event admitted by a newer build must fail closed, not fold to
+  // `undefined` (DR-0054 Phase A).
+  throw new UnknownLifecycleEventError(
+    String((event as { type?: unknown }).type),
+  );
 }
 
 export function fold(events: LifecycleEvent[]): LifecycleState {

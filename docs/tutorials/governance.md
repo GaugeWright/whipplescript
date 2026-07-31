@@ -8,7 +8,7 @@ workflow. You then change the workflow into the safe shape. Last, you authorize
 one deliberate crossing with a method that permits an audit.
 
 All the steps use the examples in
-[`examples/infoflow/`](https://github.com/jamesjscully/whipplescript/tree/main/examples/infoflow).
+[`examples/infoflow/`](https://github.com/GaugeWright/whipplescript/tree/main/examples/infoflow).
 The example is an assistant for support triage. The assistant touches the three
 components of the *lethal trifecta*: confidential data (a CRM), untrusted input
 (an inbox), and an egress channel (the reply to the customer).

@@ -1,6 +1,12 @@
 # Cloudflare Worker + Durable Object deployment for the WhippleScript runtime
 # (DR-0033 chunk 5d). Aligns with Cloudflare's DO-with-SQLite docs.
 name = "whipplescript-runtime"
+# Pinned for the same reason as `wrangler.public.toml`: without it wrangler
+# resolves the account from the ambient OAuth session, and the founder's
+# personal account is still a valid login (DR-0044 Phase 2). This config was
+# the last one left unpinned, which is how `npm run deploy` — the documented
+# command — could publish to whichever account happened to be logged in.
+account_id = "1689dd452ba2d2d8eb1f3c364c92b3f4"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 

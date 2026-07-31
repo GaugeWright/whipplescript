@@ -54,6 +54,11 @@ pub struct WorkstreamRow {
     /// engine owns.
     pub line_branch_id: String,
     pub status: StreamStatus,
+    /// The §7.1 staleness bound, in seconds (DR-0052 S1's one real
+    /// knob): a member whose base lags the line by more than this must
+    /// rebase down before it may merge up; the reconcile pass emits
+    /// `vcs.staleness.exceeded` past it. `None` = unbounded.
+    pub staleness_seconds: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -150,7 +155,8 @@ impl WorkstreamStore {
     ) -> StoreResult<Option<WorkstreamRow>> {
         let row = connection
             .query_row(
-                "SELECT stream_id, name, line_branch_id, status, created_at, updated_at \
+                "SELECT stream_id, name, line_branch_id, status, staleness_seconds, \
+                 created_at, updated_at \
                  FROM workstreams WHERE stream_id = ?1",
                 params![stream_id],
                 map_stream_row,
@@ -168,8 +174,9 @@ fn map_stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkstreamRow> {
         name: row.get(1)?,
         line_branch_id: row.get(2)?,
         status: StreamStatus::parse(&status_text).unwrap_or(StreamStatus::Active),
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        staleness_seconds: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -201,7 +208,39 @@ fn ensure_workstream_schema(connection: &Connection) -> StoreResult<()> {
             ON workstream_members(stream_id);
         "#,
     )?;
+    // The staleness bound arrived with DR-0052 S1; earlier stores gain
+    // the column in place (NULL = unbounded, the prior behavior).
+    let columns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(workstreams)")?;
+        let mapped = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        mapped.collect::<Result<_, _>>()?
+    };
+    if !columns.iter().any(|name| name == "staleness_seconds") {
+        connection.execute(
+            "ALTER TABLE workstreams ADD COLUMN staleness_seconds INTEGER",
+            [],
+        )?;
+    }
     Ok(())
+}
+
+#[cfg(feature = "native")]
+impl WorkstreamStore {
+    /// Set (or clear) the stream's staleness bound — governance surface,
+    /// not a member verb.
+    pub fn set_staleness(
+        &mut self,
+        stream_id: &str,
+        staleness_seconds: Option<i64>,
+        at: &str,
+    ) -> StoreResult<Option<WorkstreamRow>> {
+        self.connection.execute(
+            "UPDATE workstreams SET staleness_seconds = ?2, updated_at = ?3 \
+             WHERE stream_id = ?1",
+            rusqlite::params![stream_id, staleness_seconds, at],
+        )?;
+        Self::stream_by_id(&self.connection, stream_id)
+    }
 }
 
 #[cfg(feature = "native")]

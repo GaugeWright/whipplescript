@@ -11,7 +11,7 @@ workflow.
 ## 1. Install
 
 ```sh
-git clone https://github.com/jamesjscully/whipplescript.git
+git clone https://github.com/GaugeWright/whipplescript.git
 cd whipplescript
 cargo install --path crates/whipplescript-cli --locked
 whip doctor

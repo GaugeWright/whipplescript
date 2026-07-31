@@ -3,7 +3,8 @@
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
-                source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
+                source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT,
+                format_version INTEGER
             );
             CREATE UNIQUE INDEX events_instance_idempotency_key_idx
                 ON events(instance_id, idempotency_key)
@@ -199,7 +200,9 @@
                 ON inbox_items(instance_id, effect_id)
                 WHERE status = 'pending';
             CREATE TABLE tracker_events (
-                event_seq INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT, kind TEXT NOT NULL,
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
+                issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -224,9 +227,21 @@
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1), next_id INTEGER NOT NULL
             );
             INSERT INTO tracker_counter (singleton, next_id) VALUES (1, 1);
+            CREATE TABLE tracker_aliases (
+                content_id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE tracker_comments (
+                comment_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT,
+                body TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE tracker_evidence (
+                evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
+                note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX idx_tracker_issues_queue ON tracker_issues(queue, status);
             CREATE INDEX idx_tracker_leases_issue ON tracker_leases(issue_id, released_at);
             CREATE INDEX idx_tracker_events_issue ON tracker_events(issue_id, kind);
+            CREATE UNIQUE INDEX idx_tracker_events_id ON tracker_events(event_id);
             CREATE TABLE coord_leases (
                 owner TEXT NOT NULL, resource TEXT NOT NULL, key TEXT NOT NULL, holder TEXT NOT NULL,
                 acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TEXT NOT NULL,

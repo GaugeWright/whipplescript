@@ -1,0 +1,27 @@
+# Production-only managed-Machine Durable workflow host (GaugeDesk ADR 0120).
+# It deliberately has no public-session admission, credential registry,
+# deployment, collection, executor-container, or public route binding.
+name = "whipplescript-private-home-runtime"
+account_id = "1689dd452ba2d2d8eb1f3c364c92b3f4"
+main = "src/private-home.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[build]
+command = "npm run build:wasm"
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance"]
+
+[vars]
+# Public verification material for the currently admitted production Home.
+# The corresponding private signer remains only inside that Home.
+HOME_ADMISSION_KEYS = "{\"041a2aa18144c4b39b7015c1da3d85eafe9d1e0690e6e16596caa30a4dc586c1c598ec4c18f7896d6537154bbcafb657a7ec0891639bb68bc6c379c35ed69ade28\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"GiqhgUTEs5twFcHaPYXq_p0eBpDm4WWWyqMKTcWGwcU\",\"y\":\"mOxMGPeJbWU3FUu8r7ZXp-wIkWObtovGw3nDXtaa3ig\",\"ext\":true,\"key_ops\":[\"verify\"]}}"
+WHIP_MODEL_BROKER_URL = "https://auth.gaugewright.com/internal/model-egress"

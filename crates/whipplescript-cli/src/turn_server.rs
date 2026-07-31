@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -29,13 +30,16 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_kernel::coerce_native::CoerceTransport;
 use whipplescript_kernel::harness_loop::{
-    run_brokered_loop, BrokeredTurnInput, BrokeredTurnOutcome, TurnStatus,
+    run_brokered_loop, BrokeredTurnInput, BrokeredTurnOutcome, ChatMessage, HarnessModelClient,
+    HarnessModelError, HttpModelClient, ModelReply, ToolSpec, TurnStatus,
 };
-use whipplescript_kernel::harness_model::RealHarnessModelClient;
+use whipplescript_kernel::harness_model::{MessagesApiClient, RealHarnessModelClient};
 
 use crate::coerce_runtime::UreqCoerceTransport;
 use crate::harness_tools::{file_tool_specs_for_profile, FileToolExecutor, FixtureModelClient};
+use whipplescript::host_runtime::AuthoredAgentPackage;
 
 /// Wire protocol marker for the Class-B turn channel.
 pub const TURN_PROTOCOL: &str = "whip-turn/1";
@@ -282,7 +286,19 @@ fn scratch_dir_name(turn_id: &str) -> String {
 }
 
 fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
-    let system = request
+    let scratch = std::env::temp_dir().join(scratch_dir_name(turn_id));
+    run_turn_in_workspace(turn_id, request, &scratch)
+}
+
+/// Run the Class-B whole-turn loop against an explicitly materialized
+/// workspace. The caller owns confinement and lifecycle; this function owns
+/// only the governed agent loop and file tools rooted at `workspace`.
+pub fn run_turn_in_workspace(
+    turn_id: &str,
+    request: &Value,
+    workspace: &Path,
+) -> BrokeredTurnOutcome {
+    let mut system = request
         .get("system")
         .and_then(Value::as_str)
         .unwrap_or("You are a coding agent working in a scratch directory.")
@@ -292,20 +308,94 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let max_steps = request
+    let mut max_steps = request
         .get("max_steps")
         .and_then(Value::as_u64)
         .unwrap_or(30) as usize;
     let use_file_tools = request.get("tools").and_then(Value::as_str) != Some("none");
 
-    let scratch = std::env::temp_dir().join(scratch_dir_name(turn_id));
-    let _ = std::fs::create_dir_all(&scratch);
-    let executor = FileToolExecutor::new(&scratch);
-    let tools = if use_file_tools {
+    if let Err(error) = std::fs::create_dir_all(workspace) {
+        return BrokeredTurnOutcome {
+            status: TurnStatus::Failed,
+            summary: format!("could not open workspace: {error}"),
+            steps: 0,
+            observations: Vec::new(),
+            usage: json!({"input_tokens": 0, "output_tokens": 0}),
+        };
+    }
+    let protected_write_paths = request
+        .get("protected_write_paths")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let executor = FileToolExecutor::new(workspace)
+        .with_protected_write_paths(protected_write_paths)
+        .with_native_processes(
+            request
+                .get("native_processes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        );
+    let mut tools = if use_file_tools {
         file_tool_specs_for_profile(None)
     } else {
         Vec::new()
     };
+    if let Some(package) = request.get("package") {
+        if let (Some(manifest), Some(source), Some(persona), Some(version_ref)) = (
+            package.get("manifest").and_then(Value::as_str),
+            package.get("source").and_then(Value::as_str),
+            package.get("system_prompt").and_then(Value::as_str),
+            package.get("version_ref").and_then(Value::as_str),
+        ) {
+            let authored = match AuthoredAgentPackage::from_documents(manifest, source, persona) {
+                Ok(authored) => authored,
+                Err(error) => return failed_outcome(&error),
+            };
+            let resolved = match authored.resolve(version_ref) {
+                Ok(resolved) => resolved,
+                Err(error) => return failed_outcome(&error),
+            };
+            system = resolved.system_prompt;
+            max_steps = resolved.max_steps;
+            tools = resolved.tools;
+        } else {
+            let root = package
+                .get("root")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let version_ref = package
+                .get("version_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let safe_root = Path::new(root);
+            if root.is_empty()
+                || safe_root.is_absolute()
+                || safe_root
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return failed_outcome("turn package root is not workspace-relative");
+            }
+            let authored = match AuthoredAgentPackage::load(workspace.join(safe_root)) {
+                Ok(authored) => authored,
+                Err(error) => return failed_outcome(&error),
+            };
+            let resolved = match authored.resolve(version_ref) {
+                Ok(resolved) => resolved,
+                Err(error) => return failed_outcome(&error),
+            };
+            system = resolved.system_prompt;
+            max_steps = resolved.max_steps;
+            tools = resolved.tools;
+        }
+    }
     let input = BrokeredTurnInput {
         system,
         user,
@@ -339,7 +429,8 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
     }
     let coerce_provider = match provider_name {
         "anthropic" => CoerceProvider::Anthropic,
-        "openai" => CoerceProvider::OpenAi,
+        "openai" | "openai-codex" => CoerceProvider::OpenAi,
+        "openai-generic" => CoerceProvider::OpenAiCompat,
         other => {
             return BrokeredTurnOutcome {
                 status: TurnStatus::Failed,
@@ -361,7 +452,29 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
         .get("max_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(4096) as u32;
-    let transport = UreqCoerceTransport::new(std::time::Duration::from_secs(120));
+    let transport = UreqCoerceTransport::new(std::time::Duration::from_secs(120))
+        .with_workspace_egress_token(
+            request
+                .get("workspace_egress_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+    if provider_name == "openai-codex" {
+        let client = MessagesApiClient::new_codex(
+            field("api_key"),
+            "gaugewright-final-fetch",
+            turn_id,
+            field("model"),
+            field("base_url"),
+            u64::from(max_tokens),
+            Some(turn_id.to_owned()),
+        );
+        let client = TransportedModelClient {
+            client,
+            transport: &transport,
+        };
+        return run_brokered_loop(&client, &executor, &input, &mut checkpoint);
+    }
     let client = RealHarnessModelClient::new(
         &transport,
         coerce_provider,
@@ -374,6 +487,34 @@ fn run_turn(turn_id: &str, request: &Value) -> BrokeredTurnOutcome {
     run_brokered_loop(&client, &executor, &input, &mut checkpoint)
 }
 
+fn failed_outcome(reason: &str) -> BrokeredTurnOutcome {
+    BrokeredTurnOutcome {
+        status: TurnStatus::Failed,
+        summary: reason.to_owned(),
+        steps: 0,
+        observations: Vec::new(),
+        usage: json!({"input_tokens": 0, "output_tokens": 0}),
+    }
+}
+
+struct TransportedModelClient<'a, C, T> {
+    client: C,
+    transport: &'a T,
+}
+
+impl<C: HttpModelClient, T: CoerceTransport> HarnessModelClient
+    for TransportedModelClient<'_, C, T>
+{
+    fn next(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ModelReply, HarnessModelError> {
+        let request = self.client.build_request(messages, tools);
+        self.client.parse_response(self.transport.post(&request))
+    }
+}
+
 fn status_name(status: &TurnStatus) -> &'static str {
     match status {
         TurnStatus::Completed => "completed",
@@ -381,6 +522,17 @@ fn status_name(status: &TurnStatus) -> &'static str {
         TurnStatus::TimedOut => "timed_out",
         TurnStatus::Cancelled => "cancelled",
     }
+}
+
+/// Stable, adapter-neutral terminal wire value for batch execution.
+pub fn outcome_json(outcome: &BrokeredTurnOutcome) -> Value {
+    json!({
+        "status": status_name(&outcome.status),
+        "summary": outcome.summary,
+        "steps": outcome.steps,
+        "observations": outcome.observations,
+        "usage": outcome.usage,
+    })
 }
 
 /// RFC 6455 `Sec-WebSocket-Accept` for a client key.
@@ -582,6 +734,72 @@ mod tests {
         assert_eq!(status_name(&TurnStatus::Failed), "failed");
         assert_eq!(status_name(&TurnStatus::TimedOut), "timed_out");
         assert_eq!(status_name(&TurnStatus::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn batch_turn_binds_inline_package_bytes_to_the_pinned_version() {
+        let manifest = r#"{
+          "schema":"whipplescript.agent_package.v0",
+          "source":"method.whip",
+          "workflow":"Agent",
+          "agent":"assistant",
+          "system_prompt":"persona.md",
+          "capabilities":["workspace.read"],
+          "agent_abilities":["workspace.read"],
+          "max_steps":4
+        }"#;
+        let source = r#"
+          file store project {
+            root "."
+            allow read ["**"]
+          }
+          workflow Agent {
+            agent assistant {
+              provider owned
+              profile "repo-reader"
+              capacity 1
+              capabilities ["workspace.read"]
+            }
+            rule converse when started => {
+              tell assistant requires ["workspace.read"]
+                with access to project { read ["**"] }
+                "work"
+            }
+          }
+        "#;
+        let authored =
+            AuthoredAgentPackage::from_documents(manifest, source, "Read the workspace.")
+                .expect("package");
+        let workspace = std::env::temp_dir().join(format!(
+            "whipple-batch-package-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let request = json!({
+            "turn_id": "batch-package",
+            "user": "inspect it",
+            "package": {
+                "manifest": manifest,
+                "source": source,
+                "system_prompt": "Read the workspace.",
+                "version_ref": authored.version_ref(),
+            },
+            "provider": {"provider": "not-a-provider"},
+        });
+        let outcome = run_turn_in_workspace("batch-package", &request, &workspace);
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert_eq!(outcome.summary, "unknown provider `not-a-provider`");
+
+        let mut tampered = request;
+        tampered["package"]["system_prompt"] = json!("Different bytes.");
+        let outcome = run_turn_in_workspace("batch-package", &tampered, &workspace);
+        assert_eq!(outcome.status, TurnStatus::Failed);
+        assert!(outcome.summary.contains("pinned version"));
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]

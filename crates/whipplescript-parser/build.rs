@@ -26,6 +26,7 @@ use serde_json::Value;
 const STD_MANIFESTS: &[&str] = &[
     "vendored-std/manifests/memory.json",
     "vendored-std/manifests/messaging.json",
+    "vendored-std/manifests/vcs.json",
 ];
 
 /// The grammar-only manifests (`std/grammars/*.json`) carrying the
@@ -39,12 +40,13 @@ const DECL_GRAMMARS: &[&str] = &[
     "vendored-std/grammars/files.json",
     "vendored-std/grammars/messaging-grammar.json",
     "vendored-std/grammars/memory-grammar.json",
+    "vendored-std/grammars/vcs-grammar.json",
 ];
 
 /// The DR-0011 grammar vocabulary (mirrors whipplescript-core's
 /// `CONSTRUCT_GRAMMAR_*` constants; a build script cannot depend on the crate
 /// graph it builds for).
-const CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via"];
+const CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto"];
 const SLOT_KINDS: &[&str] = &["identifier", "expression"];
 const BINDING_MODES: &[&str] = &["required", "optional", "none"];
 
@@ -412,6 +414,7 @@ fn emit_declaration_row(
         "ledger" => "DeclAstKind::Ledger",
         "memory pool" => "DeclAstKind::MemoryPool",
         "file store" => "DeclAstKind::FileStore",
+        "stream" => "DeclAstKind::Stream",
         other => fail(&format!(
             "declaration_block keyword `{other}` has no known DeclAstKind builder seam"
         )),

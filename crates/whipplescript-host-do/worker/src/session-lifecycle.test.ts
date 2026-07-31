@@ -8,6 +8,7 @@ import {
   fold,
   initialLifecycleState,
   isRejection,
+  UnknownLifecycleEventError,
   type LifecycleCommand,
   type LifecycleEvent,
   type LifecycleState,
@@ -196,6 +197,36 @@ test("collection settlement is not repeatable", () => {
   let state = live(OPEN_COLLECTING);
   state = apply(state, { kind: "settleCollection" }).state;
   assert.ok(isRejection(decide(state, { kind: "settleCollection" })));
+});
+
+test("an unrecognized event fails the fold closed instead of poisoning it", () => {
+  // The rollback shape (DR-0054 Phase A): a newer worker appended an event
+  // this build does not know, then the deploy rolled back. Reducing it to
+  // `undefined` would silently corrupt every state folded after it; the fold
+  // must instead surface the row with its type for diagnosis.
+  const events = [
+    { type: "opened", atMs: 1_000, collectionDeclared: false },
+    { type: "activated" },
+    { type: "leaseExtended", atMs: 5_000 },
+  ] as unknown as LifecycleEvent[];
+  assert.throws(
+    () => fold(events),
+    (error: unknown) =>
+      error instanceof UnknownLifecycleEventError &&
+      error.eventType === "leaseExtended",
+  );
+  assert.throws(
+    () => evolve(initialLifecycleState, { type: "vanished" } as unknown as LifecycleEvent),
+    UnknownLifecycleEventError,
+  );
+  // Known events still fold exactly as before.
+  assert.equal(
+    fold([
+      { type: "opened", atMs: 1_000, collectionDeclared: false },
+      { type: "activated" },
+    ]).phase,
+    "active",
+  );
 });
 
 test("the runtime state carries no principal mode or conversation outcome", () => {

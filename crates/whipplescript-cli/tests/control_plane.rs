@@ -6320,6 +6320,9 @@ rule start_native_work
             "WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND",
             "__whipplescript_missing_codex_command__",
         )
+        // Keep the launch-failure boundary under test independent of the
+        // developer's ambient ~/.codex configuration.
+        .env("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL", "test-model")
         .args([
             "--store",
             store_str,
@@ -17471,20 +17474,32 @@ rule start_denied_work
         )
         .expect("write native policy denial workflow");
         let store_path = temp_store_path();
-        let dev = run_json(
-            bin,
-            &[
-                "--store",
-                store_path.to_str().expect("utf-8 temp path"),
-                "--json",
-                "run",
-                source_path.to_str().expect("utf-8 source path"),
-                "--provider",
-                provider,
-                "--until",
-                "idle",
-            ],
-        );
+        let args = [
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            source_path.to_str().expect("utf-8 source path"),
+            "--provider",
+            provider,
+            "--until",
+            "idle",
+        ];
+        // Codex policy validation happens after the adapter is constructed but
+        // before any app-server I/O. Supply a harmless transport and explicit
+        // model so this test exercises that boundary on clean CI hosts too.
+        let dev = if provider == "codex" {
+            run_json_with_env(
+                bin,
+                &args,
+                &[
+                    ("WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND", "/bin/cat"),
+                    ("WHIPPLESCRIPT_CODEX_APP_SERVER_MODEL", "test-model"),
+                ],
+            )
+        } else {
+            run_json(bin, &args)
+        };
         let instance_id = dev
             .get("instance_id")
             .and_then(Value::as_str)

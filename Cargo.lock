@@ -257,6 +257,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -342,6 +348,16 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -1178,6 +1194,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1216,6 +1244,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "openssl-probe"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "os_display"
@@ -1375,6 +1409,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "prctl"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "059a34f111a9dee2ce1ac2826a68b24601c4298cfeb1a587c3cb493d5ab46f52"
+dependencies = [
+ "libc",
+ "nix",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,6 +1561,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5bfb394eeed242e909609f56089eecfe5fda225042e8b171791b9c95f5931e5"
+dependencies = [
+ "openssl-probe",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1549,6 +1615,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "schannel"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1565,6 +1640,29 @@ dependencies = [
  "generic-array",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.11.1",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -1873,6 +1971,7 @@ dependencies = [
  "log",
  "once_cell",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2015,11 +2114,12 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "chrono-tz",
  "htmd",
+ "prctl",
  "regex",
  "serde",
  "serde_json",
@@ -2037,14 +2137,15 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "whipplescript-host-do"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "hex",
  "p256",
@@ -2061,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "bashkit",
  "chrono",
@@ -2078,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",
@@ -2087,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-claude"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -2095,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-codex"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -2103,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.3.1"
+version = "0.4.1"
 dependencies = [
  "rusqlite",
  "serde",

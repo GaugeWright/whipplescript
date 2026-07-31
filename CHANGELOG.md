@@ -3,6 +3,89 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.4.1] — 2026-07-29
+
+### Fixed
+- **An endorsed claim now prints in the guarantee report's trusted surface**
+  (DR-0051 §2). It never had. The surface is built by walking a rule's effects
+  for the `endorsed` flag, and a `claim` is not an effect, so the crossing 0.4.0
+  introduced was invisible to the audit surface that same release documented it
+  in.
+
+  The consequence landed where it mattered most: a program whose only crossing is
+  a person's adopted decision — a human review gate — rendered a report with no
+  source crossing on it at all, which reads as "this program raises nothing"
+  about the one program whose whole job is to raise something.
+
+  The line names the tracker as well as the rule, so `endorse <tracker> ->
+  <role>` on the governance side and the source crossing can be matched up as the
+  two ends of one crossing.
+
+### Documented
+- DR-0051 §4's closed-type predicate binds `claim … endorsed` and **not**
+  `coerce … endorsed`, and the record now says why. Not because a classifier is
+  more trustworthy than a reviewer — it is less — but because a reviewer is
+  handed a free-text box and cannot be told to sanitise it, while a coerce
+  endorser is a program with a declared schema whose canonical documented use
+  (`sanitize(content) -> Note { note string }`) is producing trusted prose. The
+  residual is named rather than waved off.
+- `ifc.rs`'s module header no longer claims the source crossings "arrive in later
+  slices"; they shipped several releases ago.
+
+## [0.4.0] — 2026-07-29
+
+Information-flow work: trackers become governed resources, and a person's
+decision can cross the integrity axis for the first time.
+
+### Breaking
+- **A tracker is an information-flow source** (DR-0051 §1). A `when <tracker> has
+  ready issue as v` trigger now reads a governed resource, labelled by
+  `grant tracker <handle> -> tracker:/<address> from <Role>` and defaulting to
+  `public` when ungranted.
+
+  This closes a hole rather than adding a restriction. Before it, issue text
+  reached a `from`-labelled sink with no grant and no diagnostic — and *still*
+  did when the tracker was explicitly labelled `from public`, because the label
+  was never consulted. A tracker is an inbound channel with a durable queue and
+  an external filing surface, which is exactly what I-IFC is about.
+
+  **Migration:** a whip reading a tracker into a `from`-labelled sink needs one
+  line naming who may file into that queue. A whip reading a tracker into
+  unlabelled sinks is unaffected — `public` into `public` was always fine.
+
+### Added
+- **`claim … endorsed`** (DR-0051 §2), the integrity crossing for a party's
+  decision, marked and audited exactly as `coerce … endorsed` is. The crossed
+  value is the claimed *item*, not the claim's `as` binding: `claim v as hold`
+  binds a lease in `hold` while the decision the program reads lives in `v`.
+
+  Honoured **only when the claimed tracker is vouched** (§3). Without that the
+  marker would be a hole rather than a crossing — an agent can file an issue, so
+  it could file its own verdict and claim it, laundering its own output through a
+  two-step it fully controls.
+- **Endorsed decisions must be bounded** (§4). A record field shaped by an
+  endorsed claim must carry a value that cannot express prose: a closed union of
+  string literals, or a non-string primitive. A bare `string`, a map, or a union
+  with one bare arm (`"keep" | string`, which is reopened) is refused. Numbers
+  are admitted deliberately — an `int` cannot instruct a downstream reader.
+
+  This binds a *fully honest* endorser, not a compromised one. A reviewer who
+  quotes a hostile item into a free-text verdict has done their job and has also
+  relayed attacker text into a fact labelled as vouched.
+
+  It does not touch the payload under review. A gate is a valve, not a filter:
+  this governs the control signal, never what flows through.
+
+### Notes
+- DR-0051 §5 (an attacker must not steer *which* reviewer is asked) is specified
+  but vacuous today and implemented as nothing: the whip surface has no assignee
+  to steer. `assigned_to` exists only in `whipplescript-store`, as a durable
+  column with no language-visible field.
+- Entries for `0.2.2`, `0.2.3`, `0.3.0`, and `0.3.1` were never written. Those
+  releases are recorded in their decision records — notably
+  [DR-0050](spec/decision-records/0050-remove-ask-human.md) for the `ask_human`
+  removal cut as `0.3.1`. This gap is noted rather than backfilled.
+
 ## [0.2.1] — 2026-07-27
 
 The first feature release since `0.1.1`, and a large one: a new MCP client

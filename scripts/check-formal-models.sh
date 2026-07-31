@@ -113,6 +113,7 @@ declare -A EXPECTED_NO_SOLUTION=(
   ["workstream.maude"]=5
   ["branch-effect-key.maude"]=2
   ["selective-undo.maude"]=2
+  ["repair-containment.maude"]=4
   ["op-undo.maude"]=2
   ["resolution-memory.maude"]=2
   ["chat-fork.maude"]=2
@@ -222,6 +223,7 @@ declare -A EXPECTED_SOLUTION=(
   ["workstream.maude"]=3
   ["branch-effect-key.maude"]=4
   ["selective-undo.maude"]=3
+  ["repair-containment.maude"]=6
   ["op-undo.maude"]=4
   ["resolution-memory.maude"]=3
   ["chat-fork.maude"]=5
@@ -2888,5 +2890,9 @@ print(
 )
 PY
 
-echo "== tla models/tla/*.tla (Apalache typecheck + bounded check)"
-"$ROOT/scripts/check-tla-models.sh"
+if [[ "${WHIPPLESCRIPT_FORMAL_SKIP_TLA:-0}" == "1" ]]; then
+  echo "== tla models/tla/*.tla delegated to the dedicated CI gate"
+else
+  echo "== tla models/tla/*.tla (Apalache typecheck + bounded check)"
+  "$ROOT/scripts/check-tla-models.sh"
+fi

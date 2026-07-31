@@ -157,13 +157,13 @@ two approval paths.
 GitHub Releases supplies prebuilt binaries:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/GaugeWright/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
 ```
 
 As an alternative, install from source:
 
 ```sh
-git clone https://github.com/jamesjscully/whipplescript.git
+git clone https://github.com/GaugeWright/whipplescript.git
 cd whipplescript
 cargo install --path crates/whipplescript-cli --locked
 whip doctor

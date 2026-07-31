@@ -129,6 +129,7 @@ pub enum Item {
     Harness(HarnessDecl),
     Tracker(TrackerDecl),
     Channel(ChannelDecl),
+    Stream(StreamDecl),
     Gauge(GaugeDecl),
     Mark(MarkDecl),
     Campaign(CampaignDecl),
@@ -164,6 +165,7 @@ impl Item {
             Self::Harness(decl) => decl.span,
             Self::Tracker(decl) => decl.span,
             Self::Channel(decl) => decl.span,
+            Self::Stream(decl) => decl.span,
             Self::Gauge(decl) => decl.span,
             Self::Mark(decl) => decl.span,
             Self::Campaign(decl) => decl.span,
@@ -279,6 +281,22 @@ pub struct ChannelDecl {
     pub provider: Ident,
     pub workspace: Option<Ident>,
     pub destination: Option<StringLiteral>,
+    pub span: SourceSpan,
+}
+
+/// `stream <name> { members [<agent>, ...] [staleness <duration>] }`
+/// (std.vcs; DR-0052 Decision 5): a declared collaboration — a named
+/// shared line whose member agents' session lines home to it, syncing
+/// greedily in-stream and promoting to mainline through one gated
+/// boundary. Members are agent declarations (every session of that
+/// agent homes here); `staleness` is the §7.1 bound. Metadata-only
+/// lowering, like `queue`/`channel`; the runtime workstream tier is the
+/// enforcement seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamDecl {
+    pub name: Ident,
+    pub members: Vec<Ident>,
+    pub staleness_seconds: Option<u64>,
     pub span: SourceSpan,
 }
 
@@ -1016,6 +1034,7 @@ pub struct IrProgram {
     pub uses: Vec<IrUse>,
     pub harnesses: Vec<IrHarness>,
     pub trackers: Vec<IrTracker>,
+    pub streams: Vec<IrStream>,
     pub channels: Vec<IrChannel>,
     pub gauges: Vec<IrGauge>,
     pub marks: Vec<IrMark>,
@@ -1132,6 +1151,17 @@ pub struct IrUse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IrUseKind {
     Package,
+}
+
+/// One lowered `stream` declaration (std.vcs): the workstream tier's
+/// declared membership + staleness bound. Runtime homing reads this.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrStream {
+    pub name: String,
+    pub members: Vec<String>,
+    pub member_spans: Vec<SourceSpan>,
+    pub staleness_seconds: Option<u64>,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1569,9 +1599,30 @@ pub struct IrRuleMetadata {
     /// `.ir` snapshot).
     pub declassified_roots: BTreeSet<String>,
     /// The `endorsed` dual of `declassified_roots`: output roots of `coerce …
-    /// endorsed` crossings, consulted by the inject check. IFC-only (NOT in the
+    /// endorsed` crossings, and (DR-0051 §2) the claimed *item* of `claim …
+    /// endorsed` crossings. Consulted by the inject check. IFC-only (NOT in the
     /// `.ir` snapshot).
     pub endorsed_roots: BTreeSet<String>,
+    /// DR-0051 §3: the *item* bindings of `claim … endorsed` effects — the
+    /// names a `when <tracker> has ready issue as <binding>` trigger bound, not
+    /// the claim's own `as` binding.
+    ///
+    /// Carried separately from `endorsed_roots` because the two answer different
+    /// questions. `endorsed_roots` says which values crossed; this says which
+    /// queue the crossing drew its authority from, so the checker can refuse a
+    /// marker whose tracker nobody vouched. IFC-only (NOT in the `.ir`
+    /// snapshot).
+    pub endorsed_claim_items: BTreeSet<String>,
+    /// DR-0051 §4: per-field binding roots for each `record <Schema> { … }`
+    /// egress — the same shape as `complete_field_reads`, keyed by
+    /// `fact:<Schema>` and then by field name.
+    ///
+    /// `egress_payload_reads` collapses a record's roots to one set, which is
+    /// enough to decide whether a *sink* is carried by a marked crossing but not
+    /// which *field* it shaped. §4 needs the finer grain: a verdict field shaped
+    /// by an endorsement must be schema-closed, while a sibling field holding a
+    /// constant is nobody's business. IFC-only (NOT in the `.ir` snapshot).
+    pub record_field_reads: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// Per-coerce argument roots: for EVERY `coerce f(args…) as <binding>` in
     /// the rule (marked or not), the binding roots its argument expressions
     /// reference. The IFC engine resolves these to governed sources for
@@ -1696,6 +1747,16 @@ pub struct IrEffectNode {
     /// provenance (context-assembly Phase 7). Recorded, not enforced — the owned
     /// catalogue stays discover-all. Empty for effects without a skill pin.
     pub turn_skills: Vec<String>,
+    /// `on stream <name>` (std.vcs): the tell's per-turn homing exception.
+    /// `None` = the agent's declared membership decides.
+    pub on_stream: Option<String>,
+    /// The raw selection-slot source of an `undo`/`transport` effect
+    /// (std.vcs R4). A string LITERAL validates statically against the
+    /// selection grammar; a dynamic expression validates at execution.
+    pub selection_source: Option<String>,
+    /// The `onto <target>` of a `transport` effect: `mainline` or a
+    /// declared stream, validated post-lowering.
+    pub transport_onto: Option<String>,
     /// The named resource (file store / channel) a direct effect touches, if any —
     /// e.g. the store of a `read`/`write`. Surfaced so information-flow analysis can
     /// see rule-body data flows, not just turn-access grants. `None` for effects
@@ -3377,6 +3438,23 @@ impl IrProgram {
                 );
             }
         }
+        if !self.streams.is_empty() {
+            push_line(&mut snapshot, "streams");
+            for stream in &self.streams {
+                push_line(
+                    &mut snapshot,
+                    format!(
+                        "  stream {} members=[{}]{}",
+                        stream.name,
+                        stream.members.join(","),
+                        stream
+                            .staleness_seconds
+                            .map(|seconds| format!(" staleness={seconds}s"))
+                            .unwrap_or_default()
+                    ),
+                );
+            }
+        }
 
         if !self.channels.is_empty() {
             push_line(&mut snapshot, "channels");
@@ -3696,6 +3774,11 @@ impl IrProgram {
                         };
                         // Turn-scoped skill pins (Phase 7) append only when present,
                         // so pin-free effects keep their existing snapshot shape.
+                        let homing = effect
+                            .on_stream
+                            .as_ref()
+                            .map(|stream| format!(" on_stream={stream}"))
+                            .unwrap_or_default();
                         let skills = if effect.turn_skills.is_empty() {
                             String::new()
                         } else {
@@ -3704,14 +3787,15 @@ impl IrProgram {
                         push_line(
                             &mut snapshot,
                             format!(
-                                "      {} kind={} binding={}{} key={}{}{}",
+                                "      {} kind={} binding={}{} key={}{}{}{}",
                                 effect.id,
                                 effect.kind.as_str(),
                                 binding,
                                 construct,
                                 effect.idempotency_key,
                                 grants,
-                                skills
+                                skills,
+                                homing
                             ),
                         );
                     }
@@ -4324,6 +4408,7 @@ fn lower_program(
         uses: Vec::new(),
         harnesses: Vec::new(),
         trackers: Vec::new(),
+        streams: Vec::new(),
         channels: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
@@ -4409,6 +4494,7 @@ fn lower_program(
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
             Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
+            Item::Stream(stream) => lower_stream(stream, &mut ir, &mut diagnostics),
             Item::Gauge(gauge) => lower_gauge(gauge, &mut ir, &mut diagnostics),
             Item::Mark(mark) => lower_mark(mark, &mut ir, &mut diagnostics),
             Item::Campaign(campaign) => lower_campaign(campaign, &mut ir, &mut diagnostics),
@@ -4598,6 +4684,7 @@ fn lower_program(
         }
     }
 
+    validate_streams(&ir, &mut diagnostics);
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
@@ -4880,7 +4967,17 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
                 // `times` only occurs as the two-token predicate `times out`.
                 matches!(
                     parts.next().map(|token| token.trim_end_matches('{')),
-                    Some("fails" | "times" | "completes" | "held" | "contended" | "ok" | "over")
+                    Some(
+                        "fails"
+                            | "times"
+                            | "completes"
+                            | "held"
+                            | "contended"
+                            | "ok"
+                            | "over"
+                            | "promoted"
+                            | "conflicted"
+                    )
                 )
             });
             if observed {
@@ -5599,6 +5696,9 @@ fn expand_pattern_item(
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
         Item::Tracker(queue) => {
             Some((format!("tracker:{}", queue.name.name), Item::Tracker(queue)))
+        }
+        Item::Stream(stream) => {
+            Some((format!("stream:{}", stream.name.name), Item::Stream(stream)))
         }
         Item::Channel(channel) => Some((
             format!("channel:{}", channel.name.name),
@@ -6606,6 +6706,50 @@ impl SchemaIndex {
                 ("labels", array_ty(string_ty())),
             ],
         );
+        // std.vcs observer schemas (DR-0052 grammar pass): the readiness
+        // sugar's typed bindings. Observer-origin — the mediator emits
+        // them; user rules eliminate, never construct.
+        index.insert_class(
+            "VcsChange",
+            [
+                ("branch", string_ty()),
+                ("cut", string_ty()),
+                ("path", string_ty()),
+                ("origin", string_ty()),
+                ("by", string_ty()),
+                ("intent", string_ty()),
+                ("at", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "VcsContention",
+            [
+                ("branch", string_ty()),
+                ("with", string_ty()),
+                ("stream", string_ty()),
+                ("slice", array_ty(string_ty())),
+                ("at", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "VcsPromotion",
+            [
+                ("branch", string_ty()),
+                ("stream", string_ty()),
+                ("cut", string_ty()),
+                ("at", string_ty()),
+            ],
+        );
+        index.insert_class(
+            "VcsStall",
+            [
+                ("branch", string_ty()),
+                ("stream", string_ty()),
+                ("boundary", string_ty()),
+                ("paths", array_ty(string_ty())),
+                ("at", string_ty()),
+            ],
+        );
         index.insert_class(
             "Evidence",
             [
@@ -6977,6 +7121,7 @@ fn lower_workflow_contract(
 /// nothing (and downstream missing-import bite is advisory only).
 pub const STD_PACKAGE_IDS: &[&str] = &[
     "std.agent",
+    "std.vcs",
     "std.coercion",
     "std.coord",
     "std.files",
@@ -7040,6 +7185,208 @@ fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         name: tracker.name.name,
         provider: tracker.provider.name,
         span: tracker.span,
+    });
+}
+
+/// Cross-declaration stream checks (DR-0052 Decision 5, run after all
+/// items lower so agent order does not matter): every member names a
+/// declared agent, and membership is single-valued — one stream per
+/// agent, so the sync topology stays a tree.
+fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    let mut memberships: Vec<(&str, &str)> = Vec::new(); // (agent, stream)
+    for stream in &ir.streams {
+        for (member, span) in stream.members.iter().zip(&stream.member_spans) {
+            if !ir.agents.iter().any(|agent| agent.name == *member) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: *span,
+                    message: format!(
+                        "stream `{}` member `{}` is not a declared agent",
+                        stream.name, member
+                    ),
+                    suggestion: Some(
+                        "stream members are agent declarations; declare the agent \
+                         or remove it from the stream"
+                            .to_owned(),
+                    ),
+                });
+                continue;
+            }
+            if let Some((_, holder)) = memberships.iter().find(|(agent, _)| agent == member) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: *span,
+                    message: format!("agent `{member}` is already a member of stream `{holder}`",),
+                    suggestion: Some(
+                        "membership is single-valued (the sync topology stays a \
+                         tree): an agent homes to exactly one stream"
+                            .to_owned(),
+                    ),
+                });
+                continue;
+            }
+            memberships.push((member, &stream.name));
+        }
+    }
+    // `on stream <name>` on a tell must name a declared stream — the
+    // per-turn exception cannot invent topology.
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            if let Some(target) = &effect.on_stream {
+                if !ir.streams.iter().any(|stream| stream.name == *target) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!("`on stream {target}` names an undeclared stream"),
+                        suggestion: Some(
+                            "declare the stream at top level: `stream <name> { members [...] }`"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+            // A literal selection validates against the ONE selection
+            // grammar at check time (DR-0052 R4.2 — the grammar lives in
+            // whipplescript-core, the same parser the runtime uses;
+            // dynamic expressions validate at execution instead).
+            if let Some(source) = &effect.selection_source {
+                let trimmed = source.trim();
+                if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+                    let literal = &trimmed[1..trimmed.len() - 1];
+                    if let Err(error) = whipplescript_core::selection::parse(literal) {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!("the selection does not parse: {error}"),
+                            suggestion: Some(
+                                "selections compose atoms like `path(<glob>)`, `by(<prefix>)`, \
+                                 `intent(<prefix>)`, `cut(<id>)` with `|`, `&`, `~`, and \
+                                 `dependents-of(...)`"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            // `with access to vcs { repair for <binding> }` (DR-0052
+            // R3): the vcs resource grants exactly one operation, on an
+            // invoke only (a tell would hand a MODEL repair authority),
+            // and its target must be a fact this rule bound — the grant's
+            // extent IS the bound incident fact.
+            for grant in &effect.access_grants {
+                if grant.resource != "vcs" {
+                    continue;
+                }
+                if effect.kind != IrEffectKind::WorkflowInvoke {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: "a `vcs` access grant rides an `invoke` only".to_owned(),
+                        suggestion: Some(
+                            "repair authority is orchestration: grant it to a repair \
+                             workflow via `invoke ... with access to vcs { repair for \
+                             <binding> }`; agents never receive it"
+                                .to_owned(),
+                        ),
+                    });
+                    continue;
+                }
+                for op in &grant.operations {
+                    if op.operation != "repair" {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!("unknown `vcs` grant operation `{}`", op.operation),
+                            suggestion: Some(
+                                "the vcs resource grants `repair for <binding>`".to_owned(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let Some(target) = &op.target else {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: "`repair` names no binding".to_owned(),
+                            suggestion: Some(
+                                "write `repair for <binding>` where the binding is a \
+                                 vcs arming fact this rule matched (e.g. `when reconcile \
+                                 stalled as r`)"
+                                    .to_owned(),
+                            ),
+                        });
+                        continue;
+                    };
+                    let bound = rule.whens.iter().any(|when| {
+                        binding_after_as(when.pattern.as_str()).as_deref() == Some(target)
+                    });
+                    if !bound {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!("`repair for {target}` names no binding of this rule"),
+                            suggestion: Some(
+                                "bind the arming fact first: `when reconcile stalled as \
+                                 <binding>` (or the dotted `when fact vcs.* as <binding>` \
+                                 form)"
+                                    .to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            // `transport ... onto <target>`: the target is a nameable
+            // tier — `mainline`, or a declared stream (its line).
+            if let Some(target) = &effect.transport_onto {
+                if target != "mainline" && !ir.streams.iter().any(|stream| stream.name == *target) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "`onto {target}` names neither `mainline` nor a declared stream"
+                        ),
+                        suggestion: Some(
+                            "transport targets are the nameable tiers: `onto mainline`, or \
+                             `onto <stream>` for a declared stream's line"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn lower_stream(stream: StreamDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    // Two streams with the same name would make homing and `promote
+    // <stream>` ambiguous (a stream name is a routing identity).
+    if let Some(existing) = ir
+        .streams
+        .iter()
+        .find(|other| other.name == stream.name.name)
+    {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: stream.name.span,
+            message: format!("duplicate stream `{}`", stream.name.name),
+            suggestion: Some(format!(
+                "stream `{}` is already declared with members [{}]",
+                existing.name,
+                existing.members.join(", ")
+            )),
+        });
+        return;
+    }
+    ir.streams.push(IrStream {
+        name: stream.name.name,
+        members: stream
+            .members
+            .iter()
+            .map(|member| member.name.clone())
+            .collect(),
+        member_spans: stream.members.iter().map(|member| member.span).collect(),
+        staleness_seconds: stream.staleness_seconds,
+        span: stream.span,
     });
 }
 
@@ -8846,6 +9193,10 @@ fn is_builtin_schema_ref(name: &str) -> bool {
         "AgentTurn"
             | "WorkItem"
             | "Evidence"
+            | "VcsChange"
+            | "VcsContention"
+            | "VcsPromotion"
+            | "VcsStall"
             | "TerminalFailed"
             | "TerminalTimedOut"
             | "TerminalCancelled"
@@ -8862,7 +9213,16 @@ fn is_builtin_schema_ref(name: &str) -> bool {
 fn is_observer_only_schema(name: &str) -> bool {
     matches!(
         name,
-        "TerminalFailed" | "TerminalTimedOut" | "TerminalCancelled" | "TerminalOutcome"
+        "TerminalFailed"
+            | "TerminalTimedOut"
+            | "TerminalCancelled"
+            | "TerminalOutcome"
+            // std.vcs observer schemas: the mediator emits them; a rule
+            // that `record`s one forges a workspace observation.
+            | "VcsChange"
+            | "VcsContention"
+            | "VcsPromotion"
+            | "VcsStall"
     )
 }
 
@@ -10068,6 +10428,27 @@ fn analyze_rule(
     // raw lines first (every single-line effect form), then the balanced
     // multi-line statements (a `coerce` whose arguments span lines carries its
     // binding on the closing line).
+    // Bindings born from the std.vcs completion-valued verbs: the
+    // succeeds-refusals below need the construct, not just the generic
+    // CapabilityCall kind. Maps binding -> (verb, negative variant).
+    let vcs_verb_bindings: BTreeMap<String, (&'static str, &'static str)> = rule
+        .body
+        .text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (verb, negative) = if line.starts_with("promote ") {
+                ("promote", "Conflicted")
+            } else if line.starts_with("undo ") {
+                ("undo", "Stranded")
+            } else if line.starts_with("transport ") {
+                ("transport", "Conflicted")
+            } else {
+                return None;
+            };
+            Some((binding_after_as(line)?, (verb, negative)))
+        })
+        .collect();
     let mut effect_binding_kinds: BTreeMap<String, IrEffectKind> = rule
         .body
         .text
@@ -10108,6 +10489,35 @@ fn analyze_rule(
         // workflow proceeding "as if holding" on Contended. Reject `succeeds`
         // and force the variant vocabulary; `fails` (infra failures) and
         // `completes` (deliberate catch-all) stay legal.
+        if predicate == "succeeds" {
+            if let Some((verb, negative)) = vcs_verb_bindings.get(binding) {
+                // std.vcs verbs are completion-valued: the generic
+                // `succeeds` arm would fire on the refusal variant too — a
+                // workflow proceeding as if the act landed. Same posture
+                // as acquire; outcome-variant predicates are only ever
+                // added alongside this refusal (DR-0052 Decision 0).
+                let positive = if *verb == "promote" {
+                    "promoted"
+                } else {
+                    "applied"
+                };
+                let negative_arm = negative.to_lowercase();
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` observes {verb} `{binding}` with `succeeds`, which also \
+                         matches a {negative} outcome (the op completes either way)",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "use `after {binding} {positive}` / `after {binding} {negative_arm}` \
+                         for the outcome variants, or `after {binding} completes` for any \
+                         settled outcome"
+                    )),
+                });
+            }
+        }
         if predicate == "succeeds" {
             match effect_binding_kinds.get(binding) {
                 Some(IrEffectKind::LeaseAcquire) => {
@@ -10487,6 +10897,9 @@ fn analyze_rule(
                 // below (which carries the real grants); empty here is fine.
                 access_grants: Vec::new(),
                 turn_skills: Vec::new(),
+                on_stream: None,
+                selection_source: None,
+                transport_onto: None,
                 resource: None,
                 agent: None,
                 workflow_target: None,
@@ -10561,11 +10974,13 @@ fn analyze_rule(
             .extend(roots);
     }
     collect_complete_field_reads(&body_ast.statements, &mut metadata.complete_field_reads);
+    collect_record_field_reads(&body_ast.statements, &mut metadata.record_field_reads);
     collect_milestone_field_reads(&body_ast.statements, &mut metadata.milestone_field_reads);
     collect_crossing_roots(
         &body_ast.statements,
         &mut metadata.declassified_roots,
         &mut metadata.endorsed_roots,
+        &mut metadata.endorsed_claim_items,
     );
     collect_provenance_metadata(
         &body_ast.statements,
@@ -10741,11 +11156,13 @@ fn collect_crossing_roots(
     statements: &[body::BodyStmt],
     declassified: &mut BTreeSet<String>,
     endorsed: &mut BTreeSet<String>,
+    claim_items: &mut BTreeSet<String>,
 ) {
     fn collect_marked(
         statements: &[body::BodyStmt],
         declassified: &mut BTreeSet<String>,
         endorsed: &mut BTreeSet<String>,
+        claim_items: &mut BTreeSet<String>,
     ) {
         for statement in statements {
             match statement {
@@ -10765,11 +11182,33 @@ fn collect_crossing_roots(
                             }
                         }
                     }
+                    // DR-0051 §2: an endorsed claim is a marked crossing of the
+                    // same kind, so its output binding joins `endorsed_roots`
+                    // and every downstream check — the narrowing, the grant
+                    // consultation, NMIF-on-the-selector — applies unchanged.
+                    if let body::BodyEffectKind::TrackerClaim {
+                        endorsed: is_endorsed,
+                        item,
+                        ..
+                    } = &effect.kind
+                    {
+                        if *is_endorsed {
+                            // The crossed value is the *claimed item*, not the
+                            // claim's `as` binding: `claim v as hold` binds a
+                            // lease in `hold`, while the decision the program
+                            // goes on to read lives in `v`. Marking the lease
+                            // would mark a handle nothing reads.
+                            endorsed.insert(item.clone());
+                            claim_items.insert(item.clone());
+                        }
+                    }
                 }
-                body::BodyStmt::After(after) => collect_marked(&after.body, declassified, endorsed),
+                body::BodyStmt::After(after) => {
+                    collect_marked(&after.body, declassified, endorsed, claim_items)
+                }
                 body::BodyStmt::Case(case) => {
                     for branch in &case.branches {
-                        collect_marked(&branch.body, declassified, endorsed);
+                        collect_marked(&branch.body, declassified, endorsed, claim_items);
                     }
                 }
                 _ => {}
@@ -10808,7 +11247,7 @@ fn collect_crossing_roots(
             }
         }
     }
-    collect_marked(statements, declassified, endorsed);
+    collect_marked(statements, declassified, endorsed, claim_items);
     // Aliases can nest under other afters, so run the alias pass to a fixpoint
     // over the (small) statement tree: one extra pass suffices in practice, but
     // loop until stable so deep nesting cannot order-skip an alias.
@@ -11227,6 +11666,55 @@ fn send_payload_reads(fields: &[body::ConstructUseField]) -> Option<(String, BTr
 /// The `fact:<Schema>` sink key and the binding roots a `record` payload
 /// references — its explicit field values plus, for `record <S> from <b>`, the
 /// copied-from binding `b`.
+/// DR-0051 §4: per-field binding roots for every `record <Schema> { … }` in a
+/// rule body, recursing into nested blocks. Mirrors
+/// `collect_complete_field_reads`; see `record_field_reads`.
+fn collect_record_field_reads(
+    statements: &[body::BodyStmt],
+    out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) {
+    fn record_fields(
+        record: &body::RecordStmt,
+        out: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    ) {
+        let per_field = out.entry(format!("fact:{}", record.schema)).or_default();
+        for field in &record.fields {
+            let mut roots = BTreeSet::new();
+            match &field.value {
+                body::FieldValue::Shorthand => {
+                    if let Some(root) = &record.from {
+                        roots.insert(root.clone());
+                    }
+                }
+                body::FieldValue::Expr { expr, .. } => collect_expr_binding_roots(expr, &mut roots),
+                body::FieldValue::Nested { fields, .. } => {
+                    collect_payload_field_roots(fields, record.from.as_deref(), &mut roots)
+                }
+            }
+            per_field
+                .entry(field.name.clone())
+                .or_default()
+                .extend(roots);
+        }
+    }
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => record_fields(record, out),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => record_fields(record, out),
+            body::BodyStmt::After(after) => collect_record_field_reads(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_record_field_reads(&branch.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn record_payload_reads(record: &body::RecordStmt) -> (String, BTreeSet<String>) {
     let mut roots = BTreeSet::new();
     if let Some(from) = &record.from {
@@ -11893,6 +12381,35 @@ fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
     }
 }
 
+/// `on stream <name>` (std.vcs) carried on an `agent.tell` effect.
+fn on_stream_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Tell { on_stream, .. } => on_stream.clone(),
+        _ => None,
+    }
+}
+
+/// The std.vcs selective verbs' statically-checkable pieces (DR-0052
+/// R4): the raw selection-slot source, and transport's `onto` target.
+fn vcs_selective_for_body(kind: &body::BodyEffectKind) -> (Option<String>, Option<String>) {
+    let body::BodyEffectKind::ConstructCapabilityCall {
+        keyword, fields, ..
+    } = kind
+    else {
+        return (None, None);
+    };
+    if keyword != "undo" && keyword != "transport" {
+        return (None, None);
+    }
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.source.clone())
+    };
+    (field("selection"), field("onto"))
+}
+
 /// The workflow an `invoke` targets, surfaced for IFC membrane-door enumeration.
 fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     match kind {
@@ -12164,6 +12681,8 @@ fn walk_effects(
                 let construct_use = construct_use_for_body(&effect.kind);
                 let access_grants = ir_access_grants_for_body(&effect.kind);
                 let turn_skills = turn_skills_for_body(&effect.kind);
+                let on_stream = on_stream_for_body(&effect.kind);
+                let (selection_source, transport_onto) = vcs_selective_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
                 let workflow_target = workflow_target_for_body(&effect.kind);
@@ -12181,6 +12700,9 @@ fn walk_effects(
                     timeout_seconds: effect.timeout_seconds,
                     access_grants,
                     turn_skills,
+                    on_stream,
+                    selection_source,
+                    transport_onto,
                     resource,
                     agent,
                     workflow_target,
@@ -12207,7 +12729,11 @@ fn walk_effects(
                     | body::AfterPredicate::Held
                     | body::AfterPredicate::Contended
                     | body::AfterPredicate::Ok
-                    | body::AfterPredicate::Over => DependencyPredicate::Completes,
+                    | body::AfterPredicate::Over
+                    | body::AfterPredicate::Promoted
+                    | body::AfterPredicate::Conflicted
+                    | body::AfterPredicate::Applied
+                    | body::AfterPredicate::Stranded => DependencyPredicate::Completes,
                     // `reaches "<name>"` (Family C) is completion-shaped for the
                     // construct-graph provenance edge; the milestone-specific
                     // gating happens at runtime against the
@@ -14817,6 +15343,30 @@ pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
             return Some(format!("message.{channel}"));
         }
     }
+    // std.vcs readiness sugar (DR-0052 grammar pass): each phrase is a
+    // defined lowering onto a generated-only `vcs.*` fact; the leading
+    // word of the stream forms is the stream guard's subject.
+    if pattern == "line changed" || pattern == "line changed by others" {
+        return Some("vcs.cut.recorded".to_owned());
+    }
+    if pattern == "reconcile stalled" {
+        return Some("vcs.reconcile.stalled".to_owned());
+    }
+    {
+        let words: Vec<&str> = pattern.split_whitespace().collect();
+        match words.as_slice() {
+            [_, "has", "contention"] => {
+                return Some("vcs.contention.predicted".to_owned());
+            }
+            [_, "promoted"] => {
+                return Some("vcs.stream.promoted".to_owned());
+            }
+            [_, "is", "quiescent"] => {
+                return Some("vcs.stream.quiescent".to_owned());
+            }
+            _ => {}
+        }
+    }
     let mut words = pattern.split_whitespace();
     let first = words.next()?;
     if words.next() == Some("completed") && words.next() == Some("turn") {
@@ -14875,11 +15425,33 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         // Inbound messaging (spec/messaging.md): `when message from <channel> as
         // msg` binds the generic `Message` envelope, never a domain type.
         "Message".to_owned()
+    } else if let Some(schema) =
+        vcs_sugar_schema(pattern.split(" as ").next().unwrap_or(pattern).trim())
+    {
+        // std.vcs readiness sugar (DR-0052): each phrase binds its
+        // builtin observer schema, like `completed turn` -> AgentTurn.
+        schema.to_owned()
     } else {
         return None;
     };
 
     Some((binding, schema))
+}
+
+/// The builtin observer schema each std.vcs sugar phrase binds.
+fn vcs_sugar_schema(phrase: &str) -> Option<&'static str> {
+    if phrase == "line changed" || phrase == "line changed by others" {
+        return Some("VcsChange");
+    }
+    if phrase == "reconcile stalled" {
+        return Some("VcsStall");
+    }
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    match words.as_slice() {
+        [_, "has", "contention"] => Some("VcsContention"),
+        [_, "promoted"] => Some("VcsPromotion"),
+        _ => None,
+    }
 }
 
 fn split_when_guard(when: &str) -> (&str, Option<&str>) {
@@ -15584,6 +16156,45 @@ fn validate_coordination_discipline(
     let mut consumes = Vec::new();
     let mut claims = Vec::new();
     collect_coordination_effects(statements, &mut acquires, &mut consumes, &mut claims);
+
+    // std.vcs completion-valued verbs (DR-0052): promote, undo, and
+    // transport are exhaustive exactly like acquire — an unwritten
+    // refusal arm is a workflow with no policy at the refusal.
+    let mut vcs_verbs: Vec<(&'static str, [&'static str; 2], String, SourceSpan)> = Vec::new();
+    for_each_body(statements, &mut |stmt| {
+        if let body::BodyStmt::Effect(effect) = stmt {
+            if let body::BodyEffectKind::ConstructCapabilityCall { keyword, .. } = &effect.kind {
+                let arms: Option<(&'static str, [&'static str; 2])> = match keyword.as_str() {
+                    "promote" => Some(("promote", ["promoted", "conflicted"])),
+                    "undo" => Some(("undo", ["applied", "stranded"])),
+                    "transport" => Some(("transport", ["applied", "conflicted"])),
+                    _ => None,
+                };
+                if let (Some((verb, required)), Some(binding)) = (arms, &effect.binding) {
+                    vcs_verbs.push((verb, required, binding.clone(), effect.span));
+                }
+            }
+        }
+    });
+    for (verb, required_arms, binding, span) in &vcs_verbs {
+        let mut predicates = BTreeSet::new();
+        collect_after_predicates(statements, binding, &mut predicates);
+        for required in required_arms {
+            if !predicates.contains(*required) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: *span,
+                    message: format!(
+                        "rule `{}` does not handle the `{required}` outcome of {verb} `{binding}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(format!(
+                        "{verb} outcomes are exhaustive: add `after {binding} {required} {{ ... }}`"
+                    )),
+                });
+            }
+        }
+    }
 
     // A `renew <binding>` names ONE OF TWO legitimate referents (T3, mirroring
     // the `release` disambiguation below):
@@ -18465,6 +19076,9 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
         || line.starts_with("recall ")
         || line.starts_with("learn ")
         || line.starts_with("curate ")
+        || line.starts_with("promote ")
+        || line.starts_with("undo ")
+        || line.starts_with("transport ")
     {
         IrEffectKind::CapabilityCall
     } else if line.starts_with("emit ") {
@@ -18655,7 +19269,8 @@ fn parse_after_line(line: &str) -> Option<(String, DependencyPredicate)> {
         }
         // Coordination outcomes (spec/coordination.md) are completion-valued;
         // the arm dispatch happens on the outcome variant at lowering.
-        "completes" | "held" | "contended" | "ok" | "over" => DependencyPredicate::Completes,
+        "completes" | "held" | "contended" | "ok" | "over" | "promoted" | "conflicted"
+        | "applied" | "stranded" => DependencyPredicate::Completes,
         // `after p reaches "<name>" [as m]` (Family C): consume the quoted
         // milestone name (which may contain whitespace — token-splitting used
         // to reject multi-word names); the IR predicate is completion-shaped
@@ -18936,6 +19551,25 @@ fn format_item(item: Item, formatted: &mut String) {
         Item::Tracker(queue) => {
             push_line(formatted, format!("tracker {} {{", queue.name.name));
             push_line(formatted, format!("  provider {}", queue.provider.name));
+            push_line(formatted, "}");
+        }
+        Item::Stream(stream) => {
+            push_line(formatted, format!("stream {} {{", stream.name.name));
+            push_line(
+                formatted,
+                format!(
+                    "  members [{}]",
+                    stream
+                        .members
+                        .iter()
+                        .map(|member| member.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            if let Some(seconds) = stream.staleness_seconds {
+                push_line(formatted, format!("  staleness {seconds}s"));
+            }
             push_line(formatted, "}");
         }
         Item::Mark(mark) => {
@@ -20137,6 +20771,7 @@ enum DeclAstKind {
     Ledger,
     MemoryPool,
     FileStore,
+    Stream,
 }
 
 /// One order-free clause of a `declaration_block` construct: a named value
@@ -20194,6 +20829,7 @@ include!(concat!(env!("OUT_DIR"), "/declaration_block_grammar.rs"));
 #[derive(Clone, Debug)]
 enum ClauseValue {
     Ident(Ident),
+    Idents(Vec<Ident>),
     Duration(u64),
     Number(u32),
     Str(StringLiteral),
@@ -20233,6 +20869,13 @@ impl ClauseBag {
     fn ident(&self, name: &str) -> Option<Ident> {
         match self.get(name) {
             Some((_, _, ClauseValue::Ident(ident))) => Some(ident.clone()),
+            _ => None,
+        }
+    }
+
+    fn idents(&self, name: &str) -> Option<Vec<Ident>> {
+        match self.get(name) {
+            Some((_, _, ClauseValue::Idents(idents))) => Some(idents.clone()),
             _ => None,
         }
     }
@@ -20933,6 +21576,15 @@ impl Parser<'_> {
     /// is literal-polymorphic (number or string); the builder casts.
     fn parse_clause_value(&mut self, clause: &ClauseSpec) -> ClauseValue {
         match clause.kind {
+            // DR-0011 vocabulary amendment (DR-0052 grammar pass,
+            // 2026-07-31): `list` extends to `identifier` clauses — a
+            // bracketed bare-ident list (`members [worker, reviewer]`),
+            // parsed by the same list parser the agent `tools` grant uses.
+            ClauseKind::Identifier if clause.list => self
+                .parse_ident_list()
+                .map_or(ClauseValue::Missing, |(idents, _)| {
+                    ClauseValue::Idents(idents)
+                }),
             ClauseKind::Identifier | ClauseKind::Schema => self
                 .expect_ident(&format!("{} value", clause.name))
                 .map_or(ClauseValue::Missing, ClauseValue::Ident),
@@ -21005,6 +21657,28 @@ impl Parser<'_> {
                     provider,
                     workspace: bag.ident("workspace"),
                     destination: bag.text_literal("destination"),
+                    span,
+                }))
+            }
+            DeclAstKind::Stream => {
+                let Some(members) = bag.idents("members").filter(|idents| !idents.is_empty())
+                else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("stream `{}` must declare its members", name.name),
+                        suggestion: Some(
+                            "a stream is a declared collaboration: name its member \
+                             agents with `members [<agent>, ...]`"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Stream(StreamDecl {
+                    name,
+                    members,
+                    staleness_seconds: bag.duration("staleness"),
                     span,
                 }))
             }
@@ -24010,8 +24684,8 @@ mod tests {
             .collect();
         assert_eq!(
             keywords.len(),
-            7,
-            "expected exactly 7 declaration_block specs"
+            8,
+            "expected exactly 8 declaration_block specs"
         );
         for expected in [
             "tracker",
@@ -24021,6 +24695,7 @@ mod tests {
             "ledger",
             "file store",
             "memory pool",
+            "stream",
         ] {
             assert!(
                 keywords.contains(&expected),
@@ -34356,6 +35031,301 @@ rule j
         let ir = compiled.ir.expect("compiles");
         assert_eq!(ir.trackers.len(), 1);
         assert_eq!(ir.trackers[0].provider, "builtin");
+    }
+
+    /// std.vcs `stream` declaration (DR-0052 grammar pass): bare-ident
+    /// member lists parse via the DR-0011 list-identifier amendment;
+    /// staleness is an ordinary duration clause; members must name
+    /// declared agents; membership is single-valued; `on stream` on a
+    /// tell must name a declared stream; fmt canonicalizes the block.
+    #[test]
+    fn stream_declaration_parses_validates_and_formats() {
+        let source = r#"
+@service
+workflow Streams
+
+agent worker {
+  profile "repo-writer"
+}
+
+agent reviewer {
+  profile "repo-reader"
+}
+
+stream triage {
+  members [worker, reviewer]
+  staleness 2h
+}
+
+signal go.now { x string }
+rule j
+  when go.now as g
+=> {
+  tell worker as turn on stream triage """markdown
+  Work {{ g.x }}.
+  """
+}
+"#;
+        let compiled = compile_program(source);
+        let ir = compiled.ir.expect("compiles");
+        assert_eq!(ir.streams.len(), 1);
+        assert_eq!(ir.streams[0].name, "triage");
+        assert_eq!(ir.streams[0].members, vec!["worker", "reviewer"]);
+        assert_eq!(ir.streams[0].staleness_seconds, Some(7200));
+        let tell = ir
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.metadata.effects)
+            .find(|effect| effect.kind == IrEffectKind::AgentTell)
+            .expect("tell effect");
+        assert_eq!(tell.on_stream.as_deref(), Some("triage"));
+
+        // Undeclared member refused.
+        let bad_member = source.replace("members [worker, reviewer]", "members [ghost]");
+        let compiled = compile_program(&bad_member);
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("not a declared agent")));
+
+        // Double membership refused (single-valued, topology stays a tree).
+        let double = source.replace(
+            "signal go.now { x string }",
+            "stream hotfix {\n  members [worker]\n}\n\nsignal go.now { x string }",
+        );
+        let compiled = compile_program(&double);
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("already a member of stream")));
+
+        // `on stream` must name a declared stream.
+        let bad_target = source.replace("on stream triage", "on stream nowhere");
+        let compiled = compile_program(&bad_target);
+        assert!(compiled.ir.is_none());
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("undeclared stream")));
+    }
+
+    /// std.vcs `promote <stream> as p` (DR-0052 grammar pass slice 3):
+    /// parses via the effect_operation table, lowers to a vcs.promote
+    /// capability call, refuses `succeeds` (the acquire posture), and
+    /// requires both outcome arms.
+    #[test]
+    fn promote_parses_refuses_succeeds_and_requires_both_arms() {
+        let base = r#"
+@service
+workflow Promote
+use std.vcs
+use std.ingress
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+stream triage {
+  members [worker]
+}
+
+class Note { body string }
+signal go.now { x string }
+rule hop
+  when go.now as g
+=> {
+  promote triage as p
+  after p promoted {
+    record Note { body "landed" }
+  }
+  after p conflicted {
+    record Note { body "blocked" }
+  }
+}
+"#;
+        let compiled = compile_program(base);
+        let ir = compiled.ir.expect("compiles");
+        let promote = ir
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.metadata.effects)
+            .find(|effect| effect.kind == IrEffectKind::CapabilityCall)
+            .expect("promote lowers to a capability call");
+        assert_eq!(promote.binding.as_deref(), Some("p"));
+
+        // `succeeds` on a promote binding is refused (a workflow must not
+        // proceed "as if promoted" on a conflicted boundary).
+        let succeeds = base.replace(
+            "after p promoted {\n    record Note { body \"landed\" }\n  }",
+            "after p succeeds {\n    record Note { body \"landed\" }\n  }",
+        );
+        let compiled = compile_program(&succeeds);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("also matches a Conflicted outcome")));
+
+        // Outcome handling is exhaustive: a missing `conflicted` arm is a
+        // program with no policy at the boundary.
+        let missing = base.replace(
+            "  after p conflicted {\n    record Note { body \"blocked\" }\n  }\n",
+            "",
+        );
+        let compiled = compile_program(&missing);
+        assert!(compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("does not handle the `conflicted` outcome")));
+    }
+
+    /// std.vcs selective verbs (DR-0052 R4): `undo`/`transport` parse,
+    /// enforce the acquire posture (succeeds refused, exhaustive arms),
+    /// statically validate literal selections against the one selection
+    /// grammar, and bound transport targets to the nameable tiers.
+    #[test]
+    fn selective_verbs_parse_enforce_and_validate_statically() {
+        let base = r#"
+@service
+workflow Selective
+use std.vcs
+use std.ingress
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+stream triage {
+  members [worker]
+}
+
+class Note { body string }
+signal go.now { x string }
+rule tidy
+  when go.now as g
+=> {
+  undo "by(instance:i-1) & path(scratch/**)" as u
+  after u applied {
+    record Note { body "clean" }
+  }
+  after u stranded {
+    record Note { body "kept" }
+  }
+  transport "path(src/**)" onto triage as t
+  after t applied {
+    record Note { body "moved" }
+  }
+  after t conflicted {
+    record Note { body "blocked" }
+  }
+}
+"#;
+        let compiled = compile_program(base);
+        let ir = compiled.ir.expect("compiles");
+        let calls: Vec<_> = ir
+            .rules
+            .iter()
+            .flat_map(|rule| &rule.metadata.effects)
+            .filter(|effect| effect.kind == IrEffectKind::CapabilityCall)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].binding.as_deref(), Some("u"));
+        assert_eq!(calls[1].transport_onto.as_deref(), Some("triage"));
+
+        // A malformed literal selection is a check error.
+        let bad_selection = base.replace(
+            r#"undo "by(instance:i-1) & path(scratch/**)" as u"#,
+            r#"undo "nonsense((" as u"#,
+        );
+        let compiled = compile_program(&bad_selection);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("selection does not parse")));
+
+        // Transport targets are the nameable tiers only.
+        let bad_target = base.replace("onto triage as t", "onto ghost as t");
+        let compiled = compile_program(&bad_target);
+        assert!(compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("neither `mainline` nor a declared stream")));
+
+        // `succeeds` on a selective binding is refused.
+        let succeeds = base.replace(
+            "after u applied {\n    record Note { body \"clean\" }\n  }",
+            "after u succeeds {\n    record Note { body \"clean\" }\n  }",
+        );
+        let compiled = compile_program(&succeeds);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("also matches a Stranded outcome")));
+
+        // Outcome handling is exhaustive.
+        let missing = base.replace(
+            "  after t conflicted {\n    record Note { body \"blocked\" }\n  }\n",
+            "",
+        );
+        let compiled = compile_program(&missing);
+        assert!(compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("does not handle the `conflicted` outcome of transport")));
+    }
+
+    /// DR-0052 R3: the vcs repair grant parses on invoke with a bound
+    /// arming fact; an unknown op and an unbound binding are refused.
+    #[test]
+    fn vcs_repair_grant_validates() {
+        let base = r#"
+workflow Main {
+  use std.vcs
+
+  rule unstick
+    when reconcile stalled as r
+  => {
+    invoke RepairFlow { note "repair" } as fix
+      with access to vcs {
+        repair for r
+      }
+  }
+}
+
+workflow RepairFlow {
+  input note string
+  output result Fixed
+  class Fixed { note string }
+
+  rule fix
+    when started
+  => {
+    complete result { note "done" }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(base, Some("Main"));
+        assert!(
+            compiled.ir.is_some(),
+            "expected compile, got {:?}",
+            compiled.diagnostics
+        );
+
+        let unbound = base.replace("repair for r", "repair for ghost");
+        let compiled = compile_program_with_root(&unbound, Some("Main"));
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("names no binding of this rule")));
+
+        let bad_op = base.replace("repair for r", "undo for r");
+        let compiled = compile_program_with_root(&bad_op, Some("Main"));
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown `vcs` grant operation")));
     }
 
     #[test]

@@ -209,6 +209,10 @@ pub enum BodyEffectKind {
         /// Turn-scoped `with skills [...]` (context-assembly Phase 7): skills pinned
         /// into this turn's provenance. Does NOT filter the discover-all catalogue.
         skills: Vec<String>,
+        /// `on stream <name>` (std.vcs, DR-0052 Decision 5): the per-turn
+        /// homing exception — this turn's bound line homes to the named
+        /// stream instead of the agent's declared membership.
+        on_stream: Option<String>,
     },
     Coerce {
         name: String,
@@ -272,6 +276,13 @@ pub enum BodyEffectKind {
         /// timed lease (`expires_at = now + n`) that `ready`/`claim` reclaim
         /// once past-due; `None` is the untimed backstop lease (T3).
         ttl_seconds: Option<u64>,
+        /// The `endorsed` source marker (DR-0051 §2), the same crossing
+        /// `coerce … endorsed` carries: the author declares that adopting this
+        /// party's decision is the integrity raise. Honoured only when the
+        /// claimed tracker is itself vouched (§3) — otherwise an agent could
+        /// file its own issue and claim it, laundering its own output through a
+        /// two-step it fully controls.
+        endorsed: bool,
     },
     TrackerRelease {
         item: String,
@@ -522,6 +533,10 @@ impl AfterPredicate {
             AfterPredicate::Contended => "contended",
             AfterPredicate::Ok => "ok",
             AfterPredicate::Over => "over",
+            AfterPredicate::Promoted => "promoted",
+            AfterPredicate::Conflicted => "conflicted",
+            AfterPredicate::Applied => "applied",
+            AfterPredicate::Stranded => "stranded",
         }
     }
 }
@@ -542,6 +557,20 @@ pub enum AfterPredicate {
     Contended,
     Ok,
     Over,
+    /// std.vcs promotion outcomes (DR-0052 grammar pass, the acquire
+    /// pattern one tier up): the boundary hop COMPLETES with variant
+    /// Promoted|Conflicted — refusal is data, and `succeeds` is refused
+    /// on a promote binding so no workflow proceeds "as if promoted" on
+    /// a conflicted boundary.
+    Promoted,
+    Conflicted,
+    /// std.vcs selective-verb outcomes (DR-0052 R4): `undo` and
+    /// `transport` COMPLETE with Applied|Stranded / Applied|Conflicted —
+    /// the proposal landed, or the dependency-closure / certified
+    /// precondition refused, as data. Same enforcement as
+    /// promote/acquire.
+    Applied,
+    Stranded,
     /// `after p reaches "<name>" as m` (Family C, child-milestone lifecycle): the
     /// invoked child workflow `p` projected the named milestone mid-flight. The
     /// milestone name is carried on `AfterBlock.milestone`, keeping this variant
@@ -562,6 +591,10 @@ impl AfterPredicate {
             Self::Contended => "contended",
             Self::Ok => "ok",
             Self::Over => "over",
+            Self::Promoted => "promoted",
+            Self::Conflicted => "conflicted",
+            Self::Applied => "applied",
+            Self::Stranded => "stranded",
             // The milestone name is rendered separately by the serializer
             // (it lives on `AfterBlock.milestone`), so the bare keyword is
             // all `as_str` carries here.
@@ -1658,14 +1691,17 @@ impl<'a> BodyParser<'a> {
         let mut timeout_seconds = None;
         let mut access_grants = Vec::new();
         let mut skills = Vec::new();
+        let mut on_stream = None;
         // Pre-prompt modifiers may interleave the standard ones (`as`/`requires`/
-        // `timeout`) with `with access to` grants and `with skills [...]`.
+        // `timeout`) with `with access to` grants, `with skills [...]`, and
+        // `on stream <name>`.
         if !self.parse_effect_modifiers_with_access(
             &mut binding,
             &mut requires,
             &mut timeout_seconds,
             &mut access_grants,
             Some(&mut skills),
+            Some(&mut on_stream),
         ) {
             return None;
         }
@@ -1676,6 +1712,7 @@ impl<'a> BodyParser<'a> {
             &mut timeout_seconds,
             &mut access_grants,
             Some(&mut skills),
+            Some(&mut on_stream),
         ) {
             return None;
         }
@@ -1684,6 +1721,7 @@ impl<'a> BodyParser<'a> {
                 target,
                 access_grants,
                 skills,
+                on_stream,
             },
             binding,
             requires,
@@ -1702,10 +1740,25 @@ impl<'a> BodyParser<'a> {
         timeout_seconds: &mut Option<u64>,
         access_grants: &mut Vec<AccessGrant>,
         mut skills: Option<&mut Vec<String>>,
+        mut on_stream: Option<&mut Option<String>>,
     ) -> bool {
         loop {
             if !self.parse_effect_modifiers(binding, requires, timeout_seconds) {
                 return false;
+            }
+            // `on stream <name>` (std.vcs): only where a homing slot is
+            // offered (`tell`); elsewhere `on` is not consumed.
+            if self.at_ident("on")
+                && matches!(self.peek_at(1).map(|t| &t.tok), Some(Tok::Ident(v)) if v == "stream")
+            {
+                if let Some(slot) = on_stream.as_deref_mut() {
+                    self.pos += 2; // on stream
+                    let Some(name) = self.ident_text("stream name after `on stream`") else {
+                        return false;
+                    };
+                    *slot = Some(name);
+                    continue;
+                }
             }
             if self.at_ident("with") {
                 // Turn-scoped `with skills [...]` (Phase 7) vs `with access to …`.
@@ -2567,6 +2620,7 @@ impl<'a> BodyParser<'a> {
             &mut timeout_seconds,
             &mut access_grants,
             None,
+            None,
         ) {
             return None;
         }
@@ -3386,8 +3440,15 @@ impl<'a> BodyParser<'a> {
         if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
             return None;
         }
+        // The trailing `endorsed` source marker (DR-0051 §2); must come last,
+        // exactly as on a `coerce`.
+        let endorsed = self.consume_ident("endorsed");
         Some(BodyStmt::Effect(EffectStmt {
-            kind: BodyEffectKind::TrackerClaim { item, ttl_seconds },
+            kind: BodyEffectKind::TrackerClaim {
+                item,
+                ttl_seconds,
+                endorsed,
+            },
             binding,
             requires,
             timeout_seconds,
@@ -3589,6 +3650,10 @@ impl<'a> BodyParser<'a> {
                 "contended" => AfterPredicate::Contended,
                 "ok" => AfterPredicate::Ok,
                 "over" => AfterPredicate::Over,
+                "promoted" => AfterPredicate::Promoted,
+                "conflicted" => AfterPredicate::Conflicted,
+                "applied" => AfterPredicate::Applied,
+                "stranded" => AfterPredicate::Stranded,
                 other => {
                     let span = self.span_from(start);
                     self.error(
@@ -3831,7 +3896,7 @@ mod tests {
     fn generated_effect_operation_grammar_covers_the_std_constructs() {
         // Drift canary for the build.rs codegen: the table generated from the
         // embedded std manifests (std/manifests/*.json) must contain exactly
-        // the four shipped effect_operation keywords with their target
+        // the seven shipped effect_operation keywords with their target
         // capabilities. A manifest edit that adds, drops, or retargets a
         // keyword shows up here before it shows up in parse behavior.
         let table = EFFECT_OPERATION_GRAMMAR
@@ -3845,6 +3910,9 @@ mod tests {
                 ("learn", "memory.write"),
                 ("curate", "memory.curate"),
                 ("send", "messaging.send"),
+                ("promote", "vcs.promote"),
+                ("undo", "vcs.undo"),
+                ("transport", "vcs.transport"),
             ]
         );
     }

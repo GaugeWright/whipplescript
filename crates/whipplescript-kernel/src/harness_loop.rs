@@ -65,6 +65,16 @@ pub struct ToolOutcome {
 /// The real impl lives in the CLI (file-store bounded); tests inject a fake.
 pub trait ToolExecutor {
     fn execute(&self, call: &ToolCall) -> ToolOutcome;
+
+    /// Mid-turn delivery (DR-0052 Decision 7): information the host wants
+    /// the running agent to see before its NEXT model call — raises
+    /// addressed to this session, contention notices. Inbound only, so
+    /// invariant I2 (interiors emit no facts) is untouched; the default
+    /// delivers nothing (delegated harnesses, tests, the stepped DO
+    /// machine — where the turn boundary remains the atom).
+    fn poll_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// One inline image attached to a user message (pi-conformance §6, v1 scope:
@@ -411,6 +421,20 @@ where
     let mut provider_retries: u32 = 0;
     let mut step = 0;
     while step < input.max_steps {
+        // Mid-turn delivery (DR-0052 Decision 7): notices arrive as
+        // ordinary inbound context — one model call of latency instead
+        // of a whole turn. Appended before the request and checkpointed,
+        // so a resumed turn keeps what it was told.
+        let notices = executor.poll_notices();
+        if !notices.is_empty() {
+            for notice in notices {
+                messages.push(ChatMessage::User {
+                    text: notice,
+                    images: Vec::new(),
+                });
+            }
+            checkpoint(&messages);
+        }
         observations.push(LoopObservation::ModelRequest { step });
         let reply = match client.next(&messages, &input.tools) {
             Ok(reply) => reply,

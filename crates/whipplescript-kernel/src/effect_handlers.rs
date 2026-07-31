@@ -1337,6 +1337,27 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
     effect: &ClaimableEffect,
     now: &str,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    run_coordination_effect_generic_ctx(kernel, instance_id, effect, now, None)
+}
+
+/// A host hook mapping one contending holder id to its workspace context.
+pub type HolderContextResolver<'a> = &'a dyn Fn(&str) -> Option<Value>;
+
+/// [`run_coordination_effect_generic`] with an optional HOLDER-CONTEXT
+/// resolver (DR-0052 S6): on a `Contended` outcome, each holder id is
+/// offered to the resolver, which may return workspace context — the
+/// holder's line, its last cut's actor (who, as which session) and
+/// intent (why) — so the `contended` arm's author can write a real
+/// policy instead of blind retry. `None` (the DO host, tests) keeps the
+/// bare outcome; the enrichment is additive fields, never a variant
+/// change.
+pub fn run_coordination_effect_generic_ctx<S: RuntimeStore + Coordination>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    now: &str,
+    holder_context: Option<HolderContextResolver<'_>>,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
     use whipplescript_store::coordination::{AcquireOutcome, ConsumeOutcome};
 
     let input = json_from_str(&effect.input_json);
@@ -1430,11 +1451,25 @@ pub fn run_coordination_effect_generic<S: RuntimeStore + Coordination>(
                             });
                         }
                     }
+                    // DR-0052 S6: the arm gets INFORMATION, not an
+                    // arbiter — who holds it, on what line, under what
+                    // intent, when the host can resolve it.
+                    let holder_details: Vec<Value> = holder_context
+                        .map(|resolve| {
+                            holders
+                                .iter()
+                                .map(|holder| {
+                                    resolve(holder).unwrap_or_else(|| json!({ "holder": holder }))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     json!({
                         "variant": "Contended",
                         "resource": resource,
                         "key": key,
                         "holders": holders,
+                        "holder_details": holder_details,
                     })
                 }
             }
@@ -2279,6 +2314,14 @@ pub enum CapabilityOutcome {
 pub trait CapabilityProvider {
     /// Produce the capability outcome for `effect` under `config`.
     fn produce(&self, effect: &ClaimableEffect, config: &EffectConfig) -> CapabilityOutcome;
+
+    /// The provider label recorded in completion summaries ("<label>
+    /// capability completed"). Defaults to `fixture` — the historical
+    /// hardcode — so existing fixture-driven records stay byte-identical;
+    /// real providers override so the record names who actually ran.
+    fn label(&self) -> &'static str {
+        "fixture"
+    }
 }
 
 /// The fixture capability provider: the behavior the capability core hardcoded
@@ -2458,6 +2501,8 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
     provider: &dyn CapabilityProvider,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input = json_from_str(&effect.input_json);
+    let completed_summary = format!("{} capability completed", provider.label());
+    let validation_summary = format!("{} capability output validation failed", provider.label());
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "capability-lease"]);
     kernel.start_run(RunStart {
@@ -2554,7 +2599,7 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                     worker_id: "whip-worker",
                     status: "failed",
                     exit_code: Some(1),
-                    summary: Some("fixture capability output validation failed"),
+                    summary: Some(&validation_summary),
                     metadata_json: &metadata_json,
                     idempotency_key: Some(&idempotency_key(&[
                         instance_id,
@@ -2567,12 +2612,12 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                 "run_id": run_id,
                 "target": effect.target,
                 "status": "failed",
-                "value": effect_failure_base("capability.call", &error, "fixture capability output validation failed", &effect.effect_id, &run_id),
+                "value": effect_failure_base("capability.call", &error, &validation_summary, &effect.effect_id, &run_id),
                 "error": {
                     "kind": "provider_output_validation",
                     "message": error,
                 },
-                "summary": "fixture capability output validation failed"
+                "summary": validation_summary
             })
             .to_string();
                 kernel.derive_fact(
@@ -2603,7 +2648,7 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
                 worker_id: "whip-worker",
                 status: "completed",
                 exit_code: Some(0),
-                summary: Some("fixture capability completed"),
+                summary: Some(&completed_summary),
                 metadata_json: &metadata_json,
                 idempotency_key: Some(&idempotency_key(&[
                     instance_id,

@@ -16,13 +16,13 @@ ARM64 with GNU libc.
 For macOS and Linux, use this command:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/GaugeWright/whipplescript/releases/latest/download/whipplescript-installer.sh | sh
 ```
 
 For Windows, use this command:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/GaugeWright/whipplescript/releases/latest/download/whipplescript-installer.ps1 | iex"
 ```
 
 To verify an archive that you downloaded manually, check the archive against its
@@ -30,8 +30,8 @@ adjacent `.sha256` file. As an alternative, check the archive against the
 `sha256.sum` file of the full release:
 
 ```sh
-curl -LO https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-x86_64-unknown-linux-gnu.tar.xz
-curl -LO https://github.com/jamesjscully/whipplescript/releases/latest/download/whipplescript-x86_64-unknown-linux-gnu.tar.xz.sha256
+curl -LO https://github.com/GaugeWright/whipplescript/releases/latest/download/whipplescript-x86_64-unknown-linux-gnu.tar.xz
+curl -LO https://github.com/GaugeWright/whipplescript/releases/latest/download/whipplescript-x86_64-unknown-linux-gnu.tar.xz.sha256
 sha256sum --check whipplescript-x86_64-unknown-linux-gnu.tar.xz.sha256
 ```
 
@@ -39,7 +39,7 @@ On macOS, the `sha256sum` command can be absent. In that condition, use
 `shasum -a 256 -c`.
 
 A Homebrew tap is planned. The commands will be
-`brew tap jamesjscully/tap && brew install whipplescript`. The project will
+`brew tap GaugeWright/tap && brew install whipplescript`. The project will
 enable the tap after the tagged releases become stable.
 
 ## From source
@@ -47,7 +47,7 @@ enable the tap after the tagged releases become stable.
 This procedure needs a Rust toolchain. Refer to <https://rustup.rs/>.
 
 ```sh
-git clone https://github.com/jamesjscully/whipplescript.git
+git clone https://github.com/GaugeWright/whipplescript.git
 cd whipplescript
 cargo install --path crates/whipplescript-cli --locked
 ```
@@ -55,7 +55,7 @@ cargo install --path crates/whipplescript-cli --locked
 As an alternative, install directly from Git:
 
 ```sh
-cargo install --git https://github.com/jamesjscully/whipplescript.git --package whipplescript --locked
+cargo install --git https://github.com/GaugeWright/whipplescript.git --package whipplescript --locked
 ```
 
 Cargo installs the binary into `~/.cargo/bin`. Make sure that this directory is

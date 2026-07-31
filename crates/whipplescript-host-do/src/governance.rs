@@ -14,8 +14,8 @@ use whipplescript_kernel::ifc::VerifiedEnvelope;
 /// The external-attestation algorithm emitted by GaugeDesk.
 pub const GAUGEDESK_ATTESTATION_ALGORITHM: &str = "p256-sha256";
 
-/// A pinned GaugeDesk governance root. The public key is SEC1-compressed and
-/// hex encoded, matching GaugeDesk's `PublicKey` wire representation.
+/// A pinned GaugeDesk governance root. The public key is the exact
+/// SEC1-encoded, hex-encoded GaugeDesk `PublicKey` wire representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GaugeDeskGovernanceRoot {
     expected_signer: String,

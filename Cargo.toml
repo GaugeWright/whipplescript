@@ -12,11 +12,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/jamesjscully/whipplescript"
-repository = "https://github.com/jamesjscully/whipplescript"
+homepage = "https://github.com/GaugeWright/whipplescript"
+repository = "https://github.com/GaugeWright/whipplescript"
 readme = "README.md"
 
 [workspace.lints.rust]

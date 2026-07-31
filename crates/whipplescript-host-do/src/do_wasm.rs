@@ -18,9 +18,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::do_store::{
-    do_load_agent_snapshot, do_mark_human_answered, do_save_agent_snapshot, SqlValue,
-};
+use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, SqlValue};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
@@ -701,6 +699,13 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
         Some("openai-codex") => CoerceProvider::OpenAi,
+        // The metered Cloudflare AI Gateway exposes the OpenAI-compatible
+        // `/compat` surface, so the wire protocol is `OpenAiCompat`. It is a
+        // distinct provider *id* rather than an alias because the id carries who
+        // pays — a gateway round spends GaugeWright's unified-billing credits,
+        // not a customer key (ADR 0085 §1). Collapsing the two here would be
+        // fine on the wire and wrong in the ledger.
+        Some("cloudflare-ai-gateway") => CoerceProvider::OpenAiCompat,
         other => return Err(format!("unknown coerce provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -743,6 +748,9 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
         Some("openai-codex") => CoerceProvider::OpenAi,
+        // Same reasoning as the coerce parser above: OpenAI-compatible on the
+        // wire, distinct as an id because the id is what says who pays.
+        Some("cloudflare-ai-gateway") => CoerceProvider::OpenAiCompat,
         other => return Err(format!("unknown agent provider: {other:?}")),
     };
     let field = |name: &str| {

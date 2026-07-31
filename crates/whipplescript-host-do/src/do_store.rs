@@ -633,7 +633,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(&completion, diagnostic.as_ref());
+        let payload = effect_completion_payload(&completion, diagnostic.as_ref())?;
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -1260,8 +1260,17 @@ fn parse_json_array(json: &str) -> StoreResult<()> {
 }
 
 /// A `SkillView` as the metadata JSON the native `skill_to_json` emits.
-fn skill_to_json(skill: &SkillView) -> Value {
-    serde_json::json!({
+/// Unreadable stored capabilities surface with the skill identity instead of
+/// silently projecting `null` (native parity, DR-0054 Phase C).
+fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
+    let required_capabilities = serde_json::from_str::<Value>(&skill.required_capabilities_json)
+        .map_err(|error| {
+            StoreError::Conflict(format!(
+                "skill `{}` ({}) has unreadable required_capabilities: {error}",
+                skill.name, skill.skill_id
+            ))
+        })?;
+    Ok(serde_json::json!({
         "skill_id": skill.skill_id,
         "name": skill.name,
         "version": skill.version,
@@ -1269,9 +1278,8 @@ fn skill_to_json(skill: &SkillView) -> Value {
         "source_path": skill.source_path,
         "content_hash": skill.content_hash,
         "description": skill.description,
-        "required_capabilities":
-            serde_json::from_str::<Value>(&skill.required_capabilities_json).unwrap_or(Value::Null),
-    })
+        "required_capabilities": required_capabilities,
+    }))
 }
 
 /// Appends an event with a per-instance monotonic sequence, returning its id +
@@ -1307,10 +1315,10 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
     let rows = sql
         .query(
             "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
-             occurred_at, source, causation_id, correlation_id, idempotency_key) VALUES \
+             occurred_at, source, causation_id, correlation_id, idempotency_key, format_version) VALUES \
              ('evt_' || lower(hex(randomblob(16))), ?1, \
              (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE instance_id = ?1), \
-             ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5, ?6, ?7) RETURNING event_id, sequence",
+             ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5, ?6, ?7, ?8) RETURNING event_id, sequence",
             &[
                 text(event.instance_id),
                 text(event.event_type),
@@ -1319,6 +1327,9 @@ fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<St
                 opt_text(event.causation_id),
                 opt_text(event.correlation_id),
                 opt_text(event.idempotency_key),
+                // DR-0054 Phase B: stamp the writer's event format (native
+                // `append_event_on` parity); legacy NULL rows read as v1.
+                int(whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION),
             ],
         )
         .map_err(|error| {
@@ -1421,11 +1432,19 @@ fn do_restore_marker_target(payload_json: &str) -> Option<i64> {
 }
 
 /// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
+/// Unreadable metadata surfaces with the run identity instead of writing `null`
+/// into the canonical event (native parity, DR-0054 Phase C).
 fn effect_completion_payload(
     completion: &EffectCompletion<'_>,
     diagnostic: Option<&TerminalDiagnosticRecord>,
-) -> String {
-    serde_json::json!({
+) -> StoreResult<String> {
+    let metadata = serde_json::from_str::<Value>(completion.metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` completion has unreadable metadata: {error}",
+            completion.effect_id, completion.run_id
+        ))
+    })?;
+    Ok(serde_json::json!({
         "effect_id": completion.effect_id,
         "run_id": completion.run_id,
         "provider": completion.provider,
@@ -1433,34 +1452,46 @@ fn effect_completion_payload(
         "status": completion.status,
         "exit_code": completion.exit_code,
         "summary": completion.summary,
-        "metadata": serde_json::from_str::<Value>(completion.metadata_json).unwrap_or(Value::Null),
-        "diagnostic": diagnostic.map(terminal_diagnostic_payload),
+        "metadata": metadata,
+        "diagnostic": diagnostic.map(terminal_diagnostic_payload).transpose()?,
     })
-    .to_string()
+    .to_string())
 }
 
 /// The nested diagnostic object in a terminal payload, mirroring
-/// `terminal_diagnostic_payload`.
-fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
-    serde_json::json!({
+/// `terminal_diagnostic_payload`. An absent span is genuinely optional; a
+/// present but unreadable span/ids field is corruption and surfaces instead of
+/// silently degrading to `null` / `[]` (native parity, DR-0054 Phase C).
+fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> StoreResult<Value> {
+    let context = |field: &str, error: serde_json::Error| {
+        StoreError::Conflict(format!(
+            "terminal diagnostic `{}` has unreadable {field}: {error}",
+            diagnostic.message
+        ))
+    };
+    Ok(serde_json::json!({
         "program_id": diagnostic.program_id,
         "program_version_id": diagnostic.program_version_id,
         "severity": diagnostic.severity.as_str(),
         "code": diagnostic.code,
         "message": diagnostic.message,
-        "source_span": diagnostic.source_span_json.as_deref()
-            .map(|span| serde_json::from_str::<Value>(span).unwrap_or(Value::Null)),
+        "source_span": diagnostic
+            .source_span_json
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|error| context("source_span", error))?,
         "subject_type": diagnostic.subject_type,
         "subject_id": diagnostic.subject_id,
         "assertion_id": diagnostic.assertion_id,
         "evidence_ids": serde_json::from_str::<Value>(&diagnostic.evidence_ids_json)
-            .unwrap_or_else(|_| serde_json::json!([])),
+            .map_err(|error| context("evidence_ids", error))?,
         "artifact_ids": serde_json::from_str::<Value>(&diagnostic.artifact_ids_json)
-            .unwrap_or_else(|_| serde_json::json!([])),
+            .map_err(|error| context("artifact_ids", error))?,
         "causation_id": diagnostic.causation_id,
         "correlation_id": diagnostic.correlation_id,
         "idempotency_key": diagnostic.idempotency_key,
-    })
+    }))
 }
 
 /// Resolves any open cancellation requests for an effect to `terminal`, mirroring
@@ -1514,23 +1545,42 @@ fn do_execution_fingerprint<Sql: DoSql>(
 }
 
 /// The `effect.run_started` event payload, mirroring `run_start_payload`.
-fn run_start_payload(run: &RunStart<'_>, metadata_json: &str) -> String {
-    serde_json::json!({
+/// Unreadable metadata surfaces with the run identity instead of recording
+/// `null` in the canonical event (native parity, DR-0054 Phase C).
+fn run_start_payload(run: &RunStart<'_>, metadata_json: &str) -> StoreResult<String> {
+    let metadata = serde_json::from_str::<Value>(metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` start has unreadable metadata: {error}",
+            run.effect_id, run.run_id
+        ))
+    })?;
+    Ok(serde_json::json!({
         "effect_id": run.effect_id,
         "run_id": run.run_id,
         "provider": run.provider,
         "worker_id": run.worker_id,
         "lease_id": run.lease_id,
         "lease_expires_at": run.lease_expires_at,
-        "metadata": serde_json::from_str::<Value>(metadata_json).unwrap_or(Value::Null),
+        "metadata": metadata,
     })
-    .to_string()
+    .to_string())
 }
 
 /// Merge the execution fingerprint into a run's metadata object, mirroring
-/// `inject_execution_fingerprint`.
-fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> String {
-    let mut value: Value = serde_json::from_str(metadata_json).unwrap_or(Value::Null);
+/// `inject_execution_fingerprint`: non-object but well-formed metadata still
+/// normalizes to an object; unreadable metadata propagates instead of being
+/// silently replaced with `{}` (native parity, DR-0054 Phase C).
+fn inject_execution_fingerprint(
+    run: &RunStart<'_>,
+    metadata_json: &str,
+    fingerprint: &str,
+) -> StoreResult<String> {
+    let mut value: Value = serde_json::from_str(metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` has unreadable metadata: {error}",
+            run.effect_id, run.run_id
+        ))
+    })?;
     if !value.is_object() {
         value = serde_json::json!({});
     }
@@ -1540,7 +1590,7 @@ fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> Strin
             Value::String(fingerprint.to_owned()),
         );
     }
-    value.to_string()
+    Ok(value.to_string())
 }
 
 /// The active `(program_version_id, revision_epoch)` for an instance, or
@@ -3905,7 +3955,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .sql
             .query(
                 &format!(
-                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence \
+                    "SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence, format_version \
                      FROM events WHERE instance_id = ?1 AND event_type IN ( \
                      'rule.committed', 'fact.derived', 'workflow.completed', 'workflow.failed', \
                      'instance.transitioned', 'workflow.revision_activated', 'effect.run_started', \
@@ -3915,6 +3965,24 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
+        // DR-0054 Phase B: fail the fold closed on an event row stamped with a
+        // format this build does not understand (native rebuild parity). Legacy
+        // NULL rows read as version 1 and pass.
+        for row in &events {
+            if let Some(version) = as_opt_i64(&row[7]) {
+                if version > whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION {
+                    return Err(StoreError::UnsupportedVersion {
+                        subject: format!(
+                            "event `{}` (instance `{instance_id}`, sequence {})",
+                            as_text(&row[0]),
+                            as_i64(&row[6])
+                        ),
+                        found: version,
+                        supported: whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION,
+                    });
+                }
+            }
+        }
         // RC-4b restore-marker fold: walk ascending; a `context.restored` marker
         // rewinds the live set to its target sequence, dropping every event a
         // later restore orphaned. With no markers present, `live` is exactly the
@@ -6058,7 +6126,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         skills.sort_by(|left, right| left.name.cmp(&right.name));
         let metadata = serde_json::json!({
             "effect_id": evidence.effect_id,
-            "skills": skills.iter().map(skill_to_json).collect::<Vec<_>>(),
+            "skills": skills.iter().map(skill_to_json).collect::<StoreResult<Vec<_>>>()?,
         })
         .to_string();
         let summary = if skills.is_empty() {
@@ -6494,8 +6562,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         }
 
         let fingerprint = do_execution_fingerprint(&self.sql, run.instance_id, run.effect_id)?;
-        let run_metadata = inject_execution_fingerprint(run.metadata_json, &fingerprint);
-        let payload = run_start_payload(&run, &run_metadata);
+        let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
+        let payload = run_start_payload(&run, &run_metadata)?;
         let event = do_append_event(
             &self.sql,
             NewEvent {
@@ -8766,7 +8834,8 @@ pub(crate) mod test_support {
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
-                source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT
+                source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT,
+                format_version INTEGER
             );
             CREATE UNIQUE INDEX events_instance_idempotency_key_idx
                 ON events(instance_id, idempotency_key)
@@ -10535,6 +10604,102 @@ mod tests {
         assert_eq!(out2.skipped, 2);
         // 1 derived + 2 imported = 3 active facts.
         assert_eq!(store.list_facts("i1").expect("facts").len(), 3);
+    }
+
+    /// DR-0054 Phase B (native parity): new event rows carry the writer's
+    /// format version; a row stamped beyond what this build supports fails the
+    /// projection fold closed with its row identity instead of misparsing.
+    #[test]
+    fn do_future_event_format_version_fails_the_fold_with_row_identity() {
+        let mut store = store();
+        let version = store
+            .create_program_version(NewProgramVersion {
+                program_name: "format-guard",
+                source_hash: "sh1",
+                ir_hash: "ih1",
+                compiler_version: "1.0",
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            })
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let event = store
+            .append_event(NewEvent {
+                instance_id: &instance.instance_id,
+                event_type: "fact.derived",
+                payload_json: r#"{"fact_id":"f1","name":"n","key":"k","value":{}}"#,
+                source: "test",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            })
+            .expect("event appends");
+
+        // The writer stamped its format on the new row.
+        let stamped = store
+            .sql
+            .query(
+                "SELECT format_version FROM events WHERE event_id = ?1",
+                &[text(&event.event_id)],
+            )
+            .expect("stamp readable");
+        assert_eq!(
+            as_opt_i64(&stamped[0][0]),
+            Some(whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION)
+        );
+
+        // A NULL (legacy) row folds fine...
+        store
+            .sql
+            .execute(
+                "UPDATE events SET format_version = NULL WHERE event_id = ?1",
+                &[text(&event.event_id)],
+            )
+            .expect("regress to legacy NULL");
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("legacy NULL rows fold as version 1");
+
+        // ...but a row from a newer format fails the fold closed with identity.
+        store
+            .sql
+            .execute(
+                "UPDATE events SET format_version = 99 WHERE event_id = ?1",
+                &[text(&event.event_id)],
+            )
+            .expect("stamp future format");
+        let error = store
+            .rebuild_projections(&instance.instance_id)
+            .expect_err("future-format row must fail the fold");
+        match &error {
+            StoreError::UnsupportedVersion {
+                subject,
+                found,
+                supported,
+            } => {
+                assert_eq!(*found, 99);
+                assert_eq!(
+                    *supported,
+                    whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION
+                );
+                assert!(
+                    subject.contains(&event.event_id) && subject.contains(&instance.instance_id),
+                    "subject carries the row identity: {subject}"
+                );
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
     }
 
     /// create_program_version upserts a program + version (idempotent on the

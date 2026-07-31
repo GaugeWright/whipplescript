@@ -21,7 +21,7 @@ review. If a number looks wrong, the agent asks you before it sends the report.
 **An assistant that keeps working.** An agent does one small useful task, then
 looks for the next one, then does that task. It runs for weeks. It remembers
 what it did last time. The core of that loop is 24 lines
-([`examples/ralph.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/ralph.whip)).
+([`examples/ralph.whip`](https://github.com/GaugeWright/whipplescript/blob/main/examples/ralph.whip)).
 
 ## What the automation does that a script cannot
 

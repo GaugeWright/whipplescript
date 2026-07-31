@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod json;
+pub mod selection;
 
 /// Implementation-stage label shown alongside the version (for project tracking;
 /// does not replace the semantic version).
@@ -124,7 +125,7 @@ pub struct ConstructGrammarClause {
 
 pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
 pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
-pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via"];
+pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto"];
 pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
 pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
 /// `declaration_block` clause value kinds (DR-0011 Shape 1, mirrors
@@ -141,7 +142,7 @@ pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
 /// `declaration_block` clause connectives: the Shape 2 slot connectives plus
 /// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
 pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
-    &["from", "for", "into", "to", "via", "by"];
+    &["from", "for", "into", "to", "via", "onto", "by"];
 
 /// The DR-0015 agent feature-class taxonomy, verbatim (spec/std-agent.md
 /// "Capability reports"). Shared vocabulary: the parser checks

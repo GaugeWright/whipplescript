@@ -21,11 +21,11 @@
 ---   observer-only: user code may eliminate an EffectError, never construct one.
 ---
 --- P3 (language-refinement DQ-2, 2026-07-21): the real v1 variants are built.
---- execK adds rExit (exit_code); coerceK adds rClass (error_class) and rStatus
---- (http_status); tellK adds rClass. invokeK narrows to the CHILD's declared
---- failure class (dynamic per program), which is beyond this fixed alphabet --
---- the checker-side rule is the same static-narrow judgment. kind is a base
---- field per resolved Q1.
+--- execK adds rExit (exit_code); coerceK adds rClass (error_class) and
+--- rStatus (http_status); tellK adds rClass. invokeK narrows to the CHILD's
+--- declared failure class (dynamic per program), which is beyond this fixed
+--- alphabet -- the checker-side rule is the same static-narrow judgment. kind
+--- is a base field per resolved Q1.
 mod WHIPPLESCRIPT-EFFECT-ERROR is
   protecting BOOL .
 

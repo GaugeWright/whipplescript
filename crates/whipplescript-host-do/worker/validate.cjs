@@ -382,7 +382,73 @@ function testCheckpointRestore() {
   console.log("PASS  checkpoint + restore reverts the DO file plane");
 }
 
+// 8) The DO schema provisions EVERY table the tracker store queries (DR-0054
+//    Phase A). `do_schema.sql` drifted from the production `do_store.rs`
+//    tracker paths — `tracker_aliases` / `tracker_comments` / `tracker_evidence`
+//    and the content-addressed `tracker_events.event_id` / `parents_json`
+//    columns existed only in the Rust test schema, so every deployed DO failed
+//    those reads. This drives the exact production SQL shapes against the
+//    bundled schema so a fresh object provably supports them.
+function testTrackerSchemaParity() {
+  const { db } = freshInstanceEnv([]);
+  // The production INSERT shapes (do_store.rs do_tracker_append_raw & co).
+  db.prepare(
+    "INSERT OR IGNORE INTO tracker_events \
+     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+     VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run("ev-root", "[]", "content-1", "issue.created", "{}", "tester", "2026-07-31 00:00:00");
+  // Dedup by event_id relies on the unique index; the same append must be a no-op.
+  const dup = db.prepare(
+    "INSERT OR IGNORE INTO tracker_events \
+     (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
+     VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run("ev-root", "[]", "content-1", "issue.created", "{}", "tester", "2026-07-31 00:00:00");
+  assert.strictEqual(Number(dup.changes), 0, "tracker_events dedups by event_id");
+  db.prepare("INSERT INTO tracker_aliases (content_id, alias) VALUES (?, ?)")
+    .run("content-1", "WS-1");
+  db.prepare(
+    "INSERT OR IGNORE INTO tracker_comments (comment_id, issue_id, author, body, created_at) \
+     VALUES (?, ?, ?, ?, ?)",
+  ).run("cm-1", "content-1", "tester", "a comment", "2026-07-31 00:00:00");
+  db.prepare(
+    "INSERT OR IGNORE INTO tracker_evidence \
+     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
+     VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run("evd-1", "content-1", "link", "https://example.test", "note", "tester", "2026-07-31 00:00:00");
+  // The production SELECT shapes.
+  assert.strictEqual(
+    db.prepare("SELECT content_id FROM tracker_aliases WHERE alias = ?").get("WS-1").content_id,
+    "content-1",
+  );
+  assert.strictEqual(
+    db.prepare(
+      "SELECT comment_id, author, body, created_at FROM tracker_comments \
+       WHERE issue_id = ? ORDER BY created_at, comment_id",
+    ).get("content-1").comment_id,
+    "cm-1",
+  );
+  assert.strictEqual(
+    db.prepare(
+      "SELECT evidence_id, kind, reference, note, added_by, created_at \
+       FROM tracker_evidence WHERE issue_id = ? ORDER BY created_at, evidence_id",
+    ).get("content-1").evidence_id,
+    "evd-1",
+  );
+  const heads = db.prepare(
+    "SELECT e.event_id FROM tracker_events e \
+     WHERE e.issue_id = ? AND e.event_id IS NOT NULL \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM tracker_events c \
+         WHERE c.issue_id = ? \
+           AND instr(c.parents_json, '\"' || e.event_id || '\"') > 0)",
+  ).all("content-1", "content-1");
+  assert.strictEqual(heads.length, 1, "head query walks event_id/parents_json");
+  assert.strictEqual(heads[0].event_id, "ev-root");
+  console.log("PASS  fresh DO schema supports every production tracker table and column");
+}
+
 testEffectFree();
+testTrackerSchemaParity();
 testCoerceSuspendResume();
 testAgentSuspendResume();
 testAgentToolCall();

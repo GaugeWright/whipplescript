@@ -174,6 +174,17 @@ pub struct CutRow {
     /// What produced the cut: `write:<path>`, `import:<scope>`,
     /// `rebase`, `merge:<branch>`, `sync:<branch>`, `restore:<cut>`.
     pub origin: Option<String>,
+    /// WHO authored the cut (DR-0052 Decision 1) — the deepest observed
+    /// principal: `s:<session>` (harness lease work-unit root),
+    /// `instance:<id>` (a run whose session carriage hasn't landed),
+    /// `human:<operator>` (CLI, OS-trust), `root` (the GaugeDesk seat),
+    /// `git:<author>` (bridge import — a CLAIM, never an observation),
+    /// `mediator` (daemon reconciliation). `None` = recorded before the
+    /// actor tier existed.
+    pub actor: Option<String>,
+    /// The motivating work item / incident id, when the recording
+    /// operation carried one (repair cuts always do).
+    pub intent: Option<String>,
     pub recorded_at: String,
 }
 
@@ -187,7 +198,33 @@ pub struct CutRecord<'a> {
     pub manifest_hash: &'a str,
     pub parent_cut_id: Option<&'a str>,
     pub origin: Option<&'a str>,
+    pub actor: Option<&'a str>,
+    pub intent: Option<&'a str>,
     pub recorded_at: &'a str,
+}
+
+/// One persisted change-unit row (DR-0052 L4): the per-path delta of
+/// one cut, indexed once — cuts are immutable and a branch's recorded
+/// cut list is append-only, so the index never invalidates. Cut-level
+/// metadata (origin/actor/intent/time) stays on the cut row and joins
+/// at read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeUnitRow {
+    pub branch_id: String,
+    /// Absolute position of the OWNING CUT in the branch's oldest-first
+    /// cut order at index time (windowed reads re-base unit seqs).
+    pub cut_seq: i64,
+    pub cut_id: String,
+    pub path: String,
+    pub before_hash: Option<String>,
+    pub after_hash: Option<String>,
+}
+
+/// The index cursor: how far a branch's cut list has been unit-indexed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeUnitCursor {
+    pub indexed_cuts: i64,
+    pub last_indexed_cut_id: Option<String>,
 }
 
 /// A branch's pointer state as one workspace operation saw it — the op
@@ -364,6 +401,28 @@ pub trait Branches {
     /// parent cut it advanced from; and what produced it. Idempotent per
     /// cut id.
     fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()>;
+
+    /// DR-0052 L4 — the change-unit index. `change_unit_cursor` reports
+    /// how far the branch's oldest-first cut list is indexed;
+    /// `append_change_unit_rows` extends the index (advancing the
+    /// cursor); `list_change_unit_rows` returns the indexed rows for the
+    /// named cuts, cut-order ascending; `reset_change_unit_index` drops
+    /// a branch's index (defensive resync only — the append-only cut
+    /// list makes it unreachable in normal operation).
+    fn change_unit_cursor(&self, branch_id: &str) -> StoreResult<ChangeUnitCursor>;
+    fn append_change_unit_rows(
+        &mut self,
+        branch_id: &str,
+        rows: &[ChangeUnitRow],
+        indexed_cuts: i64,
+        last_indexed_cut_id: Option<&str>,
+    ) -> StoreResult<()>;
+    fn list_change_unit_rows(
+        &self,
+        branch_id: &str,
+        from_cut_seq: i64,
+    ) -> StoreResult<Vec<ChangeUnitRow>>;
+    fn reset_change_unit_index(&mut self, branch_id: &str) -> StoreResult<()>;
     /// The change id a cut carries; `None` for pre-identity cuts.
     fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>>;
     /// The full recorded cut; `None` for unrecorded ids.
@@ -537,7 +596,9 @@ fn map_cut_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CutRow> {
         manifest_hash: row.get(3)?,
         parent_cut_id: row.get(4)?,
         origin: row.get(5)?,
-        recorded_at: row.get(6)?,
+        actor: row.get(6)?,
+        intent: row.get(7)?,
+        recorded_at: row.get(8)?,
     })
 }
 
@@ -644,12 +705,28 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             resolution TEXT NOT NULL,
             recorded_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS change_units (
+            branch_id TEXT NOT NULL,
+            cut_seq INTEGER NOT NULL,
+            cut_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            before_hash TEXT,
+            after_hash TEXT
+        );
+        CREATE INDEX IF NOT EXISTS change_units_branch_idx
+            ON change_units(branch_id, cut_seq);
+        CREATE TABLE IF NOT EXISTS change_unit_cursor (
+            branch_id TEXT PRIMARY KEY,
+            indexed_cuts INTEGER NOT NULL,
+            last_indexed_cut_id TEXT
+        );
         "#,
     )?;
-    // Provenance columns arrived with Phase 2; stores minted before that
-    // gain them in place (pre-migration rows read as NULL — honest
-    // "recorded before lineage existed").
-    for column in ["parent_cut_id", "origin"] {
+    // Provenance columns arrived with Phase 2, the actor tier with
+    // DR-0052; stores minted before either gain the columns in place
+    // (pre-migration rows read as NULL — honest "recorded before this
+    // provenance existed").
+    for column in ["parent_cut_id", "origin", "actor", "intent"] {
         ensure_column(connection, "cuts", column)?;
     }
     Ok(())
@@ -983,8 +1060,8 @@ impl Branches for BranchStore {
         self.connection.execute(
             "INSERT OR IGNORE INTO cuts \
              (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, \
-              origin, recorded_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              origin, actor, intent, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 cut.cut_id,
                 cut.change_id,
@@ -992,6 +1069,8 @@ impl Branches for BranchStore {
                 cut.manifest_hash,
                 cut.parent_cut_id,
                 cut.origin,
+                cut.actor,
+                cut.intent,
                 cut.recorded_at
             ],
         )?;
@@ -1010,12 +1089,101 @@ impl Branches for BranchStore {
         Ok(change)
     }
 
+    fn change_unit_cursor(&self, branch_id: &str) -> StoreResult<ChangeUnitCursor> {
+        let cursor = self
+            .connection
+            .query_row(
+                "SELECT indexed_cuts, last_indexed_cut_id FROM change_unit_cursor                  WHERE branch_id = ?1",
+                params![branch_id],
+                |row| {
+                    Ok(ChangeUnitCursor {
+                        indexed_cuts: row.get(0)?,
+                        last_indexed_cut_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(cursor.unwrap_or(ChangeUnitCursor {
+            indexed_cuts: 0,
+            last_indexed_cut_id: None,
+        }))
+    }
+
+    fn append_change_unit_rows(
+        &mut self,
+        branch_id: &str,
+        rows: &[ChangeUnitRow],
+        indexed_cuts: i64,
+        last_indexed_cut_id: Option<&str>,
+    ) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO change_units                  (branch_id, cut_seq, cut_id, path, before_hash, after_hash)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.branch_id,
+                    row.cut_seq,
+                    row.cut_id,
+                    row.path,
+                    row.before_hash,
+                    row.after_hash
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO change_unit_cursor (branch_id, indexed_cuts, last_indexed_cut_id)              VALUES (?1, ?2, ?3)              ON CONFLICT(branch_id) DO UPDATE SET indexed_cuts = ?2,              last_indexed_cut_id = ?3",
+            params![branch_id, indexed_cuts, last_indexed_cut_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn list_change_unit_rows(
+        &self,
+        branch_id: &str,
+        from_cut_seq: i64,
+    ) -> StoreResult<Vec<ChangeUnitRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash              FROM change_units WHERE branch_id = ?1 AND cut_seq >= ?2              ORDER BY cut_seq ASC, rowid ASC",
+        )?;
+        let mapped = stmt.query_map(params![branch_id, from_cut_seq], |row| {
+            Ok(ChangeUnitRow {
+                branch_id: row.get(0)?,
+                cut_seq: row.get(1)?,
+                cut_id: row.get(2)?,
+                path: row.get(3)?,
+                before_hash: row.get(4)?,
+                after_hash: row.get(5)?,
+            })
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        Ok(rows)
+    }
+
+    fn reset_change_unit_index(&mut self, branch_id: &str) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "DELETE FROM change_units WHERE branch_id = ?1",
+            params![branch_id],
+        )?;
+        tx.execute(
+            "DELETE FROM change_unit_cursor WHERE branch_id = ?1",
+            params![branch_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
         let row = self
             .connection
             .query_row(
                 "SELECT cut_id, change_id, branch_id, manifest_hash, \
-                 parent_cut_id, origin, recorded_at FROM cuts WHERE cut_id = ?1",
+                 parent_cut_id, origin, actor, intent, recorded_at \
+                 FROM cuts WHERE cut_id = ?1",
                 params![cut_id],
                 map_cut_row,
             )
@@ -1026,8 +1194,8 @@ impl Branches for BranchStore {
     fn list_cuts(&self, branch_id: &str, limit: usize) -> StoreResult<Vec<CutRow>> {
         let mut stmt = self.connection.prepare(
             "SELECT cut_id, change_id, branch_id, manifest_hash, \
-             parent_cut_id, origin, recorded_at FROM cuts \
-             WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
+             parent_cut_id, origin, actor, intent, recorded_at \
+             FROM cuts WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
         )?;
         let mapped = stmt.query_map(params![branch_id, limit as i64], map_cut_row)?;
         let mut rows = Vec::new();

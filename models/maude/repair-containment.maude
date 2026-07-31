@@ -1,0 +1,100 @@
+--- Repair containment (DR-0052 Decision 8; vw note 7.6): the governed
+--- hatch's three provable properties, with the laundering hazard as the
+--- modeled bite. Repair authority is demand-gated on MEDIATOR-OBSERVED
+--- structural stalls and scoped to the incident's DERIVED slice; agents
+--- participate through the tracker ledger (filing, raising) which is
+--- deliberately unjoined from the arming ledger. What is NOT proved is
+--- sufficiency -- a too-small slice terminates in refusal+escalation,
+--- which is the safe direction.
+---
+--- Two armers over the same ledgers. The NAIVE armer joins the ledgers:
+--- anything filed anywhere arms an incident -- so a blocked agent's own
+--- tracker item (or raise) conjures the power to undo, and repair
+--- becomes a task-completion tool (the laundering hazard). The CHECKED
+--- armer has NO rule from the tracker ledger at all: arming reads a
+--- substrate agents structurally cannot write. Application under the
+--- checked system is slice-bounded (subset, fail-closed) and terminates
+--- in exactly {attributed apply, refusal + escalation}.
+mod WHIPPLESCRIPT-REPAIR-CONTAINMENT is
+  protecting BOOL .
+
+  sorts Actor Path PSet Armer Cfg .
+  subsort Path < PSet .
+
+  ops agentA agentB humanH : -> Actor [ctor] .
+  ops pa pb pc : -> Path [ctor] .
+  ops naiveArm checkedArm : -> Armer [ctor] .
+
+  op mtP : -> PSet [ctor] .
+  op _;_ : PSet PSet -> PSet [ctor assoc comm id: mtP] .
+  eq [pset-idem] : P:Path ; P:Path = P:Path .
+
+  op pMember : Path PSet -> Bool .
+  eq pMember(P:Path, (P:Path ; PS:PSet)) = true .
+  eq pMember(P:Path, PS:PSet) = false [owise] .
+
+  op subset : PSet PSet -> Bool .
+  eq subset(mtP, PS:PSet) = true .
+  eq subset((P:Path ; QS:PSet), PS:PSet) =
+    pMember(P:Path, PS:PSet) and subset(QS:PSet, PS:PSet) .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The tracker ledger (agent-writable participation): a filed item or
+  --- a raise, each CARRYING the slice its author wants repaired -- the
+  --- laundering payload.
+  op trackerItem : Actor PSet -> Cfg [ctor] .
+  op raiseItem : Actor Actor PSet -> Cfg [ctor] .
+  --- The arming ledger (mediator-observed only): a structural stall
+  --- over its derived slice.
+  op stallFact : PSet -> Cfg [ctor] .
+
+  op armer : Armer -> Cfg [ctor] .
+  op incident : PSet -> Cfg [ctor] .        --- armed; slice is DERIVED
+  op repairReq : Actor PSet -> Cfg [ctor] . --- who wants to repair what
+  op applied : Actor PSet -> Cfg [ctor] .   --- the attributed repair cut
+  op refused : Actor -> Cfg [ctor] .
+  op escalated : -> Cfg [ctor] .
+
+  vars A B : Actor .
+  vars PS QS : PSet .
+  var K : Armer .
+
+  --- Both systems arm from the mediator's ledger: a stall IS the
+  --- situation, and its derived slice is the incident's extent.
+  rl [arm-stall] :
+      armer(K) stallFact(PS)
+      => armer(K) incident(PS) .
+
+  --- The NAIVE armer joins the ledgers -- the modeled hazard. A blocked
+  --- agent files (or raises) naming the slice that blocks it, and the
+  --- filing itself arms an incident over exactly that slice.
+  rl [naive-arm-tracker] :
+      armer(naiveArm) trackerItem(A, PS)
+      => armer(naiveArm) incident(PS) .
+  rl [naive-arm-raise] :
+      armer(naiveArm) raiseItem(A, B, PS)
+      => armer(naiveArm) incident(PS) .
+
+  --- The CHECKED armer has no tracker-ledger rule at all: self-arming is
+  --- unreachable by rule absence, and the searches verify it.
+
+  --- Checked application: within the derived slice, apply -- attributed,
+  --- consuming the incident (a landed repair closes it). Outside it,
+  --- refuse and escalate, incident intact; there is no third rule, so
+  --- no third outcome exists to reach.
+  crl [checked-apply] :
+      armer(checkedArm) incident(PS) repairReq(A, QS)
+      => armer(checkedArm) applied(A, QS)
+      if subset(QS, PS) = true .
+  crl [checked-refuse] :
+      armer(checkedArm) incident(PS) repairReq(A, QS)
+      => armer(checkedArm) incident(PS) refused(A) escalated
+      if subset(QS, PS) = false .
+
+  --- Naive application ignores the slice: whatever was requested lands.
+  rl [naive-apply] :
+      armer(naiveArm) incident(PS) repairReq(A, QS)
+      => armer(naiveArm) applied(A, QS) .
+endm

@@ -215,14 +215,20 @@ impl ImproveStore {
             )
             .map_err(StoreError::from)?;
         // Idempotent widening for stores created before mark-pinned
-        // scenarios (the ensure-* pattern): ALTER fails harmlessly when the
-        // column already exists.
+        // scenarios (the ensure-* pattern). Only the expected duplicate-column
+        // refusal is ignored; any other failure (locked database, corrupt
+        // file, ...) would leave the store silently narrower than the code
+        // assumes, so it propagates (DR-0054 Phase A).
         for alter in [
             "ALTER TABLE scenarios ADD COLUMN mark TEXT",
             "ALTER TABLE scenarios ADD COLUMN cut_sequence INTEGER",
             "ALTER TABLE scenarios ADD COLUMN store_path TEXT",
         ] {
-            let _ = connection.execute(alter, []);
+            if let Err(error) = connection.execute(alter, []) {
+                if !error.to_string().contains("duplicate column name") {
+                    return Err(StoreError::from(error));
+                }
+            }
         }
         Ok(Self { connection })
     }
@@ -302,9 +308,19 @@ impl ImproveStore {
         let mut statement = self.connection.prepare(&sql).map_err(StoreError::from)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(binds), |row| {
+                let evidence_id: i64 = row.get(0)?;
                 let tags_json: String = row.get(13)?;
+                // Unreadable tags surface with the row identity rather than
+                // silently reading as "no tags" (DR-0054 Phase A).
+                let tags = serde_json::from_str(&tags_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        format!("evidence row {evidence_id} has unreadable tags: {error}").into(),
+                    )
+                })?;
                 Ok(EvidenceRow {
-                    evidence_id: row.get(0)?,
+                    evidence_id,
                     gauge: row.get(1)?,
                     score: row.get(2)?,
                     passed: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
@@ -317,7 +333,7 @@ impl ImproveStore {
                     campaign_id: row.get(10)?,
                     candidate_id: row.get(11)?,
                     cost_micros: row.get(12)?,
-                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    tags,
                     created_at: row.get(14)?,
                 })
             })
@@ -646,12 +662,26 @@ fn scenario_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScenarioRow> {
 
 #[cfg(feature = "native")]
 fn campaign_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CampaignEventRow> {
+    let campaign_id: String = row.get(0)?;
+    let seq: i64 = row.get(1)?;
     let payload_json: String = row.get(3)?;
+    // A payload this build cannot parse (for example one written by a newer
+    // encoder) surfaces with its row identity instead of silently folding as
+    // `Null`, which would corrupt every summary derived from it (DR-0054
+    // Phase A). Callers collect rows as `Result`, so the error propagates.
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("campaign {campaign_id} event seq {seq} has an unreadable payload: {error}")
+                .into(),
+        )
+    })?;
     Ok(CampaignEventRow {
-        campaign_id: row.get(0)?,
-        seq: row.get(1)?,
+        campaign_id,
+        seq,
         event_type: row.get(2)?,
-        payload: serde_json::from_str(&payload_json).unwrap_or(Value::Null),
+        payload,
         created_at: row.get(4)?,
     })
 }
@@ -807,5 +837,79 @@ mod tests {
         let events = store.list_campaign_events(&id).expect("events");
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].event_type, "campaign.opened");
+    }
+
+    #[test]
+    fn unreadable_campaign_payload_surfaces_row_identity() {
+        let mut store = ImproveStore::open_in_memory().expect("open");
+        let id = store.open_campaign(&json!({})).expect("open campaign");
+        store
+            .connection
+            .execute(
+                "UPDATE campaign_events SET payload_json = 'not json' WHERE campaign_id = ?1",
+                params![id],
+            )
+            .expect("plant an unreadable payload");
+        let error = store
+            .list_campaign_events(&id)
+            .expect_err("an unreadable payload must surface, not fold as Null");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("campaign C-1 event seq 1"),
+            "diagnostic must carry the row identity: {rendered}"
+        );
+        assert!(
+            rendered.contains("unreadable payload"),
+            "diagnostic must name the failure: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unreadable_evidence_tags_surface_row_identity() {
+        let mut store = ImproveStore::open_in_memory().expect("open");
+        store
+            .record_evidence(NewEvidence {
+                gauge: "g",
+                score: 1.0,
+                execution_mode: "live",
+                scorer: "builtin",
+                ..Default::default()
+            })
+            .expect("record");
+        store
+            .connection
+            .execute("UPDATE evidence_rows SET tags_json = '{'", [])
+            .expect("plant unreadable tags");
+        let error = store
+            .list_evidence(None, None, None, None)
+            .expect_err("unreadable tags must surface, not read as empty");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("evidence row 1"),
+            "diagnostic must carry the row identity: {rendered}"
+        );
+        assert!(
+            rendered.contains("unreadable tags"),
+            "diagnostic must name the failure: {rendered}"
+        );
+    }
+
+    #[test]
+    fn reopening_a_store_tolerates_only_the_duplicate_column_widening() {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-improve-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("improve.sqlite");
+        drop(ImproveStore::open(&path).expect("first open widens a fresh store"));
+        // Second open re-runs the widening ALTERs against existing columns;
+        // only the duplicate-column refusal is tolerated.
+        drop(ImproveStore::open(&path).expect("reopen ignores duplicate columns"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

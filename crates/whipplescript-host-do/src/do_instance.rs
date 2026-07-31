@@ -28,10 +28,10 @@ use whipplescript_kernel::context_assembly::{
 };
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
-    run_capability_effect_generic, run_coordination_effect_generic, run_event_effect_generic,
-    run_file_effect_generic, run_file_export_effect_generic, run_file_import_effect_generic,
-    run_file_write_effect_generic, run_notify_effect_generic, run_queue_effect_generic,
-    CapabilityContract, DeliveryGovernance, FixtureCapabilityProvider,
+    run_capability_effect_generic, run_event_effect_generic, run_file_effect_generic,
+    run_file_export_effect_generic, run_file_import_effect_generic, run_file_write_effect_generic,
+    run_notify_effect_generic, run_queue_effect_generic, CapabilityContract, DeliveryGovernance,
+    FixtureCapabilityProvider,
 };
 use whipplescript_kernel::exec_http::{
     build_executor_exec_request, decode_cached_exec_result, exec_content_key, ingest_exec_stdout,
@@ -430,7 +430,43 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     })
                     .transpose()?
                     .flatten();
-                if bound.as_deref() == Some("memory-provider") {
+                if matches!(
+                    effect.target.as_deref(),
+                    Some("vcs.undo") | Some("vcs.transport")
+                ) {
+                    // std.vcs selective verbs on the DO (DR-0052 R4):
+                    // the instance's own bound line, DO branch tables.
+                    let provider = crate::do_workstreams::DoVcsSelectiveCapabilityProvider {
+                        sql: self.kernel.store().sql.clone(),
+                        instance_id: self.instance_id.to_owned(),
+                    };
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &provider,
+                    )?
+                } else if effect.target.as_deref() == Some("vcs.promote") {
+                    // std.vcs promote on the DO (DR-0052 DO-parity): the
+                    // boundary hop over the DO's own branch/workstream
+                    // tables. No adoption lease — the DO is single-writer
+                    // per object, so the mediator's serialization is
+                    // literal; a lease would guard a writer that cannot
+                    // exist.
+                    let provider = crate::do_workstreams::DoVcsPromoteCapabilityProvider {
+                        sql: self.kernel.store().sql.clone(),
+                    };
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &provider,
+                    )?
+                } else if bound.as_deref() == Some("memory-provider") {
                     let provider = crate::do_memory::DoMemoryCapabilityProvider {
                         sql: self.kernel.store().sql.clone(),
                     };
@@ -465,6 +501,16 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             "agent.tell" if self.turn.is_some() => {
                 let cfg = self.turn.expect("guarded by arm pattern");
                 let input = json_from_str(&effect.input_json);
+                // Stream homing (DR-0052, DO parity): idempotent, so every
+                // round may pass through; a contradictory topology fails
+                // the turn here, exactly as the native setup seam does.
+                crate::do_workstreams::home_do_turn_branch(
+                    &self.kernel.store().sql.clone(),
+                    self.ir,
+                    self.instance_id,
+                    effect.target.as_deref().unwrap_or_default(),
+                    &input,
+                )?;
                 let prompt = agent_prompt(&input)?;
                 // Fail closed before any provider work: a grant this placement
                 // cannot honor must stop the turn, not shrink it silently.
@@ -599,6 +645,13 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     )
                 })?;
                 let input = json_from_str(&effect.input_json);
+                crate::do_workstreams::home_do_turn_branch(
+                    &self.kernel.store().sql.clone(),
+                    self.ir,
+                    self.instance_id,
+                    effect.target.as_deref().unwrap_or_default(),
+                    &input,
+                )?;
                 let prompt = agent_prompt(&input)?;
                 // Fail closed before any provider work: a grant this placement
                 // cannot honor must stop the turn, not shrink it silently.
@@ -1089,7 +1142,30 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
             | "counter.consume" => {
                 // The DO worker uses wall-clock time for the bounded-wait deadline;
                 // deterministic-clock injection is a native/scenario concern.
-                run_coordination_effect_generic(&mut self.kernel, self.instance_id, effect, "now")?
+                // DR-0052 S6 (DO parity): resolve each contending holder's
+                // workspace context — its line and the line's newest cut's
+                // actor/intent — through the DO branch tables, exactly as
+                // the native CLI does.
+                let holder_sql = self.kernel.store().sql.clone();
+                let holder_context = move |holder: &str| -> Option<serde_json::Value> {
+                    let branches = crate::do_branches::DoBranches::new(holder_sql.clone()).ok()?;
+                    use whipplescript_store::branches::Branches;
+                    let branch_id = branches.instance_branch(holder).ok().flatten()?;
+                    let last = branches.list_cuts(&branch_id, 50).ok()?.into_iter().next();
+                    Some(serde_json::json!({
+                        "holder": holder,
+                        "branch": branch_id,
+                        "by": last.as_ref().and_then(|cut| cut.actor.clone()),
+                        "intent": last.as_ref().and_then(|cut| cut.intent.clone()),
+                    }))
+                };
+                whipplescript_kernel::effect_handlers::run_coordination_effect_generic_ctx(
+                    &mut self.kernel,
+                    self.instance_id,
+                    effect,
+                    "now",
+                    Some(&holder_context),
+                )?
             }
             "file.read" => {
                 run_file_effect_generic(&mut self.kernel, self.files, self.instance_id, effect)?

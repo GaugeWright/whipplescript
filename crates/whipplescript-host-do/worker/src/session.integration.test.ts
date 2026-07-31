@@ -13,6 +13,15 @@ const SIGNED_ENVELOPE =
   "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"envelope_hash\":\"95aa6b54f92aed0a47c8733b848b1e25b45c5eac81b63aa394125f4064d0e1b5\",\"key_id\":\"031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e\",\"signature\":\"c5897c642972e55b03b224cac5a8fcd70ab4859b90252d1f324e401e2ad13650175c38dbbe027a3906b94cd7e7b3db6d42f97bd46de98732bf77beae9bfc5b6b\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 
+// The collection recipient the cross-language vector is addressed to. A test
+// keypair with no production standing: the private half is here precisely so the
+// captured vector can be opened, and the sealer never sees it — the DO is handed
+// the public half alone, exactly as a tenant's release declares it.
+const COLLECTION_RECIPIENT_PRIVATE_SEED_HEX =
+  "624b847dff874876d18980a7d12c116f4848421302e09569efb3fa62cca47b85";
+const COLLECTION_RECIPIENT_PUBLIC_KEY_HEX =
+  "04e98c4b5e749038c87fb11e238ea748e0e7b3c952d91e909dbf22084afe86fc4d28dbedee9b3449323fdf6ebaa02810666ed917e4a6dc0b70725bcbff0438d1a0";
+
 type TestEnv = {
   WORKFLOW_INSTANCE: DurableObjectNamespace;
   SESSION_ADMISSION: DurableObjectNamespace;
@@ -671,14 +680,15 @@ describe("real WorkflowInstance hibernation", () => {
   });
 
 
-  it("emits only declared paths, seals to the admitted recipient, and deposits once", async () => {
+  it("emits only declared paths, seals to the admitted recipient, and deposits once", async ({
+    task,
+  }) => {
     const sessionId = "session-collection";
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName(sessionId));
-    // The committed cross-language vector's recipient, so the Rust opener in
-    // gaugedesk can decrypt what this session produces.
-    const recipient =
-      "04e98c4b5e749038c87fb11e238ea748e0e7b3c952d91e909dbf22084afe86fc4d28dbedee9b3449323fdf6ebaa02810666ed917e4a6dc0b70725bcbff0438d1a0";
+    // The cross-language vector's recipient, so the Rust opener in gaugedesk can
+    // decrypt what this session produces.
+    const recipient = COLLECTION_RECIPIENT_PUBLIC_KEY_HEX;
     await bootstrapSession(stub, sessionId, false, {
       exportable_paths: ["responses.json"],
       transcript_eligible: false,
@@ -742,6 +752,36 @@ describe("real WorkflowInstance hibernation", () => {
     expect((artifact.wraps as { recipient_public_key: string }[])[0]
       .recipient_public_key).toBe(recipient);
 
+    // Canonical byte assembly, pinned here rather than inferred: `byte_len` is
+    // the length of the artifact the DO built, and the DO built it from this
+    // envelope and exactly this selected workspace. A reordering or a whitespace
+    // change in `canonicalArtifact` moves this number.
+    const workspace = { "responses.json": '{"q1":"collected"}' };
+    const plaintext = JSON.stringify({
+      envelope: artifact.envelope,
+      workspace,
+    });
+    expect(artifact.byte_len).toBe(
+      new TextEncoder().encode(plaintext).byteLength,
+    );
+
+    // Hand the emitted artifact to the Node side so `capture:collection-vector`
+    // can commit it as the cross-language vector. This is what makes the vector
+    // a *DO-produced* one (COLLECT-15): the previous vector came from calling
+    // `sealArtifact` directly, which never exercised selection, canonical
+    // assembly, the size bound, or the deposit path.
+    task.meta.collectionVector = {
+      note:
+        "Produced by emitCollection in the Durable Object under workerd; " +
+        "regenerate with `npm run capture:collection-vector` in " +
+        "crates/whipplescript-host-do/worker. Rust must open it.",
+      admission_scope: "theory-a-test",
+      recipient_private_seed_hex: COLLECTION_RECIPIENT_PRIVATE_SEED_HEX,
+      recipient_public_key_hex: recipient,
+      expected_plaintext: plaintext,
+      sealed: artifact,
+    };
+
     // The session reached terminal only because the collection settled.
     const lifecycle = await runInDurableObject(stub, async (_i, state) =>
       (
@@ -751,6 +791,64 @@ describe("real WorkflowInstance hibernation", () => {
       ).map((row) => JSON.parse(row.event_json).type as string),
     );
     expect(lifecycle).toContain("collectionSettled");
+    expect(lifecycle[lifecycle.length - 1]).toBe("tornDown");
+  });
+
+  it("refuses an oversized artifact definitively and deposits nothing", async () => {
+    const sessionId = "session-collection-oversize";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, false, {
+      exportable_paths: ["responses.json"],
+      transcript_eligible: false,
+      schema_ref: "survey.v1",
+      recipient_class: "collection:tenant",
+      max_artifact_bytes: 512,
+      recipient_public_keys: [COLLECTION_RECIPIENT_PUBLIC_KEY_HEX],
+    });
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      state.storage.sql.exec(
+        "INSERT OR REPLACE INTO files (key, content) VALUES (?1, ?2)",
+        `${String(session!.instance_ref)}/responses.json`,
+        "x".repeat(4096),
+      );
+      await state.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const deployment = deployments.get(
+      deployments.idFromName("theory-a-test"),
+    );
+    const deposits = await runInDurableObject(deployment, async (_i, state) =>
+      state.storage.get<number>(`operation:${sessionId}:deposit`),
+    );
+    // The bound is checked before sealing, so an oversized artifact never
+    // reaches a recipient key and never reaches the embedder at all.
+    expect(deposits).toBeUndefined();
+
+    // Asserted on the lifecycle log rather than on `public_session_events`: the
+    // narrated `collection_failed` reason is payload-adjacent and teardown
+    // erases it with the rest, while the fold's own record is what survives.
+    const lifecycle = await runInDurableObject(stub, async (_i, state) =>
+      (
+        state.storage.sql
+          .exec("SELECT event_json FROM session_lifecycle_events ORDER BY sequence")
+          .toArray() as { event_json: string }[]
+      ).map((row) => JSON.parse(row.event_json).type as string),
+    );
+    // Definitive, not transient: a larger artifact will not shrink on retry, so
+    // the session reaches terminal instead of retrying on every lease alarm.
+    expect(lifecycle).toContain("collectionFailed");
+    expect(lifecycle).not.toContain("collectionSettled");
     expect(lifecycle[lifecycle.length - 1]).toBe("tornDown");
   });
 
@@ -828,6 +926,346 @@ describe("real WorkflowInstance hibernation", () => {
         ),
       ),
     ).toBe(1);
+  });
+
+  it("schedules the retention alarm at bootstrap so expiry needs no visitor", async () => {
+    // Every other retention test collapses the TTLs and calls
+    // `runDurableObjectAlarm` by hand, which proves what the handler does once
+    // it runs and says nothing about whether anything ever runs it. In
+    // production nothing did: sessions sat past their absolute deadline,
+    // unexpired, and a declared collection stayed pending forever because the
+    // only path that emits it is the alarm.
+    const sessionId = "session-alarm-scheduled";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    const before = Date.now();
+    await bootstrapSession(stub, sessionId);
+
+    const scheduled = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.getAlarm(),
+    );
+    expect(scheduled, "bootstrap must arm the retention alarm").not.toBeNull();
+    // `bootstrapSession` declares idle 3600s / absolute 86400s, so the idle
+    // bound is the earlier one and the deadline is openedAt + 3600s.
+    const idleMs = 3600 * 1000;
+    expect(scheduled!).toBeGreaterThanOrEqual(before + idleMs);
+    expect(scheduled!).toBeLessThanOrEqual(Date.now() + idleMs);
+  });
+
+  it("keeps the retention alarm armed after a turn drives the instance", async () => {
+    // The defect this pins: the object has one alarm and two schedulers for it.
+    // Driving the instance used to `deleteAlarm()` whenever it parked with
+    // nothing due, and driving is the last thing a turn does — so every turn
+    // disarmed retention. Sessions that ran a turn never expired, and because
+    // the expiry alarm is the only path that emits a declared collection, the
+    // drain stayed empty forever while everything else looked healthy.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          [
+            'data: {"type":"response.output_text.delta","delta":"ok"}',
+            "",
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":2},"output_tokens":1}}}',
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+    );
+
+    const sessionId = "session-alarm-survives-turn";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const armedAtBootstrap = await runInDurableObject(
+      stub,
+      async (_instance, state) => state.storage.getAlarm(),
+    );
+    expect(armedAtBootstrap).not.toBeNull();
+
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
+    socket.send(
+      JSON.stringify({
+        type: "send_message",
+        request_id: "turn-alarm-1",
+        text: "hello",
+      }),
+    );
+    for (let index = 0; index < 80; index += 1) {
+      const message = await nextMessage(socket);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    const armedAfterTurn = await runInDurableObject(
+      stub,
+      async (_instance, state) => state.storage.getAlarm(),
+    );
+    expect(
+      armedAfterTurn,
+      "a turn must not disarm the session's retention deadline",
+    ).not.toBeNull();
+  });
+
+  it("normalizes a legacy session record and backfills its lifecycle (DR-0054)", async () => {
+    // The pre-DR-0049 shape: a session record without `retention`/`principal`
+    // and no lifecycle log. Reading it used to throw a raw TypeError (killing
+    // `alarm()` permanently), and the empty log folded to `init`, which
+    // refuses deadline observations — an immortal session.
+    const sessionId = "session-legacy-shape";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM session_lifecycle_events");
+      const session = (await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      ))!;
+      delete session.retention;
+      delete session.principal;
+      await state.storage.put("public-session-state", session);
+    });
+
+    const response = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(response.status, await response.clone().text()).toBe(200);
+
+    // The read normalized the record (compat defaults, nothing deleted) and
+    // backfilled the lifecycle log so a retention deadline now exists.
+    await runInDurableObject(stub, async (_instance, state) => {
+      const events = (
+        state.storage.sql
+          .exec("SELECT event_json FROM session_lifecycle_events ORDER BY sequence")
+          .toArray() as { event_json: string }[]
+      ).map((row) => JSON.parse(row.event_json) as { type: string });
+      expect(events.map((event) => event.type)).toEqual(
+        expect.arrayContaining(["opened", "activated"]),
+      );
+      expect(await state.storage.get("public-session-state")).toBeDefined();
+    });
+  });
+
+  it("expires a pre-lifecycle session through the governed path (DR-0054)", async () => {
+    const sessionId = "session-legacy-expiry";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      // Regress to a legacy object whose recorded bounds have long passed.
+      state.storage.sql.exec("DELETE FROM session_lifecycle_events");
+      const session = (await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      ))!;
+      await state.storage.put("public-session-state", {
+        ...session,
+        created_at_unix_ms: Date.now() - 60_000,
+        last_activity_unix_ms: Date.now() - 60_000,
+        retention: { idle_ttl_seconds: 1, absolute_ttl_seconds: 1 },
+      });
+    });
+
+    // The alarm backfills the log from the record's own attested times, folds
+    // the deadline observation, and tears the session down — the legacy
+    // session is expirable, not immortal.
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const remaining = await durableStringValues(stub);
+    expect(remaining.some((value) => value.includes('"tornDown"'))).toBe(true);
+    const state = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(state.status, await state.clone().text()).toBe(409);
+  });
+
+  it("fails closed on an unknown lifecycle event without erasing anything (DR-0054)", async () => {
+    // The rollback shape: a newer worker appended an event this build does not
+    // know. The fold used to reduce it to `undefined` and poison every state
+    // after it; now readers refuse with a diagnosable error, the alarm keeps
+    // retrying instead of dying, and nothing is deleted.
+    const sessionId = "session-unknown-event";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO session_lifecycle_events (event_json) VALUES (?1)",
+        JSON.stringify({ type: "leaseExtended", atMs: Date.now() }),
+      );
+    });
+
+    const response = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(response.status).toBe(500);
+    expect(await response.text()).toContain("leaseExtended");
+
+    // The alarm handler survives, re-arms itself, and deletes nothing.
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(await state.storage.get("public-session-state")).toBeDefined();
+      expect(await state.storage.getAlarm()).not.toBeNull();
+      const log = state.storage.sql
+        .exec("SELECT count(*) AS total FROM session_lifecycle_events")
+        .toArray() as { total: number }[];
+      expect(log[0].total).toBeGreaterThan(0);
+    });
+  });
+
+  it("tombstones the instance projections coherently at expiry (DR-0054)", async () => {
+    const sessionId = "session-tombstone-coherence";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql
+        .exec("SELECT status FROM instances")
+        .toArray() as { status: string }[];
+      expect(rows.length).toBeGreaterThan(0);
+      const session = await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      await state.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      // Canonical events/facts are tombstoned...
+      const events = state.storage.sql
+        .exec("SELECT count(*) AS total FROM events")
+        .toArray() as { total: number }[];
+      expect(events[0].total).toBe(0);
+      // ...and no projection row still claims to be live: a rebuild cannot
+      // fold zero events over a "running" instance.
+      for (const [table, live] of [
+        ["instances", "'running'"],
+        ["effects", "'queued', 'running'"],
+        ["runs", "'running'"],
+      ] as const) {
+        const rows = state.storage.sql
+          .exec(`SELECT count(*) AS total FROM ${table} WHERE status IN (${live})`)
+          .toArray() as { total: number }[];
+        expect(rows[0].total, `${table} must hold no live rows`).toBe(0);
+      }
+      const tombstoned = state.storage.sql
+        .exec("SELECT count(*) AS total FROM instances WHERE status = 'tombstoned'")
+        .toArray() as { total: number }[];
+      expect(tombstoned[0].total).toBeGreaterThan(0);
+      // The explicit audit marker survives in the retained diagnostics table.
+      const marker = state.storage.sql
+        .exec(
+          "SELECT count(*) AS total FROM diagnostics WHERE code = 'session.tombstoned'",
+        )
+        .toArray() as { total: number }[];
+      expect(marker[0].total).toBe(1);
+    });
+  });
+
+  it("lazily provisions the tracker tables on an existing object (DR-0054)", async () => {
+    // A deployed object was created before `tracker_aliases` /
+    // `tracker_comments` / `tracker_evidence` and the content-addressed
+    // `tracker_events` columns existed, and the first-touch schema never
+    // revisits an existing object — production tracker reads failed on it.
+    const sessionId = "session-tracker-upgrade";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      // Regress the object to the pre-ADR-0002 tracker shape.
+      state.storage.sql.exec("DROP INDEX idx_tracker_events_id");
+      state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN event_id");
+      state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN parents_json");
+      state.storage.sql.exec("DROP TABLE tracker_aliases");
+      state.storage.sql.exec("DROP TABLE tracker_comments");
+      state.storage.sql.exec("DROP TABLE tracker_evidence");
+    });
+
+    // Any entry that touches the schema upgrades the object in place.
+    const response = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(response.status, await response.clone().text()).toBe(200);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      for (const table of [
+        "tracker_aliases",
+        "tracker_comments",
+        "tracker_evidence",
+      ]) {
+        const present = state.storage.sql
+          .exec(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            table,
+          )
+          .toArray();
+        expect(present.length, `${table} must exist after upgrade`).toBe(1);
+      }
+      // The content-addressed columns and their dedup index are back too:
+      // the production append shape works, and repeating it is a no-op.
+      const insert = () =>
+        state.storage.sql.exec(
+          `INSERT OR IGNORE INTO tracker_events
+             (event_id, parents_json, issue_id, kind, payload_json, actor, created_at)
+           VALUES ('ev-upgrade', '[]', 'content-1', 'issue.created', '{}', 'tester', '2026-07-31')`,
+        );
+      insert();
+      insert();
+      const appended = state.storage.sql
+        .exec(
+          "SELECT count(*) AS total FROM tracker_events WHERE event_id = 'ev-upgrade'",
+        )
+        .toArray() as { total: number }[];
+      expect(appended[0].total, "the unique event_id index dedups appends").toBe(1);
+      state.storage.sql.exec(
+        "INSERT INTO tracker_aliases (content_id, alias) VALUES ('content-1', 'WS-1')",
+      );
+      const alias = state.storage.sql
+        .exec("SELECT content_id FROM tracker_aliases WHERE alias = 'WS-1'")
+        .toArray() as { content_id: string }[];
+      expect(alias[0].content_id).toBe("content-1");
+    });
+  });
+
+  it("refuses to serve an object stamped by a newer deploy (DR-0054 Phase B)", async () => {
+    // A rolled-back worker attached to an object whose schema_migrations is
+    // stamped past what it knows must fail closed — a structured 500 naming
+    // both versions — instead of misreading (or lazily "upgrading") a layout
+    // it has never seen. Nothing is deleted: the newer deploy serves it again.
+    const sessionId = "session-schema-downgrade";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO schema_migrations (version, name) VALUES (99, 'from-the-future')",
+      );
+    });
+
+    const response = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(response.status).toBe(500);
+    const body = await response.text();
+    expect(body).toContain("version 99");
+    expect(body).toContain("version 1");
+    expect(body).toContain("do not delete");
+
+    // The refusal mutated nothing: the future stamp (and the object's state)
+    // survive intact for the deploy that understands them.
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql
+        .exec("SELECT MAX(version) AS version FROM schema_migrations")
+        .toArray() as { version: number }[];
+      expect(rows[0].version).toBe(99);
+    });
   });
 
   it("keeps session state, events, and sockets isolated by object identity", async () => {

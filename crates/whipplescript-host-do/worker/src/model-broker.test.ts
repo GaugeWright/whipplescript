@@ -5,6 +5,7 @@ import {
   MODEL_AUTH_SENTINEL,
   MODEL_EGRESS_PROTOCOL,
   MODEL_EGRESS_STREAM_PROTOCOL,
+  performManagedGatewayFetch,
   performModelBrokerFetch,
   stripSentinelAuthentication,
 } from "./model-broker.ts";
@@ -378,7 +379,33 @@ test("broker configuration and protocol failures are fail-closed", async () => {
   );
   await assert.rejects(
     performModelBrokerFetch(request, binding, { url: "https://broker.example" }),
-    /token is unavailable/,
+    /authorization is unavailable/,
+  );
+  await performModelBrokerFetch(
+    request,
+    binding,
+    {
+      url: "https://home.example/internal/model-egress",
+      executionGrant: "signed-grant",
+      executionSignature: "signed-signature",
+    },
+    async (_url, init) => {
+      const headers = new Headers(init.headers);
+      assert.equal(headers.get("authorization"), null);
+      assert.equal(
+        headers.get("x-gaugewright-execution-grant"),
+        "signed-grant",
+      );
+      assert.equal(
+        headers.get("x-gaugewright-execution-signature"),
+        "signed-signature",
+      );
+      return Response.json({
+        protocol: "whipplescript.model-egress.v1",
+        status: 200,
+        body: {},
+      });
+    },
   );
   await assert.rejects(
     performModelBrokerFetch(
@@ -389,4 +416,194 @@ test("broker configuration and protocol failures are fail-closed", async () => {
     ),
     /wrong protocol/,
   );
+});
+
+// ---- managed gateway funding (ADR 0085 §3/§6, FUND-1) --------------------
+
+const gatewayBinding = {
+  credential_id: "gaugedesk:managed-plan:v1:74656e616e74:73747269706500",
+  credential_class: "managed-openai",
+  provider: "cloudflare-ai-gateway" as const,
+  model: "openai/gpt-4.1",
+  base_url:
+    "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/compat",
+};
+
+// `token` is required rather than defaulted: passing `undefined` to a defaulted
+// parameter silently uses the default, which made the no-token case pass while
+// actually running with a token.
+function gatewayRound(
+  fetcher: (url: string, init: RequestInit) => Promise<Response>,
+  token: string | undefined,
+) {
+  return performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [
+        ["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`],
+        ["content-type", "application/json"],
+      ],
+      body: { model: gatewayBinding.model, stream: false },
+    },
+    gatewayBinding,
+    { token: () => token },
+    fetcher,
+  );
+}
+
+test("a managed round spends the gateway token and no customer credential", async () => {
+  let capturedAuthorization = "";
+  let capturedUrl = "";
+  await gatewayRound(async (url, init) => {
+    capturedUrl = url;
+    capturedAuthorization = new Headers(init.headers).get("authorization") ?? "";
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }, "cf-gateway-token");
+  // The gateway's own token, as a Bearer — this is what makes Cloudflare bill
+  // the service's unified-billing credits rather than a provider account.
+  assert.equal(capturedAuthorization, "Bearer cf-gateway-token");
+  // And the sentinel never survives to the wire.
+  assert.ok(!capturedAuthorization.includes(MODEL_AUTH_SENTINEL));
+  assert.equal(capturedUrl, `${gatewayBinding.base_url}/chat/completions`);
+});
+
+test("a managed gateway round publishes chat-completion text deltas", async () => {
+  const deltas: string[] = [];
+  const encoder = new TextEncoder();
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: gatewayBinding.model, stream: true },
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"content":"con"}}]}\n\n',
+        ));
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"index":0,"delta":{"content":"firmed"}}]}\n\n',
+        ));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } }),
+    (delta) => deltas.push(delta),
+  );
+  assert.deepEqual(deltas, ["con", "firmed"]);
+});
+
+test("a buffered managed gateway response still publishes its assistant text", async () => {
+  const deltas: string[] = [];
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: gatewayBinding.model, stream: false },
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async () => Response.json({
+      choices: [{ message: { role: "assistant", content: "confirmed" } }],
+    }),
+    (delta) => deltas.push(delta),
+  );
+  assert.deepEqual(deltas, ["confirmed"]);
+});
+
+test("a managed round refuses to run without a gateway token", async () => {
+  // Must fail rather than fall back: a silent fallback bills the wrong party.
+  let reached = false;
+  await assert.rejects(
+    () =>
+      gatewayRound(async () => {
+        reached = true;
+        return new Response("{}", { status: 200 });
+      }, undefined),
+    /managed funding has no gateway token/,
+  );
+  assert.equal(reached, false, "no egress may happen without the token");
+});
+
+test("a managed round refuses a provider that is not the metered gateway", async () => {
+  let reached = false;
+  await assert.rejects(
+    () =>
+      performManagedGatewayFetch(
+        {
+          url: "https://api.openai.com/v1/responses",
+          headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+          body: {},
+        },
+        { ...gatewayBinding, provider: "openai" as const, base_url: "https://api.openai.com" },
+        { token: () => "cf-gateway-token" },
+        async () => {
+          reached = true;
+          return new Response("{}", { status: 200 });
+        },
+      ),
+    /requires the metered gateway/,
+  );
+  assert.equal(reached, false);
+});
+
+test("a managed round cannot be redirected off the admitted gateway endpoint", async () => {
+  // The egress check is inherited from the direct path rather than reimplemented,
+  // which is the point: this asserts the inheritance actually holds for the
+  // path carrying anonymous visitors' traffic.
+  let reached = false;
+  await assert.rejects(
+    () =>
+      performManagedGatewayFetch(
+        {
+          url: "https://gateway.evil.example/v1/acct/gw/compat/chat/completions",
+          headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+          body: {},
+        },
+        gatewayBinding,
+        { token: () => "cf-gateway-token" },
+        async () => {
+          reached = true;
+          return new Response("{}", { status: 200 });
+        },
+      ),
+    /escaped the signed provider endpoint/,
+  );
+  assert.equal(reached, false, "no egress may reach an unadmitted origin");
+});
+
+test("the gateway log id is reported even when usage cannot be parsed", async () => {
+  // The defect this pins: the log id used to ride on ProviderUsage, so a
+  // response whose usage the parser does not understand produced no pointer at
+  // all — and the gateway's `/compat` surface returns chat-completions, not the
+  // Responses shape this parser reads. Every metered turn silently fell back to
+  // the rate card. The log id is a fact about the round, not about tokens.
+  const logs: string[] = [];
+  let usageSeen = false;
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: {},
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async () =>
+      new Response(
+        // Chat-completions shape: real, valid, and not what the usage parser reads.
+        JSON.stringify({ choices: [{ message: { content: "hi" } }], usage: { prompt_tokens: 8, completion_tokens: 1 } }),
+        { status: 200, headers: { "content-type": "application/json", "cf-aig-log-id": "01ABCDEF" } },
+      ),
+    undefined,
+    undefined,
+    () => { usageSeen = true; },
+    (id) => logs.push(id),
+  );
+  assert.deepEqual(logs, ["01ABCDEF"], "the round's cost pointer must survive");
+  assert.equal(usageSeen, false, "and it must not depend on usage parsing");
 });

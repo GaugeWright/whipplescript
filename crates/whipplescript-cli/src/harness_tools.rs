@@ -48,6 +48,8 @@ pub const TOOL_FIND: &str = "find";
 pub const TOOL_LS: &str = "ls";
 pub const TOOL_BASH: &str = "bash";
 pub const TOOL_RECALL: &str = "recall";
+pub const TOOL_CHANGES: &str = "changes";
+pub const TOOL_RAISE: &str = "raise";
 pub const TOOL_LIST_TODOS: &str = "list_todos";
 pub const TOOL_ADD_TODO: &str = "add_todo";
 pub const TOOL_UPDATE_TODO: &str = "update_todo";
@@ -414,6 +416,8 @@ pub struct WorkflowToolEntry {
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
     root: PathBuf,
+    protected_write_paths: Vec<String>,
+    native_processes: bool,
     /// `None` = direct/test executor with no policy (workspace root, any path
     /// inside it). `Some(scopes)` = a turn/store policy is installed; an empty
     /// `Some` denies all file tools (no store granted this turn).
@@ -451,6 +455,13 @@ pub struct FileToolExecutor {
     /// The parent turn's provider configuration, carried into sub-workflow drives
     /// so a `@tool` workflow's own effects run under the same provider (DR-0025).
     provider_ctx: Option<crate::SubworkflowProviderContext>,
+    /// The `changes` tool's scope (DR-0052 Decision 6): present only when
+    /// the turn's instance is branch-bound — an unbound workspace has no
+    /// line to report on, so the tool is not offered at all.
+    changes_scope: Option<ChangesScope>,
+    /// Raise items already delivered mid-turn (DR-0052 Decision 7) — a
+    /// notice arrives once per turn, then stays in the transcript.
+    delivered_raises: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// Skill activation (context-assembly Phase 2, Decision 3): map of catalogue
     /// `location` → the registered content-addressed body. A `read` of a skill
     /// location resolves here (the registry) rather than the filesystem, so the
@@ -897,6 +908,8 @@ impl FileToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            protected_write_paths: Vec::new(),
+            native_processes: false,
             file_policy: None,
             profile_policy: HarnessProfilePolicy::permissive(),
             tracker_queue: None,
@@ -913,6 +926,8 @@ impl FileToolExecutor {
             max_child_iterations: 8,
             work_unit: String::new(),
             provider_ctx: None,
+            changes_scope: None,
+            delivered_raises: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             skill_bodies: std::collections::HashMap::new(),
             content_store_path: None,
         }
@@ -927,6 +942,84 @@ impl FileToolExecutor {
     ) -> Self {
         self.skill_bodies = skill_bodies;
         self
+    }
+
+    /// Scope the `changes` tool (DR-0052 Decision 6) to the turn's bound
+    /// line. `own_principals` is the turn's chain — session + instance —
+    /// so `by: "others"` excludes exactly this turn's own work.
+    pub fn with_changes(
+        mut self,
+        branch_id: impl Into<String>,
+        own_principals: Vec<String>,
+    ) -> Self {
+        self.changes_scope = Some(ChangesScope {
+            branch_id: branch_id.into(),
+            own_principals,
+        });
+        self
+    }
+
+    /// The `changes` tool: read-only situational awareness over the bound
+    /// line. Ungated and uncountered by design — it reads the recorded
+    /// past, moves nothing, and is offered only when a line exists.
+    fn changes(&self, args: &Value) -> Result<String, String> {
+        let scope = self
+            .changes_scope
+            .as_ref()
+            .ok_or_else(|| "this turn has no bound line".to_owned())?;
+        let vcs = whipplescript_store::vcs::WorkspaceVcs::open(
+            crate::branch_store_path(),
+            crate::vcs_content_store_path(),
+        )
+        .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+        let units = vcs
+            .change_units(&scope.branch_id, 500)
+            .map_err(|error| format!("changes unavailable: {error:?}"))?;
+        let rows = changes_rows(
+            &units,
+            args.get("since").and_then(Value::as_str),
+            args.get("by").and_then(Value::as_str),
+            args.get("path").and_then(Value::as_str),
+            &scope.own_principals,
+        )?;
+        serde_json::to_string_pretty(&json!({ "line": scope.branch_id, "changes": rows }))
+            .map_err(|error| error.to_string())
+    }
+
+    /// File a `raise` (see [`raise_tool_spec`]): tracker-class speech,
+    /// gated exactly like filing an item and budgeted the same way. The
+    /// subject must parse as a selection expression when present, so a
+    /// raise always names its slice precisely or not at all.
+    fn raise(&self, args: &Value) -> Result<String, String> {
+        if let Some(reason) = self.tracker_write_policy("file", None) {
+            return Err(reason);
+        }
+        let target = str_arg(args, "target")?;
+        let message = str_arg(args, "message")?;
+        let subject = args.get("subject").and_then(Value::as_str);
+        if let Some(expr) = subject {
+            whipplescript_store::selection::parse(expr)
+                .map_err(|error| format!("subject is not a valid selection: {error}"))?;
+        }
+        let (mut store, queue) = self.tracker()?;
+        let holder = format!("agent:{}", self.holder);
+        let item = store
+            .file_item(
+                &queue,
+                message,
+                "",
+                &["raise".to_owned()],
+                &json!({
+                    "raise": {
+                        "target": target,
+                        "subject": subject,
+                        "from": self.holder,
+                    }
+                }),
+                Some(&holder),
+            )
+            .map_err(|error| format!("file_item: {error:?}"))?;
+        Ok(json!({ "id": item.id, "target": target }).to_string())
     }
 
     /// Enable large-tool-output capture + `recall` (context-assembly Phase 5): a
@@ -989,6 +1082,16 @@ impl FileToolExecutor {
         self
     }
 
+    pub fn with_protected_write_paths(mut self, paths: Vec<String>) -> Self {
+        self.protected_write_paths = paths;
+        self
+    }
+
+    pub fn with_native_processes(mut self, enabled: bool) -> Self {
+        self.native_processes = enabled;
+        self
+    }
+
     #[cfg(test)]
     fn with_turn_file_access(mut self, access: TurnFileAccess) -> Self {
         self.file_policy = Some(access.scopes);
@@ -1020,6 +1123,16 @@ impl FileToolExecutor {
     }
 
     fn policy(&self, path: &str, op: &str) -> Option<String> {
+        if op == "write"
+            && self.protected_write_paths.iter().any(|protected| {
+                path == protected
+                    || path
+                        .strip_prefix(protected)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
+        {
+            return Some(format!("path `{path}` is a protected workspace input"));
+        }
         if op == "write" && !self.profile_policy.write_files {
             return Some(format!(
                 "file write is not permitted by profile `{}`",
@@ -1123,6 +1236,8 @@ impl FileToolExecutor {
             TOOL_FIND => self.find(args),
             TOOL_LS => self.ls(args),
             TOOL_RECALL => self.recall(args),
+            TOOL_CHANGES => self.changes(args),
+            TOOL_RAISE => self.raise(args),
             other => {
                 // MCP tools are always namespaced `mcp__<server>__<tool>`, so they
                 // can never collide with a native governed tool of the same
@@ -1580,6 +1695,9 @@ impl FileToolExecutor {
                 "bash timeout must be between 1 and {BASH_DEFAULT_TIMEOUT_SECS} seconds"
             ));
         }
+        if self.native_processes {
+            return self.native_bash(command, timeout);
+        }
 
         let mut before = std::collections::BTreeMap::new();
         let mut files = Vec::new();
@@ -1677,6 +1795,117 @@ impl FileToolExecutor {
         match output.exit_code {
             0 => Ok(combined),
             code => Err(format!("command exited with status {code}\n{combined}")),
+        }
+    }
+
+    fn native_workspace_snapshot(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut pending = vec![self.root.clone()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory)
+                .map_err(|error| format!("cannot enumerate native workspace: {error}"))?
+            {
+                let entry =
+                    entry.map_err(|error| format!("cannot inspect native workspace: {error}"))?;
+                let path = entry.path();
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| format!("cannot inspect native workspace: {error}"))?;
+                if kind.is_symlink() {
+                    return Err(
+                        "native command produced an unsupported workspace symlink".to_owned()
+                    );
+                }
+                if kind.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                if snapshot.len() >= MAX_FILES_WALKED {
+                    return Err(format!(
+                        "native workspace contains more than {MAX_FILES_WALKED} files"
+                    ));
+                }
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| "native workspace traversal escaped its root".to_owned())?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                snapshot.insert(
+                    relative,
+                    std::fs::read(path)
+                        .map_err(|error| format!("cannot read native workspace: {error}"))?,
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn native_bash(&self, command: &str, timeout: Duration) -> Result<String, String> {
+        let before = self.native_workspace_snapshot()?;
+        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        let output = std::process::Command::new("timeout")
+            .arg("--signal=KILL")
+            .arg(format!("{}s", timeout.as_secs()))
+            .arg("/bin/sh")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", "/tmp")
+            .env("TMPDIR", "/tmp")
+            .output()
+            .map_err(|error| format!("cannot start native command: {error}"))?;
+        let after = match self.native_workspace_snapshot() {
+            Ok(after) => after,
+            Err(error) => {
+                // A symlink cannot be represented in the returned proposal.
+                // The Sandbox is destroyed after this turn, so fail closed.
+                return Err(error);
+            }
+        };
+        let paths = before
+            .keys()
+            .chain(after.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut violations = Vec::new();
+        for path in paths {
+            if before.get(&path) == after.get(&path) || self.policy(&path, "write").is_none() {
+                continue;
+            }
+            violations.push(path.clone());
+            let full = self.root.join(&path);
+            match before.get(&path) {
+                Some(content) => {
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(full, content);
+                }
+                None => {
+                    let _ = std::fs::remove_file(full);
+                }
+            }
+        }
+        if !violations.is_empty() {
+            return Err(format!(
+                "native command attempted protected writes: {}",
+                violations.join(", ")
+            ));
+        }
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        let combined = middle_truncate(&combined, self.max_bytes);
+        match output.status.code() {
+            Some(0) => Ok(combined),
+            Some(code) => Err(format!("command exited with status {code}\n{combined}")),
+            None => Err(format!("command was killed\n{combined}")),
         }
     }
 
@@ -1941,7 +2170,175 @@ fn item_to_todo_status(item: &str) -> &'static str {
     }
 }
 
+/// What the `changes` tool reports over: the bound line and the turn's
+/// own principal chain (session + instance), so `by: "others"` means
+/// "not my chain".
+struct ChangesScope {
+    branch_id: String,
+    own_principals: Vec<String>,
+}
+
+/// The `changes` tool's pure core: filter recorded units by since-cut,
+/// actor (`"others"` = not in `own_principals`), and path glob; shape
+/// the rows. Separated so the filter semantics are testable without a
+/// live branch store.
+fn changes_rows(
+    units: &[whipplescript_store::selection::ChangeUnit],
+    since: Option<&str>,
+    by: Option<&str>,
+    path_glob: Option<&str>,
+    own_principals: &[String],
+) -> Result<Vec<Value>, String> {
+    let since_seq = since.and_then(|cut| {
+        units
+            .iter()
+            .find(|unit| unit.cut_id == cut)
+            .map(|unit| unit.seq)
+    });
+    if since.is_some() && since_seq.is_none() {
+        return Err(format!(
+            "unknown cut `{}` on this line",
+            since.unwrap_or_default()
+        ));
+    }
+    Ok(units
+        .iter()
+        .filter(|unit| {
+            if let Some(seq) = since_seq {
+                if unit.seq <= seq {
+                    return false;
+                }
+            }
+            match by {
+                Some("others") => !unit
+                    .actor
+                    .as_deref()
+                    .is_some_and(|actor| own_principals.iter().any(|own| own == actor)),
+                Some(prefix) => unit
+                    .actor
+                    .as_deref()
+                    .is_some_and(|actor| actor.starts_with(prefix)),
+                None => true,
+            }
+        })
+        .filter(|unit| {
+            path_glob
+                .is_none_or(|glob| whipplescript_store::selection::glob_matches(glob, &unit.path))
+        })
+        .map(|unit| {
+            let kind = unit
+                .origin
+                .as_deref()
+                .map(|origin| origin.split(':').next().unwrap_or(origin).to_owned());
+            json!({
+                "path": unit.path,
+                "kind": kind,
+                "by": unit.actor,
+                "intent": unit.intent,
+                "cut": unit.cut_id,
+                "at": unit.recorded_at,
+            })
+        })
+        .collect())
+}
+
+pub(crate) fn changes_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: TOOL_CHANGES.into(),
+        description: "What moved on this session's line: recorded changes with who made \
+                      them (by), why (intent) and when. Filters: since (cut id), by \
+                      (actor prefix, or \"others\" for everyone but this session), path \
+                      (glob)."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "since": { "type": "string", "description": "only changes after this cut id" },
+                "by": { "type": "string", "description": "actor prefix filter; \"others\" = not this session" },
+                "path": { "type": "string", "description": "path glob filter" }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// `raise` (DR-0052 Decision 6 + note §7.7): attributed durable conflict
+/// speech. SPEECH, NOT AUTHORITY: it files a raise-labelled tracker item
+/// (the I3 participation ledger) — it moves no head, changes no grant,
+/// and can never arm repair (repair arms only on mediator-observed
+/// `workspace.*` facts; two ledgers, deliberately unjoined).
+pub(crate) fn raise_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: TOOL_RAISE.into(),
+        description: "Raise a conflict or concern to another session, attributed and \
+                      durable: \"B was told\" becomes recoverable fact. Speech only — \
+                      it changes nothing and unblocks nothing by itself."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "description": "the session principal addressed, e.g. \"s:sess-9\"" },
+                "subject": { "type": "string", "description": "optional selection expression for the work at issue, e.g. \"path(src/**) & by(s:sess-9)\"" },
+                "message": { "type": "string", "description": "what the target should know" }
+            },
+            "required": ["target", "message"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 impl ToolExecutor for FileToolExecutor {
+    /// Deliver open `raise` items addressed to this turn's chain (DR-0052
+    /// Decision 7): once each, formatted as an attributed workspace
+    /// notice with the safe continuations spelled out. Requires both a
+    /// tracker (the raise ledger) and a bound line (the chain identity);
+    /// absent either, nothing is ever delivered.
+    fn poll_notices(&self) -> Vec<String> {
+        let Some(scope) = self.changes_scope.as_ref() else {
+            return Vec::new();
+        };
+        let Ok((store, queue)) = self.tracker() else {
+            return Vec::new();
+        };
+        let Ok(items) = store.list_items(Some(&queue), Some("open")) else {
+            return Vec::new();
+        };
+        let mut delivered = self.delivered_raises.borrow_mut();
+        let mut notices = Vec::new();
+        for item in items {
+            if !item.labels.iter().any(|label| label == "raise") {
+                continue;
+            }
+            let raise = &item.metadata["raise"];
+            let Some(target) = raise.get("target").and_then(Value::as_str) else {
+                continue;
+            };
+            if !scope.own_principals.iter().any(|own| own == target) {
+                continue;
+            }
+            if !delivered.insert(item.id.clone()) {
+                continue;
+            }
+            let from = raise
+                .get("from")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let subject = raise
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(|expr| format!("\nSubject slice: `{expr}`"))
+                .unwrap_or_default();
+            notices.push(format!(
+                "[workspace notice — raise {} from {from}]\n{}{subject}\n\
+                 This is information, not an instruction: you may keep working, \
+                 re-scope off the named slice, or coordinate via the tracker. \
+                 Your snapshot has not changed.",
+                item.id, item.title
+            ));
+        }
+        notices
+    }
+
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         match self.dispatch(call) {
             // The single capture-time cap (Phase 4 Layer A + Phase 5): dispatch
@@ -2643,6 +3040,115 @@ fn load_workflow_tools() -> Result<(Vec<ToolSpec>, Vec<WorkflowToolEntry>), Stri
 /// typed tool. An unresolvable or non-`@tool` grant fails the turn at setup — the
 /// same condition `whip check` rejects statically. Returns empty if the program/
 /// agent context is unavailable (e.g. an ad-hoc turn) or the agent grants nothing.
+/// Stream homing at turn setup (std.vcs, DR-0052 Decision 5). Resolves
+/// the homing target — the tell's `on stream` override first, else the
+/// agent's declared membership — and joins the turn's bound line to it,
+/// creating the stream (and its shared line) on first use. Fail-closed:
+/// a line already homed to a DIFFERENT stream is contradictory topology
+/// and errors rather than silently re-homing (membership is
+/// orchestration, never ambient drift).
+fn home_turn_branch_to_stream(
+    branch_id: &str,
+    agent: &str,
+    input_json: &str,
+    program_path: Option<&Path>,
+    root: Option<&str>,
+) -> Result<(), String> {
+    use whipplescript_store::workstreams::Workstreams;
+    // The tell's per-turn exception rides the turn input.
+    let on_stream = serde_json::from_str::<Value>(input_json)
+        .ok()
+        .and_then(|input| {
+            input
+                .get("on_stream")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let (target, staleness) = match on_stream {
+        Some(target) => (Some(target), None),
+        None => {
+            // The agent's declared membership, from the program's streams.
+            let Some(program_path) = program_path else {
+                return Ok(());
+            };
+            let Ok((_, ir)) = crate::compile_source_path_with_root(
+                program_path.to_str().unwrap_or_default(),
+                root,
+            ) else {
+                // An uncompilable program failed long before homing; do
+                // not fail the turn twice from here.
+                return Ok(());
+            };
+            match ir
+                .streams
+                .iter()
+                .find(|stream| stream.members.iter().any(|member| member == agent))
+            {
+                Some(stream) => (
+                    Some(stream.name.clone()),
+                    stream.staleness_seconds.map(|seconds| seconds as i64),
+                ),
+                None => (None, None),
+            }
+        }
+    };
+    let Some(stream_id) = target else {
+        return Ok(());
+    };
+    let mut streams =
+        whipplescript_store::workstreams::WorkstreamStore::open(crate::workstream_store_path())
+            .map_err(|error| format!("workstream store unavailable: {error:?}"))?;
+    let at = crate::now_stamp();
+    match streams
+        .home_of(branch_id)
+        .map_err(|error| format!("stream homing failed: {error:?}"))?
+    {
+        Some(existing) if existing == stream_id => return Ok(()),
+        Some(existing) => {
+            return Err(format!(
+                "turn line `{branch_id}` is homed to stream `{existing}` but this                  turn declares stream `{stream_id}` — contradictory topology; fix                  the stream declarations (membership is single-valued)"
+            ));
+        }
+        None => {}
+    }
+    // First use: ensure the stream and its shared line exist.
+    let line_branch_id = format!("line-{stream_id}");
+    let mut vcs = whipplescript_store::vcs::WorkspaceVcs::open(
+        crate::branch_store_path(),
+        crate::vcs_content_store_path(),
+    )
+    .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    vcs.init(&at)
+        .map_err(|error| format!("stream line init failed: {error:?}"))?;
+    match vcs.create_branch(
+        &line_branch_id,
+        None,
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        &at,
+    ) {
+        Ok(
+            whipplescript_store::branches::CreateBranchOutcome::Created(_)
+            | whipplescript_store::branches::CreateBranchOutcome::Existing(_),
+        ) => {}
+        Ok(other) => return Err(format!("stream line not created: {other:?}")),
+        Err(error) => return Err(format!("stream line create failed: {error:?}")),
+    }
+    match streams.create_stream(&stream_id, None, &line_branch_id, &at, None) {
+        Ok(_) => {}
+        Err(error) => return Err(format!("stream create failed: {error:?}")),
+    }
+    if let Some(bound) = staleness {
+        let _ = streams.set_staleness(&stream_id, Some(bound), &at);
+    }
+    match streams
+        .join(branch_id, &stream_id, &at)
+        .map_err(|error| format!("stream join failed: {error:?}"))?
+    {
+        whipplescript_store::workstreams::JoinOutcome::Joined { .. } => Ok(()),
+        other => Err(format!("stream join refused: {other:?}")),
+    }
+}
+
 fn load_agent_granted_tools(
     program_path: Option<&Path>,
     root: Option<&str>,
@@ -3453,6 +3959,35 @@ pub fn run_owned_agent_turn(
             &profile_policy,
             &turn_tool_access,
         ));
+        // `raise` rides the tracker ledger (DR-0052: the participation
+        // path), so it is offered exactly when the tracker is.
+        tools.push(raise_tool_spec());
+    }
+    // The `changes` tool (DR-0052 Decision 6): read-only situational
+    // awareness over the turn's bound line. Offered only when the
+    // instance IS branch-bound — no line, no tool. Ungated: it reads the
+    // recorded past and moves nothing.
+    if crate::branch_store_path().exists() {
+        if let Ok(vcs) = whipplescript_store::vcs::WorkspaceVcs::open(
+            crate::branch_store_path(),
+            crate::vcs_content_store_path(),
+        ) {
+            if let Ok(Some(branch_id)) = vcs.instance_branch(instance_id) {
+                // Stream homing (std.vcs, DR-0052 Decision 5): the turn's
+                // bound line homes to the agent's declared stream (or the
+                // tell's `on stream` exception). Contradictory topology —
+                // a line already homed to a DIFFERENT stream — hard-fails
+                // the turn at setup: membership is orchestration, and a
+                // declared contradiction must not resolve silently.
+                home_turn_branch_to_stream(&branch_id, agent, input_json, program_path, root)
+                    .map_err(StoreError::Conflict)?;
+                executor = executor.with_changes(
+                    branch_id,
+                    vec![format!("s:{work_unit}"), format!("instance:{instance_id}")],
+                );
+                tools.push(changes_tool_spec());
+            }
+        }
     }
     // Sub-workflow tools (DR-0025): curated, convergence-checked workflows the
     // model may invoke synchronously as typed tools.
@@ -3665,6 +4200,50 @@ fn owned_max_steps() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DR-0052 Decision 6: the `changes` tool's filter semantics —
+    /// `by: "others"` excludes exactly the turn's own chain (session AND
+    /// instance tiers); `since` windows after the named cut and errors on
+    /// an unknown one; path globs apply.
+    #[test]
+    fn changes_rows_filters_by_chain_since_and_path() {
+        use whipplescript_store::selection::ChangeUnit;
+        let unit = |seq: usize, cut: &str, path: &str, actor: Option<&str>| ChangeUnit {
+            seq,
+            cut_id: cut.to_owned(),
+            change_id: cut.to_owned(),
+            branch_id: "line".to_owned(),
+            path: path.to_owned(),
+            before: None,
+            after: Some(format!("h{seq}")),
+            origin: Some(format!("write:{path}")),
+            actor: actor.map(str::to_owned),
+            intent: None,
+            recorded_at: format!("t{seq}"),
+        };
+        let units = vec![
+            unit(0, "c0", "src/a.rs", Some("s:sess-7")),
+            unit(1, "c1", "src/b.rs", Some("instance:i-42")),
+            unit(2, "c2", "src/c.rs", Some("s:sess-9")),
+            unit(3, "c3", "docs/d.md", None),
+        ];
+        let own = vec!["s:sess-7".to_owned(), "instance:i-42".to_owned()];
+        // "others": both own tiers excluded; the pre-actor row counts as other.
+        let rows = changes_rows(&units, None, Some("others"), None, &own).expect("rows");
+        let cuts: Vec<&str> = rows.iter().filter_map(|r| r["cut"].as_str()).collect();
+        assert_eq!(cuts, vec!["c2", "c3"]);
+        // prefix filter
+        let rows = changes_rows(&units, None, Some("s:"), None, &own).expect("rows");
+        assert_eq!(rows.len(), 2);
+        // since windows strictly after the cut
+        let rows = changes_rows(&units, Some("c1"), None, None, &own).expect("rows");
+        let cuts: Vec<&str> = rows.iter().filter_map(|r| r["cut"].as_str()).collect();
+        assert_eq!(cuts, vec!["c2", "c3"]);
+        assert!(changes_rows(&units, Some("nope"), None, None, &own).is_err());
+        // path glob
+        let rows = changes_rows(&units, None, None, Some("src/*"), &own).expect("rows");
+        assert_eq!(rows.len(), 3);
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -5026,6 +5605,106 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// DR-0052 Decision 6: `raise` is tracker-class speech — gated like
+    /// filing, refusing a bad subject expression, and landing as a
+    /// raise-labelled tracker item. It emits NO workspace fact (the
+    /// two-ledgers invariant: speech never arms).
+    #[test]
+    fn raise_is_tracker_gated_speech_with_a_parsed_subject() {
+        let root = temp_root();
+        let ungranted = turn_tool_access_from_input(r#"{"prompt":"work"}"#).expect("parse");
+        let exec = FileToolExecutor::new(&root)
+            .with_tracker("queue", "instance")
+            .with_turn_tool_access(ungranted)
+            .with_profile_policy(Some("repo-writer"));
+        let refused = exec.execute(&call(
+            TOOL_RAISE,
+            json!({ "target": "s:sess-9", "message": "heads up" }),
+        ));
+        assert_eq!(refused.status, ToolStatus::Error);
+        assert!(refused.content.contains("tracker file is not granted"));
+
+        let granted = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {"resource": "tracker", "operations": [{"operation": "file"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("file grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_tracker("queue", "instance")
+            .with_turn_tool_access(granted)
+            .with_profile_policy(Some("repo-writer"));
+        // A malformed subject refuses before anything is filed.
+        let bad = exec.execute(&call(
+            TOOL_RAISE,
+            json!({ "target": "s:sess-9", "subject": "nonsense((", "message": "m" }),
+        ));
+        assert_eq!(bad.status, ToolStatus::Error);
+        assert!(bad.content.contains("not a valid selection"));
+        // A well-formed raise files and returns the item id.
+        let ok = exec.execute(&call(
+            TOOL_RAISE,
+            json!({
+                "target": "s:sess-9",
+                "subject": "path(src/**) & by(s:sess-9)",
+                "message": "your slice and mine are converging on src/api"
+            }),
+        ));
+        assert_eq!(ok.status, ToolStatus::Ok, "{}", ok.content);
+        let payload: Value = serde_json::from_str(&ok.content).expect("json");
+        assert!(payload["id"].as_str().is_some());
+        assert_eq!(payload["target"], "s:sess-9");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// DR-0052 Decision 7: a raise addressed to this turn's chain is
+    /// delivered exactly once mid-turn; raises addressed elsewhere never
+    /// are. Requires the tracker (ledger) + a bound-line scope (chain).
+    #[test]
+    fn poll_notices_delivers_addressed_raises_once() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let root = temp_root();
+        let previous_items = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE");
+        std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
+        let granted = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {"resource": "tracker", "operations": [{"operation": "file"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grant parses");
+        let exec = FileToolExecutor::new(&root)
+            .with_tracker("queue", "instance")
+            .with_turn_tool_access(granted)
+            .with_profile_policy(Some("repo-writer"))
+            .with_changes("line-1", vec!["s:sess-7".to_owned()]);
+        let to_me = exec.execute(&call(
+            TOOL_RAISE,
+            json!({ "target": "s:sess-7", "message": "we overlap on src/api" }),
+        ));
+        assert_eq!(to_me.status, ToolStatus::Ok, "{}", to_me.content);
+        let to_other = exec.execute(&call(
+            TOOL_RAISE,
+            json!({ "target": "s:sess-9", "message": "not for sess-7" }),
+        ));
+        assert_eq!(to_other.status, ToolStatus::Ok, "{}", to_other.content);
+        let notices = exec.poll_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("we overlap on src/api"));
+        assert!(notices[0].contains("information, not an instruction"));
+        assert!(exec.poll_notices().is_empty(), "once per turn");
+        match previous_items {
+            Some(value) => std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", value),
+            None => std::env::remove_var("WHIPPLESCRIPT_ITEMS_STORE"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn turn_access_governance_requires_envelope_to_cover_file_resources() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -5791,6 +6470,37 @@ mod tests {
         let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hello" })));
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(r.content.contains("hello"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn isolated_native_bash_runs_toolchain_commands_and_restores_protected_inputs() {
+        let root = temp_root();
+        std::fs::write(root.join(".agent-config.json"), "protected").unwrap();
+        let exec = FileToolExecutor::new(&root)
+            .with_native_processes(true)
+            .with_protected_write_paths(vec![".agent-config.json".into()]);
+
+        let ran = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "mkdir -p build && printf native > build/result.txt" }),
+        ));
+        assert_eq!(ran.status, ToolStatus::Ok, "{}", ran.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("build/result.txt")).unwrap(),
+            "native"
+        );
+
+        let refused = exec.execute(&call(
+            TOOL_BASH,
+            json!({ "command": "printf changed > .agent-config.json" }),
+        ));
+        assert_eq!(refused.status, ToolStatus::Error);
+        assert!(refused.content.contains("protected writes"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".agent-config.json")).unwrap(),
+            "protected"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

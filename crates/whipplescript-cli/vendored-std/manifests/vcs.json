@@ -1,0 +1,320 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.vcs",
+  "name": "std.vcs",
+  "version": "0.1.0",
+  "capabilities": [
+    {
+      "id": "vcs.promote",
+      "description": "Promote a stream's shared line to mainline through the gated boundary (adoption lease; refusal is data).",
+      "schema": {
+        "input": {
+          "stream": "string"
+        }
+      }
+    },
+    {
+      "id": "vcs.undo",
+      "description": "Construct a proposal cut excluding a selection's writes on the instance's own bound line (dependency-closure checked; stranding refuses as data).",
+      "schema": {
+        "input": {
+          "selection": "string"
+        }
+      }
+    },
+    {
+      "id": "vcs.transport",
+      "description": "Transport a selection's net content from the instance's own bound line onto a nameable tier (a declared stream's line, or mainline).",
+      "schema": {
+        "input": {
+          "selection": "string",
+          "onto": "string"
+        }
+      }
+    }
+  ],
+  "providers": [
+    {
+      "id": "provider-vcs-fixture",
+      "provider_kind": "fixture",
+      "capability": "vcs.promote",
+      "config": {}
+    },
+    {
+      "id": "provider-vcs-native",
+      "provider_kind": "std.vcs.native",
+      "capability": "vcs.promote",
+      "config": {}
+    },
+    {
+      "id": "provider-vcs-undo-fixture",
+      "provider_kind": "fixture",
+      "capability": "vcs.undo",
+      "config": {}
+    },
+    {
+      "id": "provider-vcs-undo-native",
+      "provider_kind": "std.vcs.native",
+      "capability": "vcs.undo",
+      "config": {}
+    },
+    {
+      "id": "provider-vcs-transport-fixture",
+      "provider_kind": "fixture",
+      "capability": "vcs.transport",
+      "config": {}
+    },
+    {
+      "id": "provider-vcs-transport-native",
+      "provider_kind": "std.vcs.native",
+      "capability": "vcs.transport",
+      "config": {}
+    }
+  ],
+  "profiles": [
+    {
+      "id": "profile-vcs-promoter",
+      "name": "vcs-promoter",
+      "description": "Allow promoting declared streams through the mainline boundary.",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": [
+        "vcs.promote",
+        "vcs.undo",
+        "vcs.transport"
+      ],
+      "config": {}
+    }
+  ],
+  "bindings": [
+    {
+      "id": "binding-vcs-promote-fixture",
+      "program_id": null,
+      "capability": "vcs.promote",
+      "provider": "fixture",
+      "config": {}
+    },
+    {
+      "id": "binding-vcs-promote-native",
+      "program_id": null,
+      "capability": "vcs.promote",
+      "provider": "std.vcs.native",
+      "config": {}
+    },
+    {
+      "id": "binding-vcs-undo-fixture",
+      "program_id": null,
+      "capability": "vcs.undo",
+      "provider": "fixture",
+      "config": {}
+    },
+    {
+      "id": "binding-vcs-undo-native",
+      "program_id": null,
+      "capability": "vcs.undo",
+      "provider": "std.vcs.native",
+      "config": {}
+    },
+    {
+      "id": "binding-vcs-transport-fixture",
+      "program_id": null,
+      "capability": "vcs.transport",
+      "provider": "fixture",
+      "config": {}
+    },
+    {
+      "id": "binding-vcs-transport-native",
+      "program_id": null,
+      "capability": "vcs.transport",
+      "provider": "std.vcs.native",
+      "config": {}
+    }
+  ],
+  "libraries": [
+    {
+      "id": "std.vcs",
+      "version": "0.1.0",
+      "effect_contracts": [
+        {
+          "id": "vcs.promote",
+          "effect_kind": "capability.call",
+          "source_forms": [
+            "promote"
+          ],
+          "input_schema": {
+            "stream": "string"
+          },
+          "output_schema": {
+            "variant": "string",
+            "stream": "string",
+            "sync_cut_id": "string",
+            "detail": "string"
+          },
+          "required_capabilities": [
+            "vcs.promote"
+          ],
+          "provider_kinds": [
+            "vcs"
+          ],
+          "projected_facts": [
+            "effect.output"
+          ],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "vcs.undo",
+          "effect_kind": "capability.call",
+          "source_forms": [
+            "undo"
+          ],
+          "input_schema": {
+            "selection": "string"
+          },
+          "output_schema": {
+            "variant": "string",
+            "cut_id": "string",
+            "detail": "string"
+          },
+          "required_capabilities": [
+            "vcs.undo"
+          ],
+          "provider_kinds": [
+            "vcs"
+          ],
+          "projected_facts": [
+            "effect.output"
+          ],
+          "validation": "runtime_boundary"
+        },
+        {
+          "id": "vcs.transport",
+          "effect_kind": "capability.call",
+          "source_forms": [
+            "transport"
+          ],
+          "input_schema": {
+            "selection": "string",
+            "onto": "string"
+          },
+          "output_schema": {
+            "variant": "string",
+            "cut_id": "string",
+            "detail": "string"
+          },
+          "required_capabilities": [
+            "vcs.transport"
+          ],
+          "provider_kinds": [
+            "vcs"
+          ],
+          "projected_facts": [
+            "effect.output"
+          ],
+          "validation": "runtime_boundary"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "vcs.promote",
+          "construct_family": "effect_operation",
+          "keyword": "promote",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "promote",
+            "slots": [
+              {
+                "name": "stream",
+                "kind": "identifier"
+              }
+            ],
+            "binding": "required",
+            "target_capability": "vcs.promote"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "vcs.promote"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "VcsPromotionOutcome"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "vcs.promote"
+        },
+        {
+          "id": "vcs.undo",
+          "construct_family": "effect_operation",
+          "keyword": "undo",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "undo",
+            "slots": [
+              {
+                "name": "selection",
+                "kind": "expression"
+              }
+            ],
+            "binding": "required",
+            "target_capability": "vcs.undo"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "vcs.undo"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "VcsUndoOutcome"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "vcs.undo"
+        },
+        {
+          "id": "vcs.transport",
+          "construct_family": "effect_operation",
+          "keyword": "transport",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "transport",
+            "slots": [
+              {
+                "name": "selection",
+                "kind": "expression"
+              },
+              {
+                "name": "onto",
+                "kind": "identifier",
+                "connective": "onto"
+              }
+            ],
+            "binding": "required",
+            "target_capability": "vcs.transport"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "vcs.transport"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "VcsTransportOutcome"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "vcs.transport"
+        }
+      ]
+    }
+  ]
+}

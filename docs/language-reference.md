@@ -1460,7 +1460,7 @@ enum, a terminal union, a union of string literals, an optional, or a `bool`. A
 statement on a plain `string`. Use guarded rules instead. A `case` statement on
 a `bool` is exhaustive only when the statement covers `true` and `false`. A `_`
 arm is the alternative. Refer to
-[`examples/terminal-output-union.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/terminal-output-union.whip)
+[`examples/terminal-output-union.whip`](https://github.com/GaugeWright/whipplescript/blob/main/examples/terminal-output-union.whip)
 for exhaustive handling of a terminal.
 
 ### Inline `decide`

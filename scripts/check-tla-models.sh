@@ -71,10 +71,11 @@ fi
 # CapInvariant / NoLostEntry respectively). A mutant that stays green means the
 # invariant lost its teeth.
 coord_bite() {
-  local model="$1" guard_re="$2" what="$3"
+  local model="$1" guard_text="$2" what="$3"
   local dir
   dir="$(mktemp -d)"
-  awk -v re="$guard_re" '$0 ~ re { print "  \\* MUTANT: guard removed"; next } { print }' \
+  awk -v text="$guard_text" \
+    'index($0, text) { print "  \\* MUTANT: guard removed"; next } { print }' \
     "$ROOT/models/tla/$model.tla" > "$dir/$model.tla"
   echo "== coord bite: $model ($what) mutant must be caught"
   if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
@@ -92,8 +93,6 @@ coord_bite() {
   rm -rf "$dir"
   echo "coord bite OK ($model $what guard is load-bearing)"
 }
-coord_bite CoordLease   'Cardinality\(held\[k\]\) < Slots' MutualExclusion
-coord_bite CoordCounter 'consumed \+ a <= Cap'             CapInvariant
-# NB: no backslashes in the pattern — awk -v escape processing would eat them
-# (\\n becomes a newline in a gawk dynamic regex and silently never matches).
+coord_bite CoordLease   'Cardinality(held[k]) < Slots' MutualExclusion
+coord_bite CoordCounter 'consumed + a <= Cap'           CapInvariant
 coord_bite CoordLedger  'notin appended'                   NoLostEntry

@@ -1145,8 +1145,18 @@ impl WorkItemStore {
                     })?
                     .map(|row| {
                         let (cid, payload_json) = row?;
+                        // DR-0054 Phase C: an unreadable `issue.created` payload
+                        // surfaces with its content id instead of silently
+                        // reading as a blank queue+title (which both hides the
+                        // corruption and can mis-group distinct issues as
+                        // duplicates of each other).
                         let payload: Value =
-                            serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+                            serde_json::from_str(&payload_json).map_err(|error| {
+                                StoreError::Conflict(format!(
+                                    "tracker event `{cid}` (issue.created) has an \
+                                     unreadable payload: {error}"
+                                ))
+                            })?;
                         let queue = payload
                             .get("queue")
                             .and_then(Value::as_str)

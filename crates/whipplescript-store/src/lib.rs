@@ -8,6 +8,7 @@ pub mod coordination;
 pub mod diff;
 pub mod files;
 pub mod improve;
+pub mod incidents;
 pub mod items;
 pub mod materialize;
 pub mod memory;
@@ -15,7 +16,11 @@ pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
 pub mod reconcile;
-pub mod selection;
+/// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
+/// grammar validates statically in the parser and dynamically at the
+/// seams — no mirror to drift). Re-exported here so every existing
+/// `whipplescript_store::selection::…` path keeps working.
+pub use whipplescript_core::selection;
 pub mod skill_frontmatter;
 pub mod stat_cache;
 pub mod text_merge;
@@ -31,7 +36,9 @@ use std::{
     fs,
     path::Path,
 };
-use whipplescript_core::Severity;
+// Re-exported so store-trait hosts built without the native backend (the DO
+// host) can construct `DiagnosticRecord`s without a direct core dependency.
+pub use whipplescript_core::Severity;
 
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
@@ -39,6 +46,23 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 pub type StoreResult<T> = result::Result<T, StoreError>;
+
+/// DR-0054 Phase B: the highest `schema_migrations` version this build
+/// understands. Must stay equal to the highest version in `MIGRATIONS`
+/// (asserted by test); `apply_migrations` refuses to open a store stamped
+/// beyond it instead of silently misreading a newer layout.
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+
+/// DR-0054 Phase B: the `events.format_version` this build stamps on every
+/// new row and the highest it will fold. Legacy rows carry NULL and read as
+/// version 1; a row stamped beyond this fails the fold closed with its row
+/// identity instead of misparsing.
+pub const SUPPORTED_EVENT_FORMAT_VERSION: i64 = 1;
+
+/// DR-0054 Phase B: the crate version recorded in `store_meta.writer_version`
+/// on every open, so a store on disk can always be diagnosed ("which build
+/// last wrote this?") without guessing from its contents.
+pub const WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -54,6 +78,16 @@ pub enum StoreError {
     CapacityBlocked {
         effect_id: String,
         reason: String,
+    },
+    /// DR-0054 Phase B: persisted state is stamped with a version newer than
+    /// this build supports (a rolled-back binary over a newer store). Fail
+    /// closed — never open or fold it silently. The remediation is a build
+    /// that understands `found`, never deleting the store.
+    UnsupportedVersion {
+        /// What carries the version stamp (e.g. "store schema", an event row).
+        subject: String,
+        found: i64,
+        supported: i64,
     },
 }
 
@@ -2249,11 +2283,16 @@ impl SqliteStore {
             "facts": commit.facts.iter().map(|fact| fact.fact_id).collect::<Vec<_>>(),
             "consumed_facts": commit.consumed_fact_ids,
             "effects": commit.effects.iter().map(|effect| effect.effect_id).collect::<Vec<_>>(),
-            "terminal": commit.terminal.map(|terminal| json!({
-                "action": terminal.kind.action(),
-                "name": terminal.name,
-                "payload": serde_json::from_str::<Value>(terminal.payload_json).unwrap_or(Value::Null),
-            })),
+            // DR-0054 Phase C: the terminal payload was already parsed with
+            // `?` while building the terminal event above, so propagate here
+            // too instead of silently recording `null` in the evidence trail.
+            "terminal": commit.terminal.map(|terminal| -> StoreResult<Value> {
+                Ok(json!({
+                    "action": terminal.kind.action(),
+                    "name": terminal.name,
+                    "payload": serde_json::from_str::<Value>(terminal.payload_json)?,
+                }))
+            }).transpose()?,
             "dependencies": commit
                 .dependencies
                 .iter()
@@ -2557,7 +2596,7 @@ impl SqliteStore {
         diagnostic: Option<TerminalDiagnosticRecord>,
         run_status: &str,
     ) -> StoreResult<StoredEvent> {
-        let payload = effect_completion_payload(completion, diagnostic.as_ref());
+        let payload = effect_completion_payload(completion, diagnostic.as_ref())?;
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -4006,7 +4045,7 @@ impl SqliteStore {
         let skills = self.skills_by_name(evidence.skill_names)?;
         let metadata = json!({
             "effect_id": evidence.effect_id,
-            "skills": skills.iter().map(skill_to_json).collect::<Vec<_>>(),
+            "skills": skills.iter().map(skill_to_json).collect::<StoreResult<Vec<_>>>()?,
         })
         .to_string();
         let summary = if skills.is_empty() {
@@ -4198,6 +4237,45 @@ impl SqliteStore {
             })?
             .collect::<result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Record a child instance's repair scope (DR-0052 R3): the branch
+    /// and mediator-derived slice a `with access to vcs { repair for
+    /// <binding> }` start grant resolved to. Written by the invoke seam
+    /// only; the vcs selective-verb providers read it to RETARGET their
+    /// line and REFUSE any selection exceeding the slice. One scope per
+    /// instance (a repair flow serves one incident).
+    pub fn record_repair_scope(
+        &mut self,
+        instance_id: &str,
+        branch_id: &str,
+        slice_expr: &str,
+        source_ref: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO repair_scopes (instance_id, branch_id, slice_expr, source_ref) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(instance_id) DO UPDATE SET branch_id = ?2, slice_expr = ?3, \
+             source_ref = ?4",
+            rusqlite::params![instance_id, branch_id, slice_expr, source_ref],
+        )?;
+        Ok(())
+    }
+
+    /// The repair scope granted to an instance, if any:
+    /// (branch, slice expression, source reference).
+    pub fn repair_scope(&self, instance_id: &str) -> StoreResult<Option<(String, String, String)>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT branch_id, slice_expr, source_ref FROM repair_scopes \
+                 WHERE instance_id = ?1",
+                rusqlite::params![instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn get_instance(&self, instance_id: &str) -> StoreResult<Option<InstanceView>> {
@@ -4662,8 +4740,8 @@ impl SqliteStore {
             run.effect_id,
             fingerprint_salt.as_deref(),
         )?;
-        let run_metadata = inject_execution_fingerprint(run.metadata_json, &fingerprint);
-        let payload = run_start_payload(run, &run_metadata);
+        let run_metadata = inject_execution_fingerprint(&run, run.metadata_json, &fingerprint)?;
+        let payload = run_start_payload(run, &run_metadata)?;
         let event = append_event_on(
             &tx,
             NewEvent {
@@ -5584,7 +5662,7 @@ impl SqliteStore {
             };
             let mut statement = tx.prepare(&format!(
                 r#"
-                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence
+                SELECT event_id, event_type, payload_json, idempotency_key, causation_id, source, sequence, format_version
                 FROM events
                 WHERE instance_id = ?1
                   AND event_type IN (
@@ -5607,17 +5685,41 @@ impl SqliteStore {
             let rows = statement
                 .query_map([instance_id], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ),
+                        row.get::<_, Option<i64>>(7)?,
                     ))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
-            rows
+            // DR-0054 Phase B: fail the fold closed on an event row stamped
+            // with a format this build does not understand — misparsing it
+            // would poison every projection folded after it. Legacy NULL rows
+            // read as version 1 and pass. The error names the row so the
+            // diagnosis is "run the newer build", never "delete the store".
+            let mut checked = Vec::with_capacity(rows.len());
+            for (entry, format_version) in rows {
+                if let Some(version) = format_version {
+                    if version > SUPPORTED_EVENT_FORMAT_VERSION {
+                        return Err(StoreError::UnsupportedVersion {
+                            subject: format!(
+                                "event `{}` (instance `{instance_id}`, sequence {})",
+                                entry.0, entry.6
+                            ),
+                            found: version,
+                            supported: SUPPORTED_EVENT_FORMAT_VERSION,
+                        });
+                    }
+                }
+                checked.push(entry);
+            }
+            checked
         };
 
         // RC-4b: the restore-marker replay fold (models/maude/restore-replay.maude).
@@ -5809,11 +5911,25 @@ impl SqliteStore {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })?
                 .collect::<result::Result<Vec<_>, _>>()?;
-            rows.into_iter().find_map(|(payload_json, sequence)| {
-                let payload: Value = serde_json::from_str(&payload_json).ok()?;
-                (payload.get("cut_id").and_then(Value::as_str) == Some(cut_id))
-                    .then_some((payload, sequence))
-            })
+            // DR-0054 Phase C: an unreadable checkpoint payload used to be
+            // silently skipped, so a corrupt row surfaced as "no checkpoint
+            // with cut id X" — indistinguishable from the cut never existing,
+            // and an invitation to treat the store as disposable. Surface the
+            // corruption with the row identity instead.
+            let mut found = None;
+            for (payload_json, sequence) in rows {
+                let payload: Value = serde_json::from_str(&payload_json).map_err(|error| {
+                    StoreError::Conflict(format!(
+                        "context.checkpoint event at sequence {sequence} of instance \
+                         `{instance_id}` has an unreadable payload: {error}"
+                    ))
+                })?;
+                if payload.get("cut_id").and_then(Value::as_str) == Some(cut_id) {
+                    found = Some((payload, sequence));
+                    break;
+                }
+            }
+            found
         };
         let Some((payload, restored_to_sequence)) = checkpoint else {
             return Ok(RestoreDecision::Refused {
@@ -6878,7 +6994,8 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
                 source,
                 causation_id,
                 correlation_id,
-                idempotency_key
+                idempotency_key,
+                format_version
             )
             VALUES (
                 'evt_' || lower(hex(randomblob(16))),
@@ -6890,7 +7007,8 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
                 ?4,
                 ?5,
                 ?6,
-                ?7
+                ?7,
+                ?8
             )
             RETURNING event_id, sequence
             "#,
@@ -6902,6 +7020,10 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
                 event.causation_id,
                 event.correlation_id,
                 event.idempotency_key,
+                // DR-0054 Phase B: stamp the writer's event format so a future
+                // reader can tell a row it must not misparse. Constant within a
+                // build, so replay re-derivation stays byte-identical.
+                SUPPORTED_EVENT_FORMAT_VERSION,
             ],
             |row| {
                 Ok(StoredEvent {
@@ -9293,8 +9415,18 @@ fn skill_view_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillView> {
 }
 
 #[cfg(feature = "native")]
-fn skill_to_json(skill: &SkillView) -> Value {
-    json!({
+fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
+    // DR-0054 Phase C: unreadable stored capabilities surface with the skill's
+    // identity instead of silently projecting `null` (which would erase the
+    // capability declaration from the evidence trail without a trace).
+    let required_capabilities = serde_json::from_str::<Value>(&skill.required_capabilities_json)
+        .map_err(|error| {
+            StoreError::Conflict(format!(
+                "skill `{}` ({}) has unreadable required_capabilities: {error}",
+                skill.name, skill.skill_id
+            ))
+        })?;
+    Ok(json!({
         "skill_id": skill.skill_id,
         "name": skill.name,
         "version": skill.version,
@@ -9302,12 +9434,12 @@ fn skill_to_json(skill: &SkillView) -> Value {
         "source_path": skill.source_path,
         "content_hash": skill.content_hash,
         "description": skill.description,
-        "required_capabilities": serde_json::from_str::<Value>(&skill.required_capabilities_json).unwrap_or(Value::Null),
-    })
+        "required_capabilities": required_capabilities,
+    }))
 }
 
 #[cfg(feature = "native")]
-fn stable_hash_hex(value: &str) -> String {
+pub(crate) fn stable_hash_hex(value: &str) -> String {
     let mut hex = String::with_capacity(32);
     for byte in stable_hash_bytes(value) {
         hex.push_str(&format!("{byte:02x}"));
@@ -9554,8 +9686,17 @@ fn workflow_terminal_payload(
 fn effect_completion_payload(
     completion: EffectCompletion<'_>,
     diagnostic: Option<&TerminalDiagnosticRecord>,
-) -> String {
-    json!({
+) -> StoreResult<String> {
+    // DR-0054 Phase C: unreadable completion metadata surfaces with the run
+    // identity instead of writing `null` into the canonical `effect.terminal`
+    // event (which would silently drop the completion's metadata forever).
+    let metadata = serde_json::from_str::<Value>(completion.metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` completion has unreadable metadata: {error}",
+            completion.effect_id, completion.run_id
+        ))
+    })?;
+    Ok(json!({
         "effect_id": completion.effect_id,
         "run_id": completion.run_id,
         "provider": completion.provider,
@@ -9563,56 +9704,89 @@ fn effect_completion_payload(
         "status": completion.status,
         "exit_code": completion.exit_code,
         "summary": completion.summary,
-        "metadata": serde_json::from_str::<Value>(completion.metadata_json).unwrap_or(Value::Null),
-        "diagnostic": diagnostic.map(terminal_diagnostic_payload),
+        "metadata": metadata,
+        "diagnostic": diagnostic.map(terminal_diagnostic_payload).transpose()?,
     })
-    .to_string()
+    .to_string())
 }
 
 #[cfg(feature = "native")]
-fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> Value {
-    json!({
+fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> StoreResult<Value> {
+    // DR-0054 Phase C: an absent span is genuinely optional (`None` → `null`),
+    // but a PRESENT span/ids field this build cannot parse is corruption and
+    // surfaces instead of silently degrading to `null` / `[]`.
+    let context = |field: &str, error: serde_json::Error| {
+        StoreError::Conflict(format!(
+            "terminal diagnostic `{}` has unreadable {field}: {error}",
+            diagnostic.message
+        ))
+    };
+    Ok(json!({
         "program_id": diagnostic.program_id,
         "program_version_id": diagnostic.program_version_id,
         "severity": diagnostic.severity.as_str(),
         "code": diagnostic.code,
         "message": diagnostic.message,
-        "source_span": diagnostic.source_span_json.as_deref().map(|span| {
-            serde_json::from_str::<Value>(span).unwrap_or(Value::Null)
-        }),
+        "source_span": diagnostic
+            .source_span_json
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()
+            .map_err(|error| context("source_span", error))?,
         "subject_type": diagnostic.subject_type,
         "subject_id": diagnostic.subject_id,
         "assertion_id": diagnostic.assertion_id,
         "evidence_ids": serde_json::from_str::<Value>(&diagnostic.evidence_ids_json)
-            .unwrap_or_else(|_| json!([])),
+            .map_err(|error| context("evidence_ids", error))?,
         "artifact_ids": serde_json::from_str::<Value>(&diagnostic.artifact_ids_json)
-            .unwrap_or_else(|_| json!([])),
+            .map_err(|error| context("artifact_ids", error))?,
         "causation_id": diagnostic.causation_id,
         "correlation_id": diagnostic.correlation_id,
         "idempotency_key": diagnostic.idempotency_key,
-    })
+    }))
 }
 
 #[cfg(feature = "native")]
-fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> String {
-    json!({
+fn run_start_payload(run: RunStart<'_>, metadata_json: &str) -> StoreResult<String> {
+    // DR-0054 Phase C: unreadable run metadata surfaces with the run identity
+    // instead of recording `null` in the canonical `effect.run_started` event.
+    let metadata = serde_json::from_str::<Value>(metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` start has unreadable metadata: {error}",
+            run.effect_id, run.run_id
+        ))
+    })?;
+    Ok(json!({
         "effect_id": run.effect_id,
         "run_id": run.run_id,
         "provider": run.provider,
         "worker_id": run.worker_id,
         "lease_id": run.lease_id,
         "lease_expires_at": run.lease_expires_at,
-        "metadata": serde_json::from_str::<Value>(metadata_json).unwrap_or(Value::Null),
+        "metadata": metadata,
     })
-    .to_string()
+    .to_string())
 }
 
 #[cfg(feature = "native")]
 /// Merge the execution fingerprint into a run's metadata object so it is recorded
 /// with the run (in the `run_started` event payload and the projected `runs` row)
-/// and reconstructs on replay through the existing metadata flow.
-fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> String {
-    let mut value: Value = serde_json::from_str(metadata_json).unwrap_or(Value::Null);
+/// and reconstructs on replay through the existing metadata flow. Non-object but
+/// well-formed metadata (the historical `"null"`/scalar shapes) still normalizes
+/// to an object; UNREADABLE metadata propagates instead of being silently
+/// replaced with `{}`, which would drop the caller's metadata without a trace
+/// (DR-0054 Phase C).
+fn inject_execution_fingerprint(
+    run: &RunStart<'_>,
+    metadata_json: &str,
+    fingerprint: &str,
+) -> StoreResult<String> {
+    let mut value: Value = serde_json::from_str(metadata_json).map_err(|error| {
+        StoreError::Conflict(format!(
+            "effect `{}` run `{}` has unreadable metadata: {error}",
+            run.effect_id, run.run_id
+        ))
+    })?;
     if !value.is_object() {
         value = json!({});
     }
@@ -9622,7 +9796,7 @@ fn inject_execution_fingerprint(metadata_json: &str, fingerprint: &str) -> Strin
             Value::String(fingerprint.to_owned()),
         );
     }
-    value.to_string()
+    Ok(value.to_string())
 }
 
 #[cfg(feature = "native")]
@@ -10366,6 +10540,25 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
         "#,
     )?;
 
+    // DR-0054 Phase B downgrade guard: a store stamped past the highest
+    // migration this build knows was written by a NEWER build. Opening it
+    // anyway would silently misread (or "repair") a layout this code has never
+    // seen, so refuse before any migration or ensure-* touches it. The error
+    // names both versions; the fix is running the newer build — the store
+    // itself is intact and must not be deleted.
+    let stamped: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if stamped > SUPPORTED_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedVersion {
+            subject: "store schema (schema_migrations)".to_owned(),
+            found: stamped,
+            supported: SUPPORTED_SCHEMA_VERSION,
+        });
+    }
+
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for migration in MIGRATIONS {
@@ -10397,6 +10590,64 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_effect_time_columns(connection)?;
     ensure_skill_body_column(connection)?;
     ensure_lookup_indexes(connection)?;
+    ensure_event_format_column(connection)?;
+    ensure_store_meta(connection)?;
+    Ok(())
+}
+
+/// DR-0054 Phase B: give `events` a nullable `format_version` column via the
+/// ensure-* additive pattern. Every new row is stamped with
+/// [`SUPPORTED_EVENT_FORMAT_VERSION`]; legacy NULL rows read as version 1.
+/// Additive only — no existing row is rewritten (the event log is canonical).
+#[cfg(feature = "native")]
+fn ensure_event_format_column(connection: &Connection) -> StoreResult<()> {
+    let events_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !events_table_exists {
+        return Ok(());
+    }
+    if !column_exists(connection, "events", "format_version")? {
+        connection.execute("ALTER TABLE events ADD COLUMN format_version INTEGER", [])?;
+    }
+    Ok(())
+}
+
+/// DR-0054 Phase B: record which build last opened this store. `store_meta`
+/// carries `writer_version` (the crate version) and `format_version` (the
+/// event format this build writes), upserted on every open, so a store found
+/// on disk is always diagnosable — "written by whom, in what format" — without
+/// inference from its contents.
+#[cfg(feature = "native")]
+fn ensure_store_meta(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS store_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        "#,
+    )?;
+    for (key, value) in [
+        ("writer_version", WRITER_VERSION.to_owned()),
+        ("format_version", SUPPORTED_EVENT_FORMAT_VERSION.to_string()),
+    ] {
+        connection.execute(
+            r#"
+            INSERT INTO store_meta (key, value, updated_at)
+            VALUES (?1, ?2, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE
+            SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![key, value],
+        )?;
+    }
     Ok(())
 }
 
@@ -10596,6 +10847,13 @@ fn ensure_revision_schema(connection: &Connection) -> StoreResult<()> {
 fn ensure_workflow_invocation_schema(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS repair_scopes (
+            instance_id TEXT PRIMARY KEY,
+            branch_id TEXT NOT NULL,
+            slice_expr TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            granted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS workflow_invocations (
             invocation_id TEXT PRIMARY KEY,
             parent_instance_id TEXT NOT NULL,
@@ -10779,6 +11037,185 @@ mod tests {
             "content_blobs",
         ] {
             assert!(store.table_exists(table).expect("table lookup"), "{table}");
+        }
+    }
+
+    /// DR-0054 Phase B: the supported-version constant and the migration list
+    /// must move together — the downgrade guard compares against the constant,
+    /// so a migration added without bumping it would refuse every fresh store.
+    #[test]
+    fn supported_schema_version_matches_the_highest_migration() {
+        let highest = MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            highest, SUPPORTED_SCHEMA_VERSION,
+            "SUPPORTED_SCHEMA_VERSION must equal the highest MIGRATIONS version"
+        );
+    }
+
+    /// DR-0054 Phase B downgrade guard: a store stamped with a migration
+    /// version this build does not know refuses to open, naming both versions,
+    /// and leaves the store untouched.
+    #[test]
+    fn store_stamped_by_a_newer_build_refuses_to_open() {
+        let path = std::env::temp_dir().join(format!(
+            "whipplescript-store-downgrade-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        drop(SqliteStore::open(&path).expect("fresh store opens"));
+        {
+            let connection = Connection::open(&path).expect("raw connection opens");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, name) VALUES (99, 'from-the-future')",
+                    [],
+                )
+                .expect("future stamp inserts");
+        }
+
+        let error = match SqliteStore::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("newer-stamped store must refuse to open"),
+        };
+        match &error {
+            StoreError::UnsupportedVersion {
+                subject,
+                found,
+                supported,
+            } => {
+                assert_eq!(*found, 99);
+                assert_eq!(*supported, SUPPORTED_SCHEMA_VERSION);
+                assert!(
+                    subject.contains("schema"),
+                    "subject names what is versioned: {subject}"
+                );
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+
+        // Refusal mutated nothing: the future stamp (and the store) survive
+        // for the build that understands them.
+        let connection = Connection::open(&path).expect("store file still opens raw");
+        let stamped: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("stamp still present");
+        assert_eq!(stamped, 99, "the refusing build must not rewrite the stamp");
+        drop(connection);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// DR-0054 Phase B: every open records who wrote the store and in which
+    /// event format, so a store found on disk is diagnosable without guessing.
+    #[test]
+    fn open_records_writer_and_format_version_in_store_meta() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let writer: String = store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'writer_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("writer_version recorded");
+        assert_eq!(writer, WRITER_VERSION);
+        let format: String = store
+            .connection
+            .query_row(
+                "SELECT value FROM store_meta WHERE key = 'format_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("format_version recorded");
+        assert_eq!(format, SUPPORTED_EVENT_FORMAT_VERSION.to_string());
+    }
+
+    /// DR-0054 Phase B: new event rows carry the writer's format version; a
+    /// row stamped beyond what this build supports fails the projection fold
+    /// closed, naming the row, instead of misparsing it.
+    #[test]
+    fn future_event_format_version_fails_the_fold_with_row_identity() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("FormatGuard", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let event = store
+            .append_event(NewEvent {
+                instance_id: &instance.instance_id,
+                event_type: "fact.derived",
+                payload_json: r#"{"fact_id":"f1","name":"n","key":"k","value":{}}"#,
+                source: "test",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            })
+            .expect("event appends");
+
+        // The writer stamped its format on the new row.
+        let stamped: Option<i64> = store
+            .connection
+            .query_row(
+                "SELECT format_version FROM events WHERE event_id = ?1",
+                [&event.event_id],
+                |row| row.get(0),
+            )
+            .expect("stamp readable");
+        assert_eq!(stamped, Some(SUPPORTED_EVENT_FORMAT_VERSION));
+
+        // A NULL (legacy) row folds fine...
+        store
+            .connection
+            .execute(
+                "UPDATE events SET format_version = NULL WHERE event_id = ?1",
+                [&event.event_id],
+            )
+            .expect("regress to legacy NULL");
+        store
+            .rebuild_projections(&instance.instance_id)
+            .expect("legacy NULL rows fold as version 1");
+
+        // ...but a row from a newer format fails the fold closed with identity.
+        store
+            .connection
+            .execute(
+                "UPDATE events SET format_version = 99 WHERE event_id = ?1",
+                [&event.event_id],
+            )
+            .expect("stamp future format");
+        let error = store
+            .rebuild_projections(&instance.instance_id)
+            .expect_err("future-format row must fail the fold");
+        match &error {
+            StoreError::UnsupportedVersion {
+                subject,
+                found,
+                supported,
+            } => {
+                assert_eq!(*found, 99);
+                assert_eq!(*supported, SUPPORTED_EVENT_FORMAT_VERSION);
+                assert!(
+                    subject.contains(&event.event_id) && subject.contains(&instance.instance_id),
+                    "subject carries the row identity: {subject}"
+                );
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
 

@@ -1,0 +1,61 @@
+load ../repair-containment.maude
+
+--- Hazard demonstrated: under the NAIVE armer, a blocked agent's own
+--- tracker item arms an incident over exactly the slice it named --
+--- filing conjures the power to undo.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(naiveArm) trackerItem(agentA, (pa ; pb))
+  =>* incident(PS:PSet) RESIDUAL:Cfg .
+
+--- Hazard demonstrated: a raise arms the naive system the same way.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(naiveArm) raiseItem(agentA, agentB, pa)
+  =>* incident(PS:PSet) RESIDUAL:Cfg .
+
+--- Bite (the laundering fixture): under the CHECKED armer a blocked
+--- agent's tracker item NEVER arms -- arming reads a ledger agents
+--- cannot write.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) trackerItem(agentA, (pa ; pb))
+  =>* incident(PS:PSet) RESIDUAL:Cfg .
+
+--- Bite (two ledgers, deliberately unjoined): a raise never arms either.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) raiseItem(agentA, agentB, pa)
+  =>* incident(PS:PSet) RESIDUAL:Cfg .
+
+--- Coverage: the mediator's stall fact is what arms, carrying its
+--- derived slice into the incident.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) stallFact(pa ; pb)
+  =>* incident(pa ; pb) RESIDUAL:Cfg .
+
+--- Coverage: a request within the derived slice applies, attributed,
+--- and the landed repair closes the incident.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) stallFact(pa ; pb) repairReq(humanH, pa)
+  =>* applied(humanH, pa) RESIDUAL:Cfg .
+
+--- Bite (grant never exceeds the derived slice): a request reaching
+--- outside the incident's slice NEVER applies under the checked system.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) stallFact(pa ; pb) repairReq(humanH, (pa ; pc))
+  =>* applied(humanH, (pa ; pc)) RESIDUAL:Cfg .
+
+--- Coverage (no third outcome): the same out-of-slice request
+--- terminates in the refusal + escalation pair, incident intact.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) stallFact(pa ; pb) repairReq(humanH, (pa ; pc))
+  =>* incident(pa ; pb) refused(humanH) escalated RESIDUAL:Cfg .
+
+--- Bite (demand-gating): with no situation there is no authority -- a
+--- repair request against an unarmed workspace never applies anything.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(checkedArm) repairReq(humanH, pa)
+  =>* applied(A:Actor, PS:PSet) RESIDUAL:Cfg .
+
+--- Hazard demonstrated: the naive system lets the same out-of-slice
+--- request land -- the grant exceeded the situation that justified it.
+search [1] in WHIPPLESCRIPT-REPAIR-CONTAINMENT :
+  armer(naiveArm) stallFact(pa ; pb) repairReq(humanH, (pa ; pc))
+  =>* applied(humanH, (pa ; pc)) RESIDUAL:Cfg .

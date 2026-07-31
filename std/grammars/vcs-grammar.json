@@ -1,0 +1,42 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.vcs",
+  "name": "std.vcs",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.vcs",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "vcs.stream",
+          "construct_family": "declaration_block",
+          "keyword": "stream",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "stream",
+            "clauses": [
+              {
+                "name": "members",
+                "kind": "identifier",
+                "required": true,
+                "list": true,
+                "unknown_hint": "stream fields are `members` and `staleness`",
+                "missing_summary": "a stream is a declared collaboration: name its member agents with `members [<agent>, ...]`"
+              },
+              {
+                "name": "staleness",
+                "kind": "duration",
+                "required": false,
+                "list": false,
+                "unknown_hint": "stream fields are `members` and `staleness`",
+                "missing_summary": "a stream is a declared collaboration: name its member agents with `members [<agent>, ...]`"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

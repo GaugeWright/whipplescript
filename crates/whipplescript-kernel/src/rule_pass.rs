@@ -27,7 +27,7 @@ use crate::lowering::{
 };
 use crate::rule_lowering::{
     context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts,
-    stable_hash_hex, GuardReport, RuleContext,
+    ready_contexts_for, stable_hash_hex, GuardReport, RuleContext,
 };
 use crate::RuntimeKernel;
 
@@ -260,7 +260,15 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         }
         let mut groups: Vec<LoweringGroup> = Vec::new();
         for rule in &ir.rules {
-            let ready = ready_contexts(ir, rule, &facts, &effects, started_event_id.as_deref());
+            let own_actor = format!("instance:{instance_id}");
+            let ready = ready_contexts_for(
+                ir,
+                rule,
+                &facts,
+                &effects,
+                started_event_id.as_deref(),
+                Some(&own_actor),
+            );
             report.guard_reports.extend(ready.guard_reports);
             let mut contexts: Vec<RuleContext> = ready
                 .contexts

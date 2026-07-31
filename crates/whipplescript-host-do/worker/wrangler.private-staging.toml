@@ -1,0 +1,21 @@
+# Unpublished private managed-Machine Durable workflow host (GaugeDesk ADR 0120).
+# It deliberately has no public-session admission, credential registry,
+# deployment, collection, executor-container, or public route binding.
+name = "whipplescript-private-home-runtime-staging"
+account_id = "1689dd452ba2d2d8eb1f3c364c92b3f4"
+main = "src/private-home.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[build]
+command = "npm run build:wasm"
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance"]

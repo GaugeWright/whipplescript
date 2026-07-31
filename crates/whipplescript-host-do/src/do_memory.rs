@@ -247,6 +247,10 @@ pub struct DoMemoryCapabilityProvider<Sql: DoSql + Clone> {
 }
 
 impl<Sql: DoSql + Clone> CapabilityProvider for DoMemoryCapabilityProvider<Sql> {
+    fn label(&self) -> &'static str {
+        "memory-provider"
+    }
+
     fn produce(&self, effect: &ClaimableEffect, _config: &EffectConfig) -> CapabilityOutcome {
         let mut store = match DoMemoryStore::open(self.sql.clone()) {
             Ok(store) => store,

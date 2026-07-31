@@ -16,7 +16,12 @@ const FORBIDDEN_AMBIENT_AUTH_HEADERS = new Set([
 export interface ModelBrokerBinding {
   credential_id: string;
   credential_class?: string;
-  provider: "openai" | "openai-generic" | "anthropic" | "openai-codex";
+  provider:
+    | "openai"
+    | "openai-generic"
+    | "anthropic"
+    | "openai-codex"
+    | "cloudflare-ai-gateway";
   model: string;
   base_url: string;
 }
@@ -24,6 +29,8 @@ export interface ModelBrokerBinding {
 export interface ModelBrokerConfig {
   url?: string;
   token?: string;
+  executionGrant?: string;
+  executionSignature?: string;
 }
 
 export interface SuspendedModelRequest {
@@ -38,10 +45,34 @@ export interface ProviderUsage {
   input_tokens: number;
   cached_input_tokens: number;
   output_tokens: number;
+  /** The gateway's own log id for this round, when one was returned
+   *  (`cf-aig-log-id`).
+   *
+   *  ADR 0085 §3 calls for the broker to return "an opaque reconciliation
+   *  pointer", and §Consequences requires that "managed gateway telemetry
+   *  reconciles the authoritative WhippleScript meter instead of becoming a
+   *  parallel billing truth". This is that pointer: it identifies the gateway
+   *  log entry carrying the **actual** cost of the round, so a publisher can be
+   *  billed measured cost plus margin rather than an estimated rate card. The
+   *  meter here stays authoritative for token counts; the pointer only lets the
+   *  money be reconciled against what Cloudflare really charged. */
+  reconciliation_ref?: string;
 }
 
 export interface DirectProviderSecrets {
   resolve: (credentialRef: string) => Promise<unknown>;
+}
+
+/** The service-held gateway token for managed funding.
+ *
+ *  Deliberately a different type from {@link DirectProviderSecrets}: that one
+ *  resolves a *customer* credential by reference and proves it matches the
+ *  admitted provider and class. There is no customer credential here and
+ *  nothing to match — the token is GaugeWright's, and the customer relationship
+ *  is a billing one settled from metered usage. Sharing one interface would
+ *  invite resolving a deployment reference against a service secret. */
+export interface ManagedGatewaySecret {
+  token: () => string | undefined;
 }
 
 interface BrokerResponse {
@@ -199,7 +230,14 @@ export async function performModelBrokerFetch(
   const mark = (event: string) => onTiming?.(event, performance.now() - startedAt);
   const brokerUrl = validatedBrokerUrl(config.url);
   const token = config.token?.trim();
-  if (!token) throw new Error("model broker token is unavailable");
+  const executionGrant = config.executionGrant?.trim();
+  const executionSignature = config.executionSignature?.trim();
+  if (!token && (!executionGrant || !executionSignature)) {
+    throw new Error("model broker authorization is unavailable");
+  }
+  if (token && (executionGrant || executionSignature)) {
+    throw new Error("model broker authorization is ambiguous");
+  }
   if (!binding.credential_id.trim()) throw new Error("model broker credential ref is empty");
 
   const headers = stripSentinelAuthentication(request.headers);
@@ -218,9 +256,14 @@ export async function performModelBrokerFetch(
   };
   const brokerHeaders: Record<string, string> = {
     accept: "application/vnd.whipplescript.model-egress-stream",
-    authorization: `Bearer ${token}`,
     "content-type": "application/json",
   };
+  if (token) {
+    brokerHeaders.authorization = `Bearer ${token}`;
+  } else {
+    brokerHeaders["x-gaugewright-execution-grant"] = executionGrant!;
+    brokerHeaders["x-gaugewright-execution-signature"] = executionSignature!;
+  }
   if (idempotencyKey) brokerHeaders["idempotency-key"] = idempotencyKey;
   if (traceId) brokerHeaders["x-gaugewright-trace-id"] = traceId;
   mark("broker_fetch_start");
@@ -300,6 +343,60 @@ export async function performModelBrokerFetch(
 
 /** Public-session provider round. The request leaves the Session DO directly;
  * no Home/broker/control-plane hop receives prompt or completion bytes. */
+/**
+ * A managed-funded model round: the same egress as a direct one, paid by the
+ * service's gateway token instead of a customer credential (ADR 0085 §3
+ * "managed", §6).
+ *
+ * Implemented by delegating to {@link performDirectProviderFetch} with a secrets
+ * shim rather than by copying its body. That function owns the part that must
+ * not drift — proving the request never escaped the signed provider endpoint,
+ * stripping sentinel authentication, capping the response, parsing usage. A
+ * parallel copy of it would be a second place for an egress check to rot, and
+ * this path is the one carrying anonymous visitors' traffic.
+ */
+export async function performManagedGatewayFetch(
+  request: SuspendedModelRequest,
+  binding: ModelBrokerBinding,
+  secret: ManagedGatewaySecret,
+  fetcher: FetchLike = fetch,
+  onTextDelta?: (delta: string) => void,
+  onTiming?: ModelBrokerTimingSink,
+  onUsage?: (usage: ProviderUsage) => void,
+  onGatewayLog?: (gatewayLogId: string) => void,
+): Promise<string> {
+  if (binding.provider !== "cloudflare-ai-gateway") {
+    throw new Error(
+      `managed funding requires the metered gateway, not ${binding.provider}`,
+    );
+  }
+  const token = secret.token()?.trim();
+  if (!token) {
+    // Never fall back to another credential: that would silently bill the wrong
+    // party, which is the failure managed funding exists to prevent.
+    throw new Error("managed funding has no gateway token on this runtime");
+  }
+  return performDirectProviderFetch(
+    request,
+    binding,
+    {
+      // The shim answers with the shape `directProviderCredential` proves, so
+      // the checks there still run — the token simply is not a per-deployment
+      // reference and never came from the credential registry.
+      resolve: async () => ({
+        provider: binding.provider,
+        credential_class: binding.credential_class,
+        api_key: token,
+      }),
+    },
+    fetcher,
+    onTextDelta,
+    onTiming,
+    onUsage,
+    onGatewayLog,
+  );
+}
+
 export async function performDirectProviderFetch(
   request: SuspendedModelRequest,
   binding: ModelBrokerBinding,
@@ -308,6 +405,8 @@ export async function performDirectProviderFetch(
   onTextDelta?: (delta: string) => void,
   onTiming?: ModelBrokerTimingSink,
   onUsage?: (usage: ProviderUsage) => void,
+  /** Each metered round's gateway log id, reported as soon as it is seen. */
+  onGatewayLog?: (gatewayLogId: string) => void,
 ): Promise<string> {
   const startedAt = performance.now();
   const mark = (event: string) => onTiming?.(event, performance.now() - startedAt);
@@ -317,6 +416,10 @@ export async function performDirectProviderFetch(
   const expectedPath = binding.provider === "anthropic"
     ? `${admittedPath}/v1/messages`
     : binding.provider === "openai-generic"
+        || binding.provider === "cloudflare-ai-gateway"
+      // The gateway's `/compat` surface is OpenAI-compatible, so the admitted
+      // base URL already ends at `/compat` and the request appends
+      // `/chat/completions` — the same shape as a generic endpoint.
       ? `${admittedPath}/chat/completions`
       : `${admittedPath}/v1/responses`;
   if (
@@ -382,6 +485,14 @@ export async function performDirectProviderFetch(
   deltas.finish();
   mark("direct_provider_body_complete");
   const raw = chunks.join("");
+  // The gateway's log id is a fact about the *round*, not about token counts, so
+  // it is reported independently of whether usage parses. Riding it on
+  // `ProviderUsage` meant a response whose usage this parser does not understand
+  // — the gateway's `/compat` surface returns chat-completions, not the
+  // Responses shape — silently produced no pointer, and every metered turn fell
+  // back to the rate card. Found only by watching a real turn get billed.
+  const gatewayLogId = response.headers.get("cf-aig-log-id")?.trim();
+  if (gatewayLogId) onGatewayLog?.(gatewayLogId);
   const usage = extractResponsesUsage(raw);
   if (usage) onUsage?.(usage);
   let body: unknown = raw;
@@ -390,6 +501,19 @@ export async function performDirectProviderFetch(
       body = JSON.parse(raw);
     } catch {
       throw new Error("direct provider response was not valid JSON");
+    }
+    const completion =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as {
+            choices?: { message?: { content?: unknown } }[];
+          }).choices?.[0]?.message?.content
+        : undefined;
+    if (typeof completion === "string" && completion) {
+      if (!sawText) {
+        sawText = true;
+        mark("direct_provider_first_text_delta");
+      }
+      onTextDelta?.(completion);
     }
   }
   if (!response.ok) {
@@ -509,13 +633,26 @@ export class ResponsesSseDeltaDecoder {
         : "";
       if (!payload || payload === "[DONE]") continue;
       try {
-        const event = JSON.parse(payload) as { type?: unknown; delta?: unknown };
+        const event = JSON.parse(payload) as {
+          type?: unknown;
+          delta?: unknown;
+          choices?: { delta?: { content?: unknown } }[];
+        };
         if (
           event.type === "response.output_text.delta"
           && typeof event.delta === "string"
           && event.delta
         ) {
           this.emit?.(event.delta);
+          continue;
+        }
+        // Cloudflare AI Gateway's `/compat/chat/completions` endpoint streams
+        // OpenAI chat-completion chunks rather than Responses API events. Both
+        // are admitted public-provider protocols, so project their text through
+        // the same callback instead of completing a successful turn invisibly.
+        const chatDelta = event.choices?.[0]?.delta?.content;
+        if (typeof chatDelta === "string" && chatDelta) {
+          this.emit?.(chatDelta);
         }
       } catch {
         // A malformed provider event is ignored for live projection. The

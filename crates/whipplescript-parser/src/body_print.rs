@@ -101,6 +101,7 @@ pub(crate) fn print_effect(
             target,
             access_grants,
             skills,
+            on_stream,
         } => {
             // Re-serialize `with access to <resource> { <op clauses> }` grants so a
             // flow `tell` preserves its access metadata. `for <target>` refs are flow
@@ -118,8 +119,14 @@ pub(crate) fn print_effect(
                     .join(", ");
                 format!(" with skills [{list}]")
             };
+            // Re-serialize `on stream <name>` (std.vcs) so a flow `tell`
+            // preserves its per-turn homing.
+            let homing = on_stream
+                .as_ref()
+                .map(|stream| format!(" on stream {stream}"))
+                .unwrap_or_default();
             format!(
-                "tell {}{requires}{binding}{timeout}{grants}{skills}",
+                "tell {}{requires}{binding}{timeout}{grants}{skills}{homing}",
                 rn(target)
             )
         }
@@ -290,11 +297,17 @@ pub(crate) fn print_effect(
             push_stmt_line(out, indent, &format!("}}{binding}"));
             return;
         }
-        BodyEffectKind::TrackerClaim { item, ttl_seconds } => {
+        BodyEffectKind::TrackerClaim {
+            item,
+            ttl_seconds,
+            endorsed,
+        } => {
             let ttl = ttl_seconds
                 .map(|seconds| format!(" ttl {seconds}s"))
                 .unwrap_or_default();
-            format!("claim {}{ttl}{binding}{timeout}", rn(item))
+            // The marker prints last, as it parses (DR-0051 §2).
+            let endorsed = if *endorsed { " endorsed" } else { "" };
+            format!("claim {}{ttl}{binding}{timeout}{endorsed}", rn(item))
         }
         BodyEffectKind::TrackerRelease { item } => format!("release {}", rn(item)),
         BodyEffectKind::LeaseAcquire {

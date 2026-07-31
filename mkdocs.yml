@@ -1,8 +1,8 @@
 site_name: WhippleScript
 site_description: Durable coordination language for multi-agent workflows.
 site_url: https://docs.whipplescript.com/
-repo_url: https://github.com/jamesjscully/whipplescript
-repo_name: jamesjscully/whipplescript
+repo_url: https://github.com/GaugeWright/whipplescript
+repo_name: GaugeWright/whipplescript
 docs_dir: docs
 site_dir: site
 strict: true

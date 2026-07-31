@@ -132,7 +132,7 @@ Install from a checkout instead. If that method operates, the failure of the Git
 path is a problem with the network, with the lockfile, or with the toolchain:
 
 ```sh
-git clone https://github.com/jamesjscully/whipplescript.git
+git clone https://github.com/GaugeWright/whipplescript.git
 cd whipplescript
 cargo install --path crates/whipplescript-cli --locked
 ```

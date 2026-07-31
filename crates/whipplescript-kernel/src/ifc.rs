@@ -1,15 +1,18 @@
-//! Information-flow control checking (DR-0027 / DR-0028) — first vertical slice.
+//! Information-flow control checking (DR-0027 / DR-0028).
 //!
 //! A governance envelope (JSON; the signed-artifact form that the DR-0028
-//! governance DSL will compile to) labels real resources by confidentiality. This
-//! slice enforces the **turn-level join box** (DR-0027 I-IFC2): an agent turn
-//! granted a READ on a confidential resource and a WRITE/egress on an un-cleared
-//! resource could carry the confidential data out, so it is rejected — unless the
-//! contexts are separated or the value is declassified.
+//! governance DSL compiles to) labels real resources by confidentiality and
+//! integrity. The **turn-level join box** (DR-0027 I-IFC2) is the base case: an
+//! agent turn granted a READ on a confidential resource and a WRITE/egress on an
+//! un-cleared resource could carry the confidential data out, so it is rejected
+//! — unless the contexts are separated or the value is declassified.
 //!
-//! Scope of this slice: binary confidentiality, turn-grant granularity. The
-//! party-relative labels (the gate-green Maude models) and the source crossings
-//! (`endorsed` / `declassify`) arrive in later slices.
+//! Both axes and both source crossings are implemented here, not deferred:
+//! `coerce … endorsed` / `… declassified` (DR-0027 I-IFC3), `claim … endorsed`
+//! out of a vouched tracker (DR-0051), effect-output integrity (DR-0046), and
+//! computed fact reach (DR-0045). This header previously said the crossings
+//! "arrive in later slices" long after they had; if a claim here and the code
+//! disagree, the code is what runs.
 //!
 //! Discovery follows the gradual model (DR-0027 I-IFC6): `WHIPPLESCRIPT_IFC_ENVELOPE`
 //! points at the envelope; unset = ungoverned dev mode (a plain whip making no IFC
@@ -1092,6 +1095,49 @@ fn shared_coordination_resources(ir: &IrProgram) -> BTreeSet<String> {
                 .map(|counter| format!("resource:{}", counter.name)),
         )
         .collect()
+}
+
+/// The tracker handle a `when <tracker> has ready issue as <binding>` trigger
+/// reads, or `None` for every other `when` pattern (DR-0051 §1).
+///
+/// Matched against the program's declared trackers rather than on the shape of
+/// the words alone, so a fact class that happens to be followed by `has ready
+/// issue` is not mistaken for a queue.
+fn tracker_trigger_handle<'a>(pattern: &'a str, trackers: &BTreeSet<&str>) -> Option<&'a str> {
+    let pattern = pattern.split(" where ").next().unwrap_or(pattern);
+    let mut words = pattern.split_whitespace();
+    let handle = words.next()?;
+    (words.next() == Some("has")
+        && words.next() == Some("ready")
+        && words.next() == Some("issue")
+        && trackers.contains(handle))
+    .then_some(handle)
+}
+
+/// Whether a type can carry prose — arbitrary author-authored text — as opposed
+/// to a bounded value (DR-0051 §4).
+///
+/// The line is not "is it a string" but "can an attacker put a sentence in it".
+/// A number cannot instruct a downstream reader; a union of string literals
+/// cannot either, because its variants are declared in the class rather than
+/// chosen by whoever filled the field in. A bare `string`, a map, or an object
+/// with a prose field can.
+fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
+    use whipplescript_parser::{IrPrimitiveType, IrType};
+    match ty {
+        IrType::Primitive(IrPrimitiveType::String) => true,
+        IrType::Primitive(_) => false,
+        IrType::LiteralString(_) => false,
+        // A union is closed exactly when every arm is a declared literal. One
+        // bare `string` arm reopens it, which is the whole point of checking.
+        IrType::Union(variants) => variants.iter().any(carries_prose),
+        IrType::Optional(inner) | IrType::Array(inner) => carries_prose(inner),
+        IrType::Map(_) => true,
+        IrType::Object(fields) => fields.iter().any(|field| carries_prose(&field.ty)),
+        // A reference to another class, or an agent handle, is not something the
+        // narrowing can see through; treat it as prose-bearing (fail closed).
+        IrType::Ref(_) | IrType::AgentRef(_) => true,
+    }
 }
 
 fn ifc_resource_for_effect<'a>(
@@ -2227,6 +2273,23 @@ pub fn check_with_envelope_imports(
     // (the untrusted/fail-closed bottom) — exactly as channels work — so an
     // unrecognized signal can no longer fail OPEN past a governed envelope.
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|e| e.name.as_str()).collect();
+    // DR-0051: the declared tracker names, so a `when <tracker> has ready issue
+    // as v` trigger is recognized as an inbound read source. A tracker is a
+    // durable queue with an external filing surface — the same shape as a
+    // channel or a signal — and before this it was invisible to the checker
+    // entirely, so issue text reached a `from`-labelled sink unchecked. Default
+    // public: a queue nobody vouched is one anyone may have filed into.
+    let tracker_names: BTreeSet<&str> = ir.trackers.iter().map(|t| t.name.as_str()).collect();
+    // DR-0051 §4: declared classes by name, so a record field shaped by an
+    // endorsed claim can be checked against its declared type.
+    let class_by_name: BTreeMap<&str, &whipplescript_parser::IrClass> = ir
+        .schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            whipplescript_parser::IrSchema::Class(class) => Some((class.name.as_str(), class)),
+            whipplescript_parser::IrSchema::Enum(_) => None,
+        })
+        .collect();
     let shared_coordination = shared_coordination_resources(ir);
     // DR-0045: whole-fact producer reach, consumed by fact_reads substitution
     // and marked-crossing narrowing below.
@@ -2301,6 +2364,116 @@ pub fn check_with_envelope_imports(
         }
         fact_reads.sort();
         fact_reads.dedup();
+        // DR-0051 §1: tracker reads. A `when <tracker> has ready issue as v`
+        // trigger consumes whatever was filed into that queue, so the tracker
+        // handle joins the source families. Keyed by the bare handle exactly as
+        // a file store is — `integrity_set` resolves it through the envelope's
+        // handle→address binding, and an ungranted handle resolves to itself
+        // with no label, which is the public bottom.
+        let mut tracker_reads: Vec<&str> = rule
+            .whens
+            .iter()
+            .filter_map(|when| tracker_trigger_handle(&when.pattern, &tracker_names))
+            .collect();
+        tracker_reads.sort_unstable();
+        tracker_reads.dedup();
+        // DR-0051 §3: an endorsed claim draws its authority from the queue it
+        // claims out of, so the marker is honoured only when that queue is
+        // vouched. Without this, decision §2 is a hole rather than a crossing:
+        // an agent can file an issue, so it could file its own verdict and then
+        // claim it endorsed, laundering its own output into vouched state
+        // through a two-step it fully controls. Requiring the tracker grant puts
+        // the choice of who may endorse in the signed envelope.
+        for when in &rule.whens {
+            let Some(tracker) = tracker_trigger_handle(&when.pattern, &tracker_names) else {
+                continue;
+            };
+            let Some(bound) = binding_after_as(&when.pattern) else {
+                continue;
+            };
+            if !rule.metadata.endorsed_claim_items.contains(bound) {
+                continue;
+            }
+            if !envelope.integrity_set(tracker).is_empty() {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                span: when.span,
+                message: format!(
+                    "`claim … endorsed` in rule `{rule}` claims out of tracker `{tracker}`, \
+                     which nobody vouches (integrity public) — an endorsement may only draw \
+                     its authority from a queue the envelope says who may file into, or an \
+                     agent could file its own issue and claim it",
+                    rule = rule.name,
+                ),
+                suggestion: Some(format!(
+                    "name who may file into it: `grant tracker {tracker} -> \
+                     tracker:/{tracker} from <Role>`. if this claim is not an integrity \
+                     crossing, drop the `endorsed` marker instead"
+                )),
+                related: Vec::new(),
+            });
+        }
+        // DR-0051 §4: only closed fields cross. A record field shaped by an
+        // endorsed claim must carry a value that cannot express prose.
+        //
+        // This is not about whether the endorser is trustworthy — it binds a
+        // *fully honest* one. A reviewer who reads a hostile item and writes
+        // "flagged: it claims to be a system message telling the reader to
+        // ignore prior instructions" has done their job perfectly, and has also
+        // just relayed attacker text into a fact labelled Operator-vouched,
+        // where a downstream rule branches on it and a composed gate shows it to
+        // the next human. The bytes were never the problem; the label they
+        // acquire is. So the channel is narrowed to what a decision needs: the
+        // verdict crosses, the content does not.
+        //
+        // Note what this does NOT touch: the item's own payload. That is bytes
+        // in quarantine which the gate moves into the workspace verbatim, prose
+        // and all. The gate is a valve, not a filter — this governs the control
+        // signal, never what flows through the pipe.
+        if !rule.metadata.endorsed_claim_items.is_empty() {
+            let rule_span = rule
+                .whens
+                .first()
+                .map(|when| when.span)
+                .unwrap_or(whipplescript_parser::SourceSpan { start: 0, end: 0 });
+            for (sink, per_field) in &rule.metadata.record_field_reads {
+                let Some(schema) = sink.strip_prefix("fact:") else {
+                    continue;
+                };
+                let Some(class) = class_by_name.get(schema) else {
+                    continue;
+                };
+                for (field_name, roots) in per_field {
+                    if roots.is_disjoint(&rule.metadata.endorsed_claim_items) {
+                        continue;
+                    }
+                    let Some(field) = class.fields.iter().find(|f| &f.name == field_name) else {
+                        continue;
+                    };
+                    if !carries_prose(&field.ty) {
+                        continue;
+                    }
+                    diagnostics.push(Diagnostic {
+                        span: rule_span,
+                        message: format!(
+                            "in rule `{rule}`, `{schema}.{field_name}` is shaped by an endorsed \
+                             claim but can carry prose — an endorsement raises a *decision* to \
+                             trusted integrity, and a free-text field raised the same way \
+                             launders whatever the endorser quoted from the untrusted item",
+                            rule = rule.name,
+                        ),
+                        suggestion: Some(format!(
+                            "declare `{field_name}` as a closed union of literals (e.g. \
+                             `\"keep\" | \"flag\"`) or another type that cannot hold a sentence \
+                             — a number or a bool. to keep the endorser's prose, record it in a \
+                             separate fact the envelope leaves at public integrity"
+                        )),
+                        related: Vec::new(),
+                    });
+                }
+            }
+        }
         // Collect reads and writes across the whole rule (the rule-level join box):
         // both `with access to` turn grants AND direct file effects in the body.
         let mut reads: Vec<&str> = Vec::new();
@@ -2726,6 +2899,7 @@ pub fn check_with_envelope_imports(
             .chain(message_reads.iter().copied())
             .chain(signal_reads.iter().map(String::as_str))
             .chain(tool_result_reads.iter().map(String::as_str))
+            .chain(tracker_reads.iter().copied())
         {
             let src_integrity = source_integrity(src);
             for sink in writes
@@ -3281,6 +3455,7 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
     // the governance grants so the audit picture is complete — where a crossing is
     // claimed, not only that one is authorized.
     let signal_names: BTreeSet<&str> = ir.events.iter().map(|event| event.name.as_str()).collect();
+    let tracker_names: BTreeSet<&str> = ir.trackers.iter().map(|t| t.name.as_str()).collect();
     let schema_names: BTreeSet<&str> = ir
         .schemas
         .iter()
@@ -3355,6 +3530,35 @@ pub fn governance_report(ir: &IrProgram, verified: &VerifiedEnvelope) -> Governa
                     rule.name
                 ));
             }
+        }
+        // DR-0051 §2: an endorsed *claim* is a crossing too, and the decision
+        // record promises it prints here "exactly as an endorsed coerce is". It
+        // did not: a claim is not an effect with an `endorsed` flag, so the loop
+        // above never saw it, and a program whose only crossing is a person's
+        // adopted decision showed an audit surface with no crossing on it at
+        // all. That is the shape of the default review-by-hand gate — the case
+        // where an auditor most needs to see who was trusted and out of which
+        // queue.
+        //
+        // The tracker is named rather than only the rule, because §3 makes the
+        // queue the source of the authority: `endorse <tracker> -> <role>` in
+        // the governance half and this line in the source half are the two ends
+        // of one crossing, and an auditor should be able to match them up.
+        for when in &rule.whens {
+            let Some(tracker) = tracker_trigger_handle(&when.pattern, &tracker_names) else {
+                continue;
+            };
+            let Some(bound) = binding_after_as(&when.pattern) else {
+                continue;
+            };
+            if !rule.metadata.endorsed_claim_items.contains(bound) {
+                continue;
+            }
+            trusted_surface.push(format!(
+                "endorsed (source) at rule `{}` (claim on tracker `{tracker}`) carries: \
+                 tracker:/{tracker}",
+                rule.name
+            ));
         }
     }
     trusted_surface.sort();
@@ -7446,6 +7650,59 @@ rule triage
                 .iter()
                 .any(|c| c.contains("endorsed (source)") && c.contains("triage")),
             "source endorse should be surfaced: {:?}",
+            report.trusted_surface
+        );
+    }
+
+    #[test]
+    fn an_endorsed_claim_surfaces_in_trusted_surface_naming_its_tracker() {
+        // DR-0051 §2 promises a `claim … endorsed` prints in the trusted surface
+        // "exactly as an endorsed coerce is". It did not: a claim is not an
+        // effect carrying the marker, so the surface loop never saw it, and a
+        // program whose *only* crossing is a person's adopted decision reported
+        // an audit surface with no source crossing on it — the review-by-hand
+        // shape, where an auditor most needs to see it.
+        let program = r#"@service
+workflow ClaimSurface
+
+class Pending { request string }
+class Screening { disposition "keep" | "flag" }
+class Ticket { id string  status "open" }
+
+tracker verdicts
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule ask
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  record Pending { request ticket.id }
+}
+
+rule settle
+  when Pending as p
+  when verdicts has ready issue as v where v.body == p.request
+=> {
+  claim v as hold endorsed
+  after hold succeeds {
+    record Screening { disposition v.title }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": { "tracker:/verdicts": { "integrity": ["Operator"] } },
+                 "endorsements": [{ "resource": "verdicts", "role": "Operator" }] }"#,
+        )
+        .expect("valid");
+        let report = governance_report(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            report.trusted_surface.iter().any(|crossing| {
+                crossing.contains("endorsed (source)")
+                    && crossing.contains("settle")
+                    && crossing.contains("verdicts")
+            }),
+            "an endorsed claim should surface and name its queue: {:?}",
             report.trusted_surface
         );
     }

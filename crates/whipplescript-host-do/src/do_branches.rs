@@ -108,12 +108,27 @@ impl<S: DoSql> DoBranches<S> {
                 resolution TEXT NOT NULL,
                 recorded_at TEXT NOT NULL
             )",
+            "CREATE TABLE IF NOT EXISTS change_units (
+                branch_id TEXT NOT NULL,
+                cut_seq INTEGER NOT NULL,
+                cut_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                before_hash TEXT,
+                after_hash TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS change_units_branch_idx
+                ON change_units(branch_id, cut_seq)",
+            "CREATE TABLE IF NOT EXISTS change_unit_cursor (
+                branch_id TEXT PRIMARY KEY,
+                indexed_cuts INTEGER NOT NULL,
+                last_indexed_cut_id TEXT
+            )",
         ] {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         // Provenance columns arrived with Phase 2 (exactly as native):
         // stores minted before that gain them in place.
-        for column in ["parent_cut_id", "origin"] {
+        for column in ["parent_cut_id", "origin", "actor", "intent"] {
             let info = self
                 .sql
                 .query("PRAGMA table_info(cuts)", &[])
@@ -550,8 +565,8 @@ impl<S: DoSql> Branches for DoBranches<S> {
             .execute(
                 "INSERT OR IGNORE INTO cuts \
                  (cut_id, change_id, branch_id, manifest_hash, parent_cut_id, \
-                  origin, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                  origin, actor, intent, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 &[
                     text(cut.cut_id),
                     text(cut.change_id),
@@ -559,6 +574,8 @@ impl<S: DoSql> Branches for DoBranches<S> {
                     text(cut.manifest_hash),
                     opt_text(cut.parent_cut_id),
                     opt_text(cut.origin),
+                    opt_text(cut.actor),
+                    opt_text(cut.intent),
                     text(cut.recorded_at),
                 ],
             )
@@ -577,12 +594,126 @@ impl<S: DoSql> Branches for DoBranches<S> {
         Ok(rows.first().map(|row| as_text(&row[0])))
     }
 
+    fn change_unit_cursor(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<whipplescript_store::branches::ChangeUnitCursor> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT indexed_cuts, last_indexed_cut_id FROM change_unit_cursor \
+                 WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .map(|row| whipplescript_store::branches::ChangeUnitCursor {
+                indexed_cuts: match &row[0] {
+                    SqlValue::Int(value) => *value,
+                    other => as_text(other).parse().unwrap_or(0),
+                },
+                last_indexed_cut_id: as_opt_text(&row[1]),
+            })
+            .unwrap_or(whipplescript_store::branches::ChangeUnitCursor {
+                indexed_cuts: 0,
+                last_indexed_cut_id: None,
+            }))
+    }
+
+    fn append_change_unit_rows(
+        &mut self,
+        branch_id: &str,
+        rows: &[whipplescript_store::branches::ChangeUnitRow],
+        indexed_cuts: i64,
+        last_indexed_cut_id: Option<&str>,
+    ) -> StoreResult<()> {
+        for row in rows {
+            self.sql
+                .execute(
+                    "INSERT INTO change_units \
+                     (branch_id, cut_seq, cut_id, path, before_hash, after_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    &[
+                        text(&row.branch_id),
+                        SqlValue::Int(row.cut_seq),
+                        text(&row.cut_id),
+                        text(&row.path),
+                        opt_text(row.before_hash.as_deref()),
+                        opt_text(row.after_hash.as_deref()),
+                    ],
+                )
+                .map_err(sql_err)?;
+        }
+        self.sql
+            .execute(
+                "INSERT INTO change_unit_cursor (branch_id, indexed_cuts, last_indexed_cut_id) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(branch_id) DO UPDATE SET indexed_cuts = ?2, \
+                 last_indexed_cut_id = ?3",
+                &[
+                    text(branch_id),
+                    SqlValue::Int(indexed_cuts),
+                    opt_text(last_indexed_cut_id),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn list_change_unit_rows(
+        &self,
+        branch_id: &str,
+        from_cut_seq: i64,
+    ) -> StoreResult<Vec<whipplescript_store::branches::ChangeUnitRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash \
+                 FROM change_units WHERE branch_id = ?1 AND cut_seq >= ?2 \
+                 ORDER BY cut_seq ASC, rowid ASC",
+                &[text(branch_id), SqlValue::Int(from_cut_seq)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| whipplescript_store::branches::ChangeUnitRow {
+                branch_id: as_text(&row[0]),
+                cut_seq: match &row[1] {
+                    SqlValue::Int(value) => *value,
+                    other => as_text(other).parse().unwrap_or(0),
+                },
+                cut_id: as_text(&row[2]),
+                path: as_text(&row[3]),
+                before_hash: as_opt_text(&row[4]),
+                after_hash: as_opt_text(&row[5]),
+            })
+            .collect())
+    }
+
+    fn reset_change_unit_index(&mut self, branch_id: &str) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "DELETE FROM change_units WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "DELETE FROM change_unit_cursor WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>> {
         let rows = self
             .sql
             .query(
                 "SELECT cut_id, change_id, branch_id, manifest_hash, \
-                 parent_cut_id, origin, recorded_at FROM cuts WHERE cut_id = ?1",
+                 parent_cut_id, origin, actor, intent, recorded_at \
+                 FROM cuts WHERE cut_id = ?1",
                 &[text(cut_id)],
             )
             .map_err(sql_err)?;
@@ -594,8 +725,8 @@ impl<S: DoSql> Branches for DoBranches<S> {
             .sql
             .query(
                 "SELECT cut_id, change_id, branch_id, manifest_hash, \
-                 parent_cut_id, origin, recorded_at FROM cuts \
-                 WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
+                 parent_cut_id, origin, actor, intent, recorded_at \
+                 FROM cuts WHERE branch_id = ?1 ORDER BY rowid DESC LIMIT ?2",
                 &[text(branch_id), SqlValue::Int(limit as i64)],
             )
             .map_err(sql_err)?;
@@ -791,7 +922,9 @@ fn decode_cut_row(row: &[SqlValue]) -> CutRow {
         manifest_hash: as_text(&row[3]),
         parent_cut_id: as_opt_text(&row[4]),
         origin: as_opt_text(&row[5]),
-        recorded_at: as_text(&row[6]),
+        actor: as_opt_text(&row[6]),
+        intent: as_opt_text(&row[7]),
+        recorded_at: as_text(&row[8]),
     }
 }
 

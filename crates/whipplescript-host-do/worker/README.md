@@ -61,11 +61,55 @@ reference:
    and broker sentinel; GaugeDesk refreshes and injects the short-lived access
    token and account id locally.
 4. **Deploy**: `npm run deploy` (`wrangler deploy`).
+
+## Private Home runtime
+
+`wrangler.private-staging.toml` is the unpublished managed-Machine Durable
+workflow composition. It reuses `WorkflowInstance`, but its entrypoint accepts
+only exact `/v1/homes/.../commands/.../attempts/.../host/...` requests carrying
+a short-lived P-256 Home grant. The grant binds the Home, tenant, project,
+work-target basis, command, epoch, package, capabilities, request method/path,
+and request-body digest.
+
+This composition intentionally has no public-session admission, deployment,
+collection, public credential, executor-container, or public route binding.
+Set `WHIP_CONTROL_TOKEN` (internal Worker-to-object authentication),
+`HOME_ADMISSION_KEYS` (a JSON map of Home key ids to public P-256 JWKs), and
+the private model-broker configuration before running
+`npm run deploy:private-staging`.
+
+`npm run test:private-staging` proves unauthorized, tampered, and correctly
+signed-but-invalid policy handling. To prove real Durable Object persistence
+across an isolate replacement, run `test:private-staging:open -- <state-file>`,
+redeploy the same Worker, then run
+`test:private-staging:resume -- <state-file>`. The state file contains only
+public command, package, policy, instance, and position evidence; the signer JWK
+is supplied separately as `MACHINE_STAGING_SIGNER_JWK`.
 5. **Validate**: use the canonical managed route
    `/v1/tenants/:tenant/placements/:placement/host/...` (Bearer
    `WHIP_CONTROL_TOKEN`), or `POST /start` for the legacy workflow surface, and confirm the
    instance drives to `completed` — an effect-free workflow in one `step`, a coerce/
    agent workflow across `needs_http` rounds.
+
+## Regenerating the cross-language collection vector
+
+GaugeDesk's Rust opener must decrypt what this object seals, and the only honest
+way to check that is to hand it bytes this object actually emitted:
+
+```
+npm run capture:collection-vector   # writes ./collection-emitted-vector.json
+```
+
+It runs the `emitCollection` integration test under workerd and writes the
+deposited artifact — envelope, ciphertext, wraps, and the recipient's private
+half — to disk. Copy the file to
+`gaugedesk/crates/app/tests/collection-emitted-vector.json`; that is where the
+opener that has to agree with it lives, and where the vector is committed.
+
+The capture is deliberately opt-in via `COLLECTION_VECTOR_OUT`: an ordinary
+`npm test` must not rewrite a committed vector, or the vector stops being a fixed
+point anyone reviewed. A wholesale rewrite of the file is a claim that the seal
+changed; review it as one.
 
 ## The integration contract (three seams)
 

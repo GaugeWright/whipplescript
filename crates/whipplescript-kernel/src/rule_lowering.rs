@@ -265,6 +265,20 @@ pub fn ready_contexts(
     effects: &[EffectView],
     started_event_id: Option<&str>,
 ) -> ReadyContexts {
+    ready_contexts_for(ir, rule, facts, effects, started_event_id, None)
+}
+
+/// [`ready_contexts`] with the matching instance's own principal (DR-0052
+/// sugar: `line changed by others` excludes exactly this instance's own
+/// writes; `None` = no exclusion, the bare `line changed` semantics).
+pub fn ready_contexts_for(
+    ir: &IrProgram,
+    rule: &IrRule,
+    facts: &[FactView],
+    effects: &[EffectView],
+    started_event_id: Option<&str>,
+    own_actor: Option<&str>,
+) -> ReadyContexts {
     let mut contexts = vec![RuleContext {
         trigger_event_id: started_event_id.map(str::to_owned),
         identity: None,
@@ -314,6 +328,8 @@ pub fn ready_contexts(
                 .filter(|fact| fact.name == schema || fact.name == normalize_pattern_name(schema))
                 .filter(|fact| pattern_agent_matches(ir, schema, fact))
                 .filter(|fact| pattern_tracker_matches(schema, fact))
+                .filter(|fact| pattern_stream_matches(schema, fact))
+                .filter(|fact| pattern_others_matches(schema, fact, own_actor))
                 .cloned()
                 .collect::<Vec<_>>();
             if matching.is_empty() {
@@ -383,6 +399,7 @@ pub fn ready_contexts(
                 fact.name == normalized
                     && pattern_agent_matches(ir, pattern, fact)
                     && pattern_tracker_matches(pattern, fact)
+                    && pattern_stream_matches(pattern, fact)
             });
             if !satisfied {
                 return ReadyContexts::empty(guard_reports);
@@ -468,6 +485,39 @@ pub fn pattern_tracker_matches(pattern: &str, fact: &FactView) -> bool {
         .get("queue")
         .and_then(Value::as_str)
         .is_none_or(|fact_queue| fact_queue == tracker)
+}
+
+/// For the std.vcs stream sugar (`<stream> has contention`, `<stream>
+/// promoted`, `<stream> is quiescent`): the fact's `stream` field must
+/// name the pattern's leading word. Every other pattern passes.
+pub fn pattern_stream_matches(pattern: &str, fact: &FactView) -> bool {
+    let words: Vec<&str> = pattern.split_whitespace().collect();
+    let stream = match words.as_slice() {
+        [stream, "has", "contention"] | [stream, "promoted"] | [stream, "is", "quiescent"] => {
+            *stream
+        }
+        _ => return true,
+    };
+    json_from_str(&fact.value_json)
+        .get("stream")
+        .and_then(Value::as_str)
+        .is_none_or(|fact_stream| fact_stream == stream)
+}
+
+/// `line changed by others` (DR-0052): exclude the matching instance's
+/// own writes. With no own-principal in scope (tests, projections) the
+/// phrase matches everything, same as bare `line changed`.
+pub fn pattern_others_matches(pattern: &str, fact: &FactView, own_actor: Option<&str>) -> bool {
+    if pattern.trim() != "line changed by others" {
+        return true;
+    }
+    let Some(own) = own_actor else {
+        return true;
+    };
+    json_from_str(&fact.value_json)
+        .get("by")
+        .and_then(Value::as_str)
+        .is_none_or(|by| by != own)
 }
 
 /// For `<agent> completed turn` patterns where the leading word names a
@@ -664,6 +714,7 @@ pub fn empty_ir_program() -> IrProgram {
         uses: Vec::new(),
         harnesses: Vec::new(),
         trackers: Vec::new(),
+        streams: Vec::new(),
         channels: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
@@ -3825,6 +3876,77 @@ pub fn parse_effect_statements(
                 after: current_after,
             });
             index = next_index;
+        } else if let Some(rest) = trimmed.strip_prefix("undo ") {
+            // undo "<selection>" as <binding> (std.vcs, DR-0052 R4): a
+            // proposal cut excluding the selection's writes on the
+            // instance's own bound line. The selection is an expression
+            // (a literal validates statically; a dynamic value validates
+            // at execution); carried raw for the input builder.
+            let selection = match rest.rsplit_once(" as ") {
+                Some((expr, _)) => expr.trim().to_owned(),
+                None => rest.trim().to_owned(),
+            };
+            let target = "vcs.undo".to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("undo".to_owned()),
+                binding: binding_after_as(trimmed),
+                args: vec![selection],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
+        } else if let Some(rest) = trimmed.strip_prefix("transport ") {
+            // transport "<selection>" onto <stream|mainline> as <binding>
+            // (std.vcs, DR-0052 R4): the selection's net content lands on
+            // the nameable tier as one identity-preserving cut.
+            let (selection, tail) = match rest.split_once(" onto ") {
+                Some((expr, tail)) => (expr.trim().to_owned(), tail),
+                None => (rest.trim().to_owned(), ""),
+            };
+            let onto = tail
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let target = "vcs.transport".to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("transport".to_owned()),
+                binding: binding_after_as(trimmed),
+                args: vec![selection, onto],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
+        } else if let Some(rest) = trimmed.strip_prefix("promote ") {
+            // promote <stream> as <binding> (std.vcs, DR-0052): the
+            // boundary hop lowers to a `vcs.promote` capability.call whose
+            // input carries the stream name; the outcome's `variant`
+            // (Promoted|Conflicted) is what the after-arms dispatch on.
+            let stream = rest.split_whitespace().next().unwrap_or("").to_owned();
+            let target = "vcs.promote".to_owned();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "capability.call".to_owned(),
+                target: Some(target.clone()),
+                name: Some("promote".to_owned()),
+                binding: binding_after_as(trimmed),
+                args: vec![stream],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec![target],
+                after: current_after,
+            });
         } else if let Some(rest) = trimmed.strip_prefix("call ") {
             let target = rest
                 .split_whitespace()
@@ -3984,6 +4106,7 @@ pub fn parsed_effect_input_json(
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
             "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell, &ir.file_stores),
             "turn_skills": effect_turn_skills_json(rule, effect, IrEffectKind::AgentTell),
+            "on_stream": effect_on_stream_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
             "bindings": context_bindings_json(context),
         }),
@@ -4648,6 +4771,37 @@ pub fn parsed_effect_input_json(
                 "rule": rule.name,
             })
         }
+        "capability.call" if effect.name.as_deref() == Some("undo") => json!({
+            "target": effect.target,
+            "selection": parse_field_value_scoped(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+                live_facts,
+                live_effects,
+                live_ir,
+            ),
+            "bindings": context_bindings_json(context),
+            "rule": rule.name,
+        }),
+        "capability.call" if effect.name.as_deref() == Some("transport") => json!({
+            "target": effect.target,
+            "selection": parse_field_value_scoped(
+                effect.args.first().map(String::as_str).unwrap_or_default(),
+                context,
+                live_facts,
+                live_effects,
+                live_ir,
+            ),
+            "onto": effect.args.get(1).cloned().unwrap_or_default(),
+            "bindings": context_bindings_json(context),
+            "rule": rule.name,
+        }),
+        "capability.call" if effect.name.as_deref() == Some("promote") => json!({
+            "target": effect.target,
+            "stream": effect.args.first().cloned().unwrap_or_default(),
+            "bindings": context_bindings_json(context),
+            "rule": rule.name,
+        }),
         "capability.call" => json!({
             "target": effect.target,
             "bindings": context_bindings_json(context),
@@ -4770,6 +4924,28 @@ pub fn effect_access_grants_json(
 
 /// The turn-scoped `with skills [...]` pins on an `agent.tell` effect (context-assembly
 /// Phase 7), emitted into the effect input so the harness records them as provenance.
+/// `on stream <name>` (std.vcs) carried into the turn input — the
+/// harness's per-turn homing override.
+pub fn effect_on_stream_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffectKind) -> Value {
+    rule.metadata
+        .effects
+        .iter()
+        .find(|node| {
+            if node.kind != kind {
+                return false;
+            }
+            if let Some(binding) = &effect.binding {
+                if node.binding.as_ref() != Some(binding) {
+                    return false;
+                }
+            }
+            node.agent == effect.target
+        })
+        .and_then(|node| node.on_stream.clone())
+        .map(Value::String)
+        .unwrap_or(Value::Null)
+}
+
 pub fn effect_turn_skills_json(rule: &IrRule, effect: &ParsedEffect, kind: IrEffectKind) -> Value {
     let Some(node) = rule.metadata.effects.iter().find(|node| {
         if node.kind != kind {
@@ -5845,7 +6021,8 @@ pub fn fact_matches_after_predicate(name: &str, payload: &Value, predicate: &str
         }
         // Coordination outcomes (spec/coordination.md): the op completed and
         // its sum-typed value carries the matching variant.
-        "held" | "contended" | "ok" | "over" => {
+        "held" | "contended" | "ok" | "over" | "promoted" | "conflicted" | "applied"
+        | "stranded" => {
             status == Some("completed")
                 && payload
                     .pointer("/value/variant")

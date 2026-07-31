@@ -464,6 +464,7 @@ fn parse_provider(name: &str) -> Result<CoerceProvider, String> {
 /// effects on a worker thread pool, not async).
 pub struct UreqCoerceTransport {
     agent: ureq::Agent,
+    workspace_egress_token: Option<String>,
 }
 
 impl UreqCoerceTransport {
@@ -472,7 +473,15 @@ impl UreqCoerceTransport {
             .timeout(timeout)
             .user_agent("whipplescript-coerce")
             .build();
-        Self { agent }
+        Self {
+            agent,
+            workspace_egress_token: None,
+        }
+    }
+
+    pub fn with_workspace_egress_token(mut self, token: Option<String>) -> Self {
+        self.workspace_egress_token = token;
+        self
     }
 }
 
@@ -481,6 +490,9 @@ impl CoerceTransport for UreqCoerceTransport {
         let mut builder = self.agent.post(&request.url);
         for (name, value) in &request.headers {
             builder = builder.set(name, value);
+        }
+        if let Some(token) = &self.workspace_egress_token {
+            builder = builder.set("x-gaugewright-workspace-egress-token", token);
         }
         // We know the response is an SSE stream from the request's own Accept
         // header — don't rely on the server's (sometimes absent) content-type.

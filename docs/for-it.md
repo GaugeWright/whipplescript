@@ -55,7 +55,7 @@ this site is not prose.
    authorize one deliberate crossing. Refer to
    [Govern a workflow](tutorials/governance.md).
 3. Write your policy file for one real data source. The
-   [`examples/infoflow/`](https://github.com/jamesjscully/whipplescript/tree/main/examples/infoflow)
+   [`examples/infoflow/`](https://github.com/GaugeWright/whipplescript/tree/main/examples/infoflow)
    directory has a policy for a CRM, a public inbox, and a reply channel.
 4. Give your staff [GaugeDesk](https://gaugewright.com/gaugedesk/) with that
    policy applied. They install nothing.

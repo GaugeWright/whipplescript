@@ -133,6 +133,18 @@ pub mod std_manifests {
             "std.memory",
             include_str!("../vendored-std/manifests/memory.json"),
         ),
+        // Runtime identity for the versioned-workspace package (DR-0052
+        // grammar pass): the `vcs.promote` effect contract + the `promote
+        // <stream>` effect_operation construct (the parser grammar rides
+        // the same manifest via STD_MANIFESTS), and the capability /
+        // provider / binding rows admitting the boundary hop natively
+        // (`std.vcs.native`) or under the fixture. The `stream` DECL
+        // grammar stays in std/grammars/vcs-grammar.json (build.rs-only):
+        // the manifest authorizes, it does not parse (M1).
+        (
+            "std.vcs",
+            include_str!("../vendored-std/manifests/vcs.json"),
+        ),
         (
             "std.messaging",
             include_str!("../vendored-std/manifests/messaging.json"),

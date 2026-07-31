@@ -93,7 +93,7 @@ mod WHIPPLESCRIPT-INFOFLOW-CONFIDENTIALITY is
   --- declassify has NO rule: there is no flow into B2 and no rule crosses a secret
   --- over a declassify, so B2 is the public projection carrying none of o's secret.
   --- Adding such a rule would make the declassified-path bite satisfiable.
-  --- (Grant-authorization of the declassify is the NMIF increment, modeled next.)
+  --- Grant-authorization of the declassify is the NMIF increment, modeled next.
 
   --- violation: a carried owner-secret reaching a sink audience p who cannot read
   --- it, p does not act-for o's reader authority r. Fires for too-low parties and

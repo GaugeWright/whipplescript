@@ -42,6 +42,7 @@ pub mod do_tools;
 #[cfg(target_arch = "wasm32")]
 pub mod do_wasm;
 pub mod do_worker;
+pub mod do_workstreams;
 /// GaugeDesk-compatible governance verification for hosted placements.
 pub mod governance;
 /// Placement-neutral projection of one governed hosted turn into the public

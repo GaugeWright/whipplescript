@@ -2,56 +2,143 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      deep:
+        description: Run formal, end-to-end, schema, and release-readiness checks
+        required: false
+        default: false
+        type: boolean
   push:
-    branches: ["**"]
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE-APACHE'
+      - 'LICENSE-MIT'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE-APACHE'
+      - 'LICENSE-MIT'
+  schedule:
+    - cron: "37 6 * * 2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  checks:
+  quality:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust tests
+        run: cargo test --workspace
+
+  formal-models:
+    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install Maude
         run: |
           sudo apt-get update
           sudo apt-get install -y maude
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
-
       - name: Install Python tooling
         run: python3 -m pip install --user -r requirements-dev.txt
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Rust tests
-        run: cargo test --workspace
-
       - name: Formal model checks
-        run: scripts/check-formal-models.sh
+        run: WHIPPLESCRIPT_FORMAL_SKIP_TLA=1 scripts/check-formal-models.sh
 
+  tla-models:
+    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
       - name: TLA model checks
         run: scripts/check-tla-models.sh
 
+  e2e:
+    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: E2E smoke
         run: scripts/check-e2e.sh
 
-      - name: Release readiness
-        run: scripts/check-release-readiness.sh
+  report-schemas:
+    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Maude
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maude
+      - name: Install Python tooling
+        run: python3 -m pip install --user -r requirements-dev.txt
+      - name: Report schema checks
+        run: scripts/check-report-schemas.sh
 
+  release-readiness:
+    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Python tooling
+        run: python3 -m pip install --user -r requirements-dev.txt
+      - name: Release readiness
+        run: WHIPPLESCRIPT_RELEASE_SKIP_REPORT_SCHEMAS=1 scripts/check-release-readiness.sh
       - name: Upload readiness reports
         if: always()
         uses: actions/upload-artifact@v7

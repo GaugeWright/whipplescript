@@ -13,6 +13,7 @@
 //! inter  := prim ( '&' prim )*
 //! prim   := atom | '(' expr ')'
 //! atom   := path(<glob>) | by-effect(<prefix>) | by-origin(<prefix>)
+//!         | by(<prefix>) | intent(<prefix>)
 //!         | in-branch(<id>) | change(<id>) | cut(<id>)
 //!         | since(<stamp>) | until(<stamp>) | dependents-of(expr)
 //! ```
@@ -42,6 +43,11 @@ pub struct ChangeUnit {
     pub before: Option<String>,
     pub after: Option<String>,
     pub origin: Option<String>,
+    /// The cut's observed principal (DR-0052; `None` = pre-actor row).
+    pub actor: Option<String>,
+    /// The motivating work item / incident id, when the operation
+    /// carried one (repair cuts always do; ordinary writes may not).
+    pub intent: Option<String>,
     pub recorded_at: String,
 }
 
@@ -58,6 +64,16 @@ pub enum SelAtom {
     Path(String),
     ByEffect(String),
     ByOrigin(String),
+    /// Actor prefix (DR-0052 A2): `by(s:sess-7)` selects that session's
+    /// units, `by(s:)` every session's, `by(git:)` everything imported.
+    /// Prefix matching over the namespaced principal string is the v1
+    /// chain approximation — tier-precise joins arrive with session
+    /// carriage.
+    ByActor(String),
+    /// Intent prefix: the tracker item / incident that motivated the
+    /// cut. Empty until intent-carrying operations (repair, ingest)
+    /// record it.
+    ByIntent(String),
     InBranch(String),
     Change(String),
     Cut(String),
@@ -186,6 +202,8 @@ impl<'a> Parser<'a> {
             "path" => SelAtom::Path(arg),
             "by-effect" => SelAtom::ByEffect(arg),
             "by-origin" => SelAtom::ByOrigin(arg),
+            "by" => SelAtom::ByActor(arg),
+            "intent" => SelAtom::ByIntent(arg),
             "in-branch" => SelAtom::InBranch(arg),
             "change" => SelAtom::Change(arg),
             "cut" => SelAtom::Cut(arg),
@@ -272,6 +290,16 @@ fn eval_atom(atom: &SelAtom, universe: &[ChangeUnit]) -> BTreeSet<usize> {
                 .as_deref()
                 .is_some_and(|origin| origin.starts_with(prefix.as_str()))
         }),
+        SelAtom::ByActor(prefix) => pick(&|unit| {
+            unit.actor
+                .as_deref()
+                .is_some_and(|actor| actor.starts_with(prefix.as_str()))
+        }),
+        SelAtom::ByIntent(prefix) => pick(&|unit| {
+            unit.intent
+                .as_deref()
+                .is_some_and(|intent| intent.starts_with(prefix.as_str()))
+        }),
         SelAtom::InBranch(branch) => pick(&|unit| unit.branch_id == *branch),
         SelAtom::Change(change) => pick(&|unit| unit.change_id == *change),
         SelAtom::Cut(cut) => pick(&|unit| unit.cut_id == *cut),
@@ -328,8 +356,52 @@ mod tests {
             before: None,
             after: Some(format!("h{seq}")),
             origin: Some(format!("write:{path}")),
+            actor: None,
+            intent: None,
             recorded_at: at.to_owned(),
         }
+    }
+
+    fn unit_by(seq: usize, cut: &str, path: &str, actor: &str, at: &str) -> ChangeUnit {
+        ChangeUnit {
+            actor: Some(actor.to_owned()),
+            ..unit(seq, cut, path, at)
+        }
+    }
+
+    /// DR-0052 A2: `by(<prefix>)` selects over the namespaced principal —
+    /// exact session, whole-namespace sweeps (`by(s:)`, `by(git:)`) — and
+    /// composes with the algebra; pre-actor rows (`None`) never match.
+    /// `intent(<prefix>)` mirrors it over the intent tier.
+    #[test]
+    fn actor_and_intent_atoms_select_and_compose() {
+        let universe = vec![
+            unit_by(0, "c1", "src/a.rs", "s:sess-7", "t1"),
+            unit_by(1, "c2", "src/b.rs", "s:sess-9", "t2"),
+            unit_by(2, "c3", "docs/c.md", "git:alice@example.com", "t3"),
+            unit(3, "c4", "src/a.rs", "t4"), // pre-actor row
+        ];
+        let by_session = eval(&parse("by(s:sess-7)").expect("parse"), &universe);
+        assert_eq!(by_session, BTreeSet::from([0]));
+        let all_sessions = eval(&parse("by(s:)").expect("parse"), &universe);
+        assert_eq!(all_sessions, BTreeSet::from([0, 1]));
+        let imported = eval(&parse("by(git:)").expect("parse"), &universe);
+        assert_eq!(imported, BTreeSet::from([2]));
+        // What others built on session 7's work: dependents minus its own.
+        let downstream = eval(
+            &parse("dependents-of(by(s:sess-7)) ~ by(s:sess-7)").expect("parse"),
+            &universe,
+        );
+        assert_eq!(downstream, BTreeSet::from([3]));
+        // Intent selects nothing until an operation records one, then
+        // prefix-matches.
+        assert!(eval(&parse("intent(inc-)").expect("parse"), &universe).is_empty());
+        let mut with_intent = universe.clone();
+        with_intent[1].intent = Some("inc-42".to_owned());
+        assert_eq!(
+            eval(&parse("intent(inc-)").expect("parse"), &with_intent),
+            BTreeSet::from([1])
+        );
     }
 
     #[test]

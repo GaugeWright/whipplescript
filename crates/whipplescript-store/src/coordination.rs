@@ -102,10 +102,13 @@ impl CoordinationStore {
             }
         }
         let connection = Connection::open(path)?;
+        // Install the lock wait before the first schema-affecting PRAGMA. On a
+        // fresh shared store, concurrent workers can otherwise race while
+        // enabling WAL and fail immediately with SQLITE_BUSY.
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
             "#,
         )?;
@@ -1025,7 +1028,7 @@ fn ensure_partitioned_schema(connection: &Connection) -> StoreResult<()> {
 fn create_leases_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        CREATE TABLE leases (
+        CREATE TABLE IF NOT EXISTS leases (
             owner TEXT NOT NULL,
             resource TEXT NOT NULL,
             key TEXT NOT NULL,
@@ -1043,7 +1046,7 @@ fn create_leases_table(connection: &Connection) -> StoreResult<()> {
 fn create_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        CREATE TABLE ledger_entries (
+        CREATE TABLE IF NOT EXISTS ledger_entries (
             owner TEXT NOT NULL,
             ledger TEXT NOT NULL,
             partition TEXT NOT NULL,
@@ -1062,7 +1065,7 @@ fn create_ledger_entries_table(connection: &Connection) -> StoreResult<()> {
 fn create_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        CREATE TABLE ledger_seq (
+        CREATE TABLE IF NOT EXISTS ledger_seq (
             owner TEXT NOT NULL,
             ledger TEXT NOT NULL,
             next_seq INTEGER NOT NULL,
@@ -1077,7 +1080,7 @@ fn create_ledger_seq_table(connection: &Connection) -> StoreResult<()> {
 fn create_counters_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        CREATE TABLE counters (
+        CREATE TABLE IF NOT EXISTS counters (
             owner TEXT NOT NULL,
             counter TEXT NOT NULL,
             key TEXT NOT NULL,
@@ -1094,7 +1097,7 @@ fn create_counters_table(connection: &Connection) -> StoreResult<()> {
 fn create_coord_applied_table(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         r#"
-        CREATE TABLE coord_applied (
+        CREATE TABLE IF NOT EXISTS coord_applied (
             owner TEXT NOT NULL,
             effect_id TEXT NOT NULL,
             outcome_json TEXT NOT NULL,
@@ -1222,14 +1225,55 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
     Ok(false)
 }
 
-/// `payload_json` parsed leniently for projections.
-pub fn entry_payload(entry: &LedgerEntry) -> Value {
-    serde_json::from_str(&entry.payload_json).unwrap_or(Value::Null)
+/// `payload_json` parsed for projections. A payload this build cannot parse
+/// (for example one written by a newer encoder) surfaces as an error carrying
+/// the entry's identity instead of silently projecting `Null` — a silent null
+/// is indistinguishable from an empty payload and loses data without a trace
+/// (DR-0054 Phase A).
+pub fn entry_payload(entry: &LedgerEntry) -> StoreResult<Value> {
+    serde_json::from_str(&entry.payload_json).map_err(|error| {
+        crate::StoreError::Conflict(format!(
+            "ledger entry {}/{}/{} seq {} has an unreadable payload: {error}",
+            entry.owner, entry.ledger, entry.partition, entry.seq
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_payload_surfaces_an_unreadable_payload_with_row_identity() {
+        let entry = LedgerEntry {
+            owner: "shared".to_owned(),
+            ledger: "decisions".to_owned(),
+            partition: "main".to_owned(),
+            seq: 7,
+            payload_json: "not json".to_owned(),
+            appended_by: "worker-1".to_owned(),
+            appended_at: "2026-07-31 00:00:00".to_owned(),
+        };
+        let error = entry_payload(&entry).expect_err("unreadable payload must fail closed");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("shared/decisions/main seq 7"),
+            "diagnostic must carry the entry identity: {rendered}"
+        );
+        assert!(
+            rendered.contains("unreadable payload"),
+            "diagnostic must name the failure: {rendered}"
+        );
+
+        let readable = LedgerEntry {
+            payload_json: "{\"vote\":\"yes\"}".to_owned(),
+            ..entry
+        };
+        assert_eq!(
+            entry_payload(&readable).expect("well-formed payload parses"),
+            serde_json::json!({"vote": "yes"})
+        );
+    }
 
     /// A temp directory removed when the binding drops, panic included. Owning
     /// the directory rather than the `.sqlite` file means the `-shm`/`-wal`
@@ -1260,6 +1304,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn concurrent_first_open_initializes_schema_idempotently() {
+        let dir = TempStoreDir::new("concurrent-first-open");
+        let path = dir.store_path();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        CoordinationStore::open(path)
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:?}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("schema opener thread")
+                    .expect("concurrent schema open");
+            }
+        });
     }
 
     /// A store whose temp directory dies with it. `Deref`/`DerefMut` keep the

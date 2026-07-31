@@ -367,7 +367,7 @@ instance failed.
   to [providers & packages](../providers.md).
 - Add a typed model review with `coerce`. Do not trust the summary of the turn.
   Refer to
-  [`examples/queue-worker-with-review.whip`](https://github.com/jamesjscully/whipplescript/blob/main/examples/queue-worker-with-review.whip).
+  [`examples/queue-worker-with-review.whip`](https://github.com/GaugeWright/whipplescript/blob/main/examples/queue-worker-with-review.whip).
 - [Tutorial 3](governance.md) puts the data flows of this workflow in a signed
   governance envelope.
 - Read the [manual](../manual.md) for authoring guidance about retries,

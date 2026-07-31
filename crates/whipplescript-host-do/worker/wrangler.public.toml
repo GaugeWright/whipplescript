@@ -2,6 +2,10 @@
 # has its own Session DO namespace, and intentionally has no executor, turn
 # container, private-host broker, route, or workers.dev trigger.
 name = "whipplescript-public-runtime"
+# Pinned so a deploy cannot silently land in the wrong account. Wrangler resolves
+# the account from the ambient OAuth session when this is absent, and the founder's
+# personal account is still a valid login. A mismatched token now fails loudly.
+account_id = "1689dd452ba2d2d8eb1f3c364c92b3f4"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 workers_dev = false

@@ -39,13 +39,16 @@ import {
   evolve as evolveLifecycle,
   fold as foldLifecycle,
   isRejection as isLifecycleRejection,
+  UnknownLifecycleEventError,
   type LifecycleCommand,
   type LifecycleEvent,
   type LifecycleState,
 } from "./session-lifecycle";
 import {
   performDirectProviderFetch,
+  performManagedGatewayFetch,
   performModelBrokerFetch,
+  type ModelBrokerConfig,
   type ProviderUsage,
 } from "./model-broker";
 import {
@@ -190,6 +193,11 @@ export interface Env {
   // Only this final-fetch boundary may resolve one.
   PUBLIC_CREDENTIALS?: DurableObjectNamespace;
   WHIP_PUBLIC_CONTROL_TOKEN?: string;
+  // Managed funding (ADR 0085 §3/§6): the service-held AI Gateway token whose
+  // unified-billing credits pay for a metered turn. Not a customer credential —
+  // the deployment owner is billed onward from admitted usage, so no provider
+  // key belongs to any deployment. Read only at the final fetch boundary.
+  WHIP_GATEWAY_TOKEN?: string;
   // Secret shared with the executor/turn container sidecar. The DO sends it as
   // a bearer token on in-cluster calls; the sidecar rejects non-loopback calls
   // without it.
@@ -231,7 +239,11 @@ export class ExecutorContainer extends Container {
 const EXECUTOR_POOL_SIZE = 4;
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 
-// The DO schema (33 tables) as a bundled text module (wrangler.toml `rules`).
+// The instance's next due timer, kept as a stored fact rather than written
+// straight onto the object's single alarm — see `armAlarm`.
+const INSTANCE_DUE_KEY = "instance-next-due-unix-ms";
+
+// The DO schema (36 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
 
 // Builtin capability seeds, mirroring the native migration-0001 builtin rows
@@ -248,6 +260,29 @@ const BUILTIN_SEEDS = [
   `INSERT INTO profiles (profile_id, name, description, enforcement_mode, allowed_capabilities, config_json) VALUES ('profile_repo_reader', 'repo-reader', 'Allow repository reads and agent turns without writes.', 'enforce', '["agent.tell","repo.read","schema.coerce","event.emit","workflow.invoke"]', '{}')`,
 ];
 
+// DR-0054 Phase B: the highest `schema_migrations` version this deploy
+// understands. A rolled-back worker attached to an object stamped past this
+// must refuse rather than misread (or "lazily upgrade") a layout it has never
+// seen. Keep in step with the version rows `do_schema.sql` inserts.
+const SUPPORTED_DO_SCHEMA_VERSION = 1;
+
+/**
+ * DR-0054 Phase B: the object's durable schema is stamped with a version newer
+ * than this deploy supports. Fail closed — never serve over a misread layout,
+ * and never delete anything; the deploy that stamped it reads it fine.
+ */
+class UnsupportedSchemaVersionError extends Error {
+  constructor(found: number) {
+    super(
+      `durable object schema is at version ${found}, but this deploy supports up to ` +
+        `version ${SUPPORTED_DO_SCHEMA_VERSION}; it was written by a newer deploy. ` +
+        `Serve it with a deploy that supports version ${found} — the state is ` +
+        `intact, do not delete it`,
+    );
+    this.name = "UnsupportedSchemaVersionError";
+  }
+}
+
 // Idempotent first-touch bootstrap: a fresh DO has an empty SQLite; apply the
 // schema + builtin seeds exactly once (schema_migrations doubles as the marker).
 function ensureSchema(sql: SqlStorage): void {
@@ -259,6 +294,16 @@ function ensureSchema(sql: SqlStorage): void {
     for (const seed of BUILTIN_SEEDS) {
       sql.exec(seed);
     }
+  }
+  // DR-0054 Phase B downgrade guard: refuse BEFORE any lazy upgrade below
+  // touches an object written by a newer deploy — the additive tail assumes a
+  // layout this code knows, and running it over a newer one could corrupt it.
+  const stamped = sql
+    .exec(`SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations`)
+    .toArray() as { version: number }[];
+  const found = stamped[0]?.version ?? 0;
+  if (found > SUPPORTED_DO_SCHEMA_VERSION) {
+    throw new UnsupportedSchemaVersionError(found);
   }
   // Existing placement objects predate GaugeDesk's writer profile. Keep
   // additive runtime policy seeds outside the first-touch branch so a deploy
@@ -282,6 +327,53 @@ function ensureSchema(sql: SqlStorage): void {
     .toArray();
   if (hasAssignedTo.length === 0) {
     sql.exec(`ALTER TABLE tracker_issues ADD COLUMN assigned_to TEXT`);
+  }
+  // The tracker's alias/comment/evidence tables and the content-addressed
+  // event-id columns (ADR-0002 phase B1) shipped after objects existed, and the
+  // first-touch branch above never revisits an existing object. The production
+  // store queries all of them (`do_store.rs` tracker paths), so an object
+  // without them failed every such read. Add them lazily so a deploy upgrades
+  // existing Durable Objects exactly as `do_schema.sql` provisions fresh ones
+  // (DR-0054 Phase A).
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_aliases (
+    content_id TEXT PRIMARY KEY, alias TEXT NOT NULL UNIQUE
+  )`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_comments (
+    comment_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT,
+    body TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_evidence (
+    evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
+    note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  for (const [column, definition] of [
+    ["event_id", "event_id TEXT"],
+    ["parents_json", "parents_json TEXT NOT NULL DEFAULT '[]'"],
+  ] as const) {
+    const present = sql
+      .exec(
+        `SELECT name FROM pragma_table_info('tracker_events') WHERE name = ?`,
+        column,
+      )
+      .toArray();
+    if (present.length === 0) {
+      sql.exec(`ALTER TABLE tracker_events ADD COLUMN ${definition}`);
+    }
+  }
+  // Pre-upgrade rows carry NULL event_id (distinct under a SQLite unique
+  // index), so the dedup index is safe to add over an existing log.
+  sql.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id)`,
+  );
+  // DR-0054 Phase B: `events.format_version` is additive writer-version
+  // stamping — new rows record the event format their writer produced; legacy
+  // NULL rows read as version 1. Existing objects gain the column lazily, and
+  // no existing row is ever rewritten (the event log is canonical).
+  const hasFormatVersion = sql
+    .exec(`SELECT name FROM pragma_table_info('events') WHERE name = 'format_version'`)
+    .toArray();
+  if (hasFormatVersion.length === 0) {
+    sql.exec(`ALTER TABLE events ADD COLUMN format_version INTEGER`);
   }
   // Message-scoped image bodies are a broker cache, not part of the admitted
   // command. Existing objects acquire this additive table lazily.
@@ -565,8 +657,11 @@ interface PublicSessionBootstrap {
    * Exact non-secret credential reference supplied by the embedder. The runtime
    * carries it uninterpreted; only the privileged final-fetch boundary resolves
    * it (DR-0047 §5).
+   *
+   * Absent under managed funding: there is no customer credential, and the
+   * absence is what selects the metered gateway at turn time.
    */
-  credential_ref: string;
+  credential_ref?: string;
   package_version_ref: string;
   package: HostPackageDocuments;
   capabilities: string[];
@@ -614,6 +709,98 @@ interface PublicSessionState extends PublicSessionBootstrap {
   last_activity_unix_ms: number;
 }
 
+/**
+ * A stored `public-session-state` record this build cannot recognize
+ * (DR-0054 Phase A). Readers fail closed with this diagnosable error instead
+ * of dereferencing missing fields — a raw TypeError inside `alarm()` used to
+ * kill retention and collection for the object permanently. Nothing is
+ * deleted: the record stays in storage for diagnosis.
+ */
+class UnreadableSessionStateError extends Error {
+  constructor(detail: string) {
+    super(
+      `stored public session state is unreadable by this build (${detail}); ` +
+        "refusing to guess (fail closed, DR-0054)",
+    );
+    this.name = "UnreadableSessionStateError";
+  }
+}
+
+/**
+ * Compatibility bounds for a recognizable session record that predates the
+ * `retention` field. Matches the bounds GaugeDesk releases declare by default
+ * (idle 1h, absolute 24h) so a legacy session becomes expirable through the
+ * ordinary governed path rather than staying immortal — or being deleted
+ * outright, which DR-0054 forbids.
+ */
+const LEGACY_RETENTION_FALLBACK = {
+  idle_ttl_seconds: 3600,
+  absolute_ttl_seconds: 86400,
+};
+
+/**
+ * Validate the raw stored record's shape. A recognizable-but-legacy record
+ * (missing `retention` / `principal` / bootstrap timestamps) is normalized
+ * with deliberate compatibility values and reported; an unrecognizable one
+ * throws `UnreadableSessionStateError`. Pure over its input: repairs are
+ * applied to the returned object, never written back implicitly.
+ */
+function normalizeStoredSessionState(raw: unknown): {
+  session: PublicSessionState;
+  repairs: string[];
+} {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new UnreadableSessionStateError("record is not an object");
+  }
+  const candidate = raw as Partial<PublicSessionState> & Record<string, unknown>;
+  const missing = (
+    ["session_id", "release_id", "admission_scope", "instance_ref"] as const
+  ).filter((field) => typeof candidate[field] !== "string" || !candidate[field]);
+  if (missing.length) {
+    throw new UnreadableSessionStateError(
+      `missing identity fields: ${missing.join(", ")}`,
+    );
+  }
+  const repairs: string[] = [];
+  const session = { ...candidate } as PublicSessionState;
+  const retention = candidate.retention;
+  // Zero is a definite bound (expire now), not a missing one; only an absent
+  // or nonsensical shape takes the compatibility fallback.
+  if (
+    !retention ||
+    typeof retention !== "object" ||
+    !Number.isSafeInteger(retention.idle_ttl_seconds) ||
+    retention.idle_ttl_seconds < 0 ||
+    !Number.isSafeInteger(retention.absolute_ttl_seconds) ||
+    retention.absolute_ttl_seconds < retention.idle_ttl_seconds
+  ) {
+    session.retention = { ...LEGACY_RETENTION_FALLBACK };
+    repairs.push("retention");
+  }
+  const principal = candidate.principal;
+  if (
+    !principal ||
+    typeof principal !== "object" ||
+    typeof principal.label !== "string" ||
+    !principal.label
+  ) {
+    session.principal = { label: "legacy-unlabeled" };
+    repairs.push("principal");
+  }
+  const now = Date.now();
+  if (!Number.isFinite(candidate.created_at_unix_ms)) {
+    // No recorded open time: the current observation starts the absolute
+    // bound, which still guarantees a finite deadline.
+    session.created_at_unix_ms = now;
+    repairs.push("created_at_unix_ms");
+  }
+  if (!Number.isFinite(candidate.last_activity_unix_ms)) {
+    session.last_activity_unix_ms = session.created_at_unix_ms;
+    repairs.push("last_activity_unix_ms");
+  }
+  return { session, repairs };
+}
+
 interface PublicSessionEvent {
   sequence: number;
   type: string;
@@ -647,13 +834,53 @@ export class WorkflowInstance implements DurableObject {
     private env: Env,
   ) {}
 
+  /**
+   * DR-0054 Phase A: unrecognized durable state (an unknown lifecycle event
+   * row, an unreadable session record) fails closed as a structured 500 with
+   * the diagnosis logged, instead of an anonymous exception page. Nothing is
+   * deleted; a build that recognizes the state serves it again.
+   */
+  private failClosedResponse(error: unknown): Response | null {
+    if (
+      !(error instanceof UnknownLifecycleEventError) &&
+      !(error instanceof UnreadableSessionStateError) &&
+      !(error instanceof UnsupportedSchemaVersionError)
+    ) {
+      return null;
+    }
+    console.log(
+      JSON.stringify({
+        event: "durable_state_fail_closed",
+        error: String(error),
+      }),
+    );
+    return Response.json(
+      { error: `durable state is unreadable by this build: ${error.message}` },
+      { status: 500 },
+    );
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.routeFetch(request);
+    } catch (error) {
+      const failClosed = this.failClosedResponse(error);
+      if (failClosed) return failClosed;
+      throw error;
+    }
+  }
+
   // POST /start { program, input, principal } -- create + drive to the first
   // suspension or terminal. Subsequent external events / alarms re-enter and drive
   // further; the durable state is entirely in DO SQLite.
-  async fetch(request: Request): Promise<Response> {
+  private async routeFetch(request: Request): Promise<Response> {
     const authError = controlAuthError(request, this.env);
     if (authError) {
       return authError;
+    }
+    const privateRootError = this.pinPrivateGovernanceRoot(request);
+    if (privateRootError) {
+      return privateRootError;
     }
     const url = new URL(request.url);
     if (request.method === "GET") {
@@ -664,9 +891,7 @@ export class WorkflowInstance implements DurableObject {
         return this.publicSessionFiles(url);
       }
       if (url.pathname === "/public/session/socket") {
-        const session = await this.ctx.storage.get<PublicSessionState>(
-          "public-session-state",
-        );
+        const session = await this.readPublicSessionState();
         if (!session) {
           return Response.json(
             { error: "public session is not bootstrapped" },
@@ -816,9 +1041,7 @@ export class WorkflowInstance implements DurableObject {
   }
 
   private async publicSessionState(): Promise<Response> {
-    const session = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const session = await this.readPublicSessionState();
     if (!session) {
       return Response.json(
         { error: "public session is not bootstrapped" },
@@ -836,9 +1059,7 @@ export class WorkflowInstance implements DurableObject {
   private async claimPublicSession(
     parsed: Record<string, unknown>,
   ): Promise<Response> {
-    const session = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const session = await this.readPublicSessionState();
     const subjectHash =
       typeof parsed.subject_hash === "string" ? parsed.subject_hash : "";
     if (!session) {
@@ -1009,9 +1230,7 @@ export class WorkflowInstance implements DurableObject {
   }
 
   private async publicSessionFiles(url: URL): Promise<Response> {
-    const session = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const session = await this.readPublicSessionState();
     if (!session) {
       return Response.json(
         { error: "public session is not bootstrapped" },
@@ -1654,9 +1873,7 @@ export class WorkflowInstance implements DurableObject {
       if (attachment?.publicSession && parsed.type === "stop") {
         const requestId =
           typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
-        const publicSession = await this.ctx.storage.get<PublicSessionState>(
-          "public-session-state",
-        );
+        const publicSession = await this.readPublicSessionState();
         if (
           !publicSession ||
           !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)
@@ -1698,9 +1915,7 @@ export class WorkflowInstance implements DurableObject {
     result: Response,
   ): Promise<PublicSessionEvent | null> {
     const body = await result.json();
-    const publicSession = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const publicSession = await this.readPublicSessionState();
     if (!publicSession) {
       throw new Error("public turn lost its durable session");
     }
@@ -1720,9 +1935,7 @@ export class WorkflowInstance implements DurableObject {
     request_id?: unknown;
     text?: unknown;
   }): Promise<Response> {
-    const session = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const session = await this.readPublicSessionState();
     if (!session) {
       return Response.json(
         { error: "public session is not bootstrapped" },
@@ -1874,6 +2087,8 @@ export class WorkflowInstance implements DurableObject {
         input_tokens?: unknown;
         cached_input_tokens?: unknown;
         output_tokens?: unknown;
+        /** Every metered round's gateway cost pointer for this turn. */
+        reconciliation_refs?: unknown;
       };
       output?: {
         label_ref?: unknown;
@@ -2003,9 +2218,7 @@ export class WorkflowInstance implements DurableObject {
     body: Record<string, unknown>,
     succeeded: boolean,
   ): Promise<void> {
-    const session = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    const session = await this.readPublicSessionState();
     if (!session) throw new Error("public session is not bootstrapped");
     const requestId = publicRequestId(commandId);
     const reservation = await this.sessionAdmissionCommand(
@@ -2176,6 +2389,62 @@ export class WorkflowInstance implements DurableObject {
     return foldLifecycle(this.lifecycleEvents());
   }
 
+  /**
+   * Read and validate the durable session record (DR-0054 Phase A). Absent
+   * record -> null. A legacy-but-recognizable record is normalized with logged
+   * compatibility repairs and has its lifecycle log backfilled so the session
+   * is expirable. An unrecognizable record throws
+   * `UnreadableSessionStateError` — fail closed, never a raw TypeError, and
+   * never a deletion.
+   */
+  private async readPublicSessionState(): Promise<PublicSessionState | null> {
+    const raw = await this.ctx.storage.get<unknown>("public-session-state");
+    if (raw === undefined || raw === null) return null;
+    const { session, repairs } = normalizeStoredSessionState(raw);
+    if (repairs.length) {
+      console.log(
+        JSON.stringify({
+          event: "session_state_compat_normalized",
+          session_id: session.session_id,
+          repaired: repairs,
+        }),
+      );
+    }
+    this.backfillLegacyLifecycle(session);
+    return session;
+  }
+
+  /**
+   * A session record that predates the lifecycle log folds to `init`, and
+   * `init` refuses `observeDeadline` — such a session never expired and never
+   * tore down. Backfill the log (append-only) with the open/activate/activity
+   * observations the record itself attests, so the ordinary retention deadline
+   * exists from the next fold (DR-0054 Phase A). A session opened through the
+   * reducer has a non-empty log and is untouched.
+   */
+  private backfillLegacyLifecycle(session: PublicSessionState): void {
+    if (this.lifecycleEvents().length > 0) return;
+    console.log(
+      JSON.stringify({
+        event: "legacy_session_lifecycle_backfilled",
+        session_id: session.session_id,
+        opened_at_unix_ms: session.created_at_unix_ms,
+      }),
+    );
+    this.admitLifecycle({
+      kind: "open",
+      atMs: session.created_at_unix_ms,
+      collectionDeclared: Boolean(session.collection),
+    });
+    this.admitLifecycle({ kind: "activate" });
+    if (session.last_activity_unix_ms > session.created_at_unix_ms) {
+      this.admitLifecycle({
+        kind: "observeActivity",
+        atMs: session.last_activity_unix_ms,
+      });
+    }
+  }
+
   /** Admit one command. Returns the folded state, or null when refused. */
   private admitLifecycle(command: LifecycleCommand): LifecycleState | null {
     const state = this.lifecycleState();
@@ -2228,7 +2497,58 @@ export class WorkflowInstance implements DurableObject {
   private async schedulePublicSessionExpiry(
     session: PublicSessionState,
   ): Promise<void> {
-    await this.ctx.storage.setAlarm(this.publicSessionExpiryAt(session));
+    await this.armAlarm(session);
+  }
+
+  /**
+   * One object has one alarm, and two independent things need to wake it: the
+   * session's retention deadline and the instance's next due timer. Whichever
+   * comes first must win, and **neither may erase the other**.
+   *
+   * That second half was missing. The drive loop called `deleteAlarm()`
+   * unconditionally whenever an instance parked with nothing due, and driving
+   * is the last thing every turn does — so every turn silently disarmed
+   * retention. A session that ran even one turn then never expired, its
+   * declared collection stayed `pending` forever (the alarm is the only path
+   * that emits it), and the drain it should have fed was permanently empty.
+   * Only a session that never ran a turn kept its alarm and expired correctly,
+   * which is exactly the shape the symptom took in production.
+   *
+   * So the two deadlines are now folded here, and the drive loop records its
+   * due time as a fact rather than by writing the shared alarm directly.
+   */
+  private async armAlarm(session?: PublicSessionState): Promise<void> {
+    const deadlines: number[] = [];
+    const live =
+      session ??
+      (await this.readPublicSessionState());
+    if (live && this.lifecycleState().phase !== "tornDown") {
+      // A deadline already past means "expire now". Floor it a second out so a
+      // transiently-failing emission retries on a timer rather than spinning.
+      deadlines.push(
+        Math.max(this.publicSessionExpiryAt(live), Date.now() + 1_000),
+      );
+    }
+    const due = await this.ctx.storage.get<number>(INSTANCE_DUE_KEY);
+    if (due != null) deadlines.push(due);
+    if (deadlines.length === 0) {
+      console.log(
+        JSON.stringify({ event: "arm_alarm", armed: null, session: Boolean(live) }),
+      );
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const at = Math.min(...deadlines);
+    console.log(
+      JSON.stringify({
+        event: "arm_alarm",
+        armed: at,
+        in_ms: at - Date.now(),
+        phase: this.lifecycleState().phase,
+        instance_due: due ?? null,
+      }),
+    );
+    await this.ctx.storage.setAlarm(at);
   }
 
   /**
@@ -2246,8 +2566,25 @@ export class WorkflowInstance implements DurableObject {
    */
   private async emitCollection(session: PublicSessionState): Promise<void> {
     const policy = session.collection;
-    if (!policy) return;
-    if (this.lifecycleState().collection !== "pending") return;
+    // Both of these are silent no-ops by design, and that silence cost a long
+    // production hunt: an undeclared collection and an already-settled one look
+    // exactly like a working emission that had nothing to say.
+    if (!policy) {
+      console.log(
+        JSON.stringify({ event: "emit_collection", skipped: "no policy on session" }),
+      );
+      return;
+    }
+    if (this.lifecycleState().collection !== "pending") {
+      console.log(
+        JSON.stringify({
+          event: "emit_collection",
+          skipped: "not pending",
+          collection: this.lifecycleState().collection,
+        }),
+      );
+      return;
+    }
     ensureSchema(this.ctx.storage.sql);
 
     const prefix = `${session.instance_ref}/`;
@@ -2309,6 +2646,13 @@ export class WorkflowInstance implements DurableObject {
       artifact: sealed,
     });
     if (deposited instanceof Response) {
+      console.log(
+        JSON.stringify({
+          event: "emit_collection",
+          deposit_refused: deposited.status,
+          body: (await deposited.clone().text()).slice(0, 200),
+        }),
+      );
       // 4xx is the embedder refusing this artifact; 5xx is transient and stays
       // pending so the lease alarm brings us back.
       if (deposited.status >= 400 && deposited.status < 500) {
@@ -2343,6 +2687,47 @@ export class WorkflowInstance implements DurableObject {
       } catch {
         // A table absent on this object has nothing to tombstone.
       }
+    }
+    // DR-0054 Phase A: deleting the canonical `events`/`facts` rows while the
+    // `instances`/`effects`/`runs`/`leases` projections still said "running"
+    // left incoherent state — a later projection rebuild would fold zero events
+    // over a live instance row. Tombstone coherently: the handle rows survive
+    // as audit metadata, terminally marked so every reader refuses them instead
+    // of resuming (`commit_rule_inner` requires a `running` instance, and no
+    // scheduler predicate matches 'tombstoned'). Terminal statuses are left
+    // as-is — they are accurate audit metadata.
+    for (const statement of [
+      `UPDATE instances SET
+          last_error = 'retention tombstone (DR-0054): payload removed; prior status ' || status,
+          status = 'tombstoned',
+          completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+          updated_at = CURRENT_TIMESTAMP
+        WHERE status NOT IN ('completed', 'failed', 'timed_out', 'cancelled', 'tombstoned')`,
+      `UPDATE effects SET status = 'tombstoned', updated_at = CURRENT_TIMESTAMP
+        WHERE status NOT IN ('completed', 'failed', 'timed_out', 'cancelled', 'tombstoned')`,
+      `UPDATE runs SET status = 'tombstoned', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+        WHERE status = 'running'`,
+      `UPDATE leases SET status = 'tombstoned', released_at = COALESCE(released_at, CURRENT_TIMESTAMP)
+        WHERE released_at IS NULL`,
+    ]) {
+      try {
+        this.ctx.storage.sql.exec(statement);
+      } catch {
+        // A table absent on this object has nothing to mark.
+      }
+    }
+    // An explicit, queryable tombstone marker in the surviving audit tables:
+    // any rebuild/read of this object can see the payload was removed by
+    // governed retention rather than lost.
+    try {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO diagnostics (diagnostic_id, severity, code, message)
+         VALUES (?1, 'info', 'session.tombstoned',
+                 'retention tombstone (DR-0054): payload removed; handles, lifecycle events, and audit metadata retained')`,
+        `tombstone:${crypto.randomUUID()}`,
+      );
+    } catch {
+      // Diagnostics table absent on this object; the status marks remain.
     }
     const keys = [...(await this.ctx.storage.list()).keys()].filter(
       (key) =>
@@ -2451,6 +2836,148 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  private pinPrivateGovernanceRoot(request: Request): Response | undefined {
+    const signer = request.headers
+      .get("x-gaugewright-private-governance-signer")
+      ?.trim();
+    const key = request.headers
+      .get("x-gaugewright-private-governance-key")
+      ?.trim()
+      .toLowerCase();
+    const callback = request.headers
+      .get("x-gaugewright-private-callback")
+      ?.trim();
+    const executionGrant = request.headers
+      .get("x-gaugewright-private-execution-grant")
+      ?.trim();
+    const executionSignature = request.headers
+      .get("x-gaugewright-private-execution-signature")
+      ?.trim();
+    if (!signer && !key) return undefined;
+    if (!signer || !/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/.test(signer)) {
+      return Response.json(
+        { error: "private Home governance signer is invalid" },
+        { status: 403 },
+      );
+    }
+    if (!key || !/^04[0-9a-f]{128}$/.test(key)) {
+      return Response.json(
+        { error: "private Home governance key is invalid" },
+        { status: 403 },
+      );
+    }
+    let callbackUrl: URL;
+    try {
+      callbackUrl = new URL(callback ?? "");
+    } catch {
+      return Response.json(
+        { error: "private Home callback is invalid" },
+        { status: 403 },
+      );
+    }
+    if (
+      callbackUrl.protocol !== "https:"
+      || callbackUrl.username
+      || callbackUrl.password
+      || callbackUrl.search
+      || callbackUrl.hash
+      || !executionGrant
+      || executionGrant.length > 16_384
+      || !executionSignature
+      || executionSignature.length > 1_024
+    ) {
+      return Response.json(
+        { error: "private Home callback authorization is invalid" },
+        { status: 403 },
+      );
+    }
+    ensureSchema(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS private_governance_root (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         signer TEXT NOT NULL,
+         key TEXT NOT NULL
+       )`,
+    );
+    const existing = this.ctx.storage.sql
+      .exec(
+        "SELECT signer, key FROM private_governance_root WHERE singleton = 1",
+      )
+      .toArray() as { signer: string; key: string }[];
+    if (existing.length === 0) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO private_governance_root (singleton, signer, key)
+         VALUES (1, ?1, ?2)`,
+        signer,
+        key,
+      );
+    } else if (existing[0].signer !== signer || existing[0].key !== key) {
+      return Response.json(
+        { error: "private Home governance root changed for this command" },
+        { status: 403 },
+      );
+    }
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS private_execution_context (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         callback TEXT NOT NULL,
+         execution_grant TEXT NOT NULL,
+         execution_signature TEXT NOT NULL
+       )`,
+    );
+    const execution = this.ctx.storage.sql
+      .exec(
+        `SELECT callback FROM private_execution_context WHERE singleton = 1`,
+      )
+      .toArray() as { callback: string }[];
+    if (execution.length === 1 && execution[0].callback !== callbackUrl.toString()) {
+      return Response.json(
+        { error: "private Home callback changed for this command" },
+        { status: 403 },
+      );
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO private_execution_context
+         (singleton, callback, execution_grant, execution_signature)
+       VALUES (1, ?1, ?2, ?3)
+       ON CONFLICT(singleton) DO UPDATE SET
+         execution_grant = excluded.execution_grant,
+         execution_signature = excluded.execution_signature`,
+      callbackUrl.toString(),
+      executionGrant,
+      executionSignature,
+    );
+    return undefined;
+  }
+
+  private privateModelBrokerConfig(): ModelBrokerConfig | undefined {
+    ensureSchema(this.ctx.storage.sql);
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS private_execution_context (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         callback TEXT NOT NULL,
+         execution_grant TEXT NOT NULL,
+         execution_signature TEXT NOT NULL
+       )`,
+    );
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT callback, execution_grant, execution_signature
+           FROM private_execution_context WHERE singleton = 1`,
+      )
+      .toArray() as {
+        callback: string;
+        execution_grant: string;
+        execution_signature: string;
+      }[];
+    if (rows.length !== 1) return undefined;
+    return {
+      url: rows[0].callback,
+      executionGrant: rows[0].execution_grant,
+      executionSignature: rows[0].execution_signature,
+    };
+  }
+
   private pinnedGovernanceRoot(): { signer: string; key: string } | Response {
     ensureSchema(this.ctx.storage.sql);
     const publicRoot = this.ctx.storage.sql
@@ -2461,6 +2988,22 @@ export class WorkflowInstance implements DurableObject {
       .toArray() as { signer: string; key: string }[];
     if (publicRoot.length === 1) {
       return publicRoot[0];
+    }
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS private_governance_root (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         signer TEXT NOT NULL,
+         key TEXT NOT NULL
+       )`,
+    );
+    const privateRoot = this.ctx.storage.sql
+      .exec(
+        `SELECT signer, key FROM private_governance_root
+          WHERE singleton = 1`,
+      )
+      .toArray() as { signer: string; key: string }[];
+    if (privateRoot.length === 1) {
+      return privateRoot[0];
     }
     const signer = this.env.GAUGEDESK_GOVERNANCE_SIGNER?.trim();
     const key = this.env.GAUGEDESK_GOVERNANCE_KEY?.trim();
@@ -2508,8 +3051,14 @@ export class WorkflowInstance implements DurableObject {
       typeof policy.provider_binding_ref !== "string" ||
       typeof policy.credential_class !== "string" ||
       typeof policy.placement_ref !== "string" ||
-      typeof candidate.credential_ref !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate.credential_ref) ||
+      // Absent under managed funding, and that absence is the signal the turn
+      // runs on the metered gateway rather than a customer credential — see
+      // `resolveAdmittedProvider`. Present means BYOK and must still be an exact
+      // reference; a malformed one is refused rather than silently treated as
+      // absent, which would turn a typo into a bill charged to the wrong party.
+      (candidate.credential_ref !== undefined &&
+        (typeof candidate.credential_ref !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(candidate.credential_ref))) ||
       !Array.isArray(candidate.capabilities) ||
       !candidate.principal ||
       typeof candidate.principal.label !== "string" ||
@@ -2867,14 +3416,42 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  /**
+   * Which broker realization funds this turn (ADR 0085 §3).
+   *
+   * For a public session the choice is *whether an exact deployment credential
+   * was admitted*: one means BYOK, so the turn runs `direct` against the
+   * customer's own key; none means managed funding, so it runs `managed` on the
+   * service's metered gateway and the owner is billed from usage.
+   *
+   * Reading the absence of a credential as the managed signal is deliberate.
+   * The alternative — a separate "funding mode" flag — could disagree with the
+   * credential actually present, and the failure would be silent and expensive:
+   * a turn billed to the wrong party. Here the two cannot disagree, because
+   * there is only one fact.
+   */
   private resolveAdmittedProvider(
     admission: HostTurnAdmission,
+    exactPublicCredentialRef?: string,
   ): ResolvedHostProviderBinding | Response {
     try {
+      const privateBroker = this.privateModelBrokerConfig();
       return resolveHostedProvider(
         admission,
-        this.env,
-        this.isPublicSession() ? "direct" : "model-broker",
+        privateBroker
+          ? {
+              ...this.env,
+              WHIP_MODEL_BROKER_URL: privateBroker.url,
+              WHIP_MODEL_BROKER_TOKEN: undefined,
+              WHIP_MODEL_BROKER_EXECUTION_GRANT:
+                privateBroker.executionGrant,
+              WHIP_MODEL_BROKER_EXECUTION_SIGNATURE:
+                privateBroker.executionSignature,
+            }
+          : this.env,
+        this.isPublicSession()
+          ? (exactPublicCredentialRef ? "direct" : "managed")
+          : "model-broker",
       );
     } catch (error) {
       return Response.json(
@@ -2922,7 +3499,10 @@ export class WorkflowInstance implements DurableObject {
       const admission = JSON.parse(
         hostFunctions.host_validate_turn(makeBridge(this.ctx.storage.sql), ...common),
       ) as HostTurnAdmission;
-      const admittedBinding = this.resolveAdmittedProvider(admission);
+      const admittedBinding = this.resolveAdmittedProvider(
+        admission,
+        exactPublicCredentialRef,
+      );
       if (admittedBinding instanceof Response) return admittedBinding;
       const binding = exactPublicCredentialRef
         ? bindExactPublicCredential(admittedBinding, exactPublicCredentialRef)
@@ -3029,6 +3609,22 @@ export class WorkflowInstance implements DurableObject {
                   cached_input_tokens:
                     durableUsage.cached_input_tokens,
                   output_tokens: durableUsage.output_tokens,
+                  // Carried only when the round ran on the metered rail, so the
+                  // embedder can reconcile true cost against gateway telemetry
+                  // rather than trusting an estimated rate card (ADR 0085 §3).
+                  //
+                  // Taken from the *host's* observation rather than the runtime
+                  // projection, and the split is the point: WhippleScript owns
+                  // the token counts as signed evidence, while the gateway's log
+                  // id is something only this Worker saw, on a response header.
+                  // Folding a host observation into the runtime's meter would
+                  // misattribute who vouched for it.
+                  // Every round's log id, not the last one's. A turn is billed
+                  // as a whole; pricing it from its final round under-bills by
+                  // however many rounds preceded it.
+                  ...(driven.gateway_log_ids?.length
+                    ? { reconciliation_refs: driven.gateway_log_ids }
+                    : {}),
                 },
               }
             : {}),
@@ -3180,9 +3776,42 @@ export class WorkflowInstance implements DurableObject {
   // timers/deadlines scheduled this; re-enter and drive — the due-time pass
   // fires the timers, the rule pass sees the facts, and the run continues.
   async alarm(): Promise<void> {
-    const publicSession = await this.ctx.storage.get<PublicSessionState>(
-      "public-session-state",
-    );
+    try {
+      await this.sessionRetentionAlarm();
+    } catch (error) {
+      if (
+        !(error instanceof UnknownLifecycleEventError) &&
+        !(error instanceof UnreadableSessionStateError) &&
+        !(error instanceof UnsupportedSchemaVersionError)
+      ) {
+        throw error;
+      }
+      // DR-0054 Phase A: durable state this build cannot read fails closed
+      // WITHOUT killing retention permanently — the defect is logged with its
+      // diagnosis, nothing is deleted, and the alarm is re-armed so a deploy
+      // that recognizes the state resumes governed retention. The instance
+      // drive below still runs.
+      console.log(
+        JSON.stringify({
+          event: "session_retention_fail_closed",
+          error: String(error),
+        }),
+      );
+      const due = await this.ctx.storage.get<number>(INSTANCE_DUE_KEY);
+      const retryAt = Date.now() + 60 * 60 * 1000;
+      await this.ctx.storage.setAlarm(
+        due != null ? Math.min(due, retryAt) : retryAt,
+      );
+    }
+    const bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
+    if (bootstrap) {
+      const result = await this.drive(bootstrap);
+      console.log(`alarm fired: drove instance to ${result.status} (${result.outcome})`);
+    }
+  }
+
+  private async sessionRetentionAlarm(): Promise<void> {
+    const publicSession = await this.readPublicSessionState();
     if (publicSession) {
       // The lease is evaluated by folding a stamped observation, and this branch
       // no longer returns before the DR-0033 drive path below (DR-0049 §4).
@@ -3216,11 +3845,6 @@ export class WorkflowInstance implements DurableObject {
           await this.tombstonePublicSession();
         }
       }
-    }
-    const bootstrap = await this.ctx.storage.get<Bootstrap>("bootstrap");
-    if (bootstrap) {
-      const result = await this.drive(bootstrap);
-      console.log(`alarm fired: drove instance to ${result.status} (${result.outcome})`);
     }
   }
 
@@ -3304,6 +3928,9 @@ export class WorkflowInstance implements DurableObject {
     outcome: string;
     timing: Record<string, number>;
     usage?: ProviderUsage;
+    /** Every metered round of the turn, so settlement prices the whole turn
+     *  rather than its final round (`FUND-1`). */
+    gateway_log_ids?: string[];
   }> {
     const startedAt = performance.now();
     const timing: Record<string, number> = {};
@@ -3333,6 +3960,20 @@ export class WorkflowInstance implements DurableObject {
     let step = 0;
     let transportFailures = 0;
     let usage: ProviderUsage | undefined;
+    // Every metered round of this turn, in order. An agent turn makes several
+    // provider rounds, and `usage` is overwritten by each — so keeping only the
+    // last log id would price a whole turn from one of its rounds and under-bill
+    // it. Accumulating is the difference between billing the turn and billing a
+    // fragment of it (`FUND-1`).
+    const gatewayLogIds: string[] = [];
+    const observeUsage = (observed: ProviderUsage) => {
+      usage = observed;
+    };
+    const observeGatewayLog = (id: string) => {
+      // Deduped because a retried round re-reports the same log, and a repeated
+      // id would be charged twice.
+      if (id && !gatewayLogIds.includes(id)) gatewayLogIds.push(id);
+    };
     for (;;) {
       const stepStartedAt = performance.now();
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
@@ -3344,10 +3985,11 @@ export class WorkflowInstance implements DurableObject {
         mark("model_round_start");
         if (providerBinding?.execution === "model-broker") {
           try {
+            const privateBroker = this.privateModelBrokerConfig();
             responseJson = await performModelBrokerFetch(
               outcome.request,
               providerBinding,
-              {
+              privateBroker ?? {
                 url: this.env.WHIP_MODEL_BROKER_URL,
                 token: this.env.WHIP_MODEL_BROKER_TOKEN,
               },
@@ -3367,6 +4009,41 @@ export class WorkflowInstance implements DurableObject {
             transportFailures += 1;
             if (transportFailures >= 3) {
               throw new Error(`model broker failed repeatedly: ${message}`);
+            }
+            responseJson = JSON.stringify({ error: message });
+          }
+        } else if (providerBinding?.execution === "managed") {
+          try {
+            const replay = providerBinding.credential_class
+              ? this.publicProviderRoundReplay(
+                  hostedInstanceId ?? "",
+                  traceId ?? "",
+                  outcome.request,
+                )
+              : undefined;
+            responseJson = await performManagedGatewayFetch(
+              outcome.request,
+              providerBinding,
+              { token: () => this.env.WHIP_GATEWAY_TOKEN },
+              fetch,
+              (delta) => {
+                if (replay && !replay.accept(delta)) return;
+                mark("runtime_first_delta");
+                onTextDelta?.(delta);
+              },
+              (event, _elapsedMs) => mark(event),
+              observeUsage,
+              observeGatewayLog,
+            );
+            replay?.complete();
+            transportFailures = 0;
+            mark("model_round_complete");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.log(`managed gateway transport failed: ${message}`);
+            transportFailures += 1;
+            if (transportFailures >= 3) {
+              throw new Error(`managed gateway failed repeatedly: ${message}`);
             }
             responseJson = JSON.stringify({ error: message });
           }
@@ -3394,7 +4071,7 @@ export class WorkflowInstance implements DurableObject {
               },
               (event, _elapsedMs) => mark(event),
               (observed) => {
-                usage = observed;
+                observeUsage(observed);
               },
             );
             replay?.complete();
@@ -3415,25 +4092,30 @@ export class WorkflowInstance implements DurableObject {
         continue;
       }
       if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {
-        // The instance holds pending timers/deadlines: schedule the DO's
-        // single alarm at the earliest one (the Alarms seam, live). Clamp to
+        // The instance holds pending timers/deadlines: record the earliest as
+        // this instance's due time (the Alarms seam, live). Clamp to
         // strictly-future so a due already in the past cannot make Cloudflare
         // run the alarm instantly and re-drive in a tight loop — defense in
         // depth atop the kernel dep guard that keeps reported dues fireable.
         const at = Math.max(outcome.next_due_unix_ms, Date.now() + 1);
-        await this.ctx.storage.setAlarm(at);
+        await this.ctx.storage.put(INSTANCE_DUE_KEY, at);
       } else {
-        // Parked with nothing due, or terminal: clear any alarm a prior park
-        // scheduled, so a settled or now-unblocked instance is not woken into
-        // a pointless re-drive (deleteAlarm is a no-op when none is set).
-        await this.ctx.storage.deleteAlarm();
+        // Parked with nothing due, or terminal: drop this instance's due so a
+        // settled or now-unblocked instance is not woken into a pointless
+        // re-drive.
+        await this.ctx.storage.delete(INSTANCE_DUE_KEY);
       }
+      // Never write the shared alarm directly: a session's retention deadline
+      // lives on the same alarm, and clearing it here is what kept expiry from
+      // ever firing for a session that had run a turn.
+      await this.armAlarm();
       mark("drive_complete");
       return {
         status: instance.status(),
         outcome: outcome.kind,
         timing,
         ...(usage ? { usage } : {}),
+        ...(gatewayLogIds.length > 0 ? { gateway_log_ids: gatewayLogIds } : {}),
       };
     }
   }

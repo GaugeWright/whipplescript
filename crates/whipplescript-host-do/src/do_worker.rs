@@ -209,13 +209,25 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             sql: Rc::clone(&sql),
         })
         .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
+        // DR-0054 Phase B: real revision identity. The literal "do" stamps
+        // meant every deployed wasm — whatever its lowering — reattached to old
+        // instance state under one indistinguishable version, so a redeploy
+        // that changed semantics was invisible. Stamp the actual bootstrap
+        // source hash and this build's crate version. The IR is compiled
+        // in-process from `program_source` by THIS build, so
+        // (source_hash, compiler_version) identifies the lowering; ir_hash
+        // records that derived identity (no canonical IR serialization exists
+        // to hash directly).
+        let source_hash = whipplescript_kernel::exec_http::sha256_hex(program_source.as_bytes());
+        let compiler_version = concat!("whipplescript-host-do ", env!("CARGO_PKG_VERSION"));
+        let ir_hash = format!("{source_hash}+{compiler_version}");
         let version = kernel
             .create_program_version_for_program(
                 ProgramVersionInput {
                     program_name: &ir.workflow,
-                    source_hash: "do",
-                    ir_hash: "do",
-                    compiler_version: "do",
+                    source_hash: &source_hash,
+                    ir_hash: &ir_hash,
+                    compiler_version,
                 },
                 &ir,
             )
@@ -305,10 +317,61 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .list_instances()
             .map_err(|error| format!("{error:?}"))?
             .into_iter()
-            .next()
-            .map(|instance| instance.instance_id);
+            .next();
         let instance_id = match existing {
-            Some(instance_id) => instance_id,
+            Some(instance) => {
+                // DR-0054 Phase B: a reattach under a DIFFERENT build/source
+                // than the one the instance's pinned version row records is
+                // observable version drift, not business as usual. Record a
+                // diagnosable row (idempotent per drift pair) and continue —
+                // whether the drift is compatible is a revision-compatibility
+                // analysis that lives native-side (`whip revise` machinery),
+                // so the DO observes rather than refuses.
+                let stored = kernel
+                    .store()
+                    .get_program_version(&instance.version_id)
+                    .map_err(|error| format!("{error:?}"))?;
+                if let Some(stored) = stored {
+                    if stored.source_hash != source_hash
+                        || stored.compiler_version != compiler_version
+                    {
+                        let message = format!(
+                            "durable instance `{}` reattached under a different build: \
+                             stored source_hash `{}` / compiler `{}` vs current \
+                             source_hash `{source_hash}` / compiler `{compiler_version}`",
+                            instance.instance_id, stored.source_hash, stored.compiler_version
+                        );
+                        let drift_key = format!(
+                            "do.revision_drift:{}:{}:{ir_hash}",
+                            stored.version_id, instance.instance_id
+                        );
+                        kernel
+                            .store()
+                            .record_diagnostic(whipplescript_store::DiagnosticRecord {
+                                instance_id: Some(&instance.instance_id),
+                                program_id: Some(&instance.program_id),
+                                program_version_id: Some(&stored.version_id),
+                                severity: whipplescript_store::Severity::Warning,
+                                code: Some("do.revision_drift"),
+                                message: &message,
+                                source_span_json: None,
+                                subject_type: Some("program_version"),
+                                subject_id: Some(&version.version_id),
+                                event_id: None,
+                                effect_id: None,
+                                run_id: None,
+                                assertion_id: None,
+                                evidence_ids_json: "[]",
+                                artifact_ids_json: "[]",
+                                causation_id: None,
+                                correlation_id: None,
+                                idempotency_key: Some(&drift_key),
+                            })
+                            .map_err(|error| format!("{error:?}"))?;
+                    }
+                }
+                instance.instance_id
+            }
             None => {
                 let instance_id = kernel
                     .create_instance_with_authority(
@@ -353,7 +416,11 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     let seed = crate::do_store::stable_hash_hex(&format!("{instance_id}|{head}"));
                     let content = crate::do_branches::DoContentBlobs::new(Rc::clone(&sql))
                         .map_err(|error| format!("content blobs unavailable: {error:?}"))?;
-                    let vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+                    let mut vcs =
+                        whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
+                    // The run's writes carry the deepest observed tier
+                    // (DR-0052; session carriage upgrades this later).
+                    vcs.set_actor(Some(format!("instance:{instance_id}")));
                     Box::new(whipplescript_store::vcs::BranchFileStore::new(
                         vcs,
                         &branch_id,
@@ -750,8 +817,144 @@ mod tests {
     const TEST_NOW_MS: i64 = 1_767_225_600_000;
     use crate::do_store::test_support::store;
 
-    /// The worker-shell loop over an effect-free workflow: `create`, then `step`
-    /// until a terminal — no HTTP round, one settle.
+    // The worker-shell loop over an effect-free workflow: `create`, then `step`
+    // until a terminal — no HTTP round, one settle.
+
+    /// DR-0054 Phase B: `create` registers REAL revision identity (the hash of
+    /// the bootstrap source bytes and this build's crate version — never the
+    /// old `"do"` literals), and a reattach under a different source records a
+    /// diagnosable `do.revision_drift` row instead of silently reattaching
+    /// under an indistinguishable identity. The reattach itself proceeds.
+    #[test]
+    fn create_stamps_real_revision_identity_and_records_drift_on_reattach() {
+        fn minimal_source(marker: &str) -> String {
+            format!(
+                r#"workflow MinimalNoop
+
+output result StartupSeen
+
+class StartupSeen {{
+  source string
+  state "observed"
+}}
+
+rule observe_start
+  when started
+=> {{
+  record StartupSeen {{
+    source "{marker}"
+    state "observed"
+  }}
+
+  complete result {{
+    source "{marker}"
+    state "observed"
+  }}
+}}
+"#
+            )
+        }
+
+        let sql = store().sql;
+        let source_v1 = minimal_source("external.started");
+        let instance = DurableInstance::create(
+            sql.clone(),
+            &source_v1,
+            "{}",
+            "local/MinimalNoop",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("create");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let view = {
+            let instances = kernel.store().list_instances().expect("instances");
+            kernel
+                .store()
+                .get_program_version(&instances[0].version_id)
+                .expect("version loads")
+                .expect("version exists")
+        };
+        let expected_hash = whipplescript_kernel::exec_http::sha256_hex(source_v1.as_bytes());
+        assert_eq!(view.source_hash, expected_hash, "real source hash stamped");
+        assert!(
+            view.compiler_version.contains(env!("CARGO_PKG_VERSION")),
+            "real build version stamped: {}",
+            view.compiler_version
+        );
+        assert_ne!(view.ir_hash, "do", "no placeholder identity remains");
+        assert!(
+            kernel
+                .store()
+                .list_diagnostics(None)
+                .expect("diagnostics")
+                .iter()
+                .all(|d| d.code.as_deref() != Some("do.revision_drift")),
+            "same-build create records no drift"
+        );
+        drop(instance);
+
+        // Reattach after a "redeploy" whose bootstrap source changed: the
+        // instance still attaches, and the drift is now observable.
+        let source_v2 = minimal_source("external.redeployed");
+        let instance = DurableInstance::create(
+            sql.clone(),
+            &source_v2,
+            "{}",
+            "local/MinimalNoop",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("reattach under a different source succeeds");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let drift: Vec<_> = kernel
+            .store()
+            .list_diagnostics(None)
+            .expect("diagnostics")
+            .into_iter()
+            .filter(|d| d.code.as_deref() == Some("do.revision_drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "one drift diagnostic per drift pair");
+        assert!(
+            drift[0].message.contains(&expected_hash),
+            "drift names the stored identity: {}",
+            drift[0].message
+        );
+        assert!(
+            drift[0]
+                .message
+                .contains(&whipplescript_kernel::exec_http::sha256_hex(
+                    source_v2.as_bytes()
+                )),
+            "drift names the current identity: {}",
+            drift[0].message
+        );
+        drop(instance);
+
+        // Re-reattaching under the SAME drifted source is idempotent — the
+        // diagnostic does not accumulate.
+        let instance = DurableInstance::create(
+            sql,
+            &source_v2,
+            "{}",
+            "local/MinimalNoop",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("repeat reattach");
+        let kernel = instance.kernel.as_ref().expect("kernel");
+        let drift_count = kernel
+            .store()
+            .list_diagnostics(None)
+            .expect("diagnostics")
+            .into_iter()
+            .filter(|d| d.code.as_deref() == Some("do.revision_drift"))
+            .count();
+        assert_eq!(drift_count, 1, "drift diagnostic is idempotent");
+    }
 
     #[test]
     fn durable_exec_sidecar_round_survives_complete_handle_loss() {

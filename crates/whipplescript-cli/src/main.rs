@@ -243,6 +243,11 @@ fn main() -> ExitCode {
         Some("fork") => fork_instance_command(&options),
         Some("handles") => handles_command(&options),
         Some("branch") => branch_command(&options),
+        Some("repair") => repair_command(&options),
+        Some("publish") => publish_command(&options),
+        Some("ingest") => ingest_command(&options),
+        Some("changes") => changes_command(&options),
+        Some("undo") => ambient_undo_command(&options),
         Some("stream") => stream_command(&options),
         Some("retry") => retry(&options),
         Some("recover") => recover(&options),
@@ -250,6 +255,7 @@ fn main() -> ExitCode {
         Some("mcp") => mcp_command(&options),
         Some("deploy") => deploy_command(&options),
         Some("executor") => executor_command(&options),
+        Some("turn-once") => turn_once_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -613,6 +619,79 @@ fn executor_command(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// `whip turn-once` runs one whole owned agent turn against an already
+/// materialized workspace. This is the narrow batch seam used by disposable
+/// Isolated-workspace workers: the trusted scheduler supplies the request and
+/// workspace paths, while the turn runner remains the same kernel loop used by
+/// the Class-B executor.
+fn turn_once_command(options: &CliOptions) -> ExitCode {
+    let mut request_path: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--request" => request_path = iter.next().map(PathBuf::from),
+            "--workspace" => workspace = iter.next().map(PathBuf::from),
+            other => {
+                eprintln!("unknown turn-once argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(request_path) = request_path else {
+        eprintln!("turn-once requires --request PATH");
+        return ExitCode::from(2);
+    };
+    let Some(workspace) = workspace else {
+        eprintln!("turn-once requires --workspace PATH");
+        return ExitCode::from(2);
+    };
+    let mut request = match std::fs::read_to_string(&request_path)
+        .map_err(|error| format!("read turn request: {error}"))
+        .and_then(|bytes| {
+            serde_json::from_str::<serde_json::Value>(&bytes)
+                .map_err(|error| format!("decode turn request: {error}"))
+        }) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Ok(token) = std::env::var("GAUGEWRIGHT_WORKSPACE_EGRESS_TOKEN") {
+        if !token.is_empty() {
+            request["workspace_egress_token"] = serde_json::Value::String(token);
+        }
+        // The token is a supervisor-only transport capability. Remove its
+        // inherited environment representation before any agent-controlled
+        // command can start, and remove the command input file for the same
+        // reason.
+        std::env::remove_var("GAUGEWRIGHT_WORKSPACE_EGRESS_TOKEN");
+    }
+    let _ = std::fs::remove_file(&request_path);
+    #[cfg(target_os = "linux")]
+    if let Err(error) = prctl::set_dumpable(false) {
+        // A same-uid child must not ptrace/read the supervisor's in-memory
+        // transport capability through /proc.
+        eprintln!("cannot protect the turn supervisor from child inspection: {error}");
+        return ExitCode::FAILURE;
+    }
+    let turn_id = request
+        .get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("turn");
+    let outcome = turn_server::run_turn_in_workspace(turn_id, &request, &workspace);
+    println!("{}", turn_server::outcome_json(&outcome));
+    if matches!(
+        outcome.status,
+        whipplescript_kernel::harness_loop::TurnStatus::Completed
+    ) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// The executor image identity: sha256 over the Dockerfile and the staged
 /// whip binary. This IS the environment hash the delta-kernel cache keys on
 /// (image digest = environment hash, compute-plane note §5) — any change to
@@ -719,6 +798,22 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "fork" => "usage: whip [--json] fork <instance> [--agent <name>] [--branch-id <id>]",
         "handles" => "usage: whip [--json] handles <instance>",
         "branch" => BRANCH_USAGE,
+        "publish" => "usage: whip [--json] publish <branch-or-stream> --to <git-dir> [--as <git-branch>]\n\
+  publication, never sync: regenerate a git branch from a whip line\n\
+  (consecutive same-actor cut runs -> one commit each, Whip-* trailers)",
+        "ingest" => "usage: whip [--json] ingest <git-dir> [--at <ref>] --onto <branch>\n\
+  one squash cut of the git tree at <ref>, actor git:<author-email> (a CLAIM,\n\
+  never an observation), intent ingest:<sha>",
+        "repair" => "usage: whip [--json] repair <list|show|plan|apply|close> ...\n\
+  whip repair list [--all]\n\
+  whip repair show <incident>\n\
+  whip repair plan <incident> undo\n\
+  whip repair apply <incident> undo\n\
+  whip repair close <incident>\n\
+  incidents arm only from mediator-observed stalls; apply takes no free-form\n\
+  selection and there is no --force — a refusal escalates to a human",
+        "changes" => "usage: whip [--json] changes [--others] [--by <prefix>] [--path <glob>] [--since <cut>]\n  what moved on the ambient session's line (WHIPPLESCRIPT_SESSION); --others = everyone but me",
+        "undo" => "usage: whip [--json] undo \"<selection>\" [--apply]\n  the ambient-session form of `whip branch undo` (line implied by WHIPPLESCRIPT_SESSION; preview by default)",
         "stream" => STREAM_USAGE,
         "retry" => "usage: whip retry <instance> <effect>",
         "recover" => "usage: whip recover <instance>",
@@ -18763,6 +18858,12 @@ fn declared_workflow_authority_set(package: &str, ir: &IrProgram) -> BTreeSet<St
             authority.insert(resource_operation_principal(&store.name, operation));
         }
     }
+    // DR-0052 R3: `use std.vcs` is the program's explicit opt-in to the
+    // repair authority (the never-widen cap; the grant itself + the
+    // resolved scope stay the actual gates).
+    if ir.uses.iter().any(|import| import.name == "std.vcs") {
+        authority.insert(resource_operation_principal("vcs", "repair"));
+    }
     authority
 }
 
@@ -18840,6 +18941,87 @@ fn attenuated_authority_json_with_grant(
             .cloned()
             .collect::<BTreeSet<_>>(),
     ))
+}
+
+/// Resolve a `with access to vcs { repair for <binding> }` start grant
+/// (DR-0052 R3) against the invoke's carried bindings: the bound fact —
+/// a mediator-observed `vcs.*` arming fact — yields the incident's
+/// branch and derived slice. Fail-closed: a grant whose binding is
+/// missing, or whose fact carries no branch, fails the invoke before
+/// any child starts. Returns `(branch, slice_expr, source_ref)`.
+fn resolve_vcs_repair_grant(
+    grants: Option<&Value>,
+    bindings: Option<&Value>,
+) -> Result<Option<(String, String, String)>, String> {
+    let Some(grants) = grants.and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    for grant in grants {
+        if grant.get("resource").and_then(Value::as_str) != Some("vcs") {
+            continue;
+        }
+        for operation in grant
+            .get("operations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if operation.get("operation").and_then(Value::as_str) != Some("repair") {
+                continue;
+            }
+            let Some(target) = operation.get("target").and_then(Value::as_str) else {
+                return Err(
+                    "the vcs repair grant names no binding (`repair for <binding>`)".to_owned(),
+                );
+            };
+            let Some(fact) = bindings.and_then(|bindings| bindings.get(target)) else {
+                return Err(format!(
+                    "the vcs repair grant's binding `{target}` is not bound in this firing"
+                ));
+            };
+            let Some(branch) = fact
+                .get("branch")
+                .and_then(Value::as_str)
+                .filter(|branch| !branch.is_empty())
+            else {
+                return Err(format!(
+                    "the vcs repair grant's binding `{target}` carries no branch — repair \
+                     arms only on mediator-observed vcs.* facts"
+                ));
+            };
+            let slice = fact
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|path| format!("path({path})"))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .filter(|expr| !expr.is_empty())
+                .unwrap_or_else(|| format!("in-branch({branch})"));
+            // The incident is the scope's identity when one is open for
+            // this situation; the fact itself is the fallback reference.
+            let source_ref =
+                whipplescript_store::incidents::IncidentStore::open(incidents_store_path())
+                    .ok()
+                    .and_then(|incidents| {
+                        incidents
+                            .list(Some(whipplescript_store::incidents::IncidentStatus::Open))
+                            .ok()
+                    })
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .find(|row| row.branch_id == branch)
+                            .map(|row| row.incident_id)
+                    })
+                    .unwrap_or_else(|| format!("repair:{branch}"));
+            return Ok(Some((branch.to_owned(), slice, source_ref)));
+        }
+    }
+    Ok(None)
 }
 
 fn start_grant_authority_from_value(
@@ -23212,6 +23394,45 @@ fn run_capability_effect(
     // file-backed MemoryCapabilityProvider. Every unbound capability falls
     // back to the fixture, which keeps all existing capability tests
     // byte-identical.
+    // std.vcs selective verbs (DR-0052 R4): undo/transport operate on the
+    // INSTANCE'S OWN bound line (nameability: source cannot name a
+    // branch; the ambient line is the only legitimate referent until an
+    // R3 repair grant retargets). Native provider unless the operator
+    // pins the fixture.
+    if matches!(
+        effect.target.as_deref(),
+        Some("vcs.undo") | Some("vcs.transport")
+    ) && env::var("WHIPPLESCRIPT_VCS_PROVIDER").as_deref() != Ok("fixture")
+    {
+        return run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &VcsSelectiveCapabilityProvider {
+                store_path: store_path.to_path_buf(),
+                instance_id: instance_id.to_owned(),
+            },
+        );
+    }
+    // std.vcs promote (DR-0052 grammar pass slice 3): the boundary hop's
+    // native provider, selected unless the operator pins the fixture
+    // (`WHIPPLESCRIPT_VCS_PROVIDER=fixture` — tests, dry runs).
+    if effect.target.as_deref() == Some("vcs.promote")
+        && env::var("WHIPPLESCRIPT_VCS_PROVIDER").as_deref() != Ok("fixture")
+    {
+        return run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &VcsPromoteCapabilityProvider {
+                store_path: store_path.to_path_buf(),
+            },
+        );
+    }
     if let Some(selection) = messaging_selection {
         return match selection {
             Ok(provider_id) => match provider_id.as_str() {
@@ -23387,6 +23608,10 @@ struct LocalMailboxCapabilityProvider {
 }
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "std.messaging.local"
+    }
+
     fn produce(
         &self,
         effect: &ClaimableEffect,
@@ -23479,6 +23704,10 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for LocalMailboxC
 struct StdioCapabilityProvider;
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for StdioCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "std.messaging.stdio"
+    }
+
     fn produce(
         &self,
         effect: &ClaimableEffect,
@@ -23648,6 +23877,344 @@ fn markdown_to_text(markdown: &str) -> String {
 /// spawn is the same std::process subprocess seam exec providers use. A
 /// nonzero exit or spawn failure settles `capability.call.failed` with the
 /// DR-0032 EffectError base.
+/// The native selective-verb provider (DR-0052 R4): `undo` and
+/// `transport` over the INSTANCE'S OWN bound line — proposal cuts over
+/// an immutable record, refusal as data. Cuts are intent-stamped with
+/// the effect id (the deepest chain link) and attributed to the
+/// instance tier; emitted `vcs.*` facts route and arm exactly as the
+/// CLI verbs' do. The R3 repair grant will RETARGET the same forms at
+/// the incident's branch/slice; until a grantee exists, the ambient
+/// line is the only extent.
+struct VcsSelectiveCapabilityProvider {
+    store_path: PathBuf,
+    instance_id: String,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "std.vcs.native"
+    }
+
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let failed = |message: String| CapabilityOutcome::Failed {
+            error_kind: "vcs_selective".to_owned(),
+            message,
+        };
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(error) => return failed(format!("invalid input: {error}")),
+        };
+        let Some(selection) = input
+            .get("selection")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return failed("the effect names no selection".to_owned());
+        };
+        let expr = match whipplescript_store::selection::parse(selection) {
+            Ok(expr) => expr,
+            Err(error) => return failed(format!("selection does not parse: {error}")),
+        };
+        let mut vcs = match open_vcs() {
+            Ok(vcs) => vcs,
+            Err(_) => return failed("branch stores unavailable".to_owned()),
+        };
+        // DR-0052 R3: a repair scope RETARGETS the same form — the line
+        // becomes the incident's branch, and any selection exceeding the
+        // mediator-derived slice is REFUSED (never silently narrowed,
+        // exactly as an ungranted file write is). Without a scope, the
+        // ambient posture: the instance's own bound line.
+        let repair_scope = SqliteStore::open(&self.store_path)
+            .ok()
+            .and_then(|store| store.repair_scope(&self.instance_id).ok().flatten());
+        let (branch_id, intent) = match &repair_scope {
+            Some((branch, slice_expr, source_ref)) => {
+                let slice = match whipplescript_store::selection::parse(slice_expr) {
+                    Ok(slice) => slice,
+                    Err(error) => {
+                        return failed(format!("repair-scope slice does not parse: {error}"))
+                    }
+                };
+                let universe = match vcs.change_units(branch, 500) {
+                    Ok(universe) => universe,
+                    Err(error) => return failed(format!("change units unavailable: {error:?}")),
+                };
+                let requested = whipplescript_store::selection::eval(&expr, &universe);
+                let allowed = whipplescript_store::selection::eval(&slice, &universe);
+                if !requested.is_subset(&allowed) {
+                    return failed(
+                        "the selection exceeds the repair grant's derived slice \
+                         (never-widen: re-scope the selection to the incident)"
+                            .to_owned(),
+                    );
+                }
+                (branch.clone(), source_ref.clone())
+            }
+            None => {
+                let Ok(Some(branch_id)) = vcs.instance_branch(&self.instance_id) else {
+                    return failed(
+                        "this instance has no bound line (selective verbs operate on the \
+                         instance's own line, or under a vcs repair grant)"
+                            .to_owned(),
+                    );
+                };
+                (branch_id, effect.effect_id.clone())
+            }
+        };
+        vcs.set_actor(Some(format!("instance:{}", self.instance_id)));
+        vcs.set_intent(Some(intent));
+        let at = now_stamp();
+        let cut_id = generated_cut_id();
+        let outcome = if effect.target.as_deref() == Some("vcs.undo") {
+            match vcs.apply_undo_selection(&branch_id, &expr, &cut_id, &at) {
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::Proposed {
+                    cut_id,
+                    reverted_paths,
+                    ..
+                }) => Ok(json!({
+                    "variant": "Applied",
+                    "cut_id": cut_id,
+                    "detail": serde_json::to_string(&reverted_paths).unwrap_or_default(),
+                })),
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::WouldStrand { stranded }) => {
+                    Ok(json!({
+                        "variant": "Stranded",
+                        "cut_id": "",
+                        "detail": serde_json::to_string(
+                            &stranded
+                                .iter()
+                                .map(|unit| json!({"path": unit.path, "cut": unit.cut_id, "by": unit.actor}))
+                                .collect::<Vec<_>>()
+                        )
+                        .unwrap_or_default(),
+                    }))
+                }
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::NothingSelected) => Ok(json!({
+                    "variant": "Applied",
+                    "cut_id": "",
+                    "detail": "nothing_selected",
+                })),
+                Ok(other) => Err(format!("undo refused: {other:?}")),
+                Err(error) => Err(format!("undo failed: {error:?}")),
+            }
+        } else {
+            let onto = input
+                .get("onto")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let onto_line = if onto == "mainline" {
+                whipplescript_store::branches::MAINLINE_BRANCH_ID.to_owned()
+            } else {
+                match open_streams().ok().and_then(|streams| {
+                    whipplescript_store::workstreams::Workstreams::get_stream(&streams, onto)
+                        .ok()
+                        .flatten()
+                }) {
+                    Some(stream) => stream.line_branch_id,
+                    None => return failed(format!("`onto {onto}` names no stream")),
+                }
+            };
+            match vcs.transport_selection(&branch_id, &expr, &onto_line, &cut_id, &at) {
+                Ok(whipplescript_store::vcs::TransportOutcome::Transported {
+                    cut_id,
+                    moved_paths,
+                    ..
+                }) => Ok(json!({
+                    "variant": "Applied",
+                    "cut_id": cut_id,
+                    "detail": serde_json::to_string(&moved_paths).unwrap_or_default(),
+                })),
+                Ok(whipplescript_store::vcs::TransportOutcome::Conflicted { conflicts }) => {
+                    Ok(json!({
+                        "variant": "Conflicted",
+                        "cut_id": "",
+                        "detail": serde_json::to_string(
+                            &conflicts
+                                .iter()
+                                .map(|conflict| json!({"path": conflict.path}))
+                                .collect::<Vec<_>>()
+                        )
+                        .unwrap_or_default(),
+                    }))
+                }
+                Ok(
+                    whipplescript_store::vcs::TransportOutcome::UpToDate
+                    | whipplescript_store::vcs::TransportOutcome::NothingSelected,
+                ) => Ok(json!({
+                    "variant": "Applied",
+                    "cut_id": "",
+                    "detail": "nothing_to_move",
+                })),
+                Ok(other) => Err(format!("transport refused: {other:?}")),
+                Err(error) => Err(format!("transport failed: {error:?}")),
+            }
+        };
+        // Whatever the op observed — refusal facts included — deliver and
+        // arm, exactly as the CLI verbs do.
+        let facts = vcs.take_pending_facts();
+        arm_incidents_from_facts(&facts, &at);
+        route_workspace_facts(&vcs, facts, &self.store_path);
+        match outcome {
+            Ok(value) => CapabilityOutcome::Produced(value),
+            Err(message) => failed(message),
+        }
+    }
+}
+
+/// The native `vcs.promote` provider (DR-0052 Decision 5 / grammar-pass
+/// slice 3): the boundary hop as an in-language effect. Runs the same
+/// machinery as `whip stream promote` — adoption lease on mainline,
+/// `sync_to_line`, promotion facts to every member, stall incidents on
+/// refusal — and COMPLETES either way: the output's `variant`
+/// (Promoted | Conflicted) is what `after p promoted` / `after p
+/// conflicted` dispatch on. Refusal is data, never a failure.
+struct VcsPromoteCapabilityProvider {
+    store_path: PathBuf,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "std.vcs.native"
+    }
+
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        let failed = |message: String| CapabilityOutcome::Failed {
+            error_kind: "vcs_promote".to_owned(),
+            message,
+        };
+        let input: Value = match serde_json::from_str(&effect.input_json) {
+            Ok(value) => value,
+            Err(error) => return failed(format!("invalid vcs.promote input: {error}")),
+        };
+        let Some(stream_id) = input
+            .pointer("/message/stream")
+            .or_else(|| input.get("stream"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return failed("vcs.promote input names no stream".to_owned());
+        };
+        let streams = match whipplescript_store::workstreams::WorkstreamStore::open(
+            workstream_store_path(),
+        ) {
+            Ok(streams) => streams,
+            Err(error) => return failed(format!("workstream store unavailable: {error:?}")),
+        };
+        use whipplescript_store::workstreams::{StreamStatus, Workstreams};
+        let Ok(Some(stream)) = streams.get_stream(stream_id) else {
+            return failed(format!("no such stream `{stream_id}`"));
+        };
+        if stream.status != StreamStatus::Active {
+            return failed(format!("stream `{stream_id}` is archived"));
+        }
+        let mut vcs = match open_vcs() {
+            Ok(vcs) => vcs,
+            Err(_) => return failed("branch stores unavailable".to_owned()),
+        };
+        let at = now_stamp();
+        // The boundary hop runs under the adoption lease on mainline —
+        // identical to the CLI verb; a held lease is a retryable refusal.
+        let holder = format!("whip-promote-{}", effect.effect_id);
+        let lease_key = format!(
+            "{}::{}",
+            branch_store_path().display(),
+            whipplescript_store::branches::MAINLINE_BRANCH_ID
+        );
+        let mut coordination = match whipplescript_store::coordination::CoordinationStore::open(
+            coordination_store_path(),
+        ) {
+            Ok(coordination) => coordination,
+            Err(error) => return failed(format!("coordination store unavailable: {error:?}")),
+        };
+        match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
+            Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
+            Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
+                return failed(format!("adoption lease held by {holders:?}; retry"));
+            }
+            Err(error) => return failed(format!("adoption lease unavailable: {error:?}")),
+        }
+        let sync_cut = generated_cut_id();
+        let outcome = vcs.sync_to_line(
+            &stream.line_branch_id,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            &format!("{sync_cut}-promote"),
+            &at,
+        );
+        let _ = coordination.release("adoption", &lease_key, &holder);
+        match outcome {
+            Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
+                let mut promoted_facts: Vec<(String, Value)> = Vec::new();
+                if let Ok(member_branches) = streams.members(stream_id) {
+                    for member in member_branches {
+                        promoted_facts.push((
+                            "vcs.stream.promoted".to_owned(),
+                            json!({
+                                "branch": member,
+                                "stream": stream_id,
+                                "cut": sync_cut_id,
+                                "at": at,
+                            }),
+                        ));
+                    }
+                }
+                route_workspace_facts(&vcs, promoted_facts, &self.store_path);
+                CapabilityOutcome::Produced(json!({
+                    "variant": "Promoted",
+                    "stream": stream_id,
+                    "sync_cut_id": sync_cut_id,
+                    "detail": "",
+                }))
+            }
+            Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
+                CapabilityOutcome::Produced(json!({
+                    "variant": "Promoted",
+                    "stream": stream_id,
+                    "sync_cut_id": "",
+                    "detail": "up_to_date",
+                }))
+            }
+            Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
+                let stall = vec![(
+                    "vcs.reconcile.stalled".to_owned(),
+                    json!({
+                        "branch": stream.line_branch_id,
+                        "stream": stream_id,
+                        "boundary": "promotion",
+                        "paths": conflicts
+                            .iter()
+                            .map(|conflict| conflict.path.clone())
+                            .collect::<Vec<_>>(),
+                        "at": at,
+                    }),
+                )];
+                arm_incidents_from_facts(&stall, &at);
+                route_workspace_facts(&vcs, stall, &self.store_path);
+                CapabilityOutcome::Produced(json!({
+                    "variant": "Conflicted",
+                    "stream": stream_id,
+                    "sync_cut_id": "",
+                    "detail": serde_json::to_string(
+                        &conflicts.iter().map(conflict_json).collect::<Vec<_>>()
+                    )
+                    .unwrap_or_default(),
+                }))
+            }
+            Ok(other) => failed(format!("promotion refused: {other:?}")),
+            Err(error) => failed(format!("promotion failed: {error:?}")),
+        }
+    }
+}
+
 struct DesktopCapabilityProvider;
 
 impl DesktopCapabilityProvider {
@@ -23666,6 +24233,10 @@ impl DesktopCapabilityProvider {
 }
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for DesktopCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "std.messaging.desktop"
+    }
+
     fn produce(
         &self,
         effect: &ClaimableEffect,
@@ -23757,6 +24328,10 @@ impl MemoryCapabilityProvider {
 }
 
 impl whipplescript_kernel::effect_handlers::CapabilityProvider for MemoryCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "memory-provider"
+    }
+
     fn produce(
         &self,
         effect: &ClaimableEffect,
@@ -24043,7 +24618,35 @@ fn run_coordination_effect(
         resolved_coordination_store(side_stores),
         resolved_items_store(side_stores),
     )?);
-    run_coordination_effect_generic(&mut kernel, instance_id, effect, now)
+    // DR-0052 S6: resolve each contending holder's workspace context —
+    // its line, plus the line's newest cut's actor and intent — so the
+    // `contended` arm carries who/where/why, not just a holder id.
+    let holder_context = |holder: &str| -> Option<Value> {
+        let vcs = whipplescript_store::vcs::WorkspaceVcs::open(
+            branch_store_path(),
+            vcs_content_store_path(),
+        )
+        .ok()?;
+        let branch_id = vcs.instance_branch(holder).ok().flatten()?;
+        let last = vcs
+            .change_units(&branch_id, 50)
+            .ok()?
+            .into_iter()
+            .next_back();
+        Some(json!({
+            "holder": holder,
+            "branch": branch_id,
+            "by": last.as_ref().and_then(|unit| unit.actor.clone()),
+            "intent": last.as_ref().and_then(|unit| unit.intent.clone()),
+        }))
+    };
+    run_coordination_effect_generic_ctx(
+        &mut kernel,
+        instance_id,
+        effect,
+        now,
+        Some(&holder_context),
+    )
 }
 
 /// The validated result of `-> Schema` / `-> each Schema` stdout ingestion.
@@ -24897,6 +25500,14 @@ fn run_workflow_invoke_effect(
                     Ok(authority) => authority,
                     Err(message) => return Err(StoreError::Conflict(message)),
                 };
+            // DR-0052 R3: a vcs repair grant resolves NOW, fail-closed —
+            // an unresolvable grant fails the invoke before any child
+            // exists.
+            let repair_scope =
+                match resolve_vcs_repair_grant(input.get("access_grants"), input.get("bindings")) {
+                    Ok(scope) => scope,
+                    Err(message) => return Err(StoreError::Conflict(message)),
+                };
             let child_authority =
                 ChildStartAuthority::delegating(instance_id, start_grant_authority);
             let (child_started, child_ir) = match start_child_workflow_instance_in_package(
@@ -24927,6 +25538,10 @@ fn run_workflow_invoke_effect(
                 }
             };
             let child_instance_id = child_started.instance_id.clone();
+            if let Some((branch, slice, source_ref)) = &repair_scope {
+                let mut scope_store = SqliteStore::open(store_path)?;
+                scope_store.record_repair_scope(&child_instance_id, branch, slice, source_ref)?;
+            }
             let invocation_id = idempotency_key(&[
                 instance_id,
                 &effect.effect_id,
@@ -34790,7 +35405,7 @@ const BRANCH_USAGE: &str =
   whip branch probe <branch>\n\
   whip branch merge <branch>\n\
   whip branch restore <branch> <cut>\n\
-  whip branch attribution <branch>\n\
+  whip branch attribution <branch> [<path>] [--deep]\n\
   whip branch log <branch> [--limit <n>]\n\
   whip branch bisect <branch> --good <cut> --bad <cut> --run <command>\n\
   whip branch select <branch> <expr>\n\
@@ -34813,13 +35428,19 @@ const BRANCH_USAGE: &str =
 
 const STREAM_USAGE: &str =
     "usage: whip [--json] stream <create|join|leave|archive|promote|list|show> ...\n\
-  whip stream create <stream> [--name <label>]\n\
+  whip stream create <stream> [--name <label>] [--staleness <seconds>]\n\
   whip stream join <stream> <branch>\n\
   whip stream leave <branch>\n\
   whip stream archive <stream>\n\
   whip stream promote <stream>\n\
   whip stream list\n\
   whip stream show <stream>";
+
+fn incidents_store_path() -> PathBuf {
+    env::var("WHIPPLESCRIPT_INCIDENTS_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".whipplescript/incidents.sqlite"))
+}
 
 fn workstream_store_path() -> PathBuf {
     env::var("WHIPPLESCRIPT_WORKSTREAM_STORE")
@@ -34842,6 +35463,7 @@ fn stream_row_json(row: &whipplescript_store::workstreams::WorkstreamRow) -> Val
         "name": row.name,
         "line_branch_id": row.line_branch_id,
         "status": row.status.as_str(),
+        "staleness_seconds": row.staleness_seconds,
     })
 }
 
@@ -34868,10 +35490,18 @@ fn stream_command(options: &CliOptions) -> ExitCode {
         "create" => {
             let mut name: Option<&str> = None;
             let mut stream_id: Option<&str> = None;
+            let mut staleness: Option<i64> = None;
             let mut iter = rest.iter();
             while let Some(arg) = iter.next() {
                 match *arg {
                     "--name" => name = iter.next().copied(),
+                    "--staleness" => {
+                        staleness = iter.next().and_then(|value| value.parse::<i64>().ok());
+                        if staleness.is_none() {
+                            eprintln!("--staleness takes seconds\n{STREAM_USAGE}");
+                            return ExitCode::from(2);
+                        }
+                    }
                     other if stream_id.is_none() => stream_id = Some(other),
                     other => {
                         eprintln!("unexpected argument `{other}`\n{STREAM_USAGE}");
@@ -34912,6 +35542,14 @@ fn stream_command(options: &CliOptions) -> ExitCode {
             }
             match streams.create_stream(stream_id, name, &line_branch_id, &at, None) {
                 Ok(CreateStreamOutcome::Created(row)) => {
+                    let row = match staleness {
+                        Some(bound) => streams
+                            .set_staleness(stream_id, Some(bound), &at)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(row),
+                        None => row,
+                    };
                     emit_json(json!({"created": stream_row_json(&row)}))
                 }
                 Ok(CreateStreamOutcome::Existing(row)) => {
@@ -35034,6 +35672,24 @@ fn stream_command(options: &CliOptions) -> ExitCode {
             let _ = coordination.release("adoption", &lease_key, &holder);
             match outcome {
                 Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
+                    // DR-0052 A5: the boundary hop, as a fact — delivered
+                    // to every member branch's bound running instances
+                    // (`when <stream> promoted as p` sugar's lowering).
+                    let mut promoted_facts: Vec<(String, Value)> = Vec::new();
+                    if let Ok(member_branches) = streams.members(stream_id) {
+                        for member in member_branches {
+                            promoted_facts.push((
+                                "vcs.stream.promoted".to_owned(),
+                                json!({
+                                    "branch": member,
+                                    "stream": stream_id,
+                                    "cut": sync_cut_id,
+                                    "at": at,
+                                }),
+                            ));
+                        }
+                    }
+                    route_workspace_facts(&vcs, promoted_facts, &options.store_path);
                     emit_json(json!({
                         "promoted": stream_id, "into": "main",
                         "sync_cut_id": sync_cut_id,
@@ -35043,6 +35699,23 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                     emit_json(json!({"promoted": stream_id, "outcome": "up_to_date"}))
                 }
                 Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
+                    // Promotion refusal surfaces as a fact, not only an
+                    // error (note §7.5: refusal-as-fact).
+                    let stall = vec![(
+                        "vcs.reconcile.stalled".to_owned(),
+                        json!({
+                            "branch": stream.line_branch_id,
+                            "stream": stream_id,
+                            "boundary": "promotion",
+                            "paths": conflicts
+                                .iter()
+                                .map(|conflict| conflict.path.clone())
+                                .collect::<Vec<_>>(),
+                            "at": at,
+                        }),
+                    )];
+                    arm_incidents_from_facts(&stall, &at);
+                    route_workspace_facts(&vcs, stall, &options.store_path);
                     let payload = json!({
                         "conflicted": stream_id,
                         "conflicts": conflicts.iter().map(conflict_json).collect::<Vec<_>>(),
@@ -35130,12 +35803,36 @@ fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> 
             vcs.set_source_merger(Box::new(
                 whipplescript_kernel::source_merge::WhipSourceMerger,
             ));
+            vcs.set_actor(Some(ambient_actor()));
             vcs
         })
         .map_err(|error| {
             eprintln!("could not open the branch stores: {error:?}");
             ExitCode::FAILURE
         })
+}
+
+/// The acting principal for CLI-driven cuts (DR-0052 Decision 1's CLI
+/// seam — OS-trust, stated as such in the DR): an explicit
+/// `WHIPPLESCRIPT_ACTOR` wins (how `root` and the git bridge identify);
+/// else an ambient session (`WHIPPLESCRIPT_SESSION`, the harness lease
+/// work-unit root) reads as `s:<id>`; else the OS user as
+/// `human:<name>`.
+fn ambient_actor() -> String {
+    if let Ok(actor) = env::var("WHIPPLESCRIPT_ACTOR") {
+        if !actor.trim().is_empty() {
+            return actor.trim().to_owned();
+        }
+    }
+    if let Ok(session) = env::var("WHIPPLESCRIPT_SESSION") {
+        if !session.trim().is_empty() {
+            return format!("s:{}", session.trim());
+        }
+    }
+    let user = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_owned());
+    format!("human:{user}")
 }
 
 fn now_stamp() -> String {
@@ -35162,16 +35859,22 @@ fn file_store_for_instance(
     if !branch_store_path().exists() {
         return Box::new(NativeFileStore);
     }
-    let Ok(vcs) = WorkspaceVcs::open(branch_store_path(), vcs_content_store_path()) else {
+    let Ok(mut vcs) = WorkspaceVcs::open(branch_store_path(), vcs_content_store_path()) else {
         return Box::new(NativeFileStore);
     };
     match vcs.instance_branch(instance_id) {
-        Ok(Some(branch_id)) => Box::new(BranchFileStore::new(
-            vcs,
-            &branch_id,
-            cut_seed,
-            &now_stamp(),
-        )),
+        Ok(Some(branch_id)) => {
+            // The write is the RUN's, not the operator's: attribute the
+            // deepest observed tier (DR-0052 — `s:<session>` once session
+            // carriage lands; the instance until then).
+            vcs.set_actor(Some(format!("instance:{instance_id}")));
+            Box::new(BranchFileStore::new(
+                vcs,
+                &branch_id,
+                cut_seed,
+                &now_stamp(),
+            ))
+        }
         _ => Box::new(NativeFileStore),
     }
 }
@@ -35342,6 +36045,818 @@ fn conflict_json(conflict: &whipplescript_store::merge::PathConflict) -> Value {
 /// branch's virtual working set, merge back (certified or honest
 /// structured conflicts), discard. Every operation is a proposal over
 /// immutable content; no destructive verb exists.
+/// The fact -> incident bridge (DR-0052 R1): mediator-observed refusal
+/// and stall facts ARM repair by opening (or refreshing) incidents with
+/// their derived slice. Only `workspace.*` facts reach here — agents
+/// cannot record them and `raise` rides the tracker ledger, so
+/// self-arming is structurally unreachable.
+fn arm_incidents_from_facts(facts: &[(String, serde_json::Value)], at: &str) {
+    if facts.is_empty() {
+        return;
+    }
+    let Ok(mut incidents) =
+        whipplescript_store::incidents::IncidentStore::open(incidents_store_path())
+    else {
+        return;
+    };
+    let paths_expr = |paths: &[String]| -> String {
+        let atoms: Vec<String> = paths.iter().map(|path| format!("path({path})")).collect();
+        atoms.join(" | ")
+    };
+    for (name, payload) in facts {
+        let branch = payload
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if branch.is_empty() {
+            continue;
+        }
+        let payload_paths = |key: &str| -> Vec<String> {
+            payload
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match name.as_str() {
+            "vcs.op.refused" => {
+                let paths = {
+                    let stranded = payload_paths("stranded_paths");
+                    if stranded.is_empty() {
+                        payload_paths("paths")
+                    } else {
+                        stranded
+                    }
+                };
+                let slice = if paths.is_empty() {
+                    format!("in-branch({branch})")
+                } else {
+                    paths_expr(&paths)
+                };
+                let _ = incidents.open_incident(
+                    "op_refused",
+                    branch,
+                    None,
+                    &slice,
+                    &payload.to_string(),
+                    at,
+                );
+            }
+            "vcs.revert_war.detected" => {
+                let paths = payload_paths("paths");
+                let slice = if paths.is_empty() {
+                    format!("in-branch({branch})")
+                } else {
+                    paths_expr(&paths)
+                };
+                let _ = incidents.open_incident(
+                    "revert_war",
+                    branch,
+                    None,
+                    &slice,
+                    &payload.to_string(),
+                    at,
+                );
+            }
+            "vcs.staleness.exceeded" => {
+                let stream = payload.get("stream").and_then(Value::as_str);
+                let _ = incidents.open_incident(
+                    "staleness_exceeded",
+                    branch,
+                    stream,
+                    &format!("in-branch({branch})"),
+                    &payload.to_string(),
+                    at,
+                );
+            }
+            "vcs.reconcile.stalled" => {
+                let paths = payload_paths("paths");
+                let slice = if paths.is_empty() {
+                    format!("in-branch({branch})")
+                } else {
+                    paths_expr(&paths)
+                };
+                let stream = payload.get("stream").and_then(Value::as_str);
+                let _ = incidents.open_incident(
+                    "reconcile_stalled",
+                    branch,
+                    stream,
+                    &slice,
+                    &payload.to_string(),
+                    at,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Deliver `workspace.*` facts (DR-0052 A5) to every RUNNING instance
+/// bound to the fact's branch. Best-effort by design: workspace facts
+/// are observations riding on an operation that already succeeded — a
+/// missing or busy runtime store must not fail the operation. The
+/// namespace is generated-only by construction (user `record` mints
+/// capitalized class facts; dotted `workspace.*` names are unspellable
+/// there), so this is the ONLY producer.
+fn route_workspace_facts(
+    vcs: &whipplescript_store::vcs::NativeWorkspaceVcs,
+    facts: Vec<(String, serde_json::Value)>,
+    store_path: &std::path::Path,
+) {
+    use whipplescript_store::{DerivedFact, NewFact};
+    if facts.is_empty() || !store_path.exists() {
+        return;
+    }
+    let Ok(mut store) = SqliteStore::open(store_path) else {
+        return;
+    };
+    for (name, payload) in facts {
+        let Some(branch_id) = payload.get("branch").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(instances) = vcs.list_bound_instances_of(branch_id) else {
+            continue;
+        };
+        // Cuts key naturally by cut id (idempotent per cut); everything
+        // else keys by payload content — one observation, one fact.
+        let value_json = payload.to_string();
+        let key = payload
+            .get("cut")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                value_json.hash(&mut hasher);
+                format!("obs-{:016x}", hasher.finish())
+            });
+        for instance_id in instances {
+            let running = store
+                .get_instance(&instance_id)
+                .ok()
+                .flatten()
+                .is_some_and(|view| view.status == "running");
+            if !running {
+                continue;
+            }
+            let fact_id = format!("vcsfact-{instance_id}-{name}-{key}");
+            let _ = store.derive_fact(DerivedFact {
+                instance_id: &instance_id,
+                fact: NewFact {
+                    fact_id: &fact_id,
+                    name: &name,
+                    key: &key,
+                    value_json: &value_json,
+                    schema_id: None,
+                    provenance_class: "external",
+                    correlation_id: None,
+                    source_span_json: None,
+                },
+                source: "workspace",
+                causation_id: None,
+                idempotency_key: Some(&fact_id),
+            });
+        }
+    }
+}
+
+/// Resolve the ambient session's line (DR-0052 Decision 4): the session
+/// principal from `WHIPPLESCRIPT_SESSION`, and its line = the ACTIVE
+/// branch NAMED with that principal (names are unique among active
+/// branches, so the binding is unambiguous). Errors are hard — the
+/// ambient verbs never fall through to a shared line.
+fn ambient_session_line(
+    vcs: &whipplescript_store::vcs::NativeWorkspaceVcs,
+) -> Result<(String, String), String> {
+    let session = env::var("WHIPPLESCRIPT_SESSION")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "no ambient session: set WHIPPLESCRIPT_SESSION (the ambient verbs never \
+             fall through to a shared line; use `whip branch ...` for explicit \
+             cross-session surgery)"
+                .to_owned()
+        })?;
+    let principal = format!("s:{session}");
+    let branches = vcs
+        .list_branches(Some(whipplescript_store::branches::BranchStatus::Active))
+        .map_err(|error| format!("could not list branches: {error:?}"))?;
+    let line = branches
+        .into_iter()
+        .find(|row| row.name.as_deref() == Some(principal.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "session `{principal}` has no line yet: \
+                 `whip branch create <id> --name {principal}` binds one"
+            )
+        })?;
+    Ok((principal, line.branch_id))
+}
+
+/// `whip publish` (DR-0052 Decision 9): the git bridge's outbound half —
+/// **publication, never sync**. The git branch is a regenerable OUTPUT of
+/// a whip line: consecutive same-actor runs of cuts become one commit
+/// each (the session is the commit), authored as the actor, stamped with
+/// `Whip-Line` / `Whip-Session` / `Whip-Cuts` trailers so a round-trip
+/// can re-associate. Re-running regenerates; nothing whip needs ever
+/// depends on the git side.
+fn publish_command(options: &CliOptions) -> ExitCode {
+    let args: Vec<&str> = options.args.iter().map(String::as_str).collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|arg| *arg == name)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+    };
+    let (Some(line), Some(git_dir)) = (
+        args.first().copied().filter(|arg| !arg.starts_with("--")),
+        flag("--to"),
+    ) else {
+        eprintln!("{}", command_usage("publish").unwrap_or_default());
+        return ExitCode::from(2);
+    };
+    let git_branch = flag("--as").unwrap_or("whip-publish");
+    let vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    // A stream name resolves to its line; otherwise the argument IS the
+    // branch id.
+    let branch_id = open_streams()
+        .ok()
+        .and_then(|streams| {
+            whipplescript_store::workstreams::Workstreams::get_stream(&streams, line)
+                .ok()
+                .flatten()
+        })
+        .map(|stream| stream.line_branch_id)
+        .unwrap_or_else(|| line.to_owned());
+    let mut cuts = match vcs.list_cuts(&branch_id, 500) {
+        Ok(cuts) if !cuts.is_empty() => cuts,
+        Ok(_) => {
+            eprintln!("no recorded cuts on `{branch_id}`");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("publish failed: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    cuts.reverse(); // oldest first
+    let git = |cwd: &Path, argv: &[&str]| -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(argv)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let target = Path::new(git_dir);
+    if !target.join(".git").exists() {
+        std::fs::create_dir_all(target).ok();
+        if let Err(error) = git(target, &["init", "--quiet"]) {
+            eprintln!("git init failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(error) = git(target, &["checkout", "--quiet", "-B", git_branch]) {
+        eprintln!("git checkout failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    // Group consecutive cuts by actor: the session is the commit.
+    let mut groups: Vec<(Option<String>, Vec<whipplescript_store::branches::CutRow>)> = Vec::new();
+    for cut in cuts {
+        match groups.last_mut() {
+            Some((actor, rows)) if *actor == cut.actor => rows.push(cut),
+            _ => groups.push((cut.actor.clone(), vec![cut])),
+        }
+    }
+    let mut commits = Vec::new();
+    for (actor, rows) in &groups {
+        let last = rows.last().expect("non-empty group");
+        let manifest = match vcs.cut_manifest(&last.cut_id) {
+            Ok(Some(manifest)) => manifest,
+            _ => continue, // pre-manifest rows publish nothing
+        };
+        // Project the cut's state into the work tree (clearing all but .git).
+        if let Ok(entries) = std::fs::read_dir(target) {
+            for entry in entries.flatten() {
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).ok();
+                } else {
+                    std::fs::remove_file(&path).ok();
+                }
+            }
+        }
+        if let Err(error) = whipplescript_store::materialize::materialize_manifest(
+            &manifest,
+            vcs.content_store(),
+            target,
+            0,
+        ) {
+            eprintln!("materialize failed at `{}`: {error:?}", last.cut_id);
+            return ExitCode::FAILURE;
+        }
+        let actor_name = actor.clone().unwrap_or_else(|| "unattributed".to_owned());
+        let author = format!(
+            "{actor_name} <{}@whip.invalid>",
+            actor_name.replace([':', ' ', '@'], "-")
+        );
+        let cut_list = rows
+            .iter()
+            .map(|row| row.cut_id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let message = format!(
+            "whip: {} cut(s) by {} on {}\n\nWhip-Line: {}\nWhip-Session: {}\nWhip-Cuts: {}",
+            rows.len(),
+            actor_name,
+            branch_id,
+            branch_id,
+            actor_name,
+            cut_list
+        );
+        let date = last
+            .recorded_at
+            .strip_prefix("unix:")
+            .map(|secs| format!("@{secs} +0000"))
+            .unwrap_or_else(|| last.recorded_at.clone());
+        if let Err(error) = git(target, &["add", "-A"]) {
+            eprintln!("git add failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(target)
+            .args(["commit", "--quiet", "--allow-empty", "-m", &message])
+            .env("GIT_AUTHOR_NAME", &actor_name)
+            .env(
+                "GIT_AUTHOR_EMAIL",
+                format!("{}@whip.invalid", actor_name.replace([':', ' ', '@'], "-")),
+            )
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_NAME", "whip publish")
+            .env("GIT_COMMITTER_EMAIL", "publish@whip.invalid")
+            .env("GIT_COMMITTER_DATE", &date)
+            .output();
+        match commit {
+            Ok(output) if output.status.success() => {
+                if let Ok(sha) = git(target, &["rev-parse", "HEAD"]) {
+                    commits.push(json!({
+                        "sha": sha,
+                        "by": actor_name,
+                        "cuts": rows.len(),
+                    }));
+                }
+            }
+            Ok(output) => {
+                eprintln!(
+                    "git commit failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("git commit failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let _ = author; // author identity rides the env vars above
+    }
+    emit_json(json!({
+        "published": branch_id,
+        "to": git_dir,
+        "git_branch": git_branch,
+        "commits": commits,
+    }))
+}
+
+/// `whip ingest` (DR-0052 Decision 9): the inbound half. One SQUASH cut
+/// of the git tree at `--at <ref>` (default HEAD) onto a whip branch —
+/// actor `git:<author-email>`, which is a CLAIM and stays visibly
+/// external forever; intent `ingest:<sha>`. Per-commit ingest is a later
+/// refinement; import is an explicit act, never a sync.
+fn ingest_command(options: &CliOptions) -> ExitCode {
+    let args: Vec<&str> = options.args.iter().map(String::as_str).collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|arg| *arg == name)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+    };
+    let (Some(git_dir), Some(onto)) = (
+        args.first().copied().filter(|arg| !arg.starts_with("--")),
+        flag("--onto"),
+    ) else {
+        eprintln!("{}", command_usage("ingest").unwrap_or_default());
+        return ExitCode::from(2);
+    };
+    let reference = flag("--at").unwrap_or("HEAD");
+    let git = |argv: &[&str]| -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(git_dir)
+            .args(argv)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let sha = match git(&["rev-parse", reference]) {
+        Ok(sha) => sha.trim().to_owned(),
+        Err(error) => {
+            eprintln!("ingest: cannot resolve `{reference}`: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let author = git(&["log", "-1", "--format=%ae", &sha])
+        .map(|email| email.trim().to_owned())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let paths_output = match git(&["ls-tree", "-r", "--name-only", &sha]) {
+        Ok(listing) => listing,
+        Err(error) => {
+            eprintln!("ingest: ls-tree failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    // The claim, marked as such — never confusable with an observation.
+    vcs.set_actor(Some(format!("git:{author}")));
+    vcs.set_intent(Some(format!("ingest:{sha}")));
+    let at = now_stamp();
+    let mut written = Vec::new();
+    for path in paths_output.lines().filter(|line| !line.is_empty()) {
+        let body = match git(&["show", &format!("{sha}:{path}")]) {
+            Ok(body) => body,
+            Err(_) => continue, // binary/unreadable entries skip honestly
+        };
+        let cut_id = generated_cut_id();
+        match vcs.write(onto, path, Some(&body), &cut_id, &at) {
+            Ok(whipplescript_store::vcs::VcsWriteOutcome::Written { .. }) => {
+                written.push(path.to_owned());
+            }
+            Ok(other) => {
+                eprintln!("ingest write refused for `{path}`: {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("ingest write failed for `{path}`: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let facts = vcs.take_pending_facts();
+    arm_incidents_from_facts(&facts, &at);
+    route_workspace_facts(&vcs, facts, &options.store_path);
+    emit_json(json!({
+        "ingested": sha,
+        "from": git_dir,
+        "onto": onto,
+        "actor": format!("git:{author}"),
+        "intent": format!("ingest:{sha}"),
+        "paths": written,
+    }))
+}
+
+/// `whip repair` (DR-0052 Decision 8): the governed hatch. The incident
+/// is the noun; its slice was derived by the mediator when the incident
+/// armed, so `apply` takes no free-form selection. The only v1 action is
+/// `undo` (revert the contested slice as an ordinary proposal cut,
+/// intent-stamped with the incident). There is no `--force`: a stranding
+/// or moved-head refusal stands, and the incident stays open for a
+/// human.
+fn repair_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::incidents::{IncidentStatus, IncidentStore};
+    let mut args = options.args.iter().map(String::as_str);
+    let Some(verb) = args.next() else {
+        eprintln!("{}", command_usage("repair").unwrap_or_default());
+        return ExitCode::from(2);
+    };
+    let rest: Vec<&str> = args.collect();
+    let at = now_stamp();
+    let mut incidents = match IncidentStore::open(incidents_store_path()) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("incident store unavailable: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let incident_json = |row: &whipplescript_store::incidents::IncidentRow| {
+        json!({
+            "incident_id": row.incident_id,
+            "kind": row.kind,
+            "branch": row.branch_id,
+            "stream": row.stream_id,
+            "slice": row.slice_expr,
+            "detail": serde_json::from_str::<Value>(&row.detail_json).unwrap_or(Value::Null),
+            "status": row.status.as_str(),
+            "opened_at": row.opened_at,
+            "updated_at": row.updated_at,
+            "resolved_at": row.resolved_at,
+            "resolved_by": row.resolved_by,
+        })
+    };
+    match verb {
+        "list" => {
+            let status = if rest.contains(&"--all") {
+                None
+            } else {
+                Some(IncidentStatus::Open)
+            };
+            match incidents.list(status) {
+                Ok(rows) => emit_json(Value::Array(
+                    rows.iter().map(incident_json).collect::<Vec<_>>(),
+                )),
+                Err(error) => {
+                    eprintln!("repair list failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "show" => {
+            let Some(incident_id) = rest.first() else {
+                eprintln!("{}", command_usage("repair").unwrap_or_default());
+                return ExitCode::from(2);
+            };
+            let Ok(Some(row)) = incidents.get(incident_id) else {
+                eprintln!("no such incident `{incident_id}`");
+                return ExitCode::FAILURE;
+            };
+            // The derived slice, evaluated: which recorded units the
+            // grant would cover, with their provenance — both sides of
+            // the story, not just the id.
+            let units = open_vcs().ok().and_then(|vcs| {
+                let expr = whipplescript_store::selection::parse(&row.slice_expr).ok()?;
+                let universe = vcs.change_units(&row.branch_id, 500).ok()?;
+                let selected = whipplescript_store::selection::eval(&expr, &universe);
+                Some(
+                    selected
+                        .into_iter()
+                        .map(|index| json!(universe[index]))
+                        .collect::<Vec<_>>(),
+                )
+            });
+            emit_json(json!({
+                "incident": incident_json(&row),
+                "slice_units": units,
+            }))
+        }
+        "plan" | "apply" => {
+            let (Some(incident_id), action) = (rest.first(), rest.get(1).copied()) else {
+                eprintln!("{}", command_usage("repair").unwrap_or_default());
+                return ExitCode::from(2);
+            };
+            if action != Some("undo") {
+                eprintln!(
+                    "the only repair action is `undo` (v1); got {:?}\n{}",
+                    action,
+                    command_usage("repair").unwrap_or_default()
+                );
+                return ExitCode::from(2);
+            }
+            let Ok(Some(row)) = incidents.get(incident_id) else {
+                eprintln!("no such incident `{incident_id}`");
+                return ExitCode::FAILURE;
+            };
+            if row.status != IncidentStatus::Open {
+                eprintln!("incident `{incident_id}` is already resolved");
+                return ExitCode::FAILURE;
+            }
+            let expr = match whipplescript_store::selection::parse(&row.slice_expr) {
+                Ok(expr) => expr,
+                Err(error) => {
+                    eprintln!("incident slice does not parse: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            if verb == "plan" {
+                return match vcs.plan_undo_selection(&row.branch_id, &expr) {
+                    Ok(Some(plan)) => emit_json(json!({
+                        "incident": incident_id,
+                        "dry_run": true,
+                        "plan": plan,
+                    })),
+                    Ok(None) => {
+                        eprintln!("branch `{}` is gone", row.branch_id);
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => {
+                        eprintln!("repair plan failed: {error:?}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+            // apply: intent-stamped, slice-bounded, refusals stand.
+            vcs.set_intent(Some(row.incident_id.clone()));
+            let cut_id = generated_cut_id();
+            let outcome = vcs.apply_undo_selection(&row.branch_id, &expr, &cut_id, &at);
+            let facts = vcs.take_pending_facts();
+            arm_incidents_from_facts(&facts, &at);
+            route_workspace_facts(&vcs, facts, &options.store_path);
+            match outcome {
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::Proposed {
+                    cut_id,
+                    reverted_paths,
+                    ..
+                }) => {
+                    let _ = incidents.close(&row.incident_id, &ambient_actor(), &at);
+                    emit_json(json!({
+                        "repaired": row.incident_id,
+                        "cut_id": cut_id,
+                        "reverted_paths": reverted_paths,
+                        "intent": row.incident_id,
+                    }))
+                }
+                Ok(whipplescript_store::vcs::UndoSelectionOutcome::WouldStrand { stranded }) => {
+                    eprintln!(
+                        "repair refused: undoing this slice would strand {} retained \
+                         unit(s); the incident stays open — escalate to a human \
+                         (there is no --force)",
+                        stranded.len()
+                    );
+                    ExitCode::FAILURE
+                }
+                Ok(other) => {
+                    eprintln!("repair refused: {other:?}; the incident stays open");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("repair apply failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "close" => {
+            let Some(incident_id) = rest.first() else {
+                eprintln!("{}", command_usage("repair").unwrap_or_default());
+                return ExitCode::from(2);
+            };
+            match incidents.close(incident_id, &ambient_actor(), &at) {
+                Ok(Some(row)) if row.status == IncidentStatus::Resolved => {
+                    emit_json(json!({"closed": incident_json(&row)}))
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    eprintln!("no open incident `{incident_id}`");
+                    ExitCode::FAILURE
+                }
+                Err(error) => {
+                    eprintln!("repair close failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        other => {
+            eprintln!(
+                "unknown repair verb `{other}`\n{}",
+                command_usage("repair").unwrap_or_default()
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `whip changes [--others] [--by <prefix>] [--path <glob>] [--since <cut>]`
+/// — what moved on MY line, session-scoped (DR-0052 Decision 4/6: the
+/// `changes` surface, CLI form). Rows carry path / kind / by / intent /
+/// cut / at.
+fn changes_command(options: &CliOptions) -> ExitCode {
+    let vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    let (principal, branch_id) = match ambient_session_line(&vcs) {
+        Ok(found) => found,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let args: Vec<&str> = options.args.iter().map(String::as_str).collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|arg| *arg == name)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+    };
+    let others = args.contains(&"--others");
+    let by = flag("--by");
+    let path_glob = flag("--path");
+    let since = flag("--since");
+    let units = match vcs.change_units(&branch_id, 500) {
+        Ok(units) => units,
+        Err(error) => {
+            eprintln!("changes failed: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let since_seq = since.and_then(|cut| {
+        units
+            .iter()
+            .find(|unit| unit.cut_id == cut)
+            .map(|unit| unit.seq)
+    });
+    let rows: Vec<_> = units
+        .iter()
+        .filter(|unit| {
+            if let Some(seq) = since_seq {
+                if unit.seq <= seq {
+                    return false;
+                }
+            }
+            if others && unit.actor.as_deref() == Some(principal.as_str()) {
+                return false;
+            }
+            if let Some(prefix) = by {
+                if !unit
+                    .actor
+                    .as_deref()
+                    .is_some_and(|actor| actor.starts_with(prefix))
+                {
+                    return false;
+                }
+            }
+            if let Some(glob) = path_glob {
+                if !whipplescript_store::selection::glob_matches(glob, &unit.path) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|unit| {
+            // The mechanical kind is the origin's tag (`write:` etc.);
+            // repair/merge/rebase read directly.
+            let kind = unit
+                .origin
+                .as_deref()
+                .map(|origin| origin.split(':').next().unwrap_or(origin).to_owned());
+            json!({
+                "path": unit.path,
+                "kind": kind,
+                "by": unit.actor,
+                "intent": unit.intent,
+                "cut": unit.cut_id,
+                "at": unit.recorded_at,
+            })
+        })
+        .collect();
+    emit_json(json!({
+        "session": principal,
+        "line": branch_id,
+        "changes": rows,
+    }))
+}
+
+/// `whip undo "<expr>" [--apply]` — the ambient-session form of
+/// `branch undo`: the line is implied by the session; everything else
+/// (preview default, stranding refusal) is the explicit verb unchanged.
+fn ambient_undo_command(options: &CliOptions) -> ExitCode {
+    let vcs = match open_vcs() {
+        Ok(vcs) => vcs,
+        Err(code) => return code,
+    };
+    let (_, branch_id) = match ambient_session_line(&vcs) {
+        Ok(found) => found,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(vcs); // branch_command opens its own handle
+    let mut args = vec!["undo".to_owned(), branch_id];
+    args.extend(options.args.iter().cloned());
+    let delegated = CliOptions {
+        command: Some("branch".to_owned()),
+        args,
+        store_path: options.store_path.clone(),
+        json: options.json,
+        input_json: options.input_json.clone(),
+    };
+    branch_command(&delegated)
+}
+
 fn branch_command(options: &CliOptions) -> ExitCode {
     use whipplescript_store::branches::BranchStatus;
     use whipplescript_store::vcs::{VcsMergeOutcome, VcsWriteOutcome};
@@ -35357,7 +36872,7 @@ fn branch_command(options: &CliOptions) -> ExitCode {
         Ok(vcs) => vcs,
         Err(code) => return code,
     };
-    match verb {
+    let code = match verb {
         "create" => {
             let mut name: Option<&str> = None;
             let mut parent: &str = whipplescript_store::branches::MAINLINE_BRANCH_ID;
@@ -35624,8 +37139,10 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{BRANCH_USAGE}");
                 return ExitCode::from(2);
             };
+            // Binding queues no workspace facts; return directly (the
+            // shared tail below needs `vcs`, which the helper re-opens).
             drop(vcs);
-            match bind_instance_to_branch(&options.store_path, instance_id, branch_id) {
+            return match bind_instance_to_branch(&options.store_path, instance_id, branch_id) {
                 Ok(()) => emit_json(json!({
                     "bound": instance_id,
                     "branch_id": branch_id,
@@ -35634,7 +37151,7 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     eprintln!("branch bind failed: {message}");
                     ExitCode::FAILURE
                 }
-            }
+            };
         }
         "reconcile" => {
             // One reconciliation-daemon pass over every live branch:
@@ -35656,6 +37173,16 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 whipplescript_store::workstreams::WorkstreamStore::open(workstream_store_path())
                     .ok();
             let mut report = Vec::new();
+            let mut mediator_facts: Vec<(String, Value)> = Vec::new();
+            // Stream quiescence (DR-0052 D4 ruling): a LEVEL observed as an
+            // EDGE — emitted keyed by (stream, line-head-cut), so a rule
+            // fires once per quiescent state and re-arms when the line
+            // advances; a stale observation self-corrects at the next
+            // promote's own re-check.
+            let mut stream_quiescence: std::collections::BTreeMap<
+                String,
+                (bool, Vec<String>, String),
+            > = std::collections::BTreeMap::new();
             for row in branches {
                 if row.parent_branch_id.is_none() {
                     continue; // mainline has nothing to fold down from
@@ -35672,11 +37199,69 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     (None, _) | (_, Err(_)) => false,
                 };
                 use whipplescript_store::workstreams::{StreamStatus, Workstreams};
-                let stream_line = streams.as_ref().and_then(|streams| {
+                let stream_home = streams.as_ref().and_then(|streams| {
                     let stream_id = streams.home_of(&row.branch_id).ok().flatten()?;
                     let stream = streams.get_stream(&stream_id).ok().flatten()?;
-                    (stream.status == StreamStatus::Active).then_some(stream.line_branch_id)
+                    (stream.status == StreamStatus::Active).then_some(stream)
                 });
+                // The staleness bound (DR-0052 S1, the one real §7.1 knob):
+                // a member whose base lags its line's head by more than the
+                // stream's bound gets `vcs.staleness.exceeded` — an
+                // arming fact, because a too-stale member must rebase down
+                // before it may merge up.
+                if let Some(stream) = &stream_home {
+                    if let Some(bound) = stream.staleness_seconds {
+                        let unix = |stamp: &str| -> Option<i64> {
+                            stamp.strip_prefix("unix:")?.parse::<i64>().ok()
+                        };
+                        let line_head_at = vcs
+                            .get_branch(&stream.line_branch_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|line| line.head_cut_id)
+                            .and_then(|cut| vcs.get_cut(&cut).ok().flatten())
+                            .and_then(|cut| unix(&cut.recorded_at));
+                        // The member's freshness anchor: its newest
+                        // fold-down (a `sync:`/`rebase` cut), else its
+                        // creation — NOT the branch point, which tracks
+                        // the lineage parent rather than the stream line.
+                        let base_at = vcs
+                            .list_cuts(&row.branch_id, 50)
+                            .ok()
+                            .and_then(|cuts| {
+                                cuts.into_iter().find_map(|cut| {
+                                    let folded = cut.origin.as_deref().is_some_and(|origin| {
+                                        origin == "rebase" || origin.starts_with("sync:")
+                                    });
+                                    folded.then(|| unix(&cut.recorded_at)).flatten()
+                                })
+                            })
+                            .or_else(|| unix(&row.created_at));
+                        if let (Some(head_at), Some(base_at)) = (line_head_at, base_at) {
+                            let lag = head_at - base_at;
+                            if lag > bound {
+                                mediator_facts.push((
+                                    "vcs.staleness.exceeded".to_owned(),
+                                    json!({
+                                        "branch": row.branch_id,
+                                        "stream": stream.stream_id,
+                                        "lag_seconds": lag,
+                                        "bound_seconds": bound,
+                                        "at": at,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(stream) = &stream_home {
+                    let entry = stream_quiescence
+                        .entry(stream.stream_id.clone())
+                        .or_insert((true, Vec::new(), stream.line_branch_id.clone()));
+                    entry.0 &= quiescent;
+                    entry.1.push(row.branch_id.clone());
+                }
+                let stream_line = stream_home.map(|stream| stream.line_branch_id);
                 let cut_id = generated_cut_id();
                 if let Some(line_id) = stream_line {
                     if quiescent {
@@ -35753,6 +37338,188 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 };
                 report.push(entry);
             }
+            // DR-0052 A5: the mediator pass's observations, as facts.
+            // A conflicted entry is the arming signal
+            // (`vcs.reconcile.stalled`); a folded delta is "the
+            // mediator moved your base" (`vcs.cut.recorded`).
+            // Conflict PREDICTION (§7.1: flag overlap the moment
+            // contention starts, while coordination is still cheap):
+            // two same-stream members whose OWN work (rebase/sync cuts
+            // excluded — those are the mediator's) touches intersecting
+            // paths get `vcs.contention.predicted`, each.
+            if let Some(streams) = &streams {
+                use whipplescript_store::workstreams::{StreamStatus, Workstreams};
+                let own_paths = |branch_id: &str| -> BTreeSet<String> {
+                    vcs.change_units(branch_id, 500)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|unit| {
+                            !unit.origin.as_deref().is_some_and(|origin| {
+                                origin == "rebase" || origin.starts_with("sync:")
+                            })
+                        })
+                        .map(|unit| unit.path)
+                        .collect()
+                };
+                for stream in streams
+                    .list_streams(Some(StreamStatus::Active))
+                    .unwrap_or_default()
+                {
+                    let members = streams.members(&stream.stream_id).unwrap_or_default();
+                    let member_paths: Vec<(String, BTreeSet<String>)> = members
+                        .iter()
+                        .map(|member| (member.clone(), own_paths(member)))
+                        .collect();
+                    for (index, (member_a, paths_a)) in member_paths.iter().enumerate() {
+                        for (member_b, paths_b) in member_paths.iter().skip(index + 1) {
+                            let overlap: Vec<&String> = paths_a.intersection(paths_b).collect();
+                            if overlap.is_empty() {
+                                continue;
+                            }
+                            for (member, other) in [(member_a, member_b), (member_b, member_a)] {
+                                mediator_facts.push((
+                                    "vcs.contention.predicted".to_owned(),
+                                    json!({
+                                        "branch": member,
+                                        "with": other,
+                                        "stream": stream.stream_id,
+                                        "slice": overlap,
+                                        "at": at,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            for entry in &report {
+                let branch = entry
+                    .get("branch_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match entry.get("outcome").and_then(Value::as_str) {
+                    Some("conflicts") => mediator_facts.push((
+                        "vcs.reconcile.stalled".to_owned(),
+                        json!({
+                            "branch": branch,
+                            "line": entry.get("line_branch_id"),
+                            "paths": entry
+                                .get("conflicts")
+                                .and_then(Value::as_array)
+                                .map(|rows| {
+                                    rows.iter()
+                                        .filter_map(|row| row.get("path"))
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                }),
+                            "at": at,
+                        }),
+                    )),
+                    Some("rebased") => mediator_facts.push((
+                        "vcs.cut.recorded".to_owned(),
+                        json!({
+                            "branch": branch,
+                            "cut": entry.get("rebase_cut_id"),
+                            "origin": "rebase",
+                            "by": "mediator",
+                            "at": at,
+                        }),
+                    )),
+                    Some("admitted") => mediator_facts.push((
+                        "vcs.cut.recorded".to_owned(),
+                        json!({
+                            // The LINE moved: its followers are the audience.
+                            "branch": entry.get("line_branch_id"),
+                            "cut": entry.get("sync_cut_id"),
+                            "origin": format!("sync:{branch}"),
+                            "by": "mediator",
+                            "at": at,
+                        }),
+                    )),
+                    _ => {}
+                }
+            }
+            for (stream_id, (all_quiescent, members, line_id)) in &stream_quiescence {
+                if !all_quiescent || members.is_empty() {
+                    continue;
+                }
+                let Some(head_cut) = vcs
+                    .get_branch(line_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|line| line.head_cut_id)
+                else {
+                    continue;
+                };
+                for member in members {
+                    mediator_facts.push((
+                        "vcs.stream.quiescent".to_owned(),
+                        json!({
+                            "branch": member,
+                            "stream": stream_id,
+                            "cut": head_cut,
+                            "at": at,
+                        }),
+                    ));
+                }
+            }
+            arm_incidents_from_facts(&mediator_facts, &at);
+            // Clearing: a branch that folded or is in sync no longer has
+            // a stalled situation — its open stall incidents resolve
+            // (mediator-observed recovery, the evaporation half of R1).
+            // And the pair-counter turns repeated prediction into the
+            // `recurring` diagnostic fact.
+            if let Ok(mut incident_store) =
+                whipplescript_store::incidents::IncidentStore::open(incidents_store_path())
+            {
+                let mut recurring: Vec<(String, Value)> = Vec::new();
+                for entry in &report {
+                    let branch = entry
+                        .get("branch_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    match entry.get("outcome").and_then(Value::as_str) {
+                        Some("rebased") | Some("admitted") | Some("up_to_date") => {
+                            let _ = incident_store.close_cleared("reconcile_stalled", branch, &at);
+                        }
+                        _ => {}
+                    }
+                }
+                for (name, payload) in &mediator_facts {
+                    if name != "vcs.contention.predicted" {
+                        continue;
+                    }
+                    let (Some(branch), Some(with)) = (
+                        payload.get("branch").and_then(Value::as_str),
+                        payload.get("with").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    // Each pair appears twice (one fact per member);
+                    // bump once per ordered appearance, threshold on the
+                    // symmetric count.
+                    if branch < with {
+                        if let Ok(count) = incident_store.bump_contention(branch, with, &at) {
+                            if count >= 3 {
+                                for (member, other) in [(branch, with), (with, branch)] {
+                                    recurring.push((
+                                        "vcs.contention.recurring".to_owned(),
+                                        json!({
+                                            "branch": member,
+                                            "with": other,
+                                            "count": count,
+                                            "at": at,
+                                        }),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                route_workspace_facts(&vcs, recurring, &options.store_path);
+            }
+            route_workspace_facts(&vcs, mediator_facts, &options.store_path);
             emit_json(Value::Array(report))
         }
         "discard" => {
@@ -36120,6 +37887,45 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{BRANCH_USAGE}");
                 return ExitCode::from(2);
             };
+            // `attribution <branch> <path> --deep` (DR-0052 A3): the
+            // per-path provenance CHAIN — every recorded unit that
+            // touched the path, oldest first, each carrying cut /
+            // change / origin / actor / intent / time, plus the
+            // branch's workstream homing (the tier above the session).
+            // Blame answers "who last"; the chain answers "who, when,
+            // why, in what order".
+            let path_arg = rest.get(1).copied().filter(|arg| !arg.starts_with("--"));
+            let deep = rest.contains(&"--deep");
+            if let Some(path) = path_arg {
+                let units = match vcs.change_units(branch_id, 500) {
+                    Ok(units) => units,
+                    Err(error) => {
+                        eprintln!("branch attribution failed: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let touching: Vec<_> = units.iter().filter(|unit| unit.path == path).collect();
+                if touching.is_empty() {
+                    eprintln!("no recorded unit touches `{path}` on `{branch_id}`");
+                    return ExitCode::FAILURE;
+                }
+                let rows: Vec<_> = if deep {
+                    touching.iter().map(|unit| json!(unit)).collect()
+                } else {
+                    vec![json!(touching.last().expect("non-empty"))]
+                };
+                let stream = open_streams().ok().and_then(|streams| {
+                    whipplescript_store::workstreams::Workstreams::home_of(&streams, branch_id)
+                        .ok()
+                        .flatten()
+                });
+                return emit_json(json!({
+                    "branch": branch_id,
+                    "path": path,
+                    "stream": stream,
+                    "chain": rows,
+                }));
+            }
             match vcs.attribution(branch_id) {
                 Ok(Some(rows)) => match serde_json::to_value(&rows) {
                     Ok(payload) => emit_json(payload),
@@ -36626,7 +38432,14 @@ fn branch_command(options: &CliOptions) -> ExitCode {
             eprintln!("unknown branch verb `{other}`\n{BRANCH_USAGE}");
             ExitCode::from(2)
         }
-    }
+    };
+    // DR-0052 A5/R1: whatever the operations observed — deliver the
+    // facts, and let refusals/stalls arm incidents (early `return`s
+    // above are usage/store errors with nothing queued).
+    let facts = vcs.take_pending_facts();
+    arm_incidents_from_facts(&facts, &at);
+    route_workspace_facts(&vcs, facts, &options.store_path);
+    code
 }
 
 fn generated_cut_id() -> String {
@@ -40585,6 +42398,18 @@ fn store_error(error: StoreError) -> String {
         StoreError::Conflict(message) => message,
         StoreError::PolicyBlocked { reason, .. } => reason,
         StoreError::CapacityBlocked { reason, .. } => reason,
+        // DR-0054 Phase B: a store written by a newer whip fails closed with
+        // both versions named. The store is intact; deleting it is never the
+        // remediation.
+        StoreError::UnsupportedVersion {
+            subject,
+            found,
+            supported,
+        } => format!(
+            "{subject} is at version {found}, but this whip supports up to version {supported}; \
+             it was written by a newer whip. Run a whip that supports version {found} — the \
+             store is intact, do not delete it"
+        ),
     }
 }
 
@@ -41923,6 +43748,122 @@ mod tests {
     use whipplescript_store::{NewEffect, RuleCommit};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// DR-0052 R3: the repair scope RETARGETS the selective provider at
+    /// the incident's branch (no instance binding needed) and REFUSES a
+    /// selection exceeding the derived slice; the repair cut is
+    /// intent-stamped with the scope's source reference.
+    #[test]
+    fn repair_scope_retargets_and_refuses_excess() {
+        use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let root = std::env::temp_dir().join(format!(
+            "whip-repair-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let previous: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "WHIPPLESCRIPT_BRANCH_STORE",
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect();
+        std::env::set_var("WHIPPLESCRIPT_BRANCH_STORE", root.join("branches.sqlite"));
+        std::env::set_var(
+            "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+            root.join("content.sqlite"),
+        );
+
+        // The incident's branch carries two writes; the derived slice
+        // covers only one of them.
+        let mut vcs = open_vcs().expect("vcs");
+        vcs.init("t0").expect("init");
+        vcs.create_branch("stalled-line", None, "main", "t1")
+            .expect("branch");
+        vcs.set_actor(Some("s:sess-9".to_owned()));
+        vcs.write("stalled-line", "contested.md", Some("v1"), "cut_1", "t2")
+            .expect("write");
+        vcs.write("stalled-line", "unrelated.md", Some("v1"), "cut_2", "t3")
+            .expect("write");
+        drop(vcs);
+
+        let store_path = root.join("store.sqlite");
+        let mut store = SqliteStore::open(&store_path).expect("store");
+        store
+            .record_repair_scope(
+                "ins-repair",
+                "stalled-line",
+                "path(contested.md)",
+                "inc-test",
+            )
+            .expect("scope");
+        drop(store);
+
+        let provider = VcsSelectiveCapabilityProvider {
+            store_path: store_path.clone(),
+            instance_id: "ins-repair".to_owned(),
+        };
+        let effect = |id: &str, selection: &str| ClaimableEffect {
+            effect_id: id.to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some("vcs.undo".to_owned()),
+            profile: None,
+            input_json: json!({ "selection": selection }).to_string(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let config = EffectConfig::default();
+
+        // Exceeding the slice refuses (never-widen, refusal not narrowing).
+        let outcome = provider.produce(&effect("e-wide", "in-branch(stalled-line)"), &config);
+        let CapabilityOutcome::Failed { message, .. } = outcome else {
+            panic!("expected refusal");
+        };
+        assert!(message.contains("exceeds the repair grant"));
+        // unrelated.md is untouched by the refusal.
+        let vcs = open_vcs().expect("vcs");
+        assert_eq!(
+            vcs.read("stalled-line", "unrelated.md")
+                .expect("read")
+                .as_deref(),
+            Some("v1")
+        );
+        drop(vcs);
+
+        // Within the slice: retargeted apply on a branch this instance
+        // was never bound to, intent-stamped with the scope's source.
+        let outcome = provider.produce(&effect("e-ok", "path(contested.md)"), &config);
+        let CapabilityOutcome::Produced(value) = outcome else {
+            panic!("expected produced");
+        };
+        assert_eq!(value["variant"], "Applied");
+        let vcs = open_vcs().expect("vcs");
+        assert!(vcs
+            .read("stalled-line", "contested.md")
+            .expect("read")
+            .is_none());
+        let units = vcs.change_units("stalled-line", 10).expect("units");
+        let repair_unit = units
+            .iter()
+            .find(|unit| unit.origin.as_deref() == Some("undo-selection"))
+            .expect("repair cut");
+        assert_eq!(repair_unit.intent.as_deref(), Some("inc-test"));
+        assert_eq!(repair_unit.actor.as_deref(), Some("instance:ins-repair"));
+        drop(vcs);
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn http_source_guard_refuses_internal_targets_and_screens_dns() {
@@ -52577,6 +54518,91 @@ rule claim_ready
         assert_eq!(ready.contexts.len(), 1);
         assert_eq!(ready.contexts[0].bindings[0].0, "item");
         assert_eq!(ready.contexts[0].bindings[0].1.key, "backlog:WS-1:gen");
+    }
+
+    /// DR-0052 grammar pass slice 2: the std.vcs readiness sugar — each
+    /// phrase lowers to its `vcs.*` fact; the stream guard filters by the
+    /// leading word; `by others` excludes exactly the matching instance's
+    /// own principal.
+    #[test]
+    fn vcs_readiness_sugar_lowers_guards_and_excludes_own_writes() {
+        let source = r#"
+@service
+workflow VcsSugar
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+stream triage {
+  members [worker]
+}
+
+class Note { body string }
+rule on_change
+  when line changed by others as c
+=> {
+  record Note { body c.path }
+}
+rule on_contention
+  when triage has contention as x
+=> {
+  record Note { body x.slice }
+}
+"#;
+        let ir = whipplescript_parser::compile_program(source)
+            .ir
+            .expect("compile");
+        let cut_fact = |id: &str, by: &str| FactView {
+            fact_id: format!("fact-{id}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: "vcs.cut.recorded".to_owned(),
+            key: id.to_owned(),
+            value_json: format!(
+                r#"{{"branch":"line","cut":"{id}","path":"src/a.rs","by":"{by}"}}"#
+            ),
+            provenance_class: "external".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        };
+        let own = cut_fact("c-own", "instance:i-1");
+        let other = cut_fact("c-other", "s:sess-9");
+        let facts = vec![own, other];
+        // `line changed by others`: with the instance's own principal in
+        // scope, only the foreign cut matches.
+        let ready = whipplescript_kernel::rule_lowering::ready_contexts_for(
+            &ir,
+            &ir.rules[0],
+            &facts,
+            &[],
+            None,
+            Some("instance:i-1"),
+        );
+        assert_eq!(ready.contexts.len(), 1);
+        assert_eq!(ready.contexts[0].bindings[0].1.key, "c-other");
+        // Without an own-principal (projection contexts) both match.
+        let ready = ready_contexts(&ir, &ir.rules[0], &facts, &[], None);
+        assert_eq!(ready.contexts.len(), 2);
+        // Stream guard: `triage has contention` matches only facts whose
+        // payload names triage.
+        let contention = |id: &str, stream: &str| FactView {
+            fact_id: format!("fact-{id}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: "vcs.contention.predicted".to_owned(),
+            key: id.to_owned(),
+            value_json: format!(r#"{{"branch":"line","stream":"{stream}","slice":["src/a.rs"]}}"#),
+            provenance_class: "external".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        };
+        let facts = vec![contention("k-1", "triage"), contention("k-2", "hotfix")];
+        let ready = ready_contexts(&ir, &ir.rules[1], &facts, &[], None);
+        assert_eq!(ready.contexts.len(), 1);
+        assert_eq!(ready.contexts[0].bindings[0].1.key, "k-1");
     }
 
     #[test]

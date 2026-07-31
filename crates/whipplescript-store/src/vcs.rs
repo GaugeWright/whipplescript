@@ -20,7 +20,7 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[cfg(feature = "native")]
@@ -266,6 +266,8 @@ pub struct PathAttribution {
     pub cut_id: Option<String>,
     pub change_id: Option<String>,
     pub origin: Option<String>,
+    /// WHO last wrote it (DR-0052; `None` = pre-actor cut).
+    pub actor: Option<String>,
     pub recorded_at: Option<String>,
 }
 
@@ -383,6 +385,17 @@ pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
     source_merger: Option<Box<dyn SourceMerger>>,
+    /// The acting principal every cut this handle records is attributed
+    /// to (DR-0052 Decision 1: authorship observed at the mediator, so
+    /// the handle's constructor — CLI seam, harness, daemon — decides,
+    /// never the content). `None` = an un-attributed legacy caller.
+    actor: Option<String>,
+    /// The motivating work item / incident the current operation carries
+    /// (repair sets it per incident; ordinary writes leave it unset).
+    intent: Option<String>,
+    /// `workspace.*` facts queued by operations, drained by the caller
+    /// (DR-0052 A5: the store observes, the mediator surface routes).
+    pending_facts: Vec<(String, serde_json::Value)>,
 }
 
 /// The native workspace VCS: rusqlite-backed branch + content stores.
@@ -399,6 +412,9 @@ impl NativeWorkspaceVcs {
             branches: BranchStore::open(branches_path)?,
             content: ContentStore::open(content_path)?,
             source_merger: None,
+            actor: None,
+            intent: None,
+            pending_facts: Vec::new(),
         })
     }
 
@@ -433,6 +449,9 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             branches,
             content,
             source_merger: None,
+            actor: None,
+            intent: None,
+            pending_facts: Vec::new(),
         }
     }
 
@@ -441,6 +460,51 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// merger, no source-aware refinement.
     pub fn set_source_merger(&mut self, merger: Box<dyn SourceMerger>) {
         self.source_merger = Some(merger);
+    }
+
+    /// Attribute every cut this handle records to `actor` (DR-0052:
+    /// `s:<session>` / `instance:<id>` / `human:<op>` / `root` /
+    /// `git:<author>` / `mediator`). Set at construction seams only —
+    /// the acting principal is a property of who holds the handle.
+    pub fn set_actor(&mut self, actor: Option<String>) {
+        self.actor = actor;
+    }
+
+    /// Stamp subsequent cuts with the motivating work item / incident id
+    /// (`intent(...)` atom's data source). Cleared the same way.
+    pub fn set_intent(&mut self, intent: Option<String>) {
+        self.intent = intent;
+    }
+
+    /// Queue a `workspace.*` fact (DR-0052 A5). The store never routes —
+    /// the caller (CLI mediator surface, daemon) drains
+    /// [`Self::take_pending_facts`] and delivers to bound running
+    /// instances. Generated-only by construction: user `record` mints
+    /// capitalized class facts, so dotted `workspace.*` names are
+    /// unrecordable from source.
+    fn note_fact(&mut self, name: &str, branch_id: &str, mut payload: serde_json::Value) {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("branch".to_owned(), serde_json::json!(branch_id));
+        }
+        self.pending_facts.push((name.to_owned(), payload));
+    }
+
+    /// Drain the facts queued since the last drain, oldest first.
+    pub fn take_pending_facts(&mut self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut self.pending_facts)
+    }
+
+    /// The op-undo moved-head refusal, as a fact (op-undo.maude's bite
+    /// made observable — a DR-0052 repair arming signal).
+    fn note_head_moved(&mut self, op_id: &str, branch_id: &str, at: &str) {
+        let payload = serde_json::json!({
+            "op": "undo-op",
+            "reason": "head-moved",
+            "op_id": op_id,
+            "by": self.actor,
+            "at": at,
+        });
+        self.note_fact("vcs.op.refused", branch_id, payload);
     }
 
     /// Bootstrap the workspace: the mainline branch exists after this.
@@ -695,6 +759,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: row.head_cut_id.as_deref(),
                     origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -704,6 +770,22 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     Some(&origin),
                     at,
                 )?;
+                self.note_fact(
+                    "vcs.cut.recorded",
+                    branch_id,
+                    serde_json::json!({
+                        "cut": cut_id,
+                        "path": path,
+                        "origin": origin,
+                        "by": self.actor,
+                        "intent": self.intent,
+                        "at": at,
+                    }),
+                );
+                // DR-0052 L4: keep the change-unit index warm at the
+                // mutation point (best-effort; reads are correct either
+                // way).
+                let _ = self.maintain_change_unit_index(branch_id);
                 Ok(VcsWriteOutcome::Written {
                     cut_id: cut_id.to_owned(),
                     manifest_hash,
@@ -1376,6 +1458,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &rebased_hash,
                     parent_cut_id: branch.head_cut_id.as_deref(),
                     origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -1520,6 +1604,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                             manifest_hash: &merged_hash,
                             parent_cut_id: parent.head_cut_id.as_deref(),
                             origin: Some(&origin),
+                            actor: self.actor.as_deref(),
+                            intent: self.intent.as_deref(),
                             recorded_at: at,
                         })?;
                         advanced
@@ -1732,6 +1818,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &cut.manifest_hash,
                     parent_cut_id: row.head_cut_id.as_deref(),
                     origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -1777,6 +1865,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 manifest_hash: &manifest_hash,
                 parent_cut_id: None,
                 origin: Some("cut"),
+                actor: self.actor.as_deref(),
+                intent: self.intent.as_deref(),
                 recorded_at: at,
             })?;
             let change_id = self
@@ -1804,6 +1894,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: None,
                     origin: Some("cut"),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -1924,6 +2016,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         // the op left it (the model's moved-head bite).
         for delta in &op.deltas {
             let Some(row) = self.branches.get_branch(&delta.branch_id)? else {
+                self.note_head_moved(op_id, &delta.branch_id, at);
                 return Ok(UndoOpOutcome::HeadMoved {
                     branch_id: delta.branch_id.clone(),
                     current_head_cut_id: None,
@@ -1931,6 +2024,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 });
             };
             if OpBranchState::of(&row) != delta.after {
+                self.note_head_moved(op_id, &delta.branch_id, at);
                 return Ok(UndoOpOutcome::HeadMoved {
                     branch_id: delta.branch_id.clone(),
                     current_head_cut_id: row.head_cut_id,
@@ -2003,40 +2097,155 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         branch_id: &str,
         limit: usize,
     ) -> StoreResult<Vec<crate::selection::ChangeUnit>> {
-        let mut cuts = self.branches.list_cuts(branch_id, limit)?;
+        // DR-0052 L4: the change-unit INDEX serves the recorded prefix
+        // (no manifest loads); only the unindexed tail — cuts recorded
+        // since the last maintenance — is computed here, in memory. The
+        // index is a pure cache: cuts are immutable and the branch's cut
+        // list is append-only, so a consistent prefix can never go
+        // stale, and an inconsistent cursor (defensive: a restored or
+        // hand-edited store) just means full recompute until the next
+        // maintenance pass resets it.
+        let mut cuts = self.branches.list_cuts(branch_id, i64::MAX as usize)?;
         cuts.reverse(); // oldest first: the dependence direction
-        let mut units = Vec::new();
-        for cut in cuts {
-            let after = match self.content.get(&cut.manifest_hash)? {
-                Some(body) => serde_json::from_str::<BTreeMap<String, String>>(&body)
-                    .map_err(StoreError::from)?,
-                None => continue,
-            };
-            let before = match cut.parent_cut_id.as_deref() {
-                None => BTreeMap::new(),
-                Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
-                    None => BTreeMap::new(),
-                    Some(parent) => match self.content.get(&parent.manifest_hash)? {
-                        Some(body) => serde_json::from_str(&body).map_err(StoreError::from)?,
-                        None => continue,
-                    },
-                },
-            };
-            for path in Self::diff_paths(&before, &after) {
+        let cursor = self.branches.change_unit_cursor(branch_id)?;
+        let indexed = cursor.indexed_cuts.max(0) as usize;
+        let consistent = indexed <= cuts.len()
+            && (indexed == 0
+                || cuts.get(indexed - 1).map(|cut| cut.cut_id.as_str())
+                    == cursor.last_indexed_cut_id.as_deref());
+        let prefix = if consistent { indexed } else { 0 };
+        let by_cut: BTreeMap<&str, &crate::branches::CutRow> =
+            cuts.iter().map(|cut| (cut.cut_id.as_str(), cut)).collect();
+        let mut units: Vec<crate::selection::ChangeUnit> = Vec::new();
+        if prefix > 0 {
+            for row in self.branches.list_change_unit_rows(branch_id, 0)? {
+                if row.cut_seq as usize >= prefix {
+                    continue; // beyond the verified prefix: recompute below
+                }
+                let Some(cut) = by_cut.get(row.cut_id.as_str()) else {
+                    continue;
+                };
                 units.push(crate::selection::ChangeUnit {
                     seq: units.len(),
-                    cut_id: cut.cut_id.clone(),
+                    cut_id: row.cut_id.clone(),
                     change_id: cut.change_id.clone(),
                     branch_id: cut.branch_id.clone(),
-                    path: path.clone(),
-                    before: before.get(&path).cloned(),
-                    after: after.get(&path).cloned(),
+                    path: row.path.clone(),
+                    before: row.before_hash.clone(),
+                    after: row.after_hash.clone(),
                     origin: cut.origin.clone(),
+                    actor: cut.actor.clone(),
+                    intent: cut.intent.clone(),
                     recorded_at: cut.recorded_at.clone(),
                 });
             }
         }
+        for cut in &cuts[prefix..] {
+            self.push_units_for_cut(cut, &mut units)?;
+        }
+        // Window semantics are unchanged: callers get the units of the
+        // LAST `limit` cuts, seq re-based within the window.
+        if cuts.len() > limit {
+            let window: std::collections::BTreeSet<&str> = cuts[cuts.len() - limit..]
+                .iter()
+                .map(|cut| cut.cut_id.as_str())
+                .collect();
+            units.retain(|unit| window.contains(unit.cut_id.as_str()));
+            for (index, unit) in units.iter_mut().enumerate() {
+                unit.seq = index;
+            }
+        }
         Ok(units)
+    }
+
+    /// Compute one cut's per-path units (manifest diff against its
+    /// parent) and append them, seq-continuing.
+    fn push_units_for_cut(
+        &self,
+        cut: &crate::branches::CutRow,
+        units: &mut Vec<crate::selection::ChangeUnit>,
+    ) -> StoreResult<()> {
+        let after = match self.content.get(&cut.manifest_hash)? {
+            Some(body) => {
+                serde_json::from_str::<BTreeMap<String, String>>(&body).map_err(StoreError::from)?
+            }
+            None => return Ok(()),
+        };
+        let before = match cut.parent_cut_id.as_deref() {
+            None => BTreeMap::new(),
+            Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
+                None => BTreeMap::new(),
+                Some(parent) => match self.content.get(&parent.manifest_hash)? {
+                    Some(body) => serde_json::from_str(&body).map_err(StoreError::from)?,
+                    None => return Ok(()),
+                },
+            },
+        };
+        for path in Self::diff_paths(&before, &after) {
+            units.push(crate::selection::ChangeUnit {
+                seq: units.len(),
+                cut_id: cut.cut_id.clone(),
+                change_id: cut.change_id.clone(),
+                branch_id: cut.branch_id.clone(),
+                path: path.clone(),
+                before: before.get(&path).cloned(),
+                after: after.get(&path).cloned(),
+                origin: cut.origin.clone(),
+                actor: cut.actor.clone(),
+                intent: cut.intent.clone(),
+                recorded_at: cut.recorded_at.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Extend the change-unit index over any unindexed tail (DR-0052
+    /// L4). Called from mutation points (each call indexes only what the
+    /// last one left); an inconsistent cursor resets and reindexes from
+    /// scratch. Best-effort by design — the read path is correct with or
+    /// without it.
+    pub fn maintain_change_unit_index(&mut self, branch_id: &str) -> StoreResult<usize> {
+        let mut cuts = self.branches.list_cuts(branch_id, i64::MAX as usize)?;
+        cuts.reverse();
+        let cursor = self.branches.change_unit_cursor(branch_id)?;
+        let indexed = cursor.indexed_cuts.max(0) as usize;
+        let consistent = indexed <= cuts.len()
+            && (indexed == 0
+                || cuts.get(indexed - 1).map(|cut| cut.cut_id.as_str())
+                    == cursor.last_indexed_cut_id.as_deref());
+        let start = if consistent {
+            indexed
+        } else {
+            self.branches.reset_change_unit_index(branch_id)?;
+            0
+        };
+        if start >= cuts.len() {
+            return Ok(0);
+        }
+        let mut rows = Vec::new();
+        for (offset, cut) in cuts[start..].iter().enumerate() {
+            let mut scratch = Vec::new();
+            self.push_units_for_cut(cut, &mut scratch)?;
+            for unit in scratch {
+                rows.push(crate::branches::ChangeUnitRow {
+                    branch_id: branch_id.to_owned(),
+                    cut_seq: (start + offset) as i64,
+                    cut_id: cut.cut_id.clone(),
+                    path: unit.path,
+                    before_hash: unit.before,
+                    after_hash: unit.after,
+                });
+            }
+        }
+        let appended = rows.len();
+        let last = cuts.last().map(|cut| cut.cut_id.clone());
+        self.branches.append_change_unit_rows(
+            branch_id,
+            &rows,
+            cuts.len() as i64,
+            last.as_deref(),
+        )?;
+        Ok(appended)
     }
 
     /// Plan `undo <selection>` (vw note §7.3; selective-undo.maude): the
@@ -2084,6 +2293,21 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             return Ok(UndoSelectionOutcome::BranchMissing);
         };
         if !plan.stranded.is_empty() {
+            self.note_fact(
+                "vcs.op.refused",
+                branch_id,
+                serde_json::json!({
+                    "op": "undo-selection",
+                    "reason": "stranded",
+                    "stranded_paths": plan
+                        .stranded
+                        .iter()
+                        .map(|unit| unit.path.clone())
+                        .collect::<Vec<_>>(),
+                    "by": self.actor,
+                    "at": at,
+                }),
+            );
             return Ok(UndoSelectionOutcome::WouldStrand {
                 stranded: plan.stranded,
             });
@@ -2126,6 +2350,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: row.head_cut_id.as_deref(),
                     origin: Some("undo-selection"),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -2135,6 +2361,53 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     Some("undo-selection"),
                     at,
                 )?;
+                self.note_fact(
+                    "vcs.cut.recorded",
+                    branch_id,
+                    serde_json::json!({
+                        "cut": cut_id,
+                        "origin": "undo-selection",
+                        "paths": plan.reverts.keys().cloned().collect::<Vec<_>>(),
+                        "by": self.actor,
+                        "intent": self.intent,
+                        "at": at,
+                    }),
+                );
+                // Revert-war detection (DR-0052 Decision 8's thrash
+                // signature): this undo reverts another actor's units on
+                // paths a PRIOR undo-selection cut (by one of those
+                // actors) already fought over — the A-undoes-B,
+                // B-undoes-A path-level cycle.
+                let cross_actors: BTreeSet<String> = plan
+                    .selected
+                    .iter()
+                    .filter_map(|unit| unit.actor.clone())
+                    .filter(|actor| Some(actor.as_str()) != self.actor.as_deref())
+                    .collect();
+                if !cross_actors.is_empty() {
+                    let reverted: BTreeSet<&String> = plan.reverts.keys().collect();
+                    let prior_war = plan.selected.iter().any(|unit| {
+                        unit.origin.as_deref() == Some("undo-selection")
+                            && unit
+                                .actor
+                                .as_deref()
+                                .is_some_and(|actor| cross_actors.contains(actor))
+                            && reverted.contains(&unit.path)
+                    });
+                    if prior_war {
+                        self.note_fact(
+                            "vcs.revert_war.detected",
+                            branch_id,
+                            serde_json::json!({
+                                "undoer": self.actor,
+                                "counterparties": cross_actors,
+                                "paths": plan.reverts.keys().cloned().collect::<Vec<_>>(),
+                                "at": at,
+                            }),
+                        );
+                    }
+                }
+                let _ = self.maintain_change_unit_index(branch_id);
                 Ok(UndoSelectionOutcome::Proposed {
                     cut_id: cut_id.to_owned(),
                     manifest_hash,
@@ -2237,6 +2510,17 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             moved.push((path.clone(), net_unit.newest.after.clone()));
         }
         if !conflicts.is_empty() {
+            self.note_fact(
+                "vcs.op.refused",
+                onto,
+                serde_json::json!({
+                    "op": "transport",
+                    "reason": "conflicted",
+                    "paths": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+                    "by": self.actor,
+                    "at": at,
+                }),
+            );
             return Ok(TransportOutcome::Conflicted { conflicts });
         }
         if moved.is_empty() {
@@ -2280,6 +2564,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: target.head_cut_id.as_deref(),
                     origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -2289,10 +2575,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     Some(&origin),
                     at,
                 )?;
+                let moved_paths: Vec<String> = moved.into_iter().map(|(path, _)| path).collect();
+                self.note_fact(
+                    "vcs.cut.recorded",
+                    onto,
+                    serde_json::json!({
+                        "cut": cut_id,
+                        "origin": origin,
+                        "paths": moved_paths,
+                        "by": self.actor,
+                        "intent": self.intent,
+                        "at": at,
+                    }),
+                );
+                let _ = self.maintain_change_unit_index(onto);
                 Ok(TransportOutcome::Transported {
                     cut_id: cut_id.to_owned(),
                     change_id: transported_change,
-                    moved_paths: moved.into_iter().map(|(path, _)| path).collect(),
+                    moved_paths,
                 })
             }
             AdvanceOutcome::Stale { .. } => Err(StoreError::Conflict(
@@ -2340,6 +2640,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 cut_id: last.map(|unit| unit.cut_id.clone()),
                 change_id: last.map(|unit| unit.change_id.clone()),
                 origin: last.and_then(|unit| unit.origin.clone()),
+                actor: last.and_then(|unit| unit.actor.clone()),
                 recorded_at: last.map(|unit| unit.recorded_at.clone()),
             });
         }
@@ -2556,6 +2857,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 manifest_hash: &cut.manifest_hash,
                 parent_cut_id: cut.parent_cut_id.as_deref(),
                 origin: cut.origin.as_deref(),
+                actor: self.actor.as_deref(),
+                intent: self.intent.as_deref(),
                 recorded_at: &cut.recorded_at,
             })?;
         }
@@ -2583,6 +2886,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: None,
                     origin: Some("bundle-import"),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -2740,6 +3045,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &manifest_hash,
                     parent_cut_id: row.head_cut_id.as_deref(),
                     origin: Some("import"),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 self.log_op(
@@ -2871,6 +3178,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     manifest_hash: &head_manifest,
                     parent_cut_id: line.head_cut_id.as_deref(),
                     origin: Some(&origin),
+                    actor: self.actor.as_deref(),
+                    intent: self.intent.as_deref(),
                     recorded_at: at,
                 })?;
                 advanced
@@ -3222,6 +3531,132 @@ mod tests {
         let inner = WorkspaceVcs::open(dir.join("branches.sqlite"), dir.join("content.sqlite"))
             .expect("open vcs");
         TempVcs { dir, inner }
+    }
+
+    /// DR-0052 A1: cuts carry the handle's acting principal; attribution
+    /// and change-units surface it; an un-attributed handle records
+    /// `None` (the honest pre-actor reading, same as migrated rows).
+    #[test]
+    fn cuts_carry_the_observed_actor() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.set_actor(Some("s:sess-7".to_owned()));
+        assert!(matches!(
+            vcs.write(MAINLINE_BRANCH_ID, "src/a.md", Some("one"), "cut_1", "t1")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        let rows = vcs
+            .attribution(MAINLINE_BRANCH_ID)
+            .expect("attribution")
+            .expect("branch exists");
+        assert_eq!(rows[0].actor.as_deref(), Some("s:sess-7"));
+        // A later un-attributed handle: the newest unit wins attribution,
+        // honestly None.
+        vcs.set_actor(None);
+        assert!(matches!(
+            vcs.write(MAINLINE_BRANCH_ID, "src/a.md", Some("two"), "cut_2", "t2")
+                .expect("write"),
+            VcsWriteOutcome::Written { .. }
+        ));
+        let rows = vcs
+            .attribution(MAINLINE_BRANCH_ID)
+            .expect("attribution")
+            .expect("branch exists");
+        assert_eq!(rows[0].actor, None);
+        // The unit stream keeps both, oldest first.
+        let units = vcs.change_units(MAINLINE_BRANCH_ID, 10).expect("units");
+        assert_eq!(units[0].actor.as_deref(), Some("s:sess-7"));
+        assert_eq!(units[1].actor, None);
+    }
+
+    /// DR-0052 L4: the change-unit index is a pure cache — indexed reads
+    /// equal fresh computes byte-for-byte, maintenance is incremental
+    /// (only the unindexed tail), and window semantics are unchanged.
+    #[test]
+    fn change_unit_index_is_transparent_and_incremental() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.set_actor(Some("s:sess-7".to_owned()));
+        // Three cuts before any maintenance (write() maintains, so use
+        // the branches seam via ordinary writes and compare outputs).
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("one"), "cut_1", "t1")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "b.md", Some("two"), "cut_2", "t2")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "a.md", Some("three"), "cut_3", "t3")
+            .expect("write");
+        let indexed = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+        assert_eq!(indexed.len(), 3);
+        // The cursor is warm (write() maintained): nothing left to index.
+        assert_eq!(
+            vcs.maintain_change_unit_index(MAINLINE_BRANCH_ID)
+                .expect("maintain"),
+            0
+        );
+        // A reset forces full recompute; output is identical.
+        vcs.branches
+            .reset_change_unit_index(MAINLINE_BRANCH_ID)
+            .expect("reset");
+        let fresh = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+        assert_eq!(indexed, fresh);
+        // Maintenance after reset reindexes everything; a second pass is
+        // a no-op; a new cut indexes exactly its own units.
+        assert_eq!(
+            vcs.maintain_change_unit_index(MAINLINE_BRANCH_ID)
+                .expect("maintain"),
+            3
+        );
+        vcs.write(MAINLINE_BRANCH_ID, "c.md", Some("four"), "cut_4", "t4")
+            .expect("write");
+        assert_eq!(
+            vcs.maintain_change_unit_index(MAINLINE_BRANCH_ID)
+                .expect("maintain"),
+            0,
+            "write() already maintained"
+        );
+        let after = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+        assert_eq!(after.len(), 4);
+        // Window semantics: last 2 cuts, seq re-based.
+        let windowed = vcs.change_units(MAINLINE_BRANCH_ID, 2).expect("units");
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed[0].seq, 0);
+        assert_eq!(windowed[0].cut_id, "cut_3");
+        assert_eq!(windowed[1].cut_id, "cut_4");
+    }
+
+    /// DR-0052 A5: operations queue `workspace.*` facts for the caller
+    /// to route — a write queues `cut.recorded`; a stranding refusal
+    /// queues `op.refused`; the drain empties the queue.
+    #[test]
+    fn operations_queue_workspace_facts() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.set_actor(Some("s:sess-7".to_owned()));
+        vcs.write(MAINLINE_BRANCH_ID, "src/a.md", Some("one"), "cut_1", "t1")
+            .expect("write");
+        let facts = vcs.take_pending_facts();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].0, "vcs.cut.recorded");
+        assert_eq!(facts[0].1["branch"], "main");
+        assert_eq!(facts[0].1["by"], "s:sess-7");
+        assert_eq!(facts[0].1["path"], "src/a.md");
+        assert!(vcs.take_pending_facts().is_empty(), "drain empties");
+        // A dependent later write makes undoing the first a stranding
+        // refusal — which must queue `vcs.op.refused`.
+        vcs.write(MAINLINE_BRANCH_ID, "src/a.md", Some("two"), "cut_2", "t2")
+            .expect("write");
+        let expr = crate::selection::parse("cut(cut_1)").expect("parse");
+        let outcome = vcs
+            .apply_undo_selection(MAINLINE_BRANCH_ID, &expr, "cut_3", "t3")
+            .expect("undo");
+        assert!(matches!(outcome, UndoSelectionOutcome::WouldStrand { .. }));
+        let facts = vcs.take_pending_facts();
+        let refused = facts
+            .iter()
+            .find(|(name, _)| name == "vcs.op.refused")
+            .expect("refusal fact queued");
+        assert_eq!(refused.1["reason"], "stranded");
     }
 
     /// The full integrated loop: init → branch → isolated writes → merge
@@ -4221,6 +4656,8 @@ mod tests {
                 manifest_hash: &forged,
                 parent_cut_id: Some("sync_a1"),
                 origin: None,
+                actor: None,
+                intent: None,
                 recorded_at: "t6",
             })
             .expect("record");
