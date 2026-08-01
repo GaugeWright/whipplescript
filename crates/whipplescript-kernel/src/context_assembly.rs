@@ -36,7 +36,7 @@ pub struct SkillCatalogueEntry {
 /// stay on demand.
 pub fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
     let mut body = String::from(
-        "Skills provide specialized instructions for specific tasks. Before responding, inspect the available skill descriptions. If a skill clearly applies to the user's request, you must use the read tool to load its SKILL.md from the listed location, then follow those instructions. Resolve any relative paths in the skill against the directory containing its SKILL.md.\n<available_skills>",
+        "Skills provide specialized instructions for specific tasks. Before responding, inspect the available skill descriptions. If a skill clearly applies to the user's request, your first action must be to use the read tool to load its SKILL.md from the listed location; do not answer from memory or prior knowledge. Follow the loaded instructions, including any directions to read supporting resources, before producing the response. Resolve relative paths in the skill against the directory containing its SKILL.md.\n<available_skills>",
     );
     for skill in skills {
         body.push_str(&format!(
@@ -247,7 +247,9 @@ mod tests {
             location: ".agents/skills/triage/SKILL.md".to_owned(),
         }]);
         assert!(rendered.contains("If a skill clearly applies"));
-        assert!(rendered.contains("must use the read tool to load its SKILL.md"));
-        assert!(rendered.contains("Resolve any relative paths"));
+        assert!(rendered.contains("first action must be to use the read tool"));
+        assert!(rendered.contains("do not answer from memory or prior knowledge"));
+        assert!(rendered.contains("including any directions to read supporting resources"));
+        assert!(rendered.contains("Resolve relative paths"));
     }
 }
