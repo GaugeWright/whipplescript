@@ -36,7 +36,7 @@ pub struct SkillCatalogueEntry {
 /// stay on demand.
 pub fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
     let mut body = String::from(
-        "Available skills — read a skill's location to load its full instructions:\n<available_skills>",
+        "Skills provide specialized instructions for specific tasks. Before responding, inspect the available skill descriptions. If a skill clearly applies to the user's request, you must use the read tool to load its SKILL.md from the listed location, then follow those instructions. Resolve any relative paths in the skill against the directory containing its SKILL.md.\n<available_skills>",
     );
     for skill in skills {
         body.push_str(&format!(
@@ -237,5 +237,17 @@ mod tests {
         assert_eq!(out.bundles[0].content_hash, stable_hash_hex("PERSONA"));
         assert_eq!(out.bundles[1].content_hash, stable_hash_hex("TOOLS"));
         assert_ne!(out.bundles[0].content_hash, out.bundles[1].content_hash);
+    }
+
+    #[test]
+    fn skill_catalogue_requires_loading_a_matching_skill_before_responding() {
+        let rendered = render_available_skills(&[SkillCatalogueEntry {
+            name: "triage".to_owned(),
+            description: "Triage the inbox.".to_owned(),
+            location: ".agents/skills/triage/SKILL.md".to_owned(),
+        }]);
+        assert!(rendered.contains("If a skill clearly applies"));
+        assert!(rendered.contains("must use the read tool to load its SKILL.md"));
+        assert!(rendered.contains("Resolve any relative paths"));
     }
 }
