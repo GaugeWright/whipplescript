@@ -250,9 +250,14 @@ workflow Method {
             ))),
             ..DurableEffectPorts::default()
         };
-        let mut attached =
-            DurableInstance::attach(Rc::clone(&sql), resolved.program, &turn.instance_ref, ports)
-                .expect("attach hosted instance");
+        let mut attached = DurableInstance::attach(
+            Rc::clone(&sql),
+            resolved.program,
+            &turn.instance_ref,
+            resolved.system_prompt,
+            ports,
+        )
+        .expect("attach hosted instance");
         let first_step = attached.step(None, 1_767_225_600_000);
         let instance_status = attached.status().expect("instance status");
         let after_step = host

@@ -912,6 +912,7 @@ impl WasmDurableInstance {
             JsDoSql { bridge },
             resolved.program,
             instance_id,
+            resolved.system_prompt,
             DurableEffectPorts {
                 agent_model,
                 agent_tool_specs: Some(resolved.tools),

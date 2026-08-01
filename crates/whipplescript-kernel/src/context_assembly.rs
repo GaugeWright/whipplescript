@@ -20,6 +20,34 @@
 
 use crate::rule_lowering::stable_hash_hex;
 
+/// One progressively-disclosed Agent Skill advertised to a model. The full
+/// `SKILL.md` remains at `location` and is loaded with the ordinary read tool
+/// only when the model decides the skill matches the task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillCatalogueEntry {
+    pub name: String,
+    pub description: String,
+    pub location: String,
+}
+
+/// Render the Agent Skills discovery catalogue used by both native and Durable
+/// Object turns. This mirrors pi's metadata-first contract: only name,
+/// description, and location are always present; instructions and resources
+/// stay on demand.
+pub fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
+    let mut body = String::from(
+        "Available skills — read a skill's location to load its full instructions:\n<available_skills>",
+    );
+    for skill in skills {
+        body.push_str(&format!(
+            "\n  <skill name=\"{}\" location=\"{}\">\n  {}\n  </skill>",
+            skill.name, skill.location, skill.description
+        ));
+    }
+    body.push_str("\n</available_skills>");
+    body
+}
+
 /// The slot a bundle occupies in the assembled system prompt, in pi's fixed order.
 /// The variant declaration order IS the render order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]

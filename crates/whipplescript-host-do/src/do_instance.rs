@@ -24,7 +24,8 @@ use whipplescript_kernel::coerce_native::{
     build_coerce_call_parts, build_request, parse_response, CoerceCall,
 };
 use whipplescript_kernel::context_assembly::{
-    render_project_context, BundleKind, BundleProvenance, ProjectInstruction,
+    assemble, render_available_skills, render_project_context, BundleKind, ContextBundle,
+    ProjectInstruction, SkillCatalogueEntry,
 };
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
@@ -52,6 +53,7 @@ use whipplescript_kernel::AgentTurnExecution;
 use whipplescript_kernel::{idempotency_key, CoerceExecution, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
+use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
@@ -302,6 +304,45 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub turn: Option<&'a TurnContainerConfig>,
     pub ir: &'a IrProgram,
     pub instance_id: &'a str,
+    /// The immutable package persona admitted with this hosted instance.
+    pub system_prompt: &'a str,
+}
+
+fn discover_workspace_skills<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+) -> Result<Vec<SkillCatalogueEntry>, StoreError> {
+    let prefix = format!("{instance_id}/");
+    let rows = sql
+        .query(
+            "SELECT substr(key, length(?1) + 1), content FROM files \
+             WHERE key LIKE ?1 || '%' AND key LIKE '%/SKILL.md' ORDER BY key",
+            &[crate::do_store::SqlValue::Text(prefix)],
+        )
+        .map_err(StoreError::Conflict)?;
+    let mut skills = Vec::new();
+    for row in rows {
+        let path = crate::do_store::as_text(&row[0]);
+        let body = crate::do_store::as_text(&row[1]);
+        let Some(parent) = path.rsplit_once('/').map(|(parent, _)| parent) else {
+            continue;
+        };
+        let directory_name = parent.rsplit('/').next().unwrap_or(parent);
+        let Ok(frontmatter) = parse_skill_frontmatter(&body) else {
+            continue;
+        };
+        if frontmatter.name != directory_name {
+            continue;
+        }
+        skills.push(SkillCatalogueEntry {
+            name: frontmatter.name,
+            description: frontmatter.description,
+            location: path,
+        });
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    skills.dedup_by(|left, right| left.name == right.name);
+    Ok(skills)
 }
 
 /// Durable-object delivery governance. The mock DO is ungoverned (no envelope in
@@ -693,45 +734,51 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 // content registered at deploy resolves from the store — the
                 // same wrapper bytes the native fs path injects.
                 let docs = self.kernel.store().list_project_context_docs()?;
-                let (system, context_bundles) = if docs.is_empty() {
-                    ("You are a WhippleScript agent.".to_owned(), Vec::new())
-                } else {
-                    let instructions: Vec<ProjectInstruction> = docs
-                        .iter()
-                        .map(|doc| ProjectInstruction {
+                let mut bundles = vec![ContextBundle::new(
+                    BundleKind::Persona,
+                    "package:system-prompt",
+                    "v1",
+                    self.system_prompt,
+                )];
+                if !docs.is_empty() {
+                    for doc in &docs {
+                        let instruction = ProjectInstruction {
                             path: doc.path.clone(),
                             content: doc.body.clone(),
-                        })
-                        .collect();
-                    let block = render_project_context(&instructions);
-                    let bundles = docs
-                        .iter()
-                        .map(|doc| BundleProvenance {
-                            kind: BundleKind::ProjectContext,
-                            source: doc.path.clone(),
-                            version: String::new(),
-                            content_hash: doc.content_hash.clone(),
-                        })
-                        .collect();
-                    (
-                        format!("You are a WhippleScript agent.\n\n{block}"),
-                        bundles,
-                    )
-                };
+                        };
+                        bundles.push(ContextBundle::new(
+                            BundleKind::ProjectContext,
+                            doc.path.clone(),
+                            doc.content_hash.clone(),
+                            render_project_context(&[instruction]),
+                        ));
+                    }
+                }
+                let tools = self
+                    .agent_tool_specs
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_else(crate::do_tools::do_tool_specs);
+                let skills = discover_workspace_skills(&self.kernel.store().sql, self.instance_id)?;
+                if !skills.is_empty() && tools.iter().any(|tool| tool.name == "read") {
+                    bundles.push(ContextBundle::new(
+                        BundleKind::AvailableSkills,
+                        "workspace:skills",
+                        "v1",
+                        render_available_skills(&skills),
+                    ));
+                }
+                let assembled = assemble(bundles);
                 let turn_input = BrokeredTurnInput {
-                    system,
+                    system: assembled.system_prompt,
                     user: prompt,
                     // P4: the DO agent turn advertises the in-isolate tool set
                     // (read/write/edit/ls/find/grep/recall + the tracker todos),
                     // brokered by the `DoToolExecutor` over the DO file plane.
-                    tools: self
-                        .agent_tool_specs
-                        .map(<[_]>::to_vec)
-                        .unwrap_or_else(crate::do_tools::do_tool_specs),
+                    tools,
                     max_steps: 8,
                     resume_from,
                     user_images,
-                    context_bundles,
+                    context_bundles: assembled.bundles,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
@@ -1537,6 +1584,7 @@ mod tests {
             turn: None,
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &RefuseIoHost);
@@ -1699,6 +1747,7 @@ mod tests {
             turn: None,
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
         };
         let claimable = |effect_id: &str| ClaimableEffect {
             effect_id: effect_id.to_owned(),
@@ -1867,6 +1916,7 @@ mod tests {
             turn: None,
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &CoerceHost);
@@ -1980,6 +2030,7 @@ mod tests {
             turn: None,
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are the package persona.",
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &OkHost);
@@ -2091,21 +2142,39 @@ mod tests {
         kernel
             .ingest_external_event(&instance_id, "external.started", "{}", Some("started"))
             .expect("start event");
+        kernel
+            .store()
+            .sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2)",
+                &[
+                    crate::do_store::SqlValue::Text(format!(
+                        "{instance_id}/.agents/skills/theo/SKILL.md"
+                    )),
+                    crate::do_store::SqlValue::Text(
+                        "---\nname: theo\ndescription: Explain Theory A. Use for AI-native operating-model questions.\n---\n# Theo\nFollow Theory A.\n"
+                            .to_owned(),
+                    ),
+                ],
+            )
+            .expect("skill file seeds");
 
         let model = CapturingModel {
             systems: RefCell::new(Vec::new()),
         };
+        let tool_specs = crate::do_tools::do_tool_specs();
         let driver = DoInstanceDriver {
             kernel,
             files: &NoFiles,
             coerce: None,
             agent_model: Some(&model),
             agent_tools: &NoTools,
-            agent_tool_specs: None,
+            agent_tool_specs: Some(&tool_specs),
             exec: None,
             turn: None,
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are the package persona.",
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &OkHost);
@@ -2119,10 +2188,20 @@ mod tests {
         let systems = model.systems.borrow();
         let system = systems.first().expect("a model round ran");
         assert!(
+            system.starts_with("You are the package persona."),
+            "{system}"
+        );
+        assert!(
             system.contains("<project_instructions path=\"repo/AGENTS.md\">"),
             "{system}"
         );
         assert!(system.contains("Always be excellent."), "{system}");
+        assert!(system.contains("<available_skills>"), "{system}");
+        assert!(
+            system.contains("<skill name=\"theo\" location=\".agents/skills/theo/SKILL.md\">"),
+            "{system}"
+        );
+        assert!(system.contains("Explain Theory A."), "{system}");
 
         // One context.bundle provenance row rode the Phase 1 seam.
         let driver = machine.into_driver();
@@ -2135,12 +2214,30 @@ mod tests {
             .iter()
             .filter(|row| row.kind == "context.bundle")
             .collect();
-        assert_eq!(bundles.len(), 1, "one project-context bundle row");
+        assert_eq!(
+            bundles.len(),
+            3,
+            "package persona, project context, and skill catalogue are evidenced"
+        );
         assert!(
-            bundles[0].metadata_json.contains("project_context")
-                && bundles[0].metadata_json.contains("repo/AGENTS.md"),
-            "{}",
-            bundles[0].metadata_json
+            bundles
+                .iter()
+                .any(|row| row.metadata_json.contains("persona")),
+            "{bundles:?}"
+        );
+        assert!(
+            bundles.iter().any(|row| {
+                row.metadata_json.contains("project_context")
+                    && row.metadata_json.contains("repo/AGENTS.md")
+            }),
+            "{bundles:?}"
+        );
+        assert!(
+            bundles.iter().any(|row| {
+                row.metadata_json.contains("available_skills")
+                    && row.metadata_json.contains("workspace:skills")
+            }),
+            "{bundles:?}"
         );
     }
 
@@ -2260,6 +2357,7 @@ mod tests {
             turn: Some(&turn_cfg),
             ir: &ir,
             instance_id: &instance_id,
+            system_prompt: "You are a WhippleScript agent.",
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &TurnContainerHost);

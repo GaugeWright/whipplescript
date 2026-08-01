@@ -2630,36 +2630,12 @@ const OWNED_GUIDELINES: &[&str] = &[
 /// snippets, guidelines, current date, current working directory. Project-context
 /// and available-skills slots are populated in later tracker phases. The host
 /// supplies `date`/`cwd` (kept out of the pure kernel assembler).
-/// One entry in the `<available_skills>` catalogue: what the model needs to decide
-/// relevance and where to read the full instructions (Decision 2, discover-all).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SkillCatalogueEntry {
-    pub name: String,
-    pub description: String,
-    pub location: String,
-}
+use whipplescript_kernel::context_assembly::{render_available_skills, SkillCatalogueEntry};
 
 /// Whether the turn has a read-class tool the model can use to load a skill body.
 /// Without one the catalogue is pointless (nothing can fetch the SKILL.md).
 fn has_read_class_tool(tools: &[ToolSpec]) -> bool {
     tools.iter().any(|tool| tool.name == TOOL_READ)
-}
-
-/// Render the `<available_skills>` catalogue bundle body: one entry per skill with
-/// its `name`, `description`, and `location` (the model reads the location on
-/// demand to activate a skill — an ordinary, evidence-logged tool call).
-fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
-    let mut body = String::from(
-        "Available skills — read a skill's location to load its full instructions:\n<available_skills>",
-    );
-    for skill in skills {
-        body.push_str(&format!(
-            "\n  <skill name=\"{}\" location=\"{}\">\n  {}\n  </skill>",
-            skill.name, skill.location, skill.description
-        ));
-    }
-    body.push_str("\n</available_skills>");
-    body
 }
 
 fn owned_context_bundles(
