@@ -117,6 +117,7 @@ pub struct DurableInstance<Sql: DoSql> {
     ir: IrProgram,
     instance_id: String,
     system_prompt: String,
+    max_steps: usize,
     in_flight: Option<ClaimableEffect>,
     files: Box<dyn FileStore>,
     coerce: Option<ResolvedCoercionConfig>,
@@ -140,6 +141,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         ir: IrProgram,
         instance_id: &str,
         system_prompt: String,
+        max_steps: usize,
         ports: DurableEffectPorts,
     ) -> Result<Self, String> {
         let sql = Rc::new(sql);
@@ -170,6 +172,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             ir,
             instance_id: instance_id.to_owned(),
             system_prompt,
+            max_steps,
             in_flight: None,
             files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
@@ -439,6 +442,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             ir,
             instance_id,
             system_prompt: "You are a WhippleScript agent.".to_owned(),
+            max_steps: 8,
             in_flight: None,
             // P1: files work by default on the DO — the file plane is intrinsic
             // to having DO SQLite, so a live instance always gets a real
@@ -564,6 +568,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             ir: &self.ir,
             instance_id: &self.instance_id,
             system_prompt: &self.system_prompt,
+            max_steps: self.max_steps,
         };
 
         let now = unix_ms_to_iso8601(now_unix_ms);
@@ -580,6 +585,11 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             .store()
             .status(&self.instance_id)?
             .map(|status| status.instance.status))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_max_steps(&self) -> usize {
+        self.max_steps
     }
 
     /// Whether coerce is configured (mirrors a live worker's binding check).

@@ -306,6 +306,8 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub instance_id: &'a str,
     /// The immutable package persona admitted with this hosted instance.
     pub system_prompt: &'a str,
+    /// The immutable turn ceiling admitted with the authored package.
+    pub max_steps: usize,
 }
 
 fn discover_workspace_skills<Sql: DoSql>(
@@ -775,7 +777,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // (read/write/edit/ls/find/grep/recall + the tracker todos),
                     // brokered by the `DoToolExecutor` over the DO file plane.
                     tools,
-                    max_steps: 8,
+                    max_steps: self.max_steps,
                     resume_from,
                     user_images,
                     context_bundles: assembled.bundles,
@@ -1585,6 +1587,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &RefuseIoHost);
@@ -1748,6 +1751,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
         };
         let claimable = |effect_id: &str| ClaimableEffect {
             effect_id: effect_id.to_owned(),
@@ -1917,6 +1921,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &CoerceHost);
@@ -2031,6 +2036,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are the package persona.",
+            max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &OkHost);
@@ -2175,6 +2181,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are the package persona.",
+            max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &OkHost);
@@ -2358,6 +2365,7 @@ mod tests {
             ir: &ir,
             instance_id: &instance_id,
             system_prompt: "You are a WhippleScript agent.",
+            max_steps: 8,
         };
         let mut machine = InstanceStepMachine::new(driver);
         let outcome = run_to_completion(&mut machine, &TurnContainerHost);

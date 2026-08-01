@@ -255,9 +255,11 @@ workflow Method {
             resolved.program,
             &turn.instance_ref,
             resolved.system_prompt,
+            resolved.max_steps,
             ports,
         )
         .expect("attach hosted instance");
+        assert_eq!(attached.admitted_max_steps(), 4);
         let first_step = attached.step(None, 1_767_225_600_000);
         let instance_status = attached.status().expect("instance status");
         let after_step = host

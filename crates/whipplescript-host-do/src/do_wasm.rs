@@ -913,6 +913,7 @@ impl WasmDurableInstance {
             resolved.program,
             instance_id,
             resolved.system_prompt,
+            resolved.max_steps,
             DurableEffectPorts {
                 agent_model,
                 agent_tool_specs: Some(resolved.tools),
