@@ -1,0 +1,30 @@
+name = "whipplescript-authenticated-runtime-test"
+main = "src/authenticated-test-worker.ts"
+compatibility_date = "2026-07-24"
+
+rules = [{ type = "Text", globs = ["**/*.sql"] }]
+
+[[durable_objects.bindings]]
+name = "WORKFLOW_INSTANCE"
+class_name = "WorkflowInstance"
+
+[[durable_objects.bindings]]
+name = "SESSION_ADMISSION"
+class_name = "TestDeployment"
+
+[[durable_objects.bindings]]
+name = "PUBLIC_CREDENTIALS"
+class_name = "TestCredentialRegistry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkflowInstance", "TestDeployment", "TestCredentialRegistry"]
+
+[vars]
+WHIP_CONTROL_TOKEN = "control-token"
+WHIP_SESSION_TOKEN = "session-token"
+WHIP_PUBLIC_CONTROL_TOKEN = "public-control-secret"
+WHIP_MODEL_BROKER_URL = "https://model-broker.test/v1/model-egress"
+WHIP_MODEL_BROKER_TOKEN = "model-broker-token"
+GAUGEDESK_GOVERNANCE_SIGNER = "authority:gaugedesk:test"
+GAUGEDESK_GOVERNANCE_KEY = "031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e"

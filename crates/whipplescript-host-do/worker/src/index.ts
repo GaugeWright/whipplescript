@@ -2595,6 +2595,7 @@ export class WorkflowInstance implements DurableObject {
       rows.map(({ key, content }) => [key.slice(prefix.length), content]),
     );
     const workspace = selectWorkspace(files, policy);
+    this.ensurePublicEventSchema();
     const transcript = policy.transcript_eligible
       ? (
           this.ctx.storage.sql
@@ -4167,8 +4168,17 @@ export default {
     let id: string;
     let forwarded = request;
     if (placement) {
-      const tenantId = decodeURIComponent(placement[1]);
-      const placementId = decodeURIComponent(placement[2]);
+      let tenantId: string;
+      let placementId: string;
+      try {
+        tenantId = decodeURIComponent(placement[1]);
+        placementId = decodeURIComponent(placement[2]);
+      } catch {
+        return Response.json(
+          { error: "invalid tenant or placement id" },
+          { status: 400 },
+        );
+      }
       const validId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
       if (!validId.test(tenantId) || !validId.test(placementId)) {
         return Response.json({ error: "invalid tenant or placement id" }, { status: 400 });

@@ -24,6 +24,21 @@ export interface DurableWorkflowGrant {
   expires_at: number;
 }
 
+export function durableWorkflowObjectName(
+  grant: Pick<
+    DurableWorkflowGrant,
+    "home_id" | "tenant_id" | "project_id" | "command_id"
+  >,
+): string {
+  return JSON.stringify([
+    "private-home-v2",
+    grant.home_id,
+    grant.tenant_id,
+    grant.project_id,
+    grant.command_id,
+  ]);
+}
+
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const FORBIDDEN_CAPABILITY =

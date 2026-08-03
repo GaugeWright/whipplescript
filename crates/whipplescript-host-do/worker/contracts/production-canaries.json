@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "owner": "whipplescript-src",
+  "activation": {
+    "orchestratorRepository": "gaugewright-cloud",
+    "enabledVariable": "GW_PRODUCTION_WIRING_CANARIES_ENABLED",
+    "infisicalPath": "/synthetics/wiring",
+    "namespace": "whipplescript-production-wiring-canary"
+  },
+  "suites": [
+    {
+      "id": "public-session",
+      "state": "ready-awaiting-identity",
+      "runner": "gaugewright-cloud@1672ef5a3e7a40b06257d52f14ea6ddf5cb6121f:scripts/production-wiring-canary.mjs#panels-audience-lifecycle",
+      "executionBoundary": "managed-public-edge",
+      "contracts": [
+        "runtime.public.bootstrap",
+        "runtime.public.claim",
+        "runtime.public.erase",
+        "runtime.public.socket"
+      ],
+      "requiredInfrastructure": [
+        "dedicated Panels deployment and publisher",
+        "anonymous and OIDC audience identities",
+        "sealed collection recipient"
+      ],
+      "cleanup": "Use only the collection-enabled synthetic deployment, erase every anonymous and authenticated session, fsync sealed collection custody before acknowledgement, and retain only bounded synthetic audit metadata."
+    },
+    {
+      "id": "managed-host-lifecycle",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-workflow-placement",
+      "contracts": [
+        "runtime.host.events.live",
+        "runtime.host.events.stream",
+        "runtime.host.files.sync",
+        "runtime.host.fork.import",
+        "runtime.host.instance.open",
+        "runtime.host.policy",
+        "runtime.host.restore",
+        "runtime.host.turn.begin",
+        "runtime.host.turn.cancel",
+        "runtime.host.turn.stream"
+      ],
+      "requiredInfrastructure": [
+        "dedicated managed placement",
+        "bounded model gateway identity",
+        "disposable package, instance and fork"
+      ],
+      "cleanup": "Open only disposable instances, cancel or settle every turn, restore or delete synced files and fork envelopes, close every stream, and destroy placement state after final projection readback."
+    },
+    {
+      "id": "placement-forwarding",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-workflow-placement",
+      "contracts": [
+        "runtime.placement.forward.get",
+        "runtime.placement.forward.post"
+      ],
+      "requiredInfrastructure": [
+        "dedicated tenant placement",
+        "runtime control credential",
+        "deployed Durable workflow origin"
+      ],
+      "cleanup": "Forward bounded GET and POST probes through one synthetic placement, prove wrong tenant and token denial, and destroy the placement object after its inner lifecycle cleanup completes."
+    },
+    {
+      "id": "private-home-forwarding",
+      "state": "runner-needed",
+      "runner": null,
+      "executionBoundary": "managed-private-home",
+      "contracts": [
+        "runtime.private-home.forward.get",
+        "runtime.private-home.forward.post"
+      ],
+      "requiredInfrastructure": [
+        "dedicated private Home and tenant",
+        "ephemeral P-256 execution grant",
+        "disposable command and package"
+      ],
+      "cleanup": "Issue one exact short-lived Home grant, complete or cancel its disposable command, verify callback and package binding, revoke the admission, and destroy the command-scoped Durable object."
+    }
+  ]
+}

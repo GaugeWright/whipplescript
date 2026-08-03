@@ -1,0 +1,1123 @@
+{
+  "schemaVersion": 1,
+  "owner": "whipplescript-src",
+  "contracts": [
+    {
+      "id": "runtime.public.bootstrap",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/public/session/bootstrap",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.bootstrap/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.bootstrap/response",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.public.claim",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/public/session/claim",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.claim/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.claim/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.public.erase",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/public/session/erase",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.erase/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.erase/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.public.state",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/public/session/state",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.state/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.state/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.public.files",
+      "jurisdiction": "public-panel-session",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/public/session/files",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.files/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.files/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.public.socket",
+      "jurisdiction": "public-panel-session",
+      "transport": "websocket",
+      "method": "GET",
+      "path": "/public/session/socket",
+      "producer": "whipplescript-session-durable-object",
+      "consumer": "GaugeWright edge Deployment object",
+      "authentication": "runtime-control-bearer",
+      "scope": "deployment-session",
+      "capability": "session-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.public.socket/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.public.socket/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/session.integration.test.ts#workerd-production-object"
+        ],
+        "authority": [
+          "src/session.integration.test.ts#session-control-boundary"
+        ],
+        "journey": [
+          "gaugewright-cloud@d7da925:edge-runtime/scripts/public-composition-test.mjs"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.policy",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/policy",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.policy/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.policy/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.instance.open",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/open",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.instance.open/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.instance.open/response",
+      "sideEffect": "session",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.turn.begin",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/turns",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.turn.begin/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.turn.begin/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.fork.import",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/forks/import",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.fork.import/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.fork.import/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.turn.cancel",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/:instance/turns/:turn/cancel",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.turn.cancel/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.turn.cancel/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.files.sync",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/:instance/files/sync",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.files.sync/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.files.sync/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.checkpoint",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/:instance/checkpoint",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.checkpoint/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.checkpoint/response",
+      "sideEffect": "mutation",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.restore",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/:instance/restore",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.restore/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.restore/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.events.stream",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "sse",
+      "method": "GET",
+      "path": "/host/instances/:instance/events/stream",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.events.stream/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.events.stream/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.events.live",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "websocket",
+      "method": "GET",
+      "path": "/host/instances/:instance/events/live",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.events.live/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.events.live/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.turn.stream",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "sse",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn/stream",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.turn.stream/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.turn.stream/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.fork.export",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/fork-export",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.fork.export/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.fork.export/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.pending.compatibility",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/pending",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.pending.compatibility/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.pending.compatibility/response",
+      "sideEffect": "none",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.turn.result",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn/result",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.turn.result/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.turn.result/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.position",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/position",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.position/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.position/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.turn.read",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.turn.read/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.turn.read/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.transcript",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/turns/:turn/transcript",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.transcript/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.transcript/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.events",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/events",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.events/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.events/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.evidence",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/evidence",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.evidence/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.evidence/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.host.files",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/host/instances/:instance/files",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.files/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.files/response",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
+      "id": "runtime.placement.forward.get",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "internal-callback",
+      "method": "GET",
+      "path": "/v1/tenants/:tenant/placements/:placement/host/:operation",
+      "producer": "whipplescript-host-worker",
+      "consumer": "GaugeDesk managed workflow client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.placement.forward.get/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.placement.forward.get/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#generated-placement-boundaries"
+        ]
+      }
+    },
+    {
+      "id": "runtime.placement.forward.post",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "internal-callback",
+      "method": "POST",
+      "path": "/v1/tenants/:tenant/placements/:placement/host/:operation",
+      "producer": "whipplescript-host-worker",
+      "consumer": "GaugeDesk managed workflow client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.placement.forward.post/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.placement.forward.post/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#generated-placement-boundaries"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.forward.get",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "GET",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/:operation",
+      "producer": "whipplescript-private-home-worker",
+      "consumer": "GaugeDesk Home durable workflow client",
+      "authentication": "signed-home-execution-grant-and-internal-control-token",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.forward.get/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.forward.get/response",
+      "sideEffect": "stream",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-protocol.test.ts#grant-field-mutations",
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ]
+      }
+    },
+    {
+      "id": "runtime.private-home.forward.post",
+      "jurisdiction": "private-home-command",
+      "transport": "internal-callback",
+      "method": "POST",
+      "path": "/v1/homes/:home/tenants/:tenant/projects/:project/commands/:command/attempts/:epoch/host/:operation",
+      "producer": "whipplescript-private-home-worker",
+      "consumer": "GaugeDesk Home durable workflow client",
+      "authentication": "signed-home-execution-grant-and-internal-control-token",
+      "scope": "home-tenant-project-command",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.private-home.forward.post/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.private-home.forward.post/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/private-home-protocol.test.ts#grant-field-mutations",
+          "src/authenticated-host.integration.test.ts#signed-private-home-journey"
+        ]
+      }
+    },
+    {
+      "id": "runtime.legacy.start",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/start",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.legacy.start/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.legacy.start/response",
+      "sideEffect": "session",
+      "risk": "internal",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    }
+  ],
+  "exceptions": []
+}

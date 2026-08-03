@@ -1,12 +1,16 @@
 import { env } from "cloudflare:workers";
-// workerd-production-object
-// session-control-boundary
+// authenticated-placement-journey
+// signed-private-home-journey
+// declared-route-surface
+// generated-placement-boundaries
 import {
   evictDurableObject,
   runDurableObjectAlarm,
   runInDurableObject,
+  SELF,
 } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
+import runtimeSurface from "../contracts/runtime-route-surface.json";
 
 const SIGNER = "authority:gaugedesk:test";
 const PUBLIC_KEY =
@@ -14,6 +18,20 @@ const PUBLIC_KEY =
 const SIGNED_ENVELOPE =
   "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"envelope_hash\":\"95aa6b54f92aed0a47c8733b848b1e25b45c5eac81b63aa394125f4064d0e1b5\",\"key_id\":\"031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e\",\"signature\":\"c5897c642972e55b03b224cac5a8fcd70ab4859b90252d1f324e401e2ad13650175c38dbbe027a3906b94cd7e7b3db6d42f97bd46de98732bf77beae9bfc5b6b\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
+const HOST_PROTOCOL = "whipplescript.host.v1";
+const POLICY_ENVELOPE = JSON.parse(SIGNED_ENVELOPE) as {
+  attestation: {
+    envelope_hash: string;
+    key_id: string;
+    signer: string;
+  };
+};
+const POLICY_REF = {
+  epoch: 1,
+  envelope_hash: POLICY_ENVELOPE.attestation.envelope_hash,
+  key_id: POLICY_ENVELOPE.attestation.key_id,
+  signer: POLICY_ENVELOPE.attestation.signer,
+};
 
 // The collection recipient the cross-language vector is addressed to. A test
 // keypair with no production standing: the private half is here precisely so the
@@ -187,6 +205,23 @@ async function bootstrapSession(
     },
   );
   expect(bootstrap.status, await bootstrap.clone().text()).toBe(201);
+}
+
+async function placementFetch(
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (!headers.has("authorization")) {
+    headers.set("authorization", "Bearer control-token");
+  }
+  if (init.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return SELF.fetch(
+    `https://runtime.test/v1/tenants/tenant-journey/placements/placement-journey${path}`,
+    { ...init, headers },
+  );
 }
 
 async function durableStringValues(stub: DurableObjectStub): Promise<string[]> {
@@ -796,6 +831,46 @@ describe("real WorkflowInstance hibernation", () => {
     expect(lifecycle[lifecycle.length - 1]).toBe("tornDown");
   });
 
+  it("emits an eligible empty transcript before any public event exists", async () => {
+    const sessionId = "session-collection-empty-transcript";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, false, {
+      exportable_paths: [],
+      transcript_eligible: true,
+      schema_ref: "empty-transcript.v1",
+      recipient_class: "collection:tenant",
+      max_artifact_bytes: 1_000_000,
+      recipient_public_keys: [COLLECTION_RECIPIENT_PUBLIC_KEY_HEX],
+    });
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      await state.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+    });
+
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const deployment = deployments.get(
+      deployments.idFromName("theory-a-test"),
+    );
+    const held = await runInDurableObject(deployment, async (_instance, state) =>
+      state.storage.get<Record<string, unknown>>(`collection:${sessionId}`)
+    );
+    expect(held?.artifact).toMatchObject({
+      envelope: {
+        schema_ref: "empty-transcript.v1",
+        session_id: sessionId,
+        revision: 1,
+      },
+    });
+  });
+
   it("refuses an oversized artifact definitively and deposits nothing", async () => {
     const sessionId = "session-collection-oversize";
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
@@ -930,344 +1005,685 @@ describe("real WorkflowInstance hibernation", () => {
     ).toBe(1);
   });
 
-  it("schedules the retention alarm at bootstrap so expiry needs no visitor", async () => {
-    // Every other retention test collapses the TTLs and calls
-    // `runDurableObjectAlarm` by hand, which proves what the handler does once
-    // it runs and says nothing about whether anything ever runs it. In
-    // production nothing did: sessions sat past their absolute deadline,
-    // unexpired, and a declared collection stayed pending forever because the
-    // only path that emits it is the alarm.
-    const sessionId = "session-alarm-scheduled";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    const before = Date.now();
-    await bootstrapSession(stub, sessionId);
+  it("composes the authenticated placement route through the hosted protocol", async () => {
+    const packageDocs = await packageDocuments();
+    let brokerAttempt = 0;
+    let announceCancelableRound!: () => void;
+    const cancelableRoundStarted = new Promise<void>((resolve) => {
+      announceCancelableRound = resolve;
+    });
+    let releaseCancelableRound!: () => void;
+    const cancelableRoundRelease = new Promise<void>((resolve) => {
+      releaseCancelableRound = resolve;
+    });
+    const brokerFetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      brokerAttempt += 1;
+      expect(String(input)).toBe(
+        "https://model-broker.test/v1/model-egress",
+      );
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer model-broker-token",
+      );
+      const envelope = JSON.parse(String(init?.body)) as {
+        protocol?: string;
+        credential_ref?: string;
+      };
+      expect(envelope).toMatchObject({
+        protocol: "whipplescript.model-egress.v1",
+        credential_ref: "managed-openai",
+      });
+      if (brokerAttempt === 2) {
+        announceCancelableRound();
+        await cancelableRoundRelease;
+      }
+      return new Response(
+        [
+          'data: {"type":"response.output_text.delta","delta":"hosted"}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":1},"output_tokens":1}}}',
+          "",
+        ].join("\n"),
+        {
+          headers: {
+            "x-whip-model-egress-protocol":
+              "whipplescript.model-egress.stream.v1",
+            "x-whip-provider-status": "200",
+            "x-whip-provider-content-type": "text/event-stream",
+          },
+        },
+      );
+    });
+    vi.stubGlobal("fetch", brokerFetch);
 
-    const scheduled = await runInDurableObject(stub, async (_instance, state) =>
-      state.storage.getAlarm(),
-    );
-    expect(scheduled, "bootstrap must arm the retention alarm").not.toBeNull();
-    // `bootstrapSession` declares idle 3600s / absolute 86400s, so the idle
-    // bound is the earlier one and the deadline is openedAt + 3600s.
-    const idleMs = 3600 * 1000;
-    expect(scheduled!).toBeGreaterThanOrEqual(before + idleMs);
-    expect(scheduled!).toBeLessThanOrEqual(Date.now() + idleMs);
-  });
-
-  it("keeps the retention alarm armed after a turn drives the instance", async () => {
-    // The defect this pins: the object has one alarm and two schedulers for it.
-    // Driving the instance used to `deleteAlarm()` whenever it parked with
-    // nothing due, and driving is the last thing a turn does — so every turn
-    // disarmed retention. Sessions that ran a turn never expired, and because
-    // the expiry alarm is the only path that emits a declared collection, the
-    // drain stayed empty forever while everything else looked healthy.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(
-          [
-            'data: {"type":"response.output_text.delta","delta":"ok"}',
-            "",
-            'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":2},"output_tokens":1}}}',
-            "",
-          ].join("\n"),
-          { headers: { "content-type": "text/event-stream" } },
-        ),
-      ),
-    );
-
-    const sessionId = "session-alarm-survives-turn";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    const armedAtBootstrap = await runInDurableObject(
-      stub,
-      async (_instance, state) => state.storage.getAlarm(),
-    );
-    expect(armedAtBootstrap).not.toBeNull();
-
-    const socket = await openSocket(stub);
-    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
-    socket.send(
-      JSON.stringify({
-        type: "send_message",
-        request_id: "turn-alarm-1",
-        text: "hello",
-      }),
-    );
-    for (let index = 0; index < 80; index += 1) {
-      const message = await nextMessage(socket);
-      if (message.type === "turn_terminal" || message.type === "error") break;
+    const route =
+      "https://runtime.test/v1/tenants/tenant-journey/placements/placement-journey";
+    for (const authorization of [undefined, "Bearer wrong-control-token"]) {
+      const denied = await SELF.fetch(`${route}/host/policy`, {
+        method: "POST",
+        headers: {
+          ...(authorization ? { authorization } : {}),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          epoch: 1,
+          signed_envelope: SIGNED_ENVELOPE,
+        }),
+      });
+      expect(denied.status).toBe(401);
+      const deniedRead = await SELF.fetch(
+        `${route}/host/instances/untrusted/position`,
+        {
+          headers: {
+            ...(authorization ? { authorization } : {}),
+          },
+        },
+      );
+      expect(deniedRead.status).toBe(401);
     }
 
-    const armedAfterTurn = await runInDurableObject(
-      stub,
-      async (_instance, state) => state.storage.getAlarm(),
+    const policy = await placementFetch("/host/policy", {
+      method: "POST",
+      body: JSON.stringify({
+        epoch: 1,
+        signed_envelope: SIGNED_ENVELOPE,
+      }),
+    });
+    expect(policy.status, await policy.clone().text()).toBe(201);
+    expect(await policy.json()).toMatchObject({
+      envelope_hash: POLICY_REF.envelope_hash,
+      signer: SIGNER,
+    });
+
+    const openCommand = {
+      protocol: HOST_PROTOCOL,
+      request_id: "open-placement-journey",
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+    };
+    const openedResponse = await placementFetch("/host/instances/open", {
+      method: "POST",
+      body: JSON.stringify({
+        command: openCommand,
+        package: packageDocs,
+      }),
+    });
+    expect(
+      openedResponse.status,
+      await openedResponse.clone().text(),
+    ).toBe(201);
+    const opened = await openedResponse.json<{
+      instance_ref: string;
+      opened_at: { sequence: number };
+    }>();
+    expect(opened.instance_ref).toBeTruthy();
+    expect(opened.opened_at.sequence).toBeGreaterThan(0);
+    const instancePath =
+      `/host/instances/${encodeURIComponent(opened.instance_ref)}`;
+
+    const filesSynced = await placementFetch(`${instancePath}/files/sync`, {
+      method: "POST",
+      body: JSON.stringify({
+        files: [{ path: "journey.txt", content: "authenticated placement" }],
+        delete_missing: true,
+      }),
+    });
+    expect(filesSynced.status, await filesSynced.clone().text()).toBe(200);
+    expect(await filesSynced.json()).toEqual({ synced: 1 });
+    const fileList = await placementFetch(`${instancePath}/files`);
+    expect(fileList.status, await fileList.clone().text()).toBe(200);
+    expect(await fileList.json()).toEqual({
+      files: [{ path: "journey.txt" }],
+    });
+    const fileRead = await placementFetch(
+      `${instancePath}/files?path=journey.txt`,
+    );
+    expect(fileRead.status, await fileRead.clone().text()).toBe(200);
+    expect(await fileRead.text()).toBe("authenticated placement");
+
+    const eventSocketResponse = await placementFetch(
+      `${instancePath}/events/live`,
+      { headers: { upgrade: "websocket" } },
+    );
+    expect(eventSocketResponse.status).toBe(101);
+    const eventSocket = eventSocketResponse.webSocket;
+    expect(eventSocket).not.toBeNull();
+    eventSocket!.accept();
+    expect(await nextMessage(eventSocket!)).toMatchObject({
+      type: "runtime_events",
+    });
+
+    const beforeTurn = await placementFetch(`${instancePath}/position`);
+    expect(beforeTurn.status, await beforeTurn.clone().text()).toBe(200);
+    const beforePosition = await beforeTurn.json<{
+      instance_ref: string;
+      sequence: number;
+    }>();
+    expect(beforePosition).toMatchObject({
+      instance_ref: opened.instance_ref,
+    });
+    expect(beforePosition.sequence).toBeGreaterThan(0);
+
+    const checkpoint = await placementFetch(`${instancePath}/checkpoint`, {
+      method: "POST",
+      body: JSON.stringify({ cut_id: "authenticated-journey" }),
+    });
+    expect(checkpoint.status, await checkpoint.clone().text()).toBe(200);
+    const restore = await placementFetch(`${instancePath}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ cut_id: "authenticated-journey" }),
+    });
+    expect(restore.status, await restore.clone().text()).toBe(200);
+
+    const commandId = "turn-placement-journey";
+    const turnCommand = {
+      protocol: HOST_PROTOCOL,
+      command_id: commandId,
+      run_ref: "gaugedesk:run:placement-journey",
+      instance_ref: opened.instance_ref,
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+      actor_ref: "audience",
+      input: { text: "hello from the placement route", images: [] },
+      resources: [],
+      provider_binding: {
+        binding_id: "model",
+        credential: { credential_id: "managed-openai" },
+      },
+      placement_ceiling_ref: "do",
+    };
+    const turn = await placementFetch("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: turnCommand,
+        package: packageDocs,
+        image_bodies: [],
+      }),
+    });
+    expect(turn.status, await turn.clone().text()).toBe(200);
+    expect(await turn.json()).toMatchObject({
+      admitted: true,
+      command_id: commandId,
+    });
+    expect(brokerFetch).toHaveBeenCalledOnce();
+
+    const turnStream = await placementFetch(
+      `${instancePath}/turns/${commandId}/stream`,
+    );
+    expect(turnStream.status, await turnStream.clone().text()).toBe(200);
+    expect(turnStream.headers.get("content-type")).toContain(
+      "text/event-stream",
+    );
+    expect(await turnStream.text()).toContain('"delta":"hosted"');
+
+    for (const suffix of [
+      `/turns/${commandId}/result`,
+      `/turns/${commandId}`,
+      `/turns/${commandId}/transcript`,
+      "/events",
+      `/evidence?command_id=${commandId}`,
+      "/pending",
+    ]) {
+      const projection = await placementFetch(`${instancePath}${suffix}`);
+      expect(
+        projection.status,
+        `${suffix}: ${await projection.clone().text()}`,
+      ).toBe(200);
+      expect(await projection.text()).not.toContain("not found");
+    }
+
+    const eventStream = await placementFetch(
+      `${instancePath}/events/stream?after=0`,
+    );
+    expect(eventStream.status, await eventStream.clone().text()).toBe(200);
+    expect(eventStream.headers.get("content-type")).toContain(
+      "text/event-stream",
+    );
+    expect(await eventStream.text()).toContain("event: runtime");
+
+    const afterTurn = await placementFetch(`${instancePath}/position`);
+    expect(afterTurn.status, await afterTurn.clone().text()).toBe(200);
+    const afterPosition = await afterTurn.json<{
+      instance_ref: string;
+      sequence: number;
+    }>();
+    expect(afterPosition.sequence).toBeGreaterThan(beforePosition.sequence);
+    const exportedResponse = await placementFetch(
+      `${instancePath}/fork-export?sequence=${afterPosition.sequence}`,
     );
     expect(
-      armedAfterTurn,
-      "a turn must not disarm the session's retention deadline",
-    ).not.toBeNull();
-  });
-
-  it("normalizes a legacy session record and backfills its lifecycle (DR-0054)", async () => {
-    // The pre-DR-0049 shape: a session record without `retention`/`principal`
-    // and no lifecycle log. Reading it used to throw a raw TypeError (killing
-    // `alarm()` permanently), and the empty log folded to `init`, which
-    // refuses deadline observations — an immortal session.
-    const sessionId = "session-legacy-shape";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec("DELETE FROM session_lifecycle_events");
-      const session = (await state.storage.get<Record<string, unknown>>(
-        "public-session-state",
-      ))!;
-      delete session.retention;
-      delete session.principal;
-      await state.storage.put("public-session-state", session);
+      exportedResponse.status,
+      await exportedResponse.clone().text(),
+    ).toBe(200);
+    const exported = await exportedResponse.json<Record<string, unknown>>();
+    const forkCommand = {
+      protocol: HOST_PROTOCOL,
+      request_id: "fork-placement-journey",
+      source: afterPosition,
+      target_request_id: "open-fork-placement-journey",
+      package_version_ref: packageDocs.version_ref,
+      policy: POLICY_REF,
+    };
+    const importedResponse = await placementFetch("/host/forks/import", {
+      method: "POST",
+      body: JSON.stringify({
+        command: forkCommand,
+        export: exported,
+        package: packageDocs,
+      }),
     });
-
-    const response = await stub.fetch(
-      "https://session.test/public/session/state",
-      { headers: { authorization: "Bearer session-token" } },
+    expect(
+      importedResponse.status,
+      await importedResponse.clone().text(),
+    ).toBe(201);
+    const imported = await importedResponse.json<{
+      target: { instance_ref: string };
+    }>();
+    expect(imported.target.instance_ref).not.toBe(opened.instance_ref);
+    const forkPosition = await placementFetch(
+      `/host/instances/${encodeURIComponent(imported.target.instance_ref)}/position`,
     );
-    expect(response.status, await response.clone().text()).toBe(200);
+    expect(forkPosition.status, await forkPosition.clone().text()).toBe(200);
 
-    // The read normalized the record (compat defaults, nothing deleted) and
-    // backfilled the lifecycle log so a retention deadline now exists.
-    await runInDurableObject(stub, async (_instance, state) => {
-      const events = (
-        state.storage.sql
-          .exec("SELECT event_json FROM session_lifecycle_events ORDER BY sequence")
-          .toArray() as { event_json: string }[]
-      ).map((row) => JSON.parse(row.event_json) as { type: string });
-      expect(events.map((event) => event.type)).toEqual(
-        expect.arrayContaining(["opened", "activated"]),
-      );
-      expect(await state.storage.get("public-session-state")).toBeDefined();
+    eventSocket!.close(1000, "done");
+    const cancelCommandId = "turn-placement-cancel";
+    const cancelableTurn = placementFetch("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          ...turnCommand,
+          command_id: cancelCommandId,
+          run_ref: "gaugedesk:run:placement-cancel",
+          input: { text: "cancel this hosted turn", images: [] },
+        },
+        package: packageDocs,
+        image_bodies: [],
+      }),
     });
+    await cancelableRoundStarted;
+    const cancellation = await placementFetch(
+      `${instancePath}/turns/${cancelCommandId}/cancel`,
+      {
+        method: "POST",
+        body: "{}",
+      },
+    );
+    expect(
+      cancellation.status,
+      await cancellation.clone().text(),
+    ).toBe(202);
+    expect(await cancellation.json()).toMatchObject({
+      command_id: cancelCommandId,
+      status: "requested",
+    });
+    releaseCancelableRound();
+    const canceledTurn = await cancelableTurn;
+    expect(canceledTurn.status).toBe(200);
+    const canceledProjection = await placementFetch(
+      `${instancePath}/turns/${cancelCommandId}`,
+    );
+    expect(
+      canceledProjection.status,
+      await canceledProjection.clone().text(),
+    ).toBe(200);
+    expect(await canceledProjection.json()).toMatchObject({
+      command_id: cancelCommandId,
+      // This policy's provider declares no native stop. The durable
+      // cancellation request is accepted cooperatively, then the already
+      // terminal provider response wins; the route must not falsely promise
+      // that a request is an abort.
+      status: "completed",
+    });
+    expect(brokerFetch).toHaveBeenCalledTimes(2);
+
+    vi.unstubAllGlobals();
   });
 
-  it("expires a pre-lifecycle session through the governed path (DR-0054)", async () => {
-    const sessionId = "session-legacy-expiry";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      // Regress to a legacy object whose recorded bounds have long passed.
-      state.storage.sql.exec("DELETE FROM session_lifecycle_events");
-      const session = (await state.storage.get<Record<string, unknown>>(
-        "public-session-state",
-      ))!;
-      await state.storage.put("public-session-state", {
-        ...session,
-        created_at_unix_ms: Date.now() - 60_000,
-        last_activity_unix_ms: Date.now() - 60_000,
-        retention: { idle_ttl_seconds: 1, absolute_ttl_seconds: 1 },
+  it("composes signed Private Home grants through the real forwarding route", async () => {
+    const packageDocs = await packageDocuments();
+    const fixtureResponse = await SELF.fetch(
+      "https://runtime.test/__test/private-home/policy",
+    );
+    expect(
+      fixtureResponse.status,
+      await fixtureResponse.clone().text(),
+    ).toBe(200);
+    const fixture = await fixtureResponse.json<{
+      key_id: string;
+      signer: string;
+      envelope_hash: string;
+      governance_key_id: string;
+      signed_envelope: string;
+    }>();
+    const homeId = "home:private-journey";
+    const tenantId = "tenant:private-journey";
+    const projectId = "project:private-journey";
+    const commandId = "command:private-journey";
+    const epoch = 1;
+    const outer =
+      `/v1/homes/${encodeURIComponent(homeId)}` +
+      `/tenants/${encodeURIComponent(tenantId)}` +
+      `/projects/${encodeURIComponent(projectId)}` +
+      `/commands/${encodeURIComponent(commandId)}` +
+      `/attempts/${epoch}`;
+
+    const signedHeaders = async (
+      innerPath: string,
+      method: "GET" | "POST",
+      body = "",
+    ): Promise<Record<string, string>> => {
+      const now = Math.floor(Date.now() / 1000);
+      const grant = {
+        version: 1,
+        key_id: fixture.key_id,
+        governance_signer: fixture.signer,
+        home_id: homeId,
+        tenant_id: tenantId,
+        project_id: projectId,
+        work_target_basis: "whipple:cut:private-journey",
+        command_id: commandId,
+        attempt_id: `attempt:${commandId}:${epoch}`,
+        payload_digest: `sha256:${"1".repeat(64)}`,
+        epoch,
+        profile: "durable_workflow",
+        package_ref: packageDocs.version_ref,
+        capabilities: ["chat", "http_effect"],
+        credential_class: "private-home",
+        max_spend_nanos_usd: 1_000_000,
+        retention_seconds: 3600,
+        callback_ref:
+          "https://private-home-broker.test/v1/model-egress",
+        request_method: method,
+        request_path: innerPath,
+        request_body_sha256: await sha256(body),
+        issued_at: now,
+        expires_at: now + 300,
+      } as const;
+      const signed = await SELF.fetch(
+        "https://runtime.test/__test/private-home/sign",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(grant),
+        },
+      );
+      expect(signed.status, await signed.clone().text()).toBe(200);
+      const proof = await signed.json<{
+        grant: string;
+        signature: string;
+      }>();
+      return {
+        ...(method === "POST"
+          ? { "content-type": "application/json" }
+          : {}),
+        "x-gaugewright-execution-grant": proof.grant,
+        "x-gaugewright-execution-signature": proof.signature,
+      };
+    };
+    const admitted = async (
+      innerPath: string,
+      method: "GET" | "POST",
+      body = "",
+    ): Promise<Response> =>
+      SELF.fetch(`https://runtime.test${outer}${innerPath}`, {
+        method,
+        headers: await signedHeaders(innerPath, method, body),
+        ...(method === "POST" ? { body } : {}),
       });
+
+    const policyBody = JSON.stringify({
+      epoch,
+      signed_envelope: fixture.signed_envelope,
     });
-
-    // The alarm backfills the log from the record's own attested times, folds
-    // the deadline observation, and tears the session down — the legacy
-    // session is expirable, not immortal.
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-    const remaining = await durableStringValues(stub);
-    expect(remaining.some((value) => value.includes('"tornDown"'))).toBe(true);
-    const state = await stub.fetch(
-      "https://session.test/public/session/state",
-      { headers: { authorization: "Bearer session-token" } },
+    const missingGrant = await SELF.fetch(
+      `https://runtime.test${outer}/host/policy`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: policyBody,
+      },
     );
-    expect(state.status, await state.clone().text()).toBe(409);
-  });
+    expect(missingGrant.status).toBe(401);
+    const tamperedHeaders = await signedHeaders(
+      "/host/policy",
+      "POST",
+      policyBody,
+    );
+    const tamperedBody = await SELF.fetch(
+      `https://runtime.test${outer}/host/policy`,
+      {
+        method: "POST",
+        headers: tamperedHeaders,
+        body: `${policyBody} `,
+      },
+    );
+    expect(tamperedBody.status).toBe(403);
 
-  it("fails closed on an unknown lifecycle event without erasing anything (DR-0054)", async () => {
-    // The rollback shape: a newer worker appended an event this build does not
-    // know. The fold used to reduce it to `undefined` and poison every state
-    // after it; now readers refuse with a diagnosable error, the alarm keeps
-    // retrying instead of dying, and nothing is deleted.
-    const sessionId = "session-unknown-event";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        "INSERT INTO session_lifecycle_events (event_json) VALUES (?1)",
-        JSON.stringify({ type: "leaseExtended", atMs: Date.now() }),
+    const policy = await admitted(
+      "/host/policy",
+      "POST",
+      policyBody,
+    );
+    expect(policy.status, await policy.clone().text()).toBe(201);
+    expect(await policy.json()).toMatchObject({
+      envelope_hash: fixture.envelope_hash,
+      signer: fixture.signer,
+    });
+    const policyRef = {
+      epoch,
+      envelope_hash: fixture.envelope_hash,
+      signer: fixture.signer,
+      key_id: fixture.governance_key_id,
+    };
+    const openBody = JSON.stringify({
+      command: {
+        protocol: HOST_PROTOCOL,
+        request_id: "open-private-home-journey",
+        package_version_ref: packageDocs.version_ref,
+        policy: policyRef,
+      },
+      package: packageDocs,
+    });
+    const open = await admitted(
+      "/host/instances/open",
+      "POST",
+      openBody,
+    );
+    expect(open.status, await open.clone().text()).toBe(201);
+    const opened = await open.json<{ instance_ref: string }>();
+    expect(opened.instance_ref).toBeTruthy();
+
+    const brokerFetch = vi.fn(async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      expect(String(input)).toBe(
+        "https://private-home-broker.test/v1/model-egress",
+      );
+      const headers = new Headers(init?.headers);
+      expect(headers.get("authorization")).toBeNull();
+      expect(headers.get("x-gaugewright-execution-grant")).toBeTruthy();
+      expect(
+        headers.get("x-gaugewright-execution-signature"),
+      ).toBeTruthy();
+      return new Response(
+        [
+          'data: {"type":"response.output_text.delta","delta":"private"}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":1},"output_tokens":1}}}',
+          "",
+        ].join("\n"),
+        {
+          headers: {
+            "x-whip-model-egress-protocol":
+              "whipplescript.model-egress.stream.v1",
+            "x-whip-provider-status": "200",
+            "x-whip-provider-content-type": "text/event-stream",
+          },
+        },
       );
     });
-
-    const response = await stub.fetch(
-      "https://session.test/public/session/state",
-      { headers: { authorization: "Bearer session-token" } },
-    );
-    expect(response.status).toBe(500);
-    expect(await response.text()).toContain("leaseExtended");
-
-    // The alarm handler survives, re-arms itself, and deletes nothing.
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-    await runInDurableObject(stub, async (_instance, state) => {
-      expect(await state.storage.get("public-session-state")).toBeDefined();
-      expect(await state.storage.getAlarm()).not.toBeNull();
-      const log = state.storage.sql
-        .exec("SELECT count(*) AS total FROM session_lifecycle_events")
-        .toArray() as { total: number }[];
-      expect(log[0].total).toBeGreaterThan(0);
+    vi.stubGlobal("fetch", brokerFetch);
+    const turnBody = JSON.stringify({
+      command: {
+        protocol: HOST_PROTOCOL,
+        command_id: commandId,
+        run_ref: "gaugedesk:run:private-home-journey",
+        instance_ref: opened.instance_ref,
+        package_version_ref: packageDocs.version_ref,
+        policy: policyRef,
+        actor_ref: "audience",
+        input: { text: "hello from Private Home", images: [] },
+        resources: [],
+        provider_binding: {
+          binding_id: "model",
+          credential: { credential_id: "managed-openai" },
+        },
+        placement_ceiling_ref: "do",
+      },
+      package: packageDocs,
+      image_bodies: [],
     });
+    const turn = await admitted("/host/turns", "POST", turnBody);
+    expect(turn.status, await turn.clone().text()).toBe(200);
+    expect(await turn.json()).toMatchObject({
+      admitted: true,
+      command_id: commandId,
+    });
+    expect(brokerFetch).toHaveBeenCalledOnce();
+
+    const positionPath =
+      `/host/instances/${encodeURIComponent(opened.instance_ref)}/position`;
+    const position = await admitted(positionPath, "GET");
+    expect(position.status, await position.clone().text()).toBe(200);
+    expect(await position.json()).toMatchObject({
+      instance_ref: opened.instance_ref,
+    });
+    vi.unstubAllGlobals();
   });
 
-  it("tombstones the instance projections coherently at expiry (DR-0054)", async () => {
-    const sessionId = "session-tombstone-coherence";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      const rows = state.storage.sql
-        .exec("SELECT status FROM instances")
-        .toArray() as { status: string }[];
-      expect(rows.length).toBeGreaterThan(0);
-      const session = await state.storage.get<Record<string, unknown>>(
-        "public-session-state",
-      );
-      await state.storage.put("public-session-state", {
-        ...session,
-        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
-      });
-    });
-    expect(await runDurableObjectAlarm(stub)).toBe(true);
-
-    await runInDurableObject(stub, async (_instance, state) => {
-      // Canonical events/facts are tombstoned...
-      const events = state.storage.sql
-        .exec("SELECT count(*) AS total FROM events")
-        .toArray() as { total: number }[];
-      expect(events[0].total).toBe(0);
-      // ...and no projection row still claims to be live: a rebuild cannot
-      // fold zero events over a "running" instance.
-      for (const [table, live] of [
-        ["instances", "'running'"],
-        ["effects", "'queued', 'running'"],
-        ["runs", "'running'"],
-      ] as const) {
-        const rows = state.storage.sql
-          .exec(`SELECT count(*) AS total FROM ${table} WHERE status IN (${live})`)
-          .toArray() as { total: number }[];
-        expect(rows[0].total, `${table} must hold no live rows`).toBe(0);
-      }
-      const tombstoned = state.storage.sql
-        .exec("SELECT count(*) AS total FROM instances WHERE status = 'tombstoned'")
-        .toArray() as { total: number }[];
-      expect(tombstoned[0].total).toBeGreaterThan(0);
-      // The explicit audit marker survives in the retained diagnostics table.
-      const marker = state.storage.sql
-        .exec(
-          "SELECT count(*) AS total FROM diagnostics WHERE code = 'session.tombstoned'",
-        )
-        .toArray() as { total: number }[];
-      expect(marker[0].total).toBe(1);
-    });
-  });
-
-  it("lazily provisions the tracker tables on an existing object (DR-0054)", async () => {
-    // A deployed object was created before `tracker_aliases` /
-    // `tracker_comments` / `tracker_evidence` and the content-addressed
-    // `tracker_events` columns existed, and the first-touch schema never
-    // revisits an existing object — production tracker reads failed on it.
-    const sessionId = "session-tracker-upgrade";
-    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      // Regress the object to the pre-ADR-0002 tracker shape.
-      state.storage.sql.exec("DROP INDEX idx_tracker_events_id");
-      state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN event_id");
-      state.storage.sql.exec("ALTER TABLE tracker_events DROP COLUMN parents_json");
-      state.storage.sql.exec("DROP TABLE tracker_aliases");
-      state.storage.sql.exec("DROP TABLE tracker_comments");
-      state.storage.sql.exec("DROP TABLE tracker_evidence");
-    });
-
-    // Any entry that touches the schema upgrades the object in place.
-    const response = await stub.fetch(
-      "https://session.test/public/session/state",
-      { headers: { authorization: "Bearer session-token" } },
-    );
-    expect(response.status, await response.clone().text()).toBe(200);
-
-    await runInDurableObject(stub, async (_instance, state) => {
-      for (const table of [
-        "tracker_aliases",
-        "tracker_comments",
-        "tracker_evidence",
+  it("bounds placement identity decoding and authority across generated cases", async () => {
+    const validIds = [
+      "a",
+      "A_1",
+      "tenant:one",
+      "tenant.one-1",
+      "z".repeat(128),
+    ];
+    for (const [index, tenantId] of validIds.entries()) {
+      const placementId = validIds.at(-(index + 1))!;
+      const path =
+        `/v1/tenants/${encodeURIComponent(tenantId)}` +
+        `/placements/${encodeURIComponent(placementId)}` +
+        "/host/instances/untrusted/position";
+      for (const authorization of [
+        undefined,
+        "Bearer wrong-control-token",
       ]) {
-        const present = state.storage.sql
-          .exec(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            table,
-          )
-          .toArray();
-        expect(present.length, `${table} must exist after upgrade`).toBe(1);
+        const denied = await SELF.fetch(`https://runtime.test${path}`, {
+          headers: {
+            ...(authorization ? { authorization } : {}),
+          },
+        });
+        expect(
+          denied.status,
+          `${tenantId}/${placementId} admitted invalid authority`,
+        ).toBe(401);
       }
-      // The content-addressed columns and their dedup index are back too:
-      // the production append shape works, and repeating it is a no-op.
-      const insert = () =>
-        state.storage.sql.exec(
-          `INSERT OR IGNORE INTO tracker_events
-             (event_id, parents_json, issue_id, kind, payload_json, actor, created_at)
-           VALUES ('ev-upgrade', '[]', 'content-1', 'issue.created', '{}', 'tester', '2026-07-31')`,
+    }
+
+    const invalidSegments = [
+      "%20",
+      "bad%2Fvalue",
+      "x".repeat(129),
+      "%00",
+      "%E0%A4%A",
+    ];
+    for (const segment of invalidSegments) {
+      for (const [tenant, placement] of [
+        [segment, "valid"],
+        ["valid", segment],
+      ]) {
+        const response = await SELF.fetch(
+          `https://runtime.test/v1/tenants/${tenant}/placements/${placement}/host/instances/untrusted/position`,
+          {
+            headers: { authorization: "Bearer control-token" },
+          },
         );
-      insert();
-      insert();
-      const appended = state.storage.sql
-        .exec(
-          "SELECT count(*) AS total FROM tracker_events WHERE event_id = 'ev-upgrade'",
-        )
-        .toArray() as { total: number }[];
-      expect(appended[0].total, "the unique event_id index dedups appends").toBe(1);
-      state.storage.sql.exec(
-        "INSERT INTO tracker_aliases (content_id, alias) VALUES ('content-1', 'WS-1')",
+        expect(
+          response.status,
+          `${tenant}/${placement} escaped identity validation`,
+        ).toBe(400);
+      }
+    }
+
+    for (const segment of ["%00", "%E0%A4%A"]) {
+      const privateHome = await SELF.fetch(
+        `https://runtime.test/v1/homes/${segment}/tenants/valid/projects/valid/commands/valid/attempts/1/host/instances/untrusted/position`,
       );
-      const alias = state.storage.sql
-        .exec("SELECT content_id FROM tracker_aliases WHERE alias = 'WS-1'")
-        .toArray() as { content_id: string }[];
-      expect(alias[0].content_id).toBe("content-1");
-    });
+      expect(
+        privateHome.status,
+        `${segment} crashed the Private Home identity decoder`,
+      ).not.toBe(500);
+      if (segment === "%E0%A4%A") {
+        expect(privateHome.status).toBe(404);
+      }
+    }
   });
 
-  it("refuses to serve an object stamped by a newer deploy (DR-0054 Phase B)", async () => {
-    // A rolled-back worker attached to an object whose schema_migrations is
-    // stamped past what it knows must fail closed — a structured 500 naming
-    // both versions — instead of misreading (or lazily "upgrading") a layout
-    // it has never seen. Nothing is deleted: the newer deploy serves it again.
-    const sessionId = "session-schema-downgrade";
+  it("rejects invalid authority and accepts every declared inner route method", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
-    const stub = namespace.get(namespace.idFromName(sessionId));
-    await bootstrapSession(stub, sessionId);
-    await runInDurableObject(stub, async (_instance, state) => {
-      state.storage.sql.exec(
-        "INSERT INTO schema_migrations (version, name) VALUES (99, 'from-the-future')",
-      );
-    });
-
-    const response = await stub.fetch(
-      "https://session.test/public/session/state",
-      { headers: { authorization: "Bearer session-token" } },
+    const stub = namespace.get(namespace.idFromName("declared-route-surface"));
+    const operations = runtimeSurface.operations.filter(({ path }) =>
+      path === "/start"
+      || path.startsWith("/host/")
+      || path.startsWith("/public/session/")
     );
-    expect(response.status).toBe(500);
-    const body = await response.text();
-    expect(body).toContain("version 99");
-    expect(body).toContain("version 1");
-    expect(body).toContain("do not delete");
+    expect(operations.length).toBe(27);
 
-    // The refusal mutated nothing: the future stamp (and the object's state)
-    // survive intact for the deploy that understands them.
-    await runInDurableObject(stub, async (_instance, state) => {
-      const rows = state.storage.sql
-        .exec("SELECT MAX(version) AS version FROM schema_migrations")
-        .toArray() as { version: number }[];
-      expect(rows[0].version).toBe(99);
-    });
+    for (const operation of operations) {
+      for (const authorization of [undefined, "Bearer wrong-control-token"]) {
+        const denied = await stub.fetch(
+          `https://runtime.test${operation.samplePath}`,
+          {
+            method: operation.method,
+            headers: {
+              ...(authorization ? { authorization } : {}),
+              ...(operation.method === "POST"
+                ? { "content-type": "application/json" }
+                : {}),
+            },
+            ...(operation.method === "POST" ? { body: "{}" } : {}),
+          },
+        );
+        expect(
+          denied.status,
+          `${operation.method} ${operation.path} admitted invalid authority`,
+        ).toBe(401);
+      }
+      const response = await stub.fetch(
+        `https://runtime.test${operation.samplePath}`,
+        {
+          method: operation.method,
+          headers: {
+            authorization: operation.path.startsWith("/public/session/")
+              ? "Bearer session-token"
+              : "Bearer control-token",
+            ...(operation.method === "POST"
+              ? { "content-type": "application/json" }
+              : {}),
+          },
+          ...(operation.method === "POST" ? { body: "{}" } : {}),
+        },
+      );
+      expect(
+        response.status,
+        `${operation.method} ${operation.path} rejected its declared method`,
+      ).not.toBe(405);
+      await response.body?.cancel();
+    }
   });
 
   it("keeps session state, events, and sockets isolated by object identity", async () => {

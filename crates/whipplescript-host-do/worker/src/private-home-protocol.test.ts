@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+// grant-field-mutations
 import test from "node:test";
 import {
   canonicalJson,
+  durableWorkflowObjectName,
   p256JwkToGovernanceHex,
   validateDurableWorkflowGrant,
   verifyP256GrantSignature,
@@ -71,15 +73,25 @@ test("P-256 signature binds every private grant field", async () => {
     ),
     true,
   );
-  admitted.request_path = "/host/instances/other/evidence";
-  assert.equal(
-    await verifyP256GrantSignature(
-      admitted,
-      Buffer.from(signature).toString("base64"),
-      publicKey,
-    ),
-    false,
-  );
+  for (const field of Object.keys(admitted) as (keyof DurableWorkflowGrant)[]) {
+    const mutated = structuredClone(admitted) as Record<string, unknown>;
+    const value = mutated[field];
+    mutated[field] =
+      typeof value === "number"
+        ? value + 1
+        : Array.isArray(value)
+          ? [...value, "mutated"]
+          : `${String(value)}-mutated`;
+    assert.equal(
+      await verifyP256GrantSignature(
+        mutated as unknown as DurableWorkflowGrant,
+        Buffer.from(signature).toString("base64"),
+        publicKey,
+      ),
+      false,
+      `signature did not bind ${field}`,
+    );
+  }
 });
 
 test("Home JWK projects to GaugeDesk's exact governance key identity", async () => {
@@ -99,4 +111,35 @@ test("Home JWK projects to GaugeDesk's exact governance key identity", async () 
     ).toString("hex")}`,
   );
   assert.equal(p256JwkToGovernanceHex({ ...publicKey, x: "invalid!" }), undefined);
+});
+
+test("private Home object names are collision-free structured tuples", () => {
+  const first = {
+    home_id: "a:tenant:b",
+    tenant_id: "c",
+    project_id: "project",
+    command_id: "command",
+  };
+  const second = {
+    home_id: "a",
+    tenant_id: "b:tenant:c",
+    project_id: "project",
+    command_id: "command",
+  };
+  const legacyName = (value: typeof first) =>
+    [
+      "home",
+      value.home_id,
+      "tenant",
+      value.tenant_id,
+      "project",
+      value.project_id,
+      "command",
+      value.command_id,
+    ].join(":");
+  assert.equal(legacyName(first), legacyName(second));
+  assert.notEqual(
+    durableWorkflowObjectName(first),
+    durableWorkflowObjectName(second),
+  );
 });

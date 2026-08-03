@@ -8,7 +8,7 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ["src/*.integration.test.ts"],
+    include: ["src/session.integration.test.ts"],
     // Inert on an ordinary run; writes only when `COLLECTION_VECTOR_OUT` is set,
     // which is what `npm run capture:collection-vector` does.
     reporters: ["default", "./scripts/collection-vector-reporter.mjs"],

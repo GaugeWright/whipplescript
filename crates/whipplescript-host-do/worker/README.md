@@ -16,7 +16,24 @@ effects (sans-IO suspend/resume), eviction-safe agent turns, the
 + `wrangler.toml` are the shell that plugs those into a live Durable Object.
 
 **Chunk 5d — live validation — is the only step that cannot happen in-repo.** It
-needs a Cloudflare account and:
+needs a Cloudflare account and remains explicit in the deployed-evidence map.
+
+## Authenticated wiring evidence
+
+`contracts/product-routes.json` is generated from the maintained public
+Session, host protocol, placement-forwarding, private-Home, and legacy route
+surface. `npm run contracts:check` fails if production routing and the exact
+method/path inventory disagree or if a local evidence file/marker disappears.
+The blocking workerd gate runs the public Session composition and a separate
+authenticated host composition covering every declared inner route, generated
+placement identifiers, full host lifecycle, and signed private-Home grants.
+
+`contracts/production-canaries.json` maps every critical deployed-evidence gap
+exactly once. The public Session lifecycle uses the immutable GaugeWright Cloud
+Panels runner; managed host, placement-forwarding, and private-Home deployment
+runners remain explicit work rather than being inferred from local workerd or
+the operator-run staging script. A disabled or credential-free workflow never
+counts as deployed evidence.
 
 ## Deploy steps
 

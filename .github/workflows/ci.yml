@@ -61,6 +61,34 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
+  hosted-runtime-contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/whipplescript-host-do/worker
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: crates/whipplescript-host-do/worker/package-lock.json
+      - run: npm ci
+      - name: Inventory production runtime routes and run authenticated compositions
+        run: npm test
+      - name: Typecheck Worker
+        run: npx tsc --noEmit
+      - name: Build production public Worker artifact
+        run: npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci
+
   formal-models:
     if: ${{ github.event_name == 'schedule' || inputs.deep }}
     runs-on: ubuntu-latest

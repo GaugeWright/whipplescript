@@ -1,6 +1,7 @@
 import { WorkflowInstance, type Env as RuntimeEnv } from "./index";
 import {
   decodeGrant,
+  durableWorkflowObjectName,
   p256JwkToGovernanceHex,
   sha256Hex,
   validateDurableWorkflowGrant,
@@ -69,14 +70,18 @@ function routeIdentity(url: URL): {
   if (!match) return undefined;
   const epoch = Number(match[5]);
   if (!Number.isSafeInteger(epoch)) return undefined;
-  return {
-    homeId: decodeURIComponent(match[1]),
-    tenantId: decodeURIComponent(match[2]),
-    projectId: decodeURIComponent(match[3]),
-    commandId: decodeURIComponent(match[4]),
-    epoch,
-    innerPath: match[6],
-  };
+  try {
+    return {
+      homeId: decodeURIComponent(match[1]),
+      tenantId: decodeURIComponent(match[2]),
+      projectId: decodeURIComponent(match[3]),
+      commandId: decodeURIComponent(match[4]),
+      epoch,
+      innerPath: match[6],
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 async function admittedGrant(
@@ -183,16 +188,10 @@ export default {
       headers,
       body: request.method === "POST" ? body : undefined,
     });
-    const objectName = [
-      "home",
-      grant.home_id,
-      "tenant",
-      grant.tenant_id,
-      "project",
-      grant.project_id,
-      "command",
-      grant.command_id,
-    ].join(":");
+    // A structured tuple is injective even when an admitted identity itself
+    // contains the old delimiter words (for example `:tenant:`). Concatenating
+    // these fields could map two distinct signed grants to one object.
+    const objectName = durableWorkflowObjectName(grant);
     const stub = env.WORKFLOW_INSTANCE.get(
       env.WORKFLOW_INSTANCE.idFromName(objectName),
     );
