@@ -25,6 +25,9 @@ export function validateProductionCanaries(manifest, canaries, localRunnerSource
   assert.equal(canaries.activation.infisicalPath, "/synthetics/wiring");
   assert.match(canaries.activation.namespace, /^[a-z0-9-]+$/);
 
+  const critical = new Set(manifest.contracts
+    .filter((contract) => contract.risk === "critical")
+    .map((contract) => contract.id));
   const gaps = new Set(manifest.contracts
     .filter((contract) =>
       contract.risk === "critical" && contract.evidence.deployed.length === 0)
@@ -52,7 +55,7 @@ export function validateProductionCanaries(manifest, canaries, localRunnerSource
     assert.equal(typeof suite.cleanup, "string");
     assert(suite.cleanup.length > 100, `${suite.id} cleanup contract is not explicit`);
     for (const id of suite.contracts) {
-      assert(gaps.has(id), `${suite.id} maps ${id}, which is not a current deployed gap`);
+      assert(critical.has(id), `${suite.id} maps ${id}, which is not a critical route`);
       assert(!covered.has(id), `${id} is mapped by more than one production canary`);
       covered.add(id);
     }
@@ -78,11 +81,17 @@ export function validateProductionCanaries(manifest, canaries, localRunnerSource
   }
 
   assert.deepEqual(
-    [...covered].sort(),
-    [...gaps].sort(),
+    [...gaps].filter((id) => !covered.has(id)).sort(),
+    [],
     "production canary map is not exhaustive",
   );
-  return { gaps: gaps.size, ready, pending, suites: canaries.suites.length };
+  return {
+    gaps: gaps.size,
+    covered: covered.size,
+    ready,
+    pending,
+    suites: canaries.suites.length,
+  };
 }
 
 async function main() {
@@ -94,8 +103,9 @@ async function main() {
   ]);
   const result = validateProductionCanaries(manifest, canaries, runnerSource);
   console.log(
-    `Production canary contract covers ${result.gaps} deployed gaps in `
-      + `${result.suites} suites: ${result.ready} have approved runners awaiting `
+    `Production canary contract tracks ${result.covered} critical routes in `
+      + `${result.suites} suites, including every one of ${result.gaps} routes `
+      + `without deployed evidence: ${result.ready} have approved runners awaiting `
       + `identity and ${result.pending} still need a runner.`,
   );
 }

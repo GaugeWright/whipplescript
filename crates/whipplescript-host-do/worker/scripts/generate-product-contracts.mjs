@@ -97,6 +97,8 @@ function evidenceFor(id) {
     "src/authenticated-host.integration.test.ts#authenticated-placement-journey";
   const privateHomeJourney =
     "src/authenticated-host.integration.test.ts#signed-private-home-journey";
+  const privateHomeDeployed =
+    "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z";
   return {
     contract: publicSession
       ? ["src/session.integration.test.ts#workerd-production-object"]
@@ -125,7 +127,7 @@ function evidenceFor(id) {
         : privateHomeRoute
           ? [privateHomeJourney]
           : [],
-    deployed: [],
+    deployed: privateHomeRoute ? [privateHomeDeployed] : [],
     property: publicSession || declaredInnerRoute
       ? ["src/authenticated-host.integration.test.ts#declared-route-surface"]
       : placementRoute

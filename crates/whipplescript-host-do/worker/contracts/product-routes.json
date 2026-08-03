@@ -1040,7 +1040,9 @@
         "journey": [
           "src/authenticated-host.integration.test.ts#signed-private-home-journey"
         ],
-        "deployed": [],
+        "deployed": [
+          "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z"
+        ],
         "property": [
           "src/private-home-protocol.test.ts#grant-field-mutations",
           "src/authenticated-host.integration.test.ts#signed-private-home-journey"
@@ -1077,7 +1079,9 @@
         "journey": [
           "src/authenticated-host.integration.test.ts#signed-private-home-journey"
         ],
-        "deployed": [],
+        "deployed": [
+          "contracts/deployed-evidence.json#private-home-forwarding-2026-08-03T23:13:55Z"
+        ],
         "property": [
           "src/private-home-protocol.test.ts#grant-field-mutations",
           "src/authenticated-host.integration.test.ts#signed-private-home-journey"

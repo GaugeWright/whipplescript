@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "owner": "whipplescript-src",
+  "runs": [
+    {
+      "id": "private-home-forwarding-2026-08-03T23:13:55Z",
+      "sourceCommit": "c7bcc5bfe2d82ab5ae1cfa0223c97fbcaaca71c7",
+      "worker": "whipplescript-private-home-runtime",
+      "workerVersion": "feea7ba0-e875-4c62-b42e-5e4878f3fe01",
+      "origin": "https://whipplescript-private-home-runtime.jack-168.workers.dev",
+      "runner": "scripts/production-wiring-canary.mjs#private-home-forwarding",
+      "executedAt": "2026-08-03T23:13:55Z",
+      "execution": "identified-operator-run",
+      "result": "passed",
+      "contracts": [
+        "runtime.private-home.forward.get",
+        "runtime.private-home.forward.post"
+      ],
+      "authorityChecks": [
+        "missing execution grant denied with 401",
+        "valid signature over a tampered request body denied with 403",
+        "fresh five-minute P-256 grant admitted for exact method, path, body, package, and command"
+      ]
+    }
+  ]
+}
