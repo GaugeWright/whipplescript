@@ -1811,6 +1811,7 @@ export class WorkflowInstance implements DurableObject {
         type?: unknown;
         request_id?: unknown;
         text?: unknown;
+        images?: unknown;
         command_id?: unknown;
         ask_ref?: unknown;
         answer?: unknown;
@@ -1934,6 +1935,7 @@ export class WorkflowInstance implements DurableObject {
   private async beginPublicTurn(parsed: {
     request_id?: unknown;
     text?: unknown;
+    images?: unknown;
   }): Promise<Response> {
     const session = await this.readPublicSessionState();
     if (!session) {
@@ -1948,6 +1950,51 @@ export class WorkflowInstance implements DurableObject {
     const requestId =
       typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
     const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+    if (parsed.images !== undefined && !Array.isArray(parsed.images)) {
+      return Response.json(
+        { error: "turn images must be an array" },
+        { status: 422 },
+      );
+    }
+    const imageBodies = Array.isArray(parsed.images) ? parsed.images : [];
+    if (imageBodies.length > 16) {
+      return Response.json({ error: "turn accepts at most 16 images" }, { status: 413 });
+    }
+    let imageBytes = 0;
+    for (const body of imageBodies) {
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return Response.json({ error: "turn image has an invalid shape" }, { status: 422 });
+      }
+      const image = body as { media_type?: unknown; data_base64?: unknown };
+      if (
+        typeof image.media_type !== "string" ||
+        !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(
+          image.media_type,
+        ) ||
+        typeof image.data_base64 !== "string" ||
+        !image.data_base64 ||
+        image.data_base64.length % 4 !== 0 ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)
+      ) {
+        return Response.json(
+          { error: "turn image is not supported base64 image input" },
+          { status: 422 },
+        );
+      }
+      const padding = image.data_base64.endsWith("==")
+        ? 2
+        : image.data_base64.endsWith("=") ? 1 : 0;
+      const bytes = image.data_base64.length / 4 * 3 - padding;
+      imageBytes += bytes;
+      if (bytes > 16 * 1024 * 1024 || imageBytes > 32 * 1024 * 1024) {
+        return Response.json({ error: "turn image body limit exceeded" }, { status: 413 });
+      }
+    }
+    const imageRefs = imageBodies.map((_image, index) => ({
+      handle: "turn_images",
+      kind: "image",
+      selector: String(index),
+    }));
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId) ||
       !text ||
@@ -2045,7 +2092,7 @@ export class WorkflowInstance implements DurableObject {
         // putting a session-specific string here would be unmapped by the
         // immutable policy and silently demote the agent to `public`.
         actor_ref: "audience",
-        input: { text, images: [] },
+        input: { text, images: imageRefs },
         resources,
         provider_binding: {
           binding_id: session.host_policy.provider_binding_ref,
@@ -2056,7 +2103,7 @@ export class WorkflowInstance implements DurableObject {
         placement_ceiling_ref: session.host_policy.placement_ref,
       },
       package: session.package,
-      image_bodies: [],
+      image_bodies: imageBodies,
     }, session.credential_ref);
     const assistantText = this.hostTurnDeltas(
       session.instance_ref,

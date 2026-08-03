@@ -26,8 +26,8 @@ use crate::lowering::{
     BranchReport, OwnedDependency, OwnedEffect, OwnedFact, OwnedLowering, OwnedWorkflowTerminal,
 };
 use crate::rule_lowering::{
-    context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts,
-    ready_contexts_for, stable_hash_hex, GuardReport, RuleContext,
+    context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts_for,
+    stable_hash_hex, GuardReport, RuleContext,
 };
 use crate::RuntimeKernel;
 

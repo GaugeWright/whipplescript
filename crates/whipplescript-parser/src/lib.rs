@@ -15425,14 +15425,11 @@ fn binding_from_when(when: &str) -> Option<(String, String)> {
         // Inbound messaging (spec/messaging.md): `when message from <channel> as
         // msg` binds the generic `Message` envelope, never a domain type.
         "Message".to_owned()
-    } else if let Some(schema) =
-        vcs_sugar_schema(pattern.split(" as ").next().unwrap_or(pattern).trim())
-    {
+    } else {
+        let schema = vcs_sugar_schema(pattern.split(" as ").next().unwrap_or(pattern).trim())?;
         // std.vcs readiness sugar (DR-0052): each phrase binds its
         // builtin observer schema, like `completed turn` -> AgentTurn.
         schema.to_owned()
-    } else {
-        return None;
     };
 
     Some((binding, schema))

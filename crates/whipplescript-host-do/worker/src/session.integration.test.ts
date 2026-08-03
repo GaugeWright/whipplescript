@@ -12,7 +12,7 @@ const SIGNER = "authority:gaugedesk:test";
 const PUBLIC_KEY =
   "031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e";
 const SIGNED_ENVELOPE =
-  "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"envelope_hash\":\"95aa6b54f92aed0a47c8733b848b1e25b45c5eac81b63aa394125f4064d0e1b5\",\"key_id\":\"031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e\",\"signature\":\"c5897c642972e55b03b224cac5a8fcd70ab4859b90252d1f324e401e2ad13650175c38dbbe027a3906b94cd7e7b3db6d42f97bd46de98732bf77beae9bfc5b6b\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
+  "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"envelope_hash\":\"82abb646568a06e56ecfc32f6352c2bfd3e532f1c78b2ebb7541cc0c8c59e2d4\",\"key_id\":\"031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e\",\"signature\":\"1fcf647b38a03a3aeccb38a05f4f55ca70db1e7f88cc6fc25f826fbc20a109a64587e2f27a498f466735d7d4da7c33d6e5ec2ac9ece4a31f0690805df2673fe5\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\",\"turn_images\":\"memory:turn-images\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{\"audience\":\"audience\"},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"memory:turn-images\":{\"reader\":[\"audience\"],\"writer\":[\"audience\"]},\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 
 // The collection recipient the cross-language vector is addressed to. A test
@@ -341,8 +341,8 @@ describe("real WorkflowInstance hibernation", () => {
     resumedSocket.close(1000, "done");
   });
 
-  it("streams one direct-provider turn with canonical command correlation", async () => {
-    const providerFetch = vi.fn(async (input: RequestInfo | URL) => {
+  it("streams one direct-provider image turn with canonical command correlation", async () => {
+    const providerFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       // This historical signed-policy fixture names the full Responses path;
       // production AgentRelease builders name the provider origin. The
       // correlation proof cares that the real runtime crosses its admitted
@@ -350,6 +350,10 @@ describe("real WorkflowInstance hibernation", () => {
       // immutable fixture.
       expect(String(input)).toBe(
         "https://api.openai.com/v1/responses/v1/responses",
+      );
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(JSON.stringify(body)).toContain(
+        '"image_url":"data:image/png;base64,aGVsbG8="',
       );
       return new Response(
         [
@@ -377,6 +381,7 @@ describe("real WorkflowInstance hibernation", () => {
         type: "send_message",
         request_id: "turn-1",
         text: "hello",
+        images: [{ media_type: "image/png", data_base64: "aGVsbG8=" }],
       }),
     );
     const observed: Record<string, unknown>[] = [];
