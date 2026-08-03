@@ -21,7 +21,8 @@ tag = "v1"
 new_sqlite_classes = ["WorkflowInstance"]
 
 [vars]
-# Public verification material for the currently admitted production Home.
-# The corresponding private signer remains only inside that Home.
-HOME_ADMISSION_KEYS = "{\"041a2aa18144c4b39b7015c1da3d85eafe9d1e0690e6e16596caa30a4dc586c1c598ec4c18f7896d6537154bbcafb657a7ec0891639bb68bc6c379c35ed69ade28\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"GiqhgUTEs5twFcHaPYXq_p0eBpDm4WWWyqMKTcWGwcU\",\"y\":\"mOxMGPeJbWU3FUu8r7ZXp-wIkWObtovGw3nDXtaa3ig\",\"ext\":true,\"key_ops\":[\"verify\"]}}"
+# Public verification material for the currently admitted production Home and
+# the isolated production-wiring synthetic. The corresponding private signers
+# remain in their separate Home and canary secret boundaries.
+HOME_ADMISSION_KEYS = "{\"041a2aa18144c4b39b7015c1da3d85eafe9d1e0690e6e16596caa30a4dc586c1c598ec4c18f7896d6537154bbcafb657a7ec0891639bb68bc6c379c35ed69ade28\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"GiqhgUTEs5twFcHaPYXq_p0eBpDm4WWWyqMKTcWGwcU\",\"y\":\"mOxMGPeJbWU3FUu8r7ZXp-wIkWObtovGw3nDXtaa3ig\",\"ext\":true,\"key_ops\":[\"verify\"]},\"04ea5c670bfb20ba6f5244d023a8b478e83f4d3508884dbbb2e32c547532ba185c20fa4409baca3e2926e0f9705e8cbfeb4d1b05fd9e92109ef600d29725cbcbbe\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"6lxnC_sgum9SRNAjqLR46D9NNQiITbuy4yxUdTK6GFw\",\"y\":\"IPpECbrKPikm4PlwXoy_600bBf2ekhCe9gDSlyXLy74\",\"ext\":true,\"key_ops\":[\"verify\"]}}"
 WHIP_MODEL_BROKER_URL = "https://auth.gaugewright.com/internal/model-egress"
