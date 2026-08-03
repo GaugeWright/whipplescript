@@ -9,6 +9,7 @@ const externalRunners = new Set([
   "gaugewright-cloud@1672ef5a3e7a40b06257d52f14ea6ddf5cb6121f:"
     + "scripts/production-wiring-canary.mjs#panels-audience-lifecycle",
 ]);
+const localRunner = "scripts/production-wiring-canary.mjs";
 const allowedStates = new Set(["ready-awaiting-identity", "runner-needed"]);
 const allowedBoundaries = new Set([
   "managed-private-home",
@@ -16,7 +17,7 @@ const allowedBoundaries = new Set([
   "managed-workflow-placement",
 ]);
 
-export function validateProductionCanaries(manifest, canaries) {
+export function validateProductionCanaries(manifest, canaries, localRunnerSource = "") {
   assert.equal(canaries.schemaVersion, 1);
   assert.equal(canaries.owner, manifest.owner);
   assert.equal(canaries.activation.orchestratorRepository, "gaugewright-cloud");
@@ -57,10 +58,19 @@ export function validateProductionCanaries(manifest, canaries) {
     }
     if (suite.state === "ready-awaiting-identity") {
       ready += suite.contracts.length;
-      assert(
-        externalRunners.has(suite.runner),
-        `${suite.id} does not pin an approved immutable composed runner`,
-      );
+      assert(Array.isArray(suite.requiredEnvironment) && suite.requiredEnvironment.length > 0);
+      for (const name of suite.requiredEnvironment) {
+        assert.match(name, /^GW_SYNTHETIC_[A-Z0-9_]+$/);
+      }
+      const [locator, marker] = String(suite.runner ?? "").split("#");
+      if (!externalRunners.has(suite.runner)) {
+        assert.equal(locator, localRunner, `${suite.id} has an unapproved runner`);
+        assert(marker, `${suite.id} runner has no marker`);
+        assert(
+          localRunnerSource.includes(`"${marker}"`),
+          `${suite.id} local runner marker is absent`,
+        );
+      }
     } else {
       pending += suite.contracts.length;
       assert.equal(suite.runner, null, `${suite.id} cannot name unimplemented evidence`);
@@ -77,14 +87,15 @@ export function validateProductionCanaries(manifest, canaries) {
 
 async function main() {
   const root = resolve(import.meta.dirname, "..");
-  const [manifest, canaries] = await Promise.all([
+  const [manifest, canaries, runnerSource] = await Promise.all([
     readFile(resolve(root, "contracts/product-routes.json"), "utf8").then(JSON.parse),
     readFile(resolve(root, "contracts/production-canaries.json"), "utf8").then(JSON.parse),
+    readFile(resolve(root, localRunner), "utf8"),
   ]);
-  const result = validateProductionCanaries(manifest, canaries);
+  const result = validateProductionCanaries(manifest, canaries, runnerSource);
   console.log(
     `Production canary contract covers ${result.gaps} deployed gaps in `
-      + `${result.suites} suites: ${result.ready} have immutable runners awaiting `
+      + `${result.suites} suites: ${result.ready} have approved runners awaiting `
       + `identity and ${result.pending} still need a runner.`,
   );
 }

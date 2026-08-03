@@ -14,11 +14,15 @@ const canaries = JSON.parse(await readFile(
   resolve(root, "contracts/production-canaries.json"),
   "utf8",
 ));
+const runnerSource = await readFile(
+  resolve(root, "scripts/production-wiring-canary.mjs"),
+  "utf8",
+);
 
 test("every WhippleScript deployed gap has one cleanup-bounded suite", () => {
   assert.deepEqual(
-    validateProductionCanaries(manifest, canaries),
-    { gaps: 18, ready: 4, pending: 14, suites: 4 },
+    validateProductionCanaries(manifest, canaries, runnerSource),
+    { gaps: 18, ready: 18, pending: 0, suites: 4 },
   );
 });
 
@@ -26,7 +30,7 @@ test("an unmapped operation fails the aggregate", () => {
   const changed = structuredClone(canaries);
   changed.suites[0].contracts.pop();
   assert.throws(
-    () => validateProductionCanaries(manifest, changed),
+    () => validateProductionCanaries(manifest, changed, runnerSource),
     /production canary map is not exhaustive/,
   );
 });
@@ -35,7 +39,16 @@ test("a mutable or invented external runner cannot claim evidence", () => {
   const changed = structuredClone(canaries);
   changed.suites[0].runner = "gaugewright-cloud@main:scripts/fake.mjs#public-session";
   assert.throws(
-    () => validateProductionCanaries(manifest, changed),
-    /approved immutable composed runner/,
+    () => validateProductionCanaries(manifest, changed, runnerSource),
+    /unapproved runner/,
+  );
+});
+
+test("a missing local runner marker cannot claim readiness", () => {
+  const changed = structuredClone(canaries);
+  changed.suites[1].runner = "scripts/production-wiring-canary.mjs#invented";
+  assert.throws(
+    () => validateProductionCanaries(manifest, changed, runnerSource),
+    /local runner marker is absent/,
   );
 });

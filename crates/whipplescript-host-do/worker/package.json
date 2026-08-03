@@ -8,7 +8,7 @@
     "build:wasm": "node scripts/build-wasm.mjs",
     "contracts:generate": "node scripts/generate-product-contracts.mjs",
     "contracts:check": "node scripts/check-product-contracts.mjs",
-    "canaries:check": "node scripts/check-production-canaries.mjs && node --test scripts/check-production-canaries.test.mjs",
+    "canaries:check": "node scripts/check-production-canaries.mjs && node --test scripts/check-production-canaries.test.mjs scripts/production-wiring-canary.test.mjs",
     "deploy": "npm run build:wasm && wrangler deploy",
     "dev": "npm run build:wasm && wrangler dev",
     "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs",
@@ -27,7 +27,8 @@
     "@cloudflare/workers-types": "^5.20260708.1",
     "typescript": "^5.5.0",
     "vitest": "^4.0.0",
-    "wrangler": "^4.108.0"
+    "wrangler": "^4.108.0",
+    "ws": "^8.21.0"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"

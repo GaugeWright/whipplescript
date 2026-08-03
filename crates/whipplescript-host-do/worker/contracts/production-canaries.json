@@ -24,12 +24,21 @@
         "anonymous and OIDC audience identities",
         "sealed collection recipient"
       ],
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_PANELS_AUTHORITY",
+        "GW_SYNTHETIC_PANELS_PUBLISHER_SEED",
+        "GW_SYNTHETIC_PANELS_DEPLOYMENT",
+        "GW_SYNTHETIC_OIDC_TOKEN_ENDPOINT",
+        "GW_SYNTHETIC_OIDC_CLIENT_ID",
+        "GW_SYNTHETIC_OIDC_CLIENT_SECRET",
+        "GW_SYNTHETIC_OIDC_REFRESH_TOKEN"
+      ],
       "cleanup": "Use only the collection-enabled synthetic deployment, erase every anonymous and authenticated session, fsync sealed collection custody before acknowledgement, and retain only bounded synthetic audit metadata."
     },
     {
       "id": "managed-host-lifecycle",
-      "state": "runner-needed",
-      "runner": null,
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#managed-host-lifecycle",
       "executionBoundary": "managed-workflow-placement",
       "contracts": [
         "runtime.host.events.live",
@@ -48,12 +57,19 @@
         "bounded model gateway identity",
         "disposable package, instance and fork"
       ],
-      "cleanup": "Open only disposable instances, cancel or settle every turn, restore or delete synced files and fork envelopes, close every stream, and destroy placement state after final projection readback."
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN",
+        "GW_SYNTHETIC_WHIP_CONTROL_TOKEN",
+        "GW_SYNTHETIC_WHIP_TENANT",
+        "GW_SYNTHETIC_WHIP_PLACEMENT",
+        "GW_SYNTHETIC_WHIP_SIGNED_POLICY"
+      ],
+      "cleanup": "Reuse one stable synthetic placement and deterministic instance, turn, and fork identities; checkpoint its clean baseline before mutation, close every stream, restore the baseline, remove synced files, and retain only bounded synthetic runtime projections."
     },
     {
       "id": "placement-forwarding",
-      "state": "runner-needed",
-      "runner": null,
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#managed-host-lifecycle",
       "executionBoundary": "managed-workflow-placement",
       "contracts": [
         "runtime.placement.forward.get",
@@ -64,12 +80,19 @@
         "runtime control credential",
         "deployed Durable workflow origin"
       ],
-      "cleanup": "Forward bounded GET and POST probes through one synthetic placement, prove wrong tenant and token denial, and destroy the placement object after its inner lifecycle cleanup completes."
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_MANAGED_ORIGIN",
+        "GW_SYNTHETIC_WHIP_CONTROL_TOKEN",
+        "GW_SYNTHETIC_WHIP_TENANT",
+        "GW_SYNTHETIC_WHIP_PLACEMENT",
+        "GW_SYNTHETIC_WHIP_SIGNED_POLICY"
+      ],
+      "cleanup": "Forward bounded GET and POST probes through the stable synthetic placement, prove missing-token denial, then rely on the shared managed-host checkpoint restore and file cleanup; no nonexistent placement deletion route is assumed."
     },
     {
       "id": "private-home-forwarding",
-      "state": "runner-needed",
-      "runner": null,
+      "state": "ready-awaiting-identity",
+      "runner": "scripts/production-wiring-canary.mjs#private-home-forwarding",
       "executionBoundary": "managed-private-home",
       "contracts": [
         "runtime.private-home.forward.get",
@@ -80,7 +103,15 @@
         "ephemeral P-256 execution grant",
         "disposable command and package"
       ],
-      "cleanup": "Issue one exact short-lived Home grant, complete or cancel its disposable command, verify callback and package binding, revoke the admission, and destroy the command-scoped Durable object."
+      "requiredEnvironment": [
+        "GW_SYNTHETIC_WHIP_PRIVATE_ORIGIN",
+        "GW_SYNTHETIC_WHIP_PRIVATE_HOME",
+        "GW_SYNTHETIC_WHIP_PRIVATE_TENANT",
+        "GW_SYNTHETIC_WHIP_PRIVATE_PROJECT",
+        "GW_SYNTHETIC_WHIP_PRIVATE_GOVERNANCE_SIGNER",
+        "GW_SYNTHETIC_WHIP_PRIVATE_SIGNER_JWK"
+      ],
+      "cleanup": "Use one stable command-scoped Durable object and deterministic package, issue a fresh five-minute request-bound grant on every call, perform no model effect or spend, and retain only the bounded synthetic policy, instance, and position projections."
     }
   ]
 }
