@@ -194,6 +194,61 @@ test("public Session DO streams directly from the signed provider endpoint", asy
   assert.equal(JSON.parse(result).status, 200);
 });
 
+test("OpenAI Responses egress names the output token limit for the provider API", async () => {
+  let capturedBody: Record<string, unknown> | undefined;
+  await performDirectProviderFetch(
+    {
+      url: "https://api.openai.com/v1/responses",
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: {
+        model: "gpt-5-mini",
+        input: "Reply OK",
+        max_tokens: 256,
+        stream: true,
+      },
+    },
+    { ...binding, model: "gpt-5-mini", base_url: "https://api.openai.com" },
+    credentialResolver({
+      provider: "openai",
+      credential_class: binding.credential_class,
+      api_key: "sk-session-secret",
+    }),
+    async (_url, init) => {
+      capturedBody = JSON.parse(String(init.body));
+      return new Response(
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  );
+  assert.deepEqual(capturedBody, {
+    model: "gpt-5-mini",
+    input: "Reply OK",
+    max_output_tokens: 256,
+    stream: true,
+  });
+});
+
+test("OpenAI Responses egress refuses conflicting output token limits", async () => {
+  await assert.rejects(
+    performDirectProviderFetch(
+      {
+        url: "https://api.openai.com/v1/responses",
+        headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+        body: { max_tokens: 256, max_output_tokens: 512 },
+      },
+      { ...binding, base_url: "https://api.openai.com" },
+      credentialResolver({
+        provider: "openai",
+        credential_class: binding.credential_class,
+        api_key: "sk-session-secret",
+      }),
+      async () => { throw new Error("must not fetch"); },
+    ),
+    /conflicting output token limits/,
+  );
+});
+
 test("public Session DO resolves an owner credential only at final fetch", async () => {
   const credentialRef =
     `credential:public:${"a".repeat(64)}:openai:${"b".repeat(32)}`;
