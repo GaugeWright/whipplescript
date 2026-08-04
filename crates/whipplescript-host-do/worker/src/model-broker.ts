@@ -75,6 +75,48 @@ export interface ManagedGatewaySecret {
   token: () => string | undefined;
 }
 
+const MANAGED_BYOK_ALIAS = "primary";
+const MANAGED_GATEWAY_RETRYABLE_STATUSES = new Set([401, 403, 408, 425, 429]);
+
+interface ManagedGatewayTarget {
+  accountId: string;
+  gatewayId: string;
+  unifiedBillingBaseUrl: string;
+}
+
+function managedGatewayTarget(baseUrl: string): ManagedGatewayTarget {
+  const admitted = new URL(baseUrl);
+  const match = /^\/v1\/([0-9a-f]{32})\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/compat\/?$/
+    .exec(admitted.pathname);
+  if (
+    admitted.protocol !== "https:"
+    || admitted.hostname !== "gateway.ai.cloudflare.com"
+    || admitted.username
+    || admitted.password
+    || admitted.search
+    || admitted.hash
+    || !match
+  ) {
+    throw new Error("managed funding requires an exact Cloudflare AI Gateway compat endpoint");
+  }
+  const [, accountId, gatewayId] = match;
+  return {
+    accountId: accountId!,
+    gatewayId: gatewayId!,
+    unifiedBillingBaseUrl:
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`,
+  };
+}
+
+function managedGatewayStatus(result: string): number {
+  const parsed = JSON.parse(result) as { status?: unknown };
+  return Number.isInteger(parsed.status) ? Number(parsed.status) : 0;
+}
+
+function shouldFallbackToUnifiedBilling(status: number): boolean {
+  return MANAGED_GATEWAY_RETRYABLE_STATUSES.has(status) || status >= 500;
+}
+
 interface BrokerResponse {
   protocol: typeof MODEL_EGRESS_PROTOCOL;
   status: number;
@@ -348,12 +390,11 @@ export async function performModelBrokerFetch(
  * service's gateway token instead of a customer credential (ADR 0085 §3
  * "managed", §6).
  *
- * Implemented by delegating to {@link performDirectProviderFetch} with a secrets
- * shim rather than by copying its body. That function owns the part that must
- * not drift — proving the request never escaped the signed provider endpoint,
- * stripping sentinel authentication, capping the response, parsing usage. A
- * parallel copy of it would be a second place for an egress check to rot, and
- * this path is the one carrying anonymous visitors' traffic.
+ * Both the stored-key primary and managed-billing fallback delegate to
+ * {@link performDirectProviderFetch} with a secrets shim rather than copying its
+ * body. That function owns the part that must not drift — proving the request
+ * never escaped an admitted/derived provider endpoint, stripping sentinel
+ * authentication, capping the response, and parsing usage.
  */
 export async function performManagedGatewayFetch(
   request: SuspendedModelRequest,
@@ -376,20 +417,83 @@ export async function performManagedGatewayFetch(
     // party, which is the failure managed funding exists to prevent.
     throw new Error("managed funding has no gateway token on this runtime");
   }
+  const target = managedGatewayTarget(binding.base_url);
+  const gatewaySecret = {
+    // The shim answers with the shape `directProviderCredential` proves, so
+    // the checks there still run — the token simply is not a per-deployment
+    // reference and never came from the credential registry.
+    resolve: async () => ({
+      provider: binding.provider,
+      credential_class: binding.credential_class,
+      api_key: token,
+    }),
+  };
+
+  let primaryReachedEgress = false;
+  let primaryEmittedText = false;
+  let primaryResult: string;
+  try {
+    primaryResult = await performDirectProviderFetch(
+      request,
+      binding,
+      gatewaySecret,
+      async (url, init) => {
+        primaryReachedEgress = true;
+        const headers = new Headers(init.headers);
+        // A non-default alias is deliberate. Leaving `default` empty is what
+        // lets the REST retry below use Cloudflare Unified Billing instead of
+        // selecting the same broken provider key again.
+        headers.set("cf-aig-byok-alias", MANAGED_BYOK_ALIAS);
+        return fetcher(url, { ...init, headers });
+      },
+      (delta) => {
+        primaryEmittedText = true;
+        onTextDelta?.(delta);
+      },
+      onTiming,
+      onUsage,
+      onGatewayLog,
+    );
+  } catch (error) {
+    // Admission/endpoint/auth-sentinel failures occur before egress and remain
+    // fail-closed. Once the admitted request reached Cloudflare, a transport
+    // failure may use the same account and gateway's managed billing path, but
+    // never after text was exposed (which would duplicate a partial answer).
+    if (!primaryReachedEgress || primaryEmittedText) throw error;
+    primaryResult = JSON.stringify({ status: 599, body: null });
+  }
+
+  const primaryStatus = managedGatewayStatus(primaryResult);
+  if (!shouldFallbackToUnifiedBilling(primaryStatus) || primaryEmittedText) {
+    return primaryResult;
+  }
+
+  console.log(JSON.stringify({
+    event: "gaugewright_managed_gateway_fallback",
+    primary_status: primaryStatus,
+    fallback: "cloudflare_unified_billing",
+  }));
+
+  const fallbackBinding: ModelBrokerBinding = {
+    ...binding,
+    base_url: target.unifiedBillingBaseUrl,
+  };
+  const fallbackRequest: SuspendedModelRequest = {
+    ...request,
+    url: `${target.unifiedBillingBaseUrl}/chat/completions`,
+  };
   return performDirectProviderFetch(
-    request,
-    binding,
-    {
-      // The shim answers with the shape `directProviderCredential` proves, so
-      // the checks there still run — the token simply is not a per-deployment
-      // reference and never came from the credential registry.
-      resolve: async () => ({
-        provider: binding.provider,
-        credential_class: binding.credential_class,
-        api_key: token,
-      }),
+    fallbackRequest,
+    fallbackBinding,
+    gatewaySecret,
+    async (url, init) => {
+      const headers = new Headers(init.headers);
+      headers.set("cf-aig-gateway-id", target.gatewayId);
+      // No BYOK alias is sent here and the gateway must have no `default` key;
+      // Cloudflare's credential precedence therefore reaches Unified Billing.
+      headers.delete("cf-aig-byok-alias");
+      return fetcher(url, { ...init, headers });
     },
-    fetcher,
     onTextDelta,
     onTiming,
     onUsage,

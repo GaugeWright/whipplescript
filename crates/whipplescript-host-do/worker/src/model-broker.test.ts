@@ -453,10 +453,13 @@ function gatewayRound(
 
 test("a managed round spends the gateway token and no customer credential", async () => {
   let capturedAuthorization = "";
+  let capturedByokAlias = "";
   let capturedUrl = "";
   await gatewayRound(async (url, init) => {
     capturedUrl = url;
-    capturedAuthorization = new Headers(init.headers).get("authorization") ?? "";
+    const headers = new Headers(init.headers);
+    capturedAuthorization = headers.get("authorization") ?? "";
+    capturedByokAlias = headers.get("cf-aig-byok-alias") ?? "";
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -468,6 +471,92 @@ test("a managed round spends the gateway token and no customer credential", asyn
   // And the sentinel never survives to the wire.
   assert.ok(!capturedAuthorization.includes(MODEL_AUTH_SENTINEL));
   assert.equal(capturedUrl, `${gatewayBinding.base_url}/chat/completions`);
+  assert.equal(capturedByokAlias, "primary");
+});
+
+for (const retryableStatus of [401, 403, 408, 425, 429, 500, 503]) {
+  test(`a managed round falls back to Unified Billing after HTTP ${retryableStatus}`, async () => {
+    const calls: { url: string; headers: Headers }[] = [];
+    const result = await gatewayRound(async (url, init) => {
+      const headers = new Headers(init.headers);
+      calls.push({ url, headers });
+      if (calls.length === 1) {
+        return Response.json({ error: { type: "upstream_error" } }, {
+          status: retryableStatus,
+          headers: { "cf-aig-log-id": `primary-${retryableStatus}` },
+        });
+      }
+      return Response.json({
+        choices: [{ message: { role: "assistant", content: "fallback" } }],
+      }, { headers: { "cf-aig-log-id": `fallback-${retryableStatus}` } });
+    }, "cf-gateway-token");
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]!.url, `${gatewayBinding.base_url}/chat/completions`);
+    assert.equal(calls[0]!.headers.get("cf-aig-byok-alias"), "primary");
+    assert.equal(
+      calls[1]!.url,
+      "https://api.cloudflare.com/client/v4/accounts/1689dd452ba2d2d8eb1f3c364c92b3f4/ai/v1/chat/completions",
+    );
+    assert.equal(calls[1]!.headers.get("cf-aig-gateway-id"), "gaugewright-panels");
+    assert.equal(calls[1]!.headers.get("cf-aig-byok-alias"), null);
+    assert.equal(calls[1]!.headers.get("authorization"), "Bearer cf-gateway-token");
+    assert.equal(JSON.parse(result).status, 200);
+  });
+}
+
+test("a malformed request does not spend Unified Billing as a fallback", async () => {
+  let calls = 0;
+  const result = await gatewayRound(async () => {
+    calls += 1;
+    return Response.json({ error: { type: "invalid_request_error" } }, { status: 400 });
+  }, "cf-gateway-token");
+  assert.equal(calls, 1);
+  assert.equal(JSON.parse(result).status, 400);
+});
+
+test("a primary gateway transport failure falls back to Unified Billing", async () => {
+  let calls = 0;
+  const result = await gatewayRound(async (_url, _init) => {
+    calls += 1;
+    if (calls === 1) throw new Error("primary connection reset");
+    return Response.json({
+      choices: [{ message: { role: "assistant", content: "fallback" } }],
+    });
+  }, "cf-gateway-token");
+  assert.equal(calls, 2);
+  assert.equal(JSON.parse(result).status, 200);
+});
+
+test("a fallback reports both gateway rounds for cost reconciliation", async () => {
+  const logIds: string[] = [];
+  let calls = 0;
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: gatewayBinding.model },
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async () => {
+      calls += 1;
+      return Response.json(
+        calls === 1
+          ? { error: { type: "rate_limit_error" } }
+          : { choices: [{ message: { content: "fallback" } }] },
+        {
+          status: calls === 1 ? 429 : 200,
+          headers: { "cf-aig-log-id": `gateway-round-${calls}` },
+        },
+      );
+    },
+    undefined,
+    undefined,
+    undefined,
+    (id) => logIds.push(id),
+  );
+  assert.deepEqual(logIds, ["gateway-round-1", "gateway-round-2"]);
 });
 
 test("a managed gateway round publishes chat-completion text deltas", async () => {
@@ -575,6 +664,28 @@ test("a managed round cannot be redirected off the admitted gateway endpoint", a
     /escaped the signed provider endpoint/,
   );
   assert.equal(reached, false, "no egress may reach an unadmitted origin");
+});
+
+test("managed fallback derivation refuses a non-Cloudflare compat base URL", async () => {
+  let reached = false;
+  await assert.rejects(
+    () =>
+      performManagedGatewayFetch(
+        {
+          url: "https://gateway.example/compat/chat/completions",
+          headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+          body: {},
+        },
+        { ...gatewayBinding, base_url: "https://gateway.example/compat" },
+        { token: () => "cf-gateway-token" },
+        async () => {
+          reached = true;
+          return Response.json({});
+        },
+      ),
+    /exact Cloudflare AI Gateway compat endpoint/,
+  );
+  assert.equal(reached, false);
 });
 
 test("the gateway log id is reported even when usage cannot be parsed", async () => {
