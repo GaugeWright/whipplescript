@@ -229,7 +229,39 @@ test("OpenAI Responses egress names the output token limit for the provider API"
   });
 });
 
-test("OpenAI Responses egress refuses conflicting output token limits", async () => {
+test("Cloudflare gateway chat egress names the completion token limit", async () => {
+  let capturedBody: Record<string, unknown> | undefined;
+  const gatewayBinding = {
+    ...binding,
+    provider: "cloudflare-ai-gateway" as const,
+    model: "gpt-5-mini",
+    base_url: `https://gateway.ai.cloudflare.com/v1/${"a".repeat(32)}/managed/compat`,
+  };
+  await performDirectProviderFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: "gpt-5-mini", messages: [], max_tokens: 256 },
+    },
+    gatewayBinding,
+    credentialResolver({
+      provider: gatewayBinding.provider,
+      credential_class: binding.credential_class,
+      api_key: "gateway-token",
+    }),
+    async (_url, init) => {
+      capturedBody = JSON.parse(String(init.body));
+      return Response.json({ choices: [{ message: { content: "OK" } }] });
+    },
+  );
+  assert.deepEqual(capturedBody, {
+    model: "gpt-5-mini",
+    messages: [],
+    max_completion_tokens: 256,
+  });
+});
+
+test("provider egress refuses conflicting output token limits", async () => {
   await assert.rejects(
     performDirectProviderFetch(
       {

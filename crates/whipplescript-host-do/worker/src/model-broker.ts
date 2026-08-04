@@ -263,18 +263,20 @@ function directProviderBody(
   body: unknown,
   provider: ModelBrokerBinding["provider"],
 ): unknown {
-  if (
-    provider !== "openai"
-    && provider !== "openai-codex"
-  ) return body;
+  const providerLimit = provider === "openai" || provider === "openai-codex"
+    ? "max_output_tokens"
+    : provider === "cloudflare-ai-gateway"
+      ? "max_completion_tokens"
+      : null;
+  if (!providerLimit) return body;
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const fields = body as Record<string, unknown>;
   if (!("max_tokens" in fields)) return body;
-  if ("max_output_tokens" in fields) {
-    throw new Error("OpenAI Responses request has conflicting output token limits");
+  if (providerLimit in fields) {
+    throw new Error("provider request has conflicting output token limits");
   }
   const { max_tokens, ...rest } = fields;
-  return { ...rest, max_output_tokens: max_tokens };
+  return { ...rest, [providerLimit]: max_tokens };
 }
 
 export async function performModelBrokerFetch(
