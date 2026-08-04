@@ -39,9 +39,9 @@ use whipplescript_kernel::exec_http::{
     parse_executor_exec_response, settle_exec_http_result, ExecSettleContext,
 };
 use whipplescript_kernel::harness_loop::{
-    provider_result_from_brokered_turn, BrokeredTurnInput, BrokeredTurnMachine,
-    BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient, ImageBlock,
-    NoopCompactor, ToolExecutor, TurnStatus,
+    compactor_for_strategy, provider_result_from_brokered_turn, BrokeredTurnInput,
+    BrokeredTurnMachine, BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient,
+    ImageBlock, ToolExecutor, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -820,18 +820,63 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         })?;
                     }
                 }
-                let mut discard = |_: &[ChatMessage]| {};
-                // The DO agent turn now brokers a real in-isolate tool set (P4);
-                // conversation compaction (context-assembly Phase 4 Layer B) is a
-                // separate lift, so drive the machine with the no-op compactor for now.
-                let compactor = NoopCompactor;
+                let checkpoint_step = self
+                    .kernel
+                    .store()
+                    .list_events(self.instance_id)?
+                    .into_iter()
+                    .filter(|event| {
+                        event.event_type == "agent.turn.brokered.transcript"
+                            && serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                                .ok()
+                                .and_then(|payload| {
+                                    payload
+                                        .get("effect_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(|candidate| candidate == effect.effect_id)
+                                })
+                                .unwrap_or(false)
+                    })
+                    .count();
+                let checkpoint_store = DoSqliteStore::new(self.kernel.store().sql.clone());
+                let mut checkpoint_index = checkpoint_step;
+                let mut checkpoint = |messages: &[ChatMessage]| {
+                    let key = idempotency_key(&[
+                        self.instance_id,
+                        &effect.effect_id,
+                        "transcript",
+                        &checkpoint_index.to_string(),
+                    ]);
+                    checkpoint_index += 1;
+                    let payload = serde_json::json!({
+                        "effect_id": effect.effect_id,
+                        "messages": whipplescript_kernel::harness_loop::chat_messages_to_json(messages),
+                    })
+                    .to_string();
+                    let _ = checkpoint_store.append_event(whipplescript_store::NewEvent {
+                        instance_id: self.instance_id,
+                        event_type: "agent.turn.brokered.transcript",
+                        payload_json: &payload,
+                        source: "kernel",
+                        causation_id: None,
+                        correlation_id: Some(&effect.effect_id),
+                        idempotency_key: Some(&key),
+                    });
+                };
+                let compaction_strategy = self
+                    .ir
+                    .agents
+                    .iter()
+                    .find(|candidate| candidate.name == agent)
+                    .and_then(|candidate| candidate.compaction.as_deref());
+                let compactor = compactor_for_strategy(compaction_strategy);
                 let mut machine = match loaded {
                     None => BrokeredTurnMachine::new(
                         model,
                         self.agent_tools,
                         &turn_input,
-                        &mut discard,
-                        &compactor,
+                        &mut checkpoint,
+                        compactor.as_ref(),
                     ),
                     Some(json) => {
                         let snapshot: BrokeredTurnSnapshot = serde_json::from_str(&json)
@@ -840,8 +885,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             model,
                             self.agent_tools,
                             &turn_input,
-                            &mut discard,
-                            &compactor,
+                            &mut checkpoint,
+                            compactor.as_ref(),
                             snapshot,
                         )
                     }
@@ -2052,6 +2097,15 @@ mod tests {
             .expect("status")
             .expect("instance row");
         assert_eq!(status.instance.status, "completed");
+        let thread = driver
+            .kernel
+            .snapshot_agent_thread(&instance_id, "helper", None)
+            .expect("durable agent thread");
+        assert!(thread.iter().any(|message| matches!(
+            message,
+            ChatMessage::Assistant { text, tool_calls }
+                if text == "done" && tool_calls.is_empty()
+        )));
     }
 
     /// Store-backed project instructions (context-assembly Phase 3 item 4):

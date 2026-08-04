@@ -3619,7 +3619,6 @@ export class WorkflowInstance implements DurableObject {
           base_url: binding.base_url,
           api_key: binding.api_key,
           model: binding.model,
-          max_tokens: 4096,
           session_id: instanceId,
           cache_key: String(request.command.command_id ?? ""),
         }),

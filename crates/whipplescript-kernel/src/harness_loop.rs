@@ -1085,6 +1085,18 @@ impl Compactor for NoopCompactor {
     }
 }
 
+/// Resolve the authored owned-harness strategy through one shared policy seam.
+/// Native and Durable Object hosts must not silently choose different context
+/// behavior for the same agent declaration.
+pub fn compactor_for_strategy(strategy: Option<&str>) -> Box<dyn Compactor> {
+    match strategy {
+        Some("hard_reset") => Box::new(HardResetCompactor::default()),
+        Some("tool_results") => Box::new(ToolResultCompactor::default()),
+        Some("none") => Box::new(NoopCompactor),
+        _ => Box::new(TurnSummarizingCompactor::default()),
+    }
+}
+
 /// Trigger threshold in context-window tenths: compact when real input usage reaches
 /// this fraction of the window (Decision 7: ~90%).
 const COMPACT_TRIGGER_TENTHS: u64 = 9;

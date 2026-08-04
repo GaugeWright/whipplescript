@@ -20,9 +20,8 @@ use whipplescript_kernel::coerce_native::{
 };
 use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, Compactor, HardResetCompactor, HarnessModelClient,
-    HarnessModelError, HttpModelClient, ImageBlock, ModelReply, NoopCompactor, ToolCall,
-    ToolExecutor, ToolOutcome, ToolResultCompactor, ToolSpec, ToolStatus, TurnSummarizingCompactor,
+    BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
+    ImageBlock, ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
@@ -4104,12 +4103,8 @@ pub fn run_owned_agent_turn(
     }
     drop(coordination);
 
-    let compactor: Box<dyn Compactor> = match compaction_strategy.as_deref() {
-        Some("hard_reset") => Box::new(HardResetCompactor::default()),
-        Some("tool_results") => Box::new(ToolResultCompactor::default()),
-        Some("none") => Box::new(NoopCompactor),
-        _ => Box::new(TurnSummarizingCompactor::default()),
-    };
+    let compactor =
+        whipplescript_kernel::harness_loop::compactor_for_strategy(compaction_strategy.as_deref());
     let result = match model_config {
         Some(config) => {
             let transport = UreqCoerceTransport::new(config.timeout);

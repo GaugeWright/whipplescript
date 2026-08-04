@@ -43,11 +43,24 @@ fn openai_request_key(cache_key: Option<&str>) -> Option<String> {
 /// The context window (tokens) of a provider model, for the conversation-compaction
 /// trigger (context-assembly Phase 4). This is a **model capability**, derived from
 /// the provider + model id — never an operator config knob. The numbers are the
-/// window whip's requests actually get (e.g. Claude is 200k standard; the 1M-context
-/// beta requires an opt-in header whip does not send, so it is not claimed here).
-/// Unknown models fall back to the conservative default.
+/// window WhippleScript's requests actually get. Unknown models fall back to a
+/// conservative family default.
 pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
     let model = model.to_ascii_lowercase();
+    let is_claude = model.contains("claude") || model.starts_with("anthropic/");
+    if is_claude {
+        return if model.contains("opus-5")
+            || model.contains("sonnet-5")
+            || model.contains("opus-4-6")
+            || model.contains("opus-4-7")
+            || model.contains("opus-4-8")
+            || model.contains("sonnet-4-6")
+        {
+            1_000_000
+        } else {
+            200_000
+        };
+    }
     match provider {
         // Claude models are 200k standard context.
         CoerceProvider::Anthropic => 200_000,
@@ -66,6 +79,34 @@ pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
                 128_000
             }
         }
+    }
+}
+
+/// Maximum synchronous output the selected model actually supports. This is a
+/// provider protocol value, not an author/deployment token budget: Anthropic's
+/// Messages API requires `max_tokens`, so WhippleScript supplies the model
+/// capability instead of inventing a smaller product ceiling at the host.
+pub fn model_output_limit(provider: CoerceProvider, model: &str) -> u64 {
+    let model = model.to_ascii_lowercase();
+    let is_claude = model.contains("claude") || model.starts_with("anthropic/");
+    if is_claude {
+        if model.contains("opus-5")
+            || model.contains("sonnet-5")
+            || model.contains("opus-4-6")
+            || model.contains("opus-4-7")
+            || model.contains("opus-4-8")
+            || model.contains("sonnet-4-6")
+        {
+            128_000
+        } else {
+            64_000
+        }
+    } else {
+        // The OpenAI Responses surface requires a finite output request too.
+        // Until its Models API is a runtime dependency, use the model's known
+        // context capability as the non-product ceiling and let the provider
+        // enforce its exact output capability.
+        model_context_window(provider, &model)
     }
 }
 
@@ -1052,11 +1093,18 @@ mod tests {
 
     #[test]
     fn context_window_is_derived_from_the_model_not_configured() {
-        // Claude: 200k standard (the 1M beta is not claimed since whip does not send
-        // the opt-in header).
+        // Current Claude frontier models expose their full 1M window by default.
         assert_eq!(
             model_context_window(CoerceProvider::Anthropic, "claude-opus-4-8"),
-            200_000
+            1_000_000
+        );
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAiCompat, "anthropic/claude-opus-5"),
+            1_000_000
+        );
+        assert_eq!(
+            model_output_limit(CoerceProvider::OpenAiCompat, "anthropic/claude-opus-5"),
+            128_000
         );
         // OpenAI families map to their real windows.
         assert_eq!(

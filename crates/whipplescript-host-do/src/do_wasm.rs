@@ -687,8 +687,8 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
 /// Parse the DO-secret coerce config JSON into the ONE canonical
 /// [`ResolvedCoercionConfig`] record (spec/std-coercion.md "Config-plane
 /// reconciliation") — the same record the native door resolves from env +
-/// `whip auth` + the registry default. Defaults are owned once by std.coercion
-/// (`max_tokens` 4096, `timeout_secs` 120); the old DO-only 1024 drift is gone.
+/// `whip auth` + the registry default. Coercion retains its bounded structured-
+/// output default; it is separate from the owned agent harness below.
 /// Codex brokered turns carry only sentinel authentication. The authenticated
 /// outbound local broker replaces both sentinel fields after admission; no
 /// OAuth material enters the Durable Object.
@@ -737,9 +737,11 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
 }
 
 /// Parse the DO-secret agent-model config JSON into a `MessagesApiClient` — the
-/// same `{provider, base_url, api_key, model, max_tokens}` shape as the coerce
-/// config (an agent turn is a multi-round messages/responses call). The client is
-/// transport-free: the shell performs each round's `fetch`.
+/// same `{provider, base_url, api_key, model, max_tokens?}` shape as the coerce
+/// config (an agent turn is a multi-round messages/responses call). When omitted,
+/// WhippleScript derives the provider-required finite request value from the
+/// selected model's output capability; the host does not impose a product limit.
+/// The client is transport-free: the shell performs each round's `fetch`.
 fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let provider_id = value.get("provider").and_then(serde_json::Value::as_str);
@@ -765,7 +767,9 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let max_tokens = value
         .get("max_tokens")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(4096);
+        .unwrap_or_else(|| {
+            whipplescript_kernel::harness_model::model_output_limit(provider, &model)
+        });
     let cache_key = field("cache_key");
     if provider_id == Some("openai-codex") {
         return Ok(MessagesApiClient::new_codex(
