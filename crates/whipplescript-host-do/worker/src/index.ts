@@ -898,7 +898,7 @@ export class WorkflowInstance implements DurableObject {
             { status: 409 },
           );
         }
-        if (this.publicSessionExpired(session)) {
+        if (await this.publicSessionRequestExpired(session)) {
           return Response.json({ error: "public session has expired" }, { status: 410 });
         }
         return this.openPublicSessionSocket(request, session, url);
@@ -1048,7 +1048,7 @@ export class WorkflowInstance implements DurableObject {
         { status: 409 },
       );
     }
-    if (this.publicSessionExpired(session)) {
+    if (await this.publicSessionRequestExpired(session)) {
       return Response.json({ error: "public session has expired" }, { status: 410 });
     }
     ensureSchema(this.ctx.storage.sql);
@@ -1237,7 +1237,7 @@ export class WorkflowInstance implements DurableObject {
         { status: 409 },
       );
     }
-    if (this.publicSessionExpired(session)) {
+    if (await this.publicSessionRequestExpired(session)) {
       return Response.json({ error: "public session has expired" }, { status: 410 });
     }
     const path = url.searchParams.get("path");
@@ -1944,7 +1944,7 @@ export class WorkflowInstance implements DurableObject {
         { status: 409 },
       );
     }
-    if (this.publicSessionExpired(session)) {
+    if (await this.publicSessionRequestExpired(session)) {
       return Response.json({ error: "public session has expired" }, { status: 410 });
     }
     const requestId =
@@ -2539,6 +2539,18 @@ export class WorkflowInstance implements DurableObject {
     });
     const state = admitted ?? this.lifecycleState();
     return state.phase === "expiring" || state.phase === "tornDown";
+  }
+
+  private async publicSessionRequestExpired(
+    session: PublicSessionState,
+  ): Promise<boolean> {
+    if (!this.publicSessionExpired(session)) return false;
+    // A request can be the first observer to cross the lease deadline. That
+    // folds the lifecycle to `expiring`; it must also schedule the terminal
+    // effect, otherwise a just-consumed/early alarm leaves collection pending
+    // forever with no future wake-up.
+    await this.schedulePublicSessionExpiry(session);
+    return true;
   }
 
   private async schedulePublicSessionExpiry(

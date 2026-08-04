@@ -701,6 +701,46 @@ describe("real WorkflowInstance hibernation", () => {
     expect(state.status, await state.clone().text()).toBe(409);
   });
 
+  it("re-arms collection when a request first observes expiry", async () => {
+    const sessionId = "session-request-observed-expiry";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, false, {
+      exportable_paths: [],
+      transcript_eligible: true,
+      schema_ref: "survey.v1",
+      recipient_class: "collection:tenant",
+      max_artifact_bytes: 1_000_000,
+      recipient_public_keys: [COLLECTION_RECIPIENT_PUBLIC_KEY_HEX],
+    });
+    await runInDurableObject(stub, async (_instance, state) => {
+      const session = await state.storage.get<Record<string, unknown>>(
+        "public-session-state",
+      );
+      await state.storage.put("public-session-state", {
+        ...session,
+        retention: { idle_ttl_seconds: 0, absolute_ttl_seconds: 0 },
+      });
+      await state.storage.deleteAlarm();
+      expect(await state.storage.getAlarm()).toBeNull();
+    });
+
+    const observed = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(observed.status, await observed.clone().text()).toBe(410);
+    expect(await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.getAlarm()
+    )).not.toBeNull();
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const deployments = (env as unknown as TestEnv).SESSION_ADMISSION;
+    const deployment = deployments.get(deployments.idFromName("theory-a-test"));
+    expect(await runInDurableObject(deployment, async (_instance, state) =>
+      state.storage.get<number>(`operation:${sessionId}:deposit`)
+    )).toBe(1);
+  });
+
 
   it("emits only declared paths, seals to the admitted recipient, and deposits once", async ({
     task,
