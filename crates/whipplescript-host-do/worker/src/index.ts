@@ -2787,8 +2787,11 @@ export class WorkflowInstance implements DurableObject {
     if (keys.length) await this.ctx.storage.delete(keys);
   }
 
-  webSocketClose(socket: WebSocket, code: number, reason: string): void {
-    socket.close(code, reason);
+  webSocketClose(_socket: WebSocket, _code: number, _reason: string): void {
+    // This callback observes a peer close; it is not another opportunity to
+    // close the already-closing socket. Browsers may report the reserved 1005
+    // sentinel when no status was supplied, and echoing it into `close()`
+    // throws InvalidAccessError and resets the Durable Object after a good turn.
   }
 
   private syncHostFiles(instanceId: string, parsed: Record<string, unknown>): Response {

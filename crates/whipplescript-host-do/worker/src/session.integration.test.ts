@@ -239,6 +239,21 @@ async function durableStringValues(stub: DurableObjectStub): Promise<string[]> {
 }
 
 describe("real WorkflowInstance hibernation", () => {
+  it("does not echo a browser's reserved no-status close code", async () => {
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("session-browser-close-without-status"));
+    await runInDurableObject(stub, async (instance) => {
+      let echoed = false;
+      const observed = instance as unknown as {
+        webSocketClose: (socket: WebSocket, code: number, reason: string) => void;
+      };
+      observed.webSocketClose({
+        close() { echoed = true; },
+      } as unknown as WebSocket, 1005, "");
+      expect(echoed).toBe(false);
+    });
+  });
+
   it("rehydrates durable state and the browser socket attachment after object eviction", async () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName("session-hibernation"));
