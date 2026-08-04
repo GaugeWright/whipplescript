@@ -2675,6 +2675,14 @@ export class WorkflowInstance implements DurableObject {
     const plaintext = canonicalArtifact(envelope, workspace, transcript);
     if (plaintext.byteLength > policy.max_artifact_bytes) {
       // Definitive: a larger artifact will not become smaller on retry.
+      console.log(
+        JSON.stringify({
+          event: "emit_collection",
+          failed: "artifact exceeds the declared bound",
+          byte_len: plaintext.byteLength,
+          max_artifact_bytes: policy.max_artifact_bytes,
+        }),
+      );
       this.admitLifecycle({ kind: "failCollection" });
       this.appendPublicEvent({
         type: "collection_failed",
@@ -2693,6 +2701,13 @@ export class WorkflowInstance implements DurableObject {
       );
     } catch (error) {
       // No admitted recipient, or unusable recipient material: definitive.
+      console.log(
+        JSON.stringify({
+          event: "emit_collection",
+          failed: "artifact sealing failed",
+          error: String(error).slice(0, 300),
+        }),
+      );
       this.admitLifecycle({ kind: "failCollection" });
       this.appendPublicEvent({
         type: "collection_failed",
@@ -2726,6 +2741,14 @@ export class WorkflowInstance implements DurableObject {
     }
     this.admitLifecycle({ kind: "settleCollection" });
     this.appendPublicEvent({ type: "collection_settled", revision });
+    console.log(
+      JSON.stringify({
+        event: "emit_collection",
+        deposited: true,
+        session_id: session.session_id,
+        revision,
+      }),
+    );
   }
 
   private async tombstonePublicSession(): Promise<void> {
