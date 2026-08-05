@@ -247,6 +247,38 @@ pub enum LoopObservation {
         /// no-model rewrite).
         summary_bytes: usize,
     },
+    /// A durable user command was folded into the live turn at a model
+    /// boundary. The command id makes replay/apply-once behavior auditable.
+    UserCommandApplied {
+        command_id: String,
+        kind: TurnCommandKind,
+    },
+}
+
+/// Runtime-owned user commands that can join an already-running agent turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCommandKind {
+    /// Redirect before the next main model call.
+    Steer,
+    /// Continue only after the model would otherwise finish.
+    FollowUp,
+}
+
+/// One durable command supplied by the host. Command ids are stable across
+/// retries and DO eviction; the machine snapshots which ids it has applied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTurnCommand {
+    pub command_id: String,
+    pub text: String,
+    pub images: Vec<ImageBlock>,
+}
+
+/// Host projection over its durable command queue. Reading does not consume a
+/// row: the host marks ids applied only after the updated machine snapshot is
+/// durable, closing the crash window between injection and acknowledgement.
+pub trait TurnCommandSource {
+    fn pending(&mut self, kind: TurnCommandKind) -> Result<Vec<PendingTurnCommand>, String>;
 }
 
 /// Terminal status of a brokered turn (layer 3). Maps to the existing
@@ -557,6 +589,11 @@ pub struct BrokeredTurnSnapshot {
     /// error (Lb-5 overflow fallback), bounded by `MAX_OVERFLOW_TRIMS`.
     #[serde(default)]
     pub overflow_trims: u32,
+    /// User commands already folded into `messages`. This is the apply-once
+    /// guard when a host crashes after saving the snapshot but before marking
+    /// its queue rows applied.
+    #[serde(default)]
+    pub applied_command_ids: std::collections::BTreeSet<String>,
 }
 
 /// `serde(default)` seed for [`BrokeredTurnSnapshot::awaiting`] on pre-Phase-4
@@ -585,6 +622,7 @@ where
     compaction_epoch: u32,
     pending_compaction: Option<SummarizationRequest>,
     overflow_trims: u32,
+    applied_command_ids: std::collections::BTreeSet<String>,
     /// Transient provider-error retries used so far this turn (bounded by
     /// [`MAX_PROVIDER_RETRIES`]).
     provider_retries: u32,
@@ -593,6 +631,9 @@ where
     /// cancellation surface). Probed between rounds only, so an in-flight tool
     /// settles before the check — the settle-before-release discipline.
     cancel_check: Option<&'a dyn Fn() -> bool>,
+    /// Durable steering/follow-up source. Hosts without interactive commands
+    /// leave this absent and retain the ordinary one-shot lifecycle.
+    command_source: Option<&'a mut dyn TurnCommandSource>,
 }
 
 impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
@@ -623,8 +664,10 @@ where
             compaction_epoch: 0,
             pending_compaction: None,
             overflow_trims: 0,
+            applied_command_ids: std::collections::BTreeSet::new(),
             provider_retries: 0,
             cancel_check: None,
+            command_source: None,
         }
     }
 
@@ -659,8 +702,10 @@ where
             compaction_epoch: snapshot.compaction_epoch,
             pending_compaction: snapshot.pending_compaction,
             overflow_trims: snapshot.overflow_trims,
+            applied_command_ids: snapshot.applied_command_ids,
             provider_retries: 0,
             cancel_check: None,
+            command_source: None,
         }
     }
 
@@ -669,6 +714,11 @@ where
     /// surface; the machine consults it before each main model call.
     pub fn with_cancel_check(mut self, probe: &'a dyn Fn() -> bool) -> Self {
         self.cancel_check = Some(probe);
+        self
+    }
+
+    pub fn with_command_source(mut self, source: &'a mut dyn TurnCommandSource) -> Self {
+        self.command_source = Some(source);
         self
     }
 
@@ -686,7 +736,41 @@ where
             compaction_epoch: self.compaction_epoch,
             pending_compaction: self.pending_compaction.clone(),
             overflow_trims: self.overflow_trims,
+            applied_command_ids: self.applied_command_ids.clone(),
         }
+    }
+
+    fn inject_commands(
+        &mut self,
+        kind: TurnCommandKind,
+        limit: Option<usize>,
+    ) -> Result<bool, String> {
+        let Some(source) = self.command_source.as_mut() else {
+            return Ok(false);
+        };
+        let mut injected = false;
+        for command in source
+            .pending(kind)?
+            .into_iter()
+            .take(limit.unwrap_or(usize::MAX))
+        {
+            if !self.applied_command_ids.insert(command.command_id.clone()) {
+                continue;
+            }
+            self.messages.push(ChatMessage::User {
+                text: command.text,
+                images: command.images,
+            });
+            self.observations.push(LoopObservation::UserCommandApplied {
+                command_id: command.command_id,
+                kind,
+            });
+            injected = true;
+        }
+        if injected {
+            (self.checkpoint)(&self.messages);
+        }
+        Ok(injected)
     }
 
     /// Decide the next round: settle if the step bound is reached, else consult the
@@ -743,6 +827,18 @@ where
             return Outcome::Settle(BrokeredTurnOutcome {
                 status: TurnStatus::Cancelled,
                 summary: "turn cancelled by request".to_owned(),
+                steps: self.step,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+            });
+        }
+        // Pi-style steering joins the current run after the preceding
+        // assistant/tool batch and before the next model request. Multiple
+        // steering commands admitted before this boundary preserve FIFO order.
+        if let Err(error) = self.inject_commands(TurnCommandKind::Steer, None) {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Failed,
+                summary: format!("durable turn command read failed: {error}"),
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
@@ -918,10 +1014,34 @@ where
                 tool_calls: Vec::new(),
             });
             (self.checkpoint)(&self.messages);
+            self.step += 1;
+            // Steering wins over ordinary follow-up. Follow-ups are consumed
+            // one at a time, exactly when the agent would otherwise become
+            // idle, matching Pi's one-at-a-time queue semantics.
+            let continued = match self.inject_commands(TurnCommandKind::Steer, None) {
+                Ok(true) => Ok(true),
+                Ok(false) => self.inject_commands(TurnCommandKind::FollowUp, Some(1)),
+                Err(error) => Err(error),
+            };
+            let continued = match continued {
+                Ok(continued) => continued,
+                Err(error) => {
+                    return Outcome::Settle(BrokeredTurnOutcome {
+                        status: TurnStatus::Failed,
+                        summary: format!("durable turn command read failed: {error}"),
+                        steps: self.step,
+                        observations: std::mem::take(&mut self.observations),
+                        usage: std::mem::take(&mut self.usage),
+                    });
+                }
+            };
+            if continued {
+                return self.decide_next_call();
+            }
             return Outcome::Settle(BrokeredTurnOutcome {
                 status: TurnStatus::Completed,
                 summary: reply.text,
-                steps: self.step + 1,
+                steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
             });
@@ -1804,6 +1924,45 @@ mod tests {
         replies: RefCell<std::collections::VecDeque<Result<ModelReply, HarnessModelError>>>,
     }
 
+    type SharedCommandQueue = std::rc::Rc<RefCell<Vec<(TurnCommandKind, PendingTurnCommand)>>>;
+
+    #[derive(Clone)]
+    struct SharedCommands {
+        pending: SharedCommandQueue,
+    }
+
+    impl SharedCommands {
+        fn new() -> (Self, SharedCommandQueue) {
+            let pending = std::rc::Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    pending: pending.clone(),
+                },
+                pending,
+            )
+        }
+    }
+
+    impl TurnCommandSource for SharedCommands {
+        fn pending(&mut self, kind: TurnCommandKind) -> Result<Vec<PendingTurnCommand>, String> {
+            Ok(self
+                .pending
+                .borrow()
+                .iter()
+                .filter(|(candidate, _)| *candidate == kind)
+                .map(|(_, command)| command.clone())
+                .collect())
+        }
+    }
+
+    fn user_command(id: &str, text: &str) -> PendingTurnCommand {
+        PendingTurnCommand {
+            command_id: id.to_owned(),
+            text: text.to_owned(),
+            images: Vec::new(),
+        }
+    }
+
     impl ScriptedHttpClient {
         fn new(replies: Vec<Result<ModelReply, HarnessModelError>>) -> Self {
             Self {
@@ -2135,6 +2294,98 @@ mod tests {
     }
 
     #[test]
+    fn steering_joins_the_live_turn_after_the_current_tool_batch() {
+        let http = ScriptedHttpClient::new(vec![
+            Ok(tool_reply("c1", "read")),
+            Ok(final_reply("redirected")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_owned(),
+        });
+        let turn_input = input(8);
+        let mut checkpoint = |_: &[ChatMessage]| {};
+        let (mut commands, control) = SharedCommands::new();
+        let mut machine =
+            BrokeredTurnMachine::new(&http, &exec, &turn_input, &mut checkpoint, &NoopCompactor)
+                .with_command_source(&mut commands);
+
+        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        control.borrow_mut().push((
+            TurnCommandKind::Steer,
+            user_command("steer-1", "change direction"),
+        ));
+        assert!(matches!(
+            machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                url: "https://fake/model".to_owned(),
+                headers: Vec::new(),
+                body: json!({}),
+            })))),
+            Outcome::NeedsIo(_)
+        ));
+        let snapshot = machine.snapshot();
+        assert!(snapshot.applied_command_ids.contains("steer-1"));
+        assert!(matches!(
+            snapshot.messages.last(),
+            Some(ChatMessage::User { text, .. }) if text == "change direction"
+        ));
+        assert!(matches!(
+            machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                url: "https://fake/model".to_owned(),
+                headers: Vec::new(),
+                body: json!({}),
+            })))),
+            Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn follow_up_continues_only_when_the_agent_would_finish() {
+        let http = ScriptedHttpClient::new(vec![
+            Ok(final_reply("first answer")),
+            Ok(final_reply("second answer")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let turn_input = input(8);
+        let mut checkpoint = |_: &[ChatMessage]| {};
+        let (mut commands, control) = SharedCommands::new();
+        let mut machine =
+            BrokeredTurnMachine::new(&http, &exec, &turn_input, &mut checkpoint, &NoopCompactor)
+                .with_command_source(&mut commands);
+
+        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        control.borrow_mut().push((
+            TurnCommandKind::FollowUp,
+            user_command("follow-1", "one more thing"),
+        ));
+        assert!(matches!(
+            machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+                url: "https://fake/model".to_owned(),
+                headers: Vec::new(),
+                body: json!({}),
+            })))),
+            Outcome::NeedsIo(_)
+        ));
+        let outcome = match machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+            url: "https://fake/model".to_owned(),
+            headers: Vec::new(),
+            body: json!({}),
+        })))) {
+            Outcome::Settle(outcome) => outcome,
+            Outcome::NeedsIo(_) => panic!("follow-up should settle after its final answer"),
+        };
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert_eq!(outcome.summary, "second answer");
+        assert_eq!(outcome.steps, 2);
+    }
+
+    #[test]
     fn brokered_turn_machine_matches_loop_tool_then_final() {
         assert_loops_equivalent(
             || vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))],
@@ -2289,7 +2540,9 @@ mod tests {
                         "tool_result for {call_id} had no preceding tool_requested"
                     );
                 }
-                LoopObservation::ModelRequest { .. } | LoopObservation::Compacted { .. } => {}
+                LoopObservation::ModelRequest { .. }
+                | LoopObservation::Compacted { .. }
+                | LoopObservation::UserCommandApplied { .. } => {}
             }
         }
     }

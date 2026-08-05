@@ -397,6 +397,31 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
   sql.exec(`CREATE INDEX IF NOT EXISTS idx_host_turn_deltas
     ON host_turn_deltas(instance_id, command_id, sequence)`);
+  // Interactive user commands belong to the live agent turn, not the browser.
+  // They remain pending until the Rust machine snapshot records their stable
+  // ids, making steering/follow-up apply-once across reconnect and eviction.
+  sql.exec(`CREATE TABLE IF NOT EXISTS public_turn_commands (
+    command_id TEXT PRIMARY KEY,
+    turn_command_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('steer', 'follow_up')),
+    text TEXT NOT NULL,
+    images_json TEXT NOT NULL DEFAULT '[]',
+    position INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'applied', 'removed')),
+    announced INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    applied_at TEXT
+  )`);
+  sql.exec(`CREATE INDEX IF NOT EXISTS idx_public_turn_commands_pending
+    ON public_turn_commands(turn_command_id, kind, status, position)`);
+  // Correlation-only browser command binding. WhippleScript's effect state,
+  // never this row, decides whether the turn is running or terminal.
+  sql.exec(`CREATE TABLE IF NOT EXISTS public_turn_binding (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    request_id TEXT NOT NULL,
+    command_id TEXT NOT NULL
+  )`);
   // A public session object pins exactly one release/engagement and the
   // GaugeDesk governance root authenticated by that signed release. It is the
   // session's home; no placement/Home callback participates after bootstrap.
@@ -813,6 +838,67 @@ type PublicSessionEventInput = Omit<PublicSessionEvent, "sequence"> & {
   type: string;
 };
 
+interface PublicImageBody {
+  media_type: string;
+  data_base64: string;
+}
+
+interface PublicTurnQueueItem {
+  command_id: string;
+  text: string;
+  position: number;
+}
+
+function validatePublicMessage(parsed: {
+  request_id?: unknown;
+  text?: unknown;
+  images?: unknown;
+}):
+  | { ok: true; requestId: string; text: string; images: PublicImageBody[] }
+  | { ok: false; response: Response } {
+  const requestId =
+    typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
+  const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+  if (parsed.images !== undefined && !Array.isArray(parsed.images)) {
+    return { ok: false, response: Response.json({ error: "turn images must be an array" }, { status: 422 }) };
+  }
+  const images = (Array.isArray(parsed.images) ? parsed.images : []) as unknown[];
+  if (images.length > 16) {
+    return { ok: false, response: Response.json({ error: "turn accepts at most 16 images" }, { status: 413 }) };
+  }
+  let imageBytes = 0;
+  for (const body of images) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { ok: false, response: Response.json({ error: "turn image has an invalid shape" }, { status: 422 }) };
+    }
+    const image = body as { media_type?: unknown; data_base64?: unknown };
+    if (
+      typeof image.media_type !== "string" ||
+      !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.media_type) ||
+      typeof image.data_base64 !== "string" ||
+      !image.data_base64 ||
+      image.data_base64.length % 4 !== 0 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)
+    ) {
+      return { ok: false, response: Response.json({ error: "turn image is not supported base64 image input" }, { status: 422 }) };
+    }
+    const padding = image.data_base64.endsWith("==") ? 2 : image.data_base64.endsWith("=") ? 1 : 0;
+    const bytes = image.data_base64.length / 4 * 3 - padding;
+    imageBytes += bytes;
+    if (bytes > 16 * 1024 * 1024 || imageBytes > 32 * 1024 * 1024) {
+      return { ok: false, response: Response.json({ error: "turn image body limit exceeded" }, { status: 413 }) };
+    }
+  }
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId) ||
+    !text ||
+    new TextEncoder().encode(text).length > 256 * 1024
+  ) {
+    return { ok: false, response: Response.json({ error: "turn requires a valid request_id and non-empty text" }, { status: 422 }) };
+  }
+  return { ok: true, requestId, text, images: images as PublicImageBody[] };
+}
+
 export class WorkflowInstance implements DurableObject {
   private readonly turnStreams = new Map<
     string,
@@ -1208,6 +1294,9 @@ export class WorkflowInstance implements DurableObject {
   private async publicSessionSnapshot(
     session: PublicSessionState,
   ): Promise<Record<string, unknown>> {
+    // Repair the narrow crash window after Rust saved/applied a command but
+    // before the Worker projected its public event/transcript update.
+    await this.publishAppliedTurnCommands();
     const transcript =
       (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
         "public-transcript",
@@ -1226,6 +1315,7 @@ export class WorkflowInstance implements DurableObject {
       cursor: this.publicEventCursor(),
       transcript,
       files,
+      queue: this.publicTurnQueue(),
     };
   }
 
@@ -1803,6 +1893,7 @@ export class WorkflowInstance implements DurableObject {
     socket: WebSocket,
     message: string | ArrayBuffer,
   ): Promise<void> {
+    let operationId: unknown;
     try {
       const parsed = JSON.parse(
         typeof message === "string" ? message : new TextDecoder().decode(message),
@@ -1815,7 +1906,9 @@ export class WorkflowInstance implements DurableObject {
         command_id?: unknown;
         ask_ref?: unknown;
         answer?: unknown;
+        operation_id?: unknown;
       };
+      operationId = parsed.operation_id;
       const attachment = socket.deserializeAttachment() as
         | { instanceId?: string; after?: number; publicSession?: boolean }
         | null;
@@ -1871,6 +1964,33 @@ export class WorkflowInstance implements DurableObject {
         }
         return;
       }
+      if (
+        attachment?.publicSession &&
+        (parsed.type === "steer" || parsed.type === "follow_up")
+      ) {
+        const response = await this.enqueuePublicTurnCommand(
+          parsed.type,
+          parsed,
+        );
+        if (!response.ok) {
+          const body = await response.json<{ error?: string }>();
+          throw new Error(body.error ?? `turn command rejected (${response.status})`);
+        }
+        return;
+      }
+      if (
+        attachment?.publicSession &&
+        ["queue_edit", "queue_remove", "queue_reorder", "queue_promote"].includes(
+          String(parsed.type),
+        )
+      ) {
+        const response = this.mutatePublicTurnQueue(parsed);
+        if (!response.ok) {
+          const body = await response.json<{ error?: string }>();
+          throw new Error(body.error ?? `queue command rejected (${response.status})`);
+        }
+        return;
+      }
       if (attachment?.publicSession && parsed.type === "stop") {
         const requestId =
           typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
@@ -1891,11 +2011,21 @@ export class WorkflowInstance implements DurableObject {
           ),
         );
         this.appendPublicEvent({
+          type: "turn_stop_requested",
+          request_id: requestId,
+          command_id: commandId,
+          receipt,
+        }, `turn-stop-requested:${commandId}`);
+        // Compatibility for clients released before the stop acknowledgement
+        // was distinguished from the eventual terminal outcome. New clients
+        // treat both event names as acknowledgements and wait for turn_terminal.
+        this.appendPublicEvent({
           type: "turn_stopped",
           request_id: requestId,
           command_id: commandId,
           receipt,
-        }, `turn-stop:${commandId}`);
+          compatibility_alias: true,
+        }, `turn-stopped-compat:${commandId}`);
         return;
       }
       if (attachment?.publicSession) {
@@ -1906,7 +2036,13 @@ export class WorkflowInstance implements DurableObject {
         : attachment?.after ?? 0;
       this.sendHostProgress(socket, instanceId, Math.max(0, after));
     } catch (error) {
-      socket.send(JSON.stringify({ type: "error", error: String(error) }));
+      socket.send(JSON.stringify({
+        type: "error",
+        error: String(error),
+        ...(typeof operationId === "string"
+          ? { operation_id: operationId }
+          : {}),
+      }));
     }
   }
 
@@ -1915,6 +2051,10 @@ export class WorkflowInstance implements DurableObject {
     requestId: string,
     result: Response,
   ): Promise<PublicSessionEvent | null> {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM public_turn_binding WHERE singleton = 1 AND request_id = ?1",
+      requestId,
+    );
     const body = await result.json();
     const publicSession = await this.readPublicSessionState();
     if (!publicSession) {
@@ -1932,6 +2072,235 @@ export class WorkflowInstance implements DurableObject {
     return terminal;
   }
 
+  private publicTurnQueue(): PublicTurnQueueItem[] {
+    ensureSchema(this.ctx.storage.sql);
+    return (this.ctx.storage.sql
+      .exec(
+        `SELECT command_id, text, position
+           FROM public_turn_commands
+          WHERE status = 'pending'
+          ORDER BY CASE kind WHEN 'steer' THEN 0 ELSE 1 END,
+                   position, created_at, command_id`,
+      )
+      .toArray() as {
+        command_id: string;
+        text: string;
+        position: number;
+      }[]).map((row) => ({
+        command_id: row.command_id,
+        text: row.text,
+        position: Number(row.position),
+      }));
+  }
+
+  private publishPublicTurnQueue(eventKey?: string, operationId?: string): void {
+    this.appendPublicEvent(
+      {
+        type: "turn_queue_changed",
+        queue: this.publicTurnQueue(),
+        ...(operationId ? { operation_id: operationId } : {}),
+      },
+      eventKey,
+    );
+  }
+
+  private async enqueuePublicTurnCommand(
+    kind: "steer" | "follow_up",
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const session = await this.readPublicSessionState();
+    if (!session) {
+      return Response.json({ error: "public session is not bootstrapped" }, { status: 409 });
+    }
+    const message = validatePublicMessage(parsed);
+    if (!message.ok) return message.response;
+    ensureSchema(this.ctx.storage.sql);
+    const active = this.ctx.storage.sql
+      .exec(
+        `SELECT request_id, command_id FROM public_turn_binding
+          WHERE singleton = 1`,
+      )
+      .toArray() as { request_id: string; command_id: string }[];
+    if (active.length === 0) {
+      return Response.json({ error: "session has no running turn" }, { status: 409 });
+    }
+    const positionRows = this.ctx.storage.sql
+      .exec(
+        `SELECT COALESCE(MAX(position), 0) + 1024 AS position
+           FROM public_turn_commands
+          WHERE turn_command_id = ?1 AND kind = ?2 AND status = 'pending'`,
+        active[0].command_id,
+        kind,
+      )
+      .toArray() as { position: number }[];
+    const position = Number(positionRows[0]?.position ?? 1024);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO public_turn_commands
+         (command_id, turn_command_id, kind, text, images_json, position)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+       ON CONFLICT(command_id) DO NOTHING`,
+      message.requestId,
+      active[0].command_id,
+      kind,
+      message.text,
+      JSON.stringify(message.images),
+      position,
+    );
+    this.publishPublicTurnQueue(
+      `turn-command-queue:${message.requestId}`,
+      typeof parsed.operation_id === "string" ? parsed.operation_id : message.requestId,
+    );
+    return Response.json({ admitted: true, command_id: message.requestId }, { status: 202 });
+  }
+
+  private mutatePublicTurnQueue(parsed: Record<string, unknown>): Response {
+    ensureSchema(this.ctx.storage.sql);
+    const commandId =
+      typeof parsed.command_id === "string" ? parsed.command_id.trim() : "";
+    if (parsed.type !== "queue_reorder" && !commandId) {
+      return Response.json({ error: "queue command requires command_id" }, { status: 422 });
+    }
+    if (parsed.type === "queue_edit") {
+      const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+      if (!text || new TextEncoder().encode(text).length > 256 * 1024) {
+        return Response.json({ error: "queue edit requires non-empty text" }, { status: 422 });
+      }
+      const changed = this.ctx.storage.sql.exec(
+        "UPDATE public_turn_commands SET text = ?1 WHERE command_id = ?2 AND status = 'pending'",
+        text,
+        commandId,
+      ).rowsWritten;
+      if (!changed) return Response.json({ error: "queued command is no longer pending" }, { status: 409 });
+    } else if (parsed.type === "queue_remove") {
+      const changed = this.ctx.storage.sql.exec(
+        "UPDATE public_turn_commands SET status = 'removed' WHERE command_id = ?1 AND status = 'pending'",
+        commandId,
+      ).rowsWritten;
+      if (!changed) {
+        const removed = this.ctx.storage.sql.exec(
+          "SELECT 1 AS present FROM public_turn_commands WHERE command_id = ?1 AND status = 'removed'",
+          commandId,
+        ).toArray();
+        if (removed.length === 0) {
+          return Response.json({ error: "queued command is no longer pending" }, { status: 409 });
+        }
+      }
+    } else if (parsed.type === "queue_promote") {
+      const changed = this.ctx.storage.sql.exec(
+        `UPDATE public_turn_commands SET kind = 'steer', position = 0
+          WHERE command_id = ?1 AND status = 'pending'`,
+        commandId,
+      ).rowsWritten;
+      if (!changed) return Response.json({ error: "queued command is no longer pending" }, { status: 409 });
+    } else if (parsed.type === "queue_reorder") {
+      const ids = Array.isArray(parsed.command_ids)
+        ? parsed.command_ids.filter((id): id is string => typeof id === "string")
+        : [];
+      if (ids.length === 0 || new Set(ids).size !== ids.length) {
+        return Response.json({ error: "queue reorder requires unique command_ids" }, { status: 422 });
+      }
+      ids.forEach((id, index) => {
+        this.ctx.storage.sql.exec(
+          "UPDATE public_turn_commands SET position = ?1 WHERE command_id = ?2 AND status = 'pending' AND kind = 'follow_up'",
+          (index + 1) * 1024,
+          id,
+        );
+      });
+    } else {
+      return Response.json({ error: "unsupported queue command" }, { status: 422 });
+    }
+    const operationId =
+      typeof parsed.operation_id === "string" ? parsed.operation_id : undefined;
+    this.publishPublicTurnQueue(
+      operationId ? `turn-queue-operation:${operationId}` : undefined,
+      operationId,
+    );
+    return Response.json({ updated: true });
+  }
+
+  private async projectPublicAssistantSegment(
+    instanceId: string,
+    commandId: string,
+  ): Promise<void> {
+    const cursorKey = `public-transcript-delta-cursor:${commandId}`;
+    const after = (await this.ctx.storage.get<number>(cursorKey)) ?? 0;
+    const deltas = this.hostTurnDeltas(instanceId, commandId, after);
+    if (deltas.length === 0) return;
+    const text = deltas.map((event) => event.delta).join("");
+    const transcript =
+      (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+        "public-transcript",
+      )) ?? [];
+    if (text) transcript.push({ type: "assistant", text });
+    await this.ctx.storage.put({
+      "public-transcript": transcript,
+      [cursorKey]: deltas.at(-1)!.sequence,
+    });
+  }
+
+  private async publishAppliedTurnCommands(): Promise<void> {
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT command_id, turn_command_id, kind, text FROM public_turn_commands
+          WHERE status = 'applied' AND announced = 0 ORDER BY applied_at, command_id`,
+      )
+      .toArray() as {
+        command_id: string;
+        turn_command_id: string;
+        kind: string;
+        text: string;
+      }[];
+    if (rows.length === 0) return;
+    for (const row of rows) {
+      const active = this.ctx.storage.sql
+        .exec(
+          "SELECT request_id FROM public_turn_binding WHERE singleton = 1 AND command_id = ?1",
+          row.turn_command_id,
+        )
+        .toArray() as { request_id: string }[];
+      const session = await this.readPublicSessionState();
+      if (session) {
+        await this.projectPublicAssistantSegment(
+          session.instance_ref,
+          row.turn_command_id,
+        );
+      }
+      const transcript =
+        (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
+          "public-transcript",
+        )) ?? [];
+      const projectionKey = `public-transcript-user:${row.command_id}`;
+      if (!(await this.ctx.storage.get<boolean>(projectionKey))) {
+        transcript.push({ type: "user", text: row.text });
+        await this.ctx.storage.put({
+          "public-transcript": transcript,
+          [projectionKey]: true,
+        });
+        this.appendPublicEvent({
+          type: "message_accepted",
+          request_id: row.command_id,
+          command_id: row.turn_command_id,
+          ...(active[0]?.request_id
+            ? { parent_request_id: active[0].request_id }
+            : {}),
+          role: "user",
+          text: row.text,
+        }, `turn-command-message:${row.command_id}`);
+      }
+      this.appendPublicEvent({
+        type: "turn_command_applied",
+        request_id: row.command_id,
+        command_id: row.turn_command_id,
+        kind: row.kind,
+      }, `turn-command-applied:${row.command_id}`);
+      this.ctx.storage.sql.exec(
+        "UPDATE public_turn_commands SET announced = 1 WHERE command_id = ?1",
+        row.command_id,
+      );
+    }
+    this.publishPublicTurnQueue();
+  }
+
   private async beginPublicTurn(parsed: {
     request_id?: unknown;
     text?: unknown;
@@ -1947,64 +2316,32 @@ export class WorkflowInstance implements DurableObject {
     if (await this.publicSessionRequestExpired(session)) {
       return Response.json({ error: "public session has expired" }, { status: 410 });
     }
-    const requestId =
-      typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
-    const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
-    if (parsed.images !== undefined && !Array.isArray(parsed.images)) {
-      return Response.json(
-        { error: "turn images must be an array" },
-        { status: 422 },
-      );
+    const message = validatePublicMessage(parsed);
+    if (!message.ok) return message.response;
+    const { requestId, text, images: imageBodies } = message;
+    ensureSchema(this.ctx.storage.sql);
+    const commandId = publicCommandId(session.session_id, requestId);
+    const active = this.ctx.storage.sql
+      .exec(
+        "SELECT request_id, command_id FROM public_turn_binding WHERE singleton = 1",
+      )
+      .toArray() as { request_id: string; command_id: string }[];
+    if (active.length > 0 && active[0].request_id !== requestId) {
+      return Response.json({ error: "a public turn is already running" }, { status: 409 });
     }
-    const imageBodies = Array.isArray(parsed.images) ? parsed.images : [];
-    if (imageBodies.length > 16) {
-      return Response.json({ error: "turn accepts at most 16 images" }, { status: 413 });
-    }
-    let imageBytes = 0;
-    for (const body of imageBodies) {
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
-        return Response.json({ error: "turn image has an invalid shape" }, { status: 422 });
-      }
-      const image = body as { media_type?: unknown; data_base64?: unknown };
-      if (
-        typeof image.media_type !== "string" ||
-        !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(
-          image.media_type,
-        ) ||
-        typeof image.data_base64 !== "string" ||
-        !image.data_base64 ||
-        image.data_base64.length % 4 !== 0 ||
-        !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)
-      ) {
-        return Response.json(
-          { error: "turn image is not supported base64 image input" },
-          { status: 422 },
-        );
-      }
-      const padding = image.data_base64.endsWith("==")
-        ? 2
-        : image.data_base64.endsWith("=") ? 1 : 0;
-      const bytes = image.data_base64.length / 4 * 3 - padding;
-      imageBytes += bytes;
-      if (bytes > 16 * 1024 * 1024 || imageBytes > 32 * 1024 * 1024) {
-        return Response.json({ error: "turn image body limit exceeded" }, { status: 413 });
-      }
-    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO public_turn_binding (singleton, request_id, command_id)
+       VALUES (1, ?1, ?2)
+       ON CONFLICT(singleton) DO UPDATE SET request_id = excluded.request_id,
+         command_id = excluded.command_id`,
+      requestId,
+      commandId,
+    );
     const imageRefs = imageBodies.map((_image, index) => ({
       handle: "turn_images",
       kind: "image",
       selector: String(index),
     }));
-    if (
-      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId) ||
-      !text ||
-      new TextEncoder().encode(text).length > 256 * 1024
-    ) {
-      return Response.json(
-        { error: "turn requires a valid request_id and non-empty text" },
-        { status: 422 },
-      );
-    }
     // Activity is an admitted observation stamped here, not a field assignment.
     // It also returns an expiring session to active inside the grace window.
     const activityAt = Date.now();
@@ -2027,7 +2364,6 @@ export class WorkflowInstance implements DurableObject {
     if (capabilities.has("command.run")) {
       resources.push({ handle: "command", kind: "command", selector: null });
     }
-    const commandId = publicCommandId(session.session_id, requestId);
     const turnStartedAt = performance.now();
     this.publicTraceStarts.set(commandId, turnStartedAt);
     const traceBoundary = (boundary: string) => {
@@ -2105,24 +2441,7 @@ export class WorkflowInstance implements DurableObject {
       package: session.package,
       image_bodies: imageBodies,
     }, session.credential_ref);
-    const assistantText = this.hostTurnDeltas(
-      session.instance_ref,
-      commandId,
-      0,
-    )
-      .map((event) => event.delta)
-      .join("");
-    const assistantProjectionKey = `public-transcript-assistant:${requestId}`;
-    if (
-      assistantText &&
-      !(await this.ctx.storage.get<boolean>(assistantProjectionKey))
-    ) {
-      transcript.push({ type: "assistant", text: assistantText });
-      await this.ctx.storage.put({
-        "public-transcript": transcript,
-        [assistantProjectionKey]: true,
-      });
-    }
+    await this.projectPublicAssistantSegment(session.instance_ref, commandId);
     traceBoundary("runtime_turn_complete");
     const turnBody = (await turn.clone().json()) as {
       outcome?: unknown;
@@ -2153,6 +2472,7 @@ export class WorkflowInstance implements DurableObject {
         ? turnBody.receipt.status
         : "";
     const turnSucceeded = turn.ok && receiptStatus === "completed";
+    const turnCancelled = turn.ok && receiptStatus === "cancelled";
     if (turn.ok && turnBody.outcome === "parked" && !receiptStatus) {
       // The reservation remains held by the original request id while the same
       // durable turn waits. Human continuation replays `reserve` idempotently
@@ -2254,9 +2574,9 @@ export class WorkflowInstance implements DurableObject {
       {
         ...turnBody,
         runtime_outcome: turnBody.outcome,
-        outcome: turnSucceeded ? "terminal" : "failed",
+        outcome: turnSucceeded ? "terminal" : turnCancelled ? "interrupted" : "failed",
       },
-      { status: turnSucceeded ? 200 : 502 },
+      { status: turnSucceeded || turnCancelled ? 200 : 502 },
     );
   }
 
@@ -2303,26 +2623,7 @@ export class WorkflowInstance implements DurableObject {
       throw new Error(`public continuation settlement failed (${settlement.status})`);
     }
     if (succeeded && exactUsage) {
-      const transcript =
-        (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
-          "public-transcript",
-        )) ?? [];
-      const assistantText = this.hostTurnDeltas(
-        session.instance_ref,
-        commandId,
-        0,
-      ).map((event) => event.delta).join("");
-      const projectionKey = `public-transcript-assistant:${requestId}`;
-      if (
-        assistantText &&
-        !(await this.ctx.storage.get<boolean>(projectionKey))
-      ) {
-        transcript.push({ type: "assistant", text: assistantText });
-        await this.ctx.storage.put({
-          "public-transcript": transcript,
-          [projectionKey]: true,
-        });
-      }
+      await this.projectPublicAssistantSegment(session.instance_ref, commandId);
       const output = body.output as {
         label_ref?: unknown;
         tool_calls?: {
@@ -4062,6 +4363,7 @@ export class WorkflowInstance implements DurableObject {
     for (;;) {
       const stepStartedAt = performance.now();
       const outcome = JSON.parse(instance.step(responseJson, Date.now())) as StepOutcome;
+      if (hostedInstanceId) await this.publishAppliedTurnCommands();
       timing[`wasm_step_${step}_ms`] =
         Math.round((performance.now() - stepStartedAt) * 10) / 10;
       step += 1;

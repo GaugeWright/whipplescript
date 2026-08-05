@@ -443,6 +443,196 @@ describe("real WorkflowInstance hibernation", () => {
     socket.close(1000, "done");
   });
 
+  it("applies durable steering before the next model round and follow-up at idle", async () => {
+    let releaseFirst!: () => void;
+    const firstRoundGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const providerBodies: string[] = [];
+    let round = 0;
+    const providerFetch = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        round += 1;
+        providerBodies.push(String(init?.body ?? ""));
+        if (round === 1) {
+          await firstRoundGate;
+          return new Response(
+            [
+              `data: ${JSON.stringify({
+                type: "response.output_item.done",
+                item: {
+                  type: "function_call",
+                  call_id: "tool-1",
+                  name: "read",
+                  arguments: JSON.stringify({ path: "README.md" }),
+                },
+              })}`,
+              `data: ${JSON.stringify({
+                type: "response.completed",
+                response: {
+                  output: [],
+                  usage: { input_tokens: 3, output_tokens: 1 },
+                },
+              })}`,
+              "",
+            ].join("\n"),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        const text = round === 2 ? "redirected" : "followed up";
+        return new Response(
+          [
+            `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}`,
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                output: [],
+                usage: { input_tokens: 3, output_tokens: 1 },
+              },
+            })}`,
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", providerFetch);
+
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("session-interactive-commands"));
+    await bootstrapSession(stub, "session-interactive-commands");
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-live",
+      text: "start",
+    }));
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledTimes(1));
+    socket.send(JSON.stringify({
+      type: "follow_up",
+      operation_id: "op-follow",
+      request_id: "follow-1",
+      text: "one more thing",
+    }));
+    socket.send(JSON.stringify({
+      type: "steer",
+      operation_id: "op-steer",
+      request_id: "steer-1",
+      text: "change direction",
+    }));
+
+    const observed: Record<string, unknown>[] = [];
+    while (
+      observed.filter(({ type }) => type === "turn_queue_changed").length < 2
+    ) {
+      observed.push(await nextMessage(socket));
+    }
+    releaseFirst();
+    for (let index = 0; index < 120; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    expect(providerFetch).toHaveBeenCalledTimes(3);
+    expect(providerBodies[1]).toContain("change direction");
+    expect(providerBodies[2]).toContain("one more thing");
+    expect(observed.filter(({ type }) => type === "turn_command_applied"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ request_id: "steer-1", kind: "steer" }),
+        expect.objectContaining({ request_id: "follow-1", kind: "follow_up" }),
+      ]));
+    expect(observed.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-live",
+    });
+    const state = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    expect(await state.json()).toMatchObject({
+      queue: [],
+      transcript: [
+        { type: "user", text: "start" },
+        { type: "user", text: "change direction" },
+        { type: "assistant", text: "redirected" },
+        { type: "user", text: "one more thing" },
+        { type: "assistant", text: "followed up" },
+      ],
+    });
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
+  it("stops cooperatively at the next model boundary without starting another round", async () => {
+    let releaseFirst!: () => void;
+    const firstRoundGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const providerFetch = vi.fn(
+      async () => {
+        await firstRoundGate;
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "tool-cancel",
+                name: "read",
+                arguments: JSON.stringify({ path: "README.md" }),
+              },
+            })}`,
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                output: [],
+                usage: { input_tokens: 3, output_tokens: 1 },
+              },
+            })}`,
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", providerFetch);
+
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("session-cooperative-stop"));
+    await bootstrapSession(stub, "session-cooperative-stop");
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-stop",
+      text: "start",
+    }));
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce());
+    socket.send(JSON.stringify({ type: "stop", request_id: "turn-stop" }));
+
+    const observed: Record<string, unknown>[] = [];
+    while (!observed.some(({ type }) => type === "turn_stop_requested")) {
+      observed.push(await nextMessage(socket));
+    }
+    releaseFirst();
+    for (let index = 0; index < 80; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    expect(providerFetch).toHaveBeenCalledOnce();
+    expect(observed.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-stop",
+      status: 200,
+      body: { outcome: "interrupted" },
+    });
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
   it("keeps the provider credential out of fabricated unoffered tool calls", async () => {
     const toolCalls = [
       ["write", { path: "canary.txt", content: "ordinary content" }],

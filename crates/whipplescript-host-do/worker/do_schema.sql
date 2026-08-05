@@ -183,6 +183,26 @@
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
+            CREATE TABLE public_turn_commands (
+                command_id TEXT PRIMARY KEY,
+                turn_command_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('steer', 'follow_up')),
+                text TEXT NOT NULL,
+                images_json TEXT NOT NULL DEFAULT '[]',
+                position INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'applied', 'removed')),
+                announced INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TEXT
+            );
+            CREATE INDEX idx_public_turn_commands_pending
+                ON public_turn_commands(turn_command_id, kind, status, position);
+            CREATE TABLE public_turn_binding (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                request_id TEXT NOT NULL,
+                command_id TEXT NOT NULL
+            );
             CREATE TABLE inbox_items (
                 inbox_item_id TEXT PRIMARY KEY,
                 instance_id TEXT NOT NULL,

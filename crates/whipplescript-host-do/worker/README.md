@@ -150,3 +150,15 @@ changed; review it as one.
   directly.
 
 Once these are wired and the object deployed, 5d is exercising already-proven Rust.
+
+## Public turn commands
+
+The public Session WebSocket owns the active turn's interactive command queue.
+`steer` joins the current WhippleScript run before its next model request;
+`follow_up` waits until the agent would otherwise finish. Queue edits, removal,
+reordering, and promotion are durable Session commands and the queue is included
+in the resumable session snapshot. `stop` is separate: its
+`turn_stop_requested` event acknowledges the durable cancellation request, while
+the later `turn_terminal` event reports the outcome WhippleScript actually
+observed. A legacy `turn_stopped` alias is emitted during the compatibility
+window; it is also an acknowledgement, not a terminal outcome.

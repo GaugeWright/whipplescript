@@ -198,7 +198,7 @@ pub struct AgentThreadSeed<'a> {
 fn brokered_observation_evidence(
     obs: &crate::harness_loop::LoopObservation,
 ) -> (&'static str, Value) {
-    use crate::harness_loop::{LoopObservation, ToolStatus};
+    use crate::harness_loop::{LoopObservation, ToolStatus, TurnCommandKind};
     match obs {
         LoopObservation::ModelRequest { step } => {
             ("agent.turn.brokered.model_request", json!({ "step": step }))
@@ -232,6 +232,16 @@ fn brokered_observation_evidence(
                 "epoch": epoch,
                 "folded_messages": folded_messages,
                 "summary_bytes": summary_bytes,
+            }),
+        ),
+        LoopObservation::UserCommandApplied { command_id, kind } => (
+            "agent.turn.user_command_applied",
+            json!({
+                "command_id": command_id,
+                "kind": match kind {
+                    TurnCommandKind::Steer => "steer",
+                    TurnCommandKind::FollowUp => "follow_up",
+                },
             }),
         ),
     }

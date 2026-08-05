@@ -9015,6 +9015,13 @@ pub(crate) mod test_support {
             CREATE TABLE agent_turn_snapshots (
                 effect_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL
             );
+            CREATE TABLE public_turn_commands (
+                command_id TEXT PRIMARY KEY, turn_command_id TEXT NOT NULL,
+                kind TEXT NOT NULL, text TEXT NOT NULL, images_json TEXT NOT NULL DEFAULT '[]',
+                position INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                announced INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, applied_at TEXT
+            );
             CREATE TABLE tracker_events (
                 event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
@@ -9113,6 +9120,58 @@ pub fn do_load_agent_snapshot<Sql: DoSql>(
         )
         .map_err(sql_err)?;
     Ok(rows.first().map(|row| as_text(&row[0])))
+}
+
+/// Read unconsumed interactive commands for one live agent effect. The rows
+/// remain pending until the caller has durably saved a machine snapshot that
+/// includes their ids.
+pub fn do_pending_turn_commands<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+    kind: whipplescript_kernel::harness_loop::TurnCommandKind,
+) -> StoreResult<Vec<whipplescript_kernel::harness_loop::PendingTurnCommand>> {
+    let kind = match kind {
+        whipplescript_kernel::harness_loop::TurnCommandKind::Steer => "steer",
+        whipplescript_kernel::harness_loop::TurnCommandKind::FollowUp => "follow_up",
+    };
+    let rows = sql
+        .query(
+            "SELECT command_id, text, images_json FROM public_turn_commands \
+             WHERE turn_command_id = ?1 AND kind = ?2 AND status = 'pending' \
+             ORDER BY position, created_at, command_id",
+            &[text(effect_id), text(kind)],
+        )
+        .map_err(sql_err)?;
+    rows.into_iter()
+        .map(|row| {
+            let images = serde_json::from_str(&as_text(&row[2]))
+                .map_err(|error| StoreError::Conflict(error.to_string()))?;
+            Ok(whipplescript_kernel::harness_loop::PendingTurnCommand {
+                command_id: as_text(&row[0]),
+                text: as_text(&row[1]),
+                images,
+            })
+        })
+        .collect()
+}
+
+/// Acknowledge commands only after the snapshot containing their ids is
+/// durable. Repeating this after a crash is harmless.
+pub fn do_mark_turn_commands_applied<Sql: DoSql>(
+    sql: &Sql,
+    effect_id: &str,
+    command_ids: &std::collections::BTreeSet<String>,
+) -> StoreResult<()> {
+    for command_id in command_ids {
+        sql.execute(
+            "UPDATE public_turn_commands SET status = 'applied', \
+             applied_at = CURRENT_TIMESTAMP WHERE turn_command_id = ?1 \
+             AND command_id = ?2 AND status = 'pending'",
+            &[text(effect_id), text(command_id)],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

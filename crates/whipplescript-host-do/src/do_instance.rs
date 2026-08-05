@@ -41,7 +41,7 @@ use whipplescript_kernel::exec_http::{
 use whipplescript_kernel::harness_loop::{
     compactor_for_strategy, provider_result_from_brokered_turn, BrokeredTurnInput,
     BrokeredTurnMachine, BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient,
-    ImageBlock, ToolExecutor, TurnStatus,
+    ImageBlock, PendingTurnCommand, ToolExecutor, TurnCommandKind, TurnCommandSource, TurnStatus,
 };
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
@@ -308,6 +308,18 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     pub system_prompt: &'a str,
     /// The immutable turn ceiling admitted with the authored package.
     pub max_steps: usize,
+}
+
+struct DoTurnCommandSource<Sql: DoSql> {
+    sql: Sql,
+    effect_id: String,
+}
+
+impl<Sql: DoSql> TurnCommandSource for DoTurnCommandSource<Sql> {
+    fn pending(&mut self, kind: TurnCommandKind) -> Result<Vec<PendingTurnCommand>, String> {
+        crate::do_store::do_pending_turn_commands(&self.sql, &self.effect_id, kind)
+            .map_err(|error| format!("{error:?}"))
+    }
 }
 
 fn discover_workspace_skills<Sql: DoSql>(
@@ -870,6 +882,18 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .find(|candidate| candidate.name == agent)
                     .and_then(|candidate| candidate.compaction.as_deref());
                 let compactor = compactor_for_strategy(compaction_strategy);
+                let cancel_store = DoSqliteStore::new(self.kernel.store().sql.clone());
+                let cancel_probe = || {
+                    cancel_store
+                        .effect_has_open_cancellation_request(self.instance_id, &effect.effect_id)
+                        // A broken durable cancellation read must not authorize
+                        // another paid/provider round. Fail closed as cancelled.
+                        .unwrap_or(true)
+                };
+                let mut command_source = DoTurnCommandSource {
+                    sql: self.kernel.store().sql.clone(),
+                    effect_id: effect.effect_id.clone(),
+                };
                 let mut machine = match loaded {
                     None => BrokeredTurnMachine::new(
                         model,
@@ -890,13 +914,24 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             snapshot,
                         )
                     }
-                };
+                }
+                .with_cancel_check(&cancel_probe)
+                .with_command_source(&mut command_source);
                 let step = machine.step(incoming.map(IoResult::Http));
+                // Snapshot before acknowledging any injected user command. If
+                // the object is evicted between these writes, restore sees the
+                // command id in the snapshot and will not inject it twice.
+                let snapshot = machine.snapshot();
+                let json = serde_json::to_string(&snapshot)
+                    .map_err(|error| StoreError::Conflict(error.to_string()))?;
+                do_save_agent_snapshot(&self.kernel.store().sql, &effect.effect_id, &json)?;
+                crate::do_store::do_mark_turn_commands_applied(
+                    &self.kernel.store().sql,
+                    &effect.effect_id,
+                    &snapshot.applied_command_ids,
+                )?;
                 match step {
                     Outcome::NeedsIo(IoRequest::Http(request)) => {
-                        let json = serde_json::to_string(&machine.snapshot())
-                            .map_err(|error| StoreError::Conflict(error.to_string()))?;
-                        do_save_agent_snapshot(&self.kernel.store().sql, &effect.effect_id, &json)?;
                         return Ok(EffectStep::NeedsHttp(request));
                     }
                     Outcome::Settle(outcome) => {
