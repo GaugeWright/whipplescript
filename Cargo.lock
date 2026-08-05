@@ -2149,6 +2149,7 @@ version = "0.4.1"
 dependencies = [
  "hex",
  "p256",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

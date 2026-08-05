@@ -32,6 +32,7 @@ use whipplescript_kernel::effect_handlers::glob_match;
 use whipplescript_kernel::harness_loop::{
     ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
+use whipplescript_kernel::host_package::workspace_tool_specs_from_registry;
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::RuntimeStore;
@@ -71,148 +72,13 @@ const DO_TRACKER_QUEUE: &str = "agent";
 /// so `list_todos` can distinguish agent- from rule-filed items.
 const DO_TRACKER_HOLDER: &str = "agent";
 
-/// The model-facing tools the DO agent turn advertises, with schemas mirroring
-/// the native set exactly. No profile filtering in v1 — the DO turn offers the
-/// full set admitted by the package.
+/// The complete model-facing tool set used only when a caller does not supply a
+/// package-derived ability ceiling. Workspace schemas come from the same kernel
+/// registry used by public and native package resolution.
 pub fn do_tool_specs() -> Vec<ToolSpec> {
-    let mut specs = file_tool_specs();
+    let mut specs = workspace_tool_specs_from_registry(true, true, true);
     specs.extend(tracker_tool_specs());
-    specs.push(ToolSpec {
-        name: TOOL_BASH.into(),
-        description: "Run governed virtual bash over the placement workspace.".into(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string" },
-                "timeout": { "type": "integer", "minimum": 1, "maximum": 30 }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        }),
-    });
     specs
-}
-
-fn file_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: TOOL_READ.into(),
-            description: "Read a file's text. Optional 1-based line offset and limit; a long \
-                          file is windowed with a continuation notice."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "workspace-relative path" },
-                    "offset": { "type": "integer", "description": "1-based first line" },
-                    "limit": { "type": "integer", "description": "max lines to return" }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_WRITE.into(),
-            description: "Create or overwrite a file with the given content.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_EDIT.into(),
-            description: "Exact string-replace edits in an existing file. Each oldText must \
-                          match a unique region of the current file."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "edits": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "oldText": { "type": "string" },
-                                "newText": { "type": "string" }
-                            },
-                            "required": ["oldText", "newText"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["path", "edits"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_GREP.into(),
-            description: "Search file contents for a regex (invalid patterns fall back to a \
-                          literal substring); returns path:line:text."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string", "description": "regex; an invalid regex is searched literally" },
-                    "path": { "type": "string", "description": "subdir to search, default root" },
-                    "ignoreCase": { "type": "boolean" },
-                    "context": { "type": "integer", "description": "lines of context before/after each match, default 0" },
-                    "limit": { "type": "integer" }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_FIND.into(),
-            description: "Find files whose workspace-relative path matches a glob pattern.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string", "description": "glob, e.g. **/*.rs" },
-                    "path": { "type": "string" },
-                    "limit": { "type": "integer" }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_LS.into(),
-            description: "List a directory's entries (directories marked with a trailing /)."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "default workspace root" },
-                    "limit": { "type": "integer" }
-                },
-                "additionalProperties": false
-            }),
-        },
-        ToolSpec {
-            name: TOOL_RECALL.into(),
-            description: "Read the full text of an earlier tool output that was truncated. \
-                          Pass the id from a truncation footer; optional 1-based line offset \
-                          and limit to page through a large output."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "content id from a truncation footer" },
-                    "offset": { "type": "integer", "description": "1-based first line" },
-                    "limit": { "type": "integer", "description": "max lines to return" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
-            }),
-        },
-    ]
 }
 
 /// The tracker tools (mirror native `tracker_tool_specs()` exactly).
@@ -350,19 +216,27 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// All `files` keys, sorted, capped at [`MAX_FILES_WALKED`].
     fn all_keys(&self) -> Result<Vec<String>, String> {
         let rows = if self.key_prefix.is_empty() {
-            self.sql.query("SELECT key FROM files ORDER BY key", &[])
+            self.sql.query(
+                "SELECT key FROM files ORDER BY key LIMIT ?1",
+                &[SqlValue::Int((MAX_FILES_WALKED + 1) as i64)],
+            )
         } else {
             self.sql.query(
-                "SELECT substr(key, length(?1) + 1) FROM files WHERE key LIKE ?1 || '%' ORDER BY key",
-                &[SqlValue::Text(self.key_prefix.clone())],
+                "SELECT substr(key, length(?1) + 1) FROM files \
+                 WHERE key LIKE ?1 || '%' ORDER BY key LIMIT ?2",
+                &[
+                    SqlValue::Text(self.key_prefix.clone()),
+                    SqlValue::Int((MAX_FILES_WALKED + 1) as i64),
+                ],
             )
         }
-            .map_err(|error| format!("list files failed: {error}"))?;
-        Ok(rows
-            .iter()
-            .take(MAX_FILES_WALKED)
-            .map(|row| as_text(&row[0]))
-            .collect())
+        .map_err(|error| format!("list files failed: {error}"))?;
+        if rows.len() > MAX_FILES_WALKED {
+            return Err(format!(
+                "workspace contains more than the supported {MAX_FILES_WALKED} files"
+            ));
+        }
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
     }
 
     fn bash(&self, args: &Value) -> Result<String, String> {
@@ -523,31 +397,42 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// List `files` keys under a prefix (flat-key `ls`): keys starting with the
     /// given path, or all keys when none is given. Sorted, capped.
     fn ls(&self, args: &Value) -> Result<String, String> {
-        let prefix = optional_str_arg(args, "path")
-            .filter(|path| !path.is_empty() && *path != ".")
-            .unwrap_or("");
+        let prefix = directory_prefix(optional_str_arg(args, "path"));
         let limit = usize_arg(args, "limit").unwrap_or(500);
-        let mut keys: Vec<String> = self
-            .all_keys()?
+        let mut entries = BTreeSet::new();
+        for key in self.all_keys()? {
+            let Some(relative) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if relative.is_empty() {
+                continue;
+            }
+            match relative.split_once('/') {
+                Some((directory, _)) => {
+                    entries.insert(format!("{directory}/"));
+                }
+                None => {
+                    entries.insert(relative.to_owned());
+                }
+            }
+        }
+        Ok(entries
             .into_iter()
-            .filter(|key| key.starts_with(prefix))
-            .collect();
-        keys.truncate(limit);
-        Ok(keys.join("\n"))
+            .take(limit)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// Find `files` keys matching a glob pattern (flat-key `find`): the classic
     /// `*`-wildcard match over the key, optionally prefix-filtered by `path`.
     fn find(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let prefix = optional_str_arg(args, "path")
-            .filter(|path| !path.is_empty() && *path != ".")
-            .unwrap_or("");
+        let prefix = directory_prefix(optional_str_arg(args, "path"));
         let limit = usize_arg(args, "limit").unwrap_or(1000);
         let mut hits: Vec<String> = self
             .all_keys()?
             .into_iter()
-            .filter(|key| key.starts_with(prefix) && glob_match(pattern, key))
+            .filter(|key| key.starts_with(&prefix) && glob_match(pattern, key))
             .collect();
         hits.truncate(limit);
         if hits.is_empty() {
@@ -559,36 +444,23 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     /// Search line contents across `files` rows (flat-key `grep`): emit
     /// `key:lineno:line` for matches (and `key-lineno-line` for context lines),
-    /// per-line char cap, match-count limit. The pattern is matched as a literal
-    /// substring (an invalid-regex fallback that also serves the common
-    /// paste-a-fragment case; the DO avoids a regex dependency in the isolate).
+    /// per-line char cap, match-count limit. A valid pattern is a regular
+    /// expression; an invalid pattern falls back to a literal substring so a
+    /// pasted code fragment remains searchable.
     fn grep(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let prefix = optional_str_arg(args, "path")
-            .filter(|path| !path.is_empty() && *path != ".")
-            .unwrap_or("");
+        let prefix = directory_prefix(optional_str_arg(args, "path"));
         let ignore_case = args
             .get("ignoreCase")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let limit = usize_arg(args, "limit").unwrap_or(100);
         let context = usize_arg(args, "context").unwrap_or(0);
-        let needle = if ignore_case {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
-        let is_match = |line: &str| -> bool {
-            if ignore_case {
-                line.to_lowercase().contains(&needle)
-            } else {
-                line.contains(&needle)
-            }
-        };
+        let matcher = GrepMatcher::new(pattern, ignore_case);
         let keys: Vec<String> = self
             .all_keys()?
             .into_iter()
-            .filter(|key| key.starts_with(prefix))
+            .filter(|key| key.starts_with(&prefix))
             .collect();
         let mut hits: Vec<String> = Vec::new();
         let mut matches_found = 0usize;
@@ -600,7 +472,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 continue;
             };
             let lines: Vec<&str> = content.lines().collect();
-            let matched: Vec<bool> = lines.iter().map(|line| is_match(line)).collect();
+            let matched: Vec<bool> = lines.iter().map(|line| matcher.is_match(line)).collect();
             // The match limit counts matches; context lines ride along free.
             // Overlapping context windows are merged (each line emitted once).
             let mut emit: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
@@ -775,10 +647,64 @@ fn optional_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+/// Convert an optional directory argument into an unambiguous flat-key prefix.
+/// The trailing slash prevents `references` from also selecting `references2`.
+fn directory_prefix(path: Option<&str>) -> String {
+    let path = path.unwrap_or(".").trim();
+    if path.is_empty() || path == "." {
+        String::new()
+    } else {
+        format!("{}/", path.trim_end_matches('/'))
+    }
+}
+
 fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
+}
+
+/// Native and DO grep share the same forgiving contract: compile a real regex
+/// when possible and treat invalid regex syntax as the literal text users often
+/// paste from source files.
+enum GrepMatcher {
+    Regex(regex::Regex),
+    Literal { needle: String, ignore_case: bool },
+}
+
+impl GrepMatcher {
+    fn new(pattern: &str, ignore_case: bool) -> Self {
+        match regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+        {
+            Ok(regex) => Self::Regex(regex),
+            Err(_) => Self::Literal {
+                needle: if ignore_case {
+                    pattern.to_lowercase()
+                } else {
+                    pattern.to_owned()
+                },
+                ignore_case,
+            },
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Regex(regex) => regex.is_match(line),
+            Self::Literal {
+                needle,
+                ignore_case,
+            } => {
+                if *ignore_case {
+                    line.to_lowercase().contains(needle)
+                } else {
+                    line.contains(needle)
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the `edits` argument with pi's tolerance: a real array, an array
@@ -943,6 +869,19 @@ mod tests {
     }
 
     #[test]
+    fn do_workspace_tool_schemas_are_the_kernel_registry_schemas() {
+        let expected = workspace_tool_specs_from_registry(true, true, true);
+        let actual = do_tool_specs();
+        for expected_tool in expected {
+            let actual_tool = actual
+                .iter()
+                .find(|tool| tool.name == expected_tool.name)
+                .expect("DO advertises every admitted workspace tool");
+            assert_eq!(actual_tool, &expected_tool);
+        }
+    }
+
+    #[test]
     fn write_then_read_round_trips() {
         let exec = executor();
         let out = exec.execute(&call(
@@ -1084,15 +1023,31 @@ mod tests {
     }
 
     #[test]
-    fn ls_lists_keys_under_a_prefix() {
+    fn ls_lists_immediate_entries_and_keeps_directory_prefixes_distinct() {
         let exec = executor();
-        for key in ["src/a.rs", "src/b.rs", "docs/c.md"] {
+        for key in ["src/a.rs", "src/nested/b.rs", "docs/c.md", "src2/d.rs"] {
             exec.execute(&call("write", json!({ "path": key, "content": "x" })));
         }
         let all = exec.execute(&call("ls", json!({})));
-        assert_eq!(all.content, "docs/c.md\nsrc/a.rs\nsrc/b.rs");
+        assert_eq!(all.content, "docs/\nsrc/\nsrc2/");
         let under_src = exec.execute(&call("ls", json!({ "path": "src/" })));
-        assert_eq!(under_src.content, "src/a.rs\nsrc/b.rs");
+        assert_eq!(under_src.content, "a.rs\nnested/");
+    }
+
+    #[test]
+    fn discovery_reports_the_workspace_walk_ceiling_instead_of_silently_omitting_files() {
+        let exec = executor();
+        for index in 0..=MAX_FILES_WALKED {
+            exec.sql
+                .execute(
+                    "INSERT INTO files (key, content) VALUES (?1, 'x')",
+                    &[SqlValue::Text(format!("file-{index:04}.md"))],
+                )
+                .expect("seed file");
+        }
+        let result = exec.execute(&call("find", json!({ "pattern": "*.md" })));
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(result.content.contains("supported 5000 files"));
     }
 
     #[test]
@@ -1124,6 +1079,109 @@ mod tests {
         assert_eq!(hits.content, "f.txt:2:two needle");
         let miss = exec.execute(&call("grep", json!({ "pattern": "absent" })));
         assert_eq!(miss.content, "No matches");
+    }
+
+    #[test]
+    fn grep_supports_regex_case_context_and_exact_directory_scope() {
+        let exec = executor();
+        for (path, content) in [
+            (
+                ".agents/skills/theory-a/references/core.md",
+                "before\nCoordination cost falls\nafter",
+            ),
+            (
+                ".agents/skills/theory-a/references2/noise.md",
+                "COORDINATION cost rises",
+            ),
+        ] {
+            exec.execute(&call("write", json!({ "path": path, "content": content })));
+        }
+        let hits = exec.execute(&call(
+            "grep",
+            json!({
+                "pattern": "coordination\\s+cost (falls|drops)",
+                "path": ".agents/skills/theory-a/references",
+                "ignoreCase": true,
+                "context": 1,
+                "limit": 1
+            }),
+        ));
+        assert_eq!(hits.status, ToolStatus::Ok);
+        assert!(hits.content.contains("core.md:2:Coordination cost falls"));
+        assert!(hits.content.contains("core.md-1-before"));
+        assert!(hits.content.contains("core.md-3-after"));
+        assert!(!hits.content.contains("references2"));
+    }
+
+    #[test]
+    fn invalid_grep_regex_falls_back_to_literal_text() {
+        let exec = executor();
+        exec.execute(&call(
+            "write",
+            json!({ "path": "code.md", "content": "Use value[0] exactly." }),
+        ));
+        let hits = exec.execute(&call("grep", json!({ "pattern": "value[0" })));
+        assert_eq!(hits.status, ToolStatus::Ok);
+        assert_eq!(hits.content, "code.md:1:Use value[0] exactly.");
+    }
+
+    #[test]
+    fn read_only_panel_can_discover_and_read_a_progressively_disclosed_skill() {
+        let exec = executor();
+        for (path, content) in [
+            (
+                ".agents/skills/theory-a/SKILL.md",
+                "---\nname: theory-a\ndescription: Explain AI-native operating models.\n---\nRead the relevant reference before answering.",
+            ),
+            (
+                ".agents/skills/theory-a/references/governance.md",
+                "# Governance\nDecision rights move toward the best available information.",
+            ),
+            (
+                ".agents/skills/theory-a/references/operating-model.md",
+                "# Operating model\nCoordination becomes a designed information flow.",
+            ),
+        ] {
+            exec.execute(&call(
+                "write",
+                json!({ "path": path, "content": content }),
+            ));
+        }
+
+        let read_only_names = workspace_tool_specs_from_registry(true, false, false)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(read_only_names, ["read", "grep", "find", "ls", "recall"]);
+
+        let references = exec.execute(&call(
+            "find",
+            json!({
+                "path": ".agents/skills/theory-a/references",
+                "pattern": "**/*.md"
+            }),
+        ));
+        assert!(references.content.contains("governance.md"));
+        assert!(references.content.contains("operating-model.md"));
+
+        let match_ = exec.execute(&call(
+            "grep",
+            json!({
+                "path": ".agents/skills/theory-a/references",
+                "pattern": "decision rights",
+                "ignoreCase": true
+            }),
+        ));
+        assert!(match_.content.contains("governance.md:2:"));
+
+        let reference = exec.execute(&call(
+            "read",
+            json!({ "path": ".agents/skills/theory-a/references/governance.md" }),
+        ));
+        assert_eq!(
+            reference.content,
+            "# Governance\nDecision rights move toward the best available information."
+        );
     }
 
     #[test]

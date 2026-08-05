@@ -785,9 +785,9 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 let turn_input = BrokeredTurnInput {
                     system: assembled.system_prompt,
                     user: prompt,
-                    // P4: the DO agent turn advertises the in-isolate tool set
-                    // (read/write/edit/ls/find/grep/recall + the tracker todos),
-                    // brokered by the `DoToolExecutor` over the DO file plane.
+                    // The package-derived ability ceiling selects the exact
+                    // in-isolate workspace tools advertised for this turn;
+                    // `DoToolExecutor` brokers them over the DO file plane.
                     tools,
                     max_steps: self.max_steps,
                     resume_from,
@@ -2257,7 +2257,11 @@ mod tests {
         let model = CapturingModel {
             systems: RefCell::new(Vec::new()),
         };
-        let tool_specs = crate::do_tools::do_tool_specs();
+        // Match a public read-workspace panel such as Theo: skill discovery must
+        // not depend on write, tracker, or command authority.
+        let tool_specs = whipplescript_kernel::host_package::workspace_tool_specs_from_registry(
+            true, false, false,
+        );
         let driver = DoInstanceDriver {
             kernel,
             files: &NoFiles,

@@ -396,10 +396,11 @@ pub fn workspace_tool_specs_from_registry(
     let mut tools = Vec::new();
     if readable {
         tools.extend([
-            tool_spec("read", "Read a workspace text file.", json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"],"additionalProperties":false})),
-            tool_spec("grep", "Search text in workspace files.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false})),
-            tool_spec("find", "Find workspace paths by wildcard pattern.", json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"],"additionalProperties":false})),
-            tool_spec("ls", "List a workspace directory.", json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false})),
+            tool_spec("read", "Read a file's text. Optional 1-based line offset and limit; a long file is windowed with a continuation notice.", json!({"type":"object","properties":{"path":{"type":"string","description":"workspace-relative path"},"offset":{"type":"integer","minimum":1,"description":"1-based first line"},"limit":{"type":"integer","minimum":1,"description":"max lines to return"}},"required":["path"],"additionalProperties":false})),
+            tool_spec("grep", "Search file contents for a regex; invalid patterns fall back to a literal substring. Returns path:line:text.", json!({"type":"object","properties":{"pattern":{"type":"string","description":"regular expression; invalid regex is searched literally"},"path":{"type":"string","description":"directory to search, default workspace root"},"ignoreCase":{"type":"boolean"},"context":{"type":"integer","minimum":0,"description":"lines before and after each match, default 0"},"limit":{"type":"integer","minimum":1,"description":"maximum matches, default 100"}},"required":["pattern"],"additionalProperties":false})),
+            tool_spec("find", "Find files whose workspace-relative path matches a glob pattern.", json!({"type":"object","properties":{"pattern":{"type":"string","description":"glob, for example **/*.md"},"path":{"type":"string","description":"directory to search, default workspace root"},"limit":{"type":"integer","minimum":1,"description":"maximum paths, default 1000"}},"required":["pattern"],"additionalProperties":false})),
+            tool_spec("ls", "List one directory's immediate entries; directories have a trailing slash.", json!({"type":"object","properties":{"path":{"type":"string","description":"directory, default workspace root"},"limit":{"type":"integer","minimum":1,"description":"maximum entries, default 500"}},"additionalProperties":false})),
+            tool_spec("recall", "Read the full text of an earlier tool output that was truncated. Pass the id from its truncation notice; optional 1-based line offset and limit page through it.", json!({"type":"object","properties":{"id":{"type":"string","description":"content id from a truncation notice"},"offset":{"type":"integer","minimum":1,"description":"1-based first line"},"limit":{"type":"integer","minimum":1,"description":"max lines to return"}},"required":["id"],"additionalProperties":false})),
         ]);
     }
     if writable {
@@ -412,7 +413,7 @@ pub fn workspace_tool_specs_from_registry(
         tools.push(tool_spec(
             "bash",
             "Run governed virtual bash over the placement workspace.",
-            json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1}},"required":["command"],"additionalProperties":false}),
+            json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":30,"description":"seconds, default 30"}},"required":["command"],"additionalProperties":false}),
         ));
     }
     tools
@@ -506,7 +507,25 @@ workflow Chat {
                 .expect("package");
         let resolved = package.resolve(package.version_ref()).expect("resolved");
         assert_eq!(package.agent_abilities(), ["workspace.read"]);
-        assert!(resolved.tools.iter().any(|tool| tool.name == "read"));
+        assert_eq!(
+            resolved
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "grep", "find", "ls", "recall"]
+        );
+        let grep = resolved
+            .tools
+            .iter()
+            .find(|tool| tool.name == "grep")
+            .expect("grep is readable");
+        let grep_properties = grep.input_schema["properties"]
+            .as_object()
+            .expect("grep properties");
+        for option in ["pattern", "path", "ignoreCase", "context", "limit"] {
+            assert!(grep_properties.contains_key(option), "missing {option}");
+        }
         assert!(!resolved.tools.iter().any(|tool| tool.name == "write"));
         assert!(!resolved.tools.iter().any(|tool| tool.name == "bash"));
         assert_eq!(resolved.capabilities, ["workspace.read"]);

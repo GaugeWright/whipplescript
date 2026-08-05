@@ -87,9 +87,10 @@ operate exactly as they operate with a delegating family.
 
 The current scope is **experimental**:
 
-- The tools are `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash`. The
-  first six tools execute through the path policy of the `file store`. A path
-  that is absolute or that uses `..` cannot leave the store.
+- The tools are `read`, `write`, `edit`, `grep`, `find`, `ls`, `recall`, and
+  `bash`. The workspace tools execute through the path policy of the file store.
+  `recall` pages a content-addressed result when another tool's output was
+  truncated. A path that is absolute or that uses `..` cannot leave the store.
 
   The file tools are **deny by default**. The harness offers a file tool only
   when the turn carries the applicable grants of a file store. The `edit` tool
