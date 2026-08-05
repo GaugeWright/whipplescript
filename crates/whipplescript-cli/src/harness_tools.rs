@@ -2492,10 +2492,10 @@ const OWNED_GUIDELINES: &[&str] = &[
     "When finished, reply with a short summary and make no further tool calls.",
 ];
 
-/// The owned-harness system-prompt bundles in pi's order: persona, one-line tool
-/// snippets, guidelines, current date, current working directory. Project-context
-/// and available-skills slots are populated in later tracker phases. The host
-/// supplies `date`/`cwd` (kept out of the pure kernel assembler).
+/// The owned-harness system-prompt bundles: persona, guidelines, current date,
+/// and current working directory. Provider-native tool definitions are the only
+/// capability description; project-context and available-skills slots are
+/// populated separately. The host supplies `date`/`cwd`.
 use whipplescript_kernel::context_assembly::{render_available_skills, SkillCatalogueEntry};
 
 /// Whether the turn has a read-class tool the model can use to load a skill body.
@@ -2518,23 +2518,6 @@ fn owned_context_bundles(
         "v1",
         OWNED_PERSONA,
     )];
-
-    if !tools.is_empty() {
-        let mut body = String::from("Available tools:\n");
-        for tool in tools {
-            body.push_str(&format!(
-                "- {}: {}\n",
-                tool.name,
-                first_line(&tool.description)
-            ));
-        }
-        bundles.push(ContextBundle::new(
-            BundleKind::Tools,
-            "builtin:tools",
-            "v1",
-            body.trim_end(),
-        ));
-    }
 
     // Which third-party MCP servers this turn can reach, and how much anyone has
     // vouched for them. Recorded as `context.bundle` evidence (Decision 5), so
@@ -2609,15 +2592,6 @@ fn owned_context_bundles(
     }
 
     bundles
-}
-
-/// The first non-empty line of a tool description, for the one-line prompt snippet.
-fn first_line(description: &str) -> &str {
-    description
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
 }
 
 /// The current UTC date as `YYYY-MM-DD` for the date bundle. Date-only (not
@@ -3888,9 +3862,10 @@ pub fn run_owned_agent_turn(
         &workspace,
         global_context_dir.as_deref(),
     );
-    // Assemble the system prompt from provenance-tagged bundles (mirror pi):
-    // persona, tool snippets, guidelines, project context, available skills, date,
-    // cwd. The host supplies date/cwd + the skill catalogue + project instructions;
+    // Assemble the system prompt from provenance-tagged bundles: persona,
+    // guidelines, project context, available skills, date, and cwd. Tools remain
+    // solely in the provider-native tool field. The host supplies date/cwd plus
+    // the skill catalogue and project instructions;
     // the kernel assembler renders them in canonical order (context-assembly
     // Phase 1). Per-bundle provenance (`assembled.bundles`) is recorded as
     // `context.bundle` evidence by `run_brokered_agent_turn` (Decision 5).
@@ -4248,7 +4223,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_context_prompt_mirrors_pi_shape_and_keeps_authority_contract() {
+    fn owned_context_prompt_keeps_authority_without_repeating_tool_definitions() {
         let tools = vec![ToolSpec {
             name: "read".into(),
             description: "Read a file from the workspace.".into(),
@@ -4267,30 +4242,27 @@ mod tests {
         // Persona + guidelines carry the turn-scoped authority + termination contract.
         assert!(prompt.contains("authority granted for this turn"));
         assert!(prompt.contains("make no further tool calls"));
-        // pi-shape: the tool list is enumerated in prose (one line per tool).
-        assert!(prompt.contains("Available tools:"));
-        assert!(prompt.contains("- read: Read a file from the workspace."));
+        // Tool capability is sent only through the provider-native tool field.
+        assert!(!prompt.contains("Available tools:"));
+        assert!(!prompt.contains("- read: Read a file from the workspace."));
         // Date + cwd bundles are present.
         assert!(prompt.contains("Current date: 2026-07-04"));
         assert!(prompt.contains("Current working directory: /repo"));
-        // Canonical order: persona/tools/guidelines before date before cwd.
+        // Canonical order: persona/guidelines before date before cwd.
         let persona_at = prompt
             .find("expert coding assistant")
             .expect("persona marker present");
-        let tools_at = prompt
-            .find("Available tools:")
-            .expect("tools marker present");
         let date_at = prompt.find("Current date:").expect("date marker present");
         let cwd_at = prompt
             .find("Current working directory:")
             .expect("cwd marker present");
-        assert!(persona_at < tools_at && tools_at < date_at && date_at < cwd_at);
-        // One provenance row per included bundle (persona, tools, guidelines, date, cwd).
-        assert_eq!(assembled.bundles.len(), 5);
+        assert!(persona_at < date_at && date_at < cwd_at);
+        // One provenance row per included bundle (persona, guidelines, date, cwd).
+        assert_eq!(assembled.bundles.len(), 4);
     }
 
     #[test]
-    fn owned_context_prompt_omits_tool_list_when_no_tools_offered() {
+    fn owned_context_prompt_is_independent_of_the_offered_tool_set() {
         let assembled = assemble(owned_context_bundles(
             &[],
             "2026-07-04",
@@ -4300,7 +4272,7 @@ mod tests {
             &[],
         ));
         assert!(!assembled.system_prompt.contains("Available tools:"));
-        // persona, guidelines, date, cwd -- no tools bundle.
+        // Persona, guidelines, date, and cwd are independent of tool authority.
         assert_eq!(assembled.bundles.len(), 4);
     }
 

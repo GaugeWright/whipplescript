@@ -1,14 +1,14 @@
 //! Owned-harness context assembly (context-assembly-tracker Phase 1). The owned
 //! brokered harness used to ship a single hardcoded system-prompt constant; this
 //! module composes the system prompt from an ordered list of provenance-tagged
-//! bundles, mirroring pi's recipe (persona, tool snippets, guidelines, doc
-//! pointers, project context, available skills, date, cwd).
+//! bundles (persona, guidelines, doc pointers, project context, available
+//! skills, date, cwd). Tool definitions stay in the provider-native tool field
+//! and are not duplicated into the system prompt.
 //!
 //! The assembler is pure and host-agnostic: the host (native CLI or the durable
 //! object) supplies each bundle's rendered body -- the persona/guidelines text,
-//! the one-line tool snippets, the date/cwd strings, and later the project-context
-//! files and skills catalogue. This keeps the seam DO-portable (no filesystem or
-//! clock in the kernel) per DR-0033.
+//! date/cwd strings, project-context files, and skills catalogue. This keeps the
+//! seam DO-portable (no filesystem or clock in the kernel) per DR-0033.
 //!
 //! Two invariants from the Phase 0 models are honoured here:
 //! - catalogue/prompt determinism: bundles render in a fixed slot order
@@ -53,7 +53,6 @@ pub fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum BundleKind {
     Persona,
-    Tools,
     Guidelines,
     DocPointers,
     ProjectContext,
@@ -67,7 +66,6 @@ impl BundleKind {
     pub fn tag(self) -> &'static str {
         match self {
             BundleKind::Persona => "persona",
-            BundleKind::Tools => "tools",
             BundleKind::Guidelines => "guidelines",
             BundleKind::DocPointers => "doc_pointers",
             BundleKind::ProjectContext => "project_context",
@@ -191,7 +189,7 @@ mod tests {
     fn renders_bundles_in_canonical_slot_order_regardless_of_insertion() {
         let forward = assemble(vec![
             bundle(BundleKind::Persona, "PERSONA"),
-            bundle(BundleKind::Tools, "TOOLS"),
+            bundle(BundleKind::Guidelines, "GUIDELINES"),
             bundle(BundleKind::Date, "DATE"),
             bundle(BundleKind::Cwd, "CWD"),
         ]);
@@ -199,11 +197,14 @@ mod tests {
         let scrambled = assemble(vec![
             bundle(BundleKind::Cwd, "CWD"),
             bundle(BundleKind::Date, "DATE"),
-            bundle(BundleKind::Tools, "TOOLS"),
+            bundle(BundleKind::Guidelines, "GUIDELINES"),
             bundle(BundleKind::Persona, "PERSONA"),
         ]);
         assert_eq!(forward.system_prompt, scrambled.system_prompt);
-        assert_eq!(forward.system_prompt, "PERSONA\n\nTOOLS\n\nDATE\n\nCWD");
+        assert_eq!(
+            forward.system_prompt,
+            "PERSONA\n\nGUIDELINES\n\nDATE\n\nCWD"
+        );
         assert_eq!(forward.bundles, scrambled.bundles);
     }
 
@@ -231,11 +232,11 @@ mod tests {
     fn every_included_bundle_gets_a_provenance_row_with_a_content_hash() {
         let out = assemble(vec![
             bundle(BundleKind::Persona, "PERSONA"),
-            bundle(BundleKind::Tools, "TOOLS"),
+            bundle(BundleKind::Guidelines, "GUIDELINES"),
         ]);
         assert_eq!(out.bundles.len(), 2);
         assert_eq!(out.bundles[0].content_hash, stable_hash_hex("PERSONA"));
-        assert_eq!(out.bundles[1].content_hash, stable_hash_hex("TOOLS"));
+        assert_eq!(out.bundles[1].content_hash, stable_hash_hex("GUIDELINES"));
         assert_ne!(out.bundles[0].content_hash, out.bundles[1].content_hash);
     }
 
