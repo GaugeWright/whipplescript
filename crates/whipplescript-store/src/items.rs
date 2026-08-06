@@ -218,6 +218,7 @@ impl WorkItemStore {
             }
         }
         let connection = Connection::open(path)?;
+        crate::establish_wal(&connection)?;
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an
@@ -1302,8 +1303,6 @@ impl WorkItemStore {
 /// stay keyed by it (clone-local), the event log by the opaque `content_id`.
 #[cfg(feature = "native")]
 const TRACKER_SCHEMA_SQL: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS tracker_events (
     event_seq INTEGER PRIMARY KEY AUTOINCREMENT,

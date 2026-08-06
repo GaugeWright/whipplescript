@@ -131,13 +131,8 @@ impl WorkstreamStore {
             }
         }
         let connection = Connection::open(path)?;
-        connection.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 5000;
-            PRAGMA foreign_keys = ON;
-            "#,
-        )?;
+        crate::establish_wal(&connection)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         ensure_workstream_schema(&connection)?;
         Ok(Self { connection })
     }

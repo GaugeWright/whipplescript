@@ -102,16 +102,11 @@ impl CoordinationStore {
             }
         }
         let connection = Connection::open(path)?;
-        // Install the lock wait before the first schema-affecting PRAGMA. On a
-        // fresh shared store, concurrent workers can otherwise race while
-        // enabling WAL and fail immediately with SQLITE_BUSY.
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            "#,
-        )?;
+        // Several workers open one shared coordination store, and the first of
+        // them to arrive at a fresh file has to establish WAL against the
+        // others. `establish_wal` is what survives that race.
+        crate::establish_wal(&connection)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         ensure_partitioned_schema(&connection)?;
         Ok(Self { connection })
     }
@@ -1306,6 +1301,16 @@ mod tests {
         }
     }
 
+    /// Every worker that opens one *fresh* shared store at once must come back
+    /// with a usable store. The first open of a file is the only moment the
+    /// journal mode is converted, and that conversion takes a brief exclusive
+    /// lock that `busy_timeout` does not cover — so this is where a contended
+    /// open used to fail outright with SQLITE_BUSY.
+    ///
+    /// Asserting the resulting journal mode is the point, not decoration: an
+    /// open that "succeeded" without establishing WAL would leave the store in
+    /// rollback-journal mode, where a writer excludes readers, and every
+    /// concurrency property the coordination store claims rests on WAL.
     #[test]
     fn concurrent_first_open_initializes_schema_idempotently() {
         let dir = TempStoreDir::new("concurrent-first-open");
@@ -1318,17 +1323,26 @@ mod tests {
                     let barrier = std::sync::Arc::clone(&barrier);
                     scope.spawn(move || {
                         barrier.wait();
-                        CoordinationStore::open(path)
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:?}"))
+                        let store =
+                            CoordinationStore::open(path).map_err(|error| format!("{error:?}"))?;
+                        let mode: String = store
+                            .connection
+                            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                            .map_err(|error| format!("{error:?}"))?;
+                        Ok::<_, String>(mode)
                     })
                 })
                 .collect::<Vec<_>>();
             for handle in handles {
-                handle
+                let mode = handle
                     .join()
                     .expect("schema opener thread")
                     .expect("concurrent schema open");
+                assert_eq!(
+                    mode.to_ascii_lowercase(),
+                    "wal",
+                    "a contended first open must still leave the store in WAL",
+                );
             }
         });
     }

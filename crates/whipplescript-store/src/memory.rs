@@ -180,10 +180,10 @@ impl SqliteMemoryStore {
     }
 
     fn bootstrap(connection: Connection) -> StoreResult<Self> {
+        crate::establish_wal(&connection)?;
         connection
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 CREATE TABLE IF NOT EXISTS memory_entries (
+                "CREATE TABLE IF NOT EXISTS memory_entries (
                    memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    pool TEXT NOT NULL,
                    text TEXT NOT NULL,

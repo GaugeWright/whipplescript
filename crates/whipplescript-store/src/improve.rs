@@ -158,10 +158,10 @@ impl ImproveStore {
     }
 
     fn bootstrap(connection: Connection) -> StoreResult<Self> {
+        crate::establish_wal(&connection)?;
         connection
             .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 CREATE TABLE IF NOT EXISTS evidence_rows (
+                "CREATE TABLE IF NOT EXISTS evidence_rows (
                    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
                    gauge TEXT NOT NULL,
                    score REAL NOT NULL,

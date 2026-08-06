@@ -1101,7 +1101,7 @@ impl SqliteStore {
         // write wait briefly instead of failing with SQLITE_BUSY. The durable
         // lease + per-row idempotency machinery is what makes the concurrent
         // execution itself safe (see models/tla AtMostOneRunExecutingEffect).
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        establish_wal(&connection)?;
         apply_migrations(&mut connection)?;
         if path.to_string_lossy() != ":memory:" {
             harden_store_file_permissions(path)?;
@@ -1113,7 +1113,7 @@ impl SqliteStore {
         let mut connection = Connection::open_in_memory()?;
         // WAL does not apply to an in-memory database; busy_timeout is harmless
         // and keeps behavior uniform with the file-backed store.
-        connection.execute_batch("PRAGMA busy_timeout=5000;")?;
+        connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         apply_migrations(&mut connection)?;
         Ok(Self { connection })
     }
@@ -6725,6 +6725,91 @@ impl RuntimeStore for SqliteStore {
     fn table_exists(&self, table: &str) -> StoreResult<bool> {
         self.table_exists(table)
     }
+}
+
+/// How long a contended write waits before it gives up with `SQLITE_BUSY`.
+/// Every store in this crate shares the value so one contended path cannot
+/// wait a different amount from another for no stated reason.
+#[cfg(feature = "native")]
+pub(crate) const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Put a freshly opened connection into the mode every store in this crate
+/// expects: a lock wait installed, and WAL established.
+///
+/// `busy_timeout` does not cover the WAL conversion. Switching a database out
+/// of `delete` journal mode needs a brief exclusive lock, and SQLite does not
+/// run the busy handler for that conversion — it returns `SQLITE_BUSY` at
+/// once. So N workers opening one *fresh* store concurrently would each set
+/// their timeout, race for the conversion, and all but one would fail
+/// immediately no matter how long the timeout was. Only the first open of a
+/// given file can hit this: once the database is in WAL the conversion is a
+/// no-op that takes no exclusive lock.
+///
+/// A `SQLITE_BUSY` here therefore does not mean "cannot proceed", it means
+/// "someone else is converting". Re-read the mode: if the winner has landed,
+/// this connection wants exactly what it already has. Otherwise back off and
+/// look again, and surface the real error if the contention never clears —
+/// never open a store whose journal mode was not established.
+///
+/// An in-memory database reports `memory` and cannot be converted; that is a
+/// success, not a failure to establish WAL.
+#[cfg(feature = "native")]
+pub(crate) fn establish_wal(connection: &Connection) -> StoreResult<()> {
+    const ATTEMPTS: u32 = 50;
+
+    connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
+
+    let established = |mode: &str| -> bool {
+        let mode = mode.to_ascii_lowercase();
+        mode == "wal" || mode == "memory"
+    };
+    let current: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if established(&current) {
+        return Ok(());
+    }
+
+    for attempt in 0..ATTEMPTS {
+        // `PRAGMA journal_mode = WAL` reports the resulting mode as a row, so
+        // it is a query rather than a statement to execute and discard.
+        let outcome = connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        });
+        match outcome {
+            Ok(mode) if established(&mode) => return Ok(()),
+            // The conversion reported some other mode: it did not take, and no
+            // error explains why. Treat it like contention and look again.
+            Ok(_) => {}
+            Err(error) if is_busy(&error) => {}
+            Err(error) => return Err(StoreError::from(error)),
+        }
+
+        let settled: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if established(&settled) {
+            return Ok(());
+        }
+        if attempt + 1 == ATTEMPTS {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    Err(StoreError::Conflict(format!(
+        "could not establish WAL journal mode after {ATTEMPTS} attempts: the database stayed locked by another connection",
+    )))
+}
+
+#[cfg(feature = "native")]
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
 }
 
 #[cfg(feature = "native")]
