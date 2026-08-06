@@ -14,6 +14,7 @@ use whipplescript_store::{
 #[test]
 fn checks_all_example_workflows() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let examples = [
         "minimal-noop.whip",
         "ralph.whip",
@@ -54,7 +55,7 @@ fn checks_all_example_workflows() {
         .collect::<Vec<_>>();
     args.extend(path_strings);
 
-    let output = run_text(bin, &args);
+    let output = run_text_isolated(bin, &stores, &args);
 
     for example in examples {
         assert!(output.contains(example), "{output}");
@@ -69,8 +70,13 @@ fn checks_all_example_workflows() {
 #[test]
 fn agents_command_lists_declared_agents() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let example = example_path("clock-source.whip");
-    let report = run_json(bin, &["--json", "agents", example.to_str().expect("utf-8")]);
+    let report = run_json_isolated(
+        bin,
+        &stores,
+        &["--json", "agents", example.to_str().expect("utf-8")],
+    );
     let agents = report
         .get("agents")
         .and_then(Value::as_array)
@@ -95,9 +101,11 @@ fn agents_command_lists_declared_agents() {
 #[test]
 fn providers_command_aggregates_all_providers() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let example = example_path("clock-source.whip");
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &stores,
         &["--json", "providers", example.to_str().expect("utf-8")],
     );
     let providers = report
@@ -127,8 +135,13 @@ fn providers_command_aggregates_all_providers() {
 #[test]
 fn skills_command_lists_declared_skills() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let example = example_path("revision-ticket-v1.whip");
-    let report = run_json(bin, &["--json", "skills", example.to_str().expect("utf-8")]);
+    let report = run_json_isolated(
+        bin,
+        &stores,
+        &["--json", "skills", example.to_str().expect("utf-8")],
+    );
     let skills = report
         .get("skills")
         .and_then(Value::as_array)
@@ -157,8 +170,9 @@ fn action_expanded_chain_runs_end_to_end() {
     let store = temp_store_path();
     let example = example_path("reusable-action-chain.whip");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store,
         &[
             "--store",
             store.to_str().expect("utf-8 store path"),
@@ -176,8 +190,9 @@ fn action_expanded_chain_runs_end_to_end() {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store,
         &[
             "--store",
             store.to_str().expect("utf-8 store path"),
@@ -202,8 +217,9 @@ fn action_expanded_chain_runs_end_to_end() {
         "inlined `done` consumed the input: {fact_names:?}"
     );
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store,
         &[
             "--store",
             store.to_str().expect("utf-8 store path"),
@@ -226,10 +242,12 @@ fn action_expanded_chain_runs_end_to_end() {
 #[test]
 fn check_json_reports_source_metadata() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &stores,
         &[
             "--json",
             "check",
@@ -286,10 +304,12 @@ fn check_json_reports_source_metadata() {
 #[test]
 fn compile_json_reports_source_metadata() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &stores,
         &[
             "--json",
             "compile",
@@ -347,8 +367,9 @@ table tasks as Task [
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -365,8 +386,9 @@ table tasks as Task [
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -448,8 +470,9 @@ rule pick
     .expect("write source");
 
     let store = store_path.to_str().expect("utf-8 temp path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -468,14 +491,22 @@ rule pick
         .expect("instance id")
         .to_owned();
 
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("completed"),
         "file.read drives the workflow to completion: {status}"
     );
 
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", &instance_id],
+    );
     let read_fact = facts
         .as_array()
         .expect("facts")
@@ -555,8 +586,9 @@ rule record_line
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -577,7 +609,11 @@ rule record_line
 
     // One `ingress.fed` signal fact per line, carrying that line's text.
     let fed_texts = |instance: &str| -> Vec<String> {
-        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let facts = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "facts", instance],
+        );
         let mut rows: Vec<(i64, String)> = facts
             .as_array()
             .expect("facts array")
@@ -608,7 +644,11 @@ rule record_line
 
     // The rule reacted to each admitted signal (one `FedLine` per line).
     let fed_line_count = |instance: &str| -> usize {
-        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let facts = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "facts", instance],
+        );
         facts
             .as_array()
             .expect("facts array")
@@ -626,8 +666,9 @@ rule record_line
     // file re-admits nothing. Without the (source, line ordinal) cursor this
     // re-attempt would hit the event log's UNIQUE(idempotency_key) constraint or
     // double the facts; instead the count is unchanged.
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -760,8 +801,9 @@ rule record_item
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json_with_env(
+    let dev = run_json_with_env_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -783,7 +825,11 @@ rule record_item
 
     // One `ingress.ingested` signal fact per array element, in feed order.
     let ingested_texts = |instance: &str| -> Vec<String> {
-        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let facts = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "facts", instance],
+        );
         let mut rows: Vec<(i64, String)> = facts
             .as_array()
             .expect("facts array")
@@ -814,7 +860,11 @@ rule record_item
 
     // The rule reacted to each admitted signal (one `IngestedItem` per element).
     let ingested_item_count = |instance: &str| -> usize {
-        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let facts = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "facts", instance],
+        );
         facts
             .as_array()
             .expect("facts array")
@@ -832,8 +882,9 @@ rule record_item
     // *same* feed and re-admits nothing. Without the (source, element ordinal)
     // cursor this re-attempt would hit the event log's UNIQUE(idempotency_key)
     // constraint or double the facts; instead the count is unchanged.
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -913,8 +964,9 @@ rule record_item
     let dead_program = dead_source.to_str().expect("utf-8 dead source");
     // `dev --until idle` completes (run_json asserts exit 0) despite the dead
     // endpoint; nothing is admitted.
-    let dead_dev = run_json(
+    let dead_dev = run_json_isolated(
         bin,
+        &dead_store,
         &[
             "--store",
             dead_store_str,
@@ -931,8 +983,9 @@ rule record_item
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("dead instance id");
-    let dead_facts = run_json(
+    let dead_facts = run_json_isolated(
         bin,
+        &dead_store,
         &["--store", dead_store_str, "--json", "facts", dead_instance],
     );
     let dead_ingested = dead_facts
@@ -1007,8 +1060,9 @@ rule record_drop
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1028,7 +1082,11 @@ rule record_drop
         .to_owned();
 
     let drop_facts = |instance: &str| -> Vec<(String, String)> {
-        let facts = run_json(bin, &["--store", store, "--json", "facts", instance]);
+        let facts = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "facts", instance],
+        );
         facts
             .as_array()
             .expect("facts array")
@@ -1054,8 +1112,9 @@ rule record_drop
     assert!(first[0].0.ends_with("a.json"), "{first:?}");
 
     // Unchanged content: a later worker pass re-admits nothing.
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1077,8 +1136,9 @@ rule record_drop
 
     // A content change is a NEW (path, content-hash) occurrence: it re-admits.
     fs::write(root.join("a.json"), r#"{"n":2}"#).expect("change drop");
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1147,8 +1207,9 @@ rule record_deploy
 
     let store = store_path.to_str().expect("utf-8 store path");
     let program = source_path.to_str().expect("utf-8 source path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1175,7 +1236,7 @@ rule record_deploy
         json!({"instance": instance_id, "signal": "deploy.finished", "payload": {"service": "api", "status": "ok"}, "delivery_id": "dl-1"}),
         json!({"instance": instance_id, "signal": "deploy.unknown", "payload": {}}),
     );
-    let mut serve = Command::new(bin)
+    let mut serve = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -1238,11 +1299,16 @@ rule record_deploy
 
     // The one admitted signal fires the reacting rule on the next pass; the
     // duplicate and the rejected lines left no facts behind.
-    run_text(
+    run_text_isolated(
         bin,
+        &store_path,
         &["--store", store, "step", &instance_id, "--program", program],
     );
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", &instance_id],
+    );
     let count = |name: &str| -> usize {
         facts
             .as_array()
@@ -1306,8 +1372,9 @@ rule record_deploy
     let committed_path = committed.to_str().expect("utf-8 path");
     let tampered_path = tampered.to_str().expect("utf-8 path");
 
-    let run = run_json(
+    let run = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1325,7 +1392,7 @@ rule record_deploy
         .to_owned();
 
     // The tampered program is refused before any admission.
-    let refused = Command::new(bin)
+    let refused = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -1351,7 +1418,7 @@ rule record_deploy
     );
 
     // The genuine committed program still admits.
-    let admitted = Command::new(bin)
+    let admitted = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -1428,8 +1495,9 @@ rule pick
     )
     .expect("write create source");
     let store = create_store.to_str().expect("utf-8 temp path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &create_store,
         &[
             "--store",
             store,
@@ -1447,7 +1515,11 @@ rule pick
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &create_store,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("completed"),
@@ -1506,8 +1578,9 @@ rule pick
     )
     .expect("write mode source");
     let mv_store_str = mv_store.to_str().expect("utf-8 temp path");
-    let mv_dev = run_json(
+    let mv_dev = run_json_isolated(
         bin,
+        &mv_store,
         &[
             "--store",
             mv_store_str,
@@ -1525,8 +1598,9 @@ rule pick
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let mv_status = run_json(
+    let mv_status = run_json_isolated(
         bin,
+        &mv_store,
         &["--store", mv_store_str, "--json", "status", &mv_instance],
     );
     assert_eq!(
@@ -1607,8 +1681,9 @@ rule pick
             ),
         )
         .expect("write history source");
-        let dev = run_json(
+        let dev = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 store,
@@ -1626,7 +1701,11 @@ rule pick
             .and_then(Value::as_str)
             .expect("instance id")
             .to_owned();
-        let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+        let status = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "status", &instance_id],
+        );
         assert_eq!(
             status.pointer("/instance/status").and_then(Value::as_str),
             Some("completed"),
@@ -1720,8 +1799,9 @@ rule pick
         ),
     )
     .expect("write source");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1742,8 +1822,9 @@ rule pick
     assert_eq!(fs::read_to_string(&note).ok(), Some("V1".to_owned()));
 
     // 2) Checkpoint the cut.
-    let checkpoint = run_json(
+    let checkpoint = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -1778,8 +1859,9 @@ rule pick
     assert_eq!(fs::read_to_string(&note).ok(), Some("TAMPERED".to_owned()));
 
     // 4) Restore to the cut: note.md reverts to V1.
-    let restored = run_json(
+    let restored = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store, "--json", "restore", &instance_id, "cut-1"],
     );
     assert_eq!(
@@ -1799,7 +1881,7 @@ rule pick
     );
 
     // 5) Restoring an unknown cut refuses (non-zero, no mutation).
-    let refused = Command::new(bin)
+    let refused = whip(bin, &store_path)
         .args(["--store", store, "restore", &instance_id, "no-such-cut"])
         .output()
         .expect("restore runs");
@@ -1872,8 +1954,9 @@ rule pick
         let body = fs::read_to_string(&source_path).expect("read source");
         let scenario_src = temp_workflow_path("file-allow-run");
         fs::write(&scenario_src, body.replace("INPUT", relative)).expect("write scenario");
-        let dev = run_json(
+        let dev = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 &store,
@@ -1891,7 +1974,11 @@ rule pick
             .and_then(Value::as_str)
             .expect("instance id")
             .to_owned();
-        let status = run_json(bin, &["--store", &store, "--json", "status", &instance_id]);
+        let status = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", &store, "--json", "status", &instance_id],
+        );
         let result = status
             .pointer("/instance/status")
             .and_then(Value::as_str)
@@ -1976,8 +2063,9 @@ rule fan_out
     fs::write(&ok_src, ok_workflow(ok_root.to_str().expect("utf-8 root"))).expect("write source");
     let ok_store = temp_store_path();
     let ok_store_str = ok_store.to_str().expect("utf-8 store");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &ok_store,
         &[
             "--store",
             ok_store_str,
@@ -1995,8 +2083,9 @@ rule fan_out
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &ok_store,
         &["--store", ok_store_str, "--json", "facts", &instance_id],
     );
     let count_named = |name: &str| {
@@ -2077,8 +2166,9 @@ rule pick
     .expect("write source");
     let bad_store = temp_store_path();
     let bad_store_str = bad_store.to_str().expect("utf-8 store");
-    let bad_dev = run_json(
+    let bad_dev = run_json_isolated(
         bin,
+        &bad_store,
         &[
             "--store",
             bad_store_str,
@@ -2096,8 +2186,9 @@ rule pick
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let bad_status = run_json(
+    let bad_status = run_json_isolated(
         bin,
+        &bad_store,
         &["--store", bad_store_str, "--json", "status", &bad_instance],
     );
     assert_eq!(
@@ -2107,8 +2198,9 @@ rule pick
         Some("failed"),
         "an invalid row fails the import: {bad_status}"
     );
-    let bad_facts = run_json(
+    let bad_facts = run_json_isolated(
         bin,
+        &bad_store,
         &["--store", bad_store_str, "--json", "facts", &bad_instance],
     );
     assert_eq!(
@@ -2183,8 +2275,9 @@ rule dump
 
     let store_path = temp_store_path();
     let store = store_path.to_str().expect("utf-8 store");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -2269,8 +2362,9 @@ rule pick
     .expect("write source");
 
     let store = store_path.to_str().expect("utf-8 temp path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -2289,14 +2383,22 @@ rule pick
         .expect("instance id")
         .to_owned();
 
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("failed"),
         "an escaping path refuses the read and fails the workflow: {status}"
     );
 
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", &instance_id],
+    );
     let failed = facts
         .as_array()
         .expect("facts")
@@ -2373,8 +2475,9 @@ rule observe
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2392,8 +2495,9 @@ rule observe
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2470,8 +2574,9 @@ rule run_task
 
     let mut instance_ids = Vec::new();
     for _ in 0..2 {
-        let dev = run_json(
+        let dev = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -2494,8 +2599,9 @@ rule run_task
 
     assert_ne!(instance_ids[0], instance_ids[1]);
     for instance_id in &instance_ids {
-        let facts = run_json(
+        let facts = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -2550,8 +2656,9 @@ rule seed
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2601,8 +2708,9 @@ rule seed
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2622,8 +2730,9 @@ rule seed
     );
 
     let exclude_store_path = temp_store_path();
-    let exclude_dev = run_json(
+    let exclude_dev = run_json_isolated(
         bin,
+        &exclude_store_path,
         &[
             "--store",
             exclude_store_path.to_str().expect("utf-8 temp path"),
@@ -2659,6 +2768,7 @@ rule seed
 #[test]
 fn check_resolves_relative_whip_includes() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let root = temp_workflow_path("include-root");
     let lib = root.with_file_name(format!(
         "{}.lib.whip",
@@ -2694,7 +2804,11 @@ rule noop
     )
     .expect("write root workflow");
 
-    let output = run_text(bin, &["check", root.to_str().expect("utf-8 workflow path")]);
+    let output = run_text_isolated(
+        bin,
+        &stores,
+        &["check", root.to_str().expect("utf-8 workflow path")],
+    );
     assert!(output.contains("includes"), "{output}");
     assert!(output.contains("IncludedTask"), "{output}");
 
@@ -2707,8 +2821,9 @@ fn doctor_providers_reports_deterministic_health_posture() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
 
-    let doctor = run_json(
+    let doctor = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2750,6 +2865,7 @@ fn doctor_providers_reports_deterministic_health_posture() {
 #[test]
 fn check_root_option_validates_current_workflow_name() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = temp_workflow_path("root-selection");
     fs::write(
         &source_path,
@@ -2765,8 +2881,9 @@ rule noop
     )
     .expect("write workflow");
 
-    let ok = run_text(
+    let ok = run_text_isolated(
         bin,
+        &stores,
         &[
             "check",
             "--root",
@@ -2776,7 +2893,7 @@ rule noop
     );
     assert!(ok.contains("workflow SelectedRoot"), "{ok}");
 
-    let failed = Command::new(bin)
+    let failed = whip(bin, &stores)
         .args([
             "check",
             "--root",
@@ -2802,6 +2919,7 @@ rule noop
 #[test]
 fn check_rejects_duplicate_includes_in_one_file() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let root = temp_workflow_path("duplicate-include-root");
     let lib = root.with_file_name(format!(
         "{}.lib.whip",
@@ -2830,7 +2948,7 @@ workflow DuplicateInclude
     )
     .expect("write root workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", root.to_str().expect("utf-8 workflow path")])
         .output()
         .expect("command runs");
@@ -2845,6 +2963,7 @@ workflow DuplicateInclude
 #[test]
 fn check_selects_root_from_multiple_explicit_workflows() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = temp_workflow_path("multi-root");
     fs::write(
         &source_path,
@@ -2878,7 +2997,7 @@ workflow Beta {
     )
     .expect("write workflow");
 
-    let ambiguous = Command::new(bin)
+    let ambiguous = whip(bin, &stores)
         .args(["check", source_path.to_str().expect("utf-8 workflow path")])
         .output()
         .expect("command runs");
@@ -2889,8 +3008,9 @@ workflow Beta {
         "{stderr}"
     );
 
-    let output = run_text(
+    let output = run_text_isolated(
         bin,
+        &stores,
         &[
             "check",
             "--root",
@@ -2911,8 +3031,9 @@ fn starts_and_inspects_two_instances_independently() {
     let store_path = temp_store_path();
     let example = example_path("ralph.whip");
 
-    let first = run_json(
+    let first = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2923,8 +3044,9 @@ fn starts_and_inspects_two_instances_independently() {
             "--json",
         ],
     );
-    let second = run_json(
+    let second = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2948,8 +3070,9 @@ fn starts_and_inspects_two_instances_independently() {
     assert_eq!(first.get("program_id"), second.get("program_id"));
     assert_eq!(first.get("version_id"), second.get("version_id"));
 
-    let instances = run_text(
+    let instances = run_text_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2959,8 +3082,9 @@ fn starts_and_inspects_two_instances_independently() {
     assert!(instances.contains(first_id), "{instances}");
     assert!(instances.contains(second_id), "{instances}");
 
-    let first_status = run_json(
+    let first_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2969,8 +3093,9 @@ fn starts_and_inspects_two_instances_independently() {
             "--json",
         ],
     );
-    let second_status = run_json(
+    let second_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -2988,8 +3113,9 @@ fn starts_and_inspects_two_instances_independently() {
             .map(Vec::len),
         Some(1)
     );
-    let first_trace = run_json(
+    let first_trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3009,8 +3135,9 @@ fn starts_and_inspects_two_instances_independently() {
             .map(Vec::len),
         Some(1)
     );
-    let checked_trace = run_json(
+    let checked_trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3027,8 +3154,9 @@ fn starts_and_inspects_two_instances_independently() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let first_evidence = run_json(
+    let first_evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3076,8 +3204,9 @@ rule start_work
     )
     .expect("write workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3090,8 +3219,9 @@ rule start_work
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3102,8 +3232,9 @@ rule start_work
             workflow_path.to_str().expect("utf-8 workflow path"),
         ],
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3146,8 +3277,9 @@ rule start_work
         .expect("artifact records");
     drop(store);
 
-    let artifacts = run_json(
+    let artifacts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3172,8 +3304,9 @@ rule start_work
         artifact.get("content_hash").and_then(Value::as_str),
         Some("[REDACTED]")
     );
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3186,8 +3319,9 @@ rule start_work
         run.get("run_id").and_then(Value::as_str) == Some("run-artifact-metadata")
             && run.get("artifact_count").and_then(Value::as_u64) == Some(1)
     }));
-    let trace = run_json(
+    let trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3241,8 +3375,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3261,8 +3396,9 @@ rule noop_v2
         .expect("version id")
         .to_owned();
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3303,8 +3439,9 @@ rule noop_v2
         Some(true)
     );
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3364,8 +3501,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3379,8 +3517,9 @@ rule noop_v2
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let activation = run_json(
+    let activation = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3404,8 +3543,9 @@ rule noop_v2
         Some(1)
     );
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3479,8 +3619,9 @@ rule seed_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3494,8 +3635,9 @@ rule seed_v2
         .and_then(Value::as_str)
         .expect("instance id");
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3506,7 +3648,7 @@ rule seed_v2
         ],
     );
 
-    let stale_step = Command::new(bin)
+    let stale_step = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3520,8 +3662,9 @@ rule seed_v2
     assert!(!stale_step.status.success());
     let stderr = String::from_utf8_lossy(&stale_step.stderr);
     assert!(stderr.contains("does not match active version"), "{stderr}");
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3540,8 +3683,9 @@ rule seed_v2
                 .is_some()
     }));
 
-    let step = run_json(
+    let step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3554,8 +3698,9 @@ rule seed_v2
     );
     assert_eq!(step.get("committed_rules").and_then(Value::as_u64), Some(1));
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3606,8 +3751,9 @@ rule noop
     )
     .expect("write v1 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3621,7 +3767,7 @@ rule noop
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let revise = Command::new(bin)
+    let revise = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3636,8 +3782,9 @@ rule noop
     let stderr = String::from_utf8_lossy(&revise.stderr);
     assert!(stderr.contains("failed to read"), "{stderr}");
 
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3697,8 +3844,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3716,8 +3864,9 @@ rule noop_v2
         .and_then(Value::as_str)
         .expect("version id");
 
-    let first_step = run_json(
+    let first_step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3733,8 +3882,9 @@ rule noop_v2
         Some(1)
     );
 
-    let revision = run_json(
+    let revision = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3766,8 +3916,9 @@ rule noop_v2
         Some(original_version)
     );
 
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3780,8 +3931,9 @@ rule noop_v2
     );
     assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(1));
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3853,8 +4005,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3868,8 +4021,9 @@ rule noop_v2
         .and_then(Value::as_str)
         .expect("instance id");
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3880,8 +4034,9 @@ rule noop_v2
             v1.to_str().expect("utf-8 workflow path"),
         ],
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3914,8 +4069,9 @@ rule noop_v2
         })
         .expect("run starts");
 
-    let activation = run_json(
+    let activation = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3936,8 +4092,9 @@ rule noop_v2
         .iter()
         .any(|effect| effect.as_str() == Some(effect_id.as_str())));
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3963,8 +4120,9 @@ rule noop_v2
         Some(true)
     );
 
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -3985,8 +4143,9 @@ rule noop_v2
         Some(true)
     );
 
-    let trace = run_json(
+    let trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4022,8 +4181,9 @@ rule noop_v2
             == Some("effect_cancelled")
     }));
 
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4039,8 +4199,9 @@ rule noop_v2
             .and_then(Value::as_u64),
         Some(1)
     );
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4078,8 +4239,9 @@ rule noop_v2
     assert_eq!(requests[0].status, "terminal");
     drop(store);
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4149,8 +4311,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4163,8 +4326,9 @@ rule noop_v2
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4175,8 +4339,9 @@ rule noop_v2
             v1.to_str().expect("utf-8 workflow path"),
         ],
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4219,8 +4384,9 @@ rule noop_v2
         .expect("artifact records");
     drop(store);
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4232,8 +4398,9 @@ rule noop_v2
             "--json",
         ],
     );
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4243,8 +4410,9 @@ rule noop_v2
         ],
     );
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4253,8 +4421,9 @@ rule noop_v2
             instance_id,
         ],
     );
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4263,8 +4432,9 @@ rule noop_v2
             instance_id,
         ],
     );
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4273,8 +4443,9 @@ rule noop_v2
             instance_id,
         ],
     );
-    let trace = run_json(
+    let trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4284,8 +4455,9 @@ rule noop_v2
             "--check",
         ],
     );
-    let artifacts = run_json(
+    let artifacts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4476,8 +4648,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4490,8 +4663,9 @@ rule noop_v2
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4502,8 +4676,9 @@ rule noop_v2
             v1.to_str().expect("utf-8 workflow path"),
         ],
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4536,8 +4711,9 @@ rule noop_v2
         .expect("run starts");
     drop(store);
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4549,8 +4725,9 @@ rule noop_v2
             "--json",
         ],
     );
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4574,8 +4751,9 @@ rule noop_v2
             .and_then(Value::as_u64),
         Some(0)
     );
-    let duplicate_worker = run_json(
+    let duplicate_worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4599,8 +4777,9 @@ rule noop_v2
         Some(0)
     );
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4631,8 +4810,9 @@ rule noop_v2
     assert_eq!(requests[0].status, "terminal");
     drop(store);
 
-    let events = run_json(
+    let events = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4677,8 +4857,9 @@ rule noop_v2
         Some("native_stop")
     );
 
-    let trace = run_json(
+    let trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4740,8 +4921,9 @@ rule noop_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4755,8 +4937,9 @@ rule noop_v2
         .and_then(Value::as_str)
         .expect("instance id");
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4767,8 +4950,9 @@ rule noop_v2
             v1.to_str().expect("utf-8 workflow path"),
         ],
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4787,8 +4971,9 @@ rule noop_v2
         .expect("agent effect id")
         .to_owned();
 
-    let activation = run_json(
+    let activation = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4809,8 +4994,9 @@ rule noop_v2
         .iter()
         .any(|effect| effect.as_str() == Some(effect_id.as_str())));
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4835,8 +5021,9 @@ rule noop_v2
             .and_then(Value::as_bool),
         Some(false)
     );
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4863,8 +5050,9 @@ rule noop_v2
         event.get("event_type").and_then(Value::as_str) == Some("effect.cancelled")
     }));
 
-    let trace = run_json(
+    let trace = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4929,8 +5117,9 @@ rule noop
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4944,8 +5133,9 @@ rule noop
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4972,7 +5162,7 @@ rule noop
         diagnostic.get("code").and_then(Value::as_str) == Some("revision.root_workflow_changed")
     }));
 
-    let blocked = Command::new(bin)
+    let blocked = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -4993,8 +5183,9 @@ rule noop
             .and_then(Value::as_bool),
         Some(false)
     );
-    let persisted = run_json(
+    let persisted = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5018,8 +5209,9 @@ rule noop
         .expect("diagnostic id")
         .to_owned();
 
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5046,8 +5238,9 @@ rule noop
         Some(rejected_event_id.as_str())
     );
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5080,8 +5273,9 @@ rule noop
             && link.get("relation").and_then(Value::as_str) == Some("compatibility_diagnostic")
     }));
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5150,8 +5344,9 @@ workflow RevisionSpan {
 "#;
     fs::write(&v2, v2_source).expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5164,8 +5359,9 @@ workflow RevisionSpan {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let stepped = run_json(
+    let stepped = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5181,8 +5377,9 @@ workflow RevisionSpan {
         Some(1)
     );
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5245,7 +5442,7 @@ workflow RevisionSpan {
         Some(false)
     );
 
-    let blocked = Command::new(bin)
+    let blocked = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5258,8 +5455,9 @@ workflow RevisionSpan {
         .expect("command runs");
     assert!(!blocked.status.success());
 
-    let persisted = run_json(
+    let persisted = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5298,8 +5496,9 @@ fn step_materializes_minimal_noop_fact() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("minimal-noop.whip");
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5313,8 +5512,9 @@ fn step_materializes_minimal_noop_fact() {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let step = run_json(
+    let step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5328,8 +5528,9 @@ fn step_materializes_minimal_noop_fact() {
     assert_eq!(step.get("committed_rules").and_then(Value::as_u64), Some(1));
     assert_eq!(step.get("facts_created").and_then(Value::as_u64), Some(1));
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5358,8 +5559,9 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let example = example_path("openclaw-lite.whip");
     // openclaw-lite imports `std.memory`, which ships as an embedded std
     // manifest — no lock is needed.
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5399,8 +5601,9 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
         Some(1)
     );
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5444,8 +5647,9 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("owned-harness-demo.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5463,8 +5667,9 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5495,8 +5700,9 @@ fn dev_owned_harness_completes_turn_with_leaf_invariants() {
     );
 
     // The interior observations are recorded as evidence instead.
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -5552,6 +5758,7 @@ fn dev_owned_harness_offers_available_skills_catalogue() {
     // startup, and an owned turn with a read tool offers it in the
     // `<available_skills>` catalogue (recorded as a context.bundle evidence row).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let ws = std::env::temp_dir().join(format!(
         "whip-skill-catalogue-{}-{}",
         std::process::id(),
@@ -5608,8 +5815,9 @@ workflow SkillCatalogueSmoke {
     )
     .expect("write workflow");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -5627,8 +5835,9 @@ workflow SkillCatalogueSmoke {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -5658,6 +5867,7 @@ fn skill_cli_installs_into_the_registry_and_lists_it() {
     // context-assembly Phase 2 item 5: `whip skill install` ingests a SKILL.md into
     // the store (content-addressed), and `whip skill list` reflects the registry.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let ws =
         std::env::temp_dir().join(format!("whip-skill-cli-{}-{}", std::process::id(), line!()));
     let _ = fs::remove_dir_all(&ws);
@@ -5671,8 +5881,9 @@ fn skill_cli_installs_into_the_registry_and_lists_it() {
     let store_path = ws.join(".whipplescript").join("store.sqlite");
     let store = store_path.to_str().expect("utf-8 store path");
 
-    let installed = run_json(
+    let installed = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store,
@@ -5687,7 +5898,7 @@ fn skill_cli_installs_into_the_registry_and_lists_it() {
         Some("demo")
     );
 
-    let listed = run_json(bin, &["--store", store, "--json", "skill", "list"]);
+    let listed = run_json_isolated(bin, &stores, &["--store", store, "--json", "skill", "list"]);
     let skills = listed
         .get("skills")
         .and_then(Value::as_array)
@@ -5711,6 +5922,7 @@ fn agent_declared_skills_are_pinned_as_injected_evidence() {
     // resolved from the IR and recorded as `skills.injected` provenance (pinning,
     // not a catalogue filter — Decision 2).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let ws =
         std::env::temp_dir().join(format!("whip-skill-pin-{}-{}", std::process::id(), line!()));
     let _ = fs::remove_dir_all(&ws);
@@ -5754,8 +5966,9 @@ workflow SkillPinSmoke {
     )
     .expect("write workflow");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -5773,8 +5986,9 @@ workflow SkillPinSmoke {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -5807,6 +6021,7 @@ fn owned_harness_injects_project_context_from_agents_md() {
     // context-assembly Phase 3: an AGENTS.md in the turn workspace is injected as a
     // <project_context> bundle (recorded as a context.bundle evidence row).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let ws = std::env::temp_dir().join(format!("whip-proj-ctx-{}-{}", std::process::id(), line!()));
     let _ = fs::remove_dir_all(&ws);
     fs::create_dir_all(ws.join(".whipplescript")).expect("ws dir");
@@ -5854,7 +6069,7 @@ workflow ProjCtxSmoke {
     .expect("write workflow");
 
     // The discovery roots at WHIPPLESCRIPT_HARNESS_WORKSPACE (owned_workspace_root).
-    let dev = Command::new(bin)
+    let dev = whip(bin, &stores)
         .env("WHIPPLESCRIPT_HARNESS_WORKSPACE", &ws)
         .args([
             "--store",
@@ -5880,8 +6095,9 @@ workflow ProjCtxSmoke {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store,
@@ -5932,8 +6148,9 @@ rule start_native_work
     )
     .expect("write native fixture workflow");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6058,8 +6275,9 @@ rule start_native_work
     );
     assert!(report_diagnostics.is_empty());
 
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6083,8 +6301,9 @@ rule start_native_work
         );
     }
 
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6103,8 +6322,9 @@ rule start_native_work
     assert_eq!(run.get("artifact_count").and_then(Value::as_u64), Some(1));
     let run_id = run.get("run_id").and_then(Value::as_str).expect("run id");
 
-    let artifacts = run_json(
+    let artifacts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6120,8 +6340,9 @@ rule start_native_work
             .map(Vec::len),
         Some(1)
     );
-    let recover = run_json(
+    let recover = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6134,8 +6355,9 @@ rule start_native_work
         recover.get("recovered_count").and_then(Value::as_u64),
         Some(0)
     );
-    let replayed_log = run_json(
+    let replayed_log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6196,8 +6418,9 @@ rule start_delegated_work
     )
     .expect("write delegated attestation workflow");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6215,8 +6438,9 @@ rule start_delegated_work
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6315,7 +6539,7 @@ rule start_native_work
     .expect("write unavailable native provider workflow");
 
     let store_str = store_path.to_str().expect("utf-8 temp path");
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .env(
             "WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND",
             "__whipplescript_missing_codex_command__",
@@ -6349,8 +6573,9 @@ rule start_native_work
         .expect("instance id");
 
     // The effect is blocked (recoverable), categorized provider_config — not failed.
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store_str, "--json", "effects", instance_id],
     );
     let tell = effects
@@ -6378,7 +6603,11 @@ rule start_native_work
     );
 
     // No run was started and no failure was recorded (blocked before execution).
-    let runs = run_json(bin, &["--store", store_str, "--json", "runs", instance_id]);
+    let runs = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store_str, "--json", "runs", instance_id],
+    );
     assert!(
         !runs
             .as_array()
@@ -6387,7 +6616,11 @@ rule start_native_work
             .any(|run| run.get("provider").and_then(Value::as_str) == Some("codex")),
         "no codex run should start: {runs}"
     );
-    let log = run_json(bin, &["--store", store_str, "--json", "log", instance_id]);
+    let log = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store_str, "--json", "log", instance_id],
+    );
     let events = log.as_array().expect("event array");
     assert!(
         events.iter().any(|event| {
@@ -6457,8 +6690,9 @@ rule start_work
     .expect("write provider config");
 
     let store_str = store_path.to_str().expect("utf-8 temp path");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_str,
@@ -6477,8 +6711,9 @@ rule start_work
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store_str, "--json", "effects", instance_id],
     );
     let tell = effects
@@ -6500,12 +6735,14 @@ rule start_work
             .is_some_and(|detail| detail.contains("does not allow profile `repo-reader`")),
         "block detail: {tell}"
     );
-    assert!(
-        run_json(bin, &["--store", store_str, "--json", "runs", instance_id])
-            .as_array()
-            .expect("runs array")
-            .is_empty()
-    );
+    assert!(run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store_str, "--json", "runs", instance_id]
+    )
+    .as_array()
+    .expect("runs array")
+    .is_empty());
 
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
@@ -6662,8 +6899,9 @@ fn dev_fixture_failure_reaches_event_stream() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("ralph.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6682,8 +6920,9 @@ fn dev_fixture_failure_reaches_event_stream() {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6717,8 +6956,9 @@ fn dev_fixture_failure_reaches_event_stream() {
                 .and_then(Value::as_str)
                 == Some("nonzero_exit")
     }));
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6799,7 +7039,7 @@ rule start_item
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -6826,8 +7066,9 @@ rule start_item
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6903,7 +7144,7 @@ rule work
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -6930,8 +7171,9 @@ rule work
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7066,7 +7308,7 @@ workflow Child {
     .expect("workflow writes");
     let store = store_path.to_str().expect("utf-8 temp path");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -7095,13 +7337,21 @@ workflow Child {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let status = run_json(bin, &["--store", store, "--json", "status", instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("completed"),
         "parent completes: {status}"
     );
-    let facts = run_json(bin, &["--store", store, "--json", "facts", instance_id]);
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", instance_id],
+    );
     let facts = facts.as_array().expect("facts array");
     assert!(
         facts
@@ -7111,7 +7361,11 @@ workflow Child {
     );
     // The success arm bound the CHILD payload (summary), not the milestone
     // payload — the terminal payload note carries it.
-    let log = run_json(bin, &["--store", store, "--json", "log", instance_id]);
+    let log = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "log", instance_id],
+    );
     let note = log
         .as_array()
         .expect("log array")
@@ -7175,7 +7429,7 @@ rule work
     .expect("workflow writes");
     let store = store_path.to_str().expect("utf-8 temp path");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -7197,8 +7451,9 @@ rule work
         .expect("instance id")
         .to_owned();
 
-    let progressions = run_json(
+    let progressions = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store, "--json", "progressions", &instance_id],
     );
     let firing_id = progressions
@@ -7210,7 +7465,7 @@ rule work
         .expect("work firing listed")
         .to_owned();
 
-    let cancel = Command::new(bin)
+    let cancel = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -7231,7 +7486,7 @@ rule work
 
     // Drive: nothing may re-admit the firing or re-request its timer.
     for _ in 0..2 {
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7241,7 +7496,7 @@ rule work
                 workflow_path.to_str().expect("utf-8"),
             ])
             .output();
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7253,13 +7508,21 @@ rule work
             .output();
     }
 
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("running"),
         "the instance keeps running — this is whip cancel one level down: {status}"
     );
-    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let effects = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", &instance_id],
+    );
     let timers: Vec<&str> = effects
         .as_array()
         .expect("effects array")
@@ -7272,8 +7535,9 @@ rule work
         vec!["cancelled"],
         "exactly one timer, cancelled, never re-requested"
     );
-    let after = run_json(
+    let after = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store, "--json", "progressions", &instance_id],
     );
     let state = after
@@ -7354,7 +7618,7 @@ rule ship
     .expect("workflow writes");
     let store = store_path.to_str().expect("utf-8 temp path");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -7381,7 +7645,7 @@ rule ship
     // must cancel.
     std::thread::sleep(std::time::Duration::from_millis(1500));
     for _ in 0..2 {
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7391,7 +7655,7 @@ rule ship
                 workflow_path.to_str().expect("utf-8"),
             ])
             .output();
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7407,7 +7671,7 @@ rule ship
     // pass. That mid-effect lapse is the point of a region (DR-0043 Dec. 5).
     std::thread::sleep(std::time::Duration::from_millis(3200));
     for _ in 0..3 {
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7417,7 +7681,7 @@ rule ship
                 workflow_path.to_str().expect("utf-8"),
             ])
             .output();
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7429,13 +7693,21 @@ rule ship
             .output();
     }
 
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("failed"),
         "the arm's typed fail ends the instance: {status}"
     );
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", &instance_id],
+    );
     let facts = facts.as_array().expect("facts array");
     let lapses: Vec<&Value> = facts
         .iter()
@@ -7477,7 +7749,11 @@ rule ship
         Some("cancelled_by_lapse"),
         "the arm reads `got.steps.<step>` at runtime: {status}"
     );
-    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let effects = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", &instance_id],
+    );
     let cancelled = effects
         .as_array()
         .expect("effects array")
@@ -7794,7 +8070,7 @@ rule finish
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7819,8 +8095,9 @@ rule finish
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7835,8 +8112,9 @@ rule finish
         "the join over both paths completes: {status}"
     );
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7852,8 +8130,9 @@ rule finish
             .any(|fact| fact.get("name").and_then(Value::as_str) == Some("Worked")),
         "the pinned continuation recorded Worked after its trigger was consumed: {facts:?}"
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7949,7 +8228,7 @@ rule approved
     .expect("workflow writes");
 
     let store = store_path.to_str().expect("utf-8 temp path");
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -7973,12 +8252,13 @@ rule approved
         .to_owned();
 
     // The human answers: a new ready issue whose body carries the request id.
-    let question = run_json(
+    let question = run_json_isolated(
         bin,
+        &store_path,
         &["--store", store, "--json", "progressions", &instance_id],
     );
     assert!(question.as_array().is_some_and(|rows| !rows.is_empty()));
-    let filed = Command::new(bin)
+    let filed = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "issue",
@@ -7997,7 +8277,7 @@ rule approved
     // Drive: claim -> finish (retracts the trigger projection) -> the pinned
     // continuation's done + complete.
     for _ in 0..5 {
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
             .args([
                 "--store",
@@ -8008,7 +8288,7 @@ rule approved
                 workflow_path.to_str().expect("utf-8 workflow path"),
             ])
             .output();
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
             .args([
                 "--store",
@@ -8020,7 +8300,11 @@ rule approved
             ])
             .output();
     }
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
     assert_eq!(
         status.pointer("/instance/status").and_then(Value::as_str),
         Some("completed"),
@@ -8085,7 +8369,7 @@ rule work
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -8113,8 +8397,9 @@ rule work
 
     // The rule.committed payload carries the pinned context: identity plus
     // the bound Job fact with its full value.
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -8155,8 +8440,9 @@ rule work
     );
 
     // The progressions view folds commits into firings.
-    let progressions = run_json(
+    let progressions = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -8254,7 +8540,7 @@ rule work
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -8281,8 +8567,9 @@ rule work
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -8375,7 +8662,7 @@ rule grab
 
     // Drive to idle: the instance acquires the fire-and-forget lease and stays
     // running (the `held` branch never terminates), so the lease is held.
-    let dev_output = Command::new(bin)
+    let dev_output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_COORDINATION_STORE", &coordination_path)
         .args([
             "--store",
@@ -8415,7 +8702,7 @@ rule grab
         Some(instance_id.as_str())
     );
 
-    let cancel = Command::new(bin)
+    let cancel = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_COORDINATION_STORE", &coordination_path)
         .args([
             "--store",
@@ -8445,7 +8732,8 @@ rule grab
 /// Read the workspace-scoped coordination lease table via `whip --json leases`
 /// (it reads only `WHIPPLESCRIPT_COORDINATION_STORE`, not the run store).
 fn coordination_leases(bin: &str, coordination_path: &Path) -> Vec<Value> {
-    let output = Command::new(bin)
+    let stores = temp_store_path();
+    let output = whip(bin, &stores)
         .env("WHIPPLESCRIPT_COORDINATION_STORE", coordination_path)
         .args(["--json", "leases"])
         .output()
@@ -8512,7 +8800,7 @@ rule grab
 
     // Drive to idle: the instance files an item, claims it, and stays running
     // without finishing — so the item is held `in_progress`.
-    let dev_output = Command::new(bin)
+    let dev_output = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -8552,7 +8840,7 @@ rule grab
         Some(instance_id.as_str())
     );
 
-    let cancel = Command::new(bin)
+    let cancel = whip(bin, &store_path)
         .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
         .args([
             "--store",
@@ -8590,7 +8878,8 @@ rule grab
 /// Read the workspace-scoped builtin tracker via `whip --json issue list` (reads
 /// only `WHIPPLESCRIPT_ITEMS_STORE`, not the run store).
 fn tracker_items(bin: &str, items_path: &Path) -> Vec<Value> {
-    let output = Command::new(bin)
+    let stores = temp_store_path();
+    let output = whip(bin, &stores)
         .env("WHIPPLESCRIPT_ITEMS_STORE", items_path)
         .args(["--json", "issue", "list"])
         .output()
@@ -8629,7 +8918,7 @@ fn issue_cli_lifecycle() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let items_path = temp_store_path();
     let run = |args: &[&str]| -> std::process::Output {
-        Command::new(bin)
+        whip(bin, &items_path)
             .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
             .args(args)
             .output()
@@ -8711,7 +9000,7 @@ fn issue_cli_dep_add_gates_readiness() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let items_path = temp_store_path();
     let run = |args: &[&str]| -> std::process::Output {
-        Command::new(bin)
+        whip(bin, &items_path)
             .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
             .args(args)
             .output()
@@ -8832,8 +9121,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -8856,8 +9146,9 @@ workflow Child {
         .expect("instance id")
         .to_owned();
 
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -8881,8 +9172,9 @@ workflow Child {
     );
 
     // The child's failure reason reached the parent (the invoke terminal fact).
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -8955,8 +9247,9 @@ rule route
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -8982,8 +9275,9 @@ rule route
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9049,8 +9343,9 @@ rule route
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9076,8 +9371,9 @@ rule route
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9155,8 +9451,9 @@ rule j
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9174,8 +9471,9 @@ rule j
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9245,8 +9543,9 @@ rule d
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9264,8 +9563,9 @@ rule d
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store path"),
@@ -9344,8 +9644,9 @@ rule classify_request
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -9376,8 +9677,9 @@ rule classify_request
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -9454,8 +9756,9 @@ rule recall_before_work
     )
     .expect("workflow writes");
     // `std.memory` ships embedded — no lock, no `--package-lock`.
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -9486,8 +9789,9 @@ rule recall_before_work
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -9515,6 +9819,7 @@ rule recall_before_work
 #[test]
 fn memory_roundtrip_recalls_the_learned_item() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("memory-roundtrip");
     let store_path = dir.join("store.db");
     let workflow_src =
@@ -9523,8 +9828,9 @@ fn memory_roundtrip_recalls_the_learned_item() {
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
 
     // `std.memory` ships embedded, so the round-trip runs with no lock at all.
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9541,8 +9847,9 @@ fn memory_roundtrip_recalls_the_learned_item() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9609,6 +9916,7 @@ fn memory_roundtrip_recalls_the_learned_item() {
 #[test]
 fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("memory-roundtrip-no-lock");
     let store_path = dir.join("store.db");
     let workflow_src =
@@ -9618,7 +9926,7 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
 
     // `check` resolves `use std.memory` + the `recall`/`learn` constructs from
     // the embedded manifest — no lock present, no `--package-lock` flag.
-    let checked = Command::new(bin)
+    let checked = whip(bin, &stores)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
@@ -9631,8 +9939,9 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
 
     // `dev` runs with no `--package-lock`: the embedded manifest seeds the store's
     // `memory.query`/`memory.write` providers + bindings, so the round-trip runs.
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9649,8 +9958,9 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9707,6 +10017,7 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
 #[test]
 fn memory_pool_declaration_demo_checks_and_recalls() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("memory-pool-demo");
     let store_path = dir.join("store.db");
     let workflow_src =
@@ -9716,7 +10027,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
 
     // `check` resolves `use std.memory` from the embedded manifest (no lock) and
     // renders the declared pool + its context limit in the `.ir` snapshot.
-    let checked = Command::new(bin)
+    let checked = whip(bin, &stores)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
@@ -9741,8 +10052,9 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
     );
 
     // `dev` runs the `learn`/`recall` against the declared pool to completion.
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9759,8 +10071,9 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9805,6 +10118,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
 #[test]
 fn memory_curate_dedupes_the_pool_without_a_lock() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("memory-curate-no-lock");
     let store_path = dir.join("store.db");
     let workflow_src =
@@ -9814,7 +10128,7 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
 
     // `check` resolves `use std.memory` + the `learn`/`curate`/`recall` constructs
     // from the embedded manifest — no lock present, no `--package-lock` flag.
-    let checked = Command::new(bin)
+    let checked = whip(bin, &stores)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
         .expect("check runs");
@@ -9825,8 +10139,9 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         String::from_utf8_lossy(&checked.stderr)
     );
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9843,8 +10158,9 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9928,8 +10244,9 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
 
     // The operator read surface (MEM-3): `whip memory pools|entries` lists
     // the same store the provider wrote.
-    let pools = run_json(
+    let pools = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9947,8 +10264,9 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         Some(2),
         "whip memory pools reports the deduped pool"
     );
-    let entries = run_json(
+    let entries = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_path.to_str().expect("utf-8 store"),
@@ -9986,6 +10304,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// The `notes` vendor package resolves only through the lock, so these projects
 /// exercise real lock discovery/mechanics.
 fn write_locked_notes_project(bin: &str, dir: &Path) -> PathBuf {
+    let stores = temp_store_path();
     let workflow_path = dir.join("wf.whip");
     fs::write(
         &workflow_path,
@@ -10022,8 +10341,9 @@ rule recall_before_work
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
     let manifest_copy = dir.join("notes.json");
     fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
-    run_text(
+    run_text_isolated(
         bin,
+        &stores,
         &[
             "package",
             "lock",
@@ -10038,6 +10358,7 @@ rule recall_before_work
 #[test]
 fn test_harness_reports_pass_fail_and_error_honestly() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10079,7 +10400,7 @@ test "unsupported stub outcome is invalid" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10133,6 +10454,7 @@ test "unsupported stub outcome is invalid" {
 #[test]
 fn test_harness_evaluates_fact_projection_expects() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-proj");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10169,7 +10491,7 @@ test "wrong projection count fails" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10206,6 +10528,7 @@ test "wrong projection count fails" {
 #[test]
 fn test_harness_seeds_file_fixtures() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-file");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10261,7 +10584,7 @@ test "an unseeded path fails the read" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10298,6 +10621,7 @@ fn test_harness_injects_coerce_output() {
     // returns, so a test can drive the value a workflow branches on and assert on
     // it. Two scenarios inject different verdicts and confirm each propagates.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-coerce");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10358,7 +10682,7 @@ test "injects blocked" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10395,6 +10719,7 @@ fn test_command_selection_patterns_and_exit_codes() {
     // `--pass-if-no-tests`, and the spec exit codes (0 passed · 1 failures · 4
     // nothing selected).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("test-select");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10438,7 +10763,7 @@ test "gamma passes" {
     let run = |extra: &[&str]| {
         let mut args = vec!["test", path];
         args.extend_from_slice(extra);
-        Command::new(bin)
+        whip(bin, &stores)
             .args(&args)
             .output()
             .expect("whip test runs")
@@ -10499,6 +10824,7 @@ fn test_command_aggregates_multiple_sources() {
     // scenarios into one report; selection and exit codes span all sources, and
     // each scenario runs against its own program text.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("test-multi");
     let one = dir.join("one.whip");
     let two = dir.join("two.whip");
@@ -10563,7 +10889,7 @@ test "two fails" {
     let two_path = two.to_str().expect("present");
 
     // Both sources, JSON: three scenarios aggregated, overall failed (exit 1).
-    let both = Command::new(bin)
+    let both = whip(bin, &stores)
         .args(["--json", "test", one_path, two_path])
         .output()
         .expect("whip test runs");
@@ -10585,7 +10911,7 @@ test "two fails" {
     assert!(ids.contains(&"Two::two fails"), "ids: {ids:?}");
 
     // Selection spans sources: include only the passing scenarios across files.
-    let passes = Command::new(bin)
+    let passes = whip(bin, &stores)
         .args(["test", one_path, two_path, "-i", "::*passes"])
         .output()
         .expect("whip test runs");
@@ -10598,7 +10924,7 @@ test "two fails" {
     // A compile error in any source is setup-invalid (exit 2), before running.
     let bad = dir.join("bad.whip");
     fs::write(&bad, "workflow Bad\nrule oops =>\n").expect("write bad");
-    let with_bad = Command::new(bin)
+    let with_bad = whip(bin, &stores)
         .args(["test", one_path, bad.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10613,6 +10939,7 @@ fn test_command_discovers_whip_files_in_a_directory() {
     // (skipping hidden dirs), and their scenarios are aggregated like explicit
     // files. Selection and exit codes span the discovered set.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("test-dir");
     let nested = dir.join("nested");
     fs::create_dir_all(&nested).expect("mkdir nested");
@@ -10661,7 +10988,7 @@ test "{test}" {{
     )
     .expect("write hidden");
 
-    let out = Command::new(bin)
+    let out = whip(bin, &stores)
         .args(["--json", "test", dir.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10692,6 +11019,7 @@ fn test_replay_verifies_event_log_reprojects_identically() {
     // byte-identical to the live-built one (replay equality). The user's store is
     // not mutated. An unknown instance is a setup error (exit 2).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("replay");
     let store = dir.join("store.sqlite");
     let wf = dir.join("wf.whip");
@@ -10718,8 +11046,9 @@ rule done_now
     .expect("write workflow");
     let store_str = store.to_str().expect("present");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store_str,
@@ -10738,7 +11067,7 @@ rule done_now
         .expect("instance id")
         .to_owned();
 
-    let replay = Command::new(bin)
+    let replay = whip(bin, &stores)
         .args(["--store", store_str, "--json", "test", "replay", &instance])
         .output()
         .expect("whip test replay runs");
@@ -10756,11 +11085,15 @@ rule done_now
     );
 
     // The original store is untouched — its instance still resolves.
-    let status = run_json(bin, &["--store", store_str, "--json", "status", &instance]);
+    let status = run_json_isolated(
+        bin,
+        &stores,
+        &["--store", store_str, "--json", "status", &instance],
+    );
     assert!(status.get("instance").is_some(), "store intact: {status}");
 
     // Unknown instance → setup error (exit 2).
-    let missing = Command::new(bin)
+    let missing = whip(bin, &stores)
         .args(["--store", store_str, "test", "replay", "no-such-instance"])
         .output()
         .expect("whip test replay runs");
@@ -10776,6 +11109,7 @@ fn test_harness_given_tracker_seeds_builtin_tracker_issue() {
     // as a `tracker.issue.ready` fact — going through the real projection path — so a
     // `<queue> has ready issue` rule fires on it.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-tracker");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10816,7 +11150,7 @@ test "seeded issue is picked up" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10844,6 +11178,7 @@ fn test_harness_given_clock_controls_deadline_firing() {
     // before it (deadline stays pending → no failure). Same program, opposite
     // outcomes driven solely by the injected clock.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-clock");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -10911,7 +11246,7 @@ test "clock before the deadline holds it" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -10956,6 +11291,7 @@ fn interval_clock_source_fires_occurrences_at_runtime() {
     // rule then fires. With the default `coalesce` policy a long-idle source admits
     // a single representative occurrence rather than one fact per elapsed interval.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("clock-source");
     let wf = dir.join("clock_interval.whip");
     fs::write(
@@ -11018,7 +11354,7 @@ test "interval clock holds before the first tick" {
     )
     .expect("write clock workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -11061,6 +11397,7 @@ fn calendar_clock_source_fires_occurrences_at_runtime() {
     // of the interval source. A far-future `given clock` means many daily 09:00
     // occurrences have elapsed; `coalesce` admits one representative occurrence.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("clock-calendar");
     let wf = dir.join("clock_calendar.whip");
     fs::write(
@@ -11119,7 +11456,7 @@ test "calendar clock holds before the first occurrence" {
     )
     .expect("write calendar clock workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -11161,6 +11498,7 @@ fn lint_flags_unused_coerce_functions() {
     // not flag a coerce that is called. A coerce is only callable within the
     // program, so this has no false positives.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint");
     let wf = dir.join("lint.whip");
     fs::write(
@@ -11199,7 +11537,7 @@ rule run
     )
     .expect("write lint workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
@@ -11233,6 +11571,7 @@ fn lint_advises_std_coercion_import_for_coerce_programs() {
     // missing-import lint only — `coerce` without `use std.coercion` warns
     // (exit 0), and the same program with the import is clean.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-coercion-import");
     let program = |import: &str| {
         format!(
@@ -11270,7 +11609,7 @@ rule run
     fs::write(&without, program("")).expect("write workflow");
     fs::write(&with, program("use std.coercion\n\n")).expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11303,6 +11642,7 @@ fn lint_advises_std_coord_import_for_coordination_programs() {
     // `use std.coord` warn (exit 0), and the same program with the import is
     // clean.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-coord-import");
     let program = |import: &str| {
         format!(
@@ -11357,7 +11697,7 @@ rule go
     fs::write(&without, program("")).expect("write workflow");
     fs::write(&with, program("use std.coord\n\n")).expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11391,6 +11731,7 @@ fn lint_advises_std_files_import_for_file_programs() {
     // without `use std.files` warn (exit 0), and the same program with the
     // import is clean.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-files-import");
     let program = |import: &str| {
         format!(
@@ -11424,7 +11765,7 @@ rule seed
     fs::write(&without, program("")).expect("write workflow");
     fs::write(&with, program("use std.files\n\n")).expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11458,6 +11799,7 @@ fn lint_advises_std_tracker_import_for_tracker_programs() {
     // and verbs without `use std.tracker` warn (exit 0), and the same program
     // with the import is clean.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-tracker-import");
     let program = |import: &str| {
         format!(
@@ -11503,7 +11845,7 @@ rule work_ready_item
     fs::write(&without, program("")).expect("write workflow");
     fs::write(&with, program("use std.tracker\n\n")).expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11537,6 +11879,7 @@ fn lint_advises_std_ingress_import_for_signal_programs() {
     // declarations / external sources without the import warn (exit 0), and
     // the same program with the import is clean.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-ingress-import");
     fs::create_dir_all(&dir).expect("create dir");
     let program = |import: &str| {
@@ -11567,7 +11910,7 @@ rule react
     fs::write(&without, program("")).expect("write workflow");
     fs::write(&with, program("use std.ingress\n\n")).expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11602,6 +11945,7 @@ rule react
 #[test]
 fn check_rejects_unknown_source_provider_kind() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("source-kind-known");
     fs::create_dir_all(&dir).expect("create dir");
     let program = |kind: &str, clause: &str| {
@@ -11639,7 +11983,7 @@ rule react
     };
     let unknown = dir.join("unknown-kind.whip");
     fs::write(&unknown, program("webhook", "")).expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", unknown.to_str().expect("utf-8")])
         .output()
         .expect("whip check runs");
@@ -11655,7 +11999,7 @@ rule react
 
     let known = dir.join("known-kind.whip");
     fs::write(&known, program("file", "  path \"./inbox.txt\"\n")).expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", known.to_str().expect("utf-8")])
         .output()
         .expect("whip check runs");
@@ -11711,13 +12055,14 @@ rule done
 #[test]
 fn agent_provider_kinds_are_registry_derived() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("agent-provider-registry");
     fs::create_dir_all(&dir).expect("create temp dir");
 
     // Embedded contribution: `fixture` comes from std.agent's manifest rows.
     let known = dir.join("known.whip");
     fs::write(&known, agent_provider_workflow("", "fixture")).expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", known.to_str().expect("utf-8")])
         .output()
         .expect("check runs");
@@ -11731,7 +12076,7 @@ fn agent_provider_kinds_are_registry_derived() {
     // package.
     let unknown = dir.join("unknown.whip");
     fs::write(&unknown, agent_provider_workflow("", "robo")).expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", unknown.to_str().expect("utf-8")])
         .output()
         .expect("check runs");
@@ -11765,8 +12110,9 @@ fn agent_provider_kinds_are_registry_derived() {
     )
     .expect("write manifest");
     let lock = dir.join("whip.lock");
-    run_text(
+    run_text_isolated(
         bin,
+        &stores,
         &[
             "package",
             "lock",
@@ -11775,7 +12121,7 @@ fn agent_provider_kinds_are_registry_derived() {
             manifest.to_str().expect("utf-8 manifest"),
         ],
     );
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "check",
             "--package-lock",
@@ -11800,6 +12146,7 @@ fn agent_provider_kinds_are_registry_derived() {
 #[test]
 fn agent_requires_validates_against_provider_feature_report() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("agent-requires-report");
     fs::create_dir_all(&dir).expect("create temp dir");
 
@@ -11813,7 +12160,7 @@ fn agent_requires_validates_against_provider_feature_report() {
         ),
     )
     .expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", unsupported.to_str().expect("utf-8")])
         .output()
         .expect("check runs");
@@ -11835,7 +12182,7 @@ fn agent_requires_validates_against_provider_feature_report() {
         ),
     )
     .expect("write workflow");
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", satisfied.to_str().expect("utf-8")])
         .output()
         .expect("check runs");
@@ -11855,6 +12202,7 @@ fn agent_requires_validates_against_provider_feature_report() {
 #[test]
 fn lint_missing_agent_import_is_advisory_only() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("agent-import-lint");
     fs::create_dir_all(&dir).expect("create temp dir");
     let without = dir.join("without-import.whip");
@@ -11866,7 +12214,7 @@ fn lint_missing_agent_import_is_advisory_only() {
     )
     .expect("write workflow");
     let codes = |path: &Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -11898,10 +12246,11 @@ fn coercion_status_reports_fixture_rung_and_fingerprint() {
     // fixture path reports provider `fixture`, selecting rung 4, and the
     // literal `fixture` fingerprint — and never a credential.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("coercion-status");
     let store = dir.join("store.sqlite3");
     let status = |store_path: &Path| -> Value {
-        let mut command = Command::new(bin);
+        let mut command = whip(bin, &stores);
         command.args([
             "--store",
             store_path.to_str().expect("utf-8"),
@@ -11960,6 +12309,7 @@ fn lint_flags_unused_coerce_result() {
     // (`lint.coerce_result_unused`); the same coerce with its result handled by an
     // `after <binding>` block is not.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-coerce-result");
 
     let program = |body: &str| {
@@ -12005,7 +12355,7 @@ rule run
     .expect("write workflow");
 
     let codes = |path: &std::path::Path| -> Vec<String> {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", path.to_str().expect("present")])
             .output()
             .expect("lint runs");
@@ -12037,6 +12387,7 @@ fn lint_findings_carry_declaration_spans() {
     // so editors and the CLI can point at it. Here the dead coerce's `range` must
     // start on the line where `coerce assessDead` is declared.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint");
     let wf = dir.join("lint.whip");
     let source = r#"workflow LintDemo
@@ -12070,7 +12421,7 @@ rule run
         .position(|line| line.starts_with("coerce assessDead"))
         .expect("dead coerce line") as u64;
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
@@ -12135,6 +12486,7 @@ fn lint_flags_deep_after_nesting() {
     // A rule nesting `after` blocks ≥4 levels deep is flagged (suggest a `flow`); a
     // shallow chain is not.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-deep");
     // n levels of nested `after`, each behind its own coerce.
     let nest = |levels: usize| -> String {
@@ -12155,7 +12507,7 @@ fn lint_flags_deep_after_nesting() {
     let codes = |levels: usize| -> Vec<String> {
         let wf = dir.join("deep.whip");
         fs::write(&wf, nest(levels)).expect("write workflow");
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("lint runs");
@@ -12188,12 +12540,13 @@ fn lint_flags_deep_after_nesting() {
 #[test]
 fn lint_flags_unprotected_readmission_hazard() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-readmission");
 
     let codes = |name: &str, source: &str| -> Vec<String> {
         let wf = dir.join(format!("{name}.whip"));
         fs::write(&wf, source).expect("write workflow");
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("lint runs");
@@ -12363,6 +12716,7 @@ fn lint_discovers_directory_sources_and_aggregates() {
     // the multi-source JSON uses a `reports` array, and a denied finding in any file
     // fails the run.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-dir");
     let program = |orphan: &str| {
         format!(
@@ -12388,7 +12742,7 @@ rule run
     fs::write(dir.join("b.whip"), program("OrphanB")).expect("write b");
 
     // Directory discovery → a `reports` array with one entry per file.
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", dir.to_str().expect("present")])
         .output()
         .expect("lint runs");
@@ -12400,7 +12754,7 @@ rule run
     assert_eq!(reports.len(), 2, "one report per discovered file: {report}");
 
     // A denied finding in any discovered file fails the whole run.
-    let denied = Command::new(bin)
+    let denied = whip(bin, &stores)
         .args([
             "lint",
             "--deny",
@@ -12422,6 +12776,7 @@ fn lint_flags_broad_file_grant() {
     // A file-store grant that matches everything under the root (`**`) is flagged;
     // a scoped glob (`docs/**`) is not.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-grant");
 
     let program = |glob: &str| {
@@ -12456,7 +12811,7 @@ rule pick
     let codes = |glob: &str| -> Vec<String> {
         let wf = dir.join("store.whip");
         fs::write(&wf, program(glob)).expect("write workflow");
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("lint runs");
@@ -12486,6 +12841,7 @@ rule pick
 fn lint_rule_selection_restricts_to_named_rules() {
     // `--rule <id>` runs only the named rule(s); other findings are not emitted.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-rule");
     let wf = dir.join("multi.whip");
     // Two findings: an unused class (Orphan) and an unused coerce result (verdict).
@@ -12527,7 +12883,7 @@ rule run
         let mut full = vec!["--json", "lint"];
         full.extend_from_slice(args);
         full.push(wf.to_str().expect("present"));
-        let output = Command::new(bin).args(&full).output().expect("lint runs");
+        let output = whip(bin, &stores).args(&full).output().expect("lint runs");
         let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
         let mut found: Vec<String> = report
             .get("findings")
@@ -12558,10 +12914,11 @@ rule run
 fn lint_deny_action_exits_nonzero() {
     // `--deny <id>` reports the finding and fails the run; the default `warn` does not.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-deny");
     let wf = lint_actions_workflow(&dir);
 
-    let warn = Command::new(bin)
+    let warn = whip(bin, &stores)
         .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
@@ -12570,7 +12927,7 @@ fn lint_deny_action_exits_nonzero() {
         "default action does not fail the run"
     );
 
-    let deny = Command::new(bin)
+    let deny = whip(bin, &stores)
         .args([
             "lint",
             "--deny",
@@ -12588,10 +12945,11 @@ fn lint_deny_action_exits_nonzero() {
 fn lint_allow_action_suppresses_finding() {
     // `--allow <id>` suppresses the finding entirely (not emitted, exit 0).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-allow");
     let wf = lint_actions_workflow(&dir);
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "--json",
             "lint",
@@ -12619,6 +12977,7 @@ fn lint_allow_action_suppresses_finding() {
 fn lint_config_file_applies_and_cli_overrides() {
     // A project `whip.lint.json` can deny a rule; a CLI `--allow` overrides it.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-config");
     let wf = lint_actions_workflow(&dir);
     fs::write(
@@ -12627,13 +12986,13 @@ fn lint_config_file_applies_and_cli_overrides() {
     )
     .expect("write lint config");
 
-    let config_deny = Command::new(bin)
+    let config_deny = whip(bin, &stores)
         .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
     assert!(!config_deny.status.success(), "config deny fails the run");
 
-    let cli_override = Command::new(bin)
+    let cli_override = whip(bin, &stores)
         .args([
             "lint",
             "--allow",
@@ -12655,6 +13014,7 @@ fn lint_invalid_config_is_internal_error() {
     // An invalid `whip.lint.json` is a `lint.internal` infrastructure error (exit
     // nonzero), distinct from a lint finding.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-badconfig");
     let wf = lint_actions_workflow(&dir);
     fs::write(
@@ -12663,7 +13023,7 @@ fn lint_invalid_config_is_internal_error() {
     )
     .expect("write lint config");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["lint", wf.to_str().expect("present")])
         .output()
         .expect("lint runs");
@@ -12681,6 +13041,7 @@ fn lsp_publishes_lint_findings_as_diagnostics() {
     // source + the `lint.*` code), at the finding's own severity (a warning → LSP
     // severity 2), each pointing at the offending declaration.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     // A valid program whose `Orphan` class is never referenced.
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nclass Orphan {\\n  x string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
@@ -12691,7 +13052,7 @@ fn lsp_publishes_lint_findings_as_diagnostics() {
     ));
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -12729,6 +13090,7 @@ fn lint_flags_unused_coordination_resources() {
     // Like coerce, coordination resources are only usable in-program, so an
     // unreferenced one is dead (no false positives). A referenced one is not flagged.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-res");
     let wf = dir.join("lint_res.whip");
     fs::write(
@@ -12790,7 +13152,7 @@ rule drain
     )
     .expect("write lint-res workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
@@ -12843,6 +13205,7 @@ fn lint_flags_noop_rule_with_empty_body() {
     // `whip lint` flags a rule whose body is empty (it fires but does nothing — a
     // forgotten body) and does not flag a rule that produces output.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-noop");
     let wf = dir.join("lint_noop.whip");
     fs::write(
@@ -12876,7 +13239,7 @@ rule records
     )
     .expect("write lint-noop workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
@@ -12910,6 +13273,7 @@ fn lint_flags_unused_class_and_enum_types() {
     // dead (no false positives); synthetic lowering-generated types (never in the
     // source) are excluded.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-types");
     let wf = dir.join("lint_types.whip");
     fs::write(
@@ -12955,7 +13319,7 @@ rule r
     )
     .expect("write lint-types workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "lint", wf.to_str().expect("present")])
         .output()
         .expect("whip lint runs");
@@ -12999,6 +13363,7 @@ fn lsp_publishes_diagnostics_on_did_open() {
     // it with framed JSON-RPC and assert it answers initialize and reports the
     // compile error (live error squiggles reuse the `whip check` compiler).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -13009,7 +13374,7 @@ fn lsp_publishes_diagnostics_on_did_open() {
     input += &frame(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#);
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13044,6 +13409,7 @@ fn lsp_returns_document_symbols() {
     // After opening a document, `textDocument/documentSymbol` returns the top-level
     // declarations (the editor outline), reusing the parser's `document_symbols`.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule handle\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13056,7 +13422,7 @@ fn lsp_returns_document_symbols() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13092,6 +13458,7 @@ fn lsp_go_to_definition_resolves_top_level_name() {
     // `class Ticket` on lines 1-3). Top-level names are program-unique, so the
     // name match is the definition.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13104,7 +13471,7 @@ fn lsp_go_to_definition_resolves_top_level_name() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13134,6 +13501,7 @@ fn lsp_cross_file_definition_and_workspace_symbol() {
     // file, and workspace/symbol indexes every `.whip` file on disk (not just open
     // documents). Here `b.whip` references `class Ticket` declared in `a.whip`.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let dir =
         std::env::temp_dir().join(format!("whip-lsp-xfile-{}-{}", std::process::id(), line!()));
@@ -13166,7 +13534,7 @@ fn lsp_cross_file_definition_and_workspace_symbol() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13201,6 +13569,7 @@ fn lsp_hover_shows_declaration_source() {
     // `textDocument/hover` on a reference shows the target declaration's source, so
     // hovering the `Ticket` reference reveals `class Ticket { ... }`.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13213,7 +13582,7 @@ fn lsp_hover_shows_declaration_source() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13240,6 +13609,7 @@ fn lsp_completion_offers_keywords_and_declared_symbols() {
     // `textDocument/completion` returns a flat candidate list: language keywords
     // plus the document's declared top-level names (editors filter by prefix).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\n";
     let mut input = String::new();
@@ -13252,7 +13622,7 @@ fn lsp_completion_offers_keywords_and_declared_symbols() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13285,6 +13655,7 @@ fn lsp_find_references_lists_all_occurrences() {
     // top-level symbol under the cursor (here `Ticket`: its declaration on line 1
     // and the `when Ticket` reference on line 5).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13297,7 +13668,7 @@ fn lsp_find_references_lists_all_occurrences() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13331,6 +13702,7 @@ fn lsp_rename_edits_code_occurrences_but_not_strings() {
     // `Ticket` appears twice in code (declaration + `when`) and once in a prompt;
     // only the two code occurrences are renamed.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nagent a {\\n  provider fixture\\n  capacity 1\\n}\\nrule r\\n  when Ticket as t\\n  when a is available\\n=> {\\n  tell a \\\"\\\"\\\"Look at this Ticket now.\\\"\\\"\\\"\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13343,7 +13715,7 @@ fn lsp_rename_edits_code_occurrences_but_not_strings() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13373,6 +13745,7 @@ fn lsp_formatting_returns_whole_document_edit() {
     // `textDocument/formatting` formats via the comment-preserving formatter and
     // returns a whole-document edit when the source is not already canonical.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     // Six-space field indent — non-canonical, so formatting yields an edit.
     let text = "workflow Demo\\nclass Ticket {\\n      id string\\n}\\n";
@@ -13386,7 +13759,7 @@ fn lsp_formatting_returns_whole_document_edit() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13414,6 +13787,7 @@ fn lsp_document_highlight_marks_all_occurrences() {
     // `textDocument/documentHighlight` marks every occurrence of the symbol under
     // the cursor (here `Ticket`: its declaration and the `when` reference).
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13426,7 +13800,7 @@ fn lsp_document_highlight_marks_all_occurrences() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13456,6 +13830,7 @@ fn lsp_workspace_symbol_indexes_open_documents() {
     // two documents are open; an empty query returns symbols from both, proving the
     // index spans documents rather than a single file.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text_a = "workflow A\\nclass Ticket {\\n  id string\\n}\\n";
     let text_b = "workflow B\\nclass Order {\\n  id string\\n}\\n";
@@ -13476,7 +13851,7 @@ fn lsp_workspace_symbol_indexes_open_documents() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = Command::new(bin)
+    let mut child = whip(bin, &stores)
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -13519,6 +13894,7 @@ fn test_harness_supports_per_agent_stub_outcomes() {
     // fires and records); the failing agent's turn does not (its rule never
     // fires) — both `agent.tell completed` and `agent.tell failed` are present.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-per-agent");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -13592,7 +13968,7 @@ test "alpha succeeds, beta fails" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -13621,6 +13997,7 @@ fn test_harness_stub_settles_agent_turns_and_outcome_changes_behavior() {
     // fires and the workflow stays running) — proving the outcome is not
     // cosmetic.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-stub");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -13682,7 +14059,7 @@ test "fails stub blocks completion" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -13742,6 +14119,7 @@ fn test_harness_projects_over_dotted_runtime_facts() {
     // facts. Matching is exact: a failed turn produces `agent.turn.failed`, so
     // `agent.turn.completed exists` must fail there — never a substring match.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-dotted");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -13803,7 +14181,7 @@ test "dotted matching is exact" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -13860,6 +14238,7 @@ fn test_harness_evaluates_diagnostic_expects() {
     // diagnostic with code `nonzero_exit`; a `succeeds` run records none, so the
     // same expectation must fail there — never a false pass.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-diag");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -13917,7 +14296,7 @@ test "successful run records no such diagnostic" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -13961,6 +14340,7 @@ fn test_harness_run_for_n_steps_bounds_execution() {
     // so `run for 1 steps` leaves the workflow running — proving the bound is
     // real and not silently run-to-idle.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-steps");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -14029,7 +14409,7 @@ test "one step is not yet complete" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -14072,6 +14452,7 @@ fn test_harness_evaluates_effect_and_no_effect_expects() {
     // a `fails` stub leaves `agent.tell` failed; and `expect no agent.tell` when
     // one was requested must fail — never a false pass.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-effect");
     let wf = dir.join("wf.whip");
     fs::write(
@@ -14139,7 +14520,7 @@ test "expect no agent.tell is false here" {
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["--json", "test", wf.to_str().expect("present")])
         .output()
         .expect("whip test runs");
@@ -14177,6 +14558,7 @@ fn test_harness_seeds_given_fact_and_given_input() {
     // declared input fact). Both must flow through the guard: a value that
     // matches fires the rule; a value that does not is filtered.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("harness-given");
 
     // `given fact`: workflow with no input contract, rule keyed on a fact.
@@ -14282,7 +14664,7 @@ test "input violating the contract is invalid" {
     .expect("write input workflow");
 
     let status_of = |path: &std::path::Path, id: &str| {
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "test", path.to_str().expect("present")])
             .output()
             .expect("whip test runs");
@@ -14326,13 +14708,14 @@ test "input violating the contract is invalid" {
 #[test]
 fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("fmt");
 
     // A comment-free file in non-canonical form: `fmt --check` reports it, then
     // `fmt` rewrites it, then it is idempotent.
     let plain = dir.join("plain.whip");
     fs::write(&plain, "workflow Demo\nclass Task {\n  title string\n}\n").expect("write plain");
-    let check = Command::new(bin)
+    let check = whip(bin, &stores)
         .args(["fmt", "--check", plain.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14341,7 +14724,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "non-canonical file should fail --check"
     );
 
-    let format = Command::new(bin)
+    let format = whip(bin, &stores)
         .args(["fmt", plain.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14349,7 +14732,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         format.status.success(),
         "fmt should succeed on a comment-free file"
     );
-    let recheck = Command::new(bin)
+    let recheck = whip(bin, &stores)
         .args(["fmt", "--check", plain.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14366,7 +14749,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     let original =
         "# keep me\nworkflow Demo2\n\nclass Task {  # header comment\n  title string\n}\n";
     fs::write(&commented, original).expect("write commented");
-    let refused = Command::new(bin)
+    let refused = whip(bin, &stores)
         .args(["fmt", commented.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14390,7 +14773,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "workflow Demo8  # the entry point\n\nclass Task {\n  title string\n}\n",
     )
     .expect("write top_trailing");
-    let top_fmt = Command::new(bin)
+    let top_fmt = whip(bin, &stores)
         .args(["fmt", top_trailing.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14405,7 +14788,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
             .contains("workflow Demo8  # the entry point"),
         "top-level trailing comment was dropped"
     );
-    let top_recheck = Command::new(bin)
+    let top_recheck = whip(bin, &stores)
         .args(["fmt", "--check", top_trailing.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14422,7 +14805,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "# file header\nworkflow Demo4\n# explains the class\nclass Task {\n  title string\n}\n",
     )
     .expect("write leading");
-    let leading_fmt = Command::new(bin)
+    let leading_fmt = whip(bin, &stores)
         .args(["fmt", leading.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14436,7 +14819,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         leading_out.contains("# file header") && leading_out.contains("# explains the class"),
         "leading comments were dropped:\n{leading_out}"
     );
-    let leading_recheck = Command::new(bin)
+    let leading_recheck = whip(bin, &stores)
         .args(["fmt", "--check", leading.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14452,7 +14835,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "workflow Demo5\noutput result D\nclass D {\n  x string\n}\nrule r\n  when started\n=> {\n  # note inside the body\n  complete result {\n    x \"y\"\n  }\n}\n",
     )
     .expect("write body_comment");
-    let body_fmt = Command::new(bin)
+    let body_fmt = whip(bin, &stores)
         .args(["fmt", body_comment.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14484,7 +14867,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "file store docs {\n  # the root dir\n  root \"./docs\"\n  allow read [\"*.md\"]  # markdown only\n}\n",
     );
     fs::write(&class_comment, class_src).expect("write class_comment");
-    let class_fmt = Command::new(bin)
+    let class_fmt = whip(bin, &stores)
         .args(["fmt", class_comment.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14514,7 +14897,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
             "body comment `{marker}` was dropped:\n{class_out}"
         );
     }
-    let class_recheck = Command::new(bin)
+    let class_recheck = whip(bin, &stores)
         .args(["fmt", "--check", class_comment.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14529,7 +14912,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
     let nested = dir.join("nested_enum.whip");
     let nested_src = "workflow Demo7\nenum E {\n  Data {\n    # the id\n    id string\n    score int  # the score\n  }\n}\n";
     fs::write(&nested, nested_src).expect("write nested_enum");
-    let nested_fmt = Command::new(bin)
+    let nested_fmt = whip(bin, &stores)
         .args(["fmt", nested.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14543,7 +14926,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         nested_out.contains("# the id") && nested_out.contains("score int  # the score"),
         "nested enum-variant comments were dropped:\n{nested_out}"
     );
-    let nested_recheck = Command::new(bin)
+    let nested_recheck = whip(bin, &stores)
         .args(["fmt", "--check", nested.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14564,7 +14947,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         "  tell worker \"\"\"markdown\n  # Heading\n    indented\n  \"\"\"\n}\n",
     );
     fs::write(&multiline, multiline_src).expect("write multiline");
-    let format_ml = Command::new(bin)
+    let format_ml = whip(bin, &stores)
         .args(["fmt", multiline.to_str().expect("present")])
         .output()
         .expect("fmt runs");
@@ -14579,7 +14962,7 @@ fn fmt_preserves_placeable_comments_and_refuses_unplaceable_ones() {
         formatted_ml.contains("  # Heading\n    indented\n"),
         "fmt corrupted multi-line string content:\n{formatted_ml}"
     );
-    let recheck_ml = Command::new(bin)
+    let recheck_ml = whip(bin, &stores)
         .args(["fmt", "--check", multiline.to_str().expect("present")])
         .output()
         .expect("fmt --check runs");
@@ -14603,12 +14986,13 @@ fn fmt_is_non_destructive_across_every_example() {
     // passes the idempotency check while destroying the body. The structure check
     // catches that.)
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("fmt-corpus");
     let examples_dir = format!("{}/../../examples", env!("CARGO_MANIFEST_DIR"));
     // Compile a file and project its IR to the sorted set of `rule`/`class` lines,
     // or `None` if it does not compile bare (e.g. needs `--root`/a lock).
     let compile_structure = |file: &str| -> Option<Vec<String>> {
-        let out = Command::new(bin).args(["compile", file]).output().ok()?;
+        let out = whip(bin, &stores).args(["compile", file]).output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -14649,13 +15033,13 @@ fn fmt_is_non_destructive_across_every_example() {
         fs::write(&scratch, &original).expect("write scratch");
         let scratch_str = scratch.to_str().expect("utf-8");
 
-        let format = Command::new(bin)
+        let format = whip(bin, &stores)
             .args(["fmt", scratch_str])
             .output()
             .expect("fmt runs");
         if format.status.success() {
             // Formatted: a second pass must report nothing (idempotent).
-            let recheck = Command::new(bin)
+            let recheck = whip(bin, &stores)
                 .args(["fmt", "--check", scratch_str])
                 .output()
                 .expect("fmt --check runs");
@@ -14694,6 +15078,7 @@ fn fmt_is_non_destructive_across_every_example() {
 #[test]
 fn check_discovers_lock_relative_to_workflow_file() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     // The lock lives beside the workflow, but the command runs from an unrelated
     // working directory with no lock in its ancestry. Discovery must walk up from
     // the workflow file's directory, not just the cwd.
@@ -14701,7 +15086,7 @@ fn check_discovers_lock_relative_to_workflow_file() {
     let project_dir = unique_temp_dir("lock-relative-project");
     let workflow_path = write_locked_notes_project(bin, &project_dir);
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .current_dir(&neutral_cwd)
         .args(["check", workflow_path.to_str().expect("utf-8 workflow")])
         .output()
@@ -14723,6 +15108,7 @@ fn check_lock_away_from_project_root_gives_actionable_hint() {
     // lock used away from the project root cannot reach its manifests. The error
     // should say so, not just "file not found".
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let project = unique_temp_dir("lock-hint-project");
     let workflow = write_locked_notes_project(bin, &project);
     // Copy the generated lock into a sibling dir where `source.path` won't resolve.
@@ -14730,7 +15116,7 @@ fn check_lock_away_from_project_root_gives_actionable_hint() {
     let misplaced = elsewhere.join("whip.lock");
     fs::copy(project.join("whip.lock"), &misplaced).expect("copy lock elsewhere");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "check",
             "--package-lock",
@@ -14753,6 +15139,7 @@ fn check_lock_away_from_project_root_gives_actionable_hint() {
 #[test]
 fn check_rejects_sources_implying_different_locks() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     // Two workflows under two project roots, each with its own lock. Checking both
     // at once cannot pick a single lock, so the command must fail and demand
     // `--package-lock`.
@@ -14762,7 +15149,7 @@ fn check_rejects_sources_implying_different_locks() {
     let workflow_a = write_locked_notes_project(bin, &project_a);
     let workflow_b = write_locked_notes_project(bin, &project_b);
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .current_dir(&neutral_cwd)
         .args([
             "check",
@@ -14789,6 +15176,7 @@ fn check_rejects_sources_implying_different_locks() {
 #[test]
 fn check_resolves_embedded_memory_then_coexists_with_discovered_lock() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     // A project directory holding the workflow, its manifest copy, and the lock.
     let project_dir = {
         let nanos = SystemTime::now()
@@ -14852,7 +15240,7 @@ rule recall_before_work
     // (M5), so `use std.memory` + `recall` resolves from the binary itself — check
     // passes with no supply chain. (The no-lock guard for genuinely non-embedded
     // packages is covered by `package_lock_supplies_package_import_registry`.)
-    let absent = Command::new(bin)
+    let absent = whip(bin, &stores)
         .current_dir(&project_dir)
         .args(["check", "wf.whip"])
         .output()
@@ -14874,8 +15262,9 @@ rule recall_before_work
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
     let manifest_copy = project_dir.join("notes.json");
     fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
-    run_text(
+    run_text_isolated(
         bin,
+        &stores,
         &[
             "package",
             "lock",
@@ -14884,7 +15273,7 @@ rule recall_before_work
             manifest_copy.to_str().expect("utf-8 manifest"),
         ],
     );
-    let discovered = Command::new(bin)
+    let discovered = whip(bin, &stores)
         .current_dir(&project_dir)
         .args(["check", "wf.whip"])
         .output()
@@ -14902,6 +15291,7 @@ rule recall_before_work
 #[test]
 fn tampered_manifest_fails_lock_load_with_stable_kind() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let project_dir = {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -14949,8 +15339,9 @@ rule recall_before_work
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
     let manifest_copy = project_dir.join("notes.json");
     fs::copy(&notes_manifest, &manifest_copy).expect("copy manifest beside lock");
-    run_text(
+    run_text_isolated(
         bin,
+        &stores,
         &[
             "package",
             "lock",
@@ -14966,7 +15357,7 @@ rule recall_before_work
     tampered.push_str("\n ");
     fs::write(&manifest_copy, tampered).expect("write tampered manifest");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .current_dir(&project_dir)
         .args(["--json", "check", "wf.whip"])
         .output()
@@ -15000,6 +15391,7 @@ rule recall_before_work
 #[test]
 fn package_lock_refuses_reserved_std_manifest() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lock-reserved-std");
     // A manifest claiming the reserved namespace: rename the notes example.
     let manifest_json = fs::read_to_string(
@@ -15010,7 +15402,7 @@ fn package_lock_refuses_reserved_std_manifest() {
     let manifest_path = dir.join("std-something.json");
     fs::write(&manifest_path, manifest_json).expect("write manifest");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "package",
             "lock",
@@ -15138,8 +15530,9 @@ rule recall
 "#,
     )
     .expect("manifest writes");
-    run_text(
+    run_text_isolated(
         bin,
+        &store_path,
         &[
             "package",
             "lock",
@@ -15149,8 +15542,9 @@ rule recall
         ],
     );
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15169,8 +15563,9 @@ rule recall
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15187,8 +15582,9 @@ rule recall
         .iter()
         .any(|fact| fact.get("name").and_then(Value::as_str) == Some("capability.call.succeeded")));
 
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15211,6 +15607,7 @@ rule recall
 #[test]
 fn check_rejects_removed_emit_statement() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let workflow_path = temp_workflow_path("event-emit-removed");
     fs::write(
         &workflow_path,
@@ -15230,7 +15627,7 @@ rule emit_heartbeat
     )
     .expect("workflow writes");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "check",
             workflow_path.to_str().expect("utf-8 workflow path"),
@@ -15276,8 +15673,9 @@ workflow WorkflowComplete {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15292,8 +15690,9 @@ workflow WorkflowComplete {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15323,8 +15722,9 @@ workflow WorkflowComplete {
             .and_then(Value::as_str),
         Some("result")
     );
-    let events = run_json(
+    let events = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15369,8 +15769,9 @@ workflow ScalarComplete {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15385,8 +15786,9 @@ workflow ScalarComplete {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15482,8 +15884,9 @@ workflow Other {{
     )
     .expect("write root bundle");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15500,8 +15903,9 @@ workflow Other {{
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15529,8 +15933,9 @@ fn dev_reports_the_final_instance_outcome() {
     // `whip run` prints the final instance status so a run's result is visible without
     // a separate `whip status`. minimal-noop completes and says so.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
 
-    let completed = Command::new(bin)
+    let completed = whip(bin, &stores)
         .args([
             "--store",
             temp_store_path().to_str().expect("present"),
@@ -15582,8 +15987,9 @@ workflow WorkflowInput {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15600,8 +16006,9 @@ workflow WorkflowInput {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15629,7 +16036,7 @@ workflow WorkflowInput {
                 == Some("p1")
     }));
 
-    let invalid = Command::new(bin)
+    let invalid = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15651,7 +16058,7 @@ workflow WorkflowInput {
 
     // A missing input names the expected type and shows the expected object shape, so
     // a caller who forgot the input-name nesting can see what to provide.
-    let missing = Command::new(bin)
+    let missing = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15712,8 +16119,9 @@ workflow PatternApplication {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15730,8 +16138,9 @@ workflow PatternApplication {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15810,8 +16219,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15830,8 +16240,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15852,8 +16263,9 @@ workflow Child {
                 .and_then(Value::as_str)
                 == Some("Invoke smoke")
     }));
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15963,8 +16375,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -15983,8 +16396,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16094,8 +16508,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16112,8 +16527,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let first_step = run_json(
+    let first_step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16131,8 +16547,9 @@ workflow Child {
         Some(1)
     );
 
-    let first_worker = run_json(
+    let first_worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16151,8 +16568,9 @@ workflow Child {
         first_worker.get("ran_effects").and_then(Value::as_u64),
         Some(1)
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16165,8 +16583,9 @@ workflow Child {
         effect.get("kind").and_then(Value::as_str) == Some("workflow.invoke")
             && effect.get("status").and_then(Value::as_str) == Some("running")
     }));
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16181,8 +16600,9 @@ workflow Child {
         .filter_map(|instance| instance.get("instance_id").and_then(Value::as_str))
         .find(|candidate| *candidate != instance_id)
         .expect("child instance id");
-    let parent_status = run_json(
+    let parent_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16191,8 +16611,9 @@ workflow Child {
             instance_id,
         ],
     );
-    let child_status = run_json(
+    let child_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16220,8 +16641,9 @@ workflow Child {
         Some(instance_id)
     );
 
-    let second_worker = run_json(
+    let second_worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16238,8 +16660,9 @@ workflow Child {
         second_worker.get("ran_effects").and_then(Value::as_u64),
         Some(1)
     );
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16253,8 +16676,9 @@ workflow Child {
             && effect.get("status").and_then(Value::as_str) == Some("completed")
     }));
 
-    let second_step = run_json(
+    let second_step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16271,8 +16695,9 @@ workflow Child {
         second_step.get("facts_created").and_then(Value::as_u64),
         Some(1)
     );
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16415,8 +16840,9 @@ workflow Child {
     )
     .expect("v2 workflow writes");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16433,8 +16859,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("parent instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16447,8 +16874,9 @@ workflow Child {
             "Parent",
         ],
     );
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16463,8 +16891,9 @@ workflow Child {
             "0",
         ],
     );
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16481,8 +16910,9 @@ workflow Child {
         .expect("child instance id")
         .to_owned();
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16495,8 +16925,9 @@ workflow Child {
         ],
     );
 
-    let parent_status = run_json(
+    let parent_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16541,8 +16972,9 @@ workflow Child {
         Some("running")
     );
 
-    let worker = run_json(
+    let worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16556,8 +16988,9 @@ workflow Child {
         ],
     );
     assert_eq!(worker.get("ran_effects").and_then(Value::as_u64), Some(1));
-    let repeat_worker = run_json(
+    let repeat_worker = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16575,8 +17008,9 @@ workflow Child {
         Some(0)
     );
 
-    let parent_status = run_json(
+    let parent_status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16591,8 +17025,9 @@ workflow Child {
             .and_then(Value::as_str),
         Some("completed")
     );
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16695,8 +17130,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16713,8 +17149,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16727,8 +17164,9 @@ workflow Child {
             "Parent",
         ],
     );
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16743,8 +17181,9 @@ workflow Child {
             "0",
         ],
     );
-    let instances = run_json(
+    let instances = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16759,8 +17198,9 @@ workflow Child {
         .filter_map(|instance| instance.get("instance_id").and_then(Value::as_str))
         .find(|candidate| *candidate != instance_id)
         .expect("child instance id");
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16769,8 +17209,9 @@ workflow Child {
             child_id,
         ],
     );
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16784,8 +17225,9 @@ workflow Child {
         ],
     );
 
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16798,8 +17240,9 @@ workflow Child {
         effect.get("kind").and_then(Value::as_str) == Some("workflow.invoke")
             && effect.get("status").and_then(Value::as_str) == Some("cancelled")
     }));
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16812,8 +17255,9 @@ workflow Child {
             "Parent",
         ],
     );
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16900,8 +17344,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -16920,8 +17365,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17013,8 +17459,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17033,8 +17480,9 @@ workflow Child {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let effects = run_json(
+    let effects = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17047,8 +17495,9 @@ workflow Child {
         effect.get("kind").and_then(Value::as_str) == Some("workflow.invoke")
             && effect.get("status").and_then(Value::as_str) == Some("timed_out")
     }));
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17111,8 +17560,9 @@ workflow WorkflowFail {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17127,8 +17577,9 @@ workflow WorkflowFail {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17152,8 +17603,9 @@ workflow WorkflowFail {
         Some("failed")
     );
     assert_eq!(status.get("failure_count").and_then(Value::as_i64), Some(0));
-    let events = run_json(
+    let events = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17177,8 +17629,9 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17209,8 +17662,9 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17244,8 +17698,9 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
     assert!(!arguments_json.contains("target/dogfood/language/codex-french.txt"));
     assert!(!arguments_json.contains("fixture completed"));
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17273,8 +17728,9 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17440,8 +17896,9 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17557,8 +18014,9 @@ rule start_denied_work
         // before any app-server I/O. Supply a harmless transport and explicit
         // model so this test exercises that boundary on clean CI hosts too.
         let dev = if provider == "codex" {
-            run_json_with_env(
+            run_json_with_env_isolated(
                 bin,
+                &store_path,
                 &args,
                 &[
                     ("WHIPPLESCRIPT_CODEX_APP_SERVER_COMMAND", "/bin/cat"),
@@ -17566,14 +18024,15 @@ rule start_denied_work
                 ],
             )
         } else {
-            run_json(bin, &args)
+            run_json_isolated(bin, &store_path, &args)
         };
         let instance_id = dev
             .get("instance_id")
             .and_then(Value::as_str)
             .expect("instance id");
-        let runs = run_json(
+        let runs = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -17595,8 +18054,9 @@ rule start_denied_work
             Some("failed")
         );
 
-        let log = run_json(
+        let log = run_json_isolated(
             bin,
+            &store_path,
             &[
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -17631,8 +18091,9 @@ fn dev_incident_router_routes_with_agentref_metadata() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("incident-router.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17657,8 +18118,9 @@ fn dev_incident_router_routes_with_agentref_metadata() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17700,8 +18162,9 @@ fn dev_runs_the_expression_kernel_golden_fixture() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("expression-kernel.whip");
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17725,8 +18188,9 @@ fn dev_runs_the_expression_kernel_golden_fixture() {
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17826,8 +18290,9 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17851,8 +18316,9 @@ rule route
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -17927,8 +18393,9 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18050,13 +18517,14 @@ rule classify_request
     }
     args.extend(["--until", "idle"]);
 
-    let dev = run_json(bin, &args);
+    let dev = run_json_isolated(bin, &store_path, &args);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18160,8 +18628,9 @@ rule accept_task
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18188,6 +18657,7 @@ rule accept_task
 #[test]
 fn check_accepts_duration_and_time_ordering() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = temp_workflow_path("duration-time-ordering-check");
     fs::write(
         &source_path,
@@ -18217,7 +18687,7 @@ rule time_guard
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
@@ -18265,8 +18735,9 @@ rule seed
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18289,8 +18760,9 @@ rule seed
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18342,8 +18814,9 @@ rule accept
     )
     .expect("write source");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18385,8 +18858,9 @@ rule accept
         })
         .expect("commit external fact");
 
-    let step = run_json(
+    let step = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18408,8 +18882,9 @@ rule accept
                 .and_then(Value::as_str)
                 .is_some_and(|error| error.contains("invalid duration value `not-a-duration`"))
     }));
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18431,6 +18906,7 @@ rule accept
 #[test]
 fn check_rejects_invalid_duration_and_time_literals() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = temp_workflow_path("duration-time-invalid-literals");
     fs::write(
         &source_path,
@@ -18454,7 +18930,7 @@ rule seed
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
@@ -18469,9 +18945,10 @@ rule seed
 #[test]
 fn check_rejects_bad_effect_payload_arguments() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = example_path("invalid/bad-effect-payload.whip");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
@@ -18498,9 +18975,10 @@ fn check_rejects_bad_effect_payload_arguments() {
 #[test]
 fn check_rejects_bad_finite_domain_expressions() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let source_path = example_path("invalid/bad-finite-domain.whip");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args(["check", source_path.to_str().expect("utf-8 source path")])
         .output()
         .expect("command runs");
@@ -18567,8 +19045,9 @@ rule accept
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18603,8 +19082,9 @@ rule accept
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18664,7 +19144,7 @@ rule accept
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18736,8 +19216,9 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18795,8 +19276,9 @@ rule seed
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18897,8 +19379,9 @@ rule review
     )
     .expect("write source");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18916,8 +19399,9 @@ rule review
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -18943,8 +19427,9 @@ rule review
         Some("kernel")
     );
 
-    let evidence = run_json(
+    let evidence = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19006,7 +19491,7 @@ rule seed
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19161,8 +19646,9 @@ rule seed
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19180,8 +19666,9 @@ rule seed
             .count(),
         1
     );
-    let diagnostics = run_json(
+    let diagnostics = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19216,8 +19703,9 @@ rule seed
                 .and_then(Value::as_str)
                 .is_some_and(|message| message.contains("count(Seen) == 2"))
     }));
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19267,7 +19755,7 @@ rule seed
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19503,8 +19991,9 @@ rule seed
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19778,8 +20267,9 @@ rule seedFromInput
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -19918,8 +20408,9 @@ rule handle_setup_fact
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20026,8 +20517,9 @@ rule seed
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20139,8 +20631,9 @@ rule startNativeWork
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20312,7 +20805,7 @@ rule noop
         )
         .expect("write fixture");
 
-        let output = Command::new(bin)
+        let output = whip(bin, &store_path)
             .args([
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -20369,7 +20862,7 @@ rule noop
     )
     .expect("write fixture");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20581,7 +21074,7 @@ rule noop
             .with_extension("json");
         fs::write(&fixture_path, fixture.to_string()).expect("write fixture");
 
-        let output = Command::new(bin)
+        let output = whip(bin, &store_path)
             .args([
                 "--store",
                 store_path.to_str().expect("utf-8 temp path"),
@@ -20700,7 +21193,7 @@ rule seed
     )
     .expect("write fixture");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20897,8 +21390,9 @@ rule seed
     )
     .expect("write fixture");
 
-    let report = run_json(
+    let report = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -20983,7 +21477,7 @@ assert missing.value
     )
     .expect("write source");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21017,15 +21511,16 @@ assert missing.value
     let _ = fs::remove_file(source_path);
 }
 
-fn run_json(bin: &str, args: &[&str]) -> Value {
-    let text = run_text(bin, args);
-    serde_json::from_str(&text).expect("valid JSON output")
-}
-
-/// A `whip` command whose side stores are this test's own rather than the
+/// A `whip` command whose stores are this test's own rather than the
 /// process-global `.whipplescript/*.sqlite` defaults — see
 /// [`TempStorePath::side_store_env`] for why that matters under a parallel
 /// suite.
+///
+/// Every spawn in this file goes through here or one of the `*_isolated`
+/// runners below, so no test can depend on the process-global default. The
+/// env entries are applied first: a test that pins one store itself (an
+/// items store it later reads back through [`tracker_items`], say) still
+/// wins, since a later `.env` for the same name replaces this one.
 fn whip(bin: &str, store: &TempStorePath) -> Command {
     let mut command = Command::new(bin);
     for (name, path) in store.side_store_env() {
@@ -21034,7 +21529,7 @@ fn whip(bin: &str, store: &TempStorePath) -> Command {
     command
 }
 
-/// [`run_json`] over [`whip`]: same contract, isolated side stores.
+/// JSON stdout of a successful [`whip`] run.
 fn run_json_isolated(bin: &str, store: &TempStorePath, args: &[&str]) -> Value {
     let output = whip(bin, store).args(args).output().expect("command runs");
     assert!(
@@ -21046,8 +21541,15 @@ fn run_json_isolated(bin: &str, store: &TempStorePath, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("valid JSON output")
 }
 
-fn run_json_with_env(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Value {
-    let mut command = Command::new(bin);
+/// [`run_json_isolated`] plus test-supplied environment. `envs` is applied
+/// after the store overrides, so it may pin a store of its own.
+fn run_json_with_env_isolated(
+    bin: &str,
+    store: &TempStorePath,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Value {
+    let mut command = whip(bin, store);
     command.args(args);
     for (name, value) in envs {
         command.env(name, value);
@@ -21062,8 +21564,9 @@ fn run_json_with_env(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Value {
     serde_json::from_slice(&output.stdout).expect("valid JSON output")
 }
 
-fn run_text(bin: &str, args: &[&str]) -> String {
-    let output = Command::new(bin).args(args).output().expect("command runs");
+/// Raw stdout of a successful [`whip`] run.
+fn run_text_isolated(bin: &str, store: &TempStorePath, args: &[&str]) -> String {
+    let output = whip(bin, store).args(args).output().expect("command runs");
     assert!(
         output.status.success(),
         "command failed\nstdout:\n{}\nstderr:\n{}",
@@ -21126,21 +21629,28 @@ impl AsRef<std::ffi::OsStr> for TempStorePath {
 }
 
 impl TempStorePath {
-    /// The workspace-scoped side stores, redirected into this test's own
-    /// directory.
+    /// Every store the binary resolves relative to the workspace, redirected
+    /// into this test's own directory.
     ///
-    /// `--store` is per-test already, but the coordination, work-item and
-    /// content stores are not: with their env overrides unset the binary
-    /// resolves `.whipplescript/<name>.sqlite` relative to the CURRENT
-    /// WORKING DIRECTORY, so every `whip` this crate's tests spawn opens the
-    /// same three files. Under `cargo test --workspace` that is one SQLite
-    /// writer lock shared by every test thread — and by any other `whip`
-    /// running in the tree. A contended open then either blocks for the 5s
-    /// `busy_timeout` and fails with `database is locked`, or stretches the
-    /// command far enough past a workflow's timer deadline to change what the
-    /// test observes. Both were live flakes.
-    fn side_store_env(&self) -> [(&'static str, PathBuf); 3] {
+    /// With these overrides unset the binary resolves
+    /// `.whipplescript/<name>.sqlite` relative to the CURRENT WORKING
+    /// DIRECTORY, so every `whip` this crate's tests spawn opens the same
+    /// files. Under `cargo test --workspace` that is one SQLite writer lock
+    /// shared by every test thread — and by any other `whip` running in the
+    /// tree. A contended open then either blocks for the 5s `busy_timeout`
+    /// and fails with `database is locked`, or stretches the command far
+    /// enough past a workflow's timer deadline to change what the test
+    /// observes. Both were live flakes.
+    ///
+    /// The run store is here too (`--store` still wins where a test passes
+    /// it) so a command that takes no `--store` writes into the temp
+    /// directory rather than the crate's `.whipplescript/store.sqlite`. The
+    /// test binary's own working directory therefore stays clean: after
+    /// `cargo test -p whipplescript --test control_plane` there is no
+    /// `crates/whipplescript-cli/.whipplescript` at all.
+    fn side_store_env(&self) -> [(&'static str, PathBuf); 10] {
         [
+            ("WHIPPLESCRIPT_STORE", self.path.clone()),
             (
                 "WHIPPLESCRIPT_COORDINATION_STORE",
                 self.dir.join("coordination.sqlite"),
@@ -21148,8 +21658,29 @@ impl TempStorePath {
             ("WHIPPLESCRIPT_ITEMS_STORE", self.dir.join("items.sqlite")),
             (
                 "WHIPPLESCRIPT_CONTENT_STORE",
-                self.dir.join("content.sqlite"),
+                self.dir.join("harness-content.sqlite"),
             ),
+            (
+                "WHIPPLESCRIPT_IMPROVE_STORE",
+                self.dir.join("improve.sqlite"),
+            ),
+            (
+                "WHIPPLESCRIPT_INCIDENTS_STORE",
+                self.dir.join("incidents.sqlite"),
+            ),
+            (
+                "WHIPPLESCRIPT_WORKSTREAM_STORE",
+                self.dir.join("workstreams.sqlite"),
+            ),
+            (
+                "WHIPPLESCRIPT_BRANCH_STORE",
+                self.dir.join("branches.sqlite"),
+            ),
+            (
+                "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+                self.dir.join("vcs-content.sqlite"),
+            ),
+            ("WHIPPLESCRIPT_MEMORY_STORE", self.dir.join("memory.sqlite")),
         ]
     }
 }
@@ -21268,8 +21799,9 @@ workflow GrandChild {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21289,8 +21821,9 @@ workflow GrandChild {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21396,8 +21929,9 @@ workflow Child {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21419,8 +21953,9 @@ workflow Child {
 
     // Every parent event line is stamped with the workflow id + its own
     // instance id; a root workflow has no spawning invocation.
-    let parent_log = run_json(
+    let parent_log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21443,8 +21978,9 @@ workflow Child {
 
     // Discover the child instance and read the child invocation id from the
     // parent status invocation tree.
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21463,8 +21999,9 @@ workflow Child {
         .expect("child invocation id");
 
     // Every child event line is tied back to the invocation that spawned it.
-    let child_log = run_json(
+    let child_log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21536,8 +22073,9 @@ rule seed_v2
     )
     .expect("write v2 workflow");
 
-    let started = run_json(
+    let started = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21551,8 +22089,9 @@ rule seed_v2
         .and_then(Value::as_str)
         .expect("instance id");
 
-    run_json(
+    run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21564,7 +22103,7 @@ rule seed_v2
     );
 
     // A stale step against the pre-revision program path records a diagnostic.
-    let stale_step = Command::new(bin)
+    let stale_step = whip(bin, &store_path)
         .args([
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21578,8 +22117,9 @@ rule seed_v2
     assert!(!stale_step.status.success());
 
     // Default output stays a flat array (backwards compatible).
-    let flat = run_json(
+    let flat = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21591,8 +22131,9 @@ rule seed_v2
     assert!(flat.is_array());
 
     // Grouped output buckets findings along file / workflow / subject-type.
-    let grouped = run_json(
+    let grouped = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21670,8 +22211,9 @@ workflow Solo {
     )
     .expect("workflow writes");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21691,8 +22233,9 @@ workflow Solo {
         .and_then(Value::as_str)
         .expect("instance id");
 
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -21747,6 +22290,7 @@ workflow Solo {
 #[test]
 fn branch_write_merge_conflict_roundtrip() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("branch-vcs");
     let branches = dir.join("branches.sqlite");
     let content = dir.join("vcs-content.sqlite");
@@ -21763,7 +22307,7 @@ fn branch_write_merge_conflict_roundtrip() {
     let branch = |args: &[&str]| {
         let mut full = vec!["--json", "branch"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, envs)
+        run_json_with_env_isolated(bin, &stores, &full, envs)
     };
 
     // Seed mainline, branch, diverge.
@@ -21816,7 +22360,7 @@ fn branch_write_merge_conflict_roundtrip() {
     branch(&["create", "draft_b"]);
     branch(&["write", "draft_b", "notes/a.md", "--body", "B version"]);
     branch(&["write", "main", "notes/a.md", "--body", "main version"]);
-    let conflicted = Command::new(bin)
+    let conflicted = whip(bin, &stores)
         .args(["--json", "branch", "merge", "draft_b"])
         .envs(
             envs.iter()
@@ -21898,6 +22442,7 @@ fn branch_write_merge_conflict_roundtrip() {
 #[test]
 fn branch_probe_status_restore_and_op_log_surface() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("branch-api");
     let branches = dir.join("branches.sqlite");
     let content = dir.join("vcs-content.sqlite");
@@ -21914,7 +22459,7 @@ fn branch_probe_status_restore_and_op_log_surface() {
     let branch = |args: &[&str]| {
         let mut full = vec!["--json", "branch"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, envs)
+        run_json_with_env_isolated(bin, &stores, &full, envs)
     };
 
     branch(&["write", "main", "a.md", "--body", "base"]);
@@ -22045,6 +22590,7 @@ fn branch_probe_status_restore_and_op_log_surface() {
 #[test]
 fn branch_selective_verbs_conflicts_and_archaeology() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("branch-selective");
     let branches = dir.join("branches.sqlite");
     let content = dir.join("vcs-content.sqlite");
@@ -22061,12 +22607,12 @@ fn branch_selective_verbs_conflicts_and_archaeology() {
     let branch = |args: &[&str]| {
         let mut full = vec!["--json", "branch"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, envs)
+        run_json_with_env_isolated(bin, &stores, &full, envs)
     };
     let branch_expect_fail = |args: &[&str]| {
         let mut full = vec!["--json", "branch"];
         full.extend_from_slice(args);
-        let out = Command::new(bin)
+        let out = whip(bin, &stores)
             .args(&full)
             .envs(
                 envs.iter()
@@ -22124,7 +22670,7 @@ fn branch_selective_verbs_conflicts_and_archaeology() {
         undone.get("undone").and_then(Value::as_str),
         Some("draft_a")
     );
-    let read_gone = Command::new(bin)
+    let read_gone = whip(bin, &stores)
         .args(["--json", "branch", "read", "draft_a", "p2.md"])
         .envs(
             envs.iter()
@@ -22288,10 +22834,16 @@ rule pick
     .expect("write source");
 
     // The branch must exist before an instance can be born on it.
-    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
-
-    let dev = run_json_with_env(
+    run_json_with_env_isolated(
         bin,
+        &store_path,
+        &["--json", "branch", "create", "draft_a"],
+        envs,
+    );
+
+    let dev = run_json_with_env_isolated(
+        bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -22320,8 +22872,9 @@ rule pick
 
     // The branch holds the content, keyed by the resolved full path.
     let full_path = note.to_string_lossy().into_owned();
-    let on_branch = run_json_with_env(
+    let on_branch = run_json_with_env_isolated(
         bin,
+        &store_path,
         &["--json", "branch", "read", "draft_a", &full_path],
         envs,
     );
@@ -22331,7 +22884,7 @@ rule pick
     );
 
     // Mainline sees nothing until the branch merges — then everything.
-    let on_main = Command::new(bin)
+    let on_main = whip(bin, &store_path)
         .args(["--json", "branch", "read", "main", &full_path])
         .envs(
             envs.iter()
@@ -22341,16 +22894,27 @@ rule pick
         .output()
         .expect("read runs");
     assert!(!on_main.status.success(), "mainline is isolated pre-merge");
-    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
-    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", &full_path], envs);
+    run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &["--json", "branch", "merge", "draft_a"],
+        envs,
+    );
+    let merged = run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &["--json", "branch", "read", "main", &full_path],
+        envs,
+    );
     assert_eq!(
         merged.get("body").and_then(Value::as_str),
         Some("branch body")
     );
 
     // An unbound instance on the same workspace still writes natively.
-    let dev_native = run_json_with_env(
+    let dev_native = run_json_with_env_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -22388,6 +22952,7 @@ rule pick
 #[test]
 fn owned_turn_web_fetch_guard_refuses_private_targets() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("web-fetch-guard");
     let store_path = dir.join("store.sqlite");
     let store = store_path.to_str().expect("utf-8 store path");
@@ -22431,7 +22996,7 @@ rule begin
     )
     .expect("write workflow");
 
-    let output = Command::new(bin)
+    let output = whip(bin, &stores)
         .args([
             "--store",
             store,
@@ -22466,7 +23031,11 @@ rule begin
 
     // The guard refusal is a recorded tool result inside the turn transcript:
     // typed blocked-by-policy, never a connection.
-    let log = run_json(bin, &["--store", store, "--json", "log", instance_id]);
+    let log = run_json_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "log", instance_id],
+    );
     let transcript_text = log
         .as_array()
         .expect("event array")
@@ -22503,6 +23072,7 @@ rule begin
 #[test]
 fn handles_expose_pointers_and_checkpoint_records_position_pair() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("seam-handles");
     let store_path = dir.join("store.sqlite");
     let store = store_path.to_str().expect("utf-8 store path");
@@ -22557,9 +23127,15 @@ rule pick
     )
     .expect("write source");
 
-    run_json_with_env(bin, &["--json", "branch", "create", "seam_line"], envs);
-    let dev = run_json_with_env(
+    run_json_with_env_isolated(
         bin,
+        &stores,
+        &["--json", "branch", "create", "seam_line"],
+        envs,
+    );
+    let dev = run_json_with_env_isolated(
+        bin,
+        &stores,
         &[
             "--store",
             store,
@@ -22583,8 +23159,9 @@ rule pick
 
     // The position-pair cut: external scope positions ride the same fenced
     // event as the workspace cut id.
-    let checkpoint = run_json_with_env(
+    let checkpoint = run_json_with_env_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store,
@@ -22603,8 +23180,9 @@ rule pick
         Some("pair_cut_1")
     );
 
-    let handles = run_json_with_env(
+    let handles = run_json_with_env_isolated(
         bin,
+        &stores,
         &["--store", store, "--json", "handles", &instance_id],
         envs,
     );
@@ -22667,6 +23245,7 @@ rule pick
 #[test]
 fn fork_seeds_thread_and_mints_own_branch_line() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("chat-fork");
     let store_path = dir.join("store.sqlite");
     let store = store_path.to_str().expect("utf-8 store path");
@@ -22743,9 +23322,15 @@ rule follow_up
     let program = src.to_str().expect("utf-8 source path");
 
     // The source chat instance: born on its own line, one completed turn.
-    run_json_with_env(bin, &["--json", "branch", "create", "chat_main"], envs);
-    let dev = run_json_with_env(
+    run_json_with_env_isolated(
         bin,
+        &stores,
+        &["--json", "branch", "create", "chat_main"],
+        envs,
+    );
+    let dev = run_json_with_env_isolated(
+        bin,
+        &stores,
         &[
             "--store",
             store,
@@ -22766,7 +23351,12 @@ rule follow_up
         .and_then(Value::as_str)
         .expect("source instance id")
         .to_owned();
-    let source_head = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    let source_head = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--json", "branch", "show", "chat_main"],
+        envs,
+    );
     let source_head_hash = source_head
         .get("head_manifest_hash")
         .and_then(Value::as_str)
@@ -22774,7 +23364,12 @@ rule follow_up
         .to_owned();
 
     // The fork: thread seeded, fresh branch at the source head, bound at birth.
-    let fork = run_json_with_env(bin, &["--store", store, "--json", "fork", &source_id], envs);
+    let fork = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "fork", &source_id],
+        envs,
+    );
     let target_id = fork
         .get("instance_id")
         .and_then(Value::as_str)
@@ -22796,7 +23391,12 @@ rule follow_up
             .and_then(Value::as_str),
         Some("chat_main")
     );
-    let shown = run_json_with_env(bin, &["--json", "branch", "show", &fork_branch], envs);
+    let shown = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--json", "branch", "show", &fork_branch],
+        envs,
+    );
     assert_eq!(
         shown.get("parent_branch_id").and_then(Value::as_str),
         Some("chat_main")
@@ -22808,8 +23408,9 @@ rule follow_up
     );
     // The fork inherits the source turn's file state through its own line.
     let note_key = root.join("note.md").to_string_lossy().into_owned();
-    let inherited = run_json_with_env(
+    let inherited = run_json_with_env_isolated(
         bin,
+        &stores,
         &["--json", "branch", "read", &fork_branch, &note_key],
         envs,
     );
@@ -22818,7 +23419,12 @@ rule follow_up
         Some("source turn body")
     );
     // The seed event records the conversation and its exact source coordinate.
-    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_log = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "log", &target_id],
+        envs,
+    );
     let fork_events = fork_log.as_array().expect("fork event array");
     let seeded = fork_events
         .iter()
@@ -22848,8 +23454,9 @@ rule follow_up
 
     // Drive the fork with a new user message: the turn continues from the
     // seeded thread and the rule's write lands on the fork's line only.
-    run_json_with_env(
+    run_json_with_env_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store,
@@ -22865,13 +23472,13 @@ rule follow_up
         ],
         envs,
     );
-    let mut command = Command::new(bin);
+    let mut command = whip(bin, &stores);
     command.args(["--store", store, "step", &target_id, "--program", program]);
     for (name, value) in envs {
         command.env(name, value);
     }
     assert!(command.output().expect("step runs").status.success());
-    let mut worker = Command::new(bin);
+    let mut worker = whip(bin, &stores);
     worker.args([
         "--store",
         store,
@@ -22895,7 +23502,12 @@ rule follow_up
 
     // The fork's turn saw the seeded conversation (thread continuation
     // across the fork boundary).
-    let fork_log = run_json_with_env(bin, &["--store", store, "--json", "log", &target_id], envs);
+    let fork_log = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "log", &target_id],
+        envs,
+    );
     let fork_events = fork_log.as_array().expect("fork event array");
     let transcript = fork_events
         .iter()
@@ -22925,8 +23537,9 @@ rule follow_up
     // Divergence: the fork's write is on the fork's line only, never the
     // source's line, never the real root.
     let fork_note_key = root.join("fork-note.md").to_string_lossy().into_owned();
-    let on_fork = run_json_with_env(
+    let on_fork = run_json_with_env_isolated(
         bin,
+        &stores,
         &["--json", "branch", "read", &fork_branch, &fork_note_key],
         envs,
     );
@@ -22934,7 +23547,7 @@ rule follow_up
         on_fork.get("body").and_then(Value::as_str),
         Some("written on the fork line")
     );
-    let mut on_source_line = Command::new(bin);
+    let mut on_source_line = whip(bin, &stores);
     on_source_line.args(["--json", "branch", "read", "chat_main", &fork_note_key]);
     for (name, value) in envs {
         on_source_line.env(name, value);
@@ -22950,7 +23563,12 @@ rule follow_up
 
     // The source never moved: same branch head, still exactly one
     // completed turn on its log.
-    let source_after = run_json_with_env(bin, &["--json", "branch", "show", "chat_main"], envs);
+    let source_after = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--json", "branch", "show", "chat_main"],
+        envs,
+    );
     assert_eq!(
         source_after
             .get("head_manifest_hash")
@@ -22958,7 +23576,12 @@ rule follow_up
         Some(source_head_hash.as_str()),
         "the source line's head never moves under the fork"
     );
-    let source_log = run_json_with_env(bin, &["--store", store, "--json", "log", &source_id], envs);
+    let source_log = run_json_with_env_isolated(
+        bin,
+        &stores,
+        &["--store", store, "--json", "log", &source_id],
+        envs,
+    );
     assert_eq!(
         source_log
             .as_array()
@@ -23001,9 +23624,15 @@ fn branch_bound_exec_materializes_and_imports_back() {
     ];
 
     // Seed the branch with the exec's input file (relative key).
-    run_json_with_env(bin, &["--json", "branch", "create", "draft_a"], envs);
-    run_json_with_env(
+    run_json_with_env_isolated(
         bin,
+        &store_path,
+        &["--json", "branch", "create", "draft_a"],
+        envs,
+    );
+    run_json_with_env_isolated(
+        bin,
+        &store_path,
         &[
             "--json",
             "branch",
@@ -23044,8 +23673,9 @@ rule go
     )
     .expect("write source");
 
-    let dev = run_json_with_env(
+    let dev = run_json_with_env_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store,
@@ -23068,8 +23698,9 @@ rule go
 
     // The command read the MATERIALIZED input and its output imported back
     // onto the branch as a new cut.
-    let out = run_json_with_env(
+    let out = run_json_with_env_isolated(
         bin,
+        &store_path,
         &["--json", "branch", "read", "draft_a", "out.txt"],
         envs,
     );
@@ -23079,8 +23710,9 @@ rule go
         "the exec read the projected branch file and its output landed on the branch"
     );
     // The unchanged input keeps its single blob and key.
-    let input = run_json_with_env(
+    let input = run_json_with_env_isolated(
         bin,
+        &store_path,
         &["--json", "branch", "read", "draft_a", "ws/in.md"],
         envs,
     );
@@ -23089,7 +23721,12 @@ rule go
         Some("seed-content")
     );
     // The head cut is the effect-keyed import cut.
-    let row = run_json_with_env(bin, &["--json", "branch", "show", "draft_a"], envs);
+    let row = run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &["--json", "branch", "show", "draft_a"],
+        envs,
+    );
     assert!(
         row.get("head_cut_id")
             .and_then(Value::as_str)
@@ -23097,8 +23734,18 @@ rule go
         "the import is one effect-keyed cut: {row}"
     );
     // Mainline never saw any of it; merge carries the exec's product over.
-    run_json_with_env(bin, &["--json", "branch", "merge", "draft_a"], envs);
-    let merged = run_json_with_env(bin, &["--json", "branch", "read", "main", "out.txt"], envs);
+    run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &["--json", "branch", "merge", "draft_a"],
+        envs,
+    );
+    let merged = run_json_with_env_isolated(
+        bin,
+        &store_path,
+        &["--json", "branch", "read", "main", "out.txt"],
+        envs,
+    );
     assert_eq!(
         merged.get("body").and_then(Value::as_str),
         Some("seed-content")
@@ -23118,6 +23765,7 @@ rule go
 #[test]
 fn branch_source_merge_certifies_disjoint_rules_and_refuses_interference() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("source-merge");
     let envs_owned = [
         (
@@ -23138,7 +23786,7 @@ fn branch_source_merge_certifies_disjoint_rules_and_refuses_interference() {
     let branch = |args: &[&str]| {
         let mut full = vec!["--json", "branch"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, &envs)
+        run_json_with_env_isolated(bin, &stores, &full, &envs)
     };
 
     let base = "workflow Demo\n\noutput result Report\n\nclass Report {\n  message string\n}\n\nclass Ticket {\n  status string\n}\n\nrule triage\n  when started\n=> {\n  record Ticket {\n    status \"open\"\n  }\n}\n\nrule close\n  when Ticket as t\n=> {\n  complete result {\n    message \"done\"\n  }\n}\n";
@@ -23171,7 +23819,7 @@ fn branch_source_merge_certifies_disjoint_rules_and_refuses_interference() {
     branch(&["write", "draft_b", "demo.whip", "--body", &interfering]);
     let mainline_edit = body.replace("message \"finished\"", "message \"closed out\"");
     branch(&["write", "main", "demo.whip", "--body", &mainline_edit]);
-    let conflicted = Command::new(bin)
+    let conflicted = whip(bin, &stores)
         .args(["--json", "branch", "merge", "draft_b"])
         .envs(envs_owned.iter().cloned())
         .output()
@@ -23218,7 +23866,7 @@ fn branch_reconcile_folds_disjoint_mainline_deltas_down() {
     let branch = |args: &[&str]| {
         let mut full = vec!["--store", store, "--json", "branch"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, &envs)
+        run_json_with_env_isolated(bin, &store_path, &full, &envs)
     };
 
     branch(&["write", "main", "a.md", "--body", "A0"]);
@@ -23313,7 +23961,7 @@ fn workstream_members_auto_admit_and_promote() {
     let whip = |args: &[&str]| {
         let mut full = vec!["--store", store, "--json"];
         full.extend_from_slice(args);
-        run_json_with_env(bin, &full, &envs)
+        run_json_with_env_isolated(bin, &store_path, &full, &envs)
     };
 
     // A stream with two members.
@@ -23432,6 +24080,7 @@ fn lint_flags_marks_off_consumption_boundaries() {
     // a changed candidate re-derives the effect under prefix replay), and
     // does not flag the same mark once the trigger is consumed.
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = unique_temp_dir("lint-mark-boundary");
     let program = |consume_line: &str| {
         format!(
@@ -23486,7 +24135,7 @@ rule triage
     ] {
         let wf = dir.join(format!("{label}.whip"));
         fs::write(&wf, program(consume_line)).expect("write workflow");
-        let output = Command::new(bin)
+        let output = whip(bin, &stores)
             .args(["--json", "lint", wf.to_str().expect("present")])
             .output()
             .expect("whip lint runs");
@@ -23524,6 +24173,7 @@ rule triage
 #[test]
 fn re_recording_an_identical_active_fact_collapses_instead_of_crashing() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = std::env::temp_dir().join(format!(
         "whip-dup-fact-{}-{:?}",
         std::process::id(),
@@ -23562,8 +24212,9 @@ rule two
     .expect("write source");
     let store = dir.join("dup.sqlite");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
@@ -23580,8 +24231,9 @@ rule two
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
@@ -23600,8 +24252,9 @@ rule two
     );
 
     // Exactly one Marker fact: the identical re-record collapsed.
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
@@ -23631,6 +24284,7 @@ rule two
 #[test]
 fn record_from_copies_the_source_fields_bounded_to_the_target_schema() {
     let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
     let dir = std::env::temp_dir().join(format!(
         "whip-record-from-{}-{:?}",
         std::process::id(),
@@ -23684,8 +24338,9 @@ rule finish
     .expect("write source");
     let store = dir.join("from.sqlite");
 
-    let dev = run_json(
+    let dev = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
@@ -23702,8 +24357,9 @@ rule finish
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id");
-    let status = run_json(
+    let status = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
@@ -23721,8 +24377,9 @@ rule finish
         "the downstream rule reads the copied title: {status}"
     );
 
-    let facts = run_json(
+    let facts = run_json_isolated(
         bin,
+        &stores,
         &[
             "--store",
             store.to_str().expect("utf-8"),
