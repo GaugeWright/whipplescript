@@ -80,8 +80,19 @@ fn open_improve_store() -> Result<ImproveStore, String> {
         .map_err(|error| format!("failed to open improve store: {error:?}"))
 }
 
-fn program_hash(source: &str) -> String {
-    crate::sha256_hex(source.as_bytes())
+/// Evidence-ledger program identity (DR-0054): the canonical program hash —
+/// sorted (identity, canon_hash) pairs — so formatting, comments,
+/// declaration reordering, and rule-binding renames stop orphaning the
+/// ledger. A source with no canonical form (does not parse) falls back to
+/// the byte hash: deterministic per content, fail-closed continuity.
+/// Pre-DR byte-hash rows simply re-earn evidence (the SHA re-key
+/// precedent); nothing aliases.
+/// `pub(crate)` because every ledger writer must key identically — the
+/// reopener and the warm scope join campaign and ambient rows on this
+/// hash, so a byte-hashing caller would silently unlink the streams.
+pub(crate) fn program_hash(source: &str) -> String {
+    whipplescript_parser::canonical_program_hash(source)
+        .unwrap_or_else(|| crate::sha256_hex(source.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------

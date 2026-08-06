@@ -15,7 +15,7 @@ else
   fi
 fi
 
-for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla"; do
+for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla" "$ROOT/models/tla/CredentialCustody.tla"; do
   "${APALACHE[@]}" typecheck "$MODEL"
   "${APALACHE[@]}" check \
     --cinit=ConstInit \
@@ -96,3 +96,68 @@ coord_bite() {
 coord_bite CoordLease   'Cardinality(held[k]) < Slots' MutualExclusion
 coord_bite CoordCounter 'consumed + a <= Cap'           CapInvariant
 coord_bite CoordLedger  'notin appended'                   NoLostEntry
+
+# --- DR-0053 credential custody bites (models/tla/CredentialCustody.tla) ---------
+# Every safety invariant in the custody model must have its OWN bite: the seven
+# mutations below violate invariants 2..8 respectively, so no invariant is
+# riding on another's teeth. Length 7, because a use is split into
+# StartUse/CompleteUse and the interesting traces (revoke or reseal landing
+# mid-flight) need the extra step.
+#
+# Two mutations must be scoped to CompleteUse by name rather than matched on
+# text: `c \notin revoked` and the rung guard BOTH appear in StartUse too, and
+# removing the StartUse copy proves nothing -- the claim is specifically that
+# these are RE-EVALUATED at completion.
+#
+# Keep custody_bite_in patterns BACKSLASH-FREE. awk's -v unescapes once, so a
+# pattern written `c \\notin revoked` reaches the regex engine as `c \notin
+# revoked`, where `\n` is a newline escape and the match silently never fires.
+# Replacements are unaffected (`\\*` correctly yields the TLA comment `\*`).
+CUSTODY_MODEL="$ROOT/models/tla/CredentialCustody.tla"
+
+custody_run() {
+  local dir="$1" what="$2"
+  if ! grep -q 'MUTANT' "$dir/CredentialCustody.tla"; then
+    echo "custody bite FAILED: mutation for $what matched nothing (the spec moved under it)" >&2
+    rm -rf "$dir"; exit 1
+  fi
+  echo "== custody bite: $what mutant must be caught"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv=SafetyInvariants --length=7 "$dir/CredentialCustody.tla" > "$dir/out.log" 2>&1; then
+    echo "custody bite FAILED: mutant did not violate $what" >&2
+    rm -rf "$dir"; exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$dir/out.log"; then
+    echo "custody bite FAILED: $what mutant erred for the wrong reason (not an invariant violation)" >&2
+    cat "$dir/out.log" >&2
+    rm -rf "$dir"; exit 1
+  fi
+  rm -rf "$dir"
+  echo "custody bite OK ($what is load-bearing)"
+}
+
+# Whole-file textual mutation.
+custody_bite() {
+  local sed_script="$1" what="$2" dir
+  dir="$(mktemp -d)"
+  sed "$sed_script" "$CUSTODY_MODEL" > "$dir/CredentialCustody.tla"
+  custody_run "$dir" "$what"
+}
+
+# Mutation scoped to the first matching line inside a named action.
+custody_bite_in() {
+  local action="$1" pattern="$2" replacement="$3" what="$4" dir
+  dir="$(mktemp -d)"
+  awk -v act="^${action}\\(c\\) ==" -v pat="$pattern" -v rep="$replacement" \
+    '$0 ~ act {b=1} b && $0 ~ pat {print rep; b=0; next} {print}' \
+    "$CUSTODY_MODEL" > "$dir/CredentialCustody.tla"
+  custody_run "$dir" "$what"
+}
+
+custody_bite 's|^SubstitutionPrincipal == "custodian"$|SubstitutionPrincipal == "whip" \\* MUTANT: direct-fetch fallback|' NoPlaintextInWhip
+custody_bite_in CompleteUse 'sealedAt\[c\] >= MinRung' '  \* MUTANT: completion-time rung check removed' RungFloor
+custody_bite 's|^  /\\ leased. = leased \\ {c}$|  /\\ UNCHANGED leased \\* MUTANT: revocation keeps the lease|' NoUseAfterRevoke
+custody_bite_in CompleteUse 'notin revoked' '  \* MUTANT: mid-flight revocation check removed' NoCompletionAfterRevoke
+custody_bite_in CompleteUse 'admitted. = admitted' '  /\ UNCHANGED admitted \* MUTANT: use not recorded' UsesAreRecorded
+custody_bite 's|^  /\\ Cardinality(versions\[c\]) > 1$|  \\* MUTANT: overlap guard removed|' RotationNeverEmpty
+custody_bite 's|^  /\\ uses\[c\] < Budget$|  \\* MUTANT: budget guard removed|' BudgetRespected

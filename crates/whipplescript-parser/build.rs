@@ -41,6 +41,7 @@ const DECL_GRAMMARS: &[&str] = &[
     "vendored-std/grammars/messaging-grammar.json",
     "vendored-std/grammars/memory-grammar.json",
     "vendored-std/grammars/vcs-grammar.json",
+    "vendored-std/grammars/custody-grammar.json",
 ];
 
 /// The DR-0011 grammar vocabulary (mirrors whipplescript-core's
@@ -415,6 +416,7 @@ fn emit_declaration_row(
         "memory pool" => "DeclAstKind::MemoryPool",
         "file store" => "DeclAstKind::FileStore",
         "stream" => "DeclAstKind::Stream",
+        "credential" => "DeclAstKind::Credential",
         other => fail(&format!(
             "declaration_block keyword `{other}` has no known DeclAstKind builder seam"
         )),

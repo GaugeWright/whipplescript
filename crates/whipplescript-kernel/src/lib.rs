@@ -3452,6 +3452,7 @@ fn primitive_type_name(primitive: &IrPrimitiveType) -> &'static str {
         IrPrimitiveType::Audio => "audio",
         IrPrimitiveType::Pdf => "pdf",
         IrPrimitiveType::Video => "video",
+        IrPrimitiveType::Secret => "secret",
     }
 }
 

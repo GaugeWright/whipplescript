@@ -137,6 +137,28 @@ pub trait SourceMerger {
     fn merge_source(&self, base: Option<&str>, ours: &str, theirs: &str) -> SourceMergeVerdict;
 }
 
+/// One declaration's canonical identity + content hash as the store sees it
+/// (DR-0054; the parser-side `DeclCanon` crosses the seam as plain strings).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonDecl {
+    /// Normalized header line (`rule triage`, `class Report`).
+    pub identity: String,
+    /// SHA-256/128 over the canonical print.
+    pub canon_hash: String,
+    /// The rename-detection key: the canonical print with the header's
+    /// name replaced by `_` (DR-0054 Decision 3).
+    pub rename_hash: String,
+}
+
+/// The DR-0054 canonicalization seam, same inversion as [`SourceMerger`]:
+/// the store owns WHERE declaration identity applies (change-unit index
+/// sub-rows for `.whip` paths), the host installs HOW (the parser-backed
+/// canonicalizer). `None` = the source has no canonical form; callers keep
+/// path-level rows only — attribution never guesses (fail closed).
+pub trait DeclCanonicalizer {
+    fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>>;
+}
+
 /// One reconciliation-daemon tick over one branch (the executor of
 /// reconcile.rs's plans; lifecycle in ReconciliationDaemonLifecycle.tla).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +407,7 @@ pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
     branches: B,
     content: C,
     source_merger: Option<Box<dyn SourceMerger>>,
+    decl_canonicalizer: Option<Box<dyn DeclCanonicalizer>>,
     /// The acting principal every cut this handle records is attributed
     /// to (DR-0052 Decision 1: authorship observed at the mediator, so
     /// the handle's constructor — CLI seam, harness, daemon — decides,
@@ -412,6 +435,7 @@ impl NativeWorkspaceVcs {
             branches: BranchStore::open(branches_path)?,
             content: ContentStore::open(content_path)?,
             source_merger: None,
+            decl_canonicalizer: None,
             actor: None,
             intent: None,
             pending_facts: Vec::new(),
@@ -449,6 +473,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             branches,
             content,
             source_merger: None,
+            decl_canonicalizer: None,
             actor: None,
             intent: None,
             pending_facts: Vec::new(),
@@ -460,6 +485,10 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     /// merger, no source-aware refinement.
     pub fn set_source_merger(&mut self, merger: Box<dyn SourceMerger>) {
         self.source_merger = Some(merger);
+    }
+
+    pub fn set_decl_canonicalizer(&mut self, canonicalizer: Box<dyn DeclCanonicalizer>) {
+        self.decl_canonicalizer = Some(canonicalizer);
     }
 
     /// Attribute every cut this handle records to `actor` (DR-0052:
@@ -2137,6 +2166,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     actor: cut.actor.clone(),
                     intent: cut.intent.clone(),
                     recorded_at: cut.recorded_at.clone(),
+                    decls: row
+                        .decl_units
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -2182,21 +2216,97 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             },
         };
         for path in Self::diff_paths(&before, &after) {
+            let before_hash = before.get(&path).cloned();
+            let after_hash = after.get(&path).cloned();
+            let decls =
+                self.decl_units_for(&path, before_hash.as_deref(), after_hash.as_deref())?;
             units.push(crate::selection::ChangeUnit {
                 seq: units.len(),
                 cut_id: cut.cut_id.clone(),
                 change_id: cut.change_id.clone(),
                 branch_id: cut.branch_id.clone(),
                 path: path.clone(),
-                before: before.get(&path).cloned(),
-                after: after.get(&path).cloned(),
+                before: before_hash,
+                after: after_hash,
                 origin: cut.origin.clone(),
                 actor: cut.actor.clone(),
                 intent: cut.intent.clone(),
                 recorded_at: cut.recorded_at.clone(),
+                decls,
             });
         }
         Ok(())
+    }
+
+    /// Declaration-level sub-rows for one changed path (DR-0054 Decision
+    /// 6.3): diff the two sides' canonical declaration lists. Empty when
+    /// no canonicalizer is installed, the path is not `.whip` source, or
+    /// EITHER present side has no canonical form — attribution never
+    /// guesses (a half-canonical diff would misattribute).
+    fn decl_units_for(
+        &self,
+        path: &str,
+        before_hash: Option<&str>,
+        after_hash: Option<&str>,
+    ) -> StoreResult<Vec<crate::selection::DeclUnit>> {
+        let Some(canonicalizer) = self.decl_canonicalizer.as_deref() else {
+            return Ok(Vec::new());
+        };
+        if !path.ends_with(".whip") {
+            return Ok(Vec::new());
+        }
+        let canon_side = |hash: Option<&str>| -> StoreResult<Option<Vec<CanonDecl>>> {
+            let Some(hash) = hash else {
+                return Ok(Some(Vec::new())); // absent side: no declarations
+            };
+            let Some(text) = self.content.get(hash)? else {
+                return Ok(None); // unreadable blob: fail closed
+            };
+            Ok(canonicalizer.canonical_declarations(&text))
+        };
+        let (Some(before), Some(after)) = (canon_side(before_hash)?, canon_side(after_hash)?)
+        else {
+            return Ok(Vec::new());
+        };
+        let before_map: BTreeMap<&str, &str> = before
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.identity.as_str(),
+                    declaration.canon_hash.as_str(),
+                )
+            })
+            .collect();
+        let after_map: BTreeMap<&str, &str> = after
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.identity.as_str(),
+                    declaration.canon_hash.as_str(),
+                )
+            })
+            .collect();
+        let mut identities: Vec<&str> = before_map.keys().copied().collect();
+        for identity in after_map.keys() {
+            if !before_map.contains_key(identity) {
+                identities.push(identity);
+            }
+        }
+        identities.sort_unstable();
+        let mut decls = Vec::new();
+        for identity in identities {
+            let before_canon = before_map.get(identity).copied();
+            let after_canon = after_map.get(identity).copied();
+            if before_canon == after_canon {
+                continue; // untouched (or formatting-only) declaration
+            }
+            decls.push(crate::selection::DeclUnit {
+                identity: identity.to_owned(),
+                before_canon: before_canon.map(str::to_owned),
+                after_canon: after_canon.map(str::to_owned),
+            });
+        }
+        Ok(decls)
     }
 
     /// Extend the change-unit index over any unindexed tail (DR-0052
@@ -2234,6 +2344,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     path: unit.path,
                     before_hash: unit.before,
                     after_hash: unit.after,
+                    decl_units: if unit.decls.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&unit.decls).ok()
+                    },
                 });
             }
         }
@@ -3623,6 +3738,87 @@ mod tests {
         assert_eq!(windowed[0].seq, 0);
         assert_eq!(windowed[0].cut_id, "cut_3");
         assert_eq!(windowed[1].cut_id, "cut_4");
+    }
+
+    /// DR-0054: with a canonicalizer installed, `.whip` units carry
+    /// declaration-level sub-rows (persisted through the index and
+    /// identical on recompute); non-`.whip` paths and unparseable sides
+    /// stay path-level, and the `decl()` atom selects over the sub-rows.
+    #[test]
+    fn decl_sub_rows_ride_the_index_and_the_decl_atom() {
+        // A stub canonicalizer: each line `name=hash` is one declaration
+        // (`ERR` = no canonical form) — the seam under test is the
+        // store's, not the parser's.
+        struct StubCanon;
+        impl DeclCanonicalizer for StubCanon {
+            fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>> {
+                let mut declarations = Vec::new();
+                for line in source.lines() {
+                    if line == "ERR" {
+                        return None;
+                    }
+                    let (name, hash) = line.split_once('=')?;
+                    declarations.push(CanonDecl {
+                        identity: name.to_owned(),
+                        canon_hash: hash.to_owned(),
+                        rename_hash: hash.to_owned(),
+                    });
+                }
+                Some(declarations)
+            }
+        }
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.set_decl_canonicalizer(Box::new(StubCanon));
+        vcs.set_actor(Some("s:sess-7".to_owned()));
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k1\nrule b=k2"),
+            "cut_1",
+            "t1",
+        )
+        .expect("write");
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k1\nrule b=k9\nclass C=k3"),
+            "cut_2",
+            "t2",
+        )
+        .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "notes.md", Some("prose"), "cut_3", "t3")
+            .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "bad.whip", Some("ERR"), "cut_4", "t4")
+            .expect("write");
+        let units = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+        assert_eq!(units.len(), 4);
+        // cut_1: both declarations added.
+        assert_eq!(units[0].decls.len(), 2);
+        assert_eq!(units[0].decls[0].identity, "rule a");
+        assert_eq!(units[0].decls[0].before_canon, None);
+        // cut_2: `rule a` untouched, `rule b` changed, `class C` added.
+        let changed: Vec<&str> = units[1]
+            .decls
+            .iter()
+            .map(|decl| decl.identity.as_str())
+            .collect();
+        assert_eq!(changed, vec!["class C", "rule b"]);
+        // Non-source and unparseable paths stay path-level.
+        assert!(units[2].decls.is_empty());
+        assert!(units[3].decls.is_empty());
+        // The persisted index serves the SAME sub-rows (prefix path).
+        assert_eq!(
+            vcs.maintain_change_unit_index(MAINLINE_BRANCH_ID)
+                .expect("maintain"),
+            0
+        );
+        let from_index = vcs.change_units(MAINLINE_BRANCH_ID, 500).expect("units");
+        assert_eq!(units, from_index);
+        // decl() selects over the sub-rows.
+        let expr = crate::selection::parse("decl(rule b)").expect("parse");
+        let selected = crate::selection::eval(&expr, &units);
+        assert_eq!(selected, std::collections::BTreeSet::from([0, 1]));
     }
 
     /// DR-0052 A5: operations queue `workspace.*` facts for the caller

@@ -13509,8 +13509,18 @@ fn whip_infoflow(_options: &CliOptions) -> ExitCode {
 /// the only path to signing, so the whip agent can never reach it.
 fn gov_agent(_options: &CliOptions) -> ExitCode {
     use std::io::BufRead;
-    if !gov::has_governance_privilege() {
-        eprintln!("the governance agent requires admin/governance privilege (run via sudo)");
+    // With a custodian socket configured, admin IS the `sign` capability on
+    // the governance credential (DR-0053 §10): entry is open and every sign
+    // is enforced by the custodian. Without one, fall back to the env-gated
+    // degraded shim.
+    let custodian_configured =
+        std::env::var_os(whipplescript_custody::client::CUSTODIAN_SOCKET_ENV).is_some();
+    if !custodian_configured && !gov::has_governance_privilege() {
+        eprintln!(
+            "the governance agent requires admin authority: a custodian socket \
+             (WHIPPLESCRIPT_CUSTODIAN_SOCKET) holding the governance signing credential, or \
+             the degraded WHIPPLESCRIPT_GOV_ADMIN dev shim"
+        );
         return ExitCode::from(1);
     }
     let signer = env::var("WHIPPLESCRIPT_GOV_SIGNER").unwrap_or_else(|_| "admin".to_owned());
@@ -13531,7 +13541,7 @@ fn gov_agent(_options: &CliOptions) -> ExitCode {
                 Err(message) => println!("draft error: {message}"),
             }
         } else if let Some(out) = trimmed.strip_prefix("sign ") {
-            match gov::SignedEnvelope::sign(&draft, &signer) {
+            match gov_sign_text(&draft, &signer) {
                 Ok(signed) => match std::fs::write(out.trim(), signed.to_json()) {
                     Ok(()) => println!("signed and wrote {}", out.trim()),
                     Err(err) => println!("write error: {err}"),
@@ -13593,6 +13603,32 @@ fn gov_escalations(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// Sign a governance config through whichever authority this process has:
+/// the custodian (DR-0053 §10 — the governance key is custodian-held and
+/// admin is the `sign` capability on it) when
+/// `WHIPPLESCRIPT_CUSTODIAN_SOCKET` names a daemon, else the legacy
+/// env-gated checksum path, which is labelled DEGRADED out loud — it proves
+/// tamper-evidence, not authorship, and an env var is not an authority
+/// boundary under escape.
+fn gov_sign_text(config_text: &str, signer: &str) -> Result<gov::SignedEnvelope, String> {
+    if let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env() {
+        let credential =
+            whipplescript_custody::CredentialName::new(gov::GOVERNANCE_SIGNING_CREDENTIAL)
+                .map_err(|err| format!("governance credential name: {err}"))?;
+        return gov::SignedEnvelope::sign_with_custodian(
+            config_text,
+            signer,
+            &transport,
+            &credential,
+        );
+    }
+    eprintln!(
+        "warning: no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET); signing with the \
+         DEGRADED env-gated checksum path — this attests tamper-evidence, not authorship"
+    );
+    gov::SignedEnvelope::sign(config_text, signer)
+}
+
 fn gov_sign(options: &CliOptions) -> ExitCode {
     let Some(config_path) = options.args.get(1) else {
         eprintln!("usage: whip gov sign <governance-config>");
@@ -13606,7 +13642,7 @@ fn gov_sign(options: &CliOptions) -> ExitCode {
         }
     };
     let signer = env::var("WHIPPLESCRIPT_GOV_SIGNER").unwrap_or_else(|_| "admin".to_owned());
-    match gov::SignedEnvelope::sign(&config_text, &signer) {
+    match gov_sign_text(&config_text, &signer) {
         Ok(signed) => {
             println!("{}", signed.to_json());
             ExitCode::SUCCESS
@@ -13630,9 +13666,35 @@ fn gov_verify(options: &CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Custodian-signed envelopes verify through the custodian; legacy
+    // checksum envelopes verify locally. Try the custodian first when a
+    // socket is configured — a custodian envelope can never pass the legacy
+    // path (it demands its pinned verifier), so the order cannot mask a
+    // forgery.
+    if let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env() {
+        let verifier = gov::CustodianEnvelopeVerifier::new(&transport);
+        match gov::SignedEnvelope::verify_attestation_with(&signed_text, &verifier) {
+            Ok(attestation) => {
+                println!(
+                    "verified: signed by {} under {}",
+                    attestation.signer,
+                    attestation.key_id.as_deref().unwrap_or("unknown-key")
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(custodian_error) => {
+                // Fall back to the legacy path only for envelopes that are
+                // not custodian-signed at all.
+                if signed_text.contains(gov::GOVERNANCE_CUSTODIAN_ALGORITHM) {
+                    eprintln!("{custodian_error}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
     match gov::SignedEnvelope::verify(&signed_text) {
         Ok(signer) => {
-            println!("verified: signed by {signer}");
+            println!("verified: signed by {signer} (legacy checksum attestation)");
             ExitCode::SUCCESS
         }
         Err(message) => {
@@ -26726,7 +26788,9 @@ fn run(options: &CliOptions) -> ExitCode {
         &ir,
         options.json,
         &dev_options.provider_config_paths,
-        &sha256_hex(source.as_bytes()),
+        // The LEDGER hash (DR-0054 canonical), not the byte digest — the
+        // reopener joins ambient rows to campaign rows on it.
+        &improve::program_hash(&source),
     );
     let store = match SqliteStore::open(&options.store_path) {
         Ok(store) => store,
@@ -35802,6 +35866,12 @@ fn open_vcs() -> Result<whipplescript_store::vcs::NativeWorkspaceVcs, ExitCode> 
             // conflict escalates.
             vcs.set_source_merger(Box::new(
                 whipplescript_kernel::source_merge::WhipSourceMerger,
+            ));
+            // DR-0054 declaration identity for the change-unit index's
+            // declaration-level sub-rows; absent it, attribution stays
+            // path-level (fail closed, never guessed).
+            vcs.set_decl_canonicalizer(Box::new(
+                whipplescript_kernel::source_merge::WhipDeclCanonicalizer,
             ));
             vcs.set_actor(Some(ambient_actor()));
             vcs

@@ -716,6 +716,7 @@ pub fn empty_ir_program() -> IrProgram {
         trackers: Vec::new(),
         streams: Vec::new(),
         channels: Vec::new(),
+        credentials: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
         campaigns: Vec::new(),
@@ -5239,6 +5240,7 @@ pub fn ir_type_name(ty: &IrType) -> String {
             IrPrimitiveType::Audio => "audio",
             IrPrimitiveType::Pdf => "pdf",
             IrPrimitiveType::Video => "video",
+            IrPrimitiveType::Secret => "secret",
         }
         .to_owned(),
         IrType::LiteralString(value) | IrType::Ref(value) => value.clone(),
@@ -5349,6 +5351,12 @@ fn validate_json_for_primitive(
         IrPrimitiveType::Float => value.as_f64().is_some(),
         IrPrimitiveType::Bool => value.is_boolean(),
         IrPrimitiveType::Null => value.is_null(),
+        // A secret at runtime is only ever a sentinel the lowering produced —
+        // plaintext material can never validate into a secret slot
+        // (DR-0053 §5: no expression evaluates to secret bytes).
+        IrPrimitiveType::Secret => value
+            .as_str()
+            .is_some_and(|s| whipplescript_custody::Sentinel::parse(s).is_ok()),
     };
     if !valid {
         errors.push(format!(

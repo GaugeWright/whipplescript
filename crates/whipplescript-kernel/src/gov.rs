@@ -33,15 +33,32 @@ use sha2::{Digest, Sha256};
 
 use crate::ifc::Envelope;
 
-/// Whether the current process holds governance (admin) privilege (G1).
+/// Whether the current process holds governance (admin) privilege (G1) — the
+/// **degraded** dev shim.
 ///
-/// Production binds this to the OS: `whip gov` is installed root-only / behind
-/// sudo, so being able to run the privileged path *is* the gate. Where requiring
-/// root is impractical (CI, dev sandboxes), the explicit `WHIPPLESCRIPT_GOV_ADMIN`
-/// token stands in. Otherwise the process is unprivileged — the whip agent.
+/// DR-0053 §10: an environment variable is not an authority boundary once
+/// escape is in the threat model — an escaped agent can set it and grant
+/// itself the credentials custody protects. The authority path is therefore
+/// the **custodian**: governance signing keys are custodian-held and admin is
+/// the `sign` capability on the governance credential
+/// ([`SignedEnvelope::sign_with_custodian`] /
+/// [`CustodianEnvelopeVerifier`]), bounded by the custodian socket's OS
+/// permissions and the custodian's own grants. This env-token gate remains
+/// only for CI and dev sandboxes where no custodian runs; every path through
+/// it produces the keyless checksum attestation, which trusts the local
+/// filesystem and must be labelled degraded, never presented as the custody
+/// claim.
 pub fn has_governance_privilege() -> bool {
     std::env::var_os("WHIPPLESCRIPT_GOV_ADMIN").is_some()
 }
+
+/// The conventional custodian entry for governance signing. Admin = whoever
+/// the custodian lets `sign` with this credential; the resource identity is
+/// stable across sealing backends (DR-0053 §5).
+pub const GOVERNANCE_SIGNING_CREDENTIAL: &str = "whip/governance-signing";
+
+/// The attestation algorithm tag for custodian-held governance keys.
+pub const GOVERNANCE_CUSTODIAN_ALGORITHM: &str = "ed25519-custodian";
 
 fn hash_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -166,6 +183,66 @@ impl SignedEnvelope {
         })
     }
 
+    /// Sign through the custodian (DR-0053 §10): the governance signing key
+    /// is custodian-held, so holding admin means the custodian's policy lets
+    /// this caller `sign` with the governance credential — an authority
+    /// bounded by the custodian socket's OS permissions rather than an
+    /// environment variable. Produces an external-attestation envelope whose
+    /// `key_id` is the credential's stable resource identity; verify it with
+    /// [`CustodianEnvelopeVerifier`].
+    pub fn sign_with_custodian(
+        config_text: &str,
+        signer: &str,
+        transport: &dyn whipplescript_custody::CustodyTransport,
+        credential: &whipplescript_custody::CredentialName,
+    ) -> Result<Self, String> {
+        let canonical = canonicalize(config_text)?;
+        let envelope_hash = hash_hex(&canonical);
+        let key_id = credential.resource_id();
+        let signing_bytes = signing_bytes_from_hash(
+            &envelope_hash,
+            signer,
+            GOVERNANCE_CUSTODIAN_ALGORITHM,
+            &key_id,
+        );
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: "governance-sign".to_owned(),
+                actor: Some(signer.to_owned()),
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Sign {
+                credential: credential.clone(),
+                alg: whipplescript_custody::SignatureAlg::Ed25519,
+                derivation: Vec::new(),
+                payload_b64: crate::exec_http::base64_encode(&signing_bytes),
+            },
+        );
+        let reply = transport
+            .call(call)
+            .map_err(|err| format!("custodian unreachable: {err}"))?;
+        let signature_b64 = match reply.outcome {
+            Ok(whipplescript_custody::CustodyOk::Signed { signature_b64 }) => signature_b64,
+            Ok(other) => return Err(format!("custodian returned a non-signature: {other:?}")),
+            Err(refusal) => {
+                return Err(format!(
+                    "governance sign refused by the custodian: {refusal} — admin is the `sign` \
+                     capability on {key_id}"
+                ))
+            }
+        };
+        Ok(Self {
+            canonical,
+            envelope_hash,
+            signer: signer.to_owned(),
+            external: Some(ExternalAttestation {
+                algorithm: GOVERNANCE_CUSTODIAN_ALGORITHM.to_owned(),
+                key_id,
+                signature: signature_b64,
+            }),
+        })
+    }
+
     /// Sign with privilege forced on — for tests only (the crate forbids the
     /// `set_var` that would drive the env-gated path).
     #[cfg(any(test, feature = "test-support"))]
@@ -243,6 +320,64 @@ impl SignedEnvelope {
             signer: parsed.signer,
             key_id: Some(external.key_id),
         })
+    }
+}
+
+/// Verifies custodian-signed governance envelopes: the whip agent asks the
+/// custodian — which holds the governance key and never releases it — whether
+/// the attestation's signature covers the signing bytes. Constant-time,
+/// custodian-side (DR-0053 §6). This is [`GovernanceAttestationVerifier`]'s
+/// custody realization, so `verify_attestation_with` works unchanged.
+pub struct CustodianEnvelopeVerifier<'a> {
+    transport: &'a dyn whipplescript_custody::CustodyTransport,
+}
+
+impl<'a> CustodianEnvelopeVerifier<'a> {
+    pub fn new(transport: &'a dyn whipplescript_custody::CustodyTransport) -> Self {
+        Self { transport }
+    }
+}
+
+impl GovernanceAttestationVerifier for CustodianEnvelopeVerifier<'_> {
+    fn verify(
+        &self,
+        signing_bytes: &[u8],
+        attestation: &ExternalAttestation,
+    ) -> Result<(), String> {
+        if attestation.algorithm != GOVERNANCE_CUSTODIAN_ALGORITHM {
+            return Err(format!(
+                "not a custodian-held governance attestation (algorithm {:?})",
+                attestation.algorithm
+            ));
+        }
+        let credential =
+            whipplescript_custody::CredentialName::from_resource_id(&attestation.key_id)
+                .map_err(|err| format!("attestation key_id is not a credential: {err}"))?;
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: "governance-verify".to_owned(),
+                actor: None,
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Verify {
+                credential,
+                alg: whipplescript_custody::SignatureAlg::Ed25519,
+                payload_b64: crate::exec_http::base64_encode(signing_bytes),
+                signature_b64: attestation.signature.clone(),
+            },
+        );
+        let reply = self
+            .transport
+            .call(call)
+            .map_err(|err| format!("custodian unreachable: {err}"))?;
+        match reply.outcome {
+            Ok(whipplescript_custody::CustodyOk::Verified { valid: true }) => Ok(()),
+            Ok(whipplescript_custody::CustodyOk::Verified { valid: false }) => {
+                Err("governance envelope signature is invalid".to_owned())
+            }
+            Ok(other) => Err(format!("custodian returned a non-verification: {other:?}")),
+            Err(refusal) => Err(format!("governance verify refused: {refusal}")),
+        }
     }
 }
 
@@ -521,6 +656,94 @@ grant file_store outbox -> file:/srv/outbox public\n";
         assert!(items[0].request.contains("declassify"));
         assert_eq!(items[0].from, "bob");
         let _ = std::fs::remove_file(&log);
+    }
+
+    /// DR-0053 §10: the governance key is custodian-held; admin is the
+    /// `sign` capability. Sign through the custodian, verify through the
+    /// custodian, and confirm no path yields the key or accepts a forgery.
+    #[test]
+    fn custodian_holds_the_governance_key() {
+        use std::sync::Arc;
+        use whipplescript_custodian::store::SealedStore;
+        use whipplescript_custodian::{Custodian, DeniedEgress, InProcessTransport};
+        use whipplescript_custody::CredentialName;
+        use zeroize_seed::seed;
+
+        mod zeroize_seed {
+            /// RFC 8032 test seed — a published constant, secures nothing.
+            pub fn seed() -> Vec<u8> {
+                let hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                    .collect()
+            }
+        }
+
+        let mut store = SealedStore::create(None, "pw").expect("store");
+        let credential = CredentialName::new(GOVERNANCE_SIGNING_CREDENTIAL).expect("name");
+        store
+            .register(
+                credential.clone(),
+                whipplescript_custody::CredentialKind::Ed25519,
+                zeroize::Zeroizing::new(seed()),
+                None,
+            )
+            .expect("register");
+        let custodian = Arc::new(Custodian::new(store, Box::new(DeniedEgress)));
+        let transport = InProcessTransport::new(Arc::clone(&custodian));
+
+        let signed =
+            SignedEnvelope::sign_with_custodian(CONFIG, "root-admin", &transport, &credential)
+                .expect("custodian signs");
+        let json = signed.to_json();
+
+        // The keyless checksum path refuses custodian envelopes: they demand
+        // their pinned verifier.
+        assert!(SignedEnvelope::verify_attestation(&json).is_err());
+
+        let verified = SignedEnvelope::verify_attestation_with(
+            &json,
+            &CustodianEnvelopeVerifier::new(&transport),
+        )
+        .expect("custodian verifies");
+        assert_eq!(verified.signer, "root-admin");
+        assert_eq!(
+            verified.key_id.as_deref(),
+            Some("credential:whip/governance-signing")
+        );
+
+        // A forged signature is rejected — by the custodian, in constant time.
+        let signature = signed.to_json();
+        let original_sig = serde_json::from_str::<serde_json::Value>(&signature).expect("json")
+            ["attestation"]["signature"]
+            .as_str()
+            .expect("sig")
+            .to_owned();
+        let forged = json.replace(&original_sig, &"A".repeat(original_sig.len()));
+        assert_ne!(forged, json);
+        assert!(SignedEnvelope::verify_attestation_with(
+            &forged,
+            &CustodianEnvelopeVerifier::new(&transport)
+        )
+        .is_err());
+
+        // Signing with an unknown credential is a custodian refusal — there
+        // is no environment variable to set around it.
+        let missing = CredentialName::new("whip/not-registered").expect("name");
+        assert!(
+            SignedEnvelope::sign_with_custodian(CONFIG, "root-admin", &transport, &missing)
+                .is_err()
+        );
+
+        // Both uses were recorded and attributed (§1).
+        let uses = custodian.uses();
+        assert!(uses
+            .iter()
+            .any(|record| record.attribution.run_id == "governance-sign"));
+        assert!(uses
+            .iter()
+            .any(|record| record.attribution.run_id == "governance-verify"));
     }
 
     #[test]

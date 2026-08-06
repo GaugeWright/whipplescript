@@ -2045,6 +2045,55 @@ contract of the program automatically. That registration covers the inbound
 `when message from <channel>` clause. The outbound `send` construct also needs
 the import statement `use std.messaging`.
 
+## Credentials (`std.custody`)
+
+A `credential` declaration declares a handle for a secret that a custodian
+holds. The material of the credential never appears in the source, in the
+program, or in the address space of whip. Governance supplies the reality of
+the handle through a grant, and the custodian — a separate security
+principal — performs every operation with the material.
+
+```whip
+credential stripe_api      { kind bearer }
+credential release_signing { kind ed25519 }
+credential s3_key          { kind aws_sigv4 }
+```
+
+The `kind` clause is required. The kinds are `bearer`, `basic`, `raw`,
+`hmac_sha256`, `ed25519`, `aws_sigv4`, and `jwt_rs256`. The kind lets the
+checker reject an operation that the credential cannot perform statically: a
+`sign` with a `bearer` credential is a check error. The registered kind at the
+custodian is authoritative, and a mismatch is an error. A credential
+declaration registers the `std.custody` library automatically.
+
+### The `secret` type
+
+The type `secret` is a primitive type beside `string` and `bool`. A value of
+type `secret` can be bound, passed, stored in a field of a class, and placed
+in an effect position. No operation in the language or the runtime yields the
+material of a secret. A `secret` field admits no literal: a credential is a
+reference, never a value. A model cannot produce a secret either — the
+coercion schema of a `secret` field matches nothing.
+
+### The sealing rung and the governance floor
+
+The custodian seals material at a rung that it derives from evidence:
+`process` (r0, the development shim — the reply of the custodian is tagged
+degraded), `os-keyring` (r1), `hardware` (r2, a TPM or a PKCS#11 token), and
+`remote` (r3, a vault such as OpenBao — the material never exists on the
+machine). The signed governance envelope can demand a floor:
+
+```text
+require credential hardware
+grant credential stripe -> credential:acme/stripe-live readable by Ops
+```
+
+The floor lives in the signed envelope beside `require mcp` and for the same
+reason: provisioning a credential must not lower the bar that judges it. The
+resource identity of a credential is `credential:<name>` and is deliberately
+free of the backend, so a migration from one sealing backend to another does
+not invalidate the grants that name it.
+
 Send an outbound message with a `send via <channel> { ... } as <binding>`
 statement:
 

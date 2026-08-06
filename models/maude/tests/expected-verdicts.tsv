@@ -5,6 +5,7 @@
 # filename<TAB>signature
 action-expansion.maude	SSNNN
 admission.maude	SSSSNNNNNSSNNNSSNNN
+alpha-canonicalization.maude	SNSNSSSNSSNS
 branch-effect-key.maude	SSSNSN
 cache-prefix-append-only.maude	SSSN
 case-family.maude	SSSSSNNNN
@@ -22,6 +23,10 @@ construct-graph.maude	SSSNNNNSSSSNSNNNNNNSNSNNNSNNNNNN
 construct-interop-examples.maude	SNSNSNSNSNSNSN
 construct-lowering.maude	SSSSSNNNNNNNNNNNNNNNNNSNSSSSSS
 contradiction-reopener.maude	NSSNS
+credential-no-eliminator.maude	SSSSSSNNNNNN
+credential-rung-evidence.maude	SSSSSNNNNNN
+credential-verify-endorse.maude	SSSSNNNNNN
+credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN

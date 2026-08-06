@@ -1,0 +1,21 @@
+[package]
+name = "whipplescript-custody"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Credential custody protocol for WhippleScript (DR-0053): handles, sentinels, the operation vocabulary, and the transport seam"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

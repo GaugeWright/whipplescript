@@ -4033,6 +4033,7 @@ mod tests {
             actor: actor.map(str::to_owned),
             intent: None,
             recorded_at: format!("t{seq}"),
+            decls: Vec::new(),
         };
         let units = vec![
             unit(0, "c0", "src/a.rs", Some("s:sess-7")),

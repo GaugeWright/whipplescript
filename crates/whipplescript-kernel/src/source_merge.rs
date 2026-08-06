@@ -25,11 +25,30 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use whipplescript_parser::{compile_program, IrProgram};
-use whipplescript_store::vcs::{SourceMergeVerdict, SourceMerger};
+use whipplescript_parser::{canonical_declarations, compile_program, DeclCanon, IrProgram};
+use whipplescript_store::vcs::{CanonDecl, DeclCanonicalizer, SourceMergeVerdict, SourceMerger};
 
 /// The parser-backed source merger the hosts install into `WorkspaceVcs`.
 pub struct WhipSourceMerger;
+
+/// The parser-backed DR-0054 canonicalizer the hosts install next to the
+/// merger (the change-unit index's declaration-level sub-rows ride it).
+pub struct WhipDeclCanonicalizer;
+
+impl DeclCanonicalizer for WhipDeclCanonicalizer {
+    fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>> {
+        Some(
+            canonical_declarations(source)?
+                .into_iter()
+                .map(|declaration| CanonDecl {
+                    identity: declaration.identity,
+                    canon_hash: declaration.canon_hash,
+                    rename_hash: declaration.rename_hash,
+                })
+                .collect(),
+        )
+    }
+}
 
 /// One top-level declaration block: the identity (its normalized first
 /// line) and the exact source text (reassembly is lossless by check).
@@ -254,14 +273,97 @@ impl SourceMerger for WhipSourceMerger {
         let ours_changed = changed_identities(&base_map, &ours_map);
         let theirs_changed = changed_identities(&base_map, &theirs_map);
 
-        // Both-modified-same-declaration: trivially a conflict unless both
-        // sides landed the identical text (one change, reunified).
+        // DR-0054 canonical maps (identity -> canon). The merge already
+        // requires every side to compile, so these should exist; a `None`
+        // simply forfeits the refinements below (fail-closed to the pre-DR
+        // verdicts, never the other direction).
+        let canon_map = |source: &str| -> Option<BTreeMap<String, DeclCanon>> {
+            Some(
+                canonical_declarations(source)?
+                    .into_iter()
+                    .map(|declaration| (declaration.identity.clone(), declaration))
+                    .collect(),
+            )
+        };
+        let base_canon = canon_map(base);
+        let ours_canon = canon_map(ours);
+        let theirs_canon = canon_map(theirs);
+
+        // Both-modified-same-declaration: a conflict unless both sides
+        // landed the identical text (one change, reunified) or the DR-0054
+        // dissolve applies — canonically equal sides (formatting, comments,
+        // binding names) are one change; ours' text is the deterministic
+        // pick at assembly.
         for identity in ours_changed.intersection(&theirs_changed) {
             if ours_map.get(identity).map(|text| norm(text))
-                != theirs_map.get(identity).map(|text| norm(text))
+                == theirs_map.get(identity).map(|text| norm(text))
             {
+                continue;
+            }
+            let canonically_equal = match (&ours_canon, &theirs_canon) {
+                (Some(ours_canon), Some(theirs_canon)) => matches!(
+                    (ours_canon.get(identity), theirs_canon.get(identity)),
+                    (Some(ours_decl), Some(theirs_decl))
+                        if ours_decl.canon_hash == theirs_decl.canon_hash
+                ),
+                _ => false,
+            };
+            if !canonically_equal {
                 return SourceMergeVerdict::Conflict;
             }
+        }
+
+        // DR-0054 rename carry: within one side, a deleted identity and an
+        // added identity of matching `rename_hash` are one declaration
+        // renamed — exempt from the footprint requirement (a pure rename's
+        // fact-flow delta is nil; the final compile gate still applies).
+        // Fail-closed walls: exact canonical match only, unambiguous
+        // pairing (one deleted + one added per key), and the OTHER side
+        // touched neither identity.
+        let mut carried: BTreeSet<String> = BTreeSet::new();
+        if let Some(base_canon) = &base_canon {
+            let mut detect = |changed: &BTreeSet<String>,
+                              side_map: &BTreeMap<String, String>,
+                              side_canon: &Option<BTreeMap<String, DeclCanon>>,
+                              other_changed: &BTreeSet<String>| {
+                let Some(side_canon) = side_canon else {
+                    return;
+                };
+                let mut deleted_by_key: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+                let mut added_by_key: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+                for identity in changed {
+                    if base_map.contains_key(identity) && !side_map.contains_key(identity) {
+                        if let Some(declaration) = base_canon.get(identity) {
+                            deleted_by_key
+                                .entry(declaration.rename_hash.as_str())
+                                .or_default()
+                                .push(identity);
+                        }
+                    } else if !base_map.contains_key(identity) && side_map.contains_key(identity) {
+                        if let Some(declaration) = side_canon.get(identity) {
+                            added_by_key
+                                .entry(declaration.rename_hash.as_str())
+                                .or_default()
+                                .push(identity);
+                        }
+                    }
+                }
+                for (key, deleted) in &deleted_by_key {
+                    let Some(added) = added_by_key.get(key) else {
+                        continue;
+                    };
+                    if deleted.len() != 1 || added.len() != 1 {
+                        continue;
+                    }
+                    if other_changed.contains(deleted[0]) || other_changed.contains(added[0]) {
+                        continue;
+                    }
+                    carried.insert(deleted[0].clone());
+                    carried.insert(added[0].clone());
+                }
+            };
+            detect(&ours_changed, &ours_map, &ours_canon, &theirs_changed);
+            detect(&theirs_changed, &theirs_map, &theirs_canon, &ours_changed);
         }
 
         // The certificate: every changed declaration must be a rule with a
@@ -292,8 +394,8 @@ impl SourceMerger for WhipSourceMerger {
         };
         let mut ours_footprints = Vec::new();
         for identity in &ours_changed {
-            if theirs_changed.contains(identity) {
-                continue; // identical both-sides change, already admitted
+            if theirs_changed.contains(identity) || carried.contains(identity) {
+                continue; // both-sides-admitted change, or a carried rename
             }
             let Some(footprint) = footprint_for(identity, &ours_ir, &ours_map) else {
                 return SourceMergeVerdict::Conflict;
@@ -302,7 +404,7 @@ impl SourceMerger for WhipSourceMerger {
         }
         let mut theirs_footprints = Vec::new();
         for identity in &theirs_changed {
-            if ours_changed.contains(identity) {
+            if ours_changed.contains(identity) || carried.contains(identity) {
                 continue;
             }
             let Some(footprint) = footprint_for(identity, &theirs_ir, &theirs_map) else {
@@ -416,6 +518,68 @@ mod tests {
             WhipSourceMerger.merge_source(Some(BASE), &same, &same.clone()),
             SourceMergeVerdict::Certified { .. }
         ));
+    }
+
+    /// DR-0054 dissolve: both sides touched the SAME declaration but the
+    /// difference is canonically nil (each renamed the local binding) —
+    /// one change, reunified, ours' text is the deterministic pick.
+    #[test]
+    fn canonically_equal_both_sided_change_dissolves() {
+        let ours = BASE.replace("when Ticket as t", "when Ticket as ticket");
+        let theirs = BASE.replace("when Ticket as t", "when Ticket as item");
+        let SourceMergeVerdict::Certified { merged } =
+            WhipSourceMerger.merge_source(Some(BASE), &ours, &theirs)
+        else {
+            panic!("expected the canonical dissolve to certify");
+        };
+        assert!(merged.contains("when Ticket as ticket"));
+    }
+
+    /// DR-0054 rename carry: ours renames `class Ticket` to `class Issue`
+    /// (updating the referencing rules); theirs is untouched. The class
+    /// delete+add pair matches on `rename_hash` and is carried instead of
+    /// hitting the no-footprint-model wall.
+    #[test]
+    fn pure_class_rename_carries_instead_of_failing_closed() {
+        let ours = BASE.replace("Ticket", "Issue");
+        let SourceMergeVerdict::Certified { merged } =
+            WhipSourceMerger.merge_source(Some(BASE), &ours, BASE)
+        else {
+            panic!("expected the rename carry to certify");
+        };
+        assert!(merged.contains("class Issue"));
+        assert!(!merged.contains("class Ticket"));
+    }
+
+    /// The carry is exact-match-only: a rule rename PLUS an edit is not a
+    /// rename (Decision 3), so its footprint is checked — and here it
+    /// interferes with theirs' write. A PURE rename of the same rule is
+    /// semantically untouched and certifies over the very same theirs.
+    #[test]
+    fn rename_plus_edit_is_not_carried() {
+        let theirs = BASE.replace("status \"open\"", "status \"reopened\"");
+        let pure_rename = BASE.replace("rule close\n", "rule closed_out\n");
+        assert!(matches!(
+            WhipSourceMerger.merge_source(Some(BASE), &pure_rename, &theirs),
+            SourceMergeVerdict::Certified { .. }
+        ));
+        let rename_and_edit = pure_rename.replace("message \"done\"", "message \"finished\"");
+        assert_eq!(
+            WhipSourceMerger.merge_source(Some(BASE), &rename_and_edit, &theirs),
+            SourceMergeVerdict::Conflict
+        );
+    }
+
+    /// The carry demands an untouched other side: theirs modified the very
+    /// declaration ours renamed away — honest conflict.
+    #[test]
+    fn rename_conflicts_when_the_other_side_touched_the_identity() {
+        let ours = BASE.replace("rule close\n", "rule closed_out\n");
+        let theirs = BASE.replace("message \"done\"", "message \"theirs\"");
+        assert_eq!(
+            WhipSourceMerger.merge_source(Some(BASE), &ours, &theirs),
+            SourceMergeVerdict::Conflict
+        );
     }
 
     /// Fail-closed walls: a non-rule change (class), a non-compiling

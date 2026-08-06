@@ -5,6 +5,8 @@
 //! as source text until the typed IR is ready to lower them.
 
 mod action_expand;
+mod canonical;
+pub use canonical::{canonical_declarations, canonical_program_hash, DeclCanon};
 pub mod body;
 mod body_print;
 mod then_expand;
@@ -129,6 +131,7 @@ pub enum Item {
     Harness(HarnessDecl),
     Tracker(TrackerDecl),
     Channel(ChannelDecl),
+    Credential(CredentialDecl),
     Stream(StreamDecl),
     Gauge(GaugeDecl),
     Mark(MarkDecl),
@@ -165,6 +168,7 @@ impl Item {
             Self::Harness(decl) => decl.span,
             Self::Tracker(decl) => decl.span,
             Self::Channel(decl) => decl.span,
+            Self::Credential(decl) => decl.span,
             Self::Stream(decl) => decl.span,
             Self::Gauge(decl) => decl.span,
             Self::Mark(decl) => decl.span,
@@ -281,6 +285,21 @@ pub struct ChannelDecl {
     pub provider: Ident,
     pub workspace: Option<Ident>,
     pub destination: Option<StringLiteral>,
+    pub span: SourceSpan,
+}
+
+/// `credential <name> { kind <kind> }` (std.custody; DR-0053 §5): a bare
+/// handle naming a custodian entry — governance supplies reality via
+/// `grant credential … -> credential:<addr>`, and material never appears in
+/// source. `kind` exists so the checker can statically reject an operation
+/// the credential cannot perform (`sign … with` a `bearer`); the custodian's
+/// registered kind is authoritative and mismatch is a check error. Kinds are
+/// spelled with underscores in source (`hmac_sha256`) and normalize to the
+/// protocol's kebab-case.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialDecl {
+    pub name: Ident,
+    pub kind: Ident,
     pub span: SourceSpan,
 }
 
@@ -1036,6 +1055,7 @@ pub struct IrProgram {
     pub trackers: Vec<IrTracker>,
     pub streams: Vec<IrStream>,
     pub channels: Vec<IrChannel>,
+    pub credentials: Vec<IrCredential>,
     pub gauges: Vec<IrGauge>,
     pub marks: Vec<IrMark>,
     pub campaigns: Vec<IrCampaign>,
@@ -1180,6 +1200,18 @@ pub struct IrChannel {
     pub provider: String,
     pub workspace: Option<String>,
     pub destination: Option<String>,
+    pub span: SourceSpan,
+}
+
+/// A lowered `credential` declaration (DR-0053 §5): a handle plus its
+/// declared kind, normalized to the custody protocol's kebab-case. Metadata
+/// only — reality (material, sealing rung, grants) lives with the custodian
+/// and governance, never in the program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrCredential {
+    pub name: String,
+    /// Kebab-case credential kind (`bearer`, `hmac-sha256`, …).
+    pub kind: String,
     pub span: SourceSpan,
 }
 
@@ -1454,6 +1486,11 @@ pub enum IrPrimitiveType {
     Audio,
     Pdf,
     Video,
+    /// DR-0053 §5: the carrier of credential custody. A `secret` value can be
+    /// bound, passed, stored in a field, and placed in an effect position —
+    /// and no operation anywhere in the language or runtime yields its
+    /// material (`models/maude/credential-no-eliminator.maude`).
+    Secret,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1943,6 +1980,14 @@ struct SemanticContext {
     /// `when message from` requires inbound-capable) resolve the report
     /// through this map.
     channel_providers: BTreeMap<String, String>,
+    /// Declared `credential` kinds by name (std.custody; DR-0053 §5): the
+    /// kind-conditioned static checks (`sign … with` needs a signing kind,
+    /// presentation forms need a presentable kind) resolve through this map.
+    /// Kinds are stored kebab-case, matching the custody protocol.
+    /// Consumed once `call`/`verify` land; the declaration ships first
+    /// (custody-first sequencing).
+    #[allow(dead_code)]
+    credentials: BTreeMap<String, String>,
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
     memory_pools: BTreeSet<String>,
@@ -2010,12 +2055,20 @@ enum ExprType {
     String,
     Duration,
     Time,
+    /// DR-0053: distinct from `String` so no operator, comparison, or
+    /// interpolation accepts a secret where prose is expected — the
+    /// expression-level face of the no-eliminator property. Deliberately NOT
+    /// `Unknown`, which type-checks everywhere.
+    Secret,
     Null,
     Object,
     Optional(Box<ExprType>),
     Array(Box<ExprType>),
     Map(Box<ExprType>),
-    Finite { label: String, values: Vec<String> },
+    Finite {
+        label: String,
+        values: Vec<String>,
+    },
     Collection,
     Unknown,
 }
@@ -2382,6 +2435,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Counter(decl) => ("counter", decl.name.name.clone(), decl.span),
             Item::Tracker(decl) => ("tracker", decl.name.name.clone(), decl.span),
             Item::Channel(decl) => ("channel", decl.name.name.clone(), decl.span),
+            Item::Credential(decl) => ("credential", decl.name.name.clone(), decl.span),
             Item::FileStore(decl) => ("file store", decl.name.name.clone(), decl.span),
             Item::MemoryPool(decl) => ("memory pool", decl.name.name.clone(), decl.span),
             Item::Event(decl) => ("signal", decl.name.clone(), decl.span),
@@ -3225,6 +3279,9 @@ impl IrProgram {
         if !self.channels.is_empty() {
             register_standard_library(&mut libraries, "std.messaging");
         }
+        if !self.credentials.is_empty() {
+            register_standard_library(&mut libraries, "std.custody");
+        }
         // A bare `file store` declaration registers the owning library even
         // before any rule uses a file effect (spec/std-files.md "Manifest":
         // the declaration alone previously registered nothing).
@@ -3467,6 +3524,16 @@ impl IrProgram {
                     line.push_str(&format!(" destination={destination:?}"));
                 }
                 push_line(&mut snapshot, line);
+            }
+        }
+
+        if !self.credentials.is_empty() {
+            push_line(&mut snapshot, "credentials");
+            for credential in &self.credentials {
+                push_line(
+                    &mut snapshot,
+                    format!("  credential {} kind={}", credential.name, credential.kind),
+                );
             }
         }
 
@@ -4316,6 +4383,7 @@ impl IrPrimitiveType {
             Self::Audio => "audio",
             Self::Pdf => "pdf",
             Self::Video => "video",
+            Self::Secret => "secret",
         }
     }
 }
@@ -4410,6 +4478,7 @@ fn lower_program(
         trackers: Vec::new(),
         streams: Vec::new(),
         channels: Vec::new(),
+        credentials: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
         campaigns: Vec::new(),
@@ -4494,6 +4563,7 @@ fn lower_program(
             Item::Harness(harness) => lower_harness(harness, &mut ir, &mut diagnostics),
             Item::Tracker(queue) => lower_tracker(queue, &mut ir, &mut diagnostics),
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
+            Item::Credential(credential) => lower_credential(credential, &mut ir, &mut diagnostics),
             Item::Stream(stream) => lower_stream(stream, &mut ir, &mut diagnostics),
             Item::Gauge(gauge) => lower_gauge(gauge, &mut ir, &mut diagnostics),
             Item::Mark(mark) => lower_mark(mark, &mut ir, &mut diagnostics),
@@ -5704,6 +5774,10 @@ fn expand_pattern_item(
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
         )),
+        Item::Credential(credential) => Some((
+            format!("credential:{}", credential.name.name),
+            Item::Credential(credential),
+        )),
         // Gauges, campaigns, and marks are rejected from pattern bodies by
         // `pattern_body_admission` (objective intent and cut points are
         // top-level); there is deliberately no expansion path for them.
@@ -6181,6 +6255,7 @@ impl SemanticContext {
         let mut counters = BTreeSet::new();
         let mut channels = BTreeSet::new();
         let mut channel_providers = BTreeMap::new();
+        let mut credentials = BTreeMap::new();
         let mut memory_pools = BTreeSet::new();
 
         for item in &program.items {
@@ -6221,6 +6296,12 @@ impl SemanticContext {
                     channel_providers
                         .insert(channel.name.name.clone(), channel.provider.name.clone());
                 }
+                Item::Credential(credential) => {
+                    credentials.insert(
+                        credential.name.name.clone(),
+                        credential.kind.name.replace('_', "-"),
+                    );
+                }
                 Item::MemoryPool(pool) => {
                     memory_pools.insert(pool.name.name.clone());
                 }
@@ -6244,6 +6325,7 @@ impl SemanticContext {
             counters,
             channels,
             channel_providers,
+            credentials,
             memory_pools,
         }
     }
@@ -7438,6 +7520,59 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         workspace: channel.workspace.map(|workspace| workspace.name),
         destination: channel.destination.map(|destination| destination.value),
         span: channel.span,
+    });
+}
+
+fn lower_credential(
+    credential: CredentialDecl,
+    ir: &mut IrProgram,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(existing) = ir
+        .credentials
+        .iter()
+        .find(|declared| declared.name == credential.name.name)
+    {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: credential.span,
+                message: format!(
+                    "credential `{}` is declared more than once",
+                    credential.name.name
+                ),
+                suggestion: Some("give each credential a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    // Kinds are spelled with underscores in source (identifier tokens) and
+    // normalize to the custody protocol's kebab-case. The set is the
+    // protocol's closed `CredentialKind` vocabulary — the same table the
+    // custodian enforces, so a kind the checker accepts is a kind the
+    // custodian recognizes.
+    let normalized = credential.kind.name.replace('_', "-");
+    if whipplescript_custody::CredentialKind::parse(&normalized).is_err() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: credential.kind.span,
+            message: format!(
+                "credential `{}` names unknown kind `{}`",
+                credential.name.name, credential.kind.name
+            ),
+            suggestion: Some(
+                "declare one of: bearer, basic, raw, hmac_sha256, ed25519, aws_sigv4, jwt_rs256"
+                    .to_owned(),
+            ),
+        });
+        // Fall through: the credential still lowers so reference sites do
+        // not cascade an unknown-credential error on top.
+    }
+    ir.credentials.push(IrCredential {
+        name: credential.name.name,
+        kind: normalized,
+        span: credential.span,
     });
 }
 
@@ -14149,6 +14284,7 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax, semantic: &SemanticContext) -> Ex
             "string" => ExprType::String,
             "duration" => ExprType::Duration,
             "time" => ExprType::Time,
+            "secret" => ExprType::Secret,
             _ => ExprType::Unknown,
         },
         TypeSyntax::LiteralString { value, .. } => ExprType::Finite {
@@ -14300,6 +14436,7 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Finite { label, values } => format!("{label}<{}>", values.join(" | ")),
         ExprType::Duration => "duration".to_owned(),
         ExprType::Time => "time".to_owned(),
+        ExprType::Secret => "secret".to_owned(),
         ExprType::Null => "null".to_owned(),
         ExprType::Object => "object".to_owned(),
         ExprType::Array(inner) => format!("{}[]", expr_type_label(inner)),
@@ -15451,7 +15588,7 @@ fn vcs_sugar_schema(phrase: &str) -> Option<&'static str> {
     }
 }
 
-fn split_when_guard(when: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_when_guard(when: &str) -> (&str, Option<&str>) {
     match when.split_once(" where ") {
         Some((pattern, guard)) => (pattern.trim(), Some(guard.trim())),
         None => (when.trim(), None),
@@ -18945,6 +19082,24 @@ fn validate_primitive_literal(
     literal: &LiteralExpr<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // A `secret` admits no literal at all: a credential is never a value in
+    // source (DR-0053 §5). The generic "record a compatible value" suggestion
+    // below would be exactly the wrong advice here.
+    if primitive == "secret" {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: rule.body.span,
+            message: format!(
+                "field `{record_schema}.{field}` is `secret`: secrets have no literal form"
+            ),
+            suggestion: Some(
+                "reference a declared credential; material lives with the custodian, never in \
+                 source"
+                    .to_owned(),
+            ),
+        });
+        return;
+    }
     let valid = matches!(
         (primitive, literal),
         ("string", LiteralExpr::String(_))
@@ -19230,7 +19385,7 @@ fn is_prompt_content_type_token(candidate: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
 }
 
-fn binding_after_as(line: &str) -> Option<String> {
+pub(crate) fn binding_after_as(line: &str) -> Option<String> {
     let mut tokens = line.split_whitespace();
     while let Some(token) = tokens.next() {
         if token == "as" {
@@ -19335,16 +19490,20 @@ fn lower_primitive_type(name: &str) -> IrPrimitiveType {
         "audio" => IrPrimitiveType::Audio,
         "pdf" => IrPrimitiveType::Pdf,
         "video" => IrPrimitiveType::Video,
+        // `secret` must never fall into the String default below: that would
+        // silently downgrade the one type whose point is having no
+        // eliminator.
+        "secret" => IrPrimitiveType::Secret,
         _ => IrPrimitiveType::String,
     }
 }
 
-fn push_line(snapshot: &mut String, line: impl AsRef<str>) {
+pub(crate) fn push_line(snapshot: &mut String, line: impl AsRef<str>) {
     snapshot.push_str(line.as_ref());
     snapshot.push('\n');
 }
 
-fn stable_hash(value: &str) -> String {
+pub(crate) fn stable_hash(value: &str) -> String {
     // SHA-256 truncated to 128 bits (the FNV-collision hardening swap):
     // source_hash/ir_hash are program-version identity — colliding them
     // aliases two program revisions. Report-schema digest patterns and the
@@ -19537,7 +19696,7 @@ fn format_items(items: Vec<Item>, formatted: &mut String) {
     }
 }
 
-fn format_item(item: Item, formatted: &mut String) {
+pub(crate) fn format_item(item: Item, formatted: &mut String) {
     match item {
         Item::Include(include) => {
             push_line(formatted, format!("include {:?}", include.path.value));
@@ -19676,6 +19835,11 @@ fn format_item(item: Item, formatted: &mut String) {
             }
             push_line(formatted, "}");
         }
+        Item::Credential(credential) => {
+            push_line(formatted, format!("credential {} {{", credential.name.name));
+            push_line(formatted, format!("  kind {}", credential.kind.name));
+            push_line(formatted, "}");
+        }
         Item::FileStore(file_store) => {
             push_line(formatted, format!("file store {} {{", file_store.name.name));
             push_line(formatted, format!("  root {:?}", file_store.root));
@@ -19787,13 +19951,13 @@ fn format_item(item: Item, formatted: &mut String) {
     }
 }
 
-fn format_tags(tags: &[TagDecl], formatted: &mut String) {
+pub(crate) fn format_tags(tags: &[TagDecl], formatted: &mut String) {
     for tag in tags {
         push_line(formatted, format!("@{}", tag.name));
     }
 }
 
-fn format_description(description: Option<&StringLiteral>, formatted: &mut String) {
+pub(crate) fn format_description(description: Option<&StringLiteral>, formatted: &mut String) {
     if let Some(description) = description {
         push_line(formatted, format!("description {:?}", description.value));
     }
@@ -19854,7 +20018,7 @@ fn format_apply(apply: ApplyDecl, formatted: &mut String) {
     push_line(formatted, "}");
 }
 
-fn format_workflow(workflow: WorkflowDecl, formatted: &mut String) {
+pub(crate) fn format_workflow(workflow: WorkflowDecl, formatted: &mut String) {
     format_tags(&workflow.tags, formatted);
     format_description(workflow.description.as_ref(), formatted);
     push_line(formatted, format!("workflow {} {{", workflow.name.name));
@@ -20769,6 +20933,7 @@ enum DeclAstKind {
     MemoryPool,
     FileStore,
     Stream,
+    Credential,
 }
 
 /// One order-free clause of a `declaration_block` construct: a named value
@@ -21656,6 +21821,22 @@ impl Parser<'_> {
                     destination: bag.text_literal("destination"),
                     span,
                 }))
+            }
+            DeclAstKind::Credential => {
+                let Some(kind) = bag.ident("kind") else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("credential `{}` must declare its kind", name.name),
+                        suggestion: Some(
+                            "add `kind <kind>` inside the credential block (bearer | basic | \
+                             raw | hmac_sha256 | ed25519 | aws_sigv4 | jwt_rs256)"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                };
+                Some(Item::Credential(CredentialDecl { name, kind, span }))
             }
             DeclAstKind::Stream => {
                 let Some(members) = bag.idents("members").filter(|idents| !idents.is_empty())
@@ -24627,6 +24808,7 @@ fn is_primitive_type(name: &str) -> bool {
             | "audio"
             | "pdf"
             | "video"
+            | "secret"
     )
 }
 
@@ -24681,8 +24863,8 @@ mod tests {
             .collect();
         assert_eq!(
             keywords.len(),
-            8,
-            "expected exactly 8 declaration_block specs"
+            9,
+            "expected exactly 9 declaration_block specs"
         );
         for expected in [
             "tracker",
@@ -24693,6 +24875,7 @@ mod tests {
             "file store",
             "memory pool",
             "stream",
+            "credential",
         ] {
             assert!(
                 keywords.contains(&expected),
@@ -35451,6 +35634,159 @@ rule j
             ir.channels
         );
         assert_eq!(ir.channels.len(), 2);
+    }
+
+    #[test]
+    fn credential_declaration_lowers_with_normalized_kind() {
+        // DR-0053 §5: `credential <name> { kind <kind> }` — a bare handle,
+        // channel-style. Kinds are underscore-spelled identifiers in source
+        // and normalize to the protocol's kebab-case in IR.
+        let source = r#"
+@service
+workflow Creds
+
+credential stripe_api { kind bearer }
+credential release_signing { kind ed25519 }
+credential s3_key { kind aws_sigv4 }
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let ir = compiled.ir.expect("compiles");
+        assert_eq!(ir.credentials.len(), 3);
+        assert_eq!(ir.credentials[0].name, "stripe_api");
+        assert_eq!(ir.credentials[0].kind, "bearer");
+        assert_eq!(ir.credentials[2].kind, "aws-sigv4");
+        let snapshot = ir.to_snapshot();
+        assert!(snapshot.contains("credential stripe_api kind=bearer"));
+        assert!(snapshot.contains("credential s3_key kind=aws-sigv4"));
+        assert!(
+            ir.contract_registry()
+                .libraries
+                .iter()
+                .any(|library| library.id == "std.custody"),
+            "declaring a credential registers std.custody"
+        );
+    }
+
+    #[test]
+    fn credential_requires_a_known_kind() {
+        let compiled = compile_program(
+            r#"
+@service
+workflow CredsBadKind
+
+credential mystery { kind quantum }
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#,
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown kind `quantum`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+
+        let missing = compile_program(
+            r#"
+@service
+workflow CredsNoKind
+
+credential bare_handle
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#,
+        );
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("must declare its kind")),
+            "{:?}",
+            missing.diagnostics
+        );
+    }
+
+    #[test]
+    fn duplicate_credential_is_rejected() {
+        let compiled = compile_program(
+            r#"
+@service
+workflow DupCred
+
+credential stripe_api { kind bearer }
+credential stripe_api { kind raw }
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> { complete result { v "ok" } }
+"#,
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("declared more than once")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    #[test]
+    fn secret_fields_admit_no_literal() {
+        // The no-eliminator property's source-level face: a `secret`-typed
+        // field can never be filled from a literal (DR-0053 §5 — material is
+        // never a value in source).
+        let compiled = compile_program(
+            r#"
+@service
+workflow SecretLiteral
+
+class Config {
+  token secret
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> {
+  record Config { token "sk_live_oops" }
+  complete result { v "ok" }
+}
+"#,
+        );
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("secrets have no literal form")),
+            "{:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]

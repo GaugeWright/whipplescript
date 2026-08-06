@@ -338,7 +338,27 @@ pub fn servers_from_mcp_servers_block(value: &Value) -> Result<Vec<McpServerConf
 /// value passes through. A missing variable is an error, not an empty string —
 /// a server silently launched without its credential fails in confusing ways
 /// much later.
+///
+/// Unification note (DR-0053 *Migration*): `env:` is the legacy shim of the
+/// `credential:<name>` namespace and resolves at r0, **degraded** — material
+/// enters whip's address space and the child's environment. A
+/// `credential:<name>` reference cannot be resolved here by design: the
+/// custody protocol has no operation that returns material, and injecting a
+/// secret into a spawned server's environment requires exactly that. MCP
+/// servers therefore stay on the shim until they can consume sentinels; the
+/// shim is removed at the first release that requires a sealing rung.
 fn resolve_secret(raw: &str, context: &str) -> Result<String, String> {
+    if raw.starts_with("credential:") || raw.starts_with("secret:") {
+        return Err(format!(
+            "{context} uses {raw:?}: custodian-held credentials cannot be resolved into a \
+             child environment (no custody operation returns material) — use the legacy \
+             `env:<VAR>` shim for MCP servers, which is r0/degraded by construction"
+        ));
+    }
+    resolve_secret_shim(raw, context)
+}
+
+fn resolve_secret_shim(raw: &str, context: &str) -> Result<String, String> {
     match raw.strip_prefix("env:") {
         Some(name) => std::env::var(name)
             .ok()

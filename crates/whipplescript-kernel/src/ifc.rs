@@ -77,6 +77,15 @@ pub struct Envelope {
     /// against, and the check would certify itself. Here it moves only for
     /// someone holding the signing key.
     mcp_min_rung: Option<crate::mcp::McpRung>,
+    /// `require credential <rung>` (DR-0053 §4): the minimum sealing rung a
+    /// credential's *derived* evidence must reach before the custodian's
+    /// reply is admitted. `None` = the policy does not constrain sealing.
+    ///
+    /// In the ENVELOPE beside `require mcp` and for the same reason: the
+    /// custodian derives the rung from evidence, and if the floor lived
+    /// beside the evidence, whoever provisions a credential could also lower
+    /// the bar it is judged against.
+    credential_min_rung: Option<whipplescript_custody::Rung>,
     /// workflow-invoke resources (`invoke:<name>`) governance marks INTERNAL (E2):
     /// the target is attested as a bundle-private workflow, not a cross-boundary
     /// invocation endpoint.
@@ -187,6 +196,16 @@ impl Envelope {
                     .ok_or_else(|| format!("unknown mcp_min_rung `{rung}`"))?,
             ),
             Some(_) => return Err("mcp_min_rung must be a string".to_owned()),
+        };
+        // The minimum credential sealing rung (DR-0053 §4), same discipline:
+        // a typo is an error, never a silently dropped requirement.
+        let credential_min_rung = match value.get("credential_min_rung") {
+            None => None,
+            Some(serde_json::Value::String(rung)) => Some(
+                whipplescript_custody::Rung::parse(rung)
+                    .map_err(|_| format!("unknown credential_min_rung `{rung}`"))?,
+            ),
+            Some(_) => return Err("credential_min_rung must be a string".to_owned()),
         };
         let capabilities = value
             .get("capabilities")
@@ -321,6 +340,7 @@ impl Envelope {
             internal_signals,
             internal_workflows,
             mcp_min_rung,
+            credential_min_rung,
             address_of,
             party_of,
             guarantees,
@@ -346,6 +366,7 @@ impl Envelope {
         let mut internal_signals = BTreeSet::new();
         let mut internal_workflows = BTreeSet::new();
         let mut mcp_min_rung: Option<crate::mcp::McpRung> = None;
+        let mut credential_min_rung: Option<whipplescript_custody::Rung> = None;
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
@@ -397,9 +418,24 @@ impl Envelope {
                         mcp_min_rung = Some(parsed);
                         continue;
                     }
+                    // `require credential <rung>` (DR-0053 §4): the minimum
+                    // sealing rung, judged against the rung the custodian
+                    // DERIVES from evidence — configuration is not evidence.
+                    (Some("credential"), Some(rung)) => {
+                        let parsed = whipplescript_custody::Rung::parse(rung).map_err(|_| {
+                            format!(
+                                "line {}: unknown credential sealing rung `{rung}` \
+                                 (process | os-keyring | hardware | remote)",
+                                index + 1
+                            )
+                        })?;
+                        credential_min_rung = Some(parsed);
+                        continue;
+                    }
                     _ => {
                         return Err(format!(
-                            "line {}: require needs `require mcp <rung>`",
+                            "line {}: require needs `require mcp <rung>` or \
+                             `require credential <rung>`",
                             index + 1
                         ))
                     }
@@ -513,6 +549,7 @@ impl Envelope {
             internal_signals,
             internal_workflows,
             mcp_min_rung,
+            credential_min_rung,
             address_of,
             party_of,
             guarantees,
@@ -599,6 +636,11 @@ impl Envelope {
         // is the whole point: the bar cannot be moved without the signing key.
         if let Some(rung) = self.mcp_min_rung {
             canonical["mcp_min_rung"] = serde_json::Value::String(rung.as_str().to_owned());
+        }
+        // The minimum credential sealing rung (DR-0053 §4): same
+        // emit-when-declared rule, same signed-artifact rationale.
+        if let Some(rung) = self.credential_min_rung {
+            canonical["credential_min_rung"] = serde_json::Value::String(rung.as_str().to_owned());
         }
         // Typed host governance policy (SUB-4): same emit-when-declared rule as
         // guarantees, so envelopes carrying no policy keep their signed hashes.
@@ -754,6 +796,13 @@ impl Envelope {
     /// The minimum MCP trust rung this policy requires, if any.
     pub fn mcp_min_rung(&self) -> Option<crate::mcp::McpRung> {
         self.mcp_min_rung
+    }
+
+    /// The minimum credential sealing rung this policy requires, if any
+    /// (DR-0053 §4). Compared against the rung the custodian derives and
+    /// reports on every reply — a reply below the floor is refused.
+    pub fn credential_min_rung(&self) -> Option<whipplescript_custody::Rung> {
+        self.credential_min_rung
     }
 
     fn permits_capabilities(&self, capabilities: &[String]) -> bool {
@@ -1126,6 +1175,11 @@ fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
     use whipplescript_parser::{IrPrimitiveType, IrType};
     match ty {
         IrType::Primitive(IrPrimitiveType::String) => true,
+        // A `secret` is a handle, not prose: nothing an attacker chooses can
+        // ride in it, because it has no literal form and no eliminator
+        // (DR-0053 §5). Stated explicitly so the default below is a decision,
+        // not an accident.
+        IrType::Primitive(IrPrimitiveType::Secret) => false,
         IrType::Primitive(_) => false,
         IrType::LiteralString(_) => false,
         // A union is closed exactly when every arm is a declared literal. One
@@ -1314,6 +1368,12 @@ impl VerifiedEnvelope {
     /// (`spec/mcp-support-design-note.md` section 6).
     pub fn mcp_min_rung(&self) -> Option<crate::mcp::McpRung> {
         self.envelope.mcp_min_rung()
+    }
+
+    /// The minimum credential sealing rung this verified policy requires, if
+    /// any (DR-0053 §4).
+    pub fn credential_min_rung(&self) -> Option<whipplescript_custody::Rung> {
+        self.envelope.credential_min_rung()
     }
 
     /// The dynamic per-turn guarantees this policy requires each turn to
@@ -8016,5 +8076,67 @@ rule settle
         // hashes, so adding this field cannot invalidate existing attestations.
         let envelope = Envelope::from_dsl("delegate A acts-for B\n").expect("parsed");
         assert!(!envelope.to_canonical_json().contains("mcp_min_rung"));
+    }
+
+    #[test]
+    fn envelope_dsl_declares_a_minimum_credential_rung() {
+        // DR-0053 §4: `require credential <rung>` beside `require mcp <rung>`,
+        // for the same reason — provisioning a credential must not also lower
+        // the bar it is judged against.
+        let envelope = Envelope::from_dsl("require credential hardware\n").expect("parsed");
+        assert_eq!(
+            envelope.credential_min_rung(),
+            Some(whipplescript_custody::Rung::Hardware)
+        );
+        // The r-ladder spelling parses too.
+        let ladder = Envelope::from_dsl("require credential r3\n").expect("parsed");
+        assert_eq!(
+            ladder.credential_min_rung(),
+            Some(whipplescript_custody::Rung::Remote)
+        );
+        // Absent by default (progressive rigor — governance opts in).
+        let quiet = Envelope::from_dsl("delegate A acts-for B\n").expect("parsed");
+        assert_eq!(quiet.credential_min_rung(), None);
+        // A credential is governable by its stable resource identity beside
+        // the bar (the DR-0053 §5 operator shape).
+        let both = Envelope::from_dsl(
+            "require credential hardware\n\
+             grant credential stripe -> credential:acme/stripe-live readable by Ops\n",
+        )
+        .expect("parsed");
+        assert!(both.governs("credential:acme/stripe-live"));
+        assert!(!both.governs("credential:acme/other"));
+    }
+
+    #[test]
+    fn envelope_refuses_an_unknown_credential_rung_rather_than_ignoring_it() {
+        let error = match Envelope::from_dsl("require credential hardwear\n") {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown rung must be rejected, not ignored"),
+        };
+        assert!(error.contains("unknown credential sealing rung"), "{error}");
+        let json_error = match Envelope::from_json(r#"{"credential_min_rung": "hardwear"}"#) {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown rung must be rejected, not ignored"),
+        };
+        assert!(
+            json_error.contains("unknown credential_min_rung"),
+            "{json_error}"
+        );
+    }
+
+    #[test]
+    fn minimum_credential_rung_is_inside_the_signed_artifact() {
+        let envelope = Envelope::from_dsl("require credential remote\n").expect("parsed");
+        let canonical = envelope.to_canonical_json();
+        assert!(canonical.contains("credential_min_rung"), "{canonical}");
+        let round_tripped = Envelope::from_json(&canonical).expect("reparsed");
+        assert_eq!(
+            round_tripped.credential_min_rung(),
+            Some(whipplescript_custody::Rung::Remote)
+        );
+        // Emit-when-declared: silent envelopes keep their signed hashes.
+        let quiet = Envelope::from_dsl("delegate A acts-for B\n").expect("parsed");
+        assert!(!quiet.to_canonical_json().contains("credential_min_rung"));
     }
 }

@@ -1,0 +1,31 @@
+[package]
+name = "whipplescript-custodian"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The WhippleScript credential custodian (DR-0053): a second security principal that seals material and performs custody operations; whip holds handles"
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+whipplescript-custody = { version = "0.4.1", path = "../whipplescript-custody" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+ring = "0.17"
+zeroize = "1"
+# Real network egress for `request`/`mint` (DR-0053 §2): sync ureq matches the
+# repo's threads-not-async execution model.
+ureq = { version = "2", features = ["json", "native-certs"] }
+url = "2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "whip-custodian"
+path = "src/bin/whip_custodian.rs"
+
+[lints]
+workspace = true

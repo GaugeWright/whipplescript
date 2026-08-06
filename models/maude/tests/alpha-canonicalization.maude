@@ -1,0 +1,72 @@
+load ../alpha-canonicalization.maude
+
+--- Coverage: a PURE rename (c0 -> c0fmt, same canon class) carries the
+--- evidence row to the new name under canonical continuity.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferCanon(nA, c0, nB, c0fmt) ev(nA)
+  =>* C:Cfg carriedC(nB) .
+
+--- Bite 1: the NAIVE engine -- identity is the name alone -- can never
+--- carry, even on the pure rename. The pre-DR evidence orphaning.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferNaive(nA, c0, nB, c0fmt) ev(nA)
+  =>* carriedC(N:Name) RESIDUAL:Cfg .
+
+--- Coverage: the naive engine orphans the row instead.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferNaive(nA, c0, nB, c0fmt) ev(nA)
+  =>* C:Cfg orphanedN(nA) .
+
+--- Bite 2: rename+edit (c0 -> c1, canon classes differ) NEVER claims
+--- continuity -- fail-closed, Decision 3. Fuzzy matching's silently-wrong
+--- continuity is the one direction the scheme must not err in.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferCanon(nA, c0, nB, c1) ev(nA)
+  =>* carriedC(N:Name) RESIDUAL:Cfg .
+
+--- Coverage: rename+edit orphans honestly.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  xferCanon(nA, c0, nB, c1) ev(nA)
+  =>* C:Cfg orphanedC(nA) .
+
+--- Coverage of the pre-DR hazard: both sides landed the SAME semantic edit
+--- in different formatting (c1fmt vs c1) -- the text engine conflicts on
+--- bytes it should have recognized as one change.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeTextD(c1fmt, c1)
+  =>* C:Cfg textConflictD .
+
+--- Coverage: the canonical refinement dissolves it -- either side's text
+--- certifies as the one change, reunified.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeCanonD(c1fmt, c1)
+  =>* C:Cfg canonCertified(c1fmt) .
+
+--- Bite 3: the refinement never certifies a REAL divergence -- ours kept
+--- the base's meaning (c0fmt), theirs edited it (c1): canon classes differ.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeCanonD(c0fmt, c1)
+  =>* canonCertified(C:Content) RESIDUAL:Cfg .
+
+--- Coverage: the real divergence still conflicts.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeCanonD(c0fmt, c1)
+  =>* C:Cfg canonConflict .
+
+--- Coverage: rename carry at merge -- ours renamed nA to nB with a
+--- canon-equal body while theirs left both identities untouched.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeRen(nA, c0, nB, c0fmt, false)
+  =>* C:Cfg renCarried(nA, nB) .
+
+--- Bite 4: rename+edit never rides the carry -- the canon classes differ,
+--- so the delete+add pair stays an honest conflict.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeRen(nA, c0, nB, c1, false)
+  =>* renCarried(N1:Name, N2:Name) RESIDUAL:Cfg .
+
+--- Coverage: a pure rename whose identity the OTHER side touched conflicts
+--- rather than silently rehoming the other side's work.
+search [1] in WHIPPLESCRIPT-ALPHA-CANON :
+  mergeRen(nA, c0, nB, c0fmt, true)
+  =>* C:Cfg renConflict(nA) .

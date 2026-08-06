@@ -1,0 +1,117 @@
+--- Alpha-equivalence canonicalization per DR-0054: one declaration-identity
+--- answer serving evidence transfer, merge refinement, and rename carry.
+---
+--- Two relations, never one: IDENTITY is kind+name (a rename is a detected
+--- event, not something the scheme survives invisibly); CONTENT-EQUIVALENCE
+--- is the canonical hash -- fmt print, comments stripped, positional alpha
+--- over rule bindings, declared-order-free clause sorting. The model
+--- abstracts canonicalization as canon : Content -> Canon; contents that
+--- differ only by formatting/comments/binding names share a canon class.
+---
+--- Three engines are modeled:
+---   * evidence transfer -- NAIVE keys by name alone, so ANY rename orphans
+---     the ledger row; CANONICAL carries continuity exactly when the deleted
+---     and added bodies are canon-equal (a pure rename), and refuses --
+---     orphans honestly -- on rename+edit (fail-closed, Decision 3);
+---   * merge conflict refinement -- both-sides-modified-same-declaration
+---     with textually different but canon-equal bodies is NOT a conflict
+---     and either side certifies; canon-different bodies still conflict;
+---   * merge rename carry -- one side's canonical-exact delete+add pair is
+---     carried as a rename only while the other side left the identity
+---     untouched; rename+edit or a touched other side stays a conflict.
+--- The essential bites: naive transfer can never carry; canonical transfer
+--- can never carry a rename+edit; the refined merge can never certify a
+--- canon-different pair; rename carry can never absorb an edit.
+mod WHIPPLESCRIPT-ALPHA-CANON is
+  protecting BOOL .
+
+  sorts Name Content Canon Cfg .
+
+  ops nA nB : -> Name [ctor] .          --- declaration names, the identity key
+  ops c0 c0fmt c1 c1fmt : -> Content [ctor] . --- bodies, as written
+  ops k0 k1 : -> Canon [ctor] .         --- canon classes
+
+  --- c0fmt is c0 reformatted / comment-touched / binding-renamed: same
+  --- canon class. c1 is a semantic edit: a different class. c1fmt is the
+  --- same semantic edit arriving in different formatting.
+  op canon : Content -> Canon .
+  eq canon(c0) = k0 .
+  eq canon(c0fmt) = k0 .
+  eq canon(c1) = k1 .
+  eq canon(c1fmt) = k1 .
+
+  op eqC : Canon Canon -> Bool .
+  eq eqC(K:Canon, K:Canon) = true .
+  eq eqC(K1:Canon, K2:Canon) = false [owise] .
+
+  op eqT : Content Content -> Bool .    --- textual equality, the pre-DR test
+  eq eqT(C:Content, C:Content) = true .
+  eq eqT(C1:Content, C2:Content) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- Evidence transfer across a rename delta: the old name's body was
+  --- deleted, the new name's body added; ev names the ledger row's key.
+  op ev : Name -> Cfg [ctor] .
+  op xferNaive : Name Content Name Content -> Cfg [ctor] .
+  op xferCanon : Name Content Name Content -> Cfg [ctor] .
+  op carriedC : Name -> Cfg [ctor] .    --- continuity: row rekeyed to NB
+  op orphanedC : Name -> Cfg [ctor] .   --- honest refusal, row stays orphaned
+  op orphanedN : Name -> Cfg [ctor] .
+
+  vars NA NB : Name .
+  vars CD CA CO CT : Content .
+
+  --- Naive identity is the name alone: the deleted name's row has nowhere
+  --- to go. There is deliberately NO carry rule -- that absence is bite 1.
+  rl [naive-orphan] :
+    xferNaive(NA, CD, NB, CA) ev(NA) => orphanedN(NA) .
+
+  --- Canonical continuity: exactly the pure rename (canon-equal bodies).
+  crl [canon-carry] :
+    xferCanon(NA, CD, NB, CA) ev(NA) => carriedC(NB)
+    if eqC(canon(CD), canon(CA)) = true .
+
+  --- Rename+edit fails closed: no continuity claim, the orphan is honest.
+  crl [canon-orphan] :
+    xferCanon(NA, CD, NB, CA) ev(NA) => orphanedC(NA)
+    if eqC(canon(CD), canon(CA)) = false .
+
+  --- Merge, both sides modified the SAME declaration: ours and theirs
+  --- bodies over an implicit shared base.
+  op mergeTextD : Content Content -> Cfg [ctor] .  --- pre-DR text engine
+  op mergeCanonD : Content Content -> Cfg [ctor] . --- refined engine
+  op textMerged : -> Cfg [ctor] .
+  op textConflictD : -> Cfg [ctor] .
+  op canonCertified : Content -> Cfg [ctor] . --- either side's text certifies
+  op canonConflict : -> Cfg [ctor] .
+
+  --- The text engine reunifies only the byte-identical change.
+  crl [text-same] :
+    mergeTextD(CO, CT) => textMerged if eqT(CO, CT) = true .
+  crl [text-diff] :
+    mergeTextD(CO, CT) => textConflictD if eqT(CO, CT) = false .
+
+  --- The refinement: canon-equal sides are one change; either text lands.
+  crl [canon-dissolve] :
+    mergeCanonD(CO, CT) => canonCertified(CO) if eqC(canon(CO), canon(CT)) = true .
+  crl [canon-conflict] :
+    mergeCanonD(CO, CT) => canonConflict if eqC(canon(CO), canon(CT)) = false .
+
+  --- Rename carry at merge: one side deleted NA with body CD and added NB
+  --- with body CA; the Bool records whether the OTHER side touched either
+  --- identity. Carry demands the pure rename AND an untouched other side.
+  op mergeRen : Name Content Name Content Bool -> Cfg [ctor] .
+  op renCarried : Name Name -> Cfg [ctor] .
+  op renConflict : Name -> Cfg [ctor] .
+
+  crl [ren-carry] :
+    mergeRen(NA, CD, NB, CA, false) => renCarried(NA, NB)
+    if eqC(canon(CD), canon(CA)) = true .
+  crl [ren-edit-conflict] :
+    mergeRen(NA, CD, NB, CA, B:Bool) => renConflict(NA)
+    if eqC(canon(CD), canon(CA)) = false .
+  rl [ren-touched-conflict] :
+    mergeRen(NA, CD, NB, CA, true) => renConflict(NA) .
+endm

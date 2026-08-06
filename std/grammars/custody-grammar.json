@@ -1,0 +1,34 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.custody",
+  "name": "std.custody",
+  "version": "v0",
+  "libraries": [
+    {
+      "id": "std.custody",
+      "version": "v0",
+      "constructs": [
+        {
+          "id": "custody.credential",
+          "construct_family": "declaration_block",
+          "keyword": "credential",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "credential",
+            "clauses": [
+              {
+                "name": "kind",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "credential fields are `kind`",
+                "missing_summary": "add `kind <kind>` inside the credential block (bearer | basic | raw | hmac-sha256 | ed25519 | aws-sigv4 | jwt-rs256)"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

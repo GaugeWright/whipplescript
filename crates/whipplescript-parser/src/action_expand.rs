@@ -364,7 +364,7 @@ fn statement_label(statement: &BodyStmt) -> &'static str {
 
 /// Collects the action's internal binding names (effect `as` bindings and
 /// `after ... as` aliases) in declaration order, deduplicated.
-fn collect_bindings(statements: &[BodyStmt], out: &mut Vec<String>) {
+pub(crate) fn collect_bindings(statements: &[BodyStmt], out: &mut Vec<String>) {
     for statement in statements {
         match statement {
             BodyStmt::Effect(effect) => {
@@ -390,7 +390,7 @@ fn collect_bindings(statements: &[BodyStmt], out: &mut Vec<String>) {
 /// Renames binding *definition* and `after`-reference fields in place (exact
 /// identifier match). Value-position binding uses are renamed by the serializer
 /// closure instead; together they uniquify every occurrence of a binding.
-fn rename_bindings(statements: &mut [BodyStmt], renames: &[(String, String)]) {
+pub(crate) fn rename_bindings(statements: &mut [BodyStmt], renames: &[(String, String)]) {
     let apply = |name: &mut String| {
         if let Some((_, to)) = renames.iter().find(|(from, _)| from == name) {
             *name = to.clone();

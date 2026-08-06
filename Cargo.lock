@@ -2128,6 +2128,7 @@ dependencies = [
  "ureq",
  "url",
  "whipplescript-core",
+ "whipplescript-custody",
  "whipplescript-kernel",
  "whipplescript-parser",
  "whipplescript-provider-claude",
@@ -2141,6 +2142,30 @@ version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "whipplescript-custodian"
+version = "0.4.1"
+dependencies = [
+ "base64",
+ "ring",
+ "serde",
+ "serde_json",
+ "ureq",
+ "url",
+ "whipplescript-custody",
+ "zeroize",
+]
+
+[[package]]
+name = "whipplescript-custody"
+version = "0.4.1"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2174,8 +2199,11 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "whipplescript-core",
+ "whipplescript-custodian",
+ "whipplescript-custody",
  "whipplescript-parser",
  "whipplescript-store",
+ "zeroize",
 ]
 
 [[package]]
@@ -2185,6 +2213,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "whipplescript-core",
+ "whipplescript-custody",
 ]
 
 [[package]]

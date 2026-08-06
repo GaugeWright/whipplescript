@@ -10,6 +10,7 @@ readme.workspace = true
 
 [dependencies]
 whipplescript-core = { version = "0.4.1", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.4.1", path = "../whipplescript-custody" }
 # Collision-resistant source/IR identity hashes (pure-Rust, wasm-safe).
 sha2 = "0.10"
 

@@ -12,6 +12,7 @@ readme.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
 chrono-tz = "0.10.4"
 whipplescript-core = { version = "0.4.1", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.4.1", path = "../whipplescript-custody" }
 whipplescript-parser = { version = "0.4.1", path = "../whipplescript-parser" }
 whipplescript-store = { version = "0.4.1", path = "../whipplescript-store", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +28,12 @@ futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+# An in-process custodian for the governance-signing roundtrip tests
+# (DR-0053 §10) — dev-only, so the kernel's wasm build stays custodian-free.
+whipplescript-custodian = { version = "0.4.1", path = "../whipplescript-custodian" }
+zeroize = "1"
 
 [features]
 # `native` pulls in the rusqlite-backed store (whipplescript-store/native); the

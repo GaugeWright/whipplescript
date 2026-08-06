@@ -114,7 +114,8 @@ impl<S: DoSql> DoBranches<S> {
                 cut_id TEXT NOT NULL,
                 path TEXT NOT NULL,
                 before_hash TEXT,
-                after_hash TEXT
+                after_hash TEXT,
+                decl_units TEXT
             )",
             "CREATE INDEX IF NOT EXISTS change_units_branch_idx
                 ON change_units(branch_id, cut_seq)",
@@ -127,11 +128,18 @@ impl<S: DoSql> DoBranches<S> {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
         // Provenance columns arrived with Phase 2 (exactly as native):
-        // stores minted before that gain them in place.
-        for column in ["parent_cut_id", "origin", "actor", "intent"] {
+        // stores minted before that gain them in place. DR-0054 adds the
+        // change-unit index's declaration sub-rows the same way.
+        for (table, column) in [
+            ("cuts", "parent_cut_id"),
+            ("cuts", "origin"),
+            ("cuts", "actor"),
+            ("cuts", "intent"),
+            ("change_units", "decl_units"),
+        ] {
             let info = self
                 .sql
-                .query("PRAGMA table_info(cuts)", &[])
+                .query(&format!("PRAGMA table_info({table})"), &[])
                 .map_err(sql_err)?;
             let present = info.iter().any(|row| {
                 row.get(1)
@@ -140,7 +148,10 @@ impl<S: DoSql> DoBranches<S> {
             });
             if !present {
                 self.sql
-                    .execute(&format!("ALTER TABLE cuts ADD COLUMN {column} TEXT"), &[])
+                    .execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"),
+                        &[],
+                    )
                     .map_err(sql_err)?;
             }
         }
@@ -632,8 +643,8 @@ impl<S: DoSql> Branches for DoBranches<S> {
             self.sql
                 .execute(
                     "INSERT INTO change_units \
-                     (branch_id, cut_seq, cut_id, path, before_hash, after_hash) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (branch_id, cut_seq, cut_id, path, before_hash, after_hash, decl_units) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     &[
                         text(&row.branch_id),
                         SqlValue::Int(row.cut_seq),
@@ -641,6 +652,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                         text(&row.path),
                         opt_text(row.before_hash.as_deref()),
                         opt_text(row.after_hash.as_deref()),
+                        opt_text(row.decl_units.as_deref()),
                     ],
                 )
                 .map_err(sql_err)?;
@@ -669,7 +681,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
         let rows = self
             .sql
             .query(
-                "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash \
+                "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash, decl_units \
                  FROM change_units WHERE branch_id = ?1 AND cut_seq >= ?2 \
                  ORDER BY cut_seq ASC, rowid ASC",
                 &[text(branch_id), SqlValue::Int(from_cut_seq)],
@@ -687,6 +699,7 @@ impl<S: DoSql> Branches for DoBranches<S> {
                 path: as_text(&row[3]),
                 before_hash: as_opt_text(&row[4]),
                 after_hash: as_opt_text(&row[5]),
+                decl_units: as_opt_text(&row[6]),
             })
             .collect())
     }

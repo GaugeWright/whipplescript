@@ -218,6 +218,10 @@ pub struct ChangeUnitRow {
     pub path: String,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    /// Declaration-level sub-rows (DR-0054), JSON `Vec<DeclUnit>`;
+    /// `None`/empty = the path had no canonical form on some side —
+    /// attribution stays path-level for this unit.
+    pub decl_units: Option<String>,
 }
 
 /// The index cursor: how far a branch's cut list has been unit-indexed.
@@ -711,7 +715,8 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             cut_id TEXT NOT NULL,
             path TEXT NOT NULL,
             before_hash TEXT,
-            after_hash TEXT
+            after_hash TEXT,
+            decl_units TEXT
         );
         CREATE INDEX IF NOT EXISTS change_units_branch_idx
             ON change_units(branch_id, cut_seq);
@@ -729,6 +734,8 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
     for column in ["parent_cut_id", "origin", "actor", "intent"] {
         ensure_column(connection, "cuts", column)?;
     }
+    // DR-0054: declaration-level sub-rows on the change-unit index.
+    ensure_column(connection, "change_units", "decl_units")?;
     Ok(())
 }
 
@@ -1119,14 +1126,15 @@ impl Branches for BranchStore {
         let tx = self.connection.transaction()?;
         for row in rows {
             tx.execute(
-                "INSERT INTO change_units                  (branch_id, cut_seq, cut_id, path, before_hash, after_hash)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO change_units                  (branch_id, cut_seq, cut_id, path, before_hash, after_hash, decl_units)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     row.branch_id,
                     row.cut_seq,
                     row.cut_id,
                     row.path,
                     row.before_hash,
-                    row.after_hash
+                    row.after_hash,
+                    row.decl_units
                 ],
             )?;
         }
@@ -1144,7 +1152,7 @@ impl Branches for BranchStore {
         from_cut_seq: i64,
     ) -> StoreResult<Vec<ChangeUnitRow>> {
         let mut stmt = self.connection.prepare(
-            "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash              FROM change_units WHERE branch_id = ?1 AND cut_seq >= ?2              ORDER BY cut_seq ASC, rowid ASC",
+            "SELECT branch_id, cut_seq, cut_id, path, before_hash, after_hash, decl_units              FROM change_units WHERE branch_id = ?1 AND cut_seq >= ?2              ORDER BY cut_seq ASC, rowid ASC",
         )?;
         let mapped = stmt.query_map(params![branch_id, from_cut_seq], |row| {
             Ok(ChangeUnitRow {
@@ -1154,6 +1162,7 @@ impl Branches for BranchStore {
                 path: row.get(3)?,
                 before_hash: row.get(4)?,
                 after_hash: row.get(5)?,
+                decl_units: row.get(6)?,
             })
         })?;
         let mut rows = Vec::new();

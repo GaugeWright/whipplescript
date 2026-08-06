@@ -758,9 +758,9 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
         // rows for unreserved words are dead data, and the bare verbs would
         // stay squattable by any future package construct path.
         "acquire", "agent", "append", "ask", "call", "cancel", "case", "claim", "class", "coerce",
-        "complete", "consume", "counter", "decide", "effect", "else", "emit", "enum", "event",
-        "fail", "flow", "from", "harness", "if", "ledger", "lease", "let", "match", "release",
-        "renew", "rule", "tracker", "signal", "tell", "then", "use", "when", "workflow",
+        "complete", "consume", "counter", "credential", "decide", "effect", "else", "emit", "enum",
+        "event", "fail", "flow", "from", "harness", "if", "ledger", "lease", "let", "match",
+        "release", "renew", "rule", "tracker", "signal", "tell", "then", "use", "when", "workflow",
     ],
     reserved_keyword_privileges: &[
         PlatformReservedKeywordPrivilege {
@@ -813,6 +813,17 @@ pub const PLATFORM_CONSTRUCT_CATALOG: PlatformConstructCatalog = PlatformConstru
         PlatformReservedKeywordPrivilege {
             keyword: "ledger",
             library_id: "std.coord",
+            construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
+            scope: "top_level",
+            lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,
+        },
+        // `credential` (DR-0053 §5): the custody handle declaration. Reserved
+        // so no third-party package can author a credential-like construct
+        // with weaker guarantees; metadata-only — reality lives with the
+        // custodian and governance.
+        PlatformReservedKeywordPrivilege {
+            keyword: "credential",
+            library_id: "std.custody",
             construct_family: CONSTRUCT_FAMILY_DECLARATION_BLOCK,
             scope: "top_level",
             lowering_target: CONSTRUCT_LOWERING_METADATA_ONLY,

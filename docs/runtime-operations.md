@@ -343,3 +343,38 @@ Sometimes you want a point that you can rewind to before you act, and not only a
 snapshot in JSON. In that condition, first make a
 [checkpoint](#restoring-to-a-prior-point-checkpoint-restore) of the instance. The
 `restore` command can then return the three planes to that cut.
+
+## The credential custodian (`whip-custodian`)
+
+The custodian is a separate process, in a separate security principal, that
+holds credential material so that whip never does. whip holds handles; the
+custodian substitutes, signs, verifies, derives, wraps, and mints under
+policy. There is no operation that returns material — not in the protocol, not
+in the daemon.
+
+```sh
+export WHIPPLESCRIPT_CUSTODIAN_PASSPHRASE=<passphrase>
+whip-custodian init   --store custody.json
+whip-custodian import --store custody.json --name stripe_api --kind bearer --from-stdin
+whip-custodian serve  --store custody.json --socket /run/whip/custodian.sock \
+  --egress-allow "api.stripe.com,*.amazonaws.com"
+```
+
+Point whip at the daemon with `WHIPPLESCRIPT_CUSTODIAN_SOCKET=<socket path>`.
+The admin surface — import, revoke, list — works on the sealed store directly
+and needs the passphrase; the socket carries only the custody protocol. Run
+the daemon as its own user, with the socket owned by that user, so the
+boundary is an OS permission and not a convention.
+
+At the `process` rung (r0) the store rests under a passphrase-derived key on
+the same machine. That protects the material from the language, not from an
+escape on the same account — every r0 reply says so with a `degraded` tag.
+Network egress from the custodian is deny-by-default: without `--egress-allow`
+the daemon refuses every outbound request.
+
+Governance signing uses the same machinery. Import an `ed25519` credential
+named `whip/governance-signing` and `whip gov sign` / `whip gov verify` will
+route through the custodian; admin authority becomes the ability to sign with
+that credential rather than an environment variable. Without a custodian
+socket, the legacy `WHIPPLESCRIPT_GOV_ADMIN` path still works and announces
+itself as degraded on every use.

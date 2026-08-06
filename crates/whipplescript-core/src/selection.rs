@@ -49,6 +49,23 @@ pub struct ChangeUnit {
     /// carried one (repair cuts always do; ordinary writes may not).
     pub intent: Option<String>,
     pub recorded_at: String,
+    /// Declaration-level sub-rows (DR-0054): the declarations this unit
+    /// changed, when both sides of a `.whip` path had a canonical form.
+    /// Empty = attribution stays path-level for this unit (fail closed,
+    /// never guessed).
+    #[serde(default)]
+    pub decls: Vec<DeclUnit>,
+}
+
+/// One changed declaration within a change-unit (DR-0054 Decision 6.3).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeclUnit {
+    /// Normalized header line (`rule triage`, `class Report`).
+    pub identity: String,
+    /// Canonical content hash before the cut; `None` = added here.
+    pub before_canon: Option<String>,
+    /// Canonical content hash after the cut; `None` = deleted here.
+    pub after_canon: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +91,10 @@ pub enum SelAtom {
     /// cut. Empty until intent-carrying operations (repair, ingest)
     /// record it.
     ByIntent(String),
+    /// Declaration-identity glob (DR-0054): `decl(rule close)` selects
+    /// units that changed that declaration; `decl(rule *)` every unit
+    /// with a changed rule. Only units with declaration sub-rows match.
+    Decl(String),
     InBranch(String),
     Change(String),
     Cut(String),
@@ -204,6 +225,7 @@ impl<'a> Parser<'a> {
             "by-origin" => SelAtom::ByOrigin(arg),
             "by" => SelAtom::ByActor(arg),
             "intent" => SelAtom::ByIntent(arg),
+            "decl" => SelAtom::Decl(arg),
             "in-branch" => SelAtom::InBranch(arg),
             "change" => SelAtom::Change(arg),
             "cut" => SelAtom::Cut(arg),
@@ -300,6 +322,11 @@ fn eval_atom(atom: &SelAtom, universe: &[ChangeUnit]) -> BTreeSet<usize> {
                 .as_deref()
                 .is_some_and(|intent| intent.starts_with(prefix.as_str()))
         }),
+        SelAtom::Decl(glob) => pick(&|unit| {
+            unit.decls
+                .iter()
+                .any(|decl| glob_matches(glob, &decl.identity))
+        }),
         SelAtom::InBranch(branch) => pick(&|unit| unit.branch_id == *branch),
         SelAtom::Change(change) => pick(&|unit| unit.change_id == *change),
         SelAtom::Cut(cut) => pick(&|unit| unit.cut_id == *cut),
@@ -359,6 +386,7 @@ mod tests {
             actor: None,
             intent: None,
             recorded_at: at.to_owned(),
+            decls: Vec::new(),
         }
     }
 
@@ -402,6 +430,51 @@ mod tests {
             eval(&parse("intent(inc-)").expect("parse"), &with_intent),
             BTreeSet::from([1])
         );
+    }
+
+    /// DR-0054: `decl(<glob>)` selects units by changed-declaration
+    /// identity; units without sub-rows (no canonical form) never match —
+    /// fail closed, composing with the algebra like every atom.
+    #[test]
+    fn decl_atom_selects_by_declaration_identity() {
+        let mut universe = vec![
+            unit(0, "c1", "flows/main.whip", "t1"),
+            unit(1, "c2", "flows/main.whip", "t2"),
+            unit(2, "c3", "notes/readme.md", "t3"),
+        ];
+        universe[0].decls = vec![DeclUnit {
+            identity: "rule triage".to_owned(),
+            before_canon: None,
+            after_canon: Some("k1".to_owned()),
+        }];
+        universe[1].decls = vec![
+            DeclUnit {
+                identity: "rule close".to_owned(),
+                before_canon: Some("k2".to_owned()),
+                after_canon: Some("k3".to_owned()),
+            },
+            DeclUnit {
+                identity: "class Report".to_owned(),
+                before_canon: Some("k4".to_owned()),
+                after_canon: None,
+            },
+        ];
+        assert_eq!(
+            eval(&parse("decl(rule close)").expect("parse"), &universe),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            eval(&parse("decl(rule *)").expect("parse"), &universe),
+            BTreeSet::from([0, 1])
+        );
+        assert_eq!(
+            eval(
+                &parse("decl(rule *) ~ decl(class *)").expect("parse"),
+                &universe
+            ),
+            BTreeSet::from([0])
+        );
+        assert!(eval(&parse("decl(gauge *)").expect("parse"), &universe).is_empty());
     }
 
     #[test]
