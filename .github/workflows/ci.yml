@@ -46,6 +46,12 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Green bar
+        # The hosted runtime contracts are the `hosted-runtime-contracts` job
+        # below, which runs the same four steps with the wasm-bindgen/wrangler/
+        # Node toolchain they need. This job installs none of it, so without the
+        # opt-out the green bar fails on missing tooling every run.
+        env:
+          WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
         run: scripts/check.sh
 
   hosted-runtime-contracts:
