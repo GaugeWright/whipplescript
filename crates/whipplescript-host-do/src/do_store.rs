@@ -53,6 +53,22 @@ pub enum SqlValue {
 pub trait DoSql {
     fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String>;
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
+
+    /// Publish an ephemeral live-turn observation to the shell (DR 0061).
+    ///
+    /// This rides the SQL handle because that handle is the one thing already
+    /// threaded everywhere the turn does work, and because it is a synchronous
+    /// call *out* of the kernel — which is what makes the states inside a single
+    /// `step()` observable at all. Tool execution and summarization compaction
+    /// both happen without yielding to the shell; without this seam the shell
+    /// could only report them after they had finished, which is not an
+    /// observation.
+    ///
+    /// `detail` carries the subject when the state has one — the tool's name for
+    /// `running_tool`. Never durable, never ordered, never acknowledged: a host
+    /// that drops every one of these still runs the turn correctly, so the
+    /// default is to do nothing.
+    fn activity(&self, _kind: &str, _detail: Option<&str>) {}
 }
 
 /// Share ONE `DoSql` handle across the store and the file plane (P1). Both must
@@ -65,6 +81,9 @@ impl<T: DoSql + ?Sized> DoSql for std::rc::Rc<T> {
     }
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
         (**self).query(sql, params)
+    }
+    fn activity(&self, kind: &str, detail: Option<&str>) {
+        (**self).activity(kind, detail)
     }
 }
 

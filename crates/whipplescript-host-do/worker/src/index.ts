@@ -457,8 +457,20 @@ function rowsToPositionalJson(cursor: Iterable<Record<string, unknown>>): string
 
 // `state.storage.sql` as the `DoSqlBridge` the wasm core imports. Params arrive as
 // a JSON array of `null | number | string` (the marshalled `SqlValue`s).
-function makeBridge(sql: SqlStorage) {
+/**
+ * `onActivity` receives the kernel's ephemeral live-turn observations (DR 0061).
+ * Optional because most bridge users are not driving a turn; when it is absent
+ * the method still exists and does nothing, so the WASM binding never has to
+ * probe for it.
+ */
+function makeBridge(
+  sql: SqlStorage,
+  onActivity?: (kind: string, detail?: string) => void,
+) {
   return {
+    activity(kind: string, detail?: string): void {
+      onActivity?.(kind, detail);
+    },
     exec(query: string, paramsJson: string): number {
       const params = JSON.parse(paramsJson) as unknown[];
       const cursor = sql.exec(query, ...params);
@@ -471,6 +483,21 @@ function makeBridge(sql: SqlStorage) {
     },
   };
 }
+
+/**
+ * The provider-neutral live-turn vocabulary (spec/agent-harness.md "Live Turn
+ * Observation"). Every member is a state the drive loop can publish while it is
+ * still true — tool execution and compaction run inside one synchronous kernel
+ * `step()`, so no frame sent for them could still be accurate on arrival.
+ */
+export type PublicTurnActivity =
+  | "awaiting_model"
+  | "streaming_output"
+  | "running_tool"
+  | "compacting"
+  | "retrying"
+  | "settling"
+  | "stopping";
 
 type StepOutcome =
   | { kind: "needs_http"; request: { url: string; headers: [string, string][]; body: unknown } }
@@ -920,6 +947,43 @@ export class WorkflowInstance implements DurableObject {
     private env: Env,
   ) {}
 
+  private sendPublicEphemeral(frame: Record<string, unknown>): void {
+    const encoded = JSON.stringify({ ...frame, ephemeral: true });
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as
+        | { publicSession?: boolean }
+        | null;
+      if (attachment?.publicSession) socket.send(encoded);
+    }
+  }
+
+  private publishPublicActivity(
+    commandId: string,
+    activity: PublicTurnActivity,
+    tool?: string,
+  ): void {
+    const requestId = publicRequestId(commandId);
+    if (!requestId) return;
+    this.sendPublicEphemeral({
+      type: "turn_activity",
+      request_id: requestId,
+      command_id: commandId,
+      activity,
+      ...(tool ? { tool } : {}),
+    });
+  }
+
+  /**
+   * Forward one kernel-published observation. States the kernel owns are the
+   * ones it can see from inside `step()` — the shell is blocked for their whole
+   * duration — so this filters to that set rather than trusting the string.
+   */
+  private publishKernelActivity(commandId: string, kind: string, detail?: string): void {
+    const owned = ["awaiting_model", "running_tool", "compacting"] as const;
+    if (!(owned as readonly string[]).includes(kind)) return;
+    this.publishPublicActivity(commandId, kind as PublicTurnActivity, detail);
+  }
+
   /**
    * DR-0054 Phase A: unrecognized durable state (an unknown lifecycle event
    * row, an unreadable session record) fails closed as a structured 500 with
@@ -1309,6 +1373,11 @@ export class WorkflowInstance implements DurableObject {
         prefix,
       )
       .toArray();
+    const active = this.ctx.storage.sql
+      .exec(
+        "SELECT request_id, command_id FROM public_turn_binding WHERE singleton = 1",
+      )
+      .toArray() as { request_id: string; command_id: string }[];
     return {
       session_id: session.session_id,
       release_id: session.release_id,
@@ -1316,6 +1385,15 @@ export class WorkflowInstance implements DurableObject {
       transcript,
       files,
       queue: this.publicTurnQueue(),
+      ...(active[0]
+        ? {
+            active_turn: {
+              request_id: active[0].request_id,
+              command_id: active[0].command_id,
+              activity: "awaiting_model",
+            },
+          }
+        : {}),
     };
   }
 
@@ -1833,7 +1911,7 @@ export class WorkflowInstance implements DurableObject {
     if (!Number.isSafeInteger(sequence)) return;
     if (commandId.startsWith("public:")) {
       const requestId = publicRequestId(commandId);
-      this.appendPublicEvent({
+      this.sendPublicEphemeral({
         type: "text_delta",
         command_id: commandId,
         ...(requestId ? { request_id: requestId } : {}),
@@ -2002,6 +2080,7 @@ export class WorkflowInstance implements DurableObject {
           throw new Error("stop requires a valid public request_id");
         }
         const commandId = publicCommandId(publicSession.session_id, requestId);
+        this.publishPublicActivity(commandId, "stopping");
         const receipt = JSON.parse(
           hostFunctions.host_cancel_turn(
             makeBridge(this.ctx.storage.sql),
@@ -2221,12 +2300,13 @@ export class WorkflowInstance implements DurableObject {
   private async projectPublicAssistantSegment(
     instanceId: string,
     commandId: string,
+    authoritativeText?: string,
   ): Promise<void> {
     const cursorKey = `public-transcript-delta-cursor:${commandId}`;
     const after = (await this.ctx.storage.get<number>(cursorKey)) ?? 0;
     const deltas = this.hostTurnDeltas(instanceId, commandId, after);
-    if (deltas.length === 0) return;
-    const text = deltas.map((event) => event.delta).join("");
+    if (deltas.length === 0 && authoritativeText === undefined) return;
+    const text = authoritativeText ?? deltas.map((event) => event.delta).join("");
     const transcript =
       (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
         "public-transcript",
@@ -2234,7 +2314,7 @@ export class WorkflowInstance implements DurableObject {
     if (text) transcript.push({ type: "assistant", text });
     await this.ctx.storage.put({
       "public-transcript": transcript,
-      [cursorKey]: deltas.at(-1)!.sequence,
+      ...(deltas.length > 0 ? { [cursorKey]: deltas.at(-1)!.sequence } : {}),
     });
   }
 
@@ -2441,7 +2521,6 @@ export class WorkflowInstance implements DurableObject {
       package: session.package,
       image_bodies: imageBodies,
     }, session.credential_ref);
-    await this.projectPublicAssistantSegment(session.instance_ref, commandId);
     traceBoundary("runtime_turn_complete");
     const turnBody = (await turn.clone().json()) as {
       outcome?: unknown;
@@ -2458,6 +2537,7 @@ export class WorkflowInstance implements DurableObject {
       };
       output?: {
         label_ref?: unknown;
+        assistant_text?: unknown;
         tool_calls?: {
           call_id?: unknown;
           name?: unknown;
@@ -2500,6 +2580,13 @@ export class WorkflowInstance implements DurableObject {
       return Response.json(
         { error: "provider completed without exact usage evidence" },
         { status: 502 },
+      );
+    }
+    if (turnSucceeded && typeof turnBody.output?.assistant_text === "string") {
+      await this.projectPublicAssistantSegment(
+        session.instance_ref,
+        commandId,
+        turnBody.output.assistant_text,
       );
     }
     traceBoundary("settlement_start");
@@ -2623,9 +2710,9 @@ export class WorkflowInstance implements DurableObject {
       throw new Error(`public continuation settlement failed (${settlement.status})`);
     }
     if (succeeded && exactUsage) {
-      await this.projectPublicAssistantSegment(session.instance_ref, commandId);
       const output = body.output as {
         label_ref?: unknown;
+        assistant_text?: unknown;
         tool_calls?: {
           call_id?: unknown;
           name?: unknown;
@@ -2634,6 +2721,13 @@ export class WorkflowInstance implements DurableObject {
           ok?: unknown;
         }[];
       } | undefined;
+      if (typeof output?.assistant_text === "string") {
+        await this.projectPublicAssistantSegment(
+          session.instance_ref,
+          commandId,
+          output.assistant_text,
+        );
+      }
       for (const tool of output?.tool_calls ?? []) {
         if (typeof tool.call_id !== "string" || typeof tool.name !== "string") continue;
         this.appendPublicEvent({
@@ -3909,8 +4003,12 @@ export class WorkflowInstance implements DurableObject {
       if (!instanceId) {
         return Response.json({ error: "admitted host turn is missing its runtime binding" }, { status: 503 });
       }
+      const commandId = String(request.command.command_id ?? "");
       const instance = WasmDurableInstance.attach_host(
-        makeBridge(this.ctx.storage.sql),
+        makeBridge(
+          this.ctx.storage.sql,
+          (kind, detail) => this.publishKernelActivity(commandId, kind, detail),
+        ),
         instanceId,
         request.package.manifest,
         request.package.source,
@@ -3924,13 +4022,13 @@ export class WorkflowInstance implements DurableObject {
           cache_key: String(request.command.command_id ?? ""),
         }),
       );
-      const commandId = String(request.command.command_id ?? "");
       const driven = await this.driveInstance(
         instance,
         instanceId,
         binding,
         (delta) => this.publishHostTurnDelta(instanceId, commandId, delta),
         commandId,
+        (activity) => this.publishPublicActivity(commandId, activity),
       );
       const runtimeProjection = JSON.parse(
         hostFunctions.host_project_turn(
@@ -4309,6 +4407,12 @@ export class WorkflowInstance implements DurableObject {
     providerBinding?: ResolvedHostProviderBinding,
     onTextDelta?: (delta: string) => void,
     traceId?: string,
+    // Only the states the shell itself can see. `awaiting_model`, `running_tool`,
+    // and `compacting` all happen inside `step()`, so the kernel publishes those
+    // through the bridge; the shell would only be guessing.
+    onActivity?: (
+      activity: "streaming_output" | "retrying" | "settling",
+    ) => void,
   ): Promise<{
     status: string;
     outcome: string;
@@ -4370,6 +4474,14 @@ export class WorkflowInstance implements DurableObject {
       if (hostedInstanceId) this.broadcastHostProgress(hostedInstanceId);
       if (outcome.kind === "needs_http") {
         mark("model_round_start");
+        let streaming = false;
+        const emitDelta = (delta: string) => {
+          if (!streaming) {
+            streaming = true;
+            onActivity?.("streaming_output");
+          }
+          onTextDelta?.(delta);
+        };
         if (providerBinding?.execution === "model-broker") {
           try {
             const privateBroker = this.privateModelBrokerConfig();
@@ -4383,7 +4495,7 @@ export class WorkflowInstance implements DurableObject {
               fetch,
               (delta) => {
                 mark("runtime_first_delta");
-                onTextDelta?.(delta);
+                emitDelta(delta);
               },
               traceId,
               (event, _elapsedMs) => mark(event),
@@ -4394,6 +4506,7 @@ export class WorkflowInstance implements DurableObject {
             const message = error instanceof Error ? error.message : String(error);
             console.log(`model broker transport failed: ${message}`);
             transportFailures += 1;
+            onActivity?.("retrying");
             if (transportFailures >= 3) {
               throw new Error(`model broker failed repeatedly: ${message}`);
             }
@@ -4416,7 +4529,7 @@ export class WorkflowInstance implements DurableObject {
               (delta) => {
                 if (replay && !replay.accept(delta)) return;
                 mark("runtime_first_delta");
-                onTextDelta?.(delta);
+                emitDelta(delta);
               },
               (event, _elapsedMs) => mark(event),
               observeUsage,
@@ -4429,6 +4542,7 @@ export class WorkflowInstance implements DurableObject {
             const message = error instanceof Error ? error.message : String(error);
             console.log(`managed gateway transport failed: ${message}`);
             transportFailures += 1;
+            onActivity?.("retrying");
             if (transportFailures >= 3) {
               throw new Error(`managed gateway failed repeatedly: ${message}`);
             }
@@ -4454,7 +4568,7 @@ export class WorkflowInstance implements DurableObject {
               (delta) => {
                 if (replay && !replay.accept(delta)) return;
                 mark("runtime_first_delta");
-                onTextDelta?.(delta);
+                emitDelta(delta);
               },
               (event, _elapsedMs) => mark(event),
               (observed) => {
@@ -4468,6 +4582,7 @@ export class WorkflowInstance implements DurableObject {
             const message = error instanceof Error ? error.message : String(error);
             console.log(`direct provider transport failed: ${message}`);
             transportFailures += 1;
+            onActivity?.("retrying");
             if (transportFailures >= 3) {
               throw new Error(`direct provider failed repeatedly: ${message}`);
             }
@@ -4478,6 +4593,7 @@ export class WorkflowInstance implements DurableObject {
         }
         continue;
       }
+      onActivity?.("settling");
       if (outcome.kind === "parked" && outcome.next_due_unix_ms != null) {
         // The instance holds pending timers/deadlines: record the earliest as
         // this instance's due time (the Alarms seam, live). Clamp to

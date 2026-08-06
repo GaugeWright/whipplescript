@@ -294,17 +294,13 @@ impl HttpModelClient for MessagesApiClient {
             &mut request,
             round_idempotency_key(self.cache_key.as_deref(), messages, tools),
         );
-        // The Durable Object host owns an incremental provider transport. Ask
-        // OpenAI's Responses API for SSE so the host can publish text deltas
-        // while still assembling the terminal response through
-        // `assemble_codex_responses_sse`. The native client uses
-        // `RealHarnessModelClient`, so its synchronous transport is unchanged.
-        if self.provider == CoerceProvider::OpenAi {
-            request.body["stream"] = json!(true);
-            request
-                .headers
-                .push(("accept".to_owned(), "text/event-stream".to_owned()));
-        }
+        // The Durable Object host owns incremental transport for every admitted
+        // provider. The native client uses `RealHarnessModelClient`, so its
+        // synchronous transport remains unchanged.
+        request.body["stream"] = json!(true);
+        request
+            .headers
+            .push(("accept".to_owned(), "text/event-stream".to_owned()));
         request
     }
 
@@ -313,10 +309,12 @@ impl HttpModelClient for MessagesApiClient {
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
         let response = response.map(|mut response| {
-            if self.provider == CoerceProvider::OpenAi {
-                if let Some(raw) = response.body.as_str() {
-                    response.body = assemble_codex_responses_sse(raw);
-                }
+            if let Some(raw) = response.body.as_str() {
+                response.body = match self.provider {
+                    CoerceProvider::OpenAi => assemble_codex_responses_sse(raw),
+                    CoerceProvider::OpenAiCompat => assemble_openai_chat_sse(raw),
+                    CoerceProvider::Anthropic => assemble_anthropic_messages_sse(raw),
+                };
             }
             response
         });
@@ -1027,6 +1025,169 @@ pub fn assemble_codex_responses_sse(raw: &str) -> Value {
     completed
 }
 
+/// Collapse OpenAI-compatible chat-completion chunks into their ordinary
+/// response shape. Tool argument fragments are joined by their stream index.
+pub fn assemble_openai_chat_sse(raw: &str) -> Value {
+    let mut text = String::new();
+    let mut tools: Vec<Value> = Vec::new();
+    let mut finish_reason = Value::Null;
+    let mut usage = Value::Null;
+    for payload in sse_payloads(raw) {
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        if !event.get("usage").unwrap_or(&Value::Null).is_null() {
+            usage = event["usage"].clone();
+        }
+        let Some(choice) = event
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+        else {
+            continue;
+        };
+        if !choice
+            .get("finish_reason")
+            .unwrap_or(&Value::Null)
+            .is_null()
+        {
+            finish_reason = choice["finish_reason"].clone();
+        }
+        let delta = &choice["delta"];
+        if let Some(part) = delta.get("content").and_then(Value::as_str) {
+            text.push_str(part);
+        }
+        for call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            while tools.len() <= index {
+                tools
+                    .push(json!({"id":"","type":"function","function":{"name":"","arguments":""}}));
+            }
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                tools[index]["id"] = json!(id);
+            }
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                tools[index]["function"]["name"] = json!(name);
+            }
+            if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                let joined = format!(
+                    "{}{}",
+                    tools[index]["function"]["arguments"].as_str().unwrap_or(""),
+                    args
+                );
+                tools[index]["function"]["arguments"] = json!(joined);
+            }
+        }
+    }
+    let mut message = json!({"role":"assistant","content":text});
+    if !tools.is_empty() {
+        message["tool_calls"] = Value::Array(tools);
+    }
+    json!({"choices":[{"message":message,"finish_reason":finish_reason}],"usage":usage})
+}
+
+/// Collapse Anthropic Messages events while deliberately ignoring thinking
+/// deltas. Only answer text and tool input are user-visible model output.
+pub fn assemble_anthropic_messages_sse(raw: &str) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    let mut usage = json!({"input_tokens":0,"output_tokens":0});
+    let mut stop_reason = Value::Null;
+    for payload in sse_payloads(raw) {
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(value) = event.pointer("/message/usage") {
+                    usage = value.clone();
+                }
+            }
+            Some("content_block_start") => {
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(content.len() as u64) as usize;
+                while content.len() <= index {
+                    content.push(Value::Null);
+                }
+                content[index] = event.get("content_block").cloned().unwrap_or(Value::Null);
+            }
+            Some("content_block_delta") => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while content.len() <= index {
+                    content.push(Value::Null);
+                }
+                match event.pointer("/delta/type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let joined = format!(
+                            "{}{}",
+                            content[index]
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            event
+                                .pointer("/delta/text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        );
+                        if content[index].is_null() {
+                            content[index] = json!({"type":"text"});
+                        }
+                        content[index]["text"] = json!(joined);
+                    }
+                    Some("input_json_delta") => {
+                        let joined = format!(
+                            "{}{}",
+                            content[index]
+                                .get("input_json")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            event
+                                .pointer("/delta/partial_json")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                        );
+                        content[index]["input_json"] = json!(joined);
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(reason) = event.pointer("/delta/stop_reason") {
+                    stop_reason = reason.clone();
+                }
+                if let Some(output) = event.pointer("/usage/output_tokens") {
+                    usage["output_tokens"] = output.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    for block in &mut content {
+        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+            if let Some(raw_input) = block.get("input_json").and_then(Value::as_str) {
+                block["input"] = serde_json::from_str(raw_input).unwrap_or(Value::Null);
+            }
+            block
+                .as_object_mut()
+                .map(|object| object.remove("input_json"));
+        }
+    }
+    json!({"role":"assistant","content":content,"stop_reason":stop_reason,"usage":usage})
+}
+
+fn sse_payloads(raw: &str) -> impl Iterator<Item = &str> {
+    raw.lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|payload| !payload.is_empty() && *payload != "[DONE]")
+}
+
 /// Pull a capped, single-line control-plane error message from a provider body.
 fn provider_error_excerpt(body: &Value) -> String {
     let message = body
@@ -1062,6 +1223,33 @@ mod tests {
         assert_eq!(body["output_text"], "hello");
         assert_eq!(body["output"][0]["call_id"], "c1");
         assert_eq!(body["usage"]["input_tokens"], 3);
+    }
+
+    #[test]
+    fn anthropic_sse_assembly_preserves_text_tools_and_usage() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"secret\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        );
+        let body = assemble_anthropic_messages_sse(raw);
+        assert_eq!(body["content"][0]["text"], "hello");
+        assert_eq!(body["usage"]["input_tokens"], 4);
+        assert_eq!(body["usage"]["output_tokens"], 2);
+        assert!(!body.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn openai_chat_sse_assembly_joins_text() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n",
+        );
+        let body = assemble_openai_chat_sse(raw);
+        assert_eq!(body["choices"][0]["message"]["content"], "hello");
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
     }
 
     #[test]

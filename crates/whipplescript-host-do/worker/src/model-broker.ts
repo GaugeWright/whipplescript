@@ -358,7 +358,7 @@ export async function performModelBrokerFetch(
         mark("provider_first_text_delta");
       }
       onTextDelta?.(delta);
-    });
+    }, binding.provider);
     let total = 0;
     let sawByte = false;
     for (;;) {
@@ -583,7 +583,7 @@ export async function performDirectProviderFetch(
       mark("direct_provider_first_text_delta");
     }
     onTextDelta?.(delta);
-  });
+  }, binding.provider);
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -729,9 +729,14 @@ function extractResponsesUsage(raw: string): ProviderUsage | null {
 export class ResponsesSseDeltaDecoder {
   private buffer = "";
   private readonly emit?: (delta: string) => void;
+  private readonly provider?: ModelBrokerBinding["provider"];
 
-  constructor(emit?: (delta: string) => void) {
+  constructor(
+    emit?: (delta: string) => void,
+    provider?: ModelBrokerBinding["provider"],
+  ) {
     this.emit = emit;
+    this.provider = provider;
   }
 
   feed(chunk: string): void {
@@ -762,6 +767,19 @@ export class ResponsesSseDeltaDecoder {
           delta?: unknown;
           choices?: { delta?: { content?: unknown } }[];
         };
+        if (this.provider === "anthropic" && event.type === "content_block_delta") {
+          const anthropicDelta = event.delta as { type?: unknown; text?: unknown } | undefined;
+          // `thinking_delta` is intentionally excluded: live observation may
+          // project answer text, never hidden model reasoning.
+          if (
+            anthropicDelta?.type === "text_delta"
+            && typeof anthropicDelta.text === "string"
+            && anthropicDelta.text
+          ) {
+            this.emit?.(anthropicDelta.text);
+          }
+          continue;
+        }
         if (
           event.type === "response.output_text.delta"
           && typeof event.delta === "string"

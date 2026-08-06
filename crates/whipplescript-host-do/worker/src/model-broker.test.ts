@@ -7,8 +7,18 @@ import {
   MODEL_EGRESS_STREAM_PROTOCOL,
   performManagedGatewayFetch,
   performModelBrokerFetch,
+  ResponsesSseDeltaDecoder,
   stripSentinelAuthentication,
 } from "./model-broker.ts";
+
+test("Anthropic live projection emits answer text and suppresses thinking", () => {
+  const seen: string[] = [];
+  const decoder = new ResponsesSseDeltaDecoder((delta) => seen.push(delta), "anthropic");
+  decoder.feed('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"secret"}}\n\n');
+  decoder.feed('event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}\n\n');
+  decoder.finish();
+  assert.deepEqual(seen, ["Hello"]);
+});
 
 const binding = {
   credential_id: "credential:project:alpha:v3",

@@ -563,6 +563,12 @@ extern "C" {
 
     #[wasm_bindgen(method, catch)]
     fn query(this: &DoSqlBridge, sql: &str, params_json: &str) -> Result<String, JsValue>;
+
+    /// Publish one ephemeral live-turn observation. The shell always defines
+    /// this (a no-op when the caller wired no observer), and a failure is
+    /// swallowed by design: a dropped projection must never fail a turn.
+    #[wasm_bindgen(method, catch)]
+    fn activity(this: &DoSqlBridge, kind: &str, detail: Option<String>) -> Result<(), JsValue>;
 }
 
 /// [`DoSql`] over the JS `DoSqlBridge`. `SqlValue` marshals as JSON scalars.
@@ -627,6 +633,10 @@ impl DoSql for JsDoSql {
             .map_err(|error| format!("{error:?}"))?;
         parse_rows(&rows_json)
     }
+
+    fn activity(&self, kind: &str, detail: Option<&str>) {
+        let _ = self.bridge.activity(kind, detail.map(str::to_owned));
+    }
 }
 
 /// The step response the shell hands back: `{"body": <json>, "status": <n>}` for a
@@ -651,13 +661,10 @@ fn parse_incoming(
         .get("status")
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(200) as u16;
-    let mut body = value
+    let body = value
         .get("body")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    if let Some(stream) = body.as_str().filter(|stream| stream.contains("data:")) {
-        body = whipplescript_kernel::harness_model::assemble_codex_responses_sse(stream);
-    }
     Ok(Some(Ok(HttpResponse { status, body })))
 }
 

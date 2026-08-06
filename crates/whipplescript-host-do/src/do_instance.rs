@@ -39,7 +39,7 @@ use whipplescript_kernel::exec_http::{
     parse_executor_exec_response, settle_exec_http_result, ExecSettleContext,
 };
 use whipplescript_kernel::harness_loop::{
-    compactor_for_strategy, provider_result_from_brokered_turn, BrokeredTurnInput,
+    compactor_for_strategy, provider_result_from_brokered_turn, Awaiting, BrokeredTurnInput,
     BrokeredTurnMachine, BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient,
     ImageBlock, PendingTurnCommand, ToolExecutor, TurnCommandKind, TurnCommandSource, TurnStatus,
 };
@@ -55,6 +55,19 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
+
+/// What a model round about to be issued should be called (DR 0061).
+///
+/// A summarization compaction yields its round exactly like an ordinary agent
+/// round, so the shell that performs the `fetch` cannot tell them apart — only
+/// the machine's own snapshot says which this is. Naming it here is what keeps a
+/// compaction from reading to the user as a slow answer.
+fn round_activity(awaiting: Awaiting) -> &'static str {
+    match awaiting {
+        Awaiting::Summary => "compacting",
+        Awaiting::Main => "awaiting_model",
+    }
+}
 
 /// Projected coerce provider credentials (the DO secrets plane supplies these; a
 /// live worker reads them from its bindings). This is the ONE canonical resolved
@@ -932,6 +945,15 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                 )?;
                 match step {
                     Outcome::NeedsIo(IoRequest::Http(request)) => {
+                        // A summarization compaction yields its round exactly
+                        // like a main round, so the two are indistinguishable to
+                        // the shell — only the snapshot says which this is. Name
+                        // it here, or the wait reads as an ordinary model call
+                        // (DR 0061).
+                        self.kernel
+                            .store()
+                            .sql
+                            .activity(round_activity(snapshot.awaiting), None);
                         return Ok(EffectStep::NeedsHttp(request));
                     }
                     Outcome::Settle(outcome) => {
@@ -1405,6 +1427,15 @@ mod tests {
     use whipplescript_store::NewInstanceAuthority;
 
     use crate::do_store::test_support::store;
+
+    #[test]
+    fn a_compaction_round_is_not_reported_as_an_ordinary_model_call() {
+        // Both yield `NeedsIo(Http)` and the shell performs both the same way,
+        // so this mapping is the only thing that keeps a summarization round
+        // from being announced as the answer the reader is waiting for.
+        assert_eq!(round_activity(Awaiting::Summary), "compacting");
+        assert_eq!(round_activity(Awaiting::Main), "awaiting_model");
+    }
 
     /// Refuses I/O — a store-only / effect-free run never asks for it.
     struct RefuseIoHost;

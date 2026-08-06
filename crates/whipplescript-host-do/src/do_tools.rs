@@ -610,6 +610,12 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
 impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
+        // The kernel runs tools without yielding to the shell, so this is the
+        // only point at which "a tool is running, and it is this one" is true
+        // and reportable (DR 0061). The name is the whole value: a turn that
+        // sits for ten seconds reads very differently as "running a command"
+        // than as an unexplained pause.
+        self.sql.activity("running_tool", Some(&call.name));
         match self.dispatch(call) {
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
@@ -866,6 +872,59 @@ mod tests {
             name: name.into(),
             arguments,
         }
+    }
+
+    /// A `DoSql` that records the live-turn observations published through it,
+    /// forwarding the SQL itself to a real handle so tools still run.
+    struct RecordingSql {
+        inner: crate::do_store::test_support::RusqliteDoSql,
+        activity: std::cell::RefCell<Vec<(String, Option<String>)>>,
+    }
+
+    impl DoSql for RecordingSql {
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+            self.inner.execute(sql, params)
+        }
+        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.inner.query(sql, params)
+        }
+        fn activity(&self, kind: &str, detail: Option<&str>) {
+            self.activity
+                .borrow_mut()
+                .push((kind.to_owned(), detail.map(str::to_owned)));
+        }
+    }
+
+    #[test]
+    fn every_dispatched_tool_announces_itself_by_name_before_it_runs() {
+        let sql = Rc::new(RecordingSql {
+            inner: store().sql,
+            activity: std::cell::RefCell::new(Vec::new()),
+        });
+        let executor = DoToolExecutor::new(Rc::clone(&sql));
+
+        executor.execute(&call(
+            "write",
+            serde_json::json!({
+                "path": "note.txt",
+                "content": "hello",
+            }),
+        ));
+        executor.execute(&call("read", serde_json::json!({ "path": "note.txt" })));
+        // A tool that fails still ran, so it is still announced — the reader was
+        // waiting through it either way.
+        executor.execute(&call("read", serde_json::json!({ "path": "absent.txt" })));
+
+        assert_eq!(
+            sql.activity.borrow().as_slice(),
+            &[
+                ("running_tool".to_owned(), Some("write".to_owned())),
+                ("running_tool".to_owned(), Some("read".to_owned())),
+                ("running_tool".to_owned(), Some("read".to_owned())),
+            ],
+            "the kernel runs tools without yielding, so this announcement is the \
+             only point at which a host can say which tool is running",
+        );
     }
 
     #[test]

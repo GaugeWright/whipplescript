@@ -741,6 +741,7 @@ describe("real WorkflowInstance hibernation", () => {
     expect(providerBodies[1]).toContain(
       "tool `bash` was not offered for this model round",
     );
+
     for (const forbidden of [
       "OPENAI_API_KEY",
       "ANTHROPIC_API_KEY",
@@ -1589,5 +1590,103 @@ describe("real WorkflowInstance hibernation", () => {
     );
     firstSocket.close(1000, "done");
     secondSocket.close(1000, "done");
+  });
+
+  // A failing turn already settles correctly. This pins that, because the live
+  // observation gives it a new consequence: a client derives "busy" from
+  // activity, so a turn that failed without a correlated terminal event would
+  // no longer merely block the next turn — it would leave the composer disabled
+  // with a "thinking" indicator that never clears.
+  it("settles a failed turn's client and leaves no active turn behind", async () => {
+    // A provider that never succeeds, so the turn reaches its terminal state
+    // through the failure path rather than a clean settle.
+    const providerFetch = vi.fn(async () => {
+      throw new Error("injected provider outage");
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    const sessionId = "session-turn-failure";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({
+      type: "session_ready",
+      sequence: 0,
+    });
+
+    socket.send(
+      JSON.stringify({
+        type: "send_message",
+        request_id: "turn-fails",
+        text: "hello",
+      }),
+    );
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 80; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+
+    // The failure has to arrive correlated. The bare socket `error` frame the
+    // outer catch sends carries no request_id, so a client holding a pending
+    // turn could never match it and would wait forever.
+    expect(observed.at(-1)).toMatchObject({
+      type: "error",
+      request_id: "turn-fails",
+      command_id: `public:${sessionId}:turn-fails`,
+    });
+
+    // The activity projection must have reported the turn before it failed —
+    // otherwise nothing was observable during the very wait it exists for.
+    expect(
+      observed
+        .filter(({ type }) => type === "turn_activity")
+        .map(({ activity }) => activity),
+    ).toContain("awaiting_model");
+
+    // The singleton binding must be released. Leaving it behind pins the
+    // session: every later turn 409s against a turn that already ended, and
+    // each reconnecting client reads a permanently active turn from the
+    // snapshot and sits disabled waiting on it.
+    providerFetch.mockImplementation(async () =>
+      new Response(
+        [
+          'data: {"type":"response.output_text.delta","delta":"recovered"}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1}}}',
+          "",
+        ].join("\n"),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+    );
+    socket.send(
+      JSON.stringify({
+        type: "send_message",
+        request_id: "turn-after-failure",
+        text: "again",
+      }),
+    );
+    const recovered: Record<string, unknown>[] = [];
+    for (let index = 0; index < 80; index += 1) {
+      const message = await nextMessage(socket);
+      recovered.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+    expect(recovered.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-after-failure",
+    });
+
+    // And the released binding must leave no active turn for a reconnecting
+    // client to inherit.
+    const reconnected = await openSocket(stub);
+    const ready = await nextMessage(reconnected);
+    expect(
+      (ready.snapshot as { active_turn?: unknown } | undefined)?.active_turn,
+    ).toBeUndefined();
+    socket.close(1000, "done");
+    reconnected.close(1000, "done");
   });
 });
