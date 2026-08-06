@@ -211,7 +211,7 @@ whip --store .whipplescript/quickstart.sqlite log    <instance_id>
 | [Current state](docs/current-state.md) | The parts that operate today and the parts that are not yet stable. |
 
 When you point a coding agent at WhippleScript, start the agent with
-[`skills/whipplescript-author/SKILL.md`](skills/whipplescript-author/SKILL.md).
+`skills/whipplescript-author/SKILL.md`.
 
 You can also serve the same Markdown documents as a site that you can navigate:
 
@@ -271,5 +271,5 @@ the formal models. A Nix dev shell supplies the necessary tools: run
 `nix develop`. In an environment without Nix, install the dependencies of the
 Python scripts with
 `python3 -m pip install -r requirements-dev.txt`.
-The document [`spec/implementation-plan.md`](spec/implementation-plan.md)
+The document `spec/implementation-plan.md`
 records the remaining work.

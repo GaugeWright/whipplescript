@@ -1,0 +1,1 @@
+This folder contains the built output assets for the worker "whipplescript-public-runtime" generated at 2026-08-06T03:59:05.755Z.

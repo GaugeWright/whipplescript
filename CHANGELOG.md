@@ -83,7 +83,7 @@ decision can cross the integrity axis for the first time.
   column with no language-visible field.
 - Entries for `0.2.2`, `0.2.3`, `0.3.0`, and `0.3.1` were never written. Those
   releases are recorded in their decision records — notably
-  [DR-0050](spec/decision-records/0050-remove-ask-human.md) for the `ask_human`
+  DR-0050 for the `ask_human`
   removal cut as `0.3.1`. This gap is noted rather than backfilled.
 
 ## [0.2.1] — 2026-07-27

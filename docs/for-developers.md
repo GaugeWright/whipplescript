@@ -147,14 +147,14 @@ command deploys a workflow to a Worker and a Durable Object in one operation.
 Design records and implementation trackers stay internal, and you do not need
 them for usual authoring. The repository publishes the machine-readable report
 schemas at
-[`spec/report-schemas/`](https://github.com/GaugeWright/whipplescript/tree/main/spec/report-schemas).
+`spec/report-schemas/`.
 
 ## The route for a coding agent
 
 Use this route when the task is to write a workflow or to correct a workflow.
 
 1. Read
-   [`skills/whipplescript-author/SKILL.md`](https://github.com/GaugeWright/whipplescript/blob/main/skills/whipplescript-author/SKILL.md).
+   `skills/whipplescript-author/SKILL.md`.
    The companion skill has the route map, the table that helps you select
    features, the canonical patterns, and the command loop.
 2. Select the nearest checked example from [Examples](examples.md).

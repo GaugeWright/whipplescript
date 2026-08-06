@@ -34,7 +34,7 @@ For the use of a command, refer to the [CLI reference](api-reference.md).
 | Coordination inspection | JSON with the shape of the command | Sufficiently stable for an operator. The surface has no schema identifier now. |
 
 The JSON schemas for the envelopes of the reports with a version are in
-[`spec/report-schemas/`](https://github.com/GaugeWright/whipplescript/tree/main/spec/report-schemas).
+`spec/report-schemas/`.
 Validate the schemas with the `scripts/check-report-schemas.sh` script.
 
 ## Required Fields
