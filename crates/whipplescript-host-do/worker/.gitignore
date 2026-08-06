@@ -5,3 +5,8 @@ node_modules/
 # `capture:collection-vector` writes here; the vector is committed in gaugedesk,
 # which is where the Rust opener that must agree with it lives.
 collection-emitted-vector.json
+
+# Wrangler dry-run and composition output. scripts/check.sh regenerates both on
+# every run, so tracking them means the green bar dirties the tree it verifies.
+dist-ci/
+dist-public-composition/
