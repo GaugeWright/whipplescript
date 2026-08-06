@@ -33,33 +33,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
+  # The per-change gate runs the repository's own green bar, so a local pass and
+  # a gate pass cannot mean different things. Add checks to scripts/check.sh.
+  green-bar:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      # rustup materializes the toolchain named in rust-toolchain.toml.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Rust tests
-        run: cargo test --workspace
+      - name: Green bar
+        run: scripts/check.sh
 
   hosted-runtime-contracts:
     runs-on: ubuntu-latest
@@ -70,15 +57,16 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      # rustup materializes the toolchain and wasm target named in
+      # rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install matching wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: crates/whipplescript-host-do/worker/package-lock.json
       - run: npm ci
@@ -97,7 +85,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install Maude
         run: |
@@ -128,7 +116,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: E2E smoke
         run: scripts/check-e2e.sh
@@ -141,7 +129,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Install Maude
         run: |
           sudo apt-get update
@@ -159,9 +147,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Install Python tooling
         run: python3 -m pip install --user -r requirements-dev.txt

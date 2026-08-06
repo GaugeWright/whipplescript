@@ -229,6 +229,19 @@ scripts/check-docs-snippets.sh
 scripts/check-docs-site.sh
 ```
 
+## The green bar
+
+One command runs the complete check set that applies to every change, and CI
+runs the same script:
+
+```sh
+scripts/check.sh
+```
+
+The Rust and Node versions are pinned in `rust-toolchain.toml` and
+`.node-version`; the workflows derive their versions from those files.
+[AGENTS.md](AGENTS.md) is the working guide for this repository.
+
 ## Contributing
 
 WhippleScript is open source, but it is not open to contributions from all
