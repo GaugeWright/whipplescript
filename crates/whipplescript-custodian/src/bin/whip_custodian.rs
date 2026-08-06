@@ -22,12 +22,13 @@ use whipplescript_custody::{CredentialKind, CredentialName};
 
 const USAGE: &str = "usage:
   whip-custodian init   --store <path>
-  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin]
+  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name>]
   whip-custodian list   --store <path>
   whip-custodian revoke --store <path> --name <credential>
   whip-custodian serve  --store <path> --socket <path> [--egress-allow <host,host,*.suffix>]
 
-passphrase: WHIPPLESCRIPT_CUSTODIAN_PASSPHRASE or --passphrase-file <path>";
+passphrase: WHIPPLESCRIPT_CUSTODIAN_PASSPHRASE or --passphrase-file <path>
+openbao (r3): serve connects when BAO_ADDR (or VAULT_ADDR) is set, using BAO_TOKEN (or VAULT_TOKEN)";
 
 struct Args {
     flags: std::collections::BTreeMap<String, String>,
@@ -109,6 +110,27 @@ fn run() -> Result<(), String> {
                 .get("budget")
                 .map(|b| b.parse::<u64>().map_err(|e| format!("bad --budget: {e}")))
                 .transpose()?;
+            // An r3 remote entry: only a key name is recorded; the material
+            // lives in the OpenBao transit engine and never touches this box.
+            if let Some(key_name) = args.flags.get("remote-transit") {
+                for local in ["from-env", "from-file"] {
+                    if args.flags.contains_key(local) {
+                        return Err(format!("--remote-transit conflicts with --{local}"));
+                    }
+                }
+                if args.switches.contains("from-stdin") {
+                    return Err("--remote-transit conflicts with --from-stdin".to_string());
+                }
+                let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
+                store
+                    .register_remote(name.clone(), kind, key_name.clone(), budget)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "imported {} (kind {kind}, remote openbao transit key {key_name:?})",
+                    name.resource_id()
+                );
+                return Ok(());
+            }
             let material: Zeroizing<Vec<u8>> = if let Some(var) = args.flags.get("from-env") {
                 Zeroizing::new(
                     std::env::var(var)
@@ -127,7 +149,10 @@ fn run() -> Result<(), String> {
                 }
                 Zeroizing::new(buf)
             } else {
-                return Err("one of --from-env, --from-file, --from-stdin is required".to_string());
+                return Err(
+                    "one of --from-env, --from-file, --from-stdin, --remote-transit is required"
+                        .to_string(),
+                );
             };
             let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
             store
@@ -178,7 +203,20 @@ fn run() -> Result<(), String> {
                     }
                     None => Box::new(DeniedEgress),
                 };
-            let custodian = Arc::new(Custodian::new(store, egress));
+            let mut custodian = Custodian::new(store, egress);
+            // r3: connect to OpenBao when the environment names one. A
+            // configured-but-unreachable OpenBao is a startup error, not a
+            // daemon that silently serves remote entries it cannot reach.
+            if let Some(client) =
+                whipplescript_custodian::openbao::Client::from_env().map_err(|e| e.to_string())?
+            {
+                client
+                    .token_lookup_self()
+                    .map_err(|e| format!("openbao token lookup failed ({}): {e}", client.addr()))?;
+                eprintln!("openbao transit connected (r3)");
+                custodian = custodian.with_openbao(client);
+            }
+            let custodian = Arc::new(custodian);
             eprintln!(
                 "whip-custodian: r0 process sealing (degraded), serving on {}",
                 socket.display()

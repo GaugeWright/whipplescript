@@ -14,6 +14,7 @@
 //! earlier — never credential material (§13).
 
 pub mod egress;
+pub mod openbao;
 pub mod serve;
 pub mod store;
 
@@ -35,7 +36,7 @@ use whipplescript_custody::{
     CUSTODY_PROTOCOL,
 };
 
-use store::{SealedStore, StoreError};
+use store::{Material, SealedStore, StoreError};
 
 // ---------------------------------------------------------------------------
 // Egress
@@ -94,6 +95,10 @@ pub struct Custodian {
     uses: Mutex<Vec<UseRecord>>,
     use_counts: Mutex<BTreeMap<CredentialName, u64>>,
     egress: Box<dyn Egress>,
+    /// The r3 remote backend, when the daemon configured one from
+    /// `BAO_ADDR`/`BAO_TOKEN`. A remote entry used without a client is a
+    /// loud refusal, never a silent local fallback.
+    openbao: Option<openbao::Client>,
     rng: SystemRandom,
 }
 
@@ -111,16 +116,39 @@ impl Custodian {
             uses: Mutex::new(Vec::new()),
             use_counts: Mutex::new(BTreeMap::new()),
             egress,
+            openbao: None,
             rng: SystemRandom::new(),
         }
     }
 
-    /// The rung this custodian's backend seals at, with the degraded tag. r0
-    /// is always degraded (DR-0053 §4: dev only, tagged) — the tag is derived
-    /// from what the backend *is*, never from configuration
+    /// Attach an r3 OpenBao transit client (built by the daemon from
+    /// `BAO_ADDR`/`BAO_TOKEN`). Only remote entries route through it; local
+    /// entries keep the in-process path.
+    pub fn with_openbao(mut self, client: openbao::Client) -> Self {
+        self.openbao = Some(client);
+        self
+    }
+
+    /// The rung this custodian's *local* sealing sits at, with the degraded
+    /// tag. r0 is always degraded (DR-0053 §4: dev only, tagged) — the tag is
+    /// derived from what the backend *is*, never from configuration
     /// (`credential-rung-evidence.maude`: configuration is not evidence).
+    /// Per-call replies derive the rung from the entry actually touched
+    /// ([`Self::entry_rung`]): remote entries report r3, not this floor.
     pub fn rung(&self) -> (Rung, bool) {
         (Rung::Process, true)
+    }
+
+    /// The rung/degraded pair for the entry a call touches — evidence is
+    /// where the *material* is, so it is per-entry, not per-custodian: an
+    /// OpenBao transit entry's material never exists on this box (r3, not
+    /// degraded), while a local entry stays r0 degraded. An unknown entry
+    /// reports the local floor; the refusal in the outcome says the rest.
+    fn entry_rung(&self, name: &CredentialName) -> (Rung, bool) {
+        match lock(&self.store).get(name).map(|e| &e.material) {
+            Some(Material::OpenBaoTransit { .. }) => (Rung::Remote, false),
+            _ => self.rung(),
+        }
     }
 
     /// Admin surface, reachable only in-process by the principal holding the
@@ -167,7 +195,7 @@ impl Custodian {
 
     /// Handle one protocol call. Always replies; every reply is recorded.
     pub fn handle(&self, call: &CustodyCall) -> CustodyReply {
-        let (rung, degraded) = self.rung();
+        let (rung, degraded) = self.entry_rung(call.op.credential());
         let use_id = self.fresh_id("use");
         let outcome = if call.protocol == CUSTODY_PROTOCOL {
             self.dispatch(&call.op)
@@ -222,11 +250,7 @@ impl Custodian {
                     operation,
                 });
             }
-            (
-                entry.kind,
-                Zeroizing::new(entry.material.to_vec()),
-                entry.budget,
-            )
+            (entry.kind, entry.material.clone(), entry.budget)
         };
         if let Some(budget) = budget {
             let mut counts = lock(&self.use_counts);
@@ -236,6 +260,15 @@ impl Custodian {
             }
             *count += 1;
         }
+
+        // r3 remote entries route keyed operations to the OpenBao transit
+        // engine; the material never exists in this process.
+        let material = match &material {
+            Material::OpenBaoTransit { key_name } => {
+                return self.dispatch_remote(&name, kind, key_name, op)
+            }
+            Material::Local(material) => Zeroizing::new(material.to_vec()),
+        };
 
         match op {
             CustodyOp::Request { request, .. } => self.op_request(&name, kind, &material, request),
@@ -268,6 +301,68 @@ impl Custodian {
                 extraction,
                 ..
             } => self.op_mint(&name, &material, scope, *ttl_secs, exchange, extraction),
+        }
+    }
+
+    // -- r3 remote (OpenBao transit) ----------------------------------------
+
+    /// Dispatch for an entry whose material lives in an OpenBao transit
+    /// engine. Transit performs keyed signing and verification; everything
+    /// else in the vocabulary would need the material here, which is exactly
+    /// what r3 exists to prevent — so the rest refuses, by name.
+    fn dispatch_remote(
+        &self,
+        name: &CredentialName,
+        kind: CredentialKind,
+        key_name: &str,
+        op: &CustodyOp,
+    ) -> Result<CustodyOk, CustodyError> {
+        let client = self.openbao.as_ref().ok_or_else(|| CustodyError::Backend {
+            detail: "no OpenBao connection configured (BAO_ADDR/BAO_TOKEN)".into(),
+        })?;
+        match op {
+            CustodyOp::Sign {
+                alg,
+                derivation,
+                payload_b64,
+                ..
+            } => {
+                remote_alg_admitted(name, kind, *alg, op.operation())?;
+                if !derivation.is_empty() {
+                    return Err(CustodyError::Backend {
+                        detail: "r3 transit does not support derivation chains: the chain folds \
+                                 HMAC over the raw key, which never leaves the transit engine"
+                            .into(),
+                    });
+                }
+                let payload = decode_b64(payload_b64)?;
+                let signature = client
+                    .transit_sign(key_name, &payload, kind)
+                    .map_err(|detail| CustodyError::Backend { detail })?;
+                Ok(CustodyOk::Signed {
+                    signature_b64: B64.encode(signature),
+                })
+            }
+            CustodyOp::Verify {
+                alg,
+                payload_b64,
+                signature_b64,
+                ..
+            } => {
+                remote_alg_admitted(name, kind, *alg, op.operation())?;
+                let payload = decode_b64(payload_b64)?;
+                let signature = decode_b64(signature_b64)?;
+                let valid = client
+                    .transit_verify(key_name, &payload, &signature, kind)
+                    .map_err(|detail| CustodyError::Backend { detail })?;
+                Ok(CustodyOk::Verified { valid })
+            }
+            _ => Err(CustodyError::Backend {
+                detail: format!(
+                    "{} on a remote credential is not supported at r3 transit yet",
+                    op.operation()
+                ),
+            }),
         }
     }
 
@@ -459,6 +554,37 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, CustodyError> {
     B64.decode(s).map_err(|e| CustodyError::Backend {
         detail: format!("bad base64: {e}"),
     })
+}
+
+/// Admission for a keyed operation on an r3 transit entry: only
+/// HMAC-SHA-256 keys with alg `hmac-sha256` and Ed25519 keys with alg
+/// `ed25519` are supported remotely. Anything else — RSA, AWS SigV4 key
+/// preparation, or an alg that does not match the key — refuses with a
+/// message naming r3 transit, not a generic crypto error.
+fn remote_alg_admitted(
+    name: &CredentialName,
+    kind: CredentialKind,
+    alg: SignatureAlg,
+    operation: Operation,
+) -> Result<(), CustodyError> {
+    match (kind, alg) {
+        (CredentialKind::HmacSha256, SignatureAlg::HmacSha256)
+        | (CredentialKind::Ed25519, SignatureAlg::Ed25519) => Ok(()),
+        (CredentialKind::HmacSha256, _) | (CredentialKind::Ed25519, _) => {
+            // The key could serve, but this call's alg does not match it.
+            Err(CustodyError::KindMismatch {
+                credential: name.clone(),
+                kind,
+                operation,
+            })
+        }
+        _ => Err(CustodyError::Backend {
+            detail: format!(
+                "r3 transit does not support {operation} for kind {kind}: only hmac-sha256 and \
+                 ed25519 keys operate remotely"
+            ),
+        }),
+    }
 }
 
 /// Presentation of material at a marked slot (DR-0053 §5).

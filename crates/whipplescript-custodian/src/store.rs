@@ -75,8 +75,17 @@ struct KdfParams {
 #[derive(Serialize, Deserialize, Clone)]
 struct SealedEntry {
     kind: CredentialKind,
-    nonce_b64: String,
-    sealed_b64: String,
+    /// Sealed local material. Absent for remote entries — there is no secret
+    /// on this box to seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_b64: Option<String>,
+    /// r3 remote reference: `{"remote": {"openbao_transit": "<key_name>"}}`.
+    /// Plaintext metadata by design — a key *name* in a transit engine is not
+    /// a secret, and sealing it would only pretend otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<RemoteRef>,
     #[serde(default)]
     revoked: bool,
     /// Optional per-credential use budget (DR-0053 §9), enforced per
@@ -85,10 +94,30 @@ struct SealedEntry {
     budget: Option<u64>,
 }
 
-/// One unsealed entry held in custodian memory. Material zeroizes on drop.
+/// Where a remote entry's material lives. One variant per remote backend.
+#[derive(Serialize, Deserialize, Clone)]
+struct RemoteRef {
+    /// The key name in an OpenBao transit engine.
+    openbao_transit: String,
+}
+
+/// Where an entry's material is (DR-0053 §4): held locally under seal, or
+/// resident in a remote backend that performs the operations itself.
+#[derive(Clone)]
+pub enum Material {
+    Local(Zeroizing<Vec<u8>>),
+    /// r3: the key lives in an OpenBao transit engine; material never exists
+    /// on this box.
+    OpenBaoTransit {
+        key_name: String,
+    },
+}
+
+/// One unsealed entry held in custodian memory. Local material zeroizes on
+/// drop; remote entries hold only a key name.
 pub struct Entry {
     pub kind: CredentialKind,
-    pub material: Zeroizing<Vec<u8>>,
+    pub material: Material,
     pub revoked: bool,
     pub budget: Option<u64>,
 }
@@ -180,29 +209,43 @@ impl SealedStore {
         let mut entries = BTreeMap::new();
         for (name, sealed) in &file.entries {
             let name = CredentialName::new(name).map_err(StoreError::Format)?;
-            let nonce_bytes: [u8; NONCE_LEN] = B64
-                .decode(&sealed.nonce_b64)
-                .map_err(|e| StoreError::Format(format!("bad nonce: {e}")))?
-                .try_into()
-                .map_err(|_| StoreError::Format("bad nonce length".into()))?;
-            let mut buf = B64
-                .decode(&sealed.sealed_b64)
-                .map_err(|e| StoreError::Format(format!("bad ciphertext: {e}")))?;
-            let aad = entry_aad(&name, sealed.kind);
-            let plain_len = key
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce_bytes),
-                    Aad::from(aad),
-                    &mut buf,
-                )
-                .map_err(|_| StoreError::Unsealable)?
-                .len();
-            buf.truncate(plain_len);
+            let material = match (&sealed.remote, &sealed.nonce_b64, &sealed.sealed_b64) {
+                (Some(remote), None, None) => Material::OpenBaoTransit {
+                    key_name: remote.openbao_transit.clone(),
+                },
+                (None, Some(nonce_b64), Some(sealed_b64)) => {
+                    let nonce_bytes: [u8; NONCE_LEN] = B64
+                        .decode(nonce_b64)
+                        .map_err(|e| StoreError::Format(format!("bad nonce: {e}")))?
+                        .try_into()
+                        .map_err(|_| StoreError::Format("bad nonce length".into()))?;
+                    let mut buf = B64
+                        .decode(sealed_b64)
+                        .map_err(|e| StoreError::Format(format!("bad ciphertext: {e}")))?;
+                    let aad = entry_aad(&name, sealed.kind);
+                    let plain_len = key
+                        .open_in_place(
+                            Nonce::assume_unique_for_key(nonce_bytes),
+                            Aad::from(aad),
+                            &mut buf,
+                        )
+                        .map_err(|_| StoreError::Unsealable)?
+                        .len();
+                    buf.truncate(plain_len);
+                    Material::Local(Zeroizing::new(buf))
+                }
+                _ => {
+                    return Err(StoreError::Format(format!(
+                        "entry {} must carry either sealed material or a remote reference",
+                        name.resource_id()
+                    )))
+                }
+            };
             entries.insert(
                 name,
                 Entry {
                     kind: sealed.kind,
-                    material: Zeroizing::new(buf),
+                    material,
                     revoked: sealed.revoked,
                     budget: sealed.budget,
                 },
@@ -239,7 +282,29 @@ impl SealedStore {
             name,
             Entry {
                 kind,
-                material,
+                material: Material::Local(material),
+                revoked: false,
+                budget,
+            },
+        );
+        self.persist()
+    }
+
+    /// Register (or replace) an r3 remote entry: the material lives in an
+    /// OpenBao transit engine under `key_name` and never exists on this box.
+    /// Same admin surface as [`Self::register`].
+    pub fn register_remote(
+        &mut self,
+        name: CredentialName,
+        kind: CredentialKind,
+        key_name: String,
+        budget: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.entries.insert(
+            name,
+            Entry {
+                kind,
+                material: Material::OpenBaoTransit { key_name },
                 revoked: false,
                 budget,
             },
@@ -266,27 +331,42 @@ impl SealedStore {
         let key = aead_key(&self.master_key)?;
         let mut sealed_entries = BTreeMap::new();
         for (name, entry) in &self.entries {
-            let mut nonce_bytes = [0u8; NONCE_LEN];
-            self.rng
-                .fill(&mut nonce_bytes)
-                .map_err(|_| StoreError::Format("rng failure".into()))?;
-            let mut buf = entry.material.to_vec();
-            key.seal_in_place_append_tag(
-                Nonce::assume_unique_for_key(nonce_bytes),
-                Aad::from(entry_aad(name, entry.kind)),
-                &mut buf,
-            )
-            .map_err(|_| StoreError::Format("seal failure".into()))?;
-            sealed_entries.insert(
-                name.as_str().to_string(),
-                SealedEntry {
+            let sealed = match &entry.material {
+                Material::Local(material) => {
+                    let mut nonce_bytes = [0u8; NONCE_LEN];
+                    self.rng
+                        .fill(&mut nonce_bytes)
+                        .map_err(|_| StoreError::Format("rng failure".into()))?;
+                    let mut buf = material.to_vec();
+                    key.seal_in_place_append_tag(
+                        Nonce::assume_unique_for_key(nonce_bytes),
+                        Aad::from(entry_aad(name, entry.kind)),
+                        &mut buf,
+                    )
+                    .map_err(|_| StoreError::Format("seal failure".into()))?;
+                    SealedEntry {
+                        kind: entry.kind,
+                        nonce_b64: Some(B64.encode(nonce_bytes)),
+                        sealed_b64: Some(B64.encode(&buf)),
+                        remote: None,
+                        revoked: entry.revoked,
+                        budget: entry.budget,
+                    }
+                }
+                // Remote entries persist as plaintext metadata: no nonce, no
+                // ciphertext — there is no secret to seal.
+                Material::OpenBaoTransit { key_name } => SealedEntry {
                     kind: entry.kind,
-                    nonce_b64: B64.encode(nonce_bytes),
-                    sealed_b64: B64.encode(&buf),
+                    nonce_b64: None,
+                    sealed_b64: None,
+                    remote: Some(RemoteRef {
+                        openbao_transit: key_name.clone(),
+                    }),
                     revoked: entry.revoked,
                     budget: entry.budget,
                 },
-            );
+            };
+            sealed_entries.insert(name.as_str().to_string(), sealed);
         }
         let file = StoreFile {
             version: STORE_VERSION,
@@ -337,7 +417,10 @@ mod tests {
         let reopened = SealedStore::open(&path, "hunter2").expect("open");
         let entry = reopened.get(&name("stripe_api")).expect("entry");
         assert_eq!(entry.kind, CredentialKind::Bearer);
-        assert_eq!(entry.material.as_slice(), b"sk_live_123");
+        let Material::Local(material) = &entry.material else {
+            panic!("expected local material");
+        };
+        assert_eq!(material.as_slice(), b"sk_live_123");
         assert_eq!(entry.budget, Some(10));
 
         // The stored file never contains material in the clear.
@@ -351,6 +434,47 @@ mod tests {
             SealedStore::open(&path, "wrong"),
             Err(StoreError::Unsealable)
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_entries_roundtrip_as_plaintext_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-custody-remote-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("store.json");
+
+        let mut store = SealedStore::create(Some(path.clone()), "pw").expect("create");
+        store
+            .register_remote(
+                name("release_signing"),
+                CredentialKind::Ed25519,
+                "whip-release".into(),
+                Some(4),
+            )
+            .expect("register remote");
+
+        // The reference is plaintext metadata in the exact recorded shape —
+        // no nonce, no ciphertext.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let file: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        let entry = &file["entries"]["release_signing"];
+        assert_eq!(entry["remote"]["openbao_transit"], "whip-release");
+        assert!(entry.get("nonce_b64").is_none(), "{entry}");
+        assert!(entry.get("sealed_b64").is_none(), "{entry}");
+
+        let reopened = SealedStore::open(&path, "pw").expect("open");
+        let entry = reopened.get(&name("release_signing")).expect("entry");
+        assert_eq!(entry.kind, CredentialKind::Ed25519);
+        assert_eq!(entry.budget, Some(4));
+        let Material::OpenBaoTransit { key_name } = &entry.material else {
+            panic!("expected a remote reference");
+        };
+        assert_eq!(key_name, "whip-release");
 
         std::fs::remove_dir_all(&dir).ok();
     }
