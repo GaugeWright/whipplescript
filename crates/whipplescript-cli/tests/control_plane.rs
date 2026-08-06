@@ -6541,8 +6541,13 @@ rule start_native_work
     )
     .expect("write native fixture stress workflow");
 
-    let dev = run_json(
+    // Four effects run concurrently against the run store; the side stores are
+    // this test's own so the pass cannot contend with the rest of the suite for
+    // the shared `.whipplescript` writer lock (it used to fail here with
+    // `internal store error (database is locked)` under `--workspace`).
+    let dev = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6573,8 +6578,9 @@ rule start_native_work
         .sum::<u64>();
     assert_eq!(ran_effects, 4);
 
-    let runs = run_json(
+    let runs = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -6595,8 +6601,9 @@ rule start_native_work
         assert_eq!(run.get("artifact_count").and_then(Value::as_u64), Some(1));
     }
 
-    let log = run_json(
+    let log = run_json_isolated(
         bin,
+        &store_path,
         &[
             "--store",
             store_path.to_str().expect("utf-8 temp path"),
@@ -7557,30 +7564,74 @@ rule finish
     fs::write(&v2, program("v2")).expect("v2 writes");
     let store = store_path.to_str().expect("utf-8 temp path");
 
-    let output = Command::new(bin)
-        .args([
+    // `start` + `step` rather than `run`: a rule pass ADMITS the firing and
+    // requests the timer, but only a `worker` pass ever settles one, so the
+    // firing is open here by construction. `run` drives both, and a pass slow
+    // enough to cross the 2s deadline settled the timer and completed the
+    // instance before the revision below could see it — a real flake under a
+    // loaded `cargo test --workspace`.
+    let started = run_json_isolated(
+        bin,
+        &store_path,
+        &[
             "--store",
             store,
             "--json",
-            "run",
+            "start",
             v1.to_str().expect("utf-8"),
-            "--until",
-            "idle",
-        ])
-        .output()
-        .expect("run v1");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let dev: Value =
-        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
-    let instance_id = dev
+        ],
+    );
+    let instance_id = started
         .get("instance_id")
         .and_then(Value::as_str)
         .expect("instance id")
         .to_owned();
+    let stepped = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "step",
+            &instance_id,
+            "--program",
+            v1.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("step v1 runs");
+    assert!(
+        stepped.status.success(),
+        "step v1 failed: {}",
+        String::from_utf8_lossy(&stepped.stderr)
+    );
+
+    // The precondition the revision needs, asserted rather than assumed.
+    let admitted = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", &instance_id],
+    );
+    assert_eq!(
+        admitted
+            .as_array()
+            .expect("effects array")
+            .iter()
+            .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+            .count(),
+        1,
+        "v1 admitted the firing and requested its timer: {admitted}"
+    );
+    let before = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "status", &instance_id],
+    );
+    assert_eq!(
+        before.pointer("/instance/status").and_then(Value::as_str),
+        Some("running"),
+        "the firing is still open when the revision lands: {before}"
+    );
 
     // Revise to v2 while the timer is still pending (keep policy).
-    let revised = Command::new(bin)
+    let revised = whip(bin, &store_path)
         .args([
             "--store",
             store,
@@ -7596,9 +7647,12 @@ rule finish
         String::from_utf8_lossy(&revised.stderr)
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(2500));
-    for _ in 0..3 {
-        let _ = Command::new(bin)
+    // Drive the revised instance to completion. The loop — not a fixed sleep —
+    // is what waits out the 2s deadline: a slow machine just takes more passes,
+    // and the timer settles on the first `worker` pass after it comes due.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7608,7 +7662,7 @@ rule finish
                 v2.to_str().expect("utf-8"),
             ])
             .output();
-        let _ = Command::new(bin)
+        let _ = whip(bin, &store_path)
             .args([
                 "--store",
                 store,
@@ -7618,15 +7672,25 @@ rule finish
                 v2.to_str().expect("utf-8"),
             ])
             .output();
+        let status = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "status", &instance_id],
+        );
+        if status.pointer("/instance/status").and_then(Value::as_str) == Some("completed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old firing completes after the revision: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
-
-    let status = run_json(bin, &["--store", store, "--json", "status", &instance_id]);
-    assert_eq!(
-        status.pointer("/instance/status").and_then(Value::as_str),
-        Some("completed"),
-        "the old firing completes after the revision: {status}"
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "facts", &instance_id],
     );
-    let facts = run_json(bin, &["--store", store, "--json", "facts", &instance_id]);
     let outcome = facts
         .as_array()
         .expect("facts array")
@@ -7638,7 +7702,11 @@ rule finish
         Some("v1"),
         "the continuation ran under the ADMITTING body, not the revised one: {outcome}"
     );
-    let effects = run_json(bin, &["--store", store, "--json", "effects", &instance_id]);
+    let effects = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "effects", &instance_id],
+    );
     let timers = effects
         .as_array()
         .expect("effects array")
@@ -20954,6 +21022,30 @@ fn run_json(bin: &str, args: &[&str]) -> Value {
     serde_json::from_str(&text).expect("valid JSON output")
 }
 
+/// A `whip` command whose side stores are this test's own rather than the
+/// process-global `.whipplescript/*.sqlite` defaults — see
+/// [`TempStorePath::side_store_env`] for why that matters under a parallel
+/// suite.
+fn whip(bin: &str, store: &TempStorePath) -> Command {
+    let mut command = Command::new(bin);
+    for (name, path) in store.side_store_env() {
+        command.env(name, path);
+    }
+    command
+}
+
+/// [`run_json`] over [`whip`]: same contract, isolated side stores.
+fn run_json_isolated(bin: &str, store: &TempStorePath, args: &[&str]) -> Value {
+    let output = whip(bin, store).args(args).output().expect("command runs");
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid JSON output")
+}
+
 fn run_json_with_env(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Value {
     let mut command = Command::new(bin);
     command.args(args);
@@ -21030,6 +21122,35 @@ impl AsRef<Path> for TempStorePath {
 impl AsRef<std::ffi::OsStr> for TempStorePath {
     fn as_ref(&self) -> &std::ffi::OsStr {
         self.path.as_os_str()
+    }
+}
+
+impl TempStorePath {
+    /// The workspace-scoped side stores, redirected into this test's own
+    /// directory.
+    ///
+    /// `--store` is per-test already, but the coordination, work-item and
+    /// content stores are not: with their env overrides unset the binary
+    /// resolves `.whipplescript/<name>.sqlite` relative to the CURRENT
+    /// WORKING DIRECTORY, so every `whip` this crate's tests spawn opens the
+    /// same three files. Under `cargo test --workspace` that is one SQLite
+    /// writer lock shared by every test thread — and by any other `whip`
+    /// running in the tree. A contended open then either blocks for the 5s
+    /// `busy_timeout` and fails with `database is locked`, or stretches the
+    /// command far enough past a workflow's timer deadline to change what the
+    /// test observes. Both were live flakes.
+    fn side_store_env(&self) -> [(&'static str, PathBuf); 3] {
+        [
+            (
+                "WHIPPLESCRIPT_COORDINATION_STORE",
+                self.dir.join("coordination.sqlite"),
+            ),
+            ("WHIPPLESCRIPT_ITEMS_STORE", self.dir.join("items.sqlite")),
+            (
+                "WHIPPLESCRIPT_CONTENT_STORE",
+                self.dir.join("content.sqlite"),
+            ),
+        ]
     }
 }
 
