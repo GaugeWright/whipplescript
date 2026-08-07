@@ -14,13 +14,14 @@
     "validate": "cargo build -p whipplescript-host-do --no-default-features --target wasm32-unknown-unknown --release && wasm-bindgen ../../../target/wasm32-unknown-unknown/release/whipplescript_host_do.wasm --out-dir pkg --target nodejs && node validate.cjs",
     "build:executor": "cargo build --release -p whipplescript --bin whip && cp ../../../target/release/whip executor/whip",
     "test": "npm run contracts:check && npm run canaries:check && npm run test:unit && npm run test:workerd",
-    "test:unit": "node --experimental-strip-types --test src/model-broker.test.ts src/private-home-protocol.test.ts src/provider-realization.test.ts src/session-lifecycle.test.ts src/session-collection.test.ts",
+    "test:unit": "node --experimental-strip-types --test src/assistant-text.test.ts src/model-broker.test.ts src/private-home-protocol.test.ts src/provider-realization.test.ts src/session-lifecycle.test.ts src/session-collection.test.ts",
     "deploy:private-staging": "npm run build:wasm && wrangler deploy --config wrangler.private-staging.toml",
     "test:private-staging": "node --experimental-strip-types scripts/private-home-staging-test.ts",
     "test:private-staging:open": "node --experimental-strip-types scripts/private-home-staging-test.ts open",
     "test:private-staging:resume": "node --experimental-strip-types scripts/private-home-staging-test.ts resume",
     "test:workerd": "npm run build:wasm && vitest run --config vitest.config.ts && vitest run --config vitest.authenticated.config.ts",
-    "capture:collection-vector": "COLLECTION_VECTOR_OUT=${COLLECTION_VECTOR_OUT:-collection-emitted-vector.json} vitest run --config vitest.config.ts -t 'emits only declared paths'"
+    "capture:collection-vector": "COLLECTION_VECTOR_OUT=${COLLECTION_VECTOR_OUT:-collection-emitted-vector.json} vitest run --config vitest.config.ts -t 'emits only declared paths'",
+    "deploy:public": "npm run build:wasm && wrangler deploy --config wrangler.public.toml"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",

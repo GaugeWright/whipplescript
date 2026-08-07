@@ -7,6 +7,7 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
+import { canonicalJson, sha256Hex } from "./private-home-protocol";
 
 const SIGNER = "authority:gaugedesk:test";
 const PUBLIC_KEY =
@@ -41,6 +42,97 @@ async function sha256(value: string): Promise<string> {
       await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
     ),
   );
+}
+
+/**
+ * Mint a signed governance envelope in-process.
+ *
+ * The suite previously carried one hard-coded envelope, and it grants no
+ * workspace capabilities — so every tool a test asked for was refused before
+ * dispatch and no test could drive a tool-USING turn. That is the gap the
+ * durable-assistant regression walked through: `assistant_text` is only left
+ * empty when a turn's last assistant message carried tool calls, which is the
+ * one shape the suite could not express.
+ */
+async function mintSignedEnvelope(
+  capabilities: string[] = [],
+  extra: { bindings?: Record<string, string>; resources?: Record<string, unknown> } = {},
+) {
+  const keys = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+  const point = (value: string) =>
+    Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  const publicKeyHex = `04${[...point(jwk.x!), ...point(jwk.y!)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+  const signer = "authority:gaugedesk:test";
+
+  const unsigned = {
+    bindings: {
+      do: "placement:do",
+      model: "provider:openai",
+      turn_images: "memory:turn-images",
+      ...extra.bindings,
+    },
+    // The epoch's capability ceiling: a package may request nothing outside it.
+    // Sorted: the verifier re-canonicalizes through a BTreeSet, so an
+    // insertion-ordered array hashes to a different envelope than the one it
+    // checks the attestation against.
+    ...(capabilities.length > 0 ? { capabilities: [...capabilities].sort() } : {}),
+    declassifications: [],
+    delegations: [],
+    endorsements: [],
+    parties: { audience: "audience" },
+    placements: { do: { kind: "durable_object", provider_bindings: ["model"] } },
+    provider_bindings: {
+      model: {
+        base_url: "https://api.openai.com/v1/responses",
+        credential_ref: "managed-openai",
+        model: "gpt-test",
+        provider: "openai",
+      },
+    },
+    resources: {
+      "memory:turn-images": { reader: ["audience"], writer: ["audience"] },
+      "placement:do": { principal: true, reader: [], writer: [] },
+      "provider:openai": { principal: true, reader: [], writer: [] },
+      ...extra.resources,
+    },
+  };
+  const canonical = canonicalJson(unsigned);
+  const envelopeHash = await sha256Hex(new TextEncoder().encode(canonical));
+  // The governance signing preimage: a domain tag then each field
+  // length-prefixed, so no two field splits can collide.
+  let preimage = "whipplescript-governance-envelope:v1;";
+  for (const item of [envelopeHash, signer, "p256-sha256", publicKeyHex]) {
+    preimage += `${new TextEncoder().encode(item).byteLength}:${item};`;
+  }
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    keys.privateKey,
+    new TextEncoder().encode(preimage),
+  );
+  const signatureHex = [...new Uint8Array(signature)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return {
+    publicKeyHex,
+    signer,
+    text: canonicalJson({
+      ...unsigned,
+      attestation: {
+        algorithm: "p256-sha256",
+        envelope_hash: envelopeHash,
+        key_id: publicKeyHex,
+        signature: signatureHex,
+        signer,
+      },
+    }),
+  };
 }
 
 async function packageDocuments(withTools = false) {
@@ -142,6 +234,7 @@ async function bootstrapSession(
   sessionId: string,
   withTools = false,
   collection?: Record<string, unknown>,
+  envelope?: { text: string; signer: string; publicKeyHex: string },
 ): Promise<void> {
   const packageDocs = await packageDocuments(withTools);
   const bootstrap = await stub.fetch(
@@ -169,9 +262,9 @@ async function bootstrapSession(
           : [],
         host_policy: {
           epoch: 1,
-          signed_envelope: SIGNED_ENVELOPE,
-          expected_signer: SIGNER,
-          signer_public_key_hex: PUBLIC_KEY,
+          signed_envelope: envelope?.text ?? SIGNED_ENVELOPE,
+          expected_signer: envelope?.signer ?? SIGNER,
+          signer_public_key_hex: envelope?.publicKeyHex ?? PUBLIC_KEY,
           provider_binding_ref: "model",
           credential_class: "managed-openai",
           placement_ref: "do",
@@ -1597,6 +1690,106 @@ describe("real WorkflowInstance hibernation", () => {
   // activity, so a turn that failed without a correlated terminal event would
   // no longer merely block the next turn — it would leave the composer disabled
   // with a "thinking" indicator that never clears.
+  it("records the durable answer of a turn that ran a tool", async () => {
+    // The suite could not drive a tool-USING turn at all before this: its one
+    // hard-coded envelope grants no workspace capabilities, so every tool was
+    // refused before dispatch. That blind spot is why the durable-assistant
+    // regression reached production — the settle path behaves differently once
+    // a turn has tool rounds, and nothing exercised that.
+    //
+    // This pins the end-to-end invariant (a settled tool turn records what it
+    // answered). The narrower defect — an empty `assistant_text` winning over
+    // streamed text — is pinned by the `selectAssistantText` unit tests, which
+    // fail against the original `??`.
+    // A handle is governed only when a binding resolves it to a declared
+    // resource — the package's `file store project` needs both.
+    const envelope = await mintSignedEnvelope(
+      ["workspace.read", "workspace.write", "command.run"],
+      {
+        bindings: { project: "file_store:project", command: "command:bash" },
+        resources: {
+          // Unrestricted readers: the turn's context reaches the provider, and
+          // the checker denies egress to a provider not cleared for everything
+          // the turn read.
+          "file_store:project": { reader: [], writer: [] },
+          "command:bash": { reader: [], writer: [] },
+        },
+      },
+    );
+    let attempt = 0;
+    const providerFetch = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "call-0",
+                name: "write",
+                arguments: JSON.stringify({ path: "note.txt", content: "hi" }),
+              },
+            })}`,
+            "",
+            'data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"input_tokens_details":{"cached_tokens":0},"output_tokens":2}}}',
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        [
+          'data: {"type":"response.output_text.delta","delta":"the streamed answer"}',
+          "",
+          'data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":3}}}',
+          "",
+        ].join("\n"),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    const sessionId = "session-tool-answer-survives";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId, true, undefined, envelope);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", sequence: 0 });
+
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-tool-answer",
+      text: "write the note",
+    }));
+    let terminal: Record<string, unknown> | undefined;
+    for (let index = 0; index < 160; index += 1) {
+      const message = await nextMessage(socket);
+      if (message.type === "turn_terminal" || message.type === "error") {
+        terminal = message;
+        break;
+      }
+    }
+    expect(terminal).toMatchObject({ type: "turn_terminal", status: 200 });
+
+    // The durable transcript is what survives a reload, and it is what `settle()`
+    // restores over the streamed copy — so this, not the live view, is the test.
+    const state = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    const projection = await state.json() as {
+      transcript: { type: string; text: string }[];
+    };
+    expect(projection.transcript).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "assistant", text: "the streamed answer" }),
+      ]),
+    );
+
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
   it("settles a failed turn's client and leaves no active turn behind", async () => {
     // A provider that never succeeds, so the turn reaches its terminal state
     // through the failure path rather than a clean settle.

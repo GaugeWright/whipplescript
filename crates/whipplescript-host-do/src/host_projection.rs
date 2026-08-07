@@ -299,17 +299,21 @@ fn project_output(
                 text,
                 tool_calls: calls,
             } => {
-                if calls.is_empty() {
+                // Text and tool calls are not alternatives. Providers routinely
+                // narrate a step and call a tool in the same message, and
+                // treating `calls` as a discriminator silently dropped that
+                // narration: the observation reported no answer for a turn that
+                // had produced one. Take whichever the message actually carries.
+                if !text.is_empty() {
                     assistant_text.clone_from(text);
-                } else {
-                    tool_calls.extend(calls.iter().map(|call| HostedToolCallObservation {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.arguments.clone(),
-                        result: None,
-                        ok: None,
-                    }));
                 }
+                tool_calls.extend(calls.iter().map(|call| HostedToolCallObservation {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    result: None,
+                    ok: None,
+                }));
             }
             ChatMessage::ToolResults(results) => {
                 for result in results {
@@ -477,6 +481,42 @@ mod tests {
                 output_tokens: 2,
             }
         );
+    }
+
+    #[test]
+    fn a_message_that_narrates_and_calls_a_tool_keeps_its_narration() {
+        // Providers routinely say something and call a tool in the same
+        // message. Treating `tool_calls` as a discriminator dropped the text, so
+        // the observation reported no answer for a turn that had produced one —
+        // and the shell then had nothing authoritative to settle with.
+        let events = vec![EventView {
+            event_id: "event-1".to_owned(),
+            sequence: 1,
+            event_type: "agent.turn.brokered.transcript".to_owned(),
+            payload_json: json!({
+                "effect_id": "turn-1",
+                "messages": [
+                    {"role": "user", "text": "check the notes"},
+                    {
+                        "role": "assistant",
+                        "text": "Reading the notes now.",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "name": "read",
+                            "arguments": {"path": "notes.md"}
+                        }]
+                    }
+                ]
+            })
+            .to_string(),
+            source: "runtime".to_owned(),
+            occurred_at: "2026-08-07T00:00:00Z".to_owned(),
+        }];
+        let projected = project_output(&events, "turn-1", "label:test")
+            .expect("output projection")
+            .expect("output");
+        assert_eq!(projected.assistant_text, "Reading the notes now.");
+        assert_eq!(projected.tool_calls.len(), 1, "the call is still observed");
     }
 
     #[test]

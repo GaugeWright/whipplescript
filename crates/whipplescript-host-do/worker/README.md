@@ -78,7 +78,41 @@ reference:
    `/internal/local-model-egress` route. The Worker retains only the hop token
    and broker sentinel; GaugeDesk refreshes and injects the short-lived access
    token and account id locally.
-4. **Deploy**: `npm run deploy` (`wrangler deploy`).
+4. **Deploy**: `npm run deploy` (`wrangler deploy`) — but read the next section
+   first. That command deploys `whipplescript-runtime`, which is **not** the
+   worker serving public embed sessions.
+
+## Which worker serves what
+
+`src/index.ts` is deployed under several names. `wrangler.toml` is only one of
+them, and it is not the one behind `gaugewright.com`'s public panels.
+
+| Config | Worker | Serves |
+|---|---|---|
+| `wrangler.toml` | `whipplescript-runtime` | the GaugeDesk hosted harness (`GAUGEDESK_DO_HOST_*`) |
+| `wrangler.public.toml` | `whipplescript-public-runtime` | **public embed sessions** — the panels on `gaugewright.com` |
+| `wrangler.private-production.toml` | `whipplescript-private-home-runtime` | the managed private Home |
+| `wrangler.private-staging.toml` | `whipplescript-private-home-runtime-staging` | private Home staging |
+| `wrangler.edge-staging.toml` | `whipplescript-runtime-edge-staging` | edge staging |
+
+The public one is selected by the cloud edge, not by anything in this repo:
+`gaugewright-cloud`'s `edge-runtime/wrangler.toml` binds
+`SESSIONS → class WorkflowInstance, script_name = "whipplescript-public-runtime"`.
+
+**This is a trap, and it has cost real time.** `npm run deploy` succeeds, reports
+a new version, and changes nothing a visitor sees, because the visitor's session
+is served by a different script. A live-turn feature was chased for hours past a
+deploy that had landed on the wrong worker. To ship a change to the public
+panels:
+
+```sh
+npm run deploy:public
+```
+
+Roll back with `npx wrangler versions deploy <version-id>@100% -c wrangler.public.toml`;
+list candidates with `npx wrangler versions list -c wrangler.public.toml`. Take
+the current version id *before* deploying — that is the rollback target, and a
+Durable Object swap mid-session is not something to improvise a recovery for.
 
 ## Private Home runtime
 

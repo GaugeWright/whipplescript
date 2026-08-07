@@ -245,6 +245,7 @@ const INSTANCE_DUE_KEY = "instance-next-due-unix-ms";
 
 // The DO schema (36 tables) as a bundled text module (wrangler.toml `rules`).
 import DO_SCHEMA from "../do_schema.sql";
+import { selectAssistantText } from "./assistant-text";
 
 // Builtin capability seeds, mirroring the native migration-0001 builtin rows
 // for the two effect families the DO drives today (schema.coerce + agent.tell).
@@ -2305,8 +2306,9 @@ export class WorkflowInstance implements DurableObject {
     const cursorKey = `public-transcript-delta-cursor:${commandId}`;
     const after = (await this.ctx.storage.get<number>(cursorKey)) ?? 0;
     const deltas = this.hostTurnDeltas(instanceId, commandId, after);
-    if (deltas.length === 0 && authoritativeText === undefined) return;
-    const text = authoritativeText ?? deltas.map((event) => event.delta).join("");
+    const streamed = deltas.map((event) => event.delta).join("");
+    const text = selectAssistantText(authoritativeText, streamed);
+    if (!text) return;
     const transcript =
       (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
         "public-transcript",
@@ -2582,11 +2584,13 @@ export class WorkflowInstance implements DurableObject {
         { status: 502 },
       );
     }
-    if (turnSucceeded && typeof turnBody.output?.assistant_text === "string") {
+    if (turnSucceeded) {
       await this.projectPublicAssistantSegment(
         session.instance_ref,
         commandId,
-        turnBody.output.assistant_text,
+        typeof turnBody.output?.assistant_text === "string"
+          ? turnBody.output.assistant_text
+          : undefined,
       );
     }
     traceBoundary("settlement_start");
@@ -2721,13 +2725,11 @@ export class WorkflowInstance implements DurableObject {
           ok?: unknown;
         }[];
       } | undefined;
-      if (typeof output?.assistant_text === "string") {
-        await this.projectPublicAssistantSegment(
-          session.instance_ref,
-          commandId,
-          output.assistant_text,
-        );
-      }
+      await this.projectPublicAssistantSegment(
+        session.instance_ref,
+        commandId,
+        typeof output?.assistant_text === "string" ? output.assistant_text : undefined,
+      );
       for (const tool of output?.tool_calls ?? []) {
         if (typeof tool.call_id !== "string" || typeof tool.name !== "string") continue;
         this.appendPublicEvent({
