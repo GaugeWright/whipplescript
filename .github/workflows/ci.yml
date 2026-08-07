@@ -71,6 +71,22 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Single-threaded, so the last line printed IS the test that was
+      # running when the runner died — under the parallel workspace run the
+      # last printed line only bounds a region. Resource exhaustion and
+      # concurrency cancellation are both already ruled out by measurement:
+      # the sampler showed 12.5GB of 16GB free, 85GB of disk free, load 4.6 on
+      # 4 cpus, and the mirror's syncs are hours apart with trunk cancellation
+      # already disabled. The suite also passes locally in every configuration
+      # tried, including 20 runs pinned to 2 cores with a canary process in the
+      # test binary's own process group to catch a stray group signal.
+      #
+      # If the runner dies here, the next line names the test. If it survives
+      # here and dies in the workspace run below, the trigger is parallelism
+      # rather than any single test. Either answer ends the guessing.
+      - name: Pinpoint the kernel test the runner dies on
+        run: cargo test -p whipplescript-kernel --lib -- --test-threads=1 --nocapture
+
       - name: Green bar
         # The hosted runtime contracts are the `hosted-runtime-contracts` job
         # below, which runs the same four steps with the wasm-bindgen/wrangler/
