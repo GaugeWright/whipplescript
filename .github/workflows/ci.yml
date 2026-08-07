@@ -76,9 +76,34 @@ jobs:
         # below, which runs the same four steps with the wasm-bindgen/wrangler/
         # Node toolchain they need. This job installs none of it, so without the
         # opt-out the green bar fails on missing tooling every run.
+        #
+        # The sampler is here because this job has been dying mid-test-run with
+        # "The runner has received a shutdown signal" and nothing else: no
+        # failing test, no panic, no non-zero exit. That message means the agent
+        # was terminated, which on a hosted runner is normally resource
+        # exhaustion. The suite has not been reproducible off the runner — it
+        # passes on 2 pinned cores, under fsync load, and with a canary process
+        # in the test's own process group to catch a stray group signal — so the
+        # next step is to watch the runner rather than guess again. Remove this
+        # once the log shows what is exhausted.
         env:
           WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
-        run: scripts/check.sh
+        run: |
+          echo "runner: $(nproc) cpus"
+          free -m || true
+          df -h / || true
+          ( while sleep 10; do
+              printf '[sampler] %s mem_avail=%sMB swap_free=%sMB disk_avail=%s load=%s procs=%s\n' \
+                "$(date -u +%H:%M:%S)" \
+                "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" \
+                "$(awk '/SwapFree/{print int($2/1024)}' /proc/meminfo)" \
+                "$(df -h --output=avail / | tail -1 | tr -d ' ')" \
+                "$(cut -d' ' -f1 /proc/loadavg)" \
+                "$(ps -e --no-headers | wc -l)"
+            done ) &
+          sampler=$!
+          trap 'kill "$sampler" 2>/dev/null || true' EXIT
+          scripts/check.sh
 
   # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
   # sustain, and it is the one gate that touches Worker deploy configuration.
