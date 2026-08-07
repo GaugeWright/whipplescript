@@ -62,7 +62,7 @@ jobs:
   # Mirror only: it needs ten-plus minutes and `-src` cannot give it that.
   green-bar:
     if: ${{ github.repository == 'GaugeWright/whipplescript' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -144,7 +144,7 @@ jobs:
   # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
   # sustain, and it is the one gate that touches Worker deploy configuration.
   hosted-runtime-contracts:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     defaults:
       run:
         working-directory: crates/whipplescript-host-do/worker
@@ -175,7 +175,7 @@ jobs:
   # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -195,7 +195,7 @@ jobs:
   # Mirror only — Nix plus TLC.
   tla-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -208,7 +208,7 @@ jobs:
   # Mirror only — the end-to-end suite.
   e2e:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -222,7 +222,7 @@ jobs:
   # Mirror only — schema conformance.
   report-schemas:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -244,7 +244,7 @@ jobs:
   # spec/release-checklist.md already describes it.
   release-readiness:
     if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
