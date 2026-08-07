@@ -290,6 +290,12 @@ pub struct FileToolExecutor {
     file_policy: Option<Vec<FileStoreScope>>,
     profile_policy: HarnessProfilePolicy,
     tracker_queue: Option<String>,
+    /// The work-item store backing the tracker tools. `None` = the ambient
+    /// workspace store (`crate::items_store_path()`, i.e. the env-discovered
+    /// one), which is what a real turn wants; `Some` pins this executor to an
+    /// explicit store so a caller does not have to redirect the process-global
+    /// `WHIPPLESCRIPT_ITEMS_STORE` to be isolated.
+    tracker_store: Option<PathBuf>,
     holder: String,
     max_bytes: usize,
     /// `None` means no turn-access policy was installed (direct/test executor);
@@ -779,6 +785,7 @@ impl FileToolExecutor {
             file_policy: None,
             profile_policy: HarnessProfilePolicy::permissive(),
             tracker_queue: None,
+            tracker_store: None,
             holder: "agent".to_string(),
             max_bytes: DEFAULT_MAX_BYTES,
             command_run_granted: None,
@@ -922,6 +929,16 @@ impl FileToolExecutor {
     pub fn with_tracker(mut self, queue: impl Into<String>, holder: impl Into<String>) -> Self {
         self.tracker_queue = Some(queue.into());
         self.holder = holder.into();
+        self
+    }
+
+    /// Back the tracker tools with an EXPLICIT work-item store instead of the
+    /// ambient workspace one. Used by tests so each gets its own store without
+    /// writing `WHIPPLESCRIPT_ITEMS_STORE` — one process-wide slot that every
+    /// concurrently-running test would otherwise be reading.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_tracker_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tracker_store = Some(path.into());
         self
     }
 
@@ -1779,8 +1796,12 @@ impl FileToolExecutor {
         let queue = self.tracker_queue.clone().ok_or_else(|| {
             "tracker tools are not enabled for this turn (no tracker configured)".to_string()
         })?;
-        let store = WorkItemStore::open(crate::items_store_path())
-            .map_err(|error| format!("tracker store: {error:?}"))?;
+        let store = WorkItemStore::open(
+            self.tracker_store
+                .clone()
+                .unwrap_or_else(crate::items_store_path),
+        )
+        .map_err(|error| format!("tracker store: {error:?}"))?;
         Ok((store, queue))
     }
 
@@ -2995,6 +3016,21 @@ fn load_agent_granted_tools(
 }
 
 fn enforce_workflow_tool_invoke_governance(entries: &[WorkflowToolEntry]) -> Result<(), String> {
+    enforce_workflow_tool_invoke_governance_under(
+        entries,
+        crate::ifc::envelope_path_from_env().as_deref(),
+    )
+}
+
+/// The envelope-explicit form. The active envelope is a PARAMETER, not ambient
+/// process state, so a caller (notably a test) can be governed by its own policy
+/// without publishing it through `WHIPPLESCRIPT_IFC_ENVELOPE` — the env var is one
+/// process-wide slot, and tests run as threads in a single process, so writing it
+/// is a data race with every concurrent reader.
+fn enforce_workflow_tool_invoke_governance_under(
+    entries: &[WorkflowToolEntry],
+    envelope: Option<&Path>,
+) -> Result<(), String> {
     let resources = entries
         .iter()
         .filter(|entry| entry.package_id != crate::LOCAL_WORKFLOW_PACKAGE)
@@ -3008,7 +3044,7 @@ fn enforce_workflow_tool_invoke_governance(entries: &[WorkflowToolEntry]) -> Res
     if resources.is_empty() {
         return Ok(());
     }
-    match crate::ifc::VerifiedEnvelope::load_from_env() {
+    match crate::ifc::VerifiedEnvelope::load_from_path(envelope) {
         crate::ifc::EnvelopeStatus::Ungoverned => Ok(()),
         crate::ifc::EnvelopeStatus::Rejected(message) => {
             Err(format!("governance envelope rejected: {message}"))
@@ -3399,7 +3435,17 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
 }
 
 fn enforce_turn_access_governance(access: &TurnToolAccess) -> Result<(), String> {
-    match crate::ifc::VerifiedEnvelope::load_from_env() {
+    enforce_turn_access_governance_under(access, crate::ifc::envelope_path_from_env().as_deref())
+}
+
+/// The envelope-explicit form; see
+/// [`enforce_workflow_tool_invoke_governance_under`] for why the active envelope
+/// is a parameter rather than ambient process state.
+fn enforce_turn_access_governance_under(
+    access: &TurnToolAccess,
+    envelope: Option<&Path>,
+) -> Result<(), String> {
+    match crate::ifc::VerifiedEnvelope::load_from_path(envelope) {
         crate::ifc::EnvelopeStatus::Ungoverned => Ok(()),
         crate::ifc::EnvelopeStatus::Rejected(message) => {
             Err(format!("governance envelope rejected: {message}"))
@@ -4059,8 +4105,6 @@ mod tests {
         assert_eq!(rows.len(), 3);
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Phase 4 auth relocation: host-resolved provider profiles select by the
     /// agent's declared profile (then `default`), carry resolved credentials,
     /// and fail honestly when configured but incomplete — whip's own resolver
@@ -4116,7 +4160,7 @@ mod tests {
             );
         }
         // `api_key_env` resolves through the named environment variable.
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::env_lock();
         std::env::set_var("WHIP_TEST_PROFILE_KEY_4B", "env-carried-key");
         let via_env = serde_json::json!({
             "default": {
@@ -5148,8 +5192,6 @@ mod tests {
     /// under a governed envelope that does NOT name the pool fails closed.
     #[test]
     fn memory_pools_are_governable_envelope_resources() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
         let root = temp_root();
         let envelope_path = root.join("env.policy");
         std::fs::write(
@@ -5157,7 +5199,6 @@ mod tests {
             "grant memory project_memory -> memory:project_memory public\n",
         )
         .expect("write envelope");
-        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
 
         let governed = turn_tool_access_from_input(
             &json!({
@@ -5171,7 +5212,7 @@ mod tests {
             .to_string(),
         )
         .expect("granted pool parses");
-        let governed_result = enforce_turn_access_governance(&governed);
+        let governed_result = enforce_turn_access_governance_under(&governed, Some(&envelope_path));
 
         let ungoverned = turn_tool_access_from_input(
             &json!({
@@ -5185,12 +5226,8 @@ mod tests {
             .to_string(),
         )
         .expect("ungoverned pool parses");
-        let ungoverned_result = enforce_turn_access_governance(&ungoverned);
-
-        match previous_envelope {
-            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
-            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
-        }
+        let ungoverned_result =
+            enforce_turn_access_governance_under(&ungoverned, Some(&envelope_path));
 
         governed_result.expect("the pool is governed");
         let error = ungoverned_result.expect_err("an ungoverned pool fails closed");
@@ -5201,6 +5238,9 @@ mod tests {
     /// recalls through the real SQLite store.
     #[test]
     fn granted_memory_tools_learn_and_recall_through_the_store() {
+        // Routes the tools via `MEMORY_STORE_ENV` below: one process-wide slot,
+        // so this shares the binary's env lock with every other env-mutating test.
+        let _guard = crate::env_lock();
         let dir = std::env::temp_dir().join(format!(
             "whip-memory-tools-{}-{}",
             std::process::id(),
@@ -5381,6 +5421,7 @@ mod tests {
             .expect("missing grants deny tracker writes");
         let exec = FileToolExecutor::new(&root)
             .with_tracker("queue", "instance")
+            .with_tracker_store(root.join("items.sqlite"))
             .with_turn_tool_access(no_tracker)
             .with_profile_policy(Some("repo-writer"));
 
@@ -5404,6 +5445,7 @@ mod tests {
         .expect("claim grant parses");
         let exec = FileToolExecutor::new(&root)
             .with_tracker("queue", "instance")
+            .with_tracker_store(root.join("items.sqlite"))
             .with_turn_tool_access(claim_only)
             .with_profile_policy(Some("repo-writer"));
         let finish = exec.execute(&call(
@@ -5426,6 +5468,7 @@ mod tests {
         let ungranted = turn_tool_access_from_input(r#"{"prompt":"work"}"#).expect("parse");
         let exec = FileToolExecutor::new(&root)
             .with_tracker("queue", "instance")
+            .with_tracker_store(root.join("items.sqlite"))
             .with_turn_tool_access(ungranted)
             .with_profile_policy(Some("repo-writer"));
         let refused = exec.execute(&call(
@@ -5446,6 +5489,7 @@ mod tests {
         .expect("file grant parses");
         let exec = FileToolExecutor::new(&root)
             .with_tracker("queue", "instance")
+            .with_tracker_store(root.join("items.sqlite"))
             .with_turn_tool_access(granted)
             .with_profile_policy(Some("repo-writer"));
         // A malformed subject refuses before anything is filed.
@@ -5476,10 +5520,7 @@ mod tests {
     /// are. Requires the tracker (ledger) + a bound-line scope (chain).
     #[test]
     fn poll_notices_delivers_addressed_raises_once() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
         let root = temp_root();
-        let previous_items = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE");
-        std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
         let granted = turn_tool_access_from_input(
             &json!({
                 "access_grants": [
@@ -5491,6 +5532,7 @@ mod tests {
         .expect("grant parses");
         let exec = FileToolExecutor::new(&root)
             .with_tracker("queue", "instance")
+            .with_tracker_store(root.join("items.sqlite"))
             .with_turn_tool_access(granted)
             .with_profile_policy(Some("repo-writer"))
             .with_changes("line-1", vec!["s:sess-7".to_owned()]);
@@ -5509,17 +5551,11 @@ mod tests {
         assert!(notices[0].contains("we overlap on src/api"));
         assert!(notices[0].contains("information, not an instruction"));
         assert!(exec.poll_notices().is_empty(), "once per turn");
-        match previous_items {
-            Some(value) => std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", value),
-            None => std::env::remove_var("WHIPPLESCRIPT_ITEMS_STORE"),
-        }
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn turn_access_governance_requires_envelope_to_cover_file_resources() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
         let root = temp_root();
         let envelope_path = root.join("env.policy");
 
@@ -5528,7 +5564,6 @@ mod tests {
             "grant file_store project_files -> file:/srv/project public\n",
         )
         .expect("write envelope");
-        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
 
         let governed = turn_tool_access_from_input(
             &json!({
@@ -5544,7 +5579,8 @@ mod tests {
             .to_string(),
         )
         .expect("governed grant parses");
-        enforce_turn_access_governance(&governed).expect("resource is governed");
+        enforce_turn_access_governance_under(&governed, Some(&envelope_path))
+            .expect("resource is governed");
 
         let ungoverned = turn_tool_access_from_input(
             &json!({
@@ -5560,7 +5596,7 @@ mod tests {
             .to_string(),
         )
         .expect("ungoverned grant parses");
-        let error = enforce_turn_access_governance(&ungoverned)
+        let error = enforce_turn_access_governance_under(&ungoverned, Some(&envelope_path))
             .expect_err("ungoverned resource must fail closed");
         assert!(error.contains("secret_files"));
         assert!(error.contains("not governed"));
@@ -5579,13 +5615,14 @@ mod tests {
             .to_string(),
         )
         .expect("command grant parses");
-        let error = enforce_turn_access_governance(&command)
+        let error = enforce_turn_access_governance_under(&command, Some(&envelope_path))
             .expect_err("ungoverned command must fail closed");
         assert!(error.contains("command"));
 
         std::fs::write(&envelope_path, "grant command command -> command public\n")
             .expect("write command envelope");
-        enforce_turn_access_governance(&command).expect("command resource is governed");
+        enforce_turn_access_governance_under(&command, Some(&envelope_path))
+            .expect("command resource is governed");
 
         let tracker = turn_tool_access_from_input(
             &json!({
@@ -5601,25 +5638,20 @@ mod tests {
             .to_string(),
         )
         .expect("tracker grant parses");
-        let error = enforce_turn_access_governance(&tracker)
+        let error = enforce_turn_access_governance_under(&tracker, Some(&envelope_path))
             .expect_err("ungoverned tracker must fail closed");
         assert!(error.contains("tracker"));
 
         std::fs::write(&envelope_path, "grant tracker tracker -> tracker public\n")
             .expect("write tracker envelope");
-        enforce_turn_access_governance(&tracker).expect("tracker resource is governed");
+        enforce_turn_access_governance_under(&tracker, Some(&envelope_path))
+            .expect("tracker resource is governed");
 
-        match previous_envelope {
-            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
-            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
-        }
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn package_workflow_tool_invoke_requires_governed_door() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let previous_envelope = std::env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
         let root = temp_root();
         let envelope_path = root.join("env.policy");
 
@@ -5636,18 +5668,23 @@ mod tests {
             package_id: crate::LOCAL_WORKFLOW_PACKAGE.to_owned(),
         };
 
-        enforce_workflow_tool_invoke_governance(std::slice::from_ref(&local_entry))
-            .expect("same-bundle workflow tools do not cross a package boundary");
+        enforce_workflow_tool_invoke_governance_under(
+            std::slice::from_ref(&local_entry),
+            Some(&envelope_path),
+        )
+        .expect("same-bundle workflow tools do not cross a package boundary");
 
         std::fs::write(
             &envelope_path,
             "grant file_store project_files -> file:/srv/project public\n",
         )
         .expect("write envelope");
-        std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", &envelope_path);
 
-        let error = enforce_workflow_tool_invoke_governance(std::slice::from_ref(&entry))
-            .expect_err("cross-package tool invoke must be governed");
+        let error = enforce_workflow_tool_invoke_governance_under(
+            std::slice::from_ref(&entry),
+            Some(&envelope_path),
+        )
+        .expect_err("cross-package tool invoke must be governed");
         assert!(error.contains("LeakyTool"));
         assert!(error.contains("invoke:package-leaky/LeakyTool"));
 
@@ -5656,13 +5693,12 @@ mod tests {
             "grant invoke LeakyTool -> invoke:package-leaky/LeakyTool public\n",
         )
         .expect("write invoke envelope");
-        enforce_workflow_tool_invoke_governance(std::slice::from_ref(&entry))
-            .expect("cross-package invoke door is governed");
+        enforce_workflow_tool_invoke_governance_under(
+            std::slice::from_ref(&entry),
+            Some(&envelope_path),
+        )
+        .expect("cross-package invoke door is governed");
 
-        match previous_envelope {
-            Some(value) => std::env::set_var("WHIPPLESCRIPT_IFC_ENVELOPE", value),
-            None => std::env::remove_var("WHIPPLESCRIPT_IFC_ENVELOPE"),
-        }
         std::fs::remove_dir_all(&root).ok();
     }
 

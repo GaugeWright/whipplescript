@@ -210,10 +210,35 @@ fn run() -> Result<(), String> {
             if let Some(client) =
                 whipplescript_custodian::openbao::Client::from_env().map_err(|e| e.to_string())?
             {
-                client
+                let lookup = client
                     .token_lookup_self()
                     .map_err(|e| format!("openbao token lookup failed ({}): {e}", client.addr()))?;
-                eprintln!("openbao transit connected (r3)");
+                let posture = whipplescript_custodian::openbao::TokenPosture::from_lookup(&lookup);
+                eprintln!(
+                    "openbao transit connected (r3): {} lease {}s, renewable={}",
+                    client.addr(),
+                    posture.ttl_secs,
+                    posture.renewable
+                );
+                // A renewable token outlives its lease only if something
+                // renews it. That belongs here rather than in the custody
+                // path: renewal is per-connection and time-driven, and a
+                // custodian that only renews when someone happens to sign
+                // has already expired by the time it matters.
+                let client = Arc::new(client);
+                match whipplescript_custodian::openbao::spawn_token_renewal(
+                    Arc::clone(&client),
+                    posture,
+                ) {
+                    // The handle is deliberately dropped: the thread runs for
+                    // the life of the process and there is nothing to join.
+                    Some(_handle) => eprintln!("openbao token renewal: started"),
+                    None => eprintln!(
+                        "openbao token renewal: nothing to renew (renewable={}, lease={}s) — if \
+                         this token was meant to expire, r3 stops working when it does",
+                        posture.renewable, posture.ttl_secs
+                    ),
+                }
                 custodian = custodian.with_openbao(client);
             }
             let custodian = Arc::new(custodian);

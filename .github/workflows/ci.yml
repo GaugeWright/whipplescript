@@ -30,7 +30,12 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded runs on a branch are wasted minutes, so they still cancel.
+  # Trunk is different: when a burst of merges cancels a run, the run is
+  # recorded as `failure` with no failing job, and that red never meant
+  # anything. A trunk verdict you have to click through to trust is worth
+  # less than the minutes cancelling it saves.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # The per-change gate runs the repository's own green bar, so a local pass and

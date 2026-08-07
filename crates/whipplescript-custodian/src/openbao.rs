@@ -10,6 +10,9 @@
 //! back to `VAULT_ADDR`) and `BAO_TOKEN` (falling back to `VAULT_TOKEN`) —
 //! the names the `bao`/`vault` CLIs already use, so one shell serves both.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use zeroize::Zeroizing;
@@ -19,6 +22,11 @@ use whipplescript_custody::CredentialKind;
 /// Per-request timeout. Transit calls are small; anything slower than this is
 /// an outage, not a slow sign.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Renew at half the remaining lease, so a single failed attempt still leaves
+/// as much time again to retry in.
+const MIN_RENEW_INTERVAL_SECS: u64 = 5;
+const MAX_RENEW_INTERVAL_SECS: u64 = 3600;
 
 pub struct Client {
     /// Base address, no trailing slash.
@@ -142,10 +150,12 @@ impl Client {
     }
 
     /// `POST /v1/auth/token/renew-self` — keeps a renewable token alive
-    /// across a long-running daemon.
-    pub fn token_renew_self(&self) -> Result<(), String> {
-        self.post_json("/v1/auth/token/renew-self", &serde_json::json!({}))?;
-        Ok(())
+    /// across a long-running daemon. Returns the *new* posture so the caller
+    /// can time the next renewal off the lease OpenBao actually granted
+    /// rather than the one it asked for; OpenBao is free to grant less.
+    pub fn token_renew_self(&self) -> Result<TokenPosture, String> {
+        let value = self.post_json("/v1/auth/token/renew-self", &serde_json::json!({}))?;
+        Ok(TokenPosture::from_renew(&value))
     }
 
     // -- plumbing -----------------------------------------------------------
@@ -166,6 +176,129 @@ impl Client {
         read_response(request.call())
     }
 }
+
+// -- token renewal ----------------------------------------------------------
+
+/// What OpenBao says about the daemon's own token: whether the lease can be
+/// extended, and how much of it is left. Both the lookup and the renew reply
+/// carry this, under different field names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenPosture {
+    pub renewable: bool,
+    pub ttl_secs: u64,
+}
+
+impl TokenPosture {
+    /// Read the posture out of a `lookup-self` reply (`data.renewable`,
+    /// `data.ttl`). A reply missing either field reads as *not renewable*,
+    /// which costs an operator a renewal thread they can see is absent —
+    /// the alternative is a thread renewing a token on a guess.
+    pub fn from_lookup(value: &serde_json::Value) -> Self {
+        Self::read(&value["data"], "ttl")
+    }
+
+    /// Read the posture out of a `renew-self` reply, which reports the fresh
+    /// lease under `auth.lease_duration` rather than `data.ttl`.
+    pub fn from_renew(value: &serde_json::Value) -> Self {
+        Self::read(&value["auth"], "lease_duration")
+    }
+
+    fn read(section: &serde_json::Value, ttl_field: &str) -> Self {
+        Self {
+            renewable: section["renewable"].as_bool().unwrap_or(false),
+            ttl_secs: section[ttl_field].as_u64().unwrap_or(0),
+        }
+    }
+}
+
+/// How long to wait before the next renewal attempt, given the lease left.
+/// Half the remaining lease, floored so a short-TTL token cannot spin and
+/// capped so a multi-day lease still checks in daily.
+fn renew_interval(remaining_ttl_secs: u64) -> Duration {
+    Duration::from_secs(
+        (remaining_ttl_secs / 2).clamp(MIN_RENEW_INTERVAL_SECS, MAX_RENEW_INTERVAL_SECS),
+    )
+}
+
+/// Keep the daemon's token alive for as long as the process runs.
+///
+/// `None` when there is nothing to renew — a non-renewable token, or one with
+/// no expiry at all (a dev root token). That is not a failure, but the caller
+/// should say so out loud: an operator who provisioned a renewable token and
+/// gets no renewal thread needs to see why.
+///
+/// The thread is detached in practice; the handle is returned so a test can
+/// hold one. Failures go to stderr, the daemon's one status channel, and are
+/// logged per attempt rather than only at the end — a token that renews again
+/// after a blip should leave a trace that the blip happened.
+pub fn spawn_token_renewal(
+    client: Arc<Client>,
+    posture: TokenPosture,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !posture.renewable || posture.ttl_secs == 0 {
+        return None;
+    }
+    Some(std::thread::spawn(move || renewal_loop(&client, posture)))
+}
+
+fn renewal_loop(client: &Client, initial: TokenPosture) {
+    let mut posture = initial;
+    let mut renewed_at = Instant::now();
+    let mut failures: u32 = 0;
+    loop {
+        let remaining = posture
+            .ttl_secs
+            .saturating_sub(renewed_at.elapsed().as_secs());
+        if remaining == 0 {
+            eprintln!(
+                "openbao token renewal: the {}s lease on {} has run out after {failures} \
+                 consecutive failures — every r3 credential operation fails from here until this \
+                 daemon restarts with a live token",
+                posture.ttl_secs,
+                client.addr()
+            );
+            return;
+        }
+        std::thread::sleep(renew_interval(remaining));
+        match client.token_renew_self() {
+            Ok(next) => {
+                if failures > 0 {
+                    eprintln!(
+                        "openbao token renewal: recovered after {failures} failed attempts \
+                         (lease now {}s)",
+                        next.ttl_secs
+                    );
+                    failures = 0;
+                }
+                // OpenBao can hand back a lease it will not extend again —
+                // an explicit max TTL reached, or a token whose role changed.
+                // Renewing on a loop past that point is noise; say so once.
+                if !next.renewable || next.ttl_secs == 0 {
+                    eprintln!(
+                        "openbao token renewal: token is no longer renewable (renewable={}, \
+                         lease={}s) — stopping; r3 stops working when this lease ends",
+                        next.renewable, next.ttl_secs
+                    );
+                    return;
+                }
+                posture = next;
+                renewed_at = Instant::now();
+            }
+            Err(detail) => {
+                failures += 1;
+                let left = posture
+                    .ttl_secs
+                    .saturating_sub(renewed_at.elapsed().as_secs());
+                eprintln!(
+                    "openbao token renewal FAILED (attempt {failures}, ~{left}s of lease left): \
+                     {detail}"
+                );
+            }
+        }
+    }
+}
+
+// -- response plumbing ------------------------------------------------------
 
 fn read_response(result: Result<ureq::Response, ureq::Error>) -> Result<serde_json::Value, String> {
     match result {
@@ -205,4 +338,201 @@ fn parse_vault_encoded(s: &str) -> Result<Vec<u8>, String> {
         .ok_or_else(|| format!("malformed vault-encoded value: {s:?}"))?;
     B64.decode(b64)
         .map_err(|e| format!("bad base64 in vault-encoded value: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Put a synthesized HTTP reply through `read_response`, in the same two
+    /// shapes ureq hands it one: `Ok` for a 2xx, `Error::Status` otherwise.
+    fn read(status: u16, body: &str) -> Result<serde_json::Value, String> {
+        let response = ureq::Response::new(status, "test", body).expect("build response");
+        read_response(if (200..300).contains(&status) {
+            Ok(response)
+        } else {
+            Err(ureq::Error::Status(status, response))
+        })
+    }
+
+    // -- parse_vault_encoded -------------------------------------------------
+
+    #[test]
+    fn parses_a_vault_encoded_value() {
+        // The HMAC an OpenBao dev server actually returns for `hello`.
+        let raw = parse_vault_encoded("vault:v1:aGVsbG8gd29ybGQ=").expect("parse");
+        assert_eq!(raw, b"hello world");
+    }
+
+    #[test]
+    fn parses_any_key_version_even_though_verify_pins_v1() {
+        // The parser is version-agnostic on purpose: it is `transit_verify`
+        // that pins `vault:v1:` on the way *out* (r3 v1 does not do rotation),
+        // not this function on the way in. A v2 signature parses; what it
+        // cannot do is round-trip through verify.
+        assert_eq!(
+            parse_vault_encoded("vault:v2:aGVsbG8=").expect("parse"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn empty_payload_parses_to_empty_bytes() {
+        assert!(parse_vault_encoded("vault:v1:").expect("parse").is_empty());
+    }
+
+    #[test]
+    fn rejects_a_missing_vault_prefix() {
+        // Bare base64 is the shape a caller gets from a non-transit endpoint,
+        // so it must not decode by accident.
+        let err = parse_vault_encoded("aGVsbG8=").expect_err("must reject");
+        assert!(err.contains("not a vault-encoded value"), "{err}");
+        let err = parse_vault_encoded("v1:aGVsbG8=").expect_err("must reject");
+        assert!(err.contains("not a vault-encoded value"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_missing_version_separator() {
+        let err = parse_vault_encoded("vault:v1aGVsbG8=").expect_err("must reject");
+        assert!(err.contains("malformed vault-encoded value"), "{err}");
+    }
+
+    #[test]
+    fn rejects_bad_base64() {
+        let err = parse_vault_encoded("vault:v1:not base64!").expect_err("must reject");
+        assert!(err.contains("bad base64"), "{err}");
+    }
+
+    // -- read_response -------------------------------------------------------
+
+    #[test]
+    fn reads_a_json_body() {
+        let value = read(200, r#"{"data":{"valid":true}}"#).expect("read");
+        assert_eq!(value["data"]["valid"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn an_empty_2xx_body_is_null_not_an_error() {
+        // 204 is what `renew-self` style endpoints return when they have
+        // nothing to say; it is a success, not a parse failure.
+        assert_eq!(read(204, "").expect("read"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_non_json_2xx_body_is_an_error() {
+        let err = read(200, "<html>proxy</html>").expect_err("must reject");
+        assert!(err.contains("openbao response is not JSON"), "{err}");
+    }
+
+    #[test]
+    fn surfaces_the_errors_array_on_a_non_2xx() {
+        // The shape a real OpenBao 403 carries. Losing this text is what
+        // makes a permissions problem look like an outage.
+        let err = read(403, r#"{"errors":["permission denied"]}"#).expect_err("must reject");
+        assert!(err.contains("403"), "{err}");
+        assert!(err.contains("permission denied"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_errors_array_falls_back_to_the_bare_status() {
+        // OpenBao returns `{"errors":[]}` for a 404 on an unmounted path.
+        // Reporting `openbao returned 404: []` would be worse than nothing.
+        let err = read(404, r#"{"errors":[]}"#).expect_err("must reject");
+        assert_eq!(err, "openbao returned 404");
+    }
+
+    #[test]
+    fn a_non_json_error_body_falls_back_to_the_bare_status() {
+        let err = read(502, "<html>bad gateway</html>").expect_err("must reject");
+        assert_eq!(err, "openbao returned 502");
+    }
+
+    // -- token posture and renewal timing ------------------------------------
+
+    #[test]
+    fn reads_the_posture_out_of_a_lookup_reply() {
+        let posture = TokenPosture::from_lookup(&serde_json::json!({
+            "data": { "renewable": true, "ttl": 60, "policies": ["whip-smoke"] }
+        }));
+        assert_eq!(
+            posture,
+            TokenPosture {
+                renewable: true,
+                ttl_secs: 60
+            }
+        );
+    }
+
+    #[test]
+    fn reads_the_posture_out_of_a_renew_reply() {
+        // `renew-self` reports the fresh lease under a different key than
+        // `lookup-self` does; reading the wrong one silently yields ttl 0.
+        let posture = TokenPosture::from_renew(&serde_json::json!({
+            "auth": { "renewable": true, "lease_duration": 60 }
+        }));
+        assert_eq!(
+            posture,
+            TokenPosture {
+                renewable: true,
+                ttl_secs: 60
+            }
+        );
+    }
+
+    #[test]
+    fn a_dev_root_token_reads_as_nothing_to_renew() {
+        // ttl 0, renewable false — the posture that must not start a thread.
+        let posture = TokenPosture::from_lookup(&serde_json::json!({
+            "data": { "renewable": false, "ttl": 0, "policies": ["root"] }
+        }));
+        assert_eq!(posture.ttl_secs, 0);
+        assert!(
+            spawn_token_renewal(Arc::new(Client::new("http://127.0.0.1:1", "t")), posture)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_reply_missing_the_fields_reads_as_not_renewable() {
+        let posture = TokenPosture::from_lookup(&serde_json::json!({ "data": {} }));
+        assert_eq!(
+            posture,
+            TokenPosture {
+                renewable: false,
+                ttl_secs: 0
+            }
+        );
+        assert_eq!(TokenPosture::from_renew(&serde_json::Value::Null), posture);
+    }
+
+    #[test]
+    fn a_renewable_token_with_no_lease_left_starts_no_thread() {
+        let posture = TokenPosture {
+            renewable: true,
+            ttl_secs: 0,
+        };
+        assert!(
+            spawn_token_renewal(Arc::new(Client::new("http://127.0.0.1:1", "t")), posture)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn renews_at_half_the_remaining_lease_within_bounds() {
+        assert_eq!(renew_interval(3600), Duration::from_secs(1800));
+        // Floored: a 6-second lease must not spin the loop.
+        assert_eq!(
+            renew_interval(6),
+            Duration::from_secs(MIN_RENEW_INTERVAL_SECS)
+        );
+        assert_eq!(
+            renew_interval(0),
+            Duration::from_secs(MIN_RENEW_INTERVAL_SECS)
+        );
+        // Capped: a 30-day lease still checks in hourly.
+        assert_eq!(
+            renew_interval(30 * 24 * 3600),
+            Duration::from_secs(MAX_RENEW_INTERVAL_SECS)
+        );
+    }
 }

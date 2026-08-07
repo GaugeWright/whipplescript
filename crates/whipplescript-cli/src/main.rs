@@ -95,6 +95,27 @@ use whipplescript_store::files::{FileStore, NativeFileStore};
 use whipplescript::{gov, ifc};
 use whipplescript_store::native_stores::NativeStores;
 
+/// ONE lock for every test in this binary that mutates process environment.
+///
+/// `main.rs` and its submodules compile into a SINGLE test binary whose tests run
+/// as threads in one process, so a per-module lock is not mutual exclusion at all:
+/// two modules each holding their own mutex still race for the same env slot. That
+/// is exactly how `harness_tools`' envelope tests and `tests`' envelope tests used
+/// to trample each other. Prefer passing the value explicitly (see
+/// `harness_tools::enforce_turn_access_governance_under`) — this lock is for the
+/// tests that drive a production path reading the env far down the stack.
+///
+/// Poison is deliberately ignored: a test that panicked while holding this has
+/// already reported its own failure, and poisoning every other env test on top of
+/// that only buries the real one.
+#[cfg(test)]
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 mod auth;
 mod coerce_runtime;
 mod exec_server;
@@ -43730,6 +43751,7 @@ mod tests {
     /// because they share the process-global `WHIPPLESCRIPT_MCP_CONFIG`.
     #[test]
     fn whip_mcp_subcommands_write_and_gate_trust_evidence() {
+        let _guard = crate::env_lock();
         let dir = std::env::temp_dir().join(format!("whip-mcp-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let config = dir.join("mcp.json");
@@ -43817,8 +43839,6 @@ mod tests {
     // `whipplescript_kernel::rule_pass::step_instance_generic`).
     use whipplescript_store::{NewEffect, RuleCommit};
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// DR-0052 R3: the repair scope RETARGETS the selective provider at
     /// the incident's branch (no instance binding needed) and REFUSES a
     /// selection exceeding the derived slice; the repair cut is
@@ -43826,7 +43846,7 @@ mod tests {
     #[test]
     fn repair_scope_retargets_and_refuses_excess() {
         use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::env_lock();
         let root = std::env::temp_dir().join(format!(
             "whip-repair-scope-{}-{}",
             std::process::id(),
@@ -43937,7 +43957,7 @@ mod tests {
 
     #[test]
     fn http_source_guard_refuses_internal_targets_and_screens_dns() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::env_lock();
         std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW_PRIVATE");
         std::env::remove_var("WHIPPLESCRIPT_HTTP_SOURCE_ALLOW");
 
@@ -55904,7 +55924,7 @@ workflow Child {
 
     #[test]
     fn delegating_workflow_invoke_refuses_child_ifc_violation() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::env_lock();
         let previous_envelope = env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
         let store_path = unique_test_path("invoke-child-ifc-admission", "sqlite");
         let program_path = unique_test_path("invoke-child-ifc-admission", "whip");
@@ -56712,7 +56732,7 @@ rule go
 
     #[test]
     fn notify_refuses_cross_package_internal_workflow_target() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::env_lock();
         let previous_envelope = env::var_os("WHIPPLESCRIPT_IFC_ENVELOPE");
         let store_path = unique_test_path("e2-dyn", "sqlite");
         let envelope_path = unique_test_path("e2-dyn-envelope", "json");

@@ -25,6 +25,7 @@ construct-lowering.maude	SSSSSNNNNNNNNNNNNNNNNNSNSSSSSS
 contradiction-reopener.maude	NSSNS
 credential-no-eliminator.maude	SSSSSSNNNNNN
 credential-rung-evidence.maude	SSSSSNNNNNN
+credential-scope-narrowing.maude	SSSSSNNNN
 credential-verify-endorse.maude	SSSSNNNNNN
 credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN

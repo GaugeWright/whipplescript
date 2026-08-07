@@ -19,7 +19,7 @@ pub mod serve;
 pub mod store;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -98,7 +98,9 @@ pub struct Custodian {
     /// The r3 remote backend, when the daemon configured one from
     /// `BAO_ADDR`/`BAO_TOKEN`. A remote entry used without a client is a
     /// loud refusal, never a silent local fallback.
-    openbao: Option<openbao::Client>,
+    /// Shared because the daemon's token-renewal thread holds the same
+    /// client: renewal is a property of the connection, not of any one call.
+    openbao: Option<Arc<openbao::Client>>,
     rng: SystemRandom,
 }
 
@@ -124,7 +126,7 @@ impl Custodian {
     /// Attach an r3 OpenBao transit client (built by the daemon from
     /// `BAO_ADDR`/`BAO_TOKEN`). Only remote entries route through it; local
     /// entries keep the in-process path.
-    pub fn with_openbao(mut self, client: openbao::Client) -> Self {
+    pub fn with_openbao(mut self, client: Arc<openbao::Client>) -> Self {
         self.openbao = Some(client);
         self
     }

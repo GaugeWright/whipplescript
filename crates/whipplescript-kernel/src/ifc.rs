@@ -1276,10 +1276,19 @@ impl VerifiedEnvelope {
     /// attestation, verifies it before yielding a usable envelope. Every consumer
     /// goes through here, so verification is enforced once, for all of them.
     pub fn load_from_env() -> EnvelopeStatus {
-        let Some(path) = envelope_path_from_env() else {
+        Self::load_from_path(envelope_path_from_env().as_deref())
+    }
+
+    /// The same trust boundary for an EXPLICIT envelope path — the discovery half
+    /// (which path) split from the verification half (is it authentic), so a caller
+    /// that already knows its envelope does not have to publish it through the
+    /// process-global environment to be governed by it. `None` is ungoverned dev
+    /// mode, exactly as an unset `WHIPPLESCRIPT_IFC_ENVELOPE` is.
+    pub fn load_from_path(path: Option<&std::path::Path>) -> EnvelopeStatus {
+        let Some(path) = path else {
             return EnvelopeStatus::Ungoverned;
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = std::fs::read_to_string(path) else {
             return EnvelopeStatus::Ungoverned;
         };
         Self::from_text(&text)
