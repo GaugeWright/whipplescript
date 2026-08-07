@@ -39,6 +39,36 @@ Run all Maude checks:
 scripts/check-formal-models.sh
 ```
 
+## Never begin a `---` comment line with `(`
+
+Maude reads `---(` as the opening of a *bracketed* comment that runs to the
+matching `)`, not as a line comment. A wrapped prose comment can form it by
+accident:
+
+```text
+--- CHECK ERROR 1: a narrowable operation named bare. The list is required
+--- (deliberately not prejudging the wildcard spelling deferred in vnext).
+```
+
+The bracketed comment swallows the text that follows, and the statement
+*before* it loses its terminator. Maude reports only `no parse for statement`
+— a warning, not an error — then drops that statement and carries on, so the
+file still loads and the gate still exits 0.
+
+This is silent and expensive. In `credential-scope-narrowing.maude` the
+dropped statement was `eq checkError checkError = checkError`, the equation
+keeping the soup finite. Without it the `check-*` rules re-fired without
+bound; one search grew past 18.7 GB before it was killed. The rules were never
+the problem, and parenthesizing the equation does **not** fix it — the comment
+is still malformed, so a statement is still dropped. Rewrapping the prose so
+no line starts with `(` is the fix.
+
+When a search diverges, grep the model for `no parse` first:
+
+```sh
+maude -no-banner models/maude/<model>.maude < /dev/null 2>&1 | grep "no parse"
+```
+
 The newer package/lowering models layer on top of the reusable kernel:
 
 ```text
