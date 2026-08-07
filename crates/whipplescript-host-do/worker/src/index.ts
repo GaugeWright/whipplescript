@@ -2304,6 +2304,12 @@ export class WorkflowInstance implements DurableObject {
     authoritativeText?: string,
   ): Promise<void> {
     const cursorKey = `public-transcript-delta-cursor:${commandId}`;
+    // Apply-once for the authoritative text. The delta cursor makes the streamed
+    // path idempotent — a second call finds no deltas past it — but authoritative
+    // text is not drawn from the cursor, so a turn reached by more than one
+    // settle site recorded its answer twice. The reader saw the reply duplicated.
+    const settledKey = `public-transcript-assistant:${commandId}`;
+    if (await this.ctx.storage.get<boolean>(settledKey)) return;
     const after = (await this.ctx.storage.get<number>(cursorKey)) ?? 0;
     const deltas = this.hostTurnDeltas(instanceId, commandId, after);
     const streamed = deltas.map((event) => event.delta).join("");
@@ -2313,9 +2319,13 @@ export class WorkflowInstance implements DurableObject {
       (await this.ctx.storage.get<{ type: "user" | "assistant"; text: string }[]>(
         "public-transcript",
       )) ?? [];
-    if (text) transcript.push({ type: "assistant", text });
+    transcript.push({ type: "assistant", text });
     await this.ctx.storage.put({
       "public-transcript": transcript,
+      // Only an authoritative settle closes the segment. A mid-turn projection
+      // assembles from deltas and must stay open, or a steered turn would record
+      // its first segment and silently drop everything after it.
+      ...(authoritativeText !== undefined ? { [settledKey]: true } : {}),
       ...(deltas.length > 0 ? { [cursorKey]: deltas.at(-1)!.sequence } : {}),
     });
   }
@@ -2669,112 +2679,6 @@ export class WorkflowInstance implements DurableObject {
       },
       { status: turnSucceeded || turnCancelled ? 200 : 502 },
     );
-  }
-
-  private async settlePublicContinuation(
-    commandId: string,
-    body: Record<string, unknown>,
-    succeeded: boolean,
-  ): Promise<void> {
-    const session = await this.readPublicSessionState();
-    if (!session) throw new Error("public session is not bootstrapped");
-    const requestId = publicRequestId(commandId);
-    const reservation = await this.sessionAdmissionCommand(
-      session,
-      "admit",
-      { request_id: requestId },
-    );
-    if (reservation instanceof Response) {
-      throw new Error(`cannot recover public reservation (${reservation.status})`);
-    }
-    const reservationRef =
-      typeof reservation.reservation_ref === "string"
-        ? reservation.reservation_ref
-        : "";
-    const usage = body.usage as {
-      usage_ref?: unknown;
-      input_tokens?: unknown;
-      cached_input_tokens?: unknown;
-      output_tokens?: unknown;
-    } | undefined;
-    const exactUsage =
-      typeof usage?.usage_ref === "string" &&
-      Number.isSafeInteger(usage.input_tokens) &&
-      Number.isSafeInteger(usage.cached_input_tokens) &&
-      Number.isSafeInteger(usage.output_tokens);
-    const settlement = await this.sessionAdmissionCommand(
-      session,
-      succeeded && exactUsage ? "settle" : "release",
-      {
-        reservation_ref: reservationRef,
-        ...(succeeded && exactUsage ? { usage } : {}),
-      },
-    );
-    if (settlement instanceof Response) {
-      throw new Error(`public continuation settlement failed (${settlement.status})`);
-    }
-    if (succeeded && exactUsage) {
-      const output = body.output as {
-        label_ref?: unknown;
-        assistant_text?: unknown;
-        tool_calls?: {
-          call_id?: unknown;
-          name?: unknown;
-          arguments?: unknown;
-          result?: unknown;
-          ok?: unknown;
-        }[];
-      } | undefined;
-      await this.projectPublicAssistantSegment(
-        session.instance_ref,
-        commandId,
-        typeof output?.assistant_text === "string" ? output.assistant_text : undefined,
-      );
-      for (const tool of output?.tool_calls ?? []) {
-        if (typeof tool.call_id !== "string" || typeof tool.name !== "string") continue;
-        this.appendPublicEvent({
-          type: "tool_call",
-          request_id: requestId,
-          command_id: commandId,
-          call_id: tool.call_id,
-          tool: tool.name,
-          arguments: tool.arguments ?? null,
-          label_ref: output?.label_ref ?? null,
-        }, `turn:${requestId}:tool:${tool.call_id}:call`);
-        if (typeof tool.ok === "boolean") {
-          this.appendPublicEvent({
-            type: "tool_result",
-            request_id: requestId,
-            command_id: commandId,
-            call_id: tool.call_id,
-            ok: tool.ok,
-            ...(typeof tool.result === "string" ? { result: tool.result } : {}),
-          }, `turn:${requestId}:tool:${tool.call_id}:result`);
-        }
-      }
-      const snapshot = await this.publicSessionSnapshot(session);
-      this.appendPublicEvent({
-        type: "workspace_snapshot",
-        request_id: requestId,
-        command_id: commandId,
-        files: snapshot.files,
-      }, `turn:${requestId}:workspace`);
-      this.appendPublicEvent({
-        type: "usage",
-        request_id: requestId,
-        command_id: commandId,
-        usage,
-        settlement,
-      }, `turn:${requestId}:usage`);
-    }
-    const terminal = this.appendPublicEvent({
-      type: succeeded && exactUsage ? "turn_terminal" : "error",
-      request_id: requestId,
-      command_id: commandId,
-      status: succeeded && exactUsage ? 200 : 502,
-      body,
-    }, `turn:${requestId}:terminal`);
-    await this.ctx.storage.put(`public-turn-result:${requestId}`, terminal);
   }
 
   /**

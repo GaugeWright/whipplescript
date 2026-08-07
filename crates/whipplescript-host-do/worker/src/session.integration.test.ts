@@ -1780,11 +1780,59 @@ describe("real WorkflowInstance hibernation", () => {
     const projection = await state.json() as {
       transcript: { type: string; text: string }[];
     };
-    expect(projection.transcript).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "assistant", text: "the streamed answer" }),
-      ]),
-    );
+    // Exactly once. More than one settle site can reach the projection, and the
+    // delta cursor only makes the streamed path idempotent — authoritative text
+    // is not drawn from the cursor, so an unguarded push recorded the answer
+    // twice and the reader saw the reply duplicated.
+    expect(
+      projection.transcript.filter((entry) => entry.type === "assistant"),
+    ).toEqual([{ type: "assistant", text: "the streamed answer" }]);
+
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
+  it("records an answer for every turn in a session, not just the first", async () => {
+    // A second turn is a different command, so nothing about settling the first
+    // may suppress it. Apply-once markers keyed per command are exactly the kind
+    // of guard that gets this wrong.
+    const providerFetch = vi.fn(async () => new Response(
+      [
+        'data: {"type":"response.output_text.delta","delta":"an answer"}',
+        "",
+        'data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":0},"output_tokens":1}}}',
+        "",
+      ].join("\n"),
+      { headers: { "content-type": "text/event-stream" } },
+    ));
+    vi.stubGlobal("fetch", providerFetch);
+
+    const sessionId = "session-two-turns";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready", sequence: 0 });
+
+    for (const requestId of ["turn-one", "turn-two"]) {
+      socket.send(JSON.stringify({ type: "send_message", request_id: requestId, text: `ask ${requestId}` }));
+      for (let index = 0; index < 160; index += 1) {
+        const message = await nextMessage(socket);
+        if (message.type === "turn_terminal" || message.type === "error") {
+          expect(message).toMatchObject({ type: "turn_terminal", request_id: requestId });
+          break;
+        }
+      }
+    }
+
+    const state = await stub.fetch("https://session.test/public/session/state", {
+      headers: { authorization: "Bearer session-token" },
+    });
+    const projection = await state.json() as { transcript: { type: string; text: string }[] };
+    expect(projection.transcript.filter((entry) => entry.type === "assistant")).toEqual([
+      { type: "assistant", text: "an answer" },
+      { type: "assistant", text: "an answer" },
+    ]);
 
     vi.unstubAllGlobals();
     socket.close(1000, "done");
