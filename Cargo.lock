@@ -2135,7 +2135,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.6",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "ureq",
  "url",
  "whipplescript-core",
@@ -2176,7 +2176,7 @@ dependencies = [
  "base64",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2189,7 +2189,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "wasm-bindgen",
  "whipplescript-core",
  "whipplescript-kernel",
@@ -2207,7 +2207,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokio",
  "whipplescript-core",
  "whipplescript-custodian",
@@ -2222,7 +2222,7 @@ name = "whipplescript-parser"
 version = "0.4.1"
 dependencies = [
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "whipplescript-core",
  "whipplescript-custody",
 ]
@@ -2250,7 +2250,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "whipplescript-core",
 ]
 

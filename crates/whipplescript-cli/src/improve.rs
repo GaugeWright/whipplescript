@@ -40,11 +40,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use whipplescript_parser::{IrGauge, IrProgram, BUILTIN_GAUGES};
 use whipplescript_store::improve::{
     fold_campaign_event, CampaignSummary, ImproveStore, NewEvidence, ScenarioRow,
 };
+use whipplescript_store::items::sha256_hex;
 use whipplescript_store::SqliteStore;
 
 use crate::{emit_json, CliOptions};
@@ -3113,8 +3113,14 @@ fn seal_scenarios<'a>(
     let mut ranked: Vec<(&ScenarioRow, String)> = eligible
         .iter()
         .map(|scenario| {
-            let digest = Sha256::digest(format!("{campaign_id}|{}", scenario.name).as_bytes());
-            (*scenario, format!("{digest:x}"))
+            // Sorting on this hex decides which scenarios are held out, so the
+            // encoding is part of the selection: a different one reshuffles the
+            // sealed set of every existing campaign. `sha256_hex` owns it, and
+            // pins it to a published vector.
+            (
+                *scenario,
+                sha256_hex(&format!("{campaign_id}|{}", scenario.name)),
+            )
         })
         .collect();
     ranked.sort_by(|a, b| a.1.cmp(&b.1));

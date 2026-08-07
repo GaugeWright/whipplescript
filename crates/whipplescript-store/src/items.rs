@@ -1425,7 +1425,6 @@ pub fn event_content_id(
     parents: &[String],
     created_at: &str,
 ) -> String {
-    use sha2::{Digest, Sha256};
     let mut sorted = parents.to_vec();
     sorted.sort();
     // A field-separated canonical form; the fields cannot themselves contain the
@@ -1439,7 +1438,7 @@ pub fn event_content_id(
         created_at,
     ]
     .join("\u{1e}");
-    format!("{:x}", Sha256::digest(material.as_bytes()))
+    sha256_hex(&material)
 }
 
 /// The current head event id(s) of an issue — events with no child (nothing
@@ -1661,9 +1660,27 @@ pub fn projection_column(field: &str) -> Option<&'static str> {
 }
 
 /// SHA-256 hex of a string (the `state_token` hasher). Backend-agnostic.
+///
+/// Written as an explicit byte loop rather than `format!("{:x}", digest)`,
+/// matching `content_hash_hex` and `stable_hash_hex`. `sha2` 0.11 returns a
+/// `hybrid_array::Array` where 0.10 returned a `GenericArray`, and `Array` does
+/// not implement `LowerHex` — so the formatting shorthand stopped compiling.
+/// The output is unchanged: 32 bytes as 64 lowercase hex digits, which
+/// `sha256_hex_matches_the_known_empty_vector` holds to a published vector,
+/// because these digests are durable content ids and a changed encoding would
+/// silently re-identify every existing record.
 pub fn sha256_hex(s: &str) -> String {
+    sha256_hex_bytes(s.as_bytes())
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(s.as_bytes()))
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// One event as the conflict engine reads it (id + DAG parents + kind/payload).
@@ -2257,6 +2274,28 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sha256_hex` produces durable content ids: an issue's identity is the
+    /// hash of its `issue.created` event, carried in every later event and in
+    /// relation payloads, and two clones' logs only union because they agree on
+    /// it. So the encoding is a wire format, not an implementation detail — a
+    /// changed one would silently re-identify every existing record rather than
+    /// fail. These are the published SHA-256 vectors, so the assertion is
+    /// against the standard rather than against whatever this build happens to
+    /// emit, and it holds across the `sha2` 0.10 to 0.11 move that took
+    /// `LowerHex` away from the digest type.
+    #[test]
+    fn sha256_hex_matches_the_known_empty_vector() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        assert_eq!(sha256_hex("abc").len(), 64, "32 bytes as 64 hex digits");
+    }
 
     fn open_memory() -> WorkItemStore {
         WorkItemStore::open(":memory:").expect("opens")

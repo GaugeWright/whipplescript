@@ -22,7 +22,7 @@ readme.workspace = true
 # its own storage. `sansio` (HostDriver / IoRequest / HttpRequest) lives here.
 whipplescript-kernel = { version = "0.4.1", path = "../whipplescript-kernel", default-features = false }
 # Content hashes byte-identical to the native store's (pure-Rust, wasm-safe).
-sha2 = "0.10"
+sha2 = "0.11"
 # The store TRAITS (RuntimeStore / Coordination / WorkItems / FileStore) + data
 # types, no rusqlite.
 whipplescript-store = { version = "0.4.1", path = "../whipplescript-store", default-features = false }
