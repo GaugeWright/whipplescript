@@ -71,21 +71,41 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # Single-threaded, so the last line printed IS the test that was
-      # running when the runner died — under the parallel workspace run the
-      # last printed line only bounds a region. Resource exhaustion and
-      # concurrency cancellation are both already ruled out by measurement:
-      # the sampler showed 12.5GB of 16GB free, 85GB of disk free, load 4.6 on
-      # 4 cpus, and the mirror's syncs are hours apart with trunk cancellation
-      # already disabled. The suite also passes locally in every configuration
-      # tried, including 20 runs pinned to 2 cores with a canary process in the
-      # test binary's own process group to catch a stray group signal.
+      # The single-threaded run answered the previous question: 379 passed
+      # in 8.02s, and the runner died 185s into the parallel workspace run
+      # that follows. So the trigger is parallelism, not any one test — the
+      # death point also moves between runs (host_protocol, host_package x2)
+      # while the elapsed time does not (239s, 241s, 257s).
       #
-      # If the runner dies here, the next line names the test. If it survives
-      # here and dies in the workspace run below, the trigger is parallelism
-      # rather than any single test. Either answer ends the guessing.
-      - name: Pinpoint the kernel test the runner dies on
-        run: cargo test -p whipplescript-kernel --lib -- --test-threads=1 --nocapture
+      # Ruled out by measurement, not argument: resource exhaustion (12.5GB of
+      # 16GB free, 85GB disk free, load 4.6 on 4 cpus at the moment of death),
+      # concurrency cancellation (syncs hours apart, trunk cancellation already
+      # off), and a hard job cap (hosted-runtime-contracts succeeds at 266s,
+      # longer than any green-bar failure).
+      #
+      # What remains is that something in the parallel run signals beyond its
+      # own process group. `terminate_process_tree` broadcasts SIGTERM/SIGKILL
+      # to a process group, and 4-way parallelism puts more spawned children in
+      # flight than the 1 and 2 thread runs that pass. This canary settles it:
+      # a sleeper in the step's own process group, watched from a separate
+      # session so the watcher survives whatever kills the group. If the canary
+      # dies, a signal escaped its intended child group and the culprit is
+      # named. If it lives and the runner still dies, the cause is outside this
+      # repository's code.
+      - name: Canary the parallel run
+        run: |
+          sleep 3600 &
+          canary=$!
+          echo "[canary] pid=$canary pgid=$(ps -o pgid= -p $canary | tr -d ' ')"
+          setsid bash -c "
+            while kill -0 $canary 2>/dev/null; do sleep 1; done
+            echo \"[canary] KILLED at \$(date -u +%H:%M:%S) — a signal escaped the child group\"
+          " &
+          cargo test -p whipplescript-kernel --lib || echo "[canary] kernel tests exited $?"
+          if kill -0 $canary 2>/dev/null; then
+            echo "[canary] SURVIVED the parallel kernel run"
+            kill $canary 2>/dev/null || true
+          fi
 
       - name: Green bar
         # The hosted runtime contracts are the `hosted-runtime-contracts` job
