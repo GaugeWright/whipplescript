@@ -64,7 +64,7 @@ jobs:
     if: ${{ github.repository == 'GaugeWright/whipplescript' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # rustup materializes the toolchain named in rust-toolchain.toml.
@@ -149,7 +149,7 @@ jobs:
       run:
         working-directory: crates/whipplescript-host-do/worker
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # rustup materializes the toolchain and wasm target named in
@@ -159,7 +159,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install matching wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
           cache: npm
@@ -177,7 +177,7 @@ jobs:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust
@@ -197,7 +197,7 @@ jobs:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Nix
@@ -210,7 +210,7 @@ jobs:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust
@@ -224,7 +224,7 @@ jobs:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust
@@ -246,7 +246,7 @@ jobs:
     if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install Rust
