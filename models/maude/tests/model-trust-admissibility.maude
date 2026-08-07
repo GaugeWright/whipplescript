@@ -1,0 +1,98 @@
+load ../model-trust-admissibility.maude
+
+--- Fixture discipline: every fixture carries `configured(p1)`, so the floor
+--- rule always supplies a c0 custody fact. A No-solution below therefore says
+--- "the evidence does not reach the class the label demands", never "no custody
+--- fact existed at all". Fixtures that model a config-only claim also carry
+--- `claimsCustody`, so the same results say "configuration is not evidence"
+--- rather than "nobody wrote it down".
+
+--- Coverage: the intended path. A fresh pin plus a signed, current c4 claim
+--- clears a secret delegation.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  filedClaim(p1, c4, current) delegation(p1, secret)
+  =>* C:Cfg admissible(p1, secret) .
+
+--- Coverage: the custody order does work. A c3 endpoint -- contractual
+--- zero-retention -- clears an `internal` delegation, which demands only c2.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  filedClaim(p1, c3, current) delegation(p1, internal)
+  =>* C:Cfg admissible(p1, internal) .
+
+--- Coverage: c4 needs no testimony. An endpoint the operator runs reaches the
+--- top class on a pin alone, with no filed claim anywhere in the fixture --
+--- the asymmetry between a checkable property and somebody's word.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  operatorRun(p1) delegation(p1, secret)
+  =>* C:Cfg admissible(p1, secret) derivedCustody(p1, c4) .
+
+--- THE HEADLINE. Configuration is not evidence: an endpoint whose registry row
+--- SAYS it is operator-held, freshly pinned, with nothing filed, never clears a
+--- secret delegation. No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  claimsCustody(p1, c4) delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Bite: PIN AS PRECONDITION. A properly signed, current c4 claim against an
+--- endpoint nobody pinned buys nothing. This is the open ruling in section 8,
+--- and the -PIN-OPTIONAL sibling below is where it comes out the other way.
+--- No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) claimsCustody(p1, c4) filedClaim(p1, c4, current)
+  delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Bite: DRIFT, the discriminating case. The pin was taken against dA and the
+--- endpoint now resolves to dB -- a swapped deployment, a re-pointed base URL.
+--- The claim is real, signed, current, and worthless, because it is testimony
+--- about a deployment this is no longer. No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dB)
+  filedClaim(p1, c4, current) delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Bite: the class must actually reach what the label demands. A c2 endpoint --
+--- vendor retains under stated terms -- does not carry secret data, however
+--- well attested it is. No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  filedClaim(p1, c2, current) delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Bite: EXPIRY, the section 6 proposal. Everything is in place and the claim's
+--- term has lapsed. A contract that has run out is not evidence about today,
+--- and the demotion has to be automatic rather than a diary entry.
+--- No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dA)
+  filedClaim(p1, c4, lapsed) delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Bite: evidence does not leak ACROSS endpoints. p2 is pinned, attested and
+--- operator-held; p1 is merely configured and claims the same in its registry
+--- row. p1's delegation still fails. Custody keys to the deployment binding,
+--- not to the vendor. No solution.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY :
+  configured(p1) configured(p2) claimsCustody(p1, c4)
+  pinnedDigest(p2, dA) liveDigest(p2, dA) operatorRun(p2)
+  filedClaim(p2, c4, current) delegation(p1, secret)
+  =>* admissible(p1, secret) RESIDUAL:Cfg .
+
+--- Coverage: THE SIBLING, and the evidence for the ruling. Drop the pin
+--- precondition and the DRIFT case becomes admissible -- a secret delegation
+--- standing on testimony about a deployment the endpoint no longer is. This is
+--- the same failure mode as a stale TPM quote in DR-0053.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY-PIN-OPTIONAL :
+  configured(p1) pinnedDigest(p1, dA) liveDigest(p1, dB)
+  filedClaim(p1, c4, current) delegation(p1, secret)
+  =>* C:Cfg admissible(p1, secret) .
+
+--- Coverage: and with no pin at all, a bare filed claim carries a secret
+--- delegation. Nothing anchors the testimony to an endpoint.
+search [1] in WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY-PIN-OPTIONAL :
+  configured(p1) filedClaim(p1, c4, current) delegation(p1, secret)
+  =>* C:Cfg admissible(p1, secret) .

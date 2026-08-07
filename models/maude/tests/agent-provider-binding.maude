@@ -1,0 +1,68 @@
+load ../agent-provider-binding.maude
+
+--- Fixture discipline: every agent in a WHIPPLESCRIPT-AGENT-PROVIDER-BINDING
+--- fixture carries exactly ONE boundTo. That is the premise under test, not an
+--- accident of the fixtures -- the -ROUTED module is where it is dropped, and
+--- the contrast between the two is the whole result.
+
+--- Coverage: the sound design is not vacuous. An agent bound to the cleared
+--- endpoint runs a secret turn, and the secret does reach that endpoint.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a1, onprem) tell(a1, secret)
+  =>* C:Cfg admitted(a1, secret) shipped(onprem, secret) .
+
+--- Coverage: accumulation is real. After a secret turn, a LATER public turn to
+--- the same agent still ships the earlier secret -- the append-only property
+--- that makes routing unsound is present in this module too. It is safe here
+--- only because the endpoint cannot change.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a1, onprem) tell(a1, secret) tell(a1, public)
+  =>* C:Cfg admitted(a1, public) shipped(onprem, secret) .
+
+--- Coverage: the workflow pattern (section 3). Two agents at different tiers --
+--- a1 cleared and holding the secret, a2 uncleared and running public turns --
+--- both make progress. This is the composition unit the note prescribes.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a1, onprem) boundTo(a2, cloud) tell(a1, secret) tell(a2, public)
+  =>* C:Cfg admitted(a1, secret) admitted(a2, public) .
+
+--- THE HEADLINE. Under a fixed per-agent binding, no label ever reaches an
+--- endpoint not cleared for it -- across both agents, both endpoints, and any
+--- interleaving of the four turns. The per-tell check is sound because the
+--- binding cannot move. No solution.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a1, onprem) boundTo(a2, cloud)
+  tell(a1, secret) tell(a1, public) tell(a2, secret) tell(a2, public)
+  =>* leak(P:Prov, L:Label) RESIDUAL:Cfg .
+
+--- Bite: fail-closed at the tell. An agent bound to the uncleared endpoint
+--- never runs a secret turn at all -- the secret never enters that
+--- conversation's context in the first place. No solution.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a2, cloud) tell(a2, secret)
+  =>* admitted(a2, secret) RESIDUAL:Cfg .
+
+--- Bite: context does not leak ACROSS agents. a1 holds the secret and a2 is
+--- bound to the uncleared endpoint; a2's turns ship a2's transcript only. This
+--- is what makes the two-agent workflow a real separation rather than a naming
+--- convention. No solution.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING :
+  boundTo(a1, onprem) boundTo(a2, cloud)
+  tell(a1, secret) tell(a2, public)
+  =>* shipped(cloud, secret) RESIDUAL:Cfg .
+
+--- Coverage: THE NEGATIVE FIXTURE, and the reason the headline has content.
+--- With per-turn routing the same four facts reach a leak: the secret turn goes
+--- to onprem (correctly), the public turn routes to cloud (correctly, on its
+--- own inputs), and the accumulated secret ships to cloud behind it.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING-ROUTED :
+  available(onprem) available(cloud) tell(a1, secret) tell(a1, public)
+  =>* C:Cfg leak(cloud, secret) .
+
+--- Coverage: the precise witness, so the failure cannot be read as the routing
+--- rule simply ignoring clearance. The public turn IS admitted and IS routed to
+--- cloud on its own merits, while the conversation already holds the secret.
+--- Every local decision is correct and the composition still discloses.
+search [1] in WHIPPLESCRIPT-AGENT-PROVIDER-BINDING-ROUTED :
+  available(onprem) available(cloud) tell(a1, secret) tell(a1, public)
+  =>* C:Cfg admitted(a1, public) routedTo(a1, cloud) ctx(a1, secret) leak(cloud, secret) .

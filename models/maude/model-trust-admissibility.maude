@@ -1,0 +1,192 @@
+--- Model-trust design note section 5: a delegation edge granting a provider
+--- read-authority for label L is admissible only if the endpoint's CUSTODY
+--- CLASS clears what L demands and its EVIDENCE RUNG is at least pinned.
+---
+--- Two facts about an endpoint, deliberately not one ladder. The evidence rung
+--- accrues by operator effort, exactly as the MCP ladder does; the custody class
+--- is a recorded procurement fact, because no amount of configuration turns a
+--- public API into an on-prem deployment. Both are DERIVED FROM EVIDENCE and
+--- never asserted -- the discipline DR-0053 section 4 established for credential
+--- rungs, and the reason `claimsCustody` below has no rule out of it.
+---
+---   evidence rung   unattested -> pinned -> attested
+---   custody class   c0 unknown / c1 trained / c2 retained / c3 transient /
+---                   c4 operator-held, ordered by WHO HOLDS THE TRANSCRIPT
+---
+--- This does not gate zero-setup use. A delegation edge is what raises an
+--- endpoint ABOVE public; an unattested endpoint still runs, it is simply
+--- public-only, the same way an MCP rung-0 server still works under
+--- per-tool-name grants.
+---
+--- WHAT THIS MODEL IS FOR. Section 8 leaves one thing open: whether a pin is a
+--- PRECONDITION for a custody claim or merely a peer. The -PIN-OPTIONAL sibling
+--- is the alternative built out honestly rather than as a strawman, and the
+--- discriminating case is ENDPOINT DRIFT: a claim filed against one deployment
+--- while the endpoint now resolves to another. That is structurally the same
+--- failure as DR-0053's stale TPM quote, which is the argument for ruling the
+--- way the main module does.
+---
+--- Grounding:
+---   configured(P)        an endpoint someone put in the registry
+---   claimsCustody(P, C)  what registry CONFIG says; never evidence
+---   pinnedDigest(P, D)   endpoint + model id + config digest frozen
+---   liveDigest(P, D)     what the endpoint actually resolves to now
+---   filedClaim(P, C, S)  a signed custody claim and whether its term is current
+---   operatorRun(P)       whip supervises the endpoint; the checkable class
+---   delegation(P, L)     the requested `delegate provider:P acts-for ...` edge
+mod WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY is
+  protecting BOOL .
+  protecting NAT .
+
+  sorts Prov Rung Custody Label Digest Status Cfg .
+
+  ops p1 p2 : -> Prov [ctor] .
+  ops unattested pinned attested : -> Rung [ctor] .
+  ops c0 c1 c2 c3 c4 : -> Custody [ctor] .
+  ops internal secret : -> Label [ctor] .
+  ops dA dB : -> Digest [ctor] .
+  ops current lapsed : -> Status [ctor] .
+
+  op rungLevel : Rung -> Nat .
+  eq rungLevel(unattested) = 0 .
+  eq rungLevel(pinned) = 1 .
+  eq rungLevel(attested) = 2 .
+  op rungGeq : Rung Rung -> Bool .
+  eq rungGeq(A:Rung, B:Rung) = rungLevel(A:Rung) >= rungLevel(B:Rung) .
+
+  --- The order is over WHO HOLDS THE TRANSCRIPT, not how well they hold it.
+  --- That is what makes it a total order and what answers the objection that a
+  --- badly-run on-prem box beats a contracted zero-retention API: c4's substance
+  --- is that no third party has custody at all. Operator self-leakage is a
+  --- different door -- file_store labels, telemetry export, the event stream.
+  op custodyLevel : Custody -> Nat .
+  eq custodyLevel(c0) = 0 .
+  eq custodyLevel(c1) = 1 .
+  eq custodyLevel(c2) = 2 .
+  eq custodyLevel(c3) = 3 .
+  eq custodyLevel(c4) = 4 .
+  op custodyGeq : Custody Custody -> Bool .
+  eq custodyGeq(A:Custody, B:Custody) = custodyLevel(A:Custody) >= custodyLevel(B:Custody) .
+
+  --- Governance: what each label demands of the endpoint that would hold it.
+  op requiresCustody : Label -> Custody .
+  eq requiresCustody(internal) = c2 .
+  eq requiresCustody(secret) = c3 .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op configured : Prov -> Cfg [ctor] .
+  op claimsCustody : Prov Custody -> Cfg [ctor] .
+  op pinnedDigest : Prov Digest -> Cfg [ctor] .
+  op liveDigest : Prov Digest -> Cfg [ctor] .
+  op filedClaim : Prov Custody Status -> Cfg [ctor] .
+  op operatorRun : Prov -> Cfg [ctor] .
+  op derivedRung : Prov Rung -> Cfg [ctor] .
+  op derivedCustody : Prov Custody -> Cfg [ctor] .
+  op degraded : Prov -> Cfg [ctor] .
+  op delegation : Prov Label -> Cfg [ctor] .
+  op admissible : Prov Label -> Cfg [ctor] .
+
+  vars P : Prov .  vars R : Rung .  vars C : Custody .  vars L : Label .
+  vars D E : Digest .  vars S : Status .
+
+  eq derivedRung(P, R) derivedRung(P, R) = derivedRung(P, R) .
+  eq derivedCustody(P, C) derivedCustody(P, C) = derivedCustody(P, C) .
+  eq degraded(P) degraded(P) = degraded(P) .
+  eq admissible(P, L) admissible(P, L) = admissible(P, L) .
+
+  --- The floor needs no evidence and none can be missing: a configured endpoint
+  --- IS unattested and c0, tagged degraded, rather than unknown or assumed good.
+  rl [floor] : configured(P)
+    => configured(P) derivedRung(P, unattested) derivedCustody(P, c0) degraded(P) .
+
+  --- FRESHNESS. A pin counts only against the digest it was taken against; the
+  --- endpoint drifts and the pin stops counting. Same shape as DR-0053's quote.
+  crl [rung-pinned] : pinnedDigest(P, D) liveDigest(P, E)
+    => pinnedDigest(P, D) liveDigest(P, E) derivedRung(P, pinned)
+    if D == E .
+
+  --- PIN AS PRECONDITION. A filed custody claim becomes admissible evidence
+  --- only against a pinned endpoint, and only while its term is current: a
+  --- claim about an endpoint is meaningless if the endpoint can change
+  --- underneath it, and contracts lapse.
+  crl [attest] : filedClaim(P, C, S) derivedRung(P, pinned)
+    => filedClaim(P, C, S) derivedRung(P, pinned)
+       derivedRung(P, attested) derivedCustody(P, C)
+    if S == current .
+
+  --- c4 is the one class carrying a property whip can check for itself, so it
+  --- needs no filed testimony -- only that the endpoint is the pinned one. The
+  --- asymmetry is the point: c1 through c3 are somebody's word.
+  rl [operator-held] : operatorRun(P) derivedRung(P, pinned)
+    => operatorRun(P) derivedRung(P, pinned) derivedCustody(P, c4) .
+
+  --- There is deliberately NO rule from claimsCustody to derivedCustody.
+  --- Registry configuration is not evidence, and that absence is the theorem.
+
+  crl [admit] : delegation(P, L) derivedCustody(P, C) derivedRung(P, R)
+    => delegation(P, L) derivedCustody(P, C) derivedRung(P, R) admissible(P, L)
+    if custodyGeq(C, requiresCustody(L)) and rungGeq(R, pinned) .
+endm
+
+--- THE ALTERNATIVE UNDER CONSIDERATION, section 8. A filed claim stands on its
+--- own with no pin, and admission asks nothing about the evidence rung. Built
+--- out properly rather than as a strawman: the claim is still signed, still
+--- term-checked, and configuration is still not evidence. The only thing
+--- removed is the pin, which is exactly the variable the ruling turns on.
+mod WHIPPLESCRIPT-MODEL-TRUST-ADMISSIBILITY-PIN-OPTIONAL is
+  protecting BOOL .
+  protecting NAT .
+
+  sorts Prov Rung Custody Label Digest Status Cfg .
+
+  ops p1 p2 : -> Prov [ctor] .
+  ops unattested pinned attested : -> Rung [ctor] .
+  ops c0 c1 c2 c3 c4 : -> Custody [ctor] .
+  ops internal secret : -> Label [ctor] .
+  ops dA dB : -> Digest [ctor] .
+  ops current lapsed : -> Status [ctor] .
+
+  op custodyLevel : Custody -> Nat .
+  eq custodyLevel(c0) = 0 .
+  eq custodyLevel(c1) = 1 .
+  eq custodyLevel(c2) = 2 .
+  eq custodyLevel(c3) = 3 .
+  eq custodyLevel(c4) = 4 .
+  op custodyGeq : Custody Custody -> Bool .
+  eq custodyGeq(A:Custody, B:Custody) = custodyLevel(A:Custody) >= custodyLevel(B:Custody) .
+
+  op requiresCustody : Label -> Custody .
+  eq requiresCustody(internal) = c2 .
+  eq requiresCustody(secret) = c3 .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op configured : Prov -> Cfg [ctor] .
+  op claimsCustody : Prov Custody -> Cfg [ctor] .
+  op pinnedDigest : Prov Digest -> Cfg [ctor] .
+  op liveDigest : Prov Digest -> Cfg [ctor] .
+  op filedClaim : Prov Custody Status -> Cfg [ctor] .
+  op derivedCustody : Prov Custody -> Cfg [ctor] .
+  op delegation : Prov Label -> Cfg [ctor] .
+  op admissible : Prov Label -> Cfg [ctor] .
+
+  vars P : Prov .  vars C : Custody .  vars L : Label .  vars S : Status .
+
+  eq derivedCustody(P, C) derivedCustody(P, C) = derivedCustody(P, C) .
+  eq admissible(P, L) admissible(P, L) = admissible(P, L) .
+
+  rl [floor] : configured(P) => configured(P) derivedCustody(P, c0) .
+
+  --- THE REJECTED RULE: the claim is believed without a pin binding it to an
+  --- endpoint.
+  crl [attest-unpinned] : filedClaim(P, C, S)
+    => filedClaim(P, C, S) derivedCustody(P, C)
+    if S == current .
+
+  crl [admit] : delegation(P, L) derivedCustody(P, C)
+    => delegation(P, L) derivedCustody(P, C) admissible(P, L)
+    if custodyGeq(C, requiresCustody(L)) .
+endm

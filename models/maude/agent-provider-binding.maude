@@ -1,0 +1,141 @@
+--- Model-trust design note section 3: the provider binding is a property of an
+--- AGENT for the lifetime of its conversation, not of a turn.
+---
+--- This models a check that already ships. The static provider-egress check at
+--- crates/whipplescript-kernel/src/ifc.rs:2604 compares a turn against the
+--- agent's bound provider using THAT TURN's declared reads, and reads the
+--- provider off the agent declaration at ifc.rs:2607 rather than off the tell.
+--- Read on its own that looks unsound: a turn is cleared on its own inputs
+--- while the request body carries everything the conversation has accumulated,
+--- since resume_from continues from the persisted message list --
+--- crates/whipplescript-kernel/src/harness_loop.rs:376.
+---
+--- The theorem is that the two halves fit: under a FIXED per-agent binding the
+--- per-tell check is sound, because anything sitting in the context was cleared
+--- against that same endpoint when it entered. The premise is load-bearing and
+--- invisible in the code, which is why it is modeled here rather than assumed.
+---
+--- The -ROUTED sibling is the rejected design (per-turn clearance-based
+--- routing, the candidate left open at spec/information-flow-surface.md:236).
+--- It exists so the No-solution results below have demonstrated content: there,
+--- a later turn declaring only public reads routes to a cheap endpoint and the
+--- transcript's earlier secret ships with it. The leak is RETROACTIVE, which is
+--- what makes it easy to miss by reading the check alone.
+---
+--- Grounding in whipplescript constructs:
+---   boundTo(A, P)   governance `grant agent A -> provider:P`
+---   clearedFor(P,L) whether P holds the confidentiality delegation for L
+---   tell(A, L)      a turn whose own declared reads carry label L
+---   ctx(A, L)       the accumulated transcript of A's conversation holds L
+---   shipped(P, L)   L reached provider P in a request body
+---   leak(P, L)      L reached a provider not cleared for it
+mod WHIPPLESCRIPT-AGENT-PROVIDER-BINDING is
+  protecting BOOL .
+
+  sorts Agent Prov Label Cfg .
+
+  ops a1 a2 : -> Agent [ctor] .
+  ops onprem cloud : -> Prov [ctor] .
+  ops public secret : -> Label [ctor] .
+
+  --- Clearance is a FUNCTION rather than a soup fact so the leak rule can test
+  --- its absence directly instead of by negation-as-absence. onprem carries the
+  --- Operator delegation; cloud has none, so it is cleared for public only --
+  --- the default the shipped checker already applies to an undelegated endpoint.
+  op clearedFor : Prov Label -> Bool .
+  eq clearedFor(P:Prov, public) = true .
+  eq clearedFor(onprem, secret) = true .
+  eq clearedFor(cloud, secret) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op boundTo : Agent Prov -> Cfg [ctor] .
+  op tell : Agent Label -> Cfg [ctor] .
+  op ctx : Agent Label -> Cfg [ctor] .
+  op admitted : Agent Label -> Cfg [ctor] .
+  op shipped : Prov Label -> Cfg [ctor] .
+  op leak : Prov Label -> Cfg [ctor] .
+
+  vars A : Agent .  vars P : Prov .  vars L M : Label .
+
+  eq ctx(A, L) ctx(A, L) = ctx(A, L) .
+  eq admitted(A, L) admitted(A, L) = admitted(A, L) .
+  eq shipped(P, L) shipped(P, L) = shipped(P, L) .
+  eq leak(P, L) leak(P, L) = leak(P, L) .
+
+  --- THE PREMISE, and it is a fixture discipline rather than a rule: every
+  --- agent carries exactly one boundTo. There is no rule that rebinds an agent,
+  --- because the governance grammar has no per-tell provider override -- the
+  --- provider is read off the agent declaration. The -ROUTED sibling is what
+  --- happens when this premise is dropped.
+
+  --- The check AS IMPLEMENTED: the turn's OWN declared reads, against the
+  --- agent's bound provider. A turn that does not clear it simply has no rule
+  --- to fire, which is the fail-closed direction.
+  crl [check] : tell(A, L) boundTo(A, P)
+    => boundTo(A, P) admitted(A, L) ctx(A, L)
+    if clearedFor(P, L) .
+
+  --- APPEND-ONLY, and the entire content of the theorem: a turn ships the WHOLE
+  --- accumulated context, so an admitted turn at L discloses every M the
+  --- conversation has ever held -- not just its own inputs.
+  rl [ship] : admitted(A, L) ctx(A, M) boundTo(A, P)
+    => admitted(A, L) ctx(A, M) boundTo(A, P) shipped(P, M) .
+
+  crl [leak] : shipped(P, L)
+    => shipped(P, L) leak(P, L)
+    if clearedFor(P, L) == false .
+endm
+
+--- NEGATIVE FIXTURE. Clearance-based routing: the provider is chosen per TURN
+--- from the available set, on that turn's own declared reads. Every individual
+--- decision here is locally correct -- the secret turn goes to onprem, the
+--- public turn is genuinely public -- and the composition still leaks, because
+--- the transcript does not reset between them.
+mod WHIPPLESCRIPT-AGENT-PROVIDER-BINDING-ROUTED is
+  protecting BOOL .
+
+  sorts Agent Prov Label Cfg .
+
+  ops a1 a2 : -> Agent [ctor] .
+  ops onprem cloud : -> Prov [ctor] .
+  ops public secret : -> Label [ctor] .
+
+  op clearedFor : Prov Label -> Bool .
+  eq clearedFor(P:Prov, public) = true .
+  eq clearedFor(onprem, secret) = true .
+  eq clearedFor(cloud, secret) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op available : Prov -> Cfg [ctor] .
+  op routedTo : Agent Prov -> Cfg [ctor] .
+  op tell : Agent Label -> Cfg [ctor] .
+  op ctx : Agent Label -> Cfg [ctor] .
+  op admitted : Agent Label -> Cfg [ctor] .
+  op shipped : Prov Label -> Cfg [ctor] .
+  op leak : Prov Label -> Cfg [ctor] .
+
+  vars A : Agent .  vars P : Prov .  vars L M : Label .
+
+  eq ctx(A, L) ctx(A, L) = ctx(A, L) .
+  eq admitted(A, L) admitted(A, L) = admitted(A, L) .
+  eq routedTo(A, P) routedTo(A, P) = routedTo(A, P) .
+  eq shipped(P, L) shipped(P, L) = shipped(P, L) .
+  eq leak(P, L) leak(P, L) = leak(P, L) .
+
+  --- THE REJECTED RULE: the endpoint is picked per turn, so the check's premise
+  --- -- that the context was cleared against THIS endpoint -- no longer holds.
+  crl [check-routed] : tell(A, L) available(P)
+    => available(P) admitted(A, L) ctx(A, L) routedTo(A, P)
+    if clearedFor(P, L) .
+
+  rl [ship-routed] : routedTo(A, P) ctx(A, M)
+    => routedTo(A, P) ctx(A, M) shipped(P, M) .
+
+  crl [leak] : shipped(P, L)
+    => shipped(P, L) leak(P, L)
+    if clearedFor(P, L) == false .
+endm
