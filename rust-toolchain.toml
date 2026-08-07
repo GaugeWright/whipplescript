@@ -1,0 +1,7 @@
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+# The hosted Durable Object worker compiles the runtime to Wasm, so the target
+# is part of the pinned toolchain rather than a step in one workflow.
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

@@ -37,10 +37,31 @@ concurrency:
   # less than the minutes cancelling it saves.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# WHERE EACH JOB RUNS. This one file is published to the public mirror
+# verbatim, so it is the CI for both repositories and every job says which one
+# it belongs to.
+#
+# `-src` is private and bills Actions at 1x, and its allowance is exhausted:
+# jobs there are either never assigned a runner or evicted mid-run at six to
+# seven minutes. Across every run recorded before 2026-08-07 the green bar
+# never once completed. The mirror is public, so its minutes are free and its
+# runners finish.
+#
+# So the long jobs run on the mirror and `-src` keeps only the one job that
+# fits under its ceiling and owns configuration the mirror should not drive.
+# The repository check is spelled out in each job rather than hoisted into a
+# variable because `env` is not available to a job-level `if`.
+#
+# None of this is a statement about secrecy. It is about which repository can
+# afford to run the job.
+
 jobs:
   # The per-change gate runs the repository's own green bar, so a local pass and
   # a gate pass cannot mean different things. Add checks to scripts/check.sh.
+  #
+  # Mirror only: it needs ten-plus minutes and `-src` cannot give it that.
   green-bar:
+    if: ${{ github.repository == 'GaugeWright/whipplescript' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -59,6 +80,8 @@ jobs:
           WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
         run: scripts/check.sh
 
+  # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
+  # sustain, and it is the one gate that touches Worker deploy configuration.
   hosted-runtime-contracts:
     runs-on: ubuntu-latest
     defaults:
@@ -88,8 +111,9 @@ jobs:
       - name: Build production public Worker artifact
         run: npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci
 
+  # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:
-    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -107,8 +131,9 @@ jobs:
       - name: Formal model checks
         run: WHIPPLESCRIPT_FORMAL_SKIP_TLA=1 scripts/check-formal-models.sh
 
+  # Mirror only — Nix plus TLC.
   tla-models:
-    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -119,8 +144,9 @@ jobs:
       - name: TLA model checks
         run: scripts/check-tla-models.sh
 
+  # Mirror only — the end-to-end suite.
   e2e:
-    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -132,8 +158,9 @@ jobs:
       - name: E2E smoke
         run: scripts/check-e2e.sh
 
+  # Mirror only — schema conformance.
   report-schemas:
-    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -150,8 +177,12 @@ jobs:
       - name: Report schema checks
         run: scripts/check-report-schemas.sh
 
+  # `-src` only, and dispatch only. It drives scripts and credentials the
+  # mirror does not carry, and it is far too long for `-src`'s weekly cron to
+  # ever finish — so it is a deliberate manual pre-release step, matching how
+  # spec/release-checklist.md already describes it.
   release-readiness:
-    if: ${{ github.event_name == 'schedule' || inputs.deep }}
+    if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
