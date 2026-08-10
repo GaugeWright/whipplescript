@@ -352,16 +352,24 @@ fn project_usage(
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
+    let cached_in = |details: &str| {
+        usage
+            .get(details)
+            .and_then(|details| details.get("cached_tokens"))
+    };
     Ok(Some(HostedUsageObservation {
         usage_ref: usage_ref.to_owned(),
         input_tokens: tokens("input_tokens", "prompt_tokens"),
+        // The other two fields have carried their Chat Completions alias since
+        // this was written; the cached one did not, and the omission is not
+        // visible as a failure — it reads as an honest zero. Every managed turn
+        // runs on that wire (the metered gateway's `/compat` surface), so every
+        // cached token was being priced as a fresh one. On this deployment's
+        // rate card that is ten times its true cost, silently.
         cached_input_tokens: usage
             .get("cached_input_tokens")
-            .or_else(|| {
-                usage
-                    .get("input_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-            })
+            .or_else(|| cached_in("input_tokens_details"))
+            .or_else(|| cached_in("prompt_tokens_details"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
         output_tokens: tokens("output_tokens", "completion_tokens"),
@@ -468,6 +476,29 @@ mod tests {
     fn usage_projection_preserves_cached_input_for_exact_settlement() {
         let projected = project_usage(
             r#"{"usage":{"input_tokens":9,"input_tokens_details":{"cached_tokens":7},"output_tokens":2}}"#,
+            "usage:test",
+        )
+        .expect("usage projection")
+        .expect("usage");
+        assert_eq!(
+            projected,
+            HostedUsageObservation {
+                usage_ref: "usage:test".to_owned(),
+                input_tokens: 9,
+                cached_input_tokens: 7,
+                output_tokens: 2,
+            }
+        );
+    }
+
+    /// The Chat Completions wire names every one of these fields differently,
+    /// and it is the wire every managed-funded turn runs on. A missed alias here
+    /// does not fail — it reports zero cached tokens, and the turn is billed as
+    /// if nothing had been cached.
+    #[test]
+    fn usage_projection_reads_the_chat_completions_names() {
+        let projected = project_usage(
+            r#"{"usage":{"prompt_tokens":9,"prompt_tokens_details":{"cached_tokens":7},"completion_tokens":2}}"#,
             "usage:test",
         )
         .expect("usage projection")

@@ -129,13 +129,6 @@ test("stream broker relays split provider bytes and publishes text deltas", asyn
 test("public Session DO streams directly from the signed provider endpoint", async () => {
   const deltas: string[] = [];
   const timing: string[] = [];
-  let usage:
-    | {
-        input_tokens: number;
-        cached_input_tokens: number;
-        output_tokens: number;
-      }
-    | undefined;
   let capturedAuthorization = "";
   const encoder = new TextEncoder();
   const directBinding = {
@@ -183,17 +176,9 @@ test("public Session DO streams directly from the signed provider endpoint", asy
     },
     (delta) => deltas.push(delta),
     (event) => timing.push(event),
-    (observed) => {
-      usage = observed;
-    },
   );
   assert.equal(capturedAuthorization, "Bearer sk-session-secret");
   assert.deepEqual(deltas, ["direct"]);
-  assert.deepEqual(usage, {
-    input_tokens: 3,
-    cached_input_tokens: 2,
-    output_tokens: 1,
-  });
   assert.deepEqual(timing, [
     "direct_provider_fetch_start",
     "direct_provider_headers",
@@ -650,7 +635,6 @@ test("a fallback reports both gateway rounds for cost reconciliation", async () 
     },
     undefined,
     undefined,
-    undefined,
     (id) => logIds.push(id),
   );
   assert.deepEqual(logIds, ["gateway-round-1", "gateway-round-2"]);
@@ -785,14 +769,14 @@ test("managed fallback derivation refuses a non-Cloudflare compat base URL", asy
   assert.equal(reached, false);
 });
 
-test("the gateway log id is reported even when usage cannot be parsed", async () => {
-  // The defect this pins: the log id used to ride on ProviderUsage, so a
-  // response whose usage the parser does not understand produced no pointer at
-  // all — and the gateway's `/compat` surface returns chat-completions, not the
-  // Responses shape this parser reads. Every metered turn silently fell back to
-  // the rate card. The log id is a fact about the round, not about tokens.
+test("the gateway log id is reported for a chat-completions round", async () => {
+  // The defect this pins: the log id used to ride on a usage object parsed from
+  // the response body, so a response whose usage that parser did not understand
+  // produced no pointer at all — and the gateway's `/compat` surface returns
+  // chat-completions, not the Responses shape it read. Every metered turn
+  // silently fell back to the rate card. The log id is a fact about the round,
+  // read off a header, and this is the exact body that used to defeat it.
   const logs: string[] = [];
-  let usageSeen = false;
   await performManagedGatewayFetch(
     {
       url: `${gatewayBinding.base_url}/chat/completions`,
@@ -803,15 +787,13 @@ test("the gateway log id is reported even when usage cannot be parsed", async ()
     { token: () => "cf-gateway-token" },
     async () =>
       new Response(
-        // Chat-completions shape: real, valid, and not what the usage parser reads.
+        // Chat-completions shape: real, valid, and what the old parser missed.
         JSON.stringify({ choices: [{ message: { content: "hi" } }], usage: { prompt_tokens: 8, completion_tokens: 1 } }),
         { status: 200, headers: { "content-type": "application/json", "cf-aig-log-id": "01ABCDEF" } },
       ),
     undefined,
     undefined,
-    () => { usageSeen = true; },
     (id) => logs.push(id),
   );
   assert.deepEqual(logs, ["01ABCDEF"], "the round's cost pointer must survive");
-  assert.equal(usageSeen, false, "and it must not depend on usage parsing");
 });

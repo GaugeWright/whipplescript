@@ -41,23 +41,6 @@ export interface SuspendedModelRequest {
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 export type ModelBrokerTimingSink = (event: string, elapsedMs: number) => void;
-export interface ProviderUsage {
-  input_tokens: number;
-  cached_input_tokens: number;
-  output_tokens: number;
-  /** The gateway's own log id for this round, when one was returned
-   *  (`cf-aig-log-id`).
-   *
-   *  ADR 0085 §3 calls for the broker to return "an opaque reconciliation
-   *  pointer", and §Consequences requires that "managed gateway telemetry
-   *  reconciles the authoritative WhippleScript meter instead of becoming a
-   *  parallel billing truth". This is that pointer: it identifies the gateway
-   *  log entry carrying the **actual** cost of the round, so a publisher can be
-   *  billed measured cost plus margin rather than an estimated rate card. The
-   *  meter here stays authoritative for token counts; the pointer only lets the
-   *  money be reconciled against what Cloudflare really charged. */
-  reconciliation_ref?: string;
-}
 
 export interface DirectProviderSecrets {
   resolve: (credentialRef: string) => Promise<unknown>;
@@ -414,7 +397,7 @@ export async function performModelBrokerFetch(
  * {@link performDirectProviderFetch} with a secrets shim rather than copying its
  * body. That function owns the part that must not drift — proving the request
  * never escaped an admitted/derived provider endpoint, stripping sentinel
- * authentication, capping the response, and parsing usage.
+ * authentication, and capping the response.
  */
 export async function performManagedGatewayFetch(
   request: SuspendedModelRequest,
@@ -423,7 +406,6 @@ export async function performManagedGatewayFetch(
   fetcher: FetchLike = fetch,
   onTextDelta?: (delta: string) => void,
   onTiming?: ModelBrokerTimingSink,
-  onUsage?: (usage: ProviderUsage) => void,
   onGatewayLog?: (gatewayLogId: string) => void,
 ): Promise<string> {
   if (binding.provider !== "cloudflare-ai-gateway") {
@@ -471,7 +453,6 @@ export async function performManagedGatewayFetch(
         onTextDelta?.(delta);
       },
       onTiming,
-      onUsage,
       onGatewayLog,
     );
   } catch (error) {
@@ -516,7 +497,6 @@ export async function performManagedGatewayFetch(
     },
     onTextDelta,
     onTiming,
-    onUsage,
     onGatewayLog,
   );
 }
@@ -528,7 +508,6 @@ export async function performDirectProviderFetch(
   fetcher: FetchLike = fetch,
   onTextDelta?: (delta: string) => void,
   onTiming?: ModelBrokerTimingSink,
-  onUsage?: (usage: ProviderUsage) => void,
   /** Each metered round's gateway log id, reported as soon as it is seen. */
   onGatewayLog?: (gatewayLogId: string) => void,
 ): Promise<string> {
@@ -609,16 +588,16 @@ export async function performDirectProviderFetch(
   deltas.finish();
   mark("direct_provider_body_complete");
   const raw = chunks.join("");
-  // The gateway's log id is a fact about the *round*, not about token counts, so
-  // it is reported independently of whether usage parses. Riding it on
-  // `ProviderUsage` meant a response whose usage this parser does not understand
-  // — the gateway's `/compat` surface returns chat-completions, not the
-  // Responses shape — silently produced no pointer, and every metered turn fell
-  // back to the rate card. Found only by watching a real turn get billed.
+  // The gateway's log id is a fact about the *round*, not about token counts,
+  // and it is the only billing fact this Worker vouches for. Token counts are
+  // WhippleScript's, projected from the run's own metadata as signed evidence
+  // (`host_projection::project_usage`); this file used to parse them a second
+  // time from the raw bytes, and that copy was read by nobody once the log id
+  // moved off it. A parser with no reader silently rots — that one only ever
+  // understood the Responses shape, while every managed round is chat
+  // completions — so it is gone rather than left to look authoritative.
   const gatewayLogId = response.headers.get("cf-aig-log-id")?.trim();
   if (gatewayLogId) onGatewayLog?.(gatewayLogId);
-  const usage = extractResponsesUsage(raw);
-  if (usage) onUsage?.(usage);
   let body: unknown = raw;
   if (!contentType.toLowerCase().includes("text/event-stream")) {
     try {
@@ -664,63 +643,6 @@ export async function performDirectProviderFetch(
     }));
   }
   return JSON.stringify({ status: response.status, body });
-}
-
-function extractResponsesUsage(raw: string): ProviderUsage | null {
-  let found: ProviderUsage | null = null;
-  for (const line of raw.replaceAll("\r\n", "\n").split("\n")) {
-    if (!line.startsWith("data:")) continue;
-    const payload = line.slice("data:".length).trim();
-    if (!payload || payload === "[DONE]") continue;
-    try {
-      const event = JSON.parse(payload) as {
-        response?: {
-          usage?: {
-            input_tokens?: unknown;
-            input_tokens_details?: { cached_tokens?: unknown };
-            output_tokens?: unknown;
-          };
-        };
-        usage?: {
-          input_tokens?: unknown;
-          input_tokens_details?: { cached_tokens?: unknown };
-          output_tokens?: unknown;
-        };
-      };
-      const usage = event.response?.usage ?? event.usage;
-      if (
-        usage &&
-        Number.isSafeInteger(usage.input_tokens) &&
-        Number(usage.input_tokens) >= 0 &&
-        Number.isSafeInteger(usage.output_tokens) &&
-        Number(usage.output_tokens) >= 0 &&
-        (
-          usage.input_tokens_details?.cached_tokens === undefined ||
-          (
-            Number.isSafeInteger(usage.input_tokens_details.cached_tokens) &&
-            Number(usage.input_tokens_details.cached_tokens) >= 0 &&
-            Number(usage.input_tokens_details.cached_tokens) <=
-              Number(usage.input_tokens)
-          )
-        )
-      ) {
-        found = {
-          input_tokens: Number(usage.input_tokens),
-          cached_input_tokens:
-            Number.isSafeInteger(usage.input_tokens_details?.cached_tokens) &&
-            Number(usage.input_tokens_details?.cached_tokens) >= 0
-              ? Number(usage.input_tokens_details?.cached_tokens)
-              : 0,
-          output_tokens: Number(usage.output_tokens),
-        };
-      }
-    } catch {
-      // Provider decoding remains fail-closed in WhippleScript. Usage is an
-      // additional terminal observation and malformed non-terminal SSE lines
-      // cannot invent metering evidence.
-    }
-  }
-  return found;
 }
 
 /** Incrementally extracts OpenAI Responses text deltas across arbitrary HTTP

@@ -49,7 +49,6 @@ import {
   performManagedGatewayFetch,
   performModelBrokerFetch,
   type ModelBrokerConfig,
-  type ProviderUsage,
 } from "./model-broker";
 import {
   bindExactPublicCredential,
@@ -4323,7 +4322,6 @@ export class WorkflowInstance implements DurableObject {
     status: string;
     outcome: string;
     timing: Record<string, number>;
-    usage?: ProviderUsage;
     /** Every metered round of the turn, so settlement prices the whole turn
      *  rather than its final round (`FUND-1`). */
     gateway_log_ids?: string[];
@@ -4355,16 +4353,11 @@ export class WorkflowInstance implements DurableObject {
     let responseJson: string | undefined = undefined;
     let step = 0;
     let transportFailures = 0;
-    let usage: ProviderUsage | undefined;
     // Every metered round of this turn, in order. An agent turn makes several
-    // provider rounds, and `usage` is overwritten by each — so keeping only the
-    // last log id would price a whole turn from one of its rounds and under-bill
-    // it. Accumulating is the difference between billing the turn and billing a
-    // fragment of it (`FUND-1`).
+    // provider rounds, so keeping only the last log id would price a whole turn
+    // from one of its rounds and under-bill it. Accumulating is the difference
+    // between billing the turn and billing a fragment of it (`FUND-1`).
     const gatewayLogIds: string[] = [];
-    const observeUsage = (observed: ProviderUsage) => {
-      usage = observed;
-    };
     const observeGatewayLog = (id: string) => {
       // Deduped because a retried round re-reports the same log, and a repeated
       // id would be charged twice.
@@ -4438,7 +4431,6 @@ export class WorkflowInstance implements DurableObject {
                 emitDelta(delta);
               },
               (event, _elapsedMs) => mark(event),
-              observeUsage,
               observeGatewayLog,
             );
             replay?.complete();
@@ -4476,10 +4468,9 @@ export class WorkflowInstance implements DurableObject {
                 mark("runtime_first_delta");
                 emitDelta(delta);
               },
+              // A customer-credential round has no gateway, so there is no log
+              // id to report; its cost is the customer's own provider bill.
               (event, _elapsedMs) => mark(event),
-              (observed) => {
-                observeUsage(observed);
-              },
             );
             replay?.complete();
             transportFailures = 0;
@@ -4523,7 +4514,6 @@ export class WorkflowInstance implements DurableObject {
         status: instance.status(),
         outcome: outcome.kind,
         timing,
-        ...(usage ? { usage } : {}),
         ...(gatewayLogIds.length > 0 ? { gateway_log_ids: gatewayLogIds } : {}),
       };
     }
