@@ -1263,6 +1263,32 @@ mod tests {
         assert_eq!(body["usage"]["prompt_tokens"], 3);
     }
 
+    /// The cached-token count is nested, and every stage between the provider
+    /// and the meter had to be shown to carry it before a zero in production
+    /// could be read as the provider's own answer. This pins the assembler's
+    /// half: whatever `usage` the wire sends arrives intact, nesting included.
+    /// `harness_loop::merge_usage_sums_nested_token_details` pins the summing
+    /// across rounds, and `host_projection::usage_projection_reads_the_chat_
+    /// completions_names` pins the read of exactly this shape.
+    #[test]
+    fn openai_chat_sse_assembly_preserves_nested_token_details() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n\n",
+        );
+        let body = assemble_openai_chat_sse(raw);
+        assert_eq!(
+            body["usage"],
+            json!({
+                "prompt_tokens": 9,
+                "completion_tokens": 2,
+                "prompt_tokens_details": { "cached_tokens": 7 },
+            }),
+            "the assembler must not flatten away the only cached-token report"
+        );
+    }
+
     #[test]
     fn messages_client_settles_an_openai_sse_response() {
         let client = MessagesApiClient::new(

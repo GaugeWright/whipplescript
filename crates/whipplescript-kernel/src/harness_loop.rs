@@ -1796,6 +1796,13 @@ fn model_error_summary(error: &HarnessModelError) -> String {
 
 /// Accumulate usage objects across model calls by summing shared numeric keys.
 /// Non-numeric or absent keys fall back to the latest value.
+///
+/// Nested objects are merged by the same rule rather than replaced. Both wires
+/// report cached tokens inside a details object — `prompt_tokens_details` on
+/// Chat Completions, `input_tokens_details` on Responses — so replacing meant a
+/// turn's flat counts summed over every round while its cached count came from
+/// the last round alone. That is the same under-count as pricing a whole turn
+/// from its final round, in the one field whose whole purpose is to be cheaper.
 fn merge_usage(acc: Value, next: Value) -> Value {
     match (acc, next) {
         (Value::Null, next) => next,
@@ -1807,6 +1814,9 @@ fn merge_usage(acc: Value, next: Value) -> Value {
                         (Some(a), Some(b)) => json!(a + b),
                         _ => value.clone(),
                     },
+                    (Some(nested @ Value::Object(_)), Value::Object(_)) => {
+                        merge_usage(nested.clone(), value.clone())
+                    }
                     _ => value.clone(),
                 };
                 acc_map.insert(key, merged);
@@ -2771,6 +2781,33 @@ mod tests {
             json!({ "input_tokens": 3, "output_tokens": 7 }),
         );
         assert_eq!(merged, json!({ "input_tokens": 13, "output_tokens": 12 }));
+    }
+
+    /// Cached tokens live one level down on both wires, so a turn priced from a
+    /// replaced details object bills every round's input but only the last
+    /// round's discount.
+    #[test]
+    fn merge_usage_sums_nested_token_details() {
+        let merged = merge_usage(
+            json!({
+                "prompt_tokens": 10_000,
+                "completion_tokens": 5,
+                "prompt_tokens_details": { "cached_tokens": 8_000 },
+            }),
+            json!({
+                "prompt_tokens": 12_000,
+                "completion_tokens": 7,
+                "prompt_tokens_details": { "cached_tokens": 11_000 },
+            }),
+        );
+        assert_eq!(
+            merged,
+            json!({
+                "prompt_tokens": 22_000,
+                "completion_tokens": 12,
+                "prompt_tokens_details": { "cached_tokens": 19_000 },
+            })
+        );
     }
 
     // --- Phase 4 Layer B: conversation compaction --------------------------
