@@ -41,28 +41,86 @@ concurrency:
 # verbatim, so it is the CI for both repositories and every job says which one
 # it belongs to.
 #
-# `-src` is private and bills Actions at 1x, and its allowance is exhausted:
-# jobs there are either never assigned a runner or evicted mid-run at six to
-# seven minutes. Across every run recorded before 2026-08-07 the green bar
-# never once completed. The mirror is public, so its minutes are free and its
-# runners finish.
+# The long jobs used to run on the mirror because `-src` is private, billed
+# Actions at 1x, and had exhausted its allowance — jobs there were never
+# assigned a runner or evicted mid-run. That is no longer the constraint:
+# `-src` runs on Blacksmith, which is not metered against that allowance.
 #
-# So the long jobs run on the mirror and `-src` keeps only the one job that
-# fits under its ceiling and owns configuration the mirror should not drive.
-# The repository check is spelled out in each job rather than hoisted into a
-# variable because `env` is not available to a job-level `if`.
+# So the gate comes home. `green-bar` now runs on `-src` too, where the pull
+# requests are, which is the whole point of a gate: a change is checked before
+# it lands rather than after it is published. Until now `rust`-affecting pull
+# requests here reported green having never been compiled by anything.
 #
-# None of this is a statement about secrecy. It is about which repository can
-# afford to run the job.
+# It keeps running on the mirror as well, because the two runs answer different
+# questions: `-src` checks the change, the mirror checks the curated tree
+# `publish-mirror.sh` actually publishes. `mirror-verdict.yml` carries the
+# mirror's verdict back onto the trunk commit, so dropping the mirror run would
+# leave a projection-only breakage reported green there.
+#
+# The mirror stays on GitHub-hosted runners. Actions is free for a public
+# repository, so paying Blacksmith for that work buys nothing — the migration
+# rewrote `runs-on:` in this file and followed it across, which is the one
+# thing about it that was not wanted.
+#
+# `runner` therefore resolves per repository. The repository check stays
+# spelled out in each job rather than hoisted into a variable because `env` is
+# not available to a job-level `if`.
+#
+# None of this is a statement about secrecy. It is about which repository
+# should pay for, and be gated by, the job.
 
 jobs:
   # The per-change gate runs the repository's own green bar, so a local pass and
   # a gate pass cannot mean different things. Add checks to scripts/check.sh.
   #
-  # Mirror only: it needs ten-plus minutes and `-src` cannot give it that.
+  # Runs on BOTH, for two different reasons. On `-src` it is the gate: it
+  # belongs where the pull requests are, and until it ran here every
+  # `rust`-affecting pull request reported green without being compiled by
+  # anything. On the mirror it is the check on the published projection —
+  # `publish-mirror.sh` builds a curated tree, and this is the only job that
+  # compiles and tests that tree as a whole, so `mirror-verdict.yml` has
+  # something real to carry back to trunk. Pre-merge gating is the `-src` run;
+  # the mirror run is free, and a report of the projection is exactly what it
+  # should be.
+  #
+  # This job is red, and it is red because it works. The death it reports is a
+  # standing defect in the test suite that predates this branch: the same run
+  # fails identically on the mirror's GitHub-hosted `ubuntu-latest` against
+  # trunk, where the runner prints its own epitaph, "The runner has received a
+  # shutdown signal". Bringing the gate home did not break anything. It stopped
+  # a breakage from reporting green.
+  #
+  # Eight vCPU and 32 GB was an experiment with a stated exit condition, and the
+  # answer is no. Both runs on that tier died at the same place every 4 vCPU run
+  # died, and nothing on the guest came near a limit: peak memory in use was
+  # 2.3 GB of 33 GB, MemAvailable never fell below 30 GB, swap was untouched,
+  # 173 GB of disk stayed free, load sat near 4 on 8 cpus, and Blacksmith
+  # recorded zero OOM events. Resource exhaustion is ruled out by measurement
+  # rather than argument, so the tier returns to the 4 vCPU default rather than
+  # billing twice for a run that fails either way. The sampler and the canary go
+  # with it: nothing is left to sample, and the canary's verdict was void.
+  #
+  # Void, because the canary never ran the binary that dies. `cargo test
+  # --workspace` resolves the kernel's unit tests under two feature sets and
+  # runs BOTH: `whipplescript_kernel-bdbac3a3b031a032` and
+  # `whipplescript_kernel-f581fd7d73b25eae`, the second because
+  # whipplescript-cli's dev-dependency asks for the kernel with
+  # `default-features = false` plus `test-support`. The first copy passes. The
+  # second is the one that takes the runner down, and `cargo test -p
+  # whipplescript-kernel --lib`, which is what the canary ran, builds only the
+  # first. Its "SURVIVED" proved nothing about the failing run.
+  #
+  # What the follow-up starts from: on the mirror the second copy began at
+  # 22:14:19.174 and the runner reported its shutdown signal at 22:14:19.213,
+  # 39 ms and roughly 200 passing tests later. Nothing exhausts anything in
+  # 39 ms, and no test fails, panics, or exits non-zero, so the remaining
+  # reading is that something in that run terminates a process outside its own
+  # subtree and reaches the runner agent. It reproduces off CI under `cargo test
+  # --workspace`, and does not reproduce under `cargo test -p
+  # whipplescript-kernel --lib`, which is the difference every previous local
+  # attempt was missing.
   green-bar:
-    if: ${{ github.repository == 'GaugeWright/whipplescript' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,80 +129,19 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # The single-threaded run answered the previous question: 379 passed
-      # in 8.02s, and the runner died 185s into the parallel workspace run
-      # that follows. So the trigger is parallelism, not any one test — the
-      # death point also moves between runs (host_protocol, host_package x2)
-      # while the elapsed time does not (239s, 241s, 257s).
-      #
-      # Ruled out by measurement, not argument: resource exhaustion (12.5GB of
-      # 16GB free, 85GB disk free, load 4.6 on 4 cpus at the moment of death),
-      # concurrency cancellation (syncs hours apart, trunk cancellation already
-      # off), and a hard job cap (hosted-runtime-contracts succeeds at 266s,
-      # longer than any green-bar failure).
-      #
-      # What remains is that something in the parallel run signals beyond its
-      # own process group. `terminate_process_tree` broadcasts SIGTERM/SIGKILL
-      # to a process group, and 4-way parallelism puts more spawned children in
-      # flight than the 1 and 2 thread runs that pass. This canary settles it:
-      # a sleeper in the step's own process group, watched from a separate
-      # session so the watcher survives whatever kills the group. If the canary
-      # dies, a signal escaped its intended child group and the culprit is
-      # named. If it lives and the runner still dies, the cause is outside this
-      # repository's code.
-      - name: Canary the parallel run
-        run: |
-          sleep 3600 &
-          canary=$!
-          echo "[canary] pid=$canary pgid=$(ps -o pgid= -p $canary | tr -d ' ')"
-          setsid bash -c "
-            while kill -0 $canary 2>/dev/null; do sleep 1; done
-            echo \"[canary] KILLED at \$(date -u +%H:%M:%S) — a signal escaped the child group\"
-          " &
-          cargo test -p whipplescript-kernel --lib || echo "[canary] kernel tests exited $?"
-          if kill -0 $canary 2>/dev/null; then
-            echo "[canary] SURVIVED the parallel kernel run"
-            kill $canary 2>/dev/null || true
-          fi
-
       - name: Green bar
         # The hosted runtime contracts are the `hosted-runtime-contracts` job
         # below, which runs the same four steps with the wasm-bindgen/wrangler/
         # Node toolchain they need. This job installs none of it, so without the
         # opt-out the green bar fails on missing tooling every run.
-        #
-        # The sampler is here because this job has been dying mid-test-run with
-        # "The runner has received a shutdown signal" and nothing else: no
-        # failing test, no panic, no non-zero exit. That message means the agent
-        # was terminated, which on a hosted runner is normally resource
-        # exhaustion. The suite has not been reproducible off the runner — it
-        # passes on 2 pinned cores, under fsync load, and with a canary process
-        # in the test's own process group to catch a stray group signal — so the
-        # next step is to watch the runner rather than guess again. Remove this
-        # once the log shows what is exhausted.
         env:
           WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
-        run: |
-          echo "runner: $(nproc) cpus"
-          free -m || true
-          df -h / || true
-          ( while sleep 10; do
-              printf '[sampler] %s mem_avail=%sMB swap_free=%sMB disk_avail=%s load=%s procs=%s\n' \
-                "$(date -u +%H:%M:%S)" \
-                "$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)" \
-                "$(awk '/SwapFree/{print int($2/1024)}' /proc/meminfo)" \
-                "$(df -h --output=avail / | tail -1 | tr -d ' ')" \
-                "$(cut -d' ' -f1 /proc/loadavg)" \
-                "$(ps -e --no-headers | wc -l)"
-            done ) &
-          sampler=$!
-          trap 'kill "$sampler" 2>/dev/null || true' EXIT
-          scripts/check.sh
+        run: scripts/check.sh
 
   # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
   # sustain, and it is the one gate that touches Worker deploy configuration.
   hosted-runtime-contracts:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     defaults:
       run:
         working-directory: crates/whipplescript-host-do/worker
@@ -175,7 +172,7 @@ jobs:
   # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -195,7 +192,7 @@ jobs:
   # Mirror only — Nix plus TLC.
   tla-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -208,7 +205,7 @@ jobs:
   # Mirror only — the end-to-end suite.
   e2e:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -222,7 +219,7 @@ jobs:
   # Mirror only — schema conformance.
   report-schemas:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -244,7 +241,7 @@ jobs:
   # spec/release-checklist.md already describes it.
   release-readiness:
     if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
         with:

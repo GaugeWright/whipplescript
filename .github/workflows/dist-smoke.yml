@@ -8,8 +8,12 @@ on:
         type: string
 
 jobs:
+  # Ubuntu 22.04 on both repositories, and pinned rather than latest. This is
+  # the only job that executes the packaged GNU/Linux archive, so the glibc it
+  # runs against is the compatibility floor the release is tested at. A newer
+  # image would pass a binary that fails on 22.04 and call the release good.
   packaged-linux-x64:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
     steps:
       - uses: actions/checkout@v7
         with:
