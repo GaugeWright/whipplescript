@@ -301,6 +301,17 @@ impl HttpModelClient for MessagesApiClient {
         request
             .headers
             .push(("accept".to_owned(), "text/event-stream".to_owned()));
+        if self.provider == CoerceProvider::OpenAiCompat {
+            // A Chat Completions stream reports no usage at all unless the
+            // request asks for it — the ordinary non-streamed response carries
+            // `usage` unconditionally, so turning streaming on for this provider
+            // silently removed the only token counts the turn ever produces. A
+            // host that meters exact usage then has nothing to settle with and
+            // must discard an answer the provider already gave. The Responses
+            // and Messages streams always terminate with usage, so this is the
+            // one wire that has to be asked.
+            request.body["stream_options"] = json!({ "include_usage": true });
+        }
         request
     }
 
@@ -1473,6 +1484,61 @@ mod tests {
         // Tools are the chat-completions {type:function, function:{…}} shape.
         assert_eq!(req.body["tools"][0]["type"], json!("function"));
         assert_eq!(req.body["tools"][0]["function"]["name"], json!("read"));
+    }
+
+    /// A hosted Chat Completions round must still report token counts. This wire
+    /// is the only one that drops usage when it is streamed, and a host that
+    /// settles on exact usage has nothing to settle with — it releases the
+    /// reservation and discards an answer the provider already produced.
+    #[test]
+    fn hosted_compat_stream_asks_for_usage_and_reports_it() {
+        let compat = MessagesApiClient::new(
+            CoerceProvider::OpenAiCompat,
+            "sk-key",
+            "gpt-test",
+            "https://gateway.ai.cloudflare.com/v1/account/gw/compat",
+            4096,
+            None,
+        );
+        let request = compat.build_request(&convo(), &tool_specs());
+        assert_eq!(request.body["stream"], json!(true));
+        assert_eq!(
+            request.body["stream_options"],
+            json!({ "include_usage": true }),
+            "a streamed chat-completions round must ask for its usage"
+        );
+
+        // What the flag buys: a terminal chunk carrying only the counts.
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let reply = compat
+            .parse_response(Ok(HttpResponse {
+                status: 200,
+                body: json!(raw),
+            }))
+            .expect("reply");
+        assert_eq!(reply.text, "hi");
+        assert_eq!(reply.usage["prompt_tokens"], json!(11));
+        assert_eq!(reply.usage["completion_tokens"], json!(3));
+
+        // The Responses and Messages streams end with usage unasked, and neither
+        // accepts this Chat Completions field.
+        for provider in [CoerceProvider::OpenAi, CoerceProvider::Anthropic] {
+            let client =
+                MessagesApiClient::new(provider, "key", "model", "https://provider", 4096, None);
+            assert!(
+                client
+                    .build_request(&convo(), &tool_specs())
+                    .body
+                    .get("stream_options")
+                    .is_none(),
+                "{provider:?} reports usage without being asked"
+            );
+        }
     }
 
     #[test]
