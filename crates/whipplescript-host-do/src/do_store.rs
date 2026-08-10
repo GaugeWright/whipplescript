@@ -8153,14 +8153,21 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// evidence) by folding the content_id-keyed event log through the alias
     /// bridge — the DO counterpart of the native `rebuild_projection`.
     pub fn rebuild_tracker_projection(&mut self) -> StoreResult<()> {
-        self.sql
-            .execute(
-                "DELETE FROM tracker_issues; DELETE FROM tracker_relations; \
-                 DELETE FROM tracker_leases; DELETE FROM tracker_comments; \
-                 DELETE FROM tracker_evidence;",
-                &[],
-            )
-            .map_err(sql_err)?;
+        // One statement per `execute`. `DoSql` is implemented over both the DO
+        // SQLite API, which accepts a multi-statement string, and rusqlite,
+        // which since 0.40 refuses one with "Multiple statements provided" —
+        // so the narrower contract is the only one both backends honour.
+        for table in [
+            "tracker_issues",
+            "tracker_relations",
+            "tracker_leases",
+            "tracker_comments",
+            "tracker_evidence",
+        ] {
+            self.sql
+                .execute(&format!("DELETE FROM {table}"), &[])
+                .map_err(sql_err)?;
+        }
         let alias_rows = self
             .sql
             .query("SELECT content_id, alias FROM tracker_aliases", &[])

@@ -9,8 +9,15 @@ __pycache__/
 .env
 .env.local
 .env.*.local
-**/.whipplescript/workflows/*.sqlite
-**/.whipplescript/*.sqlite
-.whipplescript/*.sqlite
+# Store state a `whip` run leaves in the working tree. The trailing `*` covers
+# SQLite's `-wal` and `-shm` sidecars, which hold committed pages not yet
+# checkpointed into the database file — every store opens in WAL mode, so they
+# are always present next to a store that has been written.
+#
+# Scoped to the database files rather than the whole directory on purpose:
+# `.whipplescript/skills/` is project content a user is meant to commit
+# (spec/skills.md), and ignoring the directory would silently hide it.
+**/.whipplescript/**/*.sqlite*
+**/.whipplescript/*.sqlite*
 .dev.vars
 crates/whipplescript-host-do/worker/.wrangler/
