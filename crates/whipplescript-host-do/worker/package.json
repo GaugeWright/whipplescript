@@ -26,10 +26,10 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.1",
     "@cloudflare/workers-types": "^5.20260708.1",
-    "typescript": "^5.5.0",
+    "typescript": "^7.0.2",
     "vitest": "^4.0.0",
     "wrangler": "^4.108.0",
-    "ws": "^8.21.1"
+    "ws": "^8.21.2"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"

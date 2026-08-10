@@ -23,7 +23,7 @@ sha2 = "0.11"
 # Placement-neutral governed bash. Default features are disabled so the kernel
 # does not acquire Bashkit's separate LLM-tool wrapper; WhippleScript owns the
 # model-facing contract through `WhipShell`.
-bashkit = { version = "=0.13.0", default-features = false, features = ["jq"] }
+bashkit = { version = "=0.15.0", default-features = false, features = ["jq"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
