@@ -16709,6 +16709,53 @@ fn check_conditioned_reads_in_text(
     }
 }
 
+/// The dotted paths inside a free-text fragment's `{{ … }}` interpolations, which
+/// are the only place a prompt or a command string reads a binding. Prose outside
+/// the braces is NOT a read — scanning it whole would turn an `e.g.` in an English
+/// sentence into a read of a binding named `e`.
+fn interpolation_paths(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            break;
+        };
+        paths.extend(dotted_paths(&after_open[..close]));
+        rest = &after_open[close + 2..];
+    }
+    paths
+}
+
+/// Reject conditioned reads in a FREE-TEXT operand — a prompt body, an `exec`
+/// command line. Only `{{ … }}` interpolations are scanned (see
+/// `interpolation_paths`); the surrounding prose is not source.
+fn check_conditioned_reads_in_interpolations(
+    rule: &RuleDecl,
+    text: &str,
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (root, path) in interpolation_paths(text) {
+        let Some(first) = path.first() else {
+            continue;
+        };
+        check_conditioned_read(
+            rule,
+            &root,
+            first,
+            span,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        );
+    }
+}
+
 /// `from_binding` is the enclosing statement's `from <binding>` source (`None`
 /// when the statement has none). A bare `Shorthand` field copies the same-named
 /// field OFF that source, so it is a read of `<from_binding>.<field>` and narrows
@@ -16834,6 +16881,187 @@ fn check_conditioned_record_reads(
     );
 }
 
+/// Every read position of one effect statement. An effect is an EGRESS as much as a
+/// terminal is — a prompt, a command line, an invoke payload, a coordination key all
+/// carry the field's value out of the rule — so a presence-conditioned field is
+/// narrowed here exactly as it is in a record or terminal value.
+///
+/// The `kind` match is wildcard-free on purpose: a new `BodyEffectKind` must state
+/// which of its operands are reads rather than inherit silence from a `_` arm. Three
+/// operand shapes:
+///
+///   * EXPRESSION text (`dotted_paths`) — an operand written as an expression:
+///     coerce arguments, coordination keys, a timer's `until` path, file paths and
+///     bodies, an export predicate, a signal's target instance.
+///   * FREE text (`interpolation_paths`, `{{ … }}` only) — a model prompt or an
+///     `exec` command line, where the surrounding prose is not source.
+///   * FIELD BLOCKS (`check_conditioned_reads_in_fields`) — an invoke payload, a
+///     tracker file/finish payload, a ledger row, a signal's override block, which
+///     narrow through the same walk record and terminal payloads use.
+///
+/// Named identifiers are not reads: an agent, capability, workflow, queue, ledger,
+/// counter, lease, file store, format, mode, or schema NAME references a declaration,
+/// and a bare binding operand (`claim <item>`, `release <item>`, `renew <lease>`,
+/// `call … for <binding>`, `exec <capability> with <binding>`) reads the whole
+/// binding rather than a conditioned field of it.
+fn check_conditioned_effect_reads(
+    rule: &RuleDecl,
+    effect: &body::EffectStmt,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let span = effect.span;
+    let expression = |text: &str, diagnostics: &mut Vec<Diagnostic>| {
+        check_conditioned_reads_in_text(
+            rule,
+            text,
+            span,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        );
+    };
+
+    // Every effect kind may carry a prompt (`tell`/`prompt`/`decide`/`coerce`
+    // bodies), and a prompt is free text: only its interpolations are reads.
+    if let Some(prompt) = &effect.prompt {
+        check_conditioned_reads_in_interpolations(
+            rule,
+            &prompt.text,
+            span,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        );
+    }
+
+    match &effect.kind {
+        body::BodyEffectKind::Coerce { args, .. } => {
+            for arg in args {
+                expression(arg, diagnostics);
+            }
+        }
+        body::BodyEffectKind::ConstructCapabilityCall { fields, .. } => {
+            for field in fields {
+                expression(&field.source, diagnostics);
+            }
+        }
+        body::BodyEffectKind::Invoke { payload, .. } => check_conditioned_reads_in_fields(
+            rule,
+            payload,
+            // An invoke payload block takes no `from` projection.
+            None,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        ),
+        body::BodyEffectKind::Timer { until, .. } => {
+            if let Some(until) = until {
+                expression(until, diagnostics);
+            }
+        }
+        body::BodyEffectKind::Exec {
+            target,
+            parse_target: _,
+        } => match target {
+            // A raw command is a string literal: prose plus interpolations.
+            body::ExecTarget::RawCommand(command) => {
+                check_conditioned_reads_in_interpolations(
+                    rule,
+                    command,
+                    span,
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+            }
+            // `with <binding>` pipes the whole binding to stdin.
+            body::ExecTarget::Capability { .. } => {}
+        },
+        body::BodyEffectKind::TrackerFile { fields, .. }
+        | body::BodyEffectKind::TrackerFinish { fields, .. }
+        | body::BodyEffectKind::LedgerAppend { fields, .. } => check_conditioned_reads_in_fields(
+            rule,
+            fields,
+            None,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        ),
+        body::BodyEffectKind::LeaseAcquire { key_expr, .. } => expression(key_expr, diagnostics),
+        body::BodyEffectKind::CounterConsume {
+            key_expr,
+            amount_expr,
+            ..
+        } => {
+            expression(key_expr, diagnostics);
+            expression(amount_expr, diagnostics);
+        }
+        // `emit signal <name> to <target> from <binding> { overrides }` is both an
+        // operand position (the target instance) and the third COPY position (the
+        // `record … from` precedent, S6): the block overrides, the projection copies
+        // every same-named field the signal declares.
+        body::BodyEffectKind::Notify {
+            target_expr,
+            event,
+            from,
+            fields,
+        } => {
+            expression(target_expr, diagnostics);
+            check_conditioned_reads_in_fields(
+                rule,
+                fields,
+                from.as_deref(),
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            );
+            check_conditioned_implicit_copies(
+                rule,
+                from.as_deref(),
+                semantic.schemas.classes.get(event),
+                fields,
+                span,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            );
+        }
+        body::BodyEffectKind::FileRead { path, .. }
+        | body::BodyEffectKind::FileImport { path, .. } => expression(path, diagnostics),
+        body::BodyEffectKind::FileWrite { path, body, .. } => {
+            expression(path, diagnostics);
+            expression(body, diagnostics);
+        }
+        body::BodyEffectKind::FileExport {
+            path, predicate, ..
+        } => {
+            expression(path, diagnostics);
+            if let Some(predicate) = predicate {
+                expression(predicate, diagnostics);
+            }
+        }
+        // Prompt-only or name-only kinds: every operand is a declaration name, a
+        // bare binding, or the prompt already scanned above.
+        body::BodyEffectKind::Tell { .. }
+        | body::BodyEffectKind::Prompt { .. }
+        | body::BodyEffectKind::Decide { .. }
+        | body::BodyEffectKind::Call { .. }
+        | body::BodyEffectKind::TrackerClaim { .. }
+        | body::BodyEffectKind::TrackerRelease { .. }
+        | body::BodyEffectKind::LeaseRenew { .. } => {}
+    }
+}
+
 /// The declared field set of the workflow output contract a `complete <name> from
 /// <binding>` projects onto — the bound on what that projection copies. `None`
 /// when the contract is scalar, inline-typed to something other than a class, or
@@ -16856,13 +17084,13 @@ fn terminal_output_fields<'a>(
 /// Family B read-narrowing (discriminated-families-design.md §5.6/§5.7): walk the
 /// rule body and reject a read of a presence-conditioned field that is not inside a
 /// matching `case <root>.<disc>` arm. Each `case` arm extends `allowed` with the
-/// fields its discriminant=literal makes present. (v1 covers record/terminal/done
-/// values, branch conditions, and case guards; effect prompt/argument positions are
-/// a documented follow-up — `emit signal … from` is covered here because its `from`
-/// projection is a copy position, not an operand one.) Every `from`-carrying
-/// statement passes its source binding down, so both spellings of a copy — the
-/// written `Shorthand` field and the field the projection copies implicitly —
-/// narrow like the `<binding>.<field>` read each one is.
+/// fields its discriminant=literal makes present. Coverage is every read position a
+/// rule body has: record/terminal/done/milestone values, branch conditions, case
+/// guards, and effect operands (`check_conditioned_effect_reads` — prompts, command
+/// lines, payloads, coordination keys). Every `from`-carrying statement passes its
+/// source binding down, so both spellings of a copy — the written `Shorthand` field
+/// and the field the projection copies implicitly — narrow like the
+/// `<binding>.<field>` read each one is.
 fn validate_conditioned_field_reads(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -16938,40 +17166,14 @@ fn validate_conditioned_field_reads(
                 allowed,
                 diagnostics,
             ),
-            // `emit signal <name> to <target> from <binding> { overrides }` is the
-            // third copy position (the `record … from` precedent, S6): the block
-            // overrides, the projection copies every same-named field the signal
-            // declares. Other effect kinds' operand positions stay out of scope.
-            body::BodyStmt::Effect(effect) => {
-                if let body::BodyEffectKind::Notify {
-                    event,
-                    from,
-                    fields,
-                    ..
-                } = &effect.kind
-                {
-                    check_conditioned_reads_in_fields(
-                        rule,
-                        fields,
-                        from.as_deref(),
-                        semantic,
-                        binding_types,
-                        allowed,
-                        diagnostics,
-                    );
-                    check_conditioned_implicit_copies(
-                        rule,
-                        from.as_deref(),
-                        semantic.schemas.classes.get(event),
-                        fields,
-                        effect.span,
-                        semantic,
-                        binding_types,
-                        allowed,
-                        diagnostics,
-                    );
-                }
-            }
+            body::BodyStmt::Effect(effect) => check_conditioned_effect_reads(
+                rule,
+                effect,
+                semantic,
+                binding_types,
+                allowed,
+                diagnostics,
+            ),
             body::BodyStmt::Done { .. }
             | body::BodyStmt::Cancel { .. }
             | body::BodyStmt::Redact { .. } => {}
@@ -31106,6 +31308,115 @@ rule r
             "{:?}",
             wrong.diagnostics
         );
+    }
+
+    #[test]
+    fn family_b_read_narrowing_covers_effect_operands() {
+        // An effect operand carries the field's value out of the rule just as a
+        // terminal payload does, so a presence-conditioned read narrows there too.
+        // One case per operand SHAPE: free text (interpolations only), expression,
+        // and field block.
+        let program = |decls: &str, body: &str| {
+            format!(
+                r#"
+workflow B
+input e Event
+output result Done
+class Done {{ region string }}
+class Event {{
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}}
+{decls}
+rule r
+  when Event as e
+=> {{
+{body}
+  complete result {{ region "ok" }}
+}}
+"#
+            )
+        };
+        let agent = r#"
+agent worker {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+"#;
+        let coerce = r#"
+coerce classify(text string) -> Done { prompt "x" }
+"#;
+        let ledger = r#"
+class Row { region string }
+ledger audit {
+  entry Row
+  partition by region
+  retain 30d
+}
+"#;
+        let lease = r#"
+lease deploys {
+  key string
+  slots 1
+  ttl 30m
+}
+"#;
+        let rejects = |compiled: &CompileOutput, what: &str| {
+            assert!(
+                compiled
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("conditional field `e.region`")),
+                "{what}: {:?}",
+                compiled.diagnostics
+            );
+        };
+        // FREE TEXT — a prompt reads only through its `{{ … }}` interpolations.
+        rejects(
+            &compile_program(&program(
+                agent,
+                "  tell worker \"ship to {{ e.region }}\" as t",
+            )),
+            "tell prompt",
+        );
+        // …and prose is not source: a bare `e.region` outside the braces is English,
+        // and narrowing it would make the check unusable on ordinary prompts.
+        let prose = compile_program(&program(
+            agent,
+            "  tell worker \"describe e.region for the operator\" as t",
+        ));
+        assert_eq!(prose.diagnostics, Vec::new());
+        assert!(prose.ir.is_some());
+        // …the same rule for an `exec` command line.
+        rejects(
+            &compile_program(&program("", "  exec \"deploy {{ e.region }}\" as x")),
+            "exec command",
+        );
+        // EXPRESSION — a coerce argument and a coordination key.
+        rejects(
+            &compile_program(&program(coerce, "  coerce classify(e.region) as c")),
+            "coerce argument",
+        );
+        rejects(
+            &compile_program(&program(lease, "  acquire deploys for e.region as slot")),
+            "lease key",
+        );
+        // FIELD BLOCK — a ledger row narrows through the shared field walk.
+        rejects(
+            &compile_program(&program(
+                ledger,
+                "  append Row {\n    region e.region\n  } to audit as row",
+            )),
+            "ledger row",
+        );
+        // Inside the matching arm every one of these operands is allowed.
+        let matching = compile_program(&program(
+            coerce,
+            "  case e.kind {\n    \"deploy\" => {\n      coerce classify(e.region) as c\n      exec \"deploy {{ e.region }}\" as x\n    }\n    \"rollback\" => { }\n  }",
+        ));
+        assert_eq!(matching.diagnostics, Vec::new());
+        assert!(matching.ir.is_some());
     }
 
     #[test]
