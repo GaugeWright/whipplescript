@@ -148,7 +148,14 @@ jobs:
       # The prototype's compiler was previously invoked by nothing: `vite build`
       # strips types through esbuild without checking them. This job owns it
       # because it is the one that already has Node.
+      #
+      # `-src` only: `ui/` is in `publish-mirror.sh`'s never-published set, so on
+      # the mirror this step names a directory that does not exist and the run
+      # dies before the shell starts. That is not a projection breakage the
+      # mirror should report — the mirror's job is to check the curated tree, and
+      # the prototype is by definition not in it.
       - name: Typecheck and build workflow prototype
+        if: github.repository == 'GaugeWright/whipplescript-src'
         working-directory: ui/workflow-prototype
         run: npm ci && npm run typecheck && npm run build
 
