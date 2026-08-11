@@ -248,7 +248,9 @@ impl Workstreams for WorkstreamStore {
         created_at: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<CreateStreamOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(existing) = Self::stream_by_id(&tx, stream_id)? {
             tx.commit()?;
             return Ok(CreateStreamOutcome::Existing(existing));
@@ -324,7 +326,9 @@ impl Workstreams for WorkstreamStore {
     }
 
     fn join(&mut self, branch_id: &str, stream_id: &str, at: &str) -> StoreResult<JoinOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(stream) = Self::stream_by_id(&tx, stream_id)? else {
             return Ok(JoinOutcome::StreamMissing);
         };
@@ -353,7 +357,9 @@ impl Workstreams for WorkstreamStore {
     }
 
     fn leave(&mut self, branch_id: &str) -> StoreResult<Option<String>> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous: Option<String> = tx
             .query_row(
                 "SELECT stream_id FROM workstream_members WHERE branch_id = ?1",
@@ -395,7 +401,9 @@ impl Workstreams for WorkstreamStore {
     }
 
     fn archive_stream(&mut self, stream_id: &str, at: &str) -> StoreResult<ArchiveOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(stream) = Self::stream_by_id(&tx, stream_id)? else {
             return Ok(ArchiveOutcome::StreamMissing);
         };

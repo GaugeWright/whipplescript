@@ -749,7 +749,9 @@ fn ensure_column(connection: &Connection, table: &str, column: &str) -> StoreRes
 #[cfg(feature = "native")]
 impl Branches for BranchStore {
     fn ensure_mainline(&mut self, created_at: &str) -> StoreResult<BranchRow> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO branches \
              (branch_id, name, parent_branch_id, status, created_at, updated_at) \
@@ -763,7 +765,9 @@ impl Branches for BranchStore {
     }
 
     fn create_branch(&mut self, request: CreateBranch<'_>) -> StoreResult<CreateBranchOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(existing) = Self::row_by_id(&tx, request.branch_id)? {
             tx.commit()?;
             return Ok(CreateBranchOutcome::Existing(existing));
@@ -910,7 +914,9 @@ impl Branches for BranchStore {
         new_parent_branch_id: &str,
         at: &str,
     ) -> StoreResult<RetargetOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(RetargetOutcome::BranchMissing);
         };
@@ -957,7 +963,9 @@ impl Branches for BranchStore {
         manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(AdvanceOutcome::NotFound);
         };
@@ -989,7 +997,9 @@ impl Branches for BranchStore {
         head_manifest_hash: &str,
         at: &str,
     ) -> StoreResult<AdvanceOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(AdvanceOutcome::NotFound);
         };
@@ -1025,7 +1035,9 @@ impl Branches for BranchStore {
         branch_id: &str,
         at: &str,
     ) -> StoreResult<BindOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing: Option<String> = tx
             .query_row(
                 "SELECT branch_id FROM branch_instances WHERE instance_id = ?1",
@@ -1118,7 +1130,9 @@ impl Branches for BranchStore {
         indexed_cuts: i64,
         last_indexed_cut_id: Option<&str>,
     ) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for row in rows {
             tx.execute(
                 "INSERT INTO change_units                  (branch_id, cut_seq, cut_id, path, before_hash, after_hash, decl_units)                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1168,7 +1182,9 @@ impl Branches for BranchStore {
     }
 
     fn reset_change_unit_index(&mut self, branch_id: &str) -> StoreResult<()> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM change_units WHERE branch_id = ?1",
             params![branch_id],
@@ -1216,7 +1232,9 @@ impl Branches for BranchStore {
         state: &OpBranchState,
         at: &str,
     ) -> StoreResult<AdvanceOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(AdvanceOutcome::NotFound);
         };
@@ -1391,7 +1409,9 @@ impl Branches for BranchStore {
     }
 
     fn discard_branch(&mut self, branch_id: &str, at: &str) -> StoreResult<StatusOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(StatusOutcome::NotFound);
         };
@@ -1414,7 +1434,9 @@ impl Branches for BranchStore {
         merge_cut_id: &str,
         at: &str,
     ) -> StoreResult<StatusOutcome> {
-        let tx = self.connection.transaction()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let Some(row) = Self::row_by_id(&tx, branch_id)? else {
             return Ok(StatusOutcome::NotFound);
         };
@@ -1741,5 +1763,100 @@ mod tests {
         };
         assert_eq!(adopted.status, BranchStatus::Adopted);
         assert_eq!(adopted.adopted_merge_cut_id.as_deref(), Some("cut_merge_1"));
+    }
+
+    /// A temp directory removed when the binding drops, panic included. Owning
+    /// the directory rather than the `.sqlite` file means the `-shm`/`-wal`
+    /// sidecars go with it.
+    struct TempBranchDir(std::path::PathBuf);
+
+    impl TempBranchDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "whipplescript-branches-{}-{}-{}",
+                label,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&dir).expect("create branches temp dir");
+            Self(dir)
+        }
+
+        fn store_path(&self) -> std::path::PathBuf {
+            self.0.join("branches.sqlite")
+        }
+    }
+
+    impl Drop for TempBranchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A branch write contended by another connection's held write lock must
+    /// *wait* for it, not fail.
+    ///
+    /// This is the regression for the defect that surfaced downstream as an
+    /// intermittent `DatabaseBusy` on a perfectly ordinary commit: every write
+    /// here opened a *deferred* transaction, read a row, and only then wrote.
+    /// SQLite refuses that SHARED→RESERVED upgrade immediately when another
+    /// connection holds the write lock and does not run the busy handler for
+    /// it, so the 5s `STORE_BUSY_TIMEOUT` these connections set never applied
+    /// and the write failed in milliseconds. Raising the timeout would not have
+    /// moved it; opening the transaction `Immediate` is what makes the timeout
+    /// mean what it says.
+    ///
+    /// The elapsed-time assertion is load-bearing, not decoration: without it a
+    /// holder thread that silently failed to take the lock would let this test
+    /// pass while proving nothing.
+    #[test]
+    fn a_contended_write_waits_for_the_held_lock_instead_of_failing() {
+        const HELD: std::time::Duration = std::time::Duration::from_millis(1_500);
+        // Well inside STORE_BUSY_TIMEOUT, so a correct wait always completes.
+        const SLACK: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let dir = TempBranchDir::new("contended-write");
+        let path = dir.store_path();
+        let mut store = BranchStore::open(&path).expect("open store");
+        store.ensure_mainline("t0").expect("bootstrap mainline");
+
+        // A second connection holds the write lock for a fixed span, the way a
+        // concurrent worker's commit does.
+        let holder_path = path.clone();
+        let holding = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let held = std::sync::Arc::clone(&holding);
+        let holder = std::thread::spawn(move || {
+            let connection = Connection::open(&holder_path).expect("open holder");
+            crate::establish_wal(&connection).expect("establish wal");
+            // `BEGIN IMMEDIATE` takes RESERVED at once, which is what excludes
+            // another writer; no row need actually change.
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("take the write lock");
+            held.wait();
+            std::thread::sleep(HELD);
+            connection
+                .execute_batch("ROLLBACK")
+                .expect("release the lock");
+        });
+
+        holding.wait();
+        let started = std::time::Instant::now();
+        let outcome = store.advance_head(MAINLINE_BRANCH_ID, None, "cut_1", "manifest_a", "t1");
+        let waited = started.elapsed();
+        holder.join().expect("holder thread");
+
+        assert!(
+            matches!(outcome, Ok(AdvanceOutcome::Advanced(_))),
+            "a contended write must wait for the lock, not fail: {outcome:?}"
+        );
+        assert!(
+            waited + SLACK >= HELD,
+            "the write returned after {waited:?}, so the holder never really held the lock \
+             and this test proved nothing"
+        );
     }
 }

@@ -1136,7 +1136,8 @@ impl SqliteStore {
         // A whip worker executes the ready set of effects concurrently (a bounded
         // thread pool), and several worker processes may run against one store.
         // WAL lets a writer and readers coexist; `busy_timeout` makes a contended
-        // write wait briefly instead of failing with SQLITE_BUSY. The durable
+        // write wait briefly instead of failing with SQLITE_BUSY — but only for a
+        // transaction opened `Immediate`, see `STORE_BUSY_TIMEOUT`. The durable
         // lease + per-row idempotency machinery is what makes the concurrent
         // execution itself safe (see models/tla AtMostOneRunExecutingEffect).
         establish_wal(&connection)?;
@@ -6941,6 +6942,18 @@ impl RuntimeStore for SqliteStore {
 /// How long a contended write waits before it gives up with `SQLITE_BUSY`.
 /// Every store in this crate shares the value so one contended path cannot
 /// wait a different amount from another for no stated reason.
+///
+/// The timeout only buys that wait for a transaction that declared itself a
+/// writer at `BEGIN`. A *deferred* transaction takes SHARED on its first read
+/// and asks to upgrade to RESERVED on its first write; if another connection
+/// holds the write lock, SQLite fails that upgrade immediately and deliberately
+/// does not run the busy handler, because waiting while holding SHARED is how
+/// two connections deadlock. So a read-then-write transaction opened as
+/// deferred fails in milliseconds against a lock this timeout would otherwise
+/// have covered, and raising the timeout does nothing for it. Every write
+/// transaction in this crate is therefore opened with
+/// `TransactionBehavior::Immediate` — including the ones that only *sometimes*
+/// write, since which branch runs is not knowable at `BEGIN`.
 #[cfg(feature = "native")]
 pub(crate) const STORE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -11283,6 +11296,46 @@ mod tests {
     #[test]
     fn store_scaffold_links_to_core() {
         assert_eq!(store_stage(), "release");
+    }
+
+    /// No write transaction in this crate may be opened deferred.
+    ///
+    /// `branches.rs` sees the contention behaviourally in
+    /// `a_contended_write_waits_for_the_held_lock_instead_of_failing`, but the
+    /// defect is per-call-site: it reappeared in two files independently and
+    /// every new write method is a fresh chance to reintroduce it. Reading the
+    /// source is the only check that covers sites nobody wrote a contention
+    /// test for. See `STORE_BUSY_TIMEOUT` for why deferred is wrong here.
+    #[test]
+    fn no_write_transaction_is_opened_deferred() {
+        // Assembled rather than written out, so this test and its own failure
+        // message are not the first thing it finds.
+        let deferred = format!(".{}()", "transaction");
+        let immediate = format!(".{}_with_behavior(..Immediate)", "transaction");
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&source_dir).expect("read crate source") {
+            let path = entry.expect("source entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source file");
+            for (index, line) in source.lines().enumerate() {
+                if line.contains(&deferred) {
+                    offenders.push(format!(
+                        "{}:{}",
+                        path.file_name().expect("file name").to_string_lossy(),
+                        index + 1,
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`{deferred}` is rusqlite's DEFERRED behaviour, which fails a contended \
+             read-then-write immediately without consulting the busy timeout. \
+             Use `{immediate}` instead. Offending sites: {offenders:?}"
+        );
     }
 
     /// DR-0062 §6: the registry records what was FILED. Derivation of rung and
