@@ -62,6 +62,10 @@ else
     prototype=ui/workflow-prototype
     [ -d "$prototype/node_modules" ] || npm --prefix "$prototype" ci
     npm --prefix "$prototype" run typecheck
+    # `tsc` never invokes vite, so the typecheck alone says nothing about the
+    # build plugins. A vite-plugin-solid bump that cannot compile a component
+    # would pass the check above and fail nowhere; building is what covers it.
+    npm --prefix "$prototype" run build
 fi
 
 echo "== whipplescript green bar PASSED =="

@@ -148,9 +148,9 @@ jobs:
       # The prototype's compiler was previously invoked by nothing: `vite build`
       # strips types through esbuild without checking them. This job owns it
       # because it is the one that already has Node.
-      - name: Typecheck workflow prototype
+      - name: Typecheck and build workflow prototype
         working-directory: ui/workflow-prototype
-        run: npm ci && npm run typecheck
+        run: npm ci && npm run typecheck && npm run build
 
   # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:
