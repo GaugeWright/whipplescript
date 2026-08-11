@@ -1299,7 +1299,7 @@ is the optional Class-A sidecar for computation.
 ### `deploy`
 
 ```sh
-whip deploy [--worker-dir <path>] [--name <worker>] \
+whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] \
   [--dry-run] [--skip-build] [--set-secrets]
 ```
 
@@ -1309,7 +1309,11 @@ on the `PATH`. The command stages the bundle of the worker. The command can
 build the bundle. The command then publishes the bundle.
 
 The `--worker-dir` flag selects the directory of the worker. As an alternative,
-set the `WHIPPLESCRIPT_WORKER_DIR` variable. The `--dry-run` flag validates the
+set the `WHIPPLESCRIPT_WORKER_DIR` variable. The `--config` flag selects one
+wrangler configuration inside that directory. A directory with one configuration
+needs no flag. A directory with several has no default: the command stops and
+names them, because one worker source published under several names cannot be
+deployed by a guess. The `--dry-run` flag validates the
 bundle and publishes nothing. The `--skip-build` flag uses a build that exists.
 The `--set-secrets` flag sends the provider credentials that you set on your
 machine as secrets of the Worker. The flag skips a key that you did not set on

@@ -1,5 +1,15 @@
 # Cloudflare Worker + Durable Object deployment for the WhippleScript runtime
 # (DR-0033 chunk 5d). Aligns with Cloudflare's DO-with-SQLite docs.
+#
+# This is the **GaugeDesk hosted harness** target (`GAUGEDESK_DO_HOST_*`), and
+# nothing else. It was called `wrangler.toml` until 2026-08-11, which made it
+# wrangler's implicit default: `wrangler deploy`, `npm run deploy`, and
+# `whip deploy` all landed here whether or not the operator meant this worker.
+# Public embed sessions run on `whipplescript-public-runtime`
+# (`wrangler.public.toml`), so a change shipped by the documented command
+# reached a live worker that no visitor talks to. That cost hours before anyone
+# checked which script the edge actually binds. There is no default config in
+# this directory any more; every deploy names its target.
 name = "whipplescript-runtime"
 # Pinned for the same reason as `wrangler.public.toml`: without it wrangler
 # resolves the account from the ambient OAuth session, and the founder's
@@ -39,10 +49,15 @@ script_name = "gaugewright-edge-runtime"
 name = "EXECUTOR"
 class_name = "ExecutorContainer"
 
+# Scaled to zero on 2026-08-11. The pool was provisioned on 2026-07-28 and has
+# been carrying four instances since, on a worker whose only consumer is an
+# opt-in developer harness — nothing in any repository points a product path at
+# it. Raise this deliberately when the harness needs the Class-A pool again;
+# leaving it at four so the capacity is "there" is how it went unnoticed.
 [[containers]]
 class_name = "ExecutorContainer"
 image = "./executor/Dockerfile"
-max_instances = 4
+max_instances = 0
 instance_type = "lite"
 
 [[migrations]]

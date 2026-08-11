@@ -13,7 +13,8 @@ Everything in Rust is built, proven against a real SQLite engine (native + wasm)
 and wasm-clean: the instance scheduler, the store, every effect family, both HTTP
 effects (sans-IO suspend/resume), eviction-safe agent turns, the
 `create`/`step`/`status` handle, and the `#[wasm_bindgen]` surface. `src/index.ts`
-+ `wrangler.toml` are the shell that plugs those into a live Durable Object.
++ the `wrangler.*.toml` configurations are the shell that plugs those into a live
+Durable Object.
 
 **Chunk 5d — live validation — is the only step that cannot happen in-repo.** It
 needs a Cloudflare account and remains explicit in the deployed-evidence map.
@@ -42,8 +43,9 @@ workflow, or a credential-free run never count as deployed evidence.
 below — dependency install, wasm build, host-boundary secret provisioning, and
 the wrangler deploy. `--dry-run` validates the bundle
 without publishing; `--worker-dir`/`WHIPPLESCRIPT_WORKER_DIR` point it at
-this directory when running outside the repo. The manual steps, for
-reference:
+this directory when running outside the repo; `--config` names which of this
+directory's configurations to publish, and is required here because there are
+several. The manual steps, for reference:
 
 1. **Build the wasm module** (from the `#[wasm_bindgen]` surface):
    ```
@@ -78,31 +80,34 @@ reference:
    `/internal/local-model-egress` route. The Worker retains only the hop token
    and broker sentinel; GaugeDesk refreshes and injects the short-lived access
    token and account id locally.
-4. **Deploy**: `npm run deploy` (`wrangler deploy`) — but read the next section
-   first. That command deploys `whipplescript-runtime`, which is **not** the
-   worker serving public embed sessions.
+4. **Deploy**: name the target — see the next section. `npm run deploy` is not
+   a deploy; it prints the map and exits non-zero.
 
 ## Which worker serves what
 
-`src/index.ts` is deployed under several names. `wrangler.toml` is only one of
-them, and it is not the one behind `gaugewright.com`'s public panels.
+`src/index.ts` is deployed under several names, so this directory has **no
+default configuration**. Every deploy names its target.
 
-| Config | Worker | Serves |
-|---|---|---|
-| `wrangler.toml` | `whipplescript-runtime` | the GaugeDesk hosted harness (`GAUGEDESK_DO_HOST_*`) |
-| `wrangler.public.toml` | `whipplescript-public-runtime` | **public embed sessions** — the panels on `gaugewright.com` |
-| `wrangler.private-production.toml` | `whipplescript-private-home-runtime` | the managed private Home |
-| `wrangler.private-staging.toml` | `whipplescript-private-home-runtime-staging` | private Home staging |
-| `wrangler.edge-staging.toml` | `whipplescript-runtime-edge-staging` | edge staging |
+| Script | Config | Worker | Serves |
+|---|---|---|---|
+| `deploy:harness` | `wrangler.harness.toml` | `whipplescript-runtime` | the GaugeDesk hosted harness (`GAUGEDESK_DO_HOST_*`) |
+| `deploy:public` | `wrangler.public.toml` | `whipplescript-public-runtime` | **public embed sessions** — the panels on `gaugewright.com` |
+| `deploy:private-production` | `wrangler.private-production.toml` | `whipplescript-private-home-runtime` | the managed private Home |
+| `deploy:private-staging` | `wrangler.private-staging.toml` | `whipplescript-private-home-runtime-staging` | private Home staging |
+| `deploy:edge-staging` | `wrangler.edge-staging.toml` | `whipplescript-runtime-edge-staging` | edge staging |
 
 The public one is selected by the cloud edge, not by anything in this repo:
 `gaugewright-cloud`'s `edge-runtime/wrangler.toml` binds
 `SESSIONS → class WorkflowInstance, script_name = "whipplescript-public-runtime"`.
 
-**This is a trap, and it has cost real time.** `npm run deploy` succeeds, reports
-a new version, and changes nothing a visitor sees, because the visitor's session
-is served by a different script. A live-turn feature was chased for hours past a
-deploy that had landed on the wrong worker. To ship a change to the public
+**Why there is no default.** Until 2026-08-11 the harness config was named
+`wrangler.toml`, which made it wrangler's implicit choice. `npm run deploy`,
+a bare `wrangler deploy`, and `whip deploy` all landed on `whipplescript-runtime`
+— a live worker that no visitor talks to. Each one succeeded and reported a new
+version. A live-turn feature was chased for hours past a deploy that had gone to
+the wrong worker. The file is now `wrangler.harness.toml`, nothing in this
+directory is implicit, and `whip deploy` refuses a directory with several
+configurations unless `--config` names one. To ship a change to the public
 panels:
 
 ```sh

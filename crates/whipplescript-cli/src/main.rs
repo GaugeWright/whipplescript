@@ -351,6 +351,7 @@ impl CliOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeployPlan {
     worker_dir: PathBuf,
+    config: Option<String>,
     name: Option<String>,
     dry_run: bool,
     skip_build: bool,
@@ -374,6 +375,7 @@ fn parse_deploy_args(
     cwd: &Path,
 ) -> Result<DeployPlan, String> {
     let mut worker_dir: Option<PathBuf> = env_worker_dir.map(Path::to_path_buf);
+    let mut config: Option<String> = None;
     let mut name = None;
     let mut dry_run = false;
     let mut skip_build = false;
@@ -386,6 +388,12 @@ fn parse_deploy_args(
                     .next()
                     .ok_or_else(|| "--worker-dir requires a path".to_owned())?;
                 worker_dir = Some(PathBuf::from(value));
+            }
+            "--config" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--config requires a wrangler configuration file".to_owned())?;
+                config = Some(value.clone());
             }
             "--name" => {
                 let value = iter
@@ -408,14 +416,44 @@ fn parse_deploy_args(
                 .to_owned()
         })?,
     };
-    if !worker_dir.join("wrangler.toml").is_file() {
+    let candidates = wrangler_configs(&worker_dir);
+    if candidates.is_empty() {
         return Err(format!(
-            "`{}` is not a deployable worker directory (no wrangler.toml)",
+            "`{}` is not a deployable worker directory (no wrangler configuration)",
             worker_dir.display()
         ));
     }
+    let config = match config {
+        Some(chosen) => {
+            if !worker_dir.join(&chosen).is_file() {
+                return Err(format!(
+                    "`{chosen}` is not a configuration in `{}`; found: {}",
+                    worker_dir.display(),
+                    candidates.join(", ")
+                ));
+            }
+            Some(chosen)
+        }
+        // One configuration is unambiguous: deploy it. Several are not, and
+        // guessing is exactly the failure this flag exists to prevent — one
+        // `src/index.ts` here is published under five worker names, and the
+        // wrong guess deploys to a live worker nobody is watching.
+        None if candidates.len() == 1 => {
+            let only = candidates[0].clone();
+            (only != "wrangler.toml").then_some(only)
+        }
+        None => {
+            return Err(format!(
+                "`{}` has several wrangler configurations and no default; \
+                 pass --config <file>: {}",
+                worker_dir.display(),
+                candidates.join(", ")
+            ));
+        }
+    };
     Ok(DeployPlan {
         worker_dir,
+        config,
         name,
         dry_run,
         skip_build,
@@ -423,12 +461,28 @@ fn parse_deploy_args(
     })
 }
 
+/// Every `wrangler*.toml` in a worker directory, sorted, so an ambiguous
+/// directory can name its own alternatives back to the operator.
+fn wrangler_configs(worker_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(worker_dir) else {
+        return Vec::new();
+    };
+    let mut found = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("wrangler") && name.ends_with(".toml"))
+        .collect::<Vec<_>>();
+    found.sort();
+    found
+}
+
 /// Walk upward from `cwd` looking for the in-repo worker shell.
 fn discover_worker_dir(cwd: &Path) -> Option<PathBuf> {
     let mut current = Some(cwd);
     while let Some(dir) = current {
         let candidate = dir.join("crates/whipplescript-host-do/worker");
-        if candidate.join("wrangler.toml").is_file() {
+        if !wrangler_configs(&candidate).is_empty() {
             return Some(candidate);
         }
         current = dir.parent();
@@ -473,6 +527,10 @@ fn deploy_steps(
     if plan.set_secrets && !plan.dry_run {
         for (key, value) in secret_values {
             let mut args = vec!["secret".to_owned(), "put".to_owned(), (*key).to_owned()];
+            if let Some(config) = &plan.config {
+                args.push("--config".to_owned());
+                args.push(config.clone());
+            }
             if let Some(name) = &plan.name {
                 args.push("--name".to_owned());
                 args.push(name.clone());
@@ -486,6 +544,10 @@ fn deploy_steps(
         }
     }
     let mut deploy_args = vec!["deploy".to_owned()];
+    if let Some(config) = &plan.config {
+        deploy_args.push("--config".to_owned());
+        deploy_args.push(config.clone());
+    }
     if plan.dry_run {
         deploy_args.push("--dry-run".to_owned());
     }
@@ -847,7 +909,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "mcp" => "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
-        "deploy" => "usage: whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
+        "deploy" => "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         "mailbox" => "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
@@ -56157,8 +56219,9 @@ workflow Child {
 
     #[test]
     fn deploy_plan_resolves_worker_dir_and_flags() {
-        // Explicit flag wins; unknown args are rejected; missing wrangler.toml
-        // is rejected. Use the real in-repo worker dir as the valid target.
+        // Explicit flag wins; unknown args are rejected; a directory with no
+        // wrangler configuration is rejected. Use the real in-repo worker dir
+        // as the valid target.
         let repo_worker = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates dir")
@@ -56166,6 +56229,8 @@ workflow Child {
         let args = vec![
             "--worker-dir".to_owned(),
             repo_worker.display().to_string(),
+            "--config".to_owned(),
+            "wrangler.harness.toml".to_owned(),
             "--name".to_owned(),
             "staging".to_owned(),
             "--dry-run".to_owned(),
@@ -56173,6 +56238,7 @@ workflow Child {
         ];
         let plan = parse_deploy_args(&args, None, Path::new("/nowhere")).expect("plan resolves");
         assert_eq!(plan.worker_dir, repo_worker);
+        assert_eq!(plan.config.as_deref(), Some("wrangler.harness.toml"));
         assert_eq!(plan.name.as_deref(), Some("staging"));
         assert!(plan.dry_run);
         assert!(plan.skip_build);
@@ -56188,7 +56254,46 @@ workflow Child {
             Path::new("/nowhere"),
         )
         .expect_err("non-worker dir rejected");
-        assert!(error.contains("no wrangler.toml"), "{error}");
+        assert!(error.contains("no wrangler configuration"), "{error}");
+
+        // The in-repo shell publishes one `src/index.ts` under several worker
+        // names, so it has no default: omitting --config must refuse and name
+        // the alternatives rather than pick one.
+        let error = parse_deploy_args(
+            &["--worker-dir".to_owned(), repo_worker.display().to_string()],
+            None,
+            Path::new("/nowhere"),
+        )
+        .expect_err("ambiguous worker dir rejected");
+        assert!(error.contains("--config"), "{error}");
+        assert!(error.contains("wrangler.public.toml"), "{error}");
+
+        // A configuration that is not in the directory is rejected by name.
+        let error = parse_deploy_args(
+            &[
+                "--worker-dir".to_owned(),
+                repo_worker.display().to_string(),
+                "--config".to_owned(),
+                "wrangler.toml".to_owned(),
+            ],
+            None,
+            Path::new("/nowhere"),
+        )
+        .expect_err("absent config rejected");
+        assert!(error.contains("wrangler.toml"), "{error}");
+
+        // An ordinary single-config worker directory still needs no flag, and
+        // the conventional name stays implicit so wrangler's own default holds.
+        let solo = unique_test_path("deploy-solo-config", "dir");
+        fs::create_dir_all(&solo.path).expect("create solo worker dir");
+        fs::write(solo.path.join("wrangler.toml"), "name = \"solo\"\n").expect("write config");
+        let plan = parse_deploy_args(
+            &["--worker-dir".to_owned(), solo.path.display().to_string()],
+            None,
+            Path::new("/nowhere"),
+        )
+        .expect("single-config dir resolves");
+        assert_eq!(plan.config, None);
 
         // Repo discovery: walking up from inside the repo finds the shell.
         let discovered = discover_worker_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
@@ -56200,6 +56305,7 @@ workflow Child {
     fn deploy_steps_sequence_matches_plan() {
         let plan = DeployPlan {
             worker_dir: PathBuf::from("/w"),
+            config: Some("wrangler.public.toml".to_owned()),
             name: Some("staging".to_owned()),
             dry_run: false,
             skip_build: false,
@@ -56222,12 +56328,27 @@ workflow Child {
         assert_eq!(secret_step.program, "wrangler");
         assert_eq!(
             secret_step.args,
-            vec!["secret", "put", "ANTHROPIC_API_KEY", "--name", "staging"]
+            vec![
+                "secret",
+                "put",
+                "ANTHROPIC_API_KEY",
+                "--config",
+                "wrangler.public.toml",
+                "--name",
+                "staging"
+            ],
+            "a secret belongs to one worker, so it is set against that worker's config"
         );
         assert_eq!(secret_step.stdin_value.as_deref(), Some("sk-test"));
         assert_eq!(
             steps[4].args,
-            vec!["deploy", "--name", "staging"],
+            vec![
+                "deploy",
+                "--config",
+                "wrangler.public.toml",
+                "--name",
+                "staging"
+            ],
             "secret value must never appear in deploy argv"
         );
 
@@ -56235,6 +56356,7 @@ workflow Child {
         // wrangler validates without publishing.
         let dry = DeployPlan {
             worker_dir: PathBuf::from("/w"),
+            config: None,
             name: None,
             dry_run: true,
             skip_build: false,
@@ -56251,6 +56373,7 @@ workflow Child {
         // Skip-build: straight to deploy.
         let quick = DeployPlan {
             worker_dir: PathBuf::from("/w"),
+            config: None,
             name: None,
             dry_run: false,
             skip_build: true,

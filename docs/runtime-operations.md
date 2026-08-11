@@ -94,10 +94,13 @@ The `whip deploy` command deploys a workflow to the edge in one operation. The
 command deploys the workflow to a Worker and its Durable Object.
 
 ```sh
-whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]
+whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]
 ```
 
-Use the `--dry-run` flag to see the build and the upload before you publish
+Use the `--config` flag to select one wrangler configuration when the worker
+directory holds several. A directory that holds several has no default, and the
+command stops rather than choose one for you. Use the `--dry-run` flag to see
+the build and the upload before you publish
 them. Use the `--skip-build` flag to use a wasm artifact that exists. Use the
 `--set-secrets` flag to send the credentials of a provider into the secrets of
 the DO as part of the deploy operation.

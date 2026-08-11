@@ -238,7 +238,7 @@ an operator. These are some usual problems:
   plan and to send nothing, use the `--dry-run` flag. To use the last build
   again, use the `--skip-build` flag. To send the credentials of the providers
   as secrets of the DO, use the `--set-secrets` flag. The full command is
-  `whip deploy [--worker-dir <path>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]`.
+  `whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]`.
 - The Class-A compute sidecar of the `whip executor` command is not on by
   default. To enable the compute plane in production, do a follow-on step of the
   configuration. A bearer token in the `WHIP_EXECUTOR_TOKEN` variable is
