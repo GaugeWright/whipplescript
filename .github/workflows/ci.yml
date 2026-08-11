@@ -105,7 +105,7 @@ jobs:
       # rustup materializes the toolchain named in rust-toolchain.toml.
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Green bar
         # The hosted runtime contracts are the `hosted-runtime-contracts` job
         # below, which runs the same four steps with the wasm-bindgen/wrangler/
@@ -130,7 +130,7 @@ jobs:
       # rust-toolchain.toml.
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install matching wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
       - uses: actions/setup-node@v7
@@ -169,7 +169,7 @@ jobs:
           submodules: recursive
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install Maude
         run: |
           sudo apt-get update
@@ -188,7 +188,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
       - name: TLA model checks
         run: scripts/check-tla-models.sh
 
@@ -202,7 +202,7 @@ jobs:
           submodules: recursive
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: E2E smoke
         run: scripts/check-e2e.sh
 
@@ -238,7 +238,7 @@ jobs:
           submodules: recursive
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install Python tooling
         run: python3 -m pip install --user -r requirements-dev.txt
       - name: Release readiness
