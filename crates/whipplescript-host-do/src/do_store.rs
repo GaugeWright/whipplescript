@@ -51,7 +51,17 @@ pub enum SqlValue {
 /// `state.storage.sql`; tests implement it over rusqlite so the ported SQL is
 /// verified against a real engine.
 pub trait DoSql {
+    /// Run one statement. `sql` must contain EXACTLY ONE — no semicolon-joined
+    /// batch, even though the DO SQL API accepts one.
+    ///
+    /// The two implementations do not agree on anything wider: rusqlite refuses a
+    /// multi-statement string outright ("Multiple statements provided") since
+    /// 0.40, where it used to tolerate one. So a batch that the Worker shell runs
+    /// happily fails under the rusqlite tests, and one statement per call is the
+    /// only contract both backends honour. To clear several tables, loop.
     fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String>;
+    /// Run one query and get back its rows. Single-statement, for the same reason
+    /// as [`DoSql::execute`].
     fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
 
     /// Publish an ephemeral live-turn observation to the shell (DR 0061).
@@ -8153,10 +8163,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
     /// evidence) by folding the content_id-keyed event log through the alias
     /// bridge — the DO counterpart of the native `rebuild_projection`.
     pub fn rebuild_tracker_projection(&mut self) -> StoreResult<()> {
-        // One statement per `execute`. `DoSql` is implemented over both the DO
-        // SQLite API, which accepts a multi-statement string, and rusqlite,
-        // which since 0.40 refuses one with "Multiple statements provided" —
-        // so the narrower contract is the only one both backends honour.
+        // Looped rather than one semicolon-joined batch: see `DoSql::execute`.
         for table in [
             "tracker_issues",
             "tracker_relations",
