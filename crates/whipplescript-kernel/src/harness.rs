@@ -785,11 +785,34 @@ fn terminate_process_tree(child: &mut std::process::Child) {
     }
 }
 
+/// Argument vector for signalling a whole process group through `kill(1)`.
+///
+/// The obvious spelling — `kill -TERM -1234` — is not merely wrong, it is
+/// catastrophic. procps-ng's `kill` consumes the leading-dash `-1234` as an
+/// *option* rather than as a pid operand, is left with no operands at all,
+/// and falls back to signalling pid 0: the CALLER'S OWN PROCESS GROUP. Under
+/// `cargo test` on CI that group contains the Actions runner agent, so a
+/// provider timeout SIGKILLed the runner mid-suite — no failing test, no
+/// panic, just a job that died with exit 143 wherever the timeout tests
+/// happened to land.
+///
+/// `-s <SIGNAL>` keeps the signal out of operand position and `--` ends
+/// option parsing, so the negative pgid is read as the process group it names.
+/// Both spellings are honoured by procps-ng and by BSD `kill(1)`.
+#[cfg(unix)]
+fn process_group_signal_args(process_group_id: u32, signal: &str) -> [String; 4] {
+    [
+        "-s".to_owned(),
+        signal.to_owned(),
+        "--".to_owned(),
+        format!("-{process_group_id}"),
+    ]
+}
+
 #[cfg(unix)]
 fn send_signal_to_process_group(process_group_id: u32, signal: &str) {
     let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg(format!("-{process_group_id}"))
+        .args(process_group_signal_args(process_group_id, signal))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -927,6 +950,24 @@ mod tests {
         );
         std::env::remove_var("WHIP_PROBE_FOREIGN_KEY");
         std::env::remove_var("WHIP_PROBE_OWN_KEY");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn process_group_signal_never_lands_on_the_caller_s_own_group() {
+        // A group signal has to name its target in operand position. Written
+        // as `kill -TERM -1234`, procps-ng eats `-1234` as an option, finds no
+        // operands, and signals pid 0 — the caller's own process group. That
+        // is how a provider timeout used to SIGKILL the CI runner agent out
+        // from under `cargo test`, so the argv shape is pinned here rather
+        // than left to a comment. Asserting the effect instead would mean a
+        // regression takes the whole test binary down with it.
+        assert_eq!(
+            process_group_signal_args(1234, "TERM"),
+            ["-s", "TERM", "--", "-1234"],
+            "the signal must stay out of operand position and `--` must end \
+             option parsing, or `kill` signals this process group"
+        );
     }
 
     #[test]

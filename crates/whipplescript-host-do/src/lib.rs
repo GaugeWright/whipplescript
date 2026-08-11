@@ -56,6 +56,7 @@ mod governed_host_tests {
 
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use serde_json::json;
     use whipplescript_kernel::coerce_native::CoerceProvider;
     use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
@@ -143,7 +144,12 @@ workflow Method {
         };
         let signer = "authority:gaugedesk";
         let key = SigningKey::from_slice(&[7u8; 32]).expect("test key");
-        let public_key = hex::encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let public_key = hex::encode(
+            key.verifying_key()
+                .as_affine()
+                .to_sec1_point(true)
+                .as_bytes(),
+        );
         let unsigned = policy.to_json().expect("policy");
         let signing_bytes = external_signing_bytes(
             &unsigned,

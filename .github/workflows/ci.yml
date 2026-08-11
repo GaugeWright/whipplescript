@@ -83,42 +83,19 @@ jobs:
   # the mirror run is free, and a report of the projection is exactly what it
   # should be.
   #
-  # This job is red, and it is red because it works. The death it reports is a
-  # standing defect in the test suite that predates this branch: the same run
-  # fails identically on the mirror's GitHub-hosted `ubuntu-latest` against
-  # trunk, where the runner prints its own epitaph, "The runner has received a
-  # shutdown signal". Bringing the gate home did not break anything. It stopped
-  # a breakage from reporting green.
-  #
-  # Eight vCPU and 32 GB was an experiment with a stated exit condition, and the
-  # answer is no. Both runs on that tier died at the same place every 4 vCPU run
-  # died, and nothing on the guest came near a limit: peak memory in use was
-  # 2.3 GB of 33 GB, MemAvailable never fell below 30 GB, swap was untouched,
-  # 173 GB of disk stayed free, load sat near 4 on 8 cpus, and Blacksmith
-  # recorded zero OOM events. Resource exhaustion is ruled out by measurement
-  # rather than argument, so the tier returns to the 4 vCPU default rather than
-  # billing twice for a run that fails either way. The sampler and the canary go
-  # with it: nothing is left to sample, and the canary's verdict was void.
-  #
-  # Void, because the canary never ran the binary that dies. `cargo test
-  # --workspace` resolves the kernel's unit tests under two feature sets and
-  # runs BOTH: `whipplescript_kernel-bdbac3a3b031a032` and
-  # `whipplescript_kernel-f581fd7d73b25eae`, the second because
-  # whipplescript-cli's dev-dependency asks for the kernel with
-  # `default-features = false` plus `test-support`. The first copy passes. The
-  # second is the one that takes the runner down, and `cargo test -p
-  # whipplescript-kernel --lib`, which is what the canary ran, builds only the
-  # first. Its "SURVIVED" proved nothing about the failing run.
-  #
-  # What the follow-up starts from: on the mirror the second copy began at
-  # 22:14:19.174 and the runner reported its shutdown signal at 22:14:19.213,
-  # 39 ms and roughly 200 passing tests later. Nothing exhausts anything in
-  # 39 ms, and no test fails, panics, or exits non-zero, so the remaining
-  # reading is that something in that run terminates a process outside its own
-  # subtree and reaches the runner agent. It reproduces off CI under `cargo test
-  # --workspace`, and does not reproduce under `cargo test -p
-  # whipplescript-kernel --lib`, which is the difference every previous local
-  # attempt was missing.
+  # This job spent a while red for a reason that had nothing to do with the
+  # gate coming home, and the diagnosis is worth keeping: the suite was killing
+  # the runner. `terminate_process_tree` in the kernel's command harness
+  # signalled a timed-out provider's process group by shelling out to
+  # `kill -TERM -<pgid>`, and procps-ng reads that leading-dash pgid as an
+  # option rather than an operand — left with no operands it falls back to
+  # signalling pid 0, the caller's own process group. On CI that group holds
+  # the runner agent, so the harness's two timeout tests SIGTERMed and then
+  # SIGKILLed the runner mid-suite. That is why no test ever failed, nothing
+  # panicked, nothing came near a memory or disk limit, and 8 vCPU with 32 GB
+  # died in exactly the same place as 4 vCPU: it was never resource
+  # exhaustion. `-s <SIGNAL> -- -<pgid>` keeps the signal out of operand
+  # position and ends option parsing, and harness.rs pins that argv in a test.
   green-bar:
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:

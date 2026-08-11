@@ -99,11 +99,17 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
 
     fn signed_policy(seed: u8, signer: &str) -> (String, String) {
         let key = SigningKey::from_slice(&[seed; 32]).expect("test key");
-        let public_key = hex::encode(key.verifying_key().to_encoded_point(true).as_bytes());
+        let public_key = hex::encode(
+            key.verifying_key()
+                .as_affine()
+                .to_sec1_point(true)
+                .as_bytes(),
+        );
         let policy = serde_json::json!({
             "resources": {
                 "placement:do": { "principal": true },
