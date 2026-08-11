@@ -1041,16 +1041,8 @@ export class WorkflowInstance implements DurableObject {
         return this.publicSessionFiles(url);
       }
       if (url.pathname === "/public/session/socket") {
-        const session = await this.readPublicSessionState();
-        if (!session) {
-          return Response.json(
-            { error: "public session is not bootstrapped" },
-            { status: 409 },
-          );
-        }
-        if (await this.publicSessionRequestExpired(session)) {
-          return Response.json({ error: "public session has expired" }, { status: 410 });
-        }
+        const session = await this.admitPublicSessionRequest();
+        if (session instanceof Response) return session;
         return this.openPublicSessionSocket(request, session, url);
       }
       const eventStream = url.pathname.match(/^\/host\/instances\/([^/]+)\/events\/stream$/);
@@ -1190,7 +1182,25 @@ export class WorkflowInstance implements DurableObject {
     return Response.json(result);
   }
 
-  private async publicSessionState(): Promise<Response> {
+  /**
+   * Every public route answers from one admission, so no two of them can
+   * disagree about whether a session is still usable.
+   *
+   * The socket used to be the only route that checked whether the runtime
+   * instance still existed, and it refused with a 503. The state projection
+   * did not check, so it kept answering 200 with the full transcript. A
+   * browser that lost its instance therefore got a socket it could never open
+   * and a projection that insisted nothing was wrong — and since the client
+   * reads the projection to decide whether a failure is terminal, it
+   * reconnected forever at the retry interval, rendering history it could
+   * never continue.
+   *
+   * A missing instance is permanent: nothing deletes those rows, and bootstrap
+   * opens the instance before it writes the session state, so this is never a
+   * not-yet-created window. It is reported as `410 Gone` rather than a
+   * server-error class precisely so every caller reads it as "start again".
+   */
+  private async admitPublicSessionRequest(): Promise<PublicSessionState | Response> {
     const session = await this.readPublicSessionState();
     if (!session) {
       return Response.json(
@@ -1201,6 +1211,18 @@ export class WorkflowInstance implements DurableObject {
     if (await this.publicSessionRequestExpired(session)) {
       return Response.json({ error: "public session has expired" }, { status: 410 });
     }
+    if (!this.instanceExists(session.instance_ref)) {
+      return Response.json(
+        { error: "public session runtime is not recoverable" },
+        { status: 410 },
+      );
+    }
+    return session;
+  }
+
+  private async publicSessionState(): Promise<Response> {
+    const session = await this.admitPublicSessionRequest();
+    if (session instanceof Response) return session;
     ensureSchema(this.ctx.storage.sql);
     const snapshot = await this.publicSessionSnapshot(session);
     return Response.json(snapshot);
@@ -1398,16 +1420,8 @@ export class WorkflowInstance implements DurableObject {
   }
 
   private async publicSessionFiles(url: URL): Promise<Response> {
-    const session = await this.readPublicSessionState();
-    if (!session) {
-      return Response.json(
-        { error: "public session is not bootstrapped" },
-        { status: 409 },
-      );
-    }
-    if (await this.publicSessionRequestExpired(session)) {
-      return Response.json({ error: "public session has expired" }, { status: 410 });
-    }
+    const session = await this.admitPublicSessionRequest();
+    if (session instanceof Response) return session;
     const path = url.searchParams.get("path");
     if (!path) return this.publicSessionState();
     if (
@@ -1682,12 +1696,6 @@ export class WorkflowInstance implements DurableObject {
   ): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return Response.json({ error: "websocket upgrade required" }, { status: 426 });
-    }
-    if (!this.instanceExists(session.instance_ref)) {
-      return Response.json(
-        { error: "public session runtime is not recoverable" },
-        { status: 503 },
-      );
     }
     const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
     const pair = new WebSocketPair();

@@ -1354,6 +1354,47 @@ describe("real WorkflowInstance hibernation", () => {
     ).not.toBeNull();
   });
 
+  it("reports a lost runtime instance as terminal on every public route", async () => {
+    // The socket was once the only route that noticed a missing instance, and
+    // it answered 503 while the state projection kept answering 200 with the
+    // full transcript. A browser reads the projection to decide whether a
+    // socket failure is terminal, so that disagreement was an unescapable
+    // reconnect loop: a rendered history it could never continue.
+    const sessionId = "session-lost-instance";
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName(sessionId));
+    await bootstrapSession(stub, sessionId);
+
+    const healthy = await stub.fetch(
+      "https://session.test/public/session/state",
+      { headers: { authorization: "Bearer session-token" } },
+    );
+    expect(healthy.status, await healthy.clone().text()).toBe(200);
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM instances");
+    });
+
+    for (const path of ["state", "files"]) {
+      const response = await stub.fetch(
+        `https://session.test/public/session/${path}`,
+        { headers: { authorization: "Bearer session-token" } },
+      );
+      expect(response.status, `${path}: ${await response.clone().text()}`).toBe(410);
+    }
+
+    const socket = await stub.fetch(
+      new Request("https://session.test/public/session/socket", {
+        headers: {
+          authorization: "Bearer session-token",
+          upgrade: "websocket",
+        },
+      }),
+    );
+    expect(socket.status, await socket.clone().text()).toBe(410);
+    expect(socket.webSocket).toBeNull();
+  });
+
   it("normalizes a legacy session record and backfills its lifecycle (DR-0054)", async () => {
     // The pre-DR-0049 shape: a session record without `retention`/`principal`
     // and no lifecycle log. Reading it used to throw a raw TypeError (killing
