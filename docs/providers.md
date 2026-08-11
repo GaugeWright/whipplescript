@@ -666,6 +666,128 @@ MCP grant is refused, not run without those tools. The `spec/durable-object-
 runtime-tracker.md` file records the work that this needs. The stdio transport
 needs a real process, so that transport stays native in any case.
 
+## `whip provider` — model trust tiers
+
+Binding an agent to an endpoint says *which* model runs the turn. It does not
+say what happens to the transcript afterwards. A zero-retention endpoint, one
+that keeps request logs for abuse monitoring, and one whose terms permit
+training on your context are three very different places for a secret to land,
+and until you say otherwise WhippleScript treats every endpoint as the last of
+those.
+
+Two separate facts decide what an endpoint may be trusted with.
+
+**The evidence rung** is how much someone has staked on the endpoint's
+identity. It climbs as you do the work:
+
+| Rung | What it means |
+| --- | --- |
+| `unattested` | an endpoint someone configured. Zero setup, and every use is tagged degraded |
+| `pinned` | `whip provider pin` froze its config digest, so a deployment that moves is caught |
+| `attested` | a custody claim has been filed against that pin, with a signer and an end date |
+
+**The custody class** is who ends up holding the transcript. It is a fact about
+the deployment you bought, not something configuration can climb:
+
+| Class | Alias | Who holds the transcript |
+| --- | --- | --- |
+| `unknown` | `c0` | nobody has said. Assume the worst |
+| `trains` | `c1` | the vendor retains it and may embed it in weights |
+| `retained` | `c2` | the vendor retains it under stated terms — logs, an abuse window |
+| `zero-retention` | `c3` | contractual zero-retention; no durable third-party copy |
+| `operator-held` | `c4` | no third party holds it at all |
+
+The order is over *who* holds it, not how well. `operator-held` beats
+`zero-retention` because no outside party has a copy to be compelled for —
+whether you then leak it to yourself is a different question, and one that
+`file store` labels and the telemetry export already govern.
+
+### Recording evidence
+
+```bash
+whip provider list
+```
+
+```bash
+whip provider pin onprem-llm
+```
+
+```bash
+whip provider attest acme-cloud --custody zero-retention --signer ops@acme.com --until 2027-01-01T00:00:00Z
+```
+
+`--signer` and `--until` are not optional. WhippleScript cannot verify a
+retention claim — no software can — so what it records is *who staked their
+name on it and until when*. A claim with nobody's name on it is not evidence,
+and a claim with no end date is the one that quietly outlives the contract it
+came from. When the term lapses the endpoint demotes on its own.
+
+An endpoint you run yourself needs no such testimony, because whip can see it:
+
+```bash
+whip provider operator-run onprem-llm
+```
+
+`whip provider status <name>` shows the resolved rung and class, the evidence
+behind each, and whether the endpoint has drifted from its pin.
+
+### Demanding a class
+
+Evidence lives in the registry, written by the commands above. The **bar it is
+judged against** lives in the signed governance envelope:
+
+```text
+grant    agent    Reviewer -> provider:onprem-llm
+delegate provider:onprem-llm acts-for Operator for confidentiality
+require  custody operator-held for Operator
+```
+
+That split is deliberate. If the demand lived beside the evidence, whoever can
+provision an endpoint could also lower the bar it has to clear, and the check
+would be certifying itself. Here it moves only for someone holding the signing
+key.
+
+The demand is keyed by **role**, not by resource, because delegation edges are
+per-role — which is what lets the check run once, when the policy loads, rather
+than at every point data leaves. A role with no `require custody` line places no
+demand at all, so an endpoint you have not attested still works; it is simply
+limited to public data, exactly as before.
+
+When a policy asks for more than the evidence supports, the runtime refuses to
+start and says which of the two to change:
+
+```text
+delegating `provider:acme-cloud` for `Operator` needs custody `operator-held`,
+but the evidence for `acme-cloud` supports only `retained` — either file a claim
+that reaches `operator-held`, or lower the demand for `Operator` in the signed
+envelope
+```
+
+### Mixing an on-prem model with a cloud one
+
+The unit is the **workflow**, not the turn. A conversation's transcript only
+grows, so a turn that looks public still ships everything the conversation has
+accumulated — which means an agent cannot be moved to a cheaper endpoint partway
+through, and WhippleScript does not offer a way to try. Bind one agent to the
+cleared endpoint, let it read the secret, and pass a narrow result to a second
+agent bound to the cheaper one:
+
+```whip
+agent Auditor      -- governance binds this to the on-prem endpoint
+agent Summarizer   -- and this to the cloud one
+
+when message m on Intake {
+  ask Auditor to review m against Ledger -> finding
+  declassify finding into Receipt -> release
+  ask Summarizer to draft a reply about release -> draft
+}
+```
+
+The `declassify` is where the whole separation rests, so its target schema is
+the real control: `Receipt` as `{ approved: bool, amount: Money }` is a genuine
+bound, while a `Receipt` carrying a free-text field the on-prem model wrote is
+an open channel with extra steps. Keep it narrow.
+
 ## Effect kinds
 
 | Effect | Created by | Executed as |

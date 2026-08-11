@@ -51,7 +51,7 @@ pub type StoreResult<T> = result::Result<T, StoreError>;
 /// understands. Must stay equal to the highest version in `MIGRATIONS`
 /// (asserted by test); `apply_migrations` refuses to open a store stamped
 /// beyond it instead of silently misreading a newer layout.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 1;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
 
 /// DR-0054 Phase B: the `events.format_version` this build stamps on every
 /// new row and the highest it will fold. Legacy rows carry NULL and read as
@@ -419,6 +419,37 @@ pub struct EffectProviderRegistration<'a> {
     pub capability: &'a str,
     pub config_json: &'a str,
     pub registered_by_package_id: Option<&'a str>,
+}
+
+/// A signed custody claim about a provider endpoint (DR-0062 §6). The signer
+/// and term are mandatory: `c1`-`c3` are testimony whip cannot verify, so what
+/// is recorded is *who staked their name and until when*, not a bare class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCustodyClaim<'a> {
+    pub effect_kind: &'a str,
+    pub provider: &'a str,
+    /// The custody class as spelled in `provider_trust::CustodyClass` — stored
+    /// as text so the store stays free of kernel types.
+    pub class: &'a str,
+    pub signer: &'a str,
+    /// RFC 3339 UTC.
+    pub filed_at: &'a str,
+    /// RFC 3339 UTC. Not optional — see the migration's CHECK.
+    pub expires_at: &'a str,
+}
+
+/// The raw evidence row. Deliberately plain: the store records what was filed,
+/// and the *derivation* of rung and class from it lives in the kernel
+/// (`provider_trust::derive`), so there is exactly one place that decides what
+/// evidence supports.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderTrustRow {
+    pub pinned_digest: Option<String>,
+    pub claim_class: Option<String>,
+    pub claim_signer: Option<String>,
+    pub claim_filed_at: Option<String>,
+    pub claim_expires_at: Option<String>,
+    pub operator_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1079,11 +1110,18 @@ struct Migration {
 }
 
 #[cfg(feature = "native")]
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "runtime-store-schema",
-    sql: include_str!("../migrations/0001_runtime_store.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "runtime-store-schema",
+        sql: include_str!("../migrations/0001_runtime_store.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "provider-trust-evidence",
+        sql: include_str!("../migrations/0002_provider_trust_evidence.sql"),
+    },
+];
 
 /// Stage marker retained for the CLI/kernel scaffold.
 pub fn store_stage() -> &'static str {
@@ -3069,6 +3107,131 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Every provider registered for one effect kind, for `whip provider list`.
+    ///
+    /// Native-only and deliberately not on `RuntimeStore`: this is a CLI
+    /// convenience, while the four evidence operations below are the surface
+    /// that carries DO parity.
+    pub fn list_effect_providers(&self, effect_kind: &str) -> StoreResult<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT provider FROM effect_providers WHERE effect_kind = ?1 ORDER BY provider",
+        )?;
+        let rows = statement
+            .query_map(params![effect_kind], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Freeze the endpoint's identity digest (DR-0062 §3, the `pinned` rung).
+    /// Idempotent per `(effect_kind, provider)`; re-pinning after a deliberate
+    /// endpoint change is how drift is *accepted* rather than worked around.
+    ///
+    /// Re-pinning deliberately does NOT clear a filed claim. The claim's own
+    /// freshness is re-evaluated against the new digest at resolution time, so a
+    /// claim filed against the old deployment simply stops counting until it is
+    /// re-filed — silently voiding it here would lose the audit trail of what
+    /// was once attested.
+    pub fn pin_provider_endpoint(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            r#"
+            INSERT INTO provider_trust_evidence (effect_kind, provider, pinned_digest)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(effect_kind, provider) DO UPDATE SET
+                pinned_digest = excluded.pinned_digest,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![effect_kind, provider, digest],
+        )?;
+        Ok(())
+    }
+
+    /// File a signed custody claim. `expires_at` is mandatory because `c1`-`c3`
+    /// are testimony, and testimony with no end date is the thing that rots.
+    pub fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()> {
+        self.connection.execute(
+            r#"
+            INSERT INTO provider_trust_evidence (
+                effect_kind, provider, claim_class, claim_signer,
+                claim_filed_at, claim_expires_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(effect_kind, provider) DO UPDATE SET
+                claim_class = excluded.claim_class,
+                claim_signer = excluded.claim_signer,
+                claim_filed_at = excluded.claim_filed_at,
+                claim_expires_at = excluded.claim_expires_at,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![
+                claim.effect_kind,
+                claim.provider,
+                claim.class,
+                claim.signer,
+                claim.filed_at,
+                claim.expires_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark whether whip supervises this endpoint — the one self-checkable
+    /// class, so it carries no signer and no term.
+    pub fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            r#"
+            INSERT INTO provider_trust_evidence (effect_kind, provider, operator_run)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(effect_kind, provider) DO UPDATE SET
+                operator_run = excluded.operator_run,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![effect_kind, provider, i64::from(operator_run)],
+        )?;
+        Ok(())
+    }
+
+    /// Everything the registry has to show for one endpoint. `None` when no
+    /// evidence row exists at all — which is the floor, and is not an error:
+    /// an endpoint with nothing to show IS `unattested`/`unknown`.
+    pub fn provider_trust_evidence(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<ProviderTrustRow>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT pinned_digest, claim_class, claim_signer,
+                       claim_filed_at, claim_expires_at, operator_run
+                FROM provider_trust_evidence
+                WHERE effect_kind = ?1 AND provider = ?2
+                "#,
+                params![effect_kind, provider],
+                |row| {
+                    Ok(ProviderTrustRow {
+                        pinned_digest: row.get(0)?,
+                        claim_class: row.get(1)?,
+                        claim_signer: row.get(2)?,
+                        claim_filed_at: row.get(3)?,
+                        claim_expires_at: row.get(4)?,
+                        operator_run: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
@@ -6135,6 +6298,28 @@ pub trait RuntimeStore {
     ) -> StoreResult<()>;
     fn register_effect_provider(&self, provider: EffectProviderRegistration<'_>)
         -> StoreResult<()>;
+    /// DR-0062 §6: freeze the endpoint identity digest (the `pinned` rung).
+    fn pin_provider_endpoint(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()>;
+    /// DR-0062 §6: file a signed custody claim, term mandatory.
+    fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()>;
+    /// DR-0062 §6: mark whether whip supervises this endpoint (`operator-held`).
+    fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()>;
+    /// DR-0062 §6: the raw evidence row; `None` is the floor, not an error.
+    fn provider_trust_evidence(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<ProviderTrustRow>>;
     fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()>;
     fn registered_profile_policy(
         &self,
@@ -6447,6 +6632,32 @@ impl RuntimeStore for SqliteStore {
         provider: EffectProviderRegistration<'_>,
     ) -> StoreResult<()> {
         self.register_effect_provider(provider)
+    }
+    fn pin_provider_endpoint(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()> {
+        SqliteStore::pin_provider_endpoint(self, effect_kind, provider, digest)
+    }
+    fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()> {
+        SqliteStore::file_provider_custody_claim(self, claim)
+    }
+    fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()> {
+        SqliteStore::set_provider_operator_run(self, effect_kind, provider, operator_run)
+    }
+    fn provider_trust_evidence(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<ProviderTrustRow>> {
+        SqliteStore::provider_trust_evidence(self, effect_kind, provider)
     }
     fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
         self.register_profile(profile)
@@ -11074,6 +11285,104 @@ mod tests {
         assert_eq!(store_stage(), "release");
     }
 
+    /// DR-0062 §6: the registry records what was FILED. Derivation of rung and
+    /// class from it lives in the kernel, so this only has to be faithful.
+    #[test]
+    fn provider_trust_evidence_records_pin_claim_and_operator_run() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+
+        // Absent until something is filed — the floor, and not an error.
+        assert_eq!(
+            store
+                .provider_trust_evidence("agent_turn", "acme")
+                .expect("read"),
+            None
+        );
+
+        store
+            .pin_provider_endpoint("agent_turn", "acme", "sha256:dA")
+            .expect("pin");
+        store
+            .file_provider_custody_claim(ProviderCustodyClaim {
+                effect_kind: "agent_turn",
+                provider: "acme",
+                class: "zero-retention",
+                signer: "ops@acme.com",
+                filed_at: "2026-08-07T00:00:00Z",
+                expires_at: "2027-08-07T00:00:00Z",
+            })
+            .expect("claim");
+        store
+            .set_provider_operator_run("agent_turn", "acme", true)
+            .expect("operator run");
+
+        let row = store
+            .provider_trust_evidence("agent_turn", "acme")
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(row.pinned_digest.as_deref(), Some("sha256:dA"));
+        assert_eq!(row.claim_class.as_deref(), Some("zero-retention"));
+        assert_eq!(row.claim_signer.as_deref(), Some("ops@acme.com"));
+        assert_eq!(
+            row.claim_expires_at.as_deref(),
+            Some("2027-08-07T00:00:00Z")
+        );
+        assert!(row.operator_run);
+
+        // Re-pinning after a deliberate endpoint change must not silently void
+        // what was attested: the claim's freshness is re-judged against the new
+        // digest at resolution time.
+        store
+            .pin_provider_endpoint("agent_turn", "acme", "sha256:dB")
+            .expect("re-pin");
+        let repinned = store
+            .provider_trust_evidence("agent_turn", "acme")
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(repinned.pinned_digest.as_deref(), Some("sha256:dB"));
+        assert_eq!(repinned.claim_class.as_deref(), Some("zero-retention"));
+
+        // Evidence does not bleed between endpoints.
+        assert_eq!(
+            store
+                .provider_trust_evidence("agent_turn", "other")
+                .expect("read"),
+            None
+        );
+    }
+
+    /// Testimony with no end date is the thing that rots, so the schema refuses
+    /// it rather than treating it as perpetual.
+    #[test]
+    fn a_custody_claim_without_a_term_is_refused_by_the_schema() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let refused = store.connection.execute(
+            "INSERT INTO provider_trust_evidence (effect_kind, provider, claim_class) \
+             VALUES ('agent_turn', 'acme', 'zero-retention')",
+            [],
+        );
+        assert!(
+            refused.is_err(),
+            "a claim with no signer and no expiry must be refused"
+        );
+    }
+
+    /// The evidence table arrived as its own migration, so a store already
+    /// stamped at 1 gains it on upgrade rather than needing a rebuild.
+    #[test]
+    fn provider_trust_evidence_is_a_separate_stamped_migration() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let versions: Vec<i64> = store
+            .connection
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(versions, vec![1, 2]);
+    }
+
     /// Drive the store through the `RuntimeStore` trait as a `&dyn` object:
     /// proves the trait is object-safe (a boxed durable-object backend is legal)
     /// and that its methods delegate to the inherent methods — the contract a
@@ -11083,7 +11392,10 @@ mod tests {
     fn runtime_store_trait_seam_is_object_safe_and_faithful() {
         let store = SqliteStore::open_in_memory().expect("store opens");
         let runtime: &dyn RuntimeStore = &store;
-        assert_eq!(runtime.schema_version().expect("version"), 1);
+        assert_eq!(
+            runtime.schema_version().expect("version"),
+            SUPPORTED_SCHEMA_VERSION
+        );
         assert!(runtime.table_exists("events").expect("table exists"));
         assert!(!runtime
             .fact_exists("no_such_instance", "no_such_fact")
@@ -11094,7 +11406,10 @@ mod tests {
     fn migrations_create_runtime_tables() {
         let store = SqliteStore::open_in_memory().expect("store opens");
 
-        assert_eq!(store.schema_version().expect("version loads"), 1);
+        assert_eq!(
+            store.schema_version().expect("version loads"),
+            SUPPORTED_SCHEMA_VERSION
+        );
         for table in [
             "programs",
             "program_versions",
@@ -11114,6 +11429,7 @@ mod tests {
             "package_registrations",
             "capability_schemas",
             "effect_providers",
+            "provider_trust_evidence",
             "profiles",
             "skills",
             "skill_attachments",

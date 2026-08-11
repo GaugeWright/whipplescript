@@ -1588,6 +1588,21 @@ describe("real WorkflowInstance hibernation", () => {
     const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
     const stub = namespace.get(namespace.idFromName(sessionId));
     await bootstrapSession(stub, sessionId);
+
+    // Read the stamp a FRESH object carries rather than hardcoding it. That is
+    // what couples this test to `do_schema.sql`: adding a migration row without
+    // bumping SUPPORTED_DO_SCHEMA_VERSION makes the deploy refuse the very state
+    // it just wrote, and the assertion below catches it here instead of as two
+    // dozen opaque 500s across the rest of the suite.
+    let supported = 0;
+    await runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql
+        .exec("SELECT MAX(version) AS version FROM schema_migrations")
+        .toArray() as { version: number }[];
+      supported = rows[0].version;
+    });
+    expect(supported).toBeGreaterThan(0);
+
     await runInDurableObject(stub, async (_instance, state) => {
       state.storage.sql.exec(
         "INSERT INTO schema_migrations (version, name) VALUES (99, 'from-the-future')",
@@ -1601,7 +1616,7 @@ describe("real WorkflowInstance hibernation", () => {
     expect(response.status).toBe(500);
     const body = await response.text();
     expect(body).toContain("version 99");
-    expect(body).toContain("version 1");
+    expect(body).toContain(`version ${supported}`);
     expect(body).toContain("do not delete");
 
     // The refusal mutated nothing: the future stamp (and the object's state)

@@ -5,6 +5,7 @@
 # filename<TAB>signature
 action-expansion.maude	SSNNN
 admission.maude	SSSSNNNNNSSNNNSSNNN
+agent-provider-binding.maude	SSSNNNSS
 alpha-canonicalization.maude	SNSNSSSNSSNS
 branch-effect-key.maude	SSSNSN
 cache-prefix-append-only.maude	SSSN
@@ -67,6 +68,7 @@ merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
 messaging-capability-report.maude	SSSSNNNN
 milestone-signal.maude	SSNNN
+model-trust-admissibility.maude	SSSNNNNNNSS
 native-provider-lifecycle.maude	SSSNN
 op-undo.maude	SNSSSN
 owned-harness-compaction.maude	SN

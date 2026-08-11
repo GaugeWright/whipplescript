@@ -1408,6 +1408,13 @@ impl GovernedHostRuntime {
         let policy = PolicyEpochRef::from_verified(epoch, &envelope)?;
         let store_path = store_path.as_ref().to_path_buf();
         let store = SqliteStore::open(&store_path).map_err(HostRuntimeError::Store)?;
+        // DR-0062 §4: a delegation edge granting a model endpoint read-authority
+        // for a role is admissible only if the endpoint's derived custody class
+        // clears what the signed envelope demands of that role. This is the one
+        // place both halves are in hand -- the envelope carries the demand, the
+        // store carries the evidence -- so the refusal lands at policy-load
+        // time rather than at the first turn that would have leaked.
+        refuse_inadmissible_provider_delegations(&store, &envelope)?;
         Ok(Self {
             kernel: RuntimeKernel::new(store),
             store_path,
@@ -3037,6 +3044,89 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
+/// The effect kind model-endpoint providers register under, and therefore the
+/// one custody evidence is keyed by (DR-0062 §6).
+pub const AGENT_TURN_EFFECT_KIND: &str = "agent.tell";
+
+/// What the registry currently supports for one model endpoint.
+pub struct ResolvedProviderTrust {
+    pub derived: whipplescript_kernel::provider_trust::DerivedTrust,
+    pub row: whipplescript_store::ProviderTrustRow,
+    /// The endpoint's digest as computed NOW. `None` when the registry has no
+    /// config for it at all.
+    pub live_digest: Option<String>,
+}
+
+/// Resolve an endpoint's rung and custody class from registry evidence.
+///
+/// Resolution, not storage, decides freshness: the live digest is recomputed
+/// here from the endpoint's current `effect_providers` config, so a deployment
+/// that moved under a pin is caught rather than vouched for by a stale row.
+///
+/// An endpoint the registry has never heard of resolves to no config and
+/// therefore no live digest, which cannot match any pin -- it lands at the floor.
+/// That is the fail-closed direction: a delegation naming an endpoint whip
+/// cannot identify must not pass.
+pub fn resolve_provider_trust(
+    store: &SqliteStore,
+    provider: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ResolvedProviderTrust, whipplescript_store::StoreError> {
+    use whipplescript_kernel::provider_trust::{
+        derive, endpoint_digest, evidence_from_registry, RegistryEvidence,
+    };
+    let live_digest = store
+        .effect_provider_config(AGENT_TURN_EFFECT_KIND, provider)?
+        .map(|config| endpoint_digest(&config));
+    let row = store
+        .provider_trust_evidence(AGENT_TURN_EFFECT_KIND, provider)?
+        .unwrap_or_default();
+    let evidence = evidence_from_registry(
+        RegistryEvidence {
+            pinned_digest: row.pinned_digest.as_deref(),
+            claim_class: row.claim_class.as_deref(),
+            claim_signer: row.claim_signer.as_deref(),
+            claim_expires_at: row.claim_expires_at.as_deref(),
+            operator_run: row.operator_run,
+        },
+        live_digest.as_deref(),
+        now,
+    );
+    Ok(ResolvedProviderTrust {
+        derived: derive(&evidence),
+        row,
+        live_digest,
+    })
+}
+
+/// Refuse a policy whose model-endpoint delegations out-run their evidence
+/// (DR-0062 §4). The envelope carries the demand and the store carries the
+/// evidence, so the refusal lands at policy-load time rather than at the first
+/// turn that would have leaked.
+fn refuse_inadmissible_provider_delegations(
+    store: &SqliteStore,
+    envelope: &VerifiedEnvelope,
+) -> Result<(), HostRuntimeError> {
+    use whipplescript_kernel::provider_trust::delegation_admissible;
+
+    let now = chrono::Utc::now();
+    for (provider, role) in envelope.provider_delegations() {
+        let Some(demand) = envelope.custody_demand_for(role) else {
+            // No demand declared for this role: unconstrained, and an
+            // unattested endpoint keeps working (public-only).
+            continue;
+        };
+        let resolved =
+            resolve_provider_trust(store, provider, now).map_err(HostRuntimeError::Store)?;
+        if let Err(denial) = delegation_admissible(&resolved.derived, Some(demand)) {
+            return Err(HostRuntimeError::PolicyRejected(
+                denial.message(provider, role),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3294,6 +3384,95 @@ workflow UnsafeHostChat {
         };
         SignedEnvelope::sign_for_test(&policy.to_json().expect("policy"), "gaugedesk-admin")
             .to_json()
+    }
+
+    /// DR-0062 §4: the refusal lands at policy-load time, not at the first turn
+    /// that would have leaked. The endpoint here is registered but bare -- no
+    /// pin, nothing filed -- so it sits at the floor while the envelope demands
+    /// zero-retention of Operator data.
+    #[test]
+    fn a_policy_whose_endpoint_under_clears_its_role_is_refused_at_load() {
+        let path = temp_store();
+        let policy_text = SignedEnvelope::sign_for_test(
+            "delegate provider:builtin-agent-harness acts-for Operator for confidentiality\n\
+             require custody zero-retention for Operator\n",
+            "admin",
+        )
+        .to_json();
+
+        let error = GovernedHostRuntime::open(&path, 1, &policy_text)
+            .err()
+            .expect("an unattested endpoint must not carry Operator data");
+        let message = format!("{error:?}");
+        assert!(message.contains("pinned endpoint"), "{message}");
+
+        // The same policy passes once the evidence actually supports it: pin the
+        // endpoint, then record that the operator runs it.
+        {
+            let store = SqliteStore::open(&path).expect("store");
+            let config = store
+                .effect_provider_config(AGENT_TURN_EFFECT_KIND, "builtin-agent-harness")
+                .expect("config")
+                .expect("seeded provider");
+            let digest = whipplescript_kernel::provider_trust::endpoint_digest(&config);
+            store
+                .pin_provider_endpoint(AGENT_TURN_EFFECT_KIND, "builtin-agent-harness", &digest)
+                .expect("pin");
+            store
+                .set_provider_operator_run(AGENT_TURN_EFFECT_KIND, "builtin-agent-harness", true)
+                .expect("operator run");
+        }
+        GovernedHostRuntime::open(&path, 1, &policy_text).expect("admissible now");
+    }
+
+    /// A role the envelope says nothing about places no demand, so zero setup
+    /// keeps working -- the endpoint is simply public-only.
+    #[test]
+    fn a_policy_with_no_custody_demand_loads_against_a_bare_endpoint() {
+        let path = temp_store();
+        let policy_text = SignedEnvelope::sign_for_test(
+            "delegate provider:builtin-agent-harness acts-for Operator for confidentiality\n",
+            "admin",
+        )
+        .to_json();
+        GovernedHostRuntime::open(&path, 1, &policy_text).expect("unconstrained");
+    }
+
+    /// Drift is caught at load: the pin was taken against one deployment and the
+    /// endpoint now resolves to another, so the claim stops counting.
+    #[test]
+    fn a_drifted_endpoint_is_refused_even_with_a_current_claim() {
+        let path = temp_store();
+        {
+            let store = SqliteStore::open(&path).expect("store");
+            store
+                .pin_provider_endpoint(
+                    AGENT_TURN_EFFECT_KIND,
+                    "builtin-agent-harness",
+                    "sha256:a-deployment-this-no-longer-is",
+                )
+                .expect("pin");
+            store
+                .file_provider_custody_claim(whipplescript_store::ProviderCustodyClaim {
+                    effect_kind: AGENT_TURN_EFFECT_KIND,
+                    provider: "builtin-agent-harness",
+                    class: "operator-held",
+                    signer: "ops@acme.com",
+                    filed_at: "2026-08-07T00:00:00Z",
+                    expires_at: "2099-01-01T00:00:00Z",
+                })
+                .expect("claim");
+        }
+        let policy_text = SignedEnvelope::sign_for_test(
+            "delegate provider:builtin-agent-harness acts-for Operator for confidentiality\n\
+             require custody zero-retention for Operator\n",
+            "admin",
+        )
+        .to_json();
+        let error = GovernedHostRuntime::open(&path, 1, &policy_text)
+            .err()
+            .expect("testimony about a deployment this no longer is must not count");
+        assert!(format!("{error:?}").contains("pinned endpoint"));
     }
 
     fn temp_store() -> std::path::PathBuf {

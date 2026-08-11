@@ -1,5 +1,6 @@
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT);
             INSERT INTO schema_migrations (version, name) VALUES (1, 'init');
+            INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -170,6 +171,15 @@
                 provider_id TEXT NOT NULL, effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
                 capability TEXT NOT NULL, config_json TEXT NOT NULL, registered_by_package_id TEXT,
                 UNIQUE(effect_kind, provider)
+            );
+            CREATE TABLE provider_trust_evidence (
+                effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
+                pinned_digest TEXT,
+                claim_class TEXT, claim_signer TEXT, claim_filed_at TEXT, claim_expires_at TEXT,
+                operator_run INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (effect_kind, provider),
+                CHECK (claim_class IS NULL OR (claim_signer IS NOT NULL AND claim_expires_at IS NOT NULL))
             );
             CREATE TABLE profiles (
                 profile_id TEXT NOT NULL, name TEXT PRIMARY KEY, description TEXT NOT NULL,

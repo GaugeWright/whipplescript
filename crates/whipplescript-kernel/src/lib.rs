@@ -25,6 +25,7 @@ pub mod native_lifecycle;
 pub mod package_registry;
 pub mod principal;
 pub mod provider;
+pub mod provider_trust;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;

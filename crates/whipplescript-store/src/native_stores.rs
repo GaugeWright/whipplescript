@@ -242,6 +242,38 @@ impl RuntimeStore for NativeStores {
         self.runtime.register_effect_provider(provider)
     }
 
+    fn pin_provider_endpoint(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()> {
+        self.runtime
+            .pin_provider_endpoint(effect_kind, provider, digest)
+    }
+
+    fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()> {
+        self.runtime.file_provider_custody_claim(claim)
+    }
+
+    fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()> {
+        self.runtime
+            .set_provider_operator_run(effect_kind, provider, operator_run)
+    }
+
+    fn provider_trust_evidence(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<ProviderTrustRow>> {
+        self.runtime.provider_trust_evidence(effect_kind, provider)
+    }
+
     fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
         self.runtime.register_profile(profile)
     }

@@ -274,6 +274,7 @@ fn main() -> ExitCode {
         Some("recover") => recover(&options),
         Some("auth") => auth_command(&options),
         Some("mcp") => mcp_command(&options),
+        Some("provider") => provider_command(&options),
         Some("deploy") => deploy_command(&options),
         Some("executor") => executor_command(&options),
         Some("turn-once") => turn_once_command(&options),
@@ -909,6 +910,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "mcp" => "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
+        "provider" => "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]>\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
@@ -22764,6 +22766,336 @@ fn auth_command(options: &CliOptions) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `whip provider` — the evidence half of model trust tiers (DR-0062 §6).
+///
+/// Evidence is recorded HERE, by day-to-day commands, and the bar it is judged
+/// against lives in the signed governance envelope. That split is the whole
+/// point: whoever provisions an endpoint must not also be able to lower the
+/// demand it has to clear.
+fn provider_command(options: &CliOptions) -> ExitCode {
+    let usage = command_usage("provider").unwrap_or_default();
+    let mut positional = Vec::new();
+    let mut custody = None::<String>;
+    let mut signer = None::<String>;
+    let mut until = None::<String>;
+    let mut off = false;
+    let mut iter = options.args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--custody" => custody = iter.next().cloned(),
+            "--signer" => signer = iter.next().cloned(),
+            "--until" => until = iter.next().cloned(),
+            "--off" => off = true,
+            other if other.starts_with('-') => {
+                eprintln!("unknown provider option `{other}`");
+                return ExitCode::from(2);
+            }
+            other => positional.push(other.to_owned()),
+        }
+    }
+    let subcommand = positional.first().map(String::as_str);
+    let name = positional.get(1).cloned();
+    match subcommand {
+        Some("list") => provider_list(options),
+        Some("status") => provider_status(options, name),
+        Some("pin") => provider_pin(options, name),
+        Some("attest") => provider_attest(options, name, custody, signer, until),
+        Some("operator-run") => provider_operator_run(options, name, !off),
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn provider_store_or_exit(options: &CliOptions) -> Result<SqliteStore, ExitCode> {
+    SqliteStore::open(&options.store_path).map_err(|error| {
+        eprintln!("cannot open store: {error:?}");
+        ExitCode::FAILURE
+    })
+}
+
+fn provider_name_or_exit(name: Option<String>) -> Result<String, ExitCode> {
+    name.ok_or_else(|| {
+        eprintln!("{}", command_usage("provider").unwrap_or_default());
+        ExitCode::from(2)
+    })
+}
+
+/// One endpoint's resolved state, as both humans and `--json` want it.
+fn provider_trust_json(
+    provider: &str,
+    resolved: &whipplescript::host_runtime::ResolvedProviderTrust,
+) -> serde_json::Value {
+    let drifted = resolved.row.pinned_digest.is_some()
+        && resolved.row.pinned_digest.as_deref() != resolved.live_digest.as_deref();
+    json!({
+        "provider": provider,
+        "rung": resolved.derived.rung.as_str(),
+        "custody": resolved.derived.custody.as_str(),
+        "degraded": resolved.derived.degraded,
+        "drifted": drifted,
+        "pinned_digest": resolved.row.pinned_digest,
+        "live_digest": resolved.live_digest,
+        "claim": resolved.row.claim_class.as_ref().map(|class| json!({
+            "custody": class,
+            "signer": resolved.row.claim_signer,
+            "filed_at": resolved.row.claim_filed_at,
+            "expires_at": resolved.row.claim_expires_at,
+        })),
+        "operator_run": resolved.row.operator_run,
+    })
+}
+
+fn provider_list(options: &CliOptions) -> ExitCode {
+    let store = match provider_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let providers =
+        match store.list_effect_providers(whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND) {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("cannot list providers: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let now = chrono::Utc::now();
+    let mut rows = Vec::new();
+    for provider in &providers {
+        match whipplescript::host_runtime::resolve_provider_trust(&store, provider, now) {
+            Ok(resolved) => rows.push(provider_trust_json(provider, &resolved)),
+            Err(error) => {
+                eprintln!("cannot resolve `{provider}`: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if options.json {
+        let _ = emit_json(json!({"providers": rows}));
+    } else if rows.is_empty() {
+        println!("no model endpoints registered");
+    } else {
+        for row in &rows {
+            println!(
+                "{:<28} {:<11} {:<15}{}",
+                row["provider"].as_str().unwrap_or_default(),
+                row["rung"].as_str().unwrap_or_default(),
+                row["custody"].as_str().unwrap_or_default(),
+                if row["drifted"].as_bool().unwrap_or(false) {
+                    "  DRIFTED"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn provider_status(options: &CliOptions, name: Option<String>) -> ExitCode {
+    let provider = match provider_name_or_exit(name) {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
+    let store = match provider_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let resolved = match whipplescript::host_runtime::resolve_provider_trust(
+        &store,
+        &provider,
+        chrono::Utc::now(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("cannot resolve `{provider}`: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = provider_trust_json(&provider, &resolved);
+    if options.json {
+        let _ = emit_json(report);
+        return ExitCode::SUCCESS;
+    }
+    println!("provider:   {provider}");
+    println!(
+        "rung:       {}{}",
+        resolved.derived.rung.as_str(),
+        if resolved.derived.degraded {
+            "  (degraded — nothing has been staked on this endpoint)"
+        } else {
+            ""
+        }
+    );
+    println!("custody:    {}", resolved.derived.custody.as_str());
+    match (&resolved.row.pinned_digest, &resolved.live_digest) {
+        (None, Some(live)) => println!("pin:        none (endpoint is currently {live})"),
+        (None, None) => println!("pin:        none (endpoint has no registry config)"),
+        (Some(pinned), live) if Some(pinned) != live.as_ref() => println!(
+            "pin:        {pinned}\nlive:       {}  DRIFTED — the pin no longer describes this endpoint",
+            live.as_deref().unwrap_or("<no config>")
+        ),
+        (Some(pinned), _) => println!("pin:        {pinned}  (fresh)"),
+    }
+    match (
+        &resolved.row.claim_class,
+        &resolved.row.claim_signer,
+        &resolved.row.claim_expires_at,
+    ) {
+        (Some(class), signer, expires) => println!(
+            "claim:      {class}, signed by {}, until {}",
+            signer.as_deref().unwrap_or("<unknown>"),
+            expires.as_deref().unwrap_or("<no term>")
+        ),
+        _ => println!("claim:      none filed"),
+    }
+    println!(
+        "operator:   {}",
+        if resolved.row.operator_run {
+            "whip supervises this endpoint"
+        } else {
+            "third-party endpoint"
+        }
+    );
+    ExitCode::SUCCESS
+}
+
+fn provider_pin(options: &CliOptions, name: Option<String>) -> ExitCode {
+    let provider = match provider_name_or_exit(name) {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
+    let store = match provider_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let config = match store.effect_provider_config(
+        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
+        &provider,
+    ) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            // Refusing here rather than pinning a placeholder: a pin is a claim
+            // about an endpoint's identity, and there is no identity to freeze.
+            eprintln!(
+                "no `{}` provider named `{provider}` is registered — nothing to pin",
+                whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("cannot read provider config: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let digest = whipplescript_kernel::provider_trust::endpoint_digest(&config);
+    if let Err(error) = store.pin_provider_endpoint(
+        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
+        &provider,
+        &digest,
+    ) {
+        eprintln!("cannot pin `{provider}`: {error:?}");
+        return ExitCode::FAILURE;
+    }
+    if options.json {
+        let _ = emit_json(json!({"provider": provider, "pinned_digest": digest}));
+    } else {
+        println!("pinned {provider} at {digest}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn provider_attest(
+    options: &CliOptions,
+    name: Option<String>,
+    custody: Option<String>,
+    signer: Option<String>,
+    until: Option<String>,
+) -> ExitCode {
+    let provider = match provider_name_or_exit(name) {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
+    let (Some(custody), Some(signer), Some(until)) = (custody, signer, until) else {
+        // All three are mandatory because a custody claim IS testimony: a class
+        // with nobody's name on it, or with no end date, is not evidence.
+        eprintln!("attest needs --custody <class> --signer <who> --until <rfc3339>");
+        return ExitCode::from(2);
+    };
+    let Some(class) = whipplescript_kernel::provider_trust::CustodyClass::parse(&custody) else {
+        eprintln!(
+            "unknown custody class `{custody}` ({})",
+            whipplescript_kernel::provider_trust::CustodyClass::NAMES
+        );
+        return ExitCode::from(2);
+    };
+    if chrono::DateTime::parse_from_rfc3339(&until).is_err() {
+        eprintln!("--until needs an RFC 3339 timestamp, got `{until}`");
+        return ExitCode::from(2);
+    }
+    let store = match provider_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let filed_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) =
+        store.file_provider_custody_claim(whipplescript_store::ProviderCustodyClaim {
+            effect_kind: whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
+            provider: &provider,
+            class: class.as_str(),
+            signer: &signer,
+            filed_at: &filed_at,
+            expires_at: &until,
+        })
+    {
+        eprintln!("cannot file claim for `{provider}`: {error:?}");
+        return ExitCode::FAILURE;
+    }
+    if options.json {
+        let _ = emit_json(json!({
+            "provider": provider,
+            "custody": class.as_str(),
+            "signer": signer,
+            "expires_at": until,
+        }));
+    } else {
+        println!(
+            "filed {} for {provider}, signed by {signer}, until {until}",
+            class.as_str()
+        );
+        println!("note: the claim counts only while `{provider}` stays pinned — `whip provider status {provider}`");
+    }
+    ExitCode::SUCCESS
+}
+
+fn provider_operator_run(options: &CliOptions, name: Option<String>, on: bool) -> ExitCode {
+    let provider = match provider_name_or_exit(name) {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
+    let store = match provider_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    if let Err(error) = store.set_provider_operator_run(
+        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
+        &provider,
+        on,
+    ) {
+        eprintln!("cannot mark `{provider}`: {error:?}");
+        return ExitCode::FAILURE;
+    }
+    if options.json {
+        let _ = emit_json(json!({"provider": provider, "operator_run": on}));
+    } else if on {
+        println!("{provider} marked operator-held");
+    } else {
+        println!("{provider} no longer marked operator-held");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `whip mcp ...` — the operator door onto the MCP server registry

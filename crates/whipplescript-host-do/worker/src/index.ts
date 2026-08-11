@@ -264,7 +264,7 @@ const BUILTIN_SEEDS = [
 // understands. A rolled-back worker attached to an object stamped past this
 // must refuse rather than misread (or "lazily upgrade") a layout it has never
 // seen. Keep in step with the version rows `do_schema.sql` inserts.
-const SUPPORTED_DO_SCHEMA_VERSION = 1;
+const SUPPORTED_DO_SCHEMA_VERSION = 2;
 
 /**
  * DR-0054 Phase B: the object's durable schema is stamped with a version newer

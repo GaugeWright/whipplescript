@@ -19,6 +19,15 @@ items_store_root="$(mktemp -d)"
 trap 'rm -rf "$items_store_root"' EXIT
 export WHIPPLESCRIPT_ITEMS_STORE="$items_store_root/items.sqlite"
 
+# The green bar also runs on the public mirror, which is a curated projection
+# rather than an active repository and so does not receive AGENTS.md. The guide
+# check applies where the guide exists; that AGENTS.md is present at all in this
+# repository is checked from GaugeWright, which owns the shared guidance.
+if [ -f AGENTS.md ]; then
+    echo "== agent guide =="
+    node scripts/check-agent-guide.mjs
+fi
+
 echo "== formatting =="
 cargo fmt --all -- --check
 

@@ -5307,6 +5307,87 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(())
     }
 
+    // DR-0062 §6 provider-trust evidence, DO parity: the SAME table, the same
+    // upsert keys, and the same rule that a filed claim carries a term (the
+    // CHECK rides in `do_schema.sql`). Derivation is deliberately NOT here —
+    // `provider_trust::derive` in the kernel is the one place that decides what
+    // evidence supports, so the two placements cannot drift on the ladder.
+    fn pin_provider_endpoint(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        digest: &str,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO provider_trust_evidence (effect_kind, provider, pinned_digest) VALUES (?1, ?2, ?3) ON CONFLICT(effect_kind, provider) DO UPDATE SET pinned_digest = excluded.pinned_digest, updated_at = CURRENT_TIMESTAMP",
+                &[text(effect_kind), text(provider), text(digest)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn file_provider_custody_claim(&self, claim: ProviderCustodyClaim<'_>) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO provider_trust_evidence (effect_kind, provider, claim_class, claim_signer, claim_filed_at, claim_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(effect_kind, provider) DO UPDATE SET claim_class = excluded.claim_class, claim_signer = excluded.claim_signer, claim_filed_at = excluded.claim_filed_at, claim_expires_at = excluded.claim_expires_at, updated_at = CURRENT_TIMESTAMP",
+                &[
+                    text(claim.effect_kind),
+                    text(claim.provider),
+                    text(claim.class),
+                    text(claim.signer),
+                    text(claim.filed_at),
+                    text(claim.expires_at),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn set_provider_operator_run(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+        operator_run: bool,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO provider_trust_evidence (effect_kind, provider, operator_run) VALUES (?1, ?2, ?3) ON CONFLICT(effect_kind, provider) DO UPDATE SET operator_run = excluded.operator_run, updated_at = CURRENT_TIMESTAMP",
+                &[
+                    text(effect_kind),
+                    text(provider),
+                    int(i64::from(operator_run)),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn provider_trust_evidence(
+        &self,
+        effect_kind: &str,
+        provider: &str,
+    ) -> StoreResult<Option<ProviderTrustRow>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT pinned_digest, claim_class, claim_signer, claim_filed_at, claim_expires_at, operator_run FROM provider_trust_evidence WHERE effect_kind = ?1 AND provider = ?2",
+                &[text(effect_kind), text(provider)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(ProviderTrustRow {
+            pinned_digest: row.first().and_then(as_opt_text),
+            claim_class: row.get(1).and_then(as_opt_text),
+            claim_signer: row.get(2).and_then(as_opt_text),
+            claim_filed_at: row.get(3).and_then(as_opt_text),
+            claim_expires_at: row.get(4).and_then(as_opt_text),
+            operator_run: row.get(5).map(as_i64).unwrap_or(0) != 0,
+        }))
+    }
+
     fn register_profile(&self, profile: ProfileRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(profile.allowed_capabilities_json)?;
         serde_json::from_str::<Value>(profile.config_json)?;
@@ -8864,6 +8945,7 @@ pub(crate) mod test_support {
             r#"
             CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT);
             INSERT INTO schema_migrations (version, name) VALUES (1, 'init');
+            INSERT INTO schema_migrations (version, name) VALUES (2, 'provider-trust-evidence');
             CREATE TABLE events (
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -9035,6 +9117,15 @@ pub(crate) mod test_support {
                 provider_id TEXT NOT NULL, effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
                 capability TEXT NOT NULL, config_json TEXT NOT NULL, registered_by_package_id TEXT,
                 UNIQUE(effect_kind, provider)
+            );
+            CREATE TABLE provider_trust_evidence (
+                effect_kind TEXT NOT NULL, provider TEXT NOT NULL,
+                pinned_digest TEXT,
+                claim_class TEXT, claim_signer TEXT, claim_filed_at TEXT, claim_expires_at TEXT,
+                operator_run INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (effect_kind, provider),
+                CHECK (claim_class IS NULL OR (claim_signer IS NOT NULL AND claim_expires_at IS NOT NULL))
             );
             CREATE TABLE profiles (
                 profile_id TEXT NOT NULL, name TEXT PRIMARY KEY, description TEXT NOT NULL,
@@ -9451,12 +9542,77 @@ mod tests {
         }
     }
 
+    /// DR-0062 §6 provider-trust evidence, DO parity: the same four operations
+    /// against the DO's own engine, keyed the same way. The native mirror is
+    /// `provider_trust_evidence_records_pin_claim_and_operator_run`; the two
+    /// must move together.
+    #[test]
+    fn do_store_records_provider_trust_evidence() {
+        let store = store();
+
+        assert_eq!(
+            store
+                .provider_trust_evidence("agent_turn", "acme")
+                .expect("read"),
+            None,
+            "no row is the floor, not an error"
+        );
+
+        store
+            .pin_provider_endpoint("agent_turn", "acme", "sha256:dA")
+            .expect("pin");
+        store
+            .file_provider_custody_claim(ProviderCustodyClaim {
+                effect_kind: "agent_turn",
+                provider: "acme",
+                class: "zero-retention",
+                signer: "ops@acme.com",
+                filed_at: "2026-08-07T00:00:00Z",
+                expires_at: "2027-08-07T00:00:00Z",
+            })
+            .expect("claim");
+        store
+            .set_provider_operator_run("agent_turn", "acme", true)
+            .expect("operator run");
+
+        let row = store
+            .provider_trust_evidence("agent_turn", "acme")
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(row.pinned_digest.as_deref(), Some("sha256:dA"));
+        assert_eq!(row.claim_class.as_deref(), Some("zero-retention"));
+        assert_eq!(row.claim_signer.as_deref(), Some("ops@acme.com"));
+        assert_eq!(
+            row.claim_expires_at.as_deref(),
+            Some("2027-08-07T00:00:00Z")
+        );
+        assert!(row.operator_run);
+
+        // Re-pinning leaves the filed claim standing, as natively.
+        store
+            .pin_provider_endpoint("agent_turn", "acme", "sha256:dB")
+            .expect("re-pin");
+        let repinned = store
+            .provider_trust_evidence("agent_turn", "acme")
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(repinned.pinned_digest.as_deref(), Some("sha256:dB"));
+        assert_eq!(repinned.claim_class.as_deref(), Some("zero-retention"));
+
+        assert_eq!(
+            store
+                .provider_trust_evidence("agent_turn", "other")
+                .expect("read"),
+            None
+        );
+    }
+
     /// The ported core methods run their real SQL against a real engine.
     #[test]
     fn do_store_core_methods_run_real_sql() {
         let store = store();
 
-        assert_eq!(store.schema_version().expect("version"), 1);
+        assert_eq!(store.schema_version().expect("version"), 2);
         assert!(!store.fact_exists("i1", "ready").expect("fact"));
 
         let event = store

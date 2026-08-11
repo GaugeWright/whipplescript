@@ -86,6 +86,23 @@ pub struct Envelope {
     /// beside the evidence, whoever provisions a credential could also lower
     /// the bar it is judged against.
     credential_min_rung: Option<whipplescript_custody::Rung>,
+    /// `require custody <class> for <Role>` (DR-0062 §6): the minimum custody
+    /// class an endpoint must reach before a delegation edge may grant it
+    /// read-authority for that role. Keyed by ROLE, not by resource, and that is
+    /// an enforcement-siting decision: delegation edges are per-role, so a
+    /// role-keyed demand is checkable at the edge, once, at config time. Keyed
+    /// per-resource it would not be checkable there at all — a provider
+    /// delegated for Operator reads every Operator resource — so enforcement
+    /// would scatter to every egress site.
+    ///
+    /// A role absent here is UNCONSTRAINED, the same `None`-means-no-floor
+    /// reading `mcp_min_rung` has: zero setup keeps working, public-only.
+    ///
+    /// In the ENVELOPE beside `require mcp` / `require credential` and for the
+    /// same reason — the registry holds the evidence, so if the bar lived there
+    /// too, whoever provisions an endpoint could lower the bar it is judged
+    /// against.
+    custody_demand: BTreeMap<String, crate::provider_trust::CustodyClass>,
     /// workflow-invoke resources (`invoke:<name>`) governance marks INTERNAL (E2):
     /// the target is attested as a bundle-private workflow, not a cross-boundary
     /// invocation endpoint.
@@ -207,6 +224,31 @@ impl Envelope {
             ),
             Some(_) => return Err("credential_min_rung must be a string".to_owned()),
         };
+        // Per-role custody demands (DR-0062 §6), same discipline: an
+        // unrecognized class is an ERROR, never an ignored key. A policy that
+        // meant to demand `zero-retention` and got a typo must not silently
+        // degrade to no demand at all.
+        let mut custody_demand: BTreeMap<String, crate::provider_trust::CustodyClass> =
+            BTreeMap::new();
+        match value.get("custody_demand") {
+            None => {}
+            Some(serde_json::Value::Object(entries)) => {
+                for (role, class) in entries {
+                    let Some(class) = class.as_str() else {
+                        return Err(format!("custody_demand for `{role}` must be a string"));
+                    };
+                    let parsed =
+                        crate::provider_trust::CustodyClass::parse(class).ok_or_else(|| {
+                            format!(
+                                "unknown custody class `{class}` for `{role}` ({})",
+                                crate::provider_trust::CustodyClass::NAMES
+                            )
+                        })?;
+                    custody_demand.insert(role.clone(), parsed);
+                }
+            }
+            Some(_) => return Err("custody_demand must be an object".to_owned()),
+        }
         let capabilities = value
             .get("capabilities")
             .and_then(serde_json::Value::as_array)
@@ -341,6 +383,7 @@ impl Envelope {
             internal_workflows,
             mcp_min_rung,
             credential_min_rung,
+            custody_demand,
             address_of,
             party_of,
             guarantees,
@@ -367,6 +410,8 @@ impl Envelope {
         let mut internal_workflows = BTreeSet::new();
         let mut mcp_min_rung: Option<crate::mcp::McpRung> = None;
         let mut credential_min_rung: Option<whipplescript_custody::Rung> = None;
+        let mut custody_demand: BTreeMap<String, crate::provider_trust::CustodyClass> =
+            BTreeMap::new();
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
@@ -432,10 +477,42 @@ impl Envelope {
                         credential_min_rung = Some(parsed);
                         continue;
                     }
+                    // `require custody <class> for <Role>` (DR-0062 §6): the
+                    // minimum custody class an endpoint must reach before a
+                    // delegation may grant it read-authority for that role.
+                    // Keyed by role so the check lands at the delegation edge.
+                    (Some("custody"), Some(class)) => {
+                        let parsed =
+                            crate::provider_trust::CustodyClass::parse(class).ok_or_else(|| {
+                                format!(
+                                    "line {}: unknown custody class `{class}` ({})",
+                                    index + 1,
+                                    crate::provider_trust::CustodyClass::NAMES
+                                )
+                            })?;
+                        // The role is not optional. A bare `require custody c3`
+                        // would read as a global floor, and there is no such
+                        // thing here: the demand is what a ROLE's data asks of
+                        // an endpoint, so an unscoped one has no meaning.
+                        match (tokens.get(3).copied(), tokens.get(4).copied()) {
+                            (Some("for"), Some(role)) => {
+                                custody_demand.insert(role.to_owned(), parsed);
+                                continue;
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "line {}: require custody needs \
+                                     `require custody <class> for <Role>`",
+                                    index + 1
+                                ))
+                            }
+                        }
+                    }
                     _ => {
                         return Err(format!(
-                            "line {}: require needs `require mcp <rung>` or \
-                             `require credential <rung>`",
+                            "line {}: require needs `require mcp <rung>`, \
+                             `require credential <rung>`, or \
+                             `require custody <class> for <Role>`",
                             index + 1
                         ))
                     }
@@ -550,6 +627,7 @@ impl Envelope {
             internal_workflows,
             mcp_min_rung,
             credential_min_rung,
+            custody_demand,
             address_of,
             party_of,
             guarantees,
@@ -641,6 +719,24 @@ impl Envelope {
         // emit-when-declared rule, same signed-artifact rationale.
         if let Some(rung) = self.credential_min_rung {
             canonical["credential_min_rung"] = serde_json::Value::String(rung.as_str().to_owned());
+        }
+        // Per-role custody demands (DR-0062 §6): same emit-when-declared rule,
+        // and the signed-artifact rationale matters most here — the registry
+        // holds the evidence and is written by day-to-day `whip provider`
+        // commands, so a demand that lived outside the signature could be
+        // lowered by whoever provisions the endpoint it judges.
+        if !self.custody_demand.is_empty() {
+            canonical["custody_demand"] = serde_json::Value::Object(
+                self.custody_demand
+                    .iter()
+                    .map(|(role, class)| {
+                        (
+                            role.clone(),
+                            serde_json::Value::String(class.as_str().to_owned()),
+                        )
+                    })
+                    .collect(),
+            );
         }
         // Typed host governance policy (SUB-4): same emit-when-declared rule as
         // guarantees, so envelopes carrying no policy keep their signed hashes.
@@ -803,6 +899,37 @@ impl Envelope {
     /// reports on every reply — a reply below the floor is refused.
     pub fn credential_min_rung(&self) -> Option<whipplescript_custody::Rung> {
         self.credential_min_rung
+    }
+
+    /// The custody class this policy demands of any endpoint delegated
+    /// read-authority for `role` (DR-0062 §6). `None` = unconstrained.
+    pub fn custody_demand_for(&self, role: &str) -> Option<crate::provider_trust::CustodyClass> {
+        self.custody_demand.get(role).copied()
+    }
+
+    /// Delegation edges whose subject is a model endpoint, as
+    /// `(provider-name, role)` — the edges DR-0062 §4 gates. The `provider:`
+    /// prefix is stripped so the name matches the registry's `provider` column.
+    ///
+    /// The confidentiality/integrity axis on the `delegate` line is not
+    /// consulted: a custody demand is about who ends up HOLDING the transcript,
+    /// which is true of an endpoint however its authority was framed.
+    pub fn provider_delegations(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.deleg.iter().filter_map(|(subject, role)| {
+            subject
+                .strip_prefix("provider:")
+                .map(|provider| (provider, role.as_str()))
+        })
+    }
+
+    /// Every declared custody demand, for the realized-protection report and
+    /// `whip provider status`.
+    pub fn custody_demands(
+        &self,
+    ) -> impl Iterator<Item = (&str, crate::provider_trust::CustodyClass)> {
+        self.custody_demand
+            .iter()
+            .map(|(role, class)| (role.as_str(), *class))
     }
 
     fn permits_capabilities(&self, capabilities: &[String]) -> bool {
@@ -1383,6 +1510,17 @@ impl VerifiedEnvelope {
     /// any (DR-0053 §4).
     pub fn credential_min_rung(&self) -> Option<whipplescript_custody::Rung> {
         self.envelope.credential_min_rung()
+    }
+
+    /// The custody class this verified policy demands of any endpoint delegated
+    /// read-authority for `role` (DR-0062 §6).
+    pub fn custody_demand_for(&self, role: &str) -> Option<crate::provider_trust::CustodyClass> {
+        self.envelope.custody_demand_for(role)
+    }
+
+    /// The model-endpoint delegation edges this policy declares (DR-0062 §4).
+    pub fn provider_delegations(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.envelope.provider_delegations()
     }
 
     /// The dynamic per-turn guarantees this policy requires each turn to
@@ -8147,5 +8285,115 @@ rule settle
         // Emit-when-declared: silent envelopes keep their signed hashes.
         let quiet = Envelope::from_dsl("delegate A acts-for B\n").expect("parsed");
         assert!(!quiet.to_canonical_json().contains("credential_min_rung"));
+    }
+
+    #[test]
+    fn envelope_dsl_declares_a_per_role_custody_demand() {
+        // DR-0062 §6: keyed by ROLE, because delegation edges are per-role and
+        // that is what makes the demand checkable at the edge rather than at
+        // every egress site.
+        let envelope = Envelope::from_dsl(
+            "require custody zero-retention for Operator\n\
+             require custody retained for Support\n",
+        )
+        .expect("parsed");
+        assert_eq!(
+            envelope.custody_demand_for("Operator"),
+            Some(crate::provider_trust::CustodyClass::ZeroRetention)
+        );
+        assert_eq!(
+            envelope.custody_demand_for("Support"),
+            Some(crate::provider_trust::CustodyClass::Retained)
+        );
+        // An undeclared role is UNCONSTRAINED, not defaulted to the floor:
+        // zero setup keeps working, public-only.
+        assert_eq!(envelope.custody_demand_for("Auditor"), None);
+        // The numeric alias parses too (the DR-0053 spelling discipline).
+        let alias = Envelope::from_dsl("require custody c4 for Operator\n").expect("parsed");
+        assert_eq!(
+            alias.custody_demand_for("Operator"),
+            Some(crate::provider_trust::CustodyClass::OperatorHeld)
+        );
+    }
+
+    #[test]
+    fn envelope_refuses_a_custody_demand_it_cannot_understand() {
+        // A typo must never silently degrade to "no demand".
+        let unknown_class = match Envelope::from_dsl("require custody zero_retention for Ops\n") {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown custody class must be rejected, not ignored"),
+        };
+        assert!(
+            unknown_class.contains("unknown custody class"),
+            "{unknown_class}"
+        );
+        // The role is not optional: an unscoped demand has no meaning, since the
+        // demand is what a ROLE's data asks of an endpoint.
+        let unscoped = match Envelope::from_dsl("require custody zero-retention\n") {
+            Err(error) => error,
+            Ok(_) => panic!("a role-less custody demand must be rejected"),
+        };
+        assert!(unscoped.contains("for <Role>"), "{unscoped}");
+        let json_error = match Envelope::from_json(r#"{"custody_demand": {"Ops": "nope"}}"#) {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown custody class must be rejected, not ignored"),
+        };
+        assert!(json_error.contains("unknown custody class"), "{json_error}");
+    }
+
+    #[test]
+    fn custody_demands_are_inside_the_signed_artifact() {
+        // The load-bearing one. The registry holds the evidence and is written
+        // by day-to-day `whip provider` commands; if the demand were outside the
+        // signature, whoever provisions an endpoint could lower the bar it is
+        // judged against, and the check would certify itself.
+        let envelope =
+            Envelope::from_dsl("require custody operator-held for Operator\n").expect("parsed");
+        let canonical = envelope.to_canonical_json();
+        assert!(canonical.contains("custody_demand"), "{canonical}");
+        let round_tripped = Envelope::from_json(&canonical).expect("reparsed");
+        assert_eq!(
+            round_tripped.custody_demand_for("Operator"),
+            Some(crate::provider_trust::CustodyClass::OperatorHeld)
+        );
+        // Emit-when-declared: silent envelopes keep their signed hashes.
+        let quiet = Envelope::from_dsl("delegate A acts-for B\n").expect("parsed");
+        assert!(!quiet.to_canonical_json().contains("custody_demand"));
+    }
+
+    #[test]
+    fn a_delegation_is_refused_when_the_endpoint_under_clears_its_role() {
+        // The end-to-end shape of DR-0062 §4, with the envelope supplying the
+        // demand and the registry-derived evidence supplying the fact.
+        use crate::provider_trust::{
+            delegation_admissible, derive, CustodyClass, FiledClaim, ProviderEvidence,
+        };
+        let envelope =
+            Envelope::from_dsl("require custody zero-retention for Operator\n").expect("parsed");
+        let demand = envelope.custody_demand_for("Operator");
+
+        let retained = derive(&ProviderEvidence {
+            pinned_digest: Some("dA".to_owned()),
+            live_digest: Some("dA".to_owned()),
+            filed_claim: Some(FiledClaim {
+                class: CustodyClass::Retained,
+                signer: "ops@acme.com".to_owned(),
+                current: true,
+            }),
+            operator_run: false,
+        });
+        let denial = delegation_admissible(&retained, demand)
+            .expect_err("a c2 endpoint must not carry Operator data");
+        let message = denial.message("acme-cloud", "Operator");
+        assert!(message.contains("zero-retention"), "{message}");
+        assert!(message.contains("retained"), "{message}");
+
+        let onprem = derive(&ProviderEvidence {
+            pinned_digest: Some("dA".to_owned()),
+            live_digest: Some("dA".to_owned()),
+            filed_claim: None,
+            operator_run: true,
+        });
+        assert!(delegation_admissible(&onprem, demand).is_ok());
     }
 }

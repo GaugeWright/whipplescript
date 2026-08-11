@@ -288,6 +288,21 @@ pub fn evidence_from_registry(
     }
 }
 
+/// The endpoint identity a pin freezes: a stable hash of the provider's
+/// resolved configuration (backend, model id, base URL — whatever the
+/// `effect_providers` row carries).
+///
+/// Canonicalized before hashing so that a re-serialization with different key
+/// order does not read as drift. Unparseable config hashes its raw bytes rather
+/// than being treated as absent: a config whip cannot parse is still a config
+/// that can CHANGE, and a pin over it must still notice.
+pub fn endpoint_digest(config_json: &str) -> String {
+    let canonical = serde_json::from_str::<serde_json::Value>(config_json)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| config_json.to_owned());
+    crate::rule_lowering::stable_hash_hex(&canonical)
+}
+
 /// Why a delegation edge was refused.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationDenial {
