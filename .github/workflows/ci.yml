@@ -145,6 +145,12 @@ jobs:
         run: npx tsc --noEmit
       - name: Build production public Worker artifact
         run: npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci
+      # The prototype's compiler was previously invoked by nothing: `vite build`
+      # strips types through esbuild without checking them. This job owns it
+      # because it is the one that already has Node.
+      - name: Typecheck workflow prototype
+        working-directory: ui/workflow-prototype
+        run: npm ci && npm run typecheck
 
   # Mirror only — 112 Maude tests, about ten minutes; free on the mirror.
   formal-models:

@@ -52,6 +52,16 @@ else
     npm --prefix "$worker" test
     (cd "$worker" && npx tsc --noEmit)
     (cd "$worker" && npx wrangler deploy --config wrangler.public.toml --dry-run --outdir dist-ci)
+
+    # The workflow prototype ships TypeScript that nothing used to run: `vite
+    # build` goes through esbuild, which strips types without checking them, so
+    # its compiler was a dependency no gate invoked and its dependency bumps
+    # could only ever be assumed green. Typechecking it is cheap and makes them
+    # answerable. It shares the guard above because it needs the same Node
+    # toolchain the green-bar job deliberately does without.
+    prototype=ui/workflow-prototype
+    [ -d "$prototype/node_modules" ] || npm --prefix "$prototype" ci
+    npm --prefix "$prototype" run typecheck
 fi
 
 echo "== whipplescript green bar PASSED =="
