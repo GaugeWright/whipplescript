@@ -16642,6 +16642,44 @@ fn family_b_arm_allowed(
     allowed
 }
 
+/// Reject ONE read of `<root>.<field>` when that field is Family B
+/// presence-conditioned and `allowed` (the conditioned fields this scope's `case`
+/// arm makes present) does not carry it. The single place the diagnostic is
+/// worded, so a written read, a `from` shorthand copy, and an implicit `from`
+/// copy all report identically.
+#[allow(clippy::too_many_arguments)]
+fn check_conditioned_read(
+    rule: &RuleDecl,
+    root: &str,
+    field: &str,
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(schema) = binding_types.get(root) else {
+        return;
+    };
+    let Some((disc, _literal)) = semantic.schemas.field_presence(schema, field) else {
+        return;
+    };
+    if allowed.contains(&(root.to_owned(), field.to_owned())) {
+        return;
+    }
+    diagnostics.push(Diagnostic {
+        related: Vec::new(),
+        span,
+        message: format!(
+            "rule `{}` reads conditional field `{root}.{field}` outside a matching `case {root}.{disc}` arm",
+            rule.name.name
+        ),
+        suggestion: Some(format!(
+            "read `{root}.{field}` inside `case {root}.{disc} {{ \"...\" => ... }}` — it is present only for a specific `{disc}`"
+        )),
+    });
+}
+
 /// Reject reads of a Family B presence-conditioned field in `text` that are not
 /// permitted by `allowed` (the conditioned fields this scope's `case` arm makes
 /// present). `text` is any source fragment that may contain dotted field paths.
@@ -16658,30 +16696,28 @@ fn check_conditioned_reads_in_text(
         let Some(first) = path.first() else {
             continue;
         };
-        let Some(schema) = binding_types.get(&root) else {
-            continue;
-        };
-        if let Some((disc, _literal)) = semantic.schemas.field_presence(schema, first) {
-            if !allowed.contains(&(root.clone(), first.clone())) {
-                diagnostics.push(Diagnostic {
-                    related: Vec::new(),
-                    span,
-                    message: format!(
-                        "rule `{}` reads conditional field `{root}.{first}` outside a matching `case {root}.{disc}` arm",
-                        rule.name.name
-                    ),
-                    suggestion: Some(format!(
-                        "read `{root}.{first}` inside `case {root}.{disc} {{ \"...\" => ... }}` — it is present only for a specific `{disc}`"
-                    )),
-                });
-            }
-        }
+        check_conditioned_read(
+            rule,
+            &root,
+            first,
+            span,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        );
     }
 }
 
+/// `from_binding` is the enclosing statement's `from <binding>` source (`None`
+/// when the statement has none). A bare `Shorthand` field copies the same-named
+/// field OFF that source, so it is a read of `<from_binding>.<field>` and narrows
+/// exactly like a written-out `<from_binding>.<field>` expression. A nested block
+/// keeps the same source (nesting introduces no new `from`).
 fn check_conditioned_reads_in_fields(
     rule: &RuleDecl,
     fields: &[body::FieldAssign],
+    from_binding: Option<&str>,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     allowed: &BTreeSet<(String, String)>,
@@ -16701,13 +16737,119 @@ fn check_conditioned_reads_in_fields(
             body::FieldValue::Nested { fields, .. } => check_conditioned_reads_in_fields(
                 rule,
                 fields,
+                from_binding,
                 semantic,
                 binding_types,
                 allowed,
                 diagnostics,
             ),
-            body::FieldValue::Shorthand => {}
+            body::FieldValue::Shorthand => {
+                if let Some(root) = from_binding {
+                    check_conditioned_read(
+                        rule,
+                        root,
+                        &field.name,
+                        field.span,
+                        semantic,
+                        binding_types,
+                        allowed,
+                        diagnostics,
+                    );
+                }
+            }
         }
+    }
+}
+
+/// The copies a `from <binding>` block makes that nobody wrote down. A `from`
+/// projection copies EVERY same-named field of the target shape off the source
+/// binding, the written block only overriding (`parse_record_fields_with_from` in
+/// the kernel is the runtime authority) — so omitting a field name copies it just
+/// the same, and a presence-conditioned one is read whether or not it is spelled.
+/// `target_fields` is the destination's declared field set, which bounds the copy;
+/// fields the block assigns explicitly are not copied and are checked as their own
+/// expressions.
+#[allow(clippy::too_many_arguments)]
+fn check_conditioned_implicit_copies(
+    rule: &RuleDecl,
+    from_binding: Option<&str>,
+    target_fields: Option<&BTreeMap<String, TypeSyntax>>,
+    fields: &[body::FieldAssign],
+    span: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let (Some(root), Some(target_fields)) = (from_binding, target_fields) else {
+        return;
+    };
+    let written: BTreeSet<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    for name in target_fields.keys() {
+        if written.contains(name.as_str()) {
+            continue;
+        }
+        check_conditioned_read(
+            rule,
+            root,
+            name,
+            span,
+            semantic,
+            binding_types,
+            allowed,
+            diagnostics,
+        );
+    }
+}
+
+/// A `record <Class> [from <binding>] { … }` in either of its two statement
+/// positions (a plain `record`, or the `done … -> record` replacement).
+fn check_conditioned_record_reads(
+    rule: &RuleDecl,
+    record: &body::RecordStmt,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    allowed: &BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    check_conditioned_reads_in_fields(
+        rule,
+        &record.fields,
+        record.from.as_deref(),
+        semantic,
+        binding_types,
+        allowed,
+        diagnostics,
+    );
+    check_conditioned_implicit_copies(
+        rule,
+        record.from.as_deref(),
+        semantic.schemas.classes.get(&record.schema),
+        &record.fields,
+        record.span,
+        semantic,
+        binding_types,
+        allowed,
+        diagnostics,
+    );
+}
+
+/// The declared field set of the workflow output contract a `complete <name> from
+/// <binding>` projects onto — the bound on what that projection copies. `None`
+/// when the contract is scalar, inline-typed to something other than a class, or
+/// not resolvable in this workflow's scope (nothing is claimed about the copy).
+fn terminal_output_fields<'a>(
+    terminal: &body::TerminalStmt,
+    semantic: &'a SemanticContext,
+) -> Option<&'a BTreeMap<String, TypeSyntax>> {
+    if terminal.kind != body::TerminalKind::Complete {
+        return None;
+    }
+    let workflow = semantic.workflow.as_ref()?;
+    let surface = semantic.workflow_inputs.get(workflow)?;
+    match surface.outputs.get(&terminal.name)? {
+        TypeSyntax::Ref { name } => semantic.schemas.classes.get(&name.name),
+        _ => None,
     }
 }
 
@@ -16716,7 +16858,11 @@ fn check_conditioned_reads_in_fields(
 /// matching `case <root>.<disc>` arm. Each `case` arm extends `allowed` with the
 /// fields its discriminant=literal makes present. (v1 covers record/terminal/done
 /// values, branch conditions, and case guards; effect prompt/argument positions are
-/// a documented follow-up.)
+/// a documented follow-up — `emit signal … from` is covered here because its `from`
+/// projection is a copy position, not an operand one.) Every `from`-carrying
+/// statement passes its source binding down, so both spellings of a copy — the
+/// written `Shorthand` field and the field the projection copies implicitly —
+/// narrow like the `<binding>.<field>` read each one is.
 fn validate_conditioned_field_reads(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -16727,18 +16873,32 @@ fn validate_conditioned_field_reads(
 ) {
     for statement in statements {
         match statement {
-            body::BodyStmt::Record(record) => check_conditioned_reads_in_fields(
-                rule,
-                &record.fields,
-                semantic,
-                binding_types,
-                allowed,
-                diagnostics,
-            ),
+            body::BodyStmt::Record(record) => {
+                check_conditioned_record_reads(
+                    rule,
+                    record,
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+            }
             body::BodyStmt::Terminal(terminal) => {
                 check_conditioned_reads_in_fields(
                     rule,
                     &terminal.fields,
+                    terminal.from.as_deref(),
+                    semantic,
+                    binding_types,
+                    allowed,
+                    diagnostics,
+                );
+                check_conditioned_implicit_copies(
+                    rule,
+                    terminal.from.as_deref(),
+                    terminal_output_fields(terminal, semantic),
+                    &terminal.fields,
+                    terminal.span,
                     semantic,
                     binding_types,
                     allowed,
@@ -16760,9 +16920,9 @@ fn validate_conditioned_field_reads(
             body::BodyStmt::Done {
                 replacement: Some(record),
                 ..
-            } => check_conditioned_reads_in_fields(
+            } => check_conditioned_record_reads(
                 rule,
-                &record.fields,
+                record,
                 semantic,
                 binding_types,
                 allowed,
@@ -16771,15 +16931,50 @@ fn validate_conditioned_field_reads(
             body::BodyStmt::Milestone { fields, .. } => check_conditioned_reads_in_fields(
                 rule,
                 fields,
+                // `emit milestone` carries no `from` projection.
+                None,
                 semantic,
                 binding_types,
                 allowed,
                 diagnostics,
             ),
+            // `emit signal <name> to <target> from <binding> { overrides }` is the
+            // third copy position (the `record … from` precedent, S6): the block
+            // overrides, the projection copies every same-named field the signal
+            // declares. Other effect kinds' operand positions stay out of scope.
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::Notify {
+                    event,
+                    from,
+                    fields,
+                    ..
+                } = &effect.kind
+                {
+                    check_conditioned_reads_in_fields(
+                        rule,
+                        fields,
+                        from.as_deref(),
+                        semantic,
+                        binding_types,
+                        allowed,
+                        diagnostics,
+                    );
+                    check_conditioned_implicit_copies(
+                        rule,
+                        from.as_deref(),
+                        semantic.schemas.classes.get(event),
+                        fields,
+                        effect.span,
+                        semantic,
+                        binding_types,
+                        allowed,
+                        diagnostics,
+                    );
+                }
+            }
             body::BodyStmt::Done { .. }
             | body::BodyStmt::Cancel { .. }
-            | body::BodyStmt::Redact { .. }
-            | body::BodyStmt::Effect(_) => {}
+            | body::BodyStmt::Redact { .. } => {}
             body::BodyStmt::After(after) => validate_conditioned_field_reads(
                 rule,
                 &after.body,
@@ -30911,6 +31106,155 @@ rule r
             "{:?}",
             wrong.diagnostics
         );
+    }
+
+    #[test]
+    fn family_b_read_narrowing_covers_from_copies() {
+        // A `from <binding>` projection COPIES the source's same-named fields, so a
+        // presence-conditioned one is read there just as surely as in a written
+        // `<binding>.<field>` expression — whether the copy is spelled as a bare
+        // shorthand field or left implicit (the block only overrides).
+        let program = |body: &str| {
+            format!(
+                r#"
+workflow B
+input e Event
+output result Done
+class Done {{ region string }}
+class Copy {{
+  kind string
+  region string
+}}
+class Event {{
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}}
+rule r
+  when Event as e
+=> {{
+{body}
+  complete result {{ region "ok" }}
+}}
+"#
+            )
+        };
+        // `record <Class> from <binding>` — the shorthand copy is a read.
+        let shorthand = compile_program(&program("  record Copy from e {\n    region\n  }"));
+        assert!(
+            shorthand
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            shorthand.diagnostics
+        );
+        // The same copy, unspelled: naming only `kind` still copies `region`.
+        let implicit = compile_program(&program("  record Copy from e {\n    kind \"x\"\n  }"));
+        assert!(
+            implicit
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            implicit.diagnostics
+        );
+        // Overriding the field explicitly copies nothing, so it reads nothing.
+        let overridden = compile_program(&program(
+            "  record Copy from e {\n    kind \"x\"\n    region \"none\"\n  }",
+        ));
+        assert_eq!(overridden.diagnostics, Vec::new());
+        assert!(overridden.ir.is_some());
+        // Inside the matching `deploy` arm both copies are allowed.
+        let matching = compile_program(&program(
+            "  case e.kind {\n    \"deploy\" => { record Copy from e {\n    region\n  } }\n    \"rollback\" => { record Copy { kind \"r\" region \"none\" } }\n  }",
+        ));
+        assert_eq!(matching.diagnostics, Vec::new());
+        assert!(matching.ir.is_some());
+        // Inside the wrong (`rollback`) arm the copy is rejected.
+        let wrong = compile_program(&program(
+            "  case e.kind {\n    \"deploy\" => { record Copy { kind \"d\" region \"x\" } }\n    \"rollback\" => { record Copy from e {\n    region\n  } }\n  }",
+        ));
+        assert!(
+            wrong
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            wrong.diagnostics
+        );
+        // `complete <T> from <binding>`: the output-contract projection copies too.
+        let terminal = compile_program(
+            r#"
+workflow B
+input e Event
+output result Done
+class Done { region string }
+class Event {
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}
+rule r
+  when Event as e
+=> {
+  complete result from e {
+    region
+  }
+}
+"#,
+        );
+        assert!(
+            terminal
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `e.region`")),
+            "{:?}",
+            terminal.diagnostics
+        );
+        // `emit signal … from <binding>`: the S6 projection is the third copy
+        // position, and its block-less form copies every declared field.
+        let signal = |body: &str| {
+            format!(
+                r#"
+use std.ingress
+
+@service
+workflow EmitFrom
+
+signal deploy.finished {{
+  kind "deploy" | "rollback"
+  peer string
+  region string when kind is "deploy"
+}}
+
+signal deploy.acknowledged {{
+  peer string
+  region string
+}}
+
+rule relay
+  when deploy.finished as deployed
+=> {{
+{body}
+}}
+"#
+            )
+        };
+        let signal_implicit = compile_program(&signal(
+            "  emit signal deploy.acknowledged to deployed.peer from deployed as sent",
+        ));
+        assert!(
+            signal_implicit
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conditional field `deployed.region`")),
+            "{:?}",
+            signal_implicit.diagnostics
+        );
+        let signal_overridden = compile_program(&signal(
+            "  emit signal deploy.acknowledged to deployed.peer from deployed {\n    region \"none\"\n  } as sent",
+        ));
+        assert_eq!(signal_overridden.diagnostics, Vec::new());
+        assert!(signal_overridden.ir.is_some());
     }
 
     #[test]
