@@ -8,6 +8,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{chat_messages_from_json, ChatMessage};
 use whipplescript_kernel::host_protocol::{
     EventPosition, LabeledRuntimeEvent, RuntimeEvidencePointer, StartTurnCommand, TurnReceipt,
@@ -337,6 +338,37 @@ fn project_output(
     }))
 }
 
+/// The wire protocol a metered-gateway round speaks, read from its admitted
+/// base URL.
+///
+/// The gateway fronts both an OpenAI-compatible shim (`/compat`) and each
+/// provider's native surface (`/anthropic`). The admitted base URL is already
+/// the egress grant the runtime proves every managed turn against, so it is the
+/// honest place to read the wire from — a separately-set flag could disagree
+/// with the URL actually being called, and the URL is what the request goes to.
+///
+/// The distinction is not cosmetic. The shim **drops `cache_control`**, so an
+/// Anthropic model routed through `/compat` can never use the prompt cache the
+/// deterministic assembler exists to exploit, and pays full price on every
+/// re-sent prefix. Measured 2026-08-11 against `gaugewright-panels`: same
+/// prefix, 9.25x cheaper on the native route's cached span.
+///
+/// Anything that is not the native surface stays `OpenAiCompat`, which is both
+/// the historical behaviour and the safe default — an unrecognized surface gets
+/// the wire that has always worked rather than one that would send a body the
+/// endpoint cannot read.
+pub fn metered_gateway_wire(base_url: Option<&str>) -> CoerceProvider {
+    if base_url
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .ends_with("/anthropic")
+    {
+        CoerceProvider::Anthropic
+    } else {
+        CoerceProvider::OpenAiCompat
+    }
+}
+
 fn project_usage(
     metadata_json: &str,
     usage_ref: &str,
@@ -357,21 +389,51 @@ fn project_usage(
             .get(details)
             .and_then(|details| details.get("cached_tokens"))
     };
+    // Anthropic's native Messages API reports the cached span in its own fields
+    // and leaves `input_tokens` as the *uncached remainder* — the inverse of
+    // Chat Completions, where `prompt_tokens` is the total and `cached_tokens`
+    // is a subset of it. Presence of the field is what identifies the wire; a
+    // native round that cached nothing reports an explicit zero, and the
+    // arithmetic below is an identity in that case.
+    //
+    // Reported raw, a cached native round would show `cached > input`, and the
+    // edge rejects exactly that as inexact usage ("exact provider usage is
+    // required"). So the wire that finally *can* cache would fail every turn it
+    // cached on. Normalizing to the Chat Completions convention keeps one meter
+    // honest across both surfaces.
+    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let raw_input = tokens("input_tokens", "prompt_tokens");
+    let (input_tokens, cached_input_tokens) = match cache_read {
+        Some(read) => {
+            // Cache *writes* are billed at 1.25x rather than the card's flat
+            // input rate, so folding them in under-states their cost slightly.
+            // That is deliberate: they are genuinely fresh (uncached) input, and
+            // the card is only the fallback basis — a settled turn bills the
+            // gateway's measured cost, which prices the premium exactly.
+            let created = usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (raw_input.saturating_add(read).saturating_add(created), read)
+        }
+        // Chat Completions and the OpenAI Responses wire. The other two fields
+        // have carried their alias since this was written; the cached one did
+        // not, and the omission was not visible as a failure — it read as an
+        // honest zero while every cached token priced as a fresh one.
+        None => (
+            raw_input,
+            usage
+                .get("cached_input_tokens")
+                .or_else(|| cached_in("input_tokens_details"))
+                .or_else(|| cached_in("prompt_tokens_details"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        ),
+    };
     Ok(Some(HostedUsageObservation {
         usage_ref: usage_ref.to_owned(),
-        input_tokens: tokens("input_tokens", "prompt_tokens"),
-        // The other two fields have carried their Chat Completions alias since
-        // this was written; the cached one did not, and the omission is not
-        // visible as a failure — it reads as an honest zero. Every managed turn
-        // runs on that wire (the metered gateway's `/compat` surface), so every
-        // cached token was being priced as a fresh one. On this deployment's
-        // rate card that is ten times its true cost, silently.
-        cached_input_tokens: usage
-            .get("cached_input_tokens")
-            .or_else(|| cached_in("input_tokens_details"))
-            .or_else(|| cached_in("prompt_tokens_details"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        cached_input_tokens,
         output_tokens: tokens("output_tokens", "completion_tokens"),
     }))
 }
@@ -487,6 +549,96 @@ mod tests {
                 input_tokens: 9,
                 cached_input_tokens: 7,
                 output_tokens: 2,
+            }
+        );
+    }
+
+    /// The surface in the admitted base URL is what picks the wire. Getting this
+    /// wrong is not a crash: `/anthropic` read as compat sends a chat-completions
+    /// body to the Messages API, and `/compat` read as native sends an
+    /// Anthropic body to the shim.
+    #[test]
+    fn metered_gateway_wire_follows_the_admitted_surface() {
+        let base = "https://gateway.ai.cloudflare.com/v1/abc/gw";
+        assert_eq!(
+            metered_gateway_wire(Some(&format!("{base}/anthropic"))),
+            CoerceProvider::Anthropic
+        );
+        // A trailing slash is the same admitted endpoint.
+        assert_eq!(
+            metered_gateway_wire(Some(&format!("{base}/anthropic/"))),
+            CoerceProvider::Anthropic
+        );
+        assert_eq!(
+            metered_gateway_wire(Some(&format!("{base}/compat"))),
+            CoerceProvider::OpenAiCompat
+        );
+        // Unknown and absent surfaces keep the long-standing wire rather than
+        // guessing into one that would send an unreadable body.
+        assert_eq!(
+            metered_gateway_wire(Some(&format!("{base}/openai"))),
+            CoerceProvider::OpenAiCompat
+        );
+        assert_eq!(metered_gateway_wire(None), CoerceProvider::OpenAiCompat);
+        // `anthropic` must be the surface segment, not a substring of the
+        // gateway's own name.
+        assert_eq!(
+            metered_gateway_wire(Some(
+                "https://gateway.ai.cloudflare.com/v1/abc/anthropic-panels/compat"
+            )),
+            CoerceProvider::OpenAiCompat
+        );
+    }
+
+    /// Anthropic's native wire splits the prompt across three fields and leaves
+    /// `input_tokens` as the uncached remainder. Reported raw this yields
+    /// `cached > input`, which the edge rejects as inexact usage — so the wire
+    /// that can finally cache would fail every turn it cached on. The projection
+    /// must total the three and report cached as a subset.
+    #[test]
+    fn usage_projection_totals_the_anthropic_native_cache_fields() {
+        let projected = project_usage(
+            r#"{"usage":{"input_tokens":11,"cache_creation_input_tokens":0,
+                "cache_read_input_tokens":3443,"output_tokens":4}}"#,
+            "usage:test",
+        )
+        .expect("usage projection")
+        .expect("usage");
+        assert_eq!(
+            projected,
+            HostedUsageObservation {
+                usage_ref: "usage:test".to_owned(),
+                input_tokens: 3454,
+                cached_input_tokens: 3443,
+                output_tokens: 4,
+            }
+        );
+        assert!(
+            projected.cached_input_tokens <= projected.input_tokens,
+            "the edge rejects a turn whose cached span exceeds its input"
+        );
+    }
+
+    /// The cache-write round of the same conversation: nothing read, a large
+    /// span created. Those tokens are genuinely fresh input and must be counted
+    /// as such rather than as cached, or the write round bills at the cached
+    /// rate it did not earn.
+    #[test]
+    fn usage_projection_counts_an_anthropic_cache_write_as_fresh_input() {
+        let projected = project_usage(
+            r#"{"usage":{"input_tokens":11,"cache_creation_input_tokens":3443,
+                "cache_read_input_tokens":0,"output_tokens":4}}"#,
+            "usage:test",
+        )
+        .expect("usage projection")
+        .expect("usage");
+        assert_eq!(
+            projected,
+            HostedUsageObservation {
+                usage_ref: "usage:test".to_owned(),
+                input_tokens: 3454,
+                cached_input_tokens: 0,
+                output_tokens: 4,
             }
         );
     }

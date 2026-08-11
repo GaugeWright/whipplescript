@@ -587,6 +587,38 @@ for (const retryableStatus of [401, 403, 408, 425, 429, 500, 503]) {
   });
 }
 
+// The fallback re-sends *this* body to a Chat Completions endpoint, which only
+// makes sense for a `/compat` primary. An Anthropic-native round carries a
+// top-level `system` with `cache_control` blocks; replaying that as chat
+// completions would not degrade, it would post a body the endpoint cannot read.
+test("an anthropic-native round does not fall back to Unified Billing", async () => {
+  const calls: string[] = [];
+  const nativeBinding = {
+    ...gatewayBinding,
+    model: "claude-opus-5",
+    base_url:
+      "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/anthropic",
+  };
+  const result = await performManagedGatewayFetch(
+    {
+      url: `${nativeBinding.base_url}/v1/messages`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: {},
+    },
+    nativeBinding,
+    { token: () => "cf-gateway-token" },
+    async (url) => {
+      calls.push(url);
+      // 429 is retryable on the compat surface — the point is that it is not
+      // retried onto a surface that never understood this body.
+      return Response.json({ error: { type: "rate_limit" } }, { status: 429 });
+    },
+  );
+  assert.equal(calls.length, 1, "a native round surfaces its own failure");
+  assert.equal(calls[0], `${nativeBinding.base_url}/v1/messages`);
+  assert.equal(JSON.parse(result).status, 429);
+});
+
 test("a malformed request does not spend Unified Billing as a fallback", async () => {
   let calls = 0;
   const result = await gatewayRound(async () => {
@@ -764,7 +796,64 @@ test("managed fallback derivation refuses a non-Cloudflare compat base URL", asy
           return Response.json({});
         },
       ),
-    /exact Cloudflare AI Gateway compat endpoint/,
+    /exact Cloudflare AI Gateway compat or anthropic endpoint/,
+  );
+  assert.equal(reached, false);
+});
+
+// The `/anthropic` surface exists for one reason: the `/compat` shim drops
+// `cache_control`, so an Anthropic model routed through it can never cache and
+// pays full price on every re-sent prefix (measured 2026-08-11: 9.25x on the
+// cached span). Admitting the native surface is what lets the breakpoint the
+// context assembler already emits actually reach the provider.
+test("managed funding admits the provider-native anthropic surface", async () => {
+  let calledUrl = "";
+  const nativeBinding = {
+    ...gatewayBinding,
+    model: "claude-opus-5",
+    base_url:
+      "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/anthropic",
+  };
+  await performManagedGatewayFetch(
+    {
+      url: `${nativeBinding.base_url}/v1/messages`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: {},
+    },
+    nativeBinding,
+    { token: () => "cf-gateway-token" },
+    async (url) => {
+      calledUrl = url;
+      return Response.json({ content: [] });
+    },
+  );
+  assert.equal(calledUrl, `${nativeBinding.base_url}/v1/messages`);
+});
+
+// A surface that is neither is still refused. Widening the regex to admit the
+// native route must not turn it into "any path under the gateway".
+test("managed funding still refuses an unadmitted gateway surface", async () => {
+  let reached = false;
+  await assert.rejects(
+    () =>
+      performManagedGatewayFetch(
+        {
+          url: "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/openai/chat/completions",
+          headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+          body: {},
+        },
+        {
+          ...gatewayBinding,
+          base_url:
+            "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/openai",
+        },
+        { token: () => "cf-gateway-token" },
+        async () => {
+          reached = true;
+          return Response.json({});
+        },
+      ),
+    /exact Cloudflare AI Gateway compat or anthropic endpoint/,
   );
   assert.equal(reached, false);
 });

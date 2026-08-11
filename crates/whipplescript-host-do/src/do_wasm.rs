@@ -706,13 +706,14 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
         Some("openai-codex") => CoerceProvider::OpenAi,
-        // The metered Cloudflare AI Gateway exposes the OpenAI-compatible
-        // `/compat` surface, so the wire protocol is `OpenAiCompat`. It is a
-        // distinct provider *id* rather than an alias because the id carries who
-        // pays — a gateway round spends GaugeWright's unified-billing credits,
-        // not a customer key (ADR 0085 §1). Collapsing the two here would be
-        // fine on the wire and wrong in the ledger.
-        Some("cloudflare-ai-gateway") => CoerceProvider::OpenAiCompat,
+        // The metered Cloudflare AI Gateway is a distinct provider *id* rather
+        // than an alias because the id carries who pays — a gateway round spends
+        // GaugeWright's credits, not a customer key (ADR 0085 §1). Collapsing it
+        // would be fine on the wire and wrong in the ledger. The wire itself
+        // comes from the admitted surface; see `metered_gateway_wire`.
+        Some("cloudflare-ai-gateway") => crate::host_projection::metered_gateway_wire(
+            value.get("base_url").and_then(serde_json::Value::as_str),
+        ),
         other => return Err(format!("unknown coerce provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -757,9 +758,11 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
         Some("openai-codex") => CoerceProvider::OpenAi,
-        // Same reasoning as the coerce parser above: OpenAI-compatible on the
-        // wire, distinct as an id because the id is what says who pays.
-        Some("cloudflare-ai-gateway") => CoerceProvider::OpenAiCompat,
+        // Same reasoning as the coerce parser above: distinct as an id because
+        // the id is what says who pays, with the wire read from the surface.
+        Some("cloudflare-ai-gateway") => crate::host_projection::metered_gateway_wire(
+            value.get("base_url").and_then(serde_json::Value::as_str),
+        ),
         other => return Err(format!("unknown agent provider: {other:?}")),
     };
     let field = |name: &str| {
