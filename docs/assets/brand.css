@@ -1,12 +1,21 @@
 /* WhippleScript docs — the GaugeWright colour scheme (navy ground, blue
-   accent, STIX Two Text serif voice). */
+   accent) and its one text family (GaugeWright DR-0071).
 
-@import url('https://fonts.googleapis.com/css2?family=STIX+Two+Text:wght@400;500;600;700&display=swap');
+   The face itself is not imported here: `theme.font.text` in mkdocs.yml is set
+   to IBM Plex Serif, so Material emits the single Google Fonts request for it.
+   A second @import would only add a redundant stylesheet. */
 
 :root {
   --ws-navy: #0e2d50;
   --ws-blue: #1f61c4;
-  --ws-serif: "STIX Two Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --ws-text: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  /* --ws-serif is retained as an alias: the serif/sans split it was named for
+     is retired, and every rule below now asks for the same family. */
+  --ws-serif: var(--ws-text);
+  /* Body copy too, not only the headings. One family carries everything a
+     person reads or operates, so the prose stops falling back to Material's
+     own sans. */
+  --md-text-font: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
 }
 
 /* Match material's own two-attribute selector (scheme + primary=black) so our
@@ -23,7 +32,8 @@ body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
   --md-typeset-a-color: #6aa3ff;
 }
 
-/* Serif carries the voice: headings + chrome titles. */
+/* Headings and chrome titles. Same family as the body now, distinguished by
+   scale and spacing rather than by face. */
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3,

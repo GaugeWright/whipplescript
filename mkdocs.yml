@@ -12,7 +12,7 @@ theme:
   logo: assets/logo.svg
   favicon: assets/favicon.svg
   font:
-    text: Figtree
+    text: IBM Plex Serif
     code: Inconsolata
   palette:
     # Navy-led by default (ecosystem-aligned); light is a toggle.
