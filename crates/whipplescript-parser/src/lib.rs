@@ -1587,6 +1587,15 @@ pub struct IrRegion {
     pub effects: Vec<IrRegionEffect>,
     pub body_removed: String,
     pub body_lapsed: String,
+    /// The `on lapse` arm's own text, without the ambient statements that
+    /// `body_lapsed` splices around it. The arm is the only part of the rule no
+    /// other pass sees (the canonical body is the HOLDS variant), so it is
+    /// validated separately and must not re-report the ambient lines.
+    pub arm_content: String,
+    /// The `(scrutinee, pattern)` chain of the `case` arms enclosing the region,
+    /// outermost first. Family B narrowing of the lapse arm starts from the
+    /// allowances those arms grant, not from the rule top.
+    pub arm_case_arms: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1991,6 +2000,11 @@ struct SemanticContext {
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
     memory_pools: BTreeSet<String>,
+    /// DR-0043 regions by rule name, stashed by `extract_rule_regions` before the
+    /// rule body was rewritten to its condition-HOLDS variant. The `on lapse` arm
+    /// is spliced out of that body, so it reaches no other pass; analysis reads it
+    /// back from here to type the arm (Decision 7 obligation 2).
+    regions: BTreeMap<String, IrRegion>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4453,6 +4467,9 @@ fn lower_program(
     let agent_names = collect_agent_names(&program, &mut diagnostics);
     let workflow_contract_names = collect_workflow_contract_names(&program, &mut diagnostics);
     let mut semantic = SemanticContext::from_program(&program, workflow_inputs);
+    // The lapse arm is spliced out of every rule body above, so analysis can only
+    // reach it through here (DR-0043 Decision 7 obligation 2).
+    semantic.regions = pending_regions.clone();
     let workflow = match program.workflow {
         Some(workflow) => workflow.name,
         None => {
@@ -6327,6 +6344,7 @@ impl SemanticContext {
             channel_providers,
             credentials,
             memory_pools,
+            regions: BTreeMap::new(),
         }
     }
 }
@@ -9726,14 +9744,14 @@ fn extract_rule_regions(
         };
         let (ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
         let mut regions = Vec::new();
-        collect_region_blocks(&ast.statements, &mut regions);
+        collect_region_blocks(&ast.statements, &[], &mut regions);
         if regions.is_empty() {
             continue;
         }
         if regions.len() > 1 {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
-                span: regions[1].span,
+                span: regions[1].0.span,
                 message: format!(
                     "rule `{}` declares more than one `during`/`until` region",
                     rule.name.name
@@ -9746,7 +9764,7 @@ fn extract_rule_regions(
             });
             continue;
         }
-        let region = regions[0].clone();
+        let (region, region_case_arms) = regions[0].clone();
         if count_effect_statements(&region.body) == 0 {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
@@ -9846,6 +9864,8 @@ fn extract_rule_regions(
                 effects: region_effects,
                 body_removed: variant_removed,
                 body_lapsed: variant_lapsed,
+                arm_content: arm_content.to_owned(),
+                arm_case_arms: region_case_arms,
             },
         );
         rule.body.text = variant_holds;
@@ -9853,18 +9873,29 @@ fn extract_rule_regions(
     pending
 }
 
-fn collect_region_blocks(statements: &[body::BodyStmt], out: &mut Vec<body::RegionBlock>) {
+/// Every region in the body, each paired with the `(scrutinee, pattern)` chain of
+/// the `case` arms that enclose it. The chain is what lets the lapse arm be
+/// read-narrowed at the position the region actually sits in: an arm inside
+/// `case e.kind { "deploy" => … }` inherits that arm's Family B allowances, so
+/// checking it against the rule-top (empty) allowed set would reject a legal read.
+fn collect_region_blocks(
+    statements: &[body::BodyStmt],
+    case_arms: &[(String, String)],
+    out: &mut Vec<(body::RegionBlock, Vec<(String, String)>)>,
+) {
     for statement in statements {
         match statement {
             body::BodyStmt::Region(region) => {
-                out.push(region.clone());
-                collect_region_blocks(&region.body, out);
-                collect_region_blocks(&region.lapse_body, out);
+                out.push((region.clone(), case_arms.to_vec()));
+                collect_region_blocks(&region.body, case_arms, out);
+                collect_region_blocks(&region.lapse_body, case_arms, out);
             }
-            body::BodyStmt::After(after) => collect_region_blocks(&after.body, out),
+            body::BodyStmt::After(after) => collect_region_blocks(&after.body, case_arms, out),
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_region_blocks(&branch.body, out);
+                    let mut nested = case_arms.to_vec();
+                    nested.push((case.scrutinee.clone(), branch.pattern.clone()));
+                    collect_region_blocks(&branch.body, &nested, out);
                 }
             }
             _ => {}
@@ -11086,6 +11117,19 @@ fn analyze_rule(
         }
     }
     sort_projection_reads(&mut metadata.projection_reads);
+    // DR-0043 Decision 7 obligation 2: the lapse arm is not in `rule.body.text`
+    // (that is the HOLDS variant), so it is checked here, once, with the binding
+    // environment the body loop just built.
+    if let Some(region) = semantic.regions.get(&rule.name.name) {
+        validate_lapse_arm(
+            rule,
+            region,
+            semantic,
+            &binding_types,
+            &effect_payload_types,
+            diagnostics,
+        );
+    }
     collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
     metadata.terminal_completes.sort();
     metadata.terminal_completes.dedup();
@@ -17473,6 +17517,139 @@ fn validate_body_effect_operands(
     }
 }
 
+/// The reserved namespace the synthesized progress-view classes live under. A `.`
+/// cannot appear in a declared class name, so these can never collide with an
+/// author's class — the same guarantee the `<Enum>.<Variant>` sum-type lowering
+/// relies on.
+const PROGRESS_VIEW_NAMESPACE: &str = "region";
+
+/// DR-0043 Decision 7 obligation 2 — type the lapse arm.
+///
+/// The `on lapse` arm is spliced out of the canonical (condition-HOLDS) rule body,
+/// so *nothing* validated it: not the progress view, and not ordinary bindings
+/// either — `fail error { reason task.bogus }` in an arm was accepted in full.
+/// This walks the arm text with the rule's binding environment extended by the
+/// progress view, against a schema index extended with two synthesized classes:
+///
+///   `region.<rule>.Progress`  one optional field per step (the step's own settled
+///                             payload) plus `steps`
+///   `region.<rule>.Steps`     one `string` field per step (its status)
+///
+/// The DR's four rules then fall out of the ordinary path resolver: a field that is
+/// neither a step nor `steps` has no field on Progress; an unknown step has no field
+/// on Steps; a path *through* a status hits "is not a schema value"; and a deeper
+/// path under a step resolves against that step's own schema because
+/// `schema_name_for_path` sees through the optional.
+///
+/// The same splice hid the arm from Family B read-narrowing, so the arm is walked
+/// with that pass too: an arm is an egress position like any other, and the region
+/// it belongs to may itself sit inside a `case` arm whose allowances the arm keeps.
+fn validate_lapse_arm(
+    rule: &RuleDecl,
+    region: &IrRegion,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    effect_payload_types: &BTreeMap<String, IrType>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut schemas = semantic.schemas.clone();
+    let mut arm_bindings = binding_types.clone();
+
+    if let Some(view) = &region.lapse_binding {
+        let progress = format!("{PROGRESS_VIEW_NAMESPACE}.{}.Progress", rule.name.name);
+        let steps = format!("{PROGRESS_VIEW_NAMESPACE}.{}.Steps", rule.name.name);
+
+        let mut progress_fields = BTreeMap::new();
+        let mut steps_fields = BTreeMap::new();
+        // Derive the step set from `region.effects` — the same list the kernel
+        // walks when it pins the view (rule_pass.rs), including the `__then_`
+        // strip, so the checker's field set and the runtime's key set cannot
+        // drift apart.
+        for effect in &region.effects {
+            let step = effect
+                .binding
+                .strip_prefix(then_expand::THEN_BINDING_PREFIX)
+                .unwrap_or(&effect.binding)
+                .to_owned();
+            // A step's status is always a string; its settled value is optional
+            // because the arm can run before that step settled — or at all.
+            steps_fields.insert(step.clone(), string_ty());
+            let settled = match effect_payload_types.get(&effect.binding) {
+                Some(IrType::Ref(name)) if semantic.schemas.class_exists(name) => TypeSyntax::Ref {
+                    name: Ident {
+                        name: name.clone(),
+                        span: zero_span(),
+                    },
+                },
+                // No resolvable payload schema: the step reads as a settled scalar,
+                // so a bare read is fine and a deeper path correctly errors.
+                _ => string_ty(),
+            };
+            progress_fields.insert(step, optional_ty(settled));
+        }
+        progress_fields.insert(
+            "steps".to_owned(),
+            TypeSyntax::Ref {
+                name: Ident {
+                    name: steps.clone(),
+                    span: zero_span(),
+                },
+            },
+        );
+
+        schemas.classes.insert(steps, steps_fields);
+        schemas.classes.insert(progress.clone(), progress_fields);
+        arm_bindings.insert(view.clone(), progress);
+    }
+
+    for line in region.arm_content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        validate_known_field_paths_in_index(
+            rule,
+            line,
+            rule.body.span,
+            &schemas,
+            &arm_bindings,
+            diagnostics,
+        );
+    }
+
+    // Family B read-narrowing. The arm is an egress like any other body position —
+    // `coerce fa(e.region)` in an arm carries the conditioned value out of the
+    // instance — and the splice is the only reason the rule-body pass never saw it.
+    // The allowed set starts from the `case` arms the region sits inside, so an arm
+    // under `case e.kind { "deploy" => … }` keeps that arm's allowances.
+    let (arm_ast, _) = body::parse_rule_body(&region.arm_content, 0);
+    let mut allowed = BTreeSet::new();
+    for (scrutinee, pattern) in &region.arm_case_arms {
+        allowed.extend(family_b_arm_allowed(
+            scrutinee,
+            pattern,
+            &arm_bindings,
+            semantic,
+        ));
+    }
+    let mut arm_diagnostics = Vec::new();
+    validate_conditioned_field_reads(
+        rule,
+        &arm_ast.statements,
+        semantic,
+        &arm_bindings,
+        &allowed,
+        &mut arm_diagnostics,
+    );
+    // `arm_content` is cut from the then-expanded body text, so offsets into it are
+    // not source positions. Every arm diagnostic is reported at the body span, the
+    // same span the field-path walk above uses.
+    for mut diagnostic in arm_diagnostics {
+        diagnostic.span = rule.body.span;
+        diagnostics.push(diagnostic);
+    }
+}
+
 fn validate_known_field_paths(
     rule: &RuleDecl,
     line: &str,
@@ -17498,14 +17675,36 @@ fn validate_known_field_paths_at_span(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_known_field_paths_in_index(
+        rule,
+        line,
+        span,
+        &semantic.schemas,
+        binding_types,
+        diagnostics,
+    );
+}
+
+/// `validate_known_field_paths_at_span` against an explicit schema index rather
+/// than the program's. The lapse arm resolves its progress view against an index
+/// extended with that region's synthesized view classes, which exist only for the
+/// duration of the check.
+fn validate_known_field_paths_in_index(
+    rule: &RuleDecl,
+    line: &str,
+    span: SourceSpan,
+    schemas: &SchemaIndex,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for (root, path) in dotted_paths(line) {
         let Some(schema) = binding_types.get(&root) else {
             continue;
         };
-        if !semantic.schemas.class_exists(schema) {
+        if !schemas.class_exists(schema) {
             continue;
         }
-        if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
+        if let Err(message) = schemas.resolve_field_path(schema, &path) {
             diagnostics.push(Diagnostic {
                 related: Vec::new(),
                 span,
@@ -33447,6 +33646,181 @@ rule ship
             bindings.contains(&"__then_plan") && bindings.contains(&"__then_approved"),
             "region effects recorded: {bindings:?}"
         );
+    }
+
+    /// DR-0043 Decision 7 obligation 2: the lapse arm is typed.
+    ///
+    /// The arm is spliced out of the canonical (HOLDS) rule body, so before this
+    /// nothing validated it — a bad path was a runtime nothing rather than a
+    /// compile-time diagnostic. Each of the DR's four rules is checked here, and
+    /// the step names are the AUTHOR's (`then plan <-` is `got.plan`, not
+    /// `got.__then_plan`), matching what the kernel pins into the view.
+    #[test]
+    fn lapse_arm_progress_view_is_typed() {
+        let program = |arm: &str| {
+            format!(
+                r#"
+workflow Deploy
+input task Task
+output result Done
+failure error Halted
+class Task {{ id string }}
+class Incident {{ sev string }}
+class Done {{ note string }}
+class Halted {{ reason string }}
+class Review {{ verdict string }}
+
+coerce judge(t string) -> Review {{ prompt "judge {{{{ t }}}}" }}
+
+rule ship
+  when Task as task
+=> {{
+  until exists(Incident where sev == "sev1") {{
+    then plan <- coerce judge(task.id)
+    complete result {{ note "shipped" }}
+  }} on lapse as got {{
+    fail error {{ reason {arm} }}
+  }}
+}}
+"#
+            )
+        };
+        let bad_path = |arm: &str| {
+            compile_program(&program(arm))
+                .diagnostics
+                .into_iter()
+                .find(|d| d.message.contains("invalid field path"))
+                .map(|d| d.message)
+        };
+
+        // Accepted: a step, a step's status, and a field of a step's own payload.
+        for arm in ["got.plan.verdict", "got.steps.plan"] {
+            let compiled = compile_program(&program(arm));
+            assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+            assert_eq!(bad_path(arm), None, "`{arm}` must resolve");
+        }
+
+        // A field that is neither a step nor `steps`.
+        assert!(bad_path("got.bogus").is_some_and(|m| m.contains("has no field `bogus`")));
+        // A step name that does not exist.
+        assert!(bad_path("got.steps.nostep").is_some_and(|m| m.contains("has no field `nostep`")),);
+        // A path *through* a status: a status is a string, not a schema.
+        assert!(
+            bad_path("got.steps.plan.deeper").is_some_and(|m| m.contains("is not a schema value")),
+        );
+        // A deeper path under a step resolves against that step's OWN schema.
+        assert!(bad_path("got.plan.bogus").is_some_and(|m| m.contains("`Review` has no field")));
+    }
+
+    /// The same splice hid ordinary bindings too: nothing in the arm was field
+    /// checked, so `task.bogus` — a plain input binding — compiled clean. That is
+    /// the wider half of the same gap and is covered by the same walk.
+    #[test]
+    fn lapse_arm_validates_ambient_binding_field_paths() {
+        let source = r#"
+workflow Deploy
+input task Task
+output result Done
+failure error Halted
+class Task { id string }
+class Incident { sev string }
+class Done { note string }
+class Halted { reason string }
+
+rule ship
+  when Task as task
+=> {
+  until exists(Incident where sev == "sev1") {
+    then plan <- timer 1s
+    complete result { note "shipped" }
+  } on lapse as got {
+    fail error { reason task.bogus }
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid field path `task.bogus`")),
+            "{:?}",
+            compiled.diagnostics
+        );
+    }
+
+    /// The splice hid the arm from Family B read-narrowing too: an `on lapse` arm
+    /// is an egress position like any other, so a presence-conditioned field read
+    /// there must be inside a matching `case` arm. The region may itself sit inside
+    /// one, and the arm keeps that arm's allowances — checking it against the rule
+    /// top would reject a legal read.
+    #[test]
+    fn lapse_arm_narrows_conditioned_reads() {
+        let program = |arm_body: &str, wrap: bool| {
+            let region = format!(
+                r#"  until exists(Incident where sev == "sev1") {{
+    then plan <- timer 1s
+    complete result {{ note "shipped" }}
+  }} on lapse as got {{
+{arm_body}
+  }}"#
+            );
+            let body = if wrap {
+                format!(
+                    "  case e.kind {{\n    \"deploy\" => {{\n{region}\n    }}\n    \
+                     \"rollback\" => {{ complete result {{ note \"rolled back\" }} }}\n  }}"
+                )
+            } else {
+                region
+            };
+            format!(
+                r#"
+workflow Deploy
+input e Event
+output result Done
+failure error Halted
+class Done {{ note string }}
+class Halted {{ reason string }}
+class Incident {{ sev string }}
+class Event {{
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+}}
+
+rule ship
+  when Event as e
+=> {{
+{body}
+}}
+"#
+            )
+        };
+        let narrowed = |source: &str| {
+            compile_program(source)
+                .diagnostics
+                .into_iter()
+                .any(|d| d.message.contains("reads conditional field `e.region`"))
+        };
+
+        // Outside any arm: the read leaves the instance through the terminal.
+        assert!(narrowed(&program(
+            "    fail error { reason e.region }",
+            false
+        )));
+        // Effect operands in the arm are egress reads too (the position #93 closed
+        // for the canonical body, which never reached the arm).
+        assert!(narrowed(&program(
+            "    exec \"deploy {{ e.region }}\" as ran\n    fail error { reason \"lapsed\" }",
+            false
+        )));
+        // Inside the matching `deploy` arm the same read is legal, and the region's
+        // enclosing arm is the context the lapse arm inherits.
+        let inside = compile_program(&program("        fail error { reason e.region }", true));
+        assert!(inside.ir.is_some(), "{:?}", inside.diagnostics);
+        assert!(!narrowed(&program(
+            "        fail error { reason e.region }",
+            true
+        )));
     }
 
     /// v1 limit: one region per rule; the second draws a spanned error.
