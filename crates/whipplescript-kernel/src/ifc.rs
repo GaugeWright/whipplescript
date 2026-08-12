@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use whipplescript_parser::{
     Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule, IrWorkflowContractKind, QueryKind,
+    RelatedInfo,
 };
 
 use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
@@ -2752,12 +2753,11 @@ pub fn check_with_envelope_imports(
             // context to the agent's model provider, so a read-confidential turn
             // whose provider is not cleared leaks to the model.
             if effect.kind == IrEffectKind::AgentTell {
-                if let Some(provider) = effect
+                let declaration = effect
                     .agent
                     .as_deref()
-                    .and_then(|name| ir.agents.iter().find(|a| a.name == name))
-                    .and_then(|a| a.provider.as_deref())
-                {
+                    .and_then(|name| ir.agents.iter().find(|a| a.name == name));
+                if let Some(provider) = declaration.and_then(|a| a.provider.as_deref()) {
                     for grant in &effect.access_grants {
                         let resource = grant.resource.as_str();
                         let reads_resource =
@@ -2779,7 +2779,19 @@ pub fn check_with_envelope_imports(
                                     "bind the agent to a provider cleared for `{resource}`, or \
                                      declassify before the turn"
                                 )),
-                                related: Vec::new(),
+                                // The binding is per-agent for the life of the
+                                // conversation (DR-0062 §1), so the fix is the
+                                // declaration, not this call site. Point there.
+                                related: declaration
+                                    .map(|agent| RelatedInfo {
+                                        span: agent.span,
+                                        message: format!(
+                                            "`{}` is bound to provider `{provider}` here",
+                                            agent.name
+                                        ),
+                                    })
+                                    .into_iter()
+                                    .collect(),
                             });
                             break;
                         }
@@ -2815,10 +2827,11 @@ pub fn check_with_envelope_imports(
             .iter()
             .filter(|effect| effect.kind == IrEffectKind::SchemaCoerce)
         {
-            let principal = effect
+            let declaration = effect
                 .coerce_target
                 .as_deref()
-                .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name))
+                .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name));
+            let principal = declaration
                 .and_then(|decl| decl.provider.as_deref())
                 .unwrap_or(UNNAMED_COERCE_BACKEND);
             for resource in reads
@@ -2843,7 +2856,27 @@ pub fn check_with_envelope_imports(
                             "clear this endpoint for the resource (`grant provider {principal} -> \
                              … readable by <role>`), or declassify before the coerce"
                         )),
-                        related: Vec::new(),
+                        // Point at the declaration whose `provider` clause chose
+                        // this endpoint — or, when none did, say so, since the
+                        // remedy there is to name one rather than to re-grant.
+                        related: declaration
+                            .map(|decl| RelatedInfo {
+                                span: decl.span,
+                                message: match decl.provider.as_deref() {
+                                    Some(provider) => format!(
+                                        "`{}` sends to provider `{provider}` here",
+                                        decl.name
+                                    ),
+                                    None => format!(
+                                        "`{}` names no provider, so it is judged as the \
+                                         un-named backend `{UNNAMED_COERCE_BACKEND}` — name one \
+                                         to govern this coerce per endpoint",
+                                        decl.name
+                                    ),
+                                },
+                            })
+                            .into_iter()
+                            .collect(),
                     });
                     break;
                 }
@@ -4323,6 +4356,86 @@ rule work
         assert!(
             !egress.iter().any(|m| m.contains("`onprem-llm`")),
             "the cleared endpoint must not be denied, got: {egress:?}"
+        );
+    }
+
+    #[test]
+    fn an_egress_denial_points_at_the_declaration_that_chose_the_endpoint() {
+        // DR-0062: the binding is per-agent for the life of a conversation and
+        // per-declaration for a coerce, so the fix is almost never at the call
+        // site the span lands on. The related label carries the reader to the
+        // line that actually chose the endpoint.
+        let program = r#"@service
+workflow EgressSiting
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { label string }
+
+agent reviewer { provider acme-cloud  profile "repo-reader"  capacity 1 }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+coerce classify(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+  provider acme-cloud
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  coerce classify(ticket.id) as verdict
+  tell reviewer "review" with access to ledger { read } as turn
+  after turn succeeds as t {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider acme-cloud -> https:acme readable by public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+
+        let turn = diagnostics
+            .iter()
+            .find(|d| {
+                d.message.contains("denied egress") && d.message.contains("sending this turn")
+            })
+            .expect("the turn egress must be denied");
+        assert!(
+            turn.related
+                .iter()
+                .any(|r| r.message.contains("reviewer") && r.message.contains("acme-cloud")),
+            "the turn denial must cite the agent declaration: {:?}",
+            turn.related
+        );
+
+        let coerce = diagnostics
+            .iter()
+            .find(|d| d.message.contains("denied egress") && d.message.contains("coerce"))
+            .expect("the coerce egress must be denied");
+        assert!(
+            coerce
+                .related
+                .iter()
+                .any(|r| r.message.contains("classify") && r.message.contains("acme-cloud")),
+            "the coerce denial must cite the declaration that chose the endpoint: {:?}",
+            coerce.related
+        );
+        // The labels point at the DECLARATIONS, not at the rule body that
+        // tripped over them — which is the whole point of the siting change.
+        assert!(
+            turn.related[0].span.start < turn.span.start,
+            "the agent declaration sits above the tell it explains"
         );
     }
 

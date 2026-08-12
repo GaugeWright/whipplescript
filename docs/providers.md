@@ -783,6 +783,11 @@ than at every point data leaves. A role with no `require custody` line places no
 demand at all, so an endpoint you have not attested still works; it is simply
 limited to public data, exactly as before.
 
+When an endpoint is not cleared for what a rule reads, the denial points at the
+declaration that chose it — the `agent` for a turn, the `coerce` for a prompt —
+rather than only at the line that tripped over it, because that declaration is
+where the binding actually lives.
+
 When a policy asks for more than the evidence supports, the runtime refuses to
 start and says which of the two to change:
 

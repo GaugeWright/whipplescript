@@ -1496,6 +1496,14 @@ pub enum IrPrimitiveType {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrAgent {
     pub name: String,
+    /// Where the declaration sits, so a diagnostic about this agent's PROVIDER
+    /// can point at the line that binds it rather than only at the `tell` that
+    /// tripped over it (DR-0062). The binding is per-agent and the fix is almost
+    /// always here, not at the call site.
+    ///
+    /// Not part of the `.ir` snapshot: analysis-facing metadata, like
+    /// `IrEffectNode::agent`.
+    pub span: SourceSpan,
     pub harness: Option<String>,
     pub provider: Option<String>,
     pub profile: Option<String>,
@@ -1528,6 +1536,10 @@ pub struct IrAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrCoerce {
     pub name: String,
+    /// Where the declaration sits, so a diagnostic about the endpoint this
+    /// coerce reaches can point at its `provider` clause (DR-0062), the same way
+    /// an agent's does. Not part of the `.ir` snapshot.
+    pub span: SourceSpan,
     pub params: Vec<IrParam>,
     pub output: IrType,
     pub body: String,
@@ -8083,6 +8095,7 @@ fn lower_agent(
 ) {
     let mut lowered = IrAgent {
         name: agent.name.name.clone(),
+        span: agent.name.span,
         harness: agent.harness.as_ref().map(|harness| harness.name.clone()),
         provider: None,
         profile: None,
@@ -9378,6 +9391,7 @@ fn lower_coerce(
     validate_coerce_body_fields(&coerce, diagnostics);
 
     ir.coerces.push(IrCoerce {
+        span: coerce.name.span,
         name: coerce.name.name,
         params: coerce
             .params
