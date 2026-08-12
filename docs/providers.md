@@ -731,6 +731,36 @@ whip provider operator-run onprem-llm
 `whip provider status <name>` shows the resolved rung and class, the evidence
 behind each, and whether the endpoint has drifted from its pin.
 
+One endpoint can be registered for both `agent.tell` and `schema.coerce`. Those
+are separate registrations with their own configuration, so they can genuinely be
+different deployments — and they carry separate evidence. When a name is
+ambiguous the commands refuse rather than guess, and `--effect-kind` says which
+you mean. A delegated endpoint must clear the demand under *every* kind it serves.
+
+### Coerce backends are endpoints too
+
+A `coerce`/`decide`/`prompt` ships its interpolated prompt to a model just as a
+turn does, so it is governed the same way — by the endpoint it actually reaches.
+Name that endpoint on the declaration and it becomes the principal:
+
+```whip
+coerce classify(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+  provider onprem-llm
+}
+```
+
+Two coerces in one rule reaching different backends are judged separately, so
+clearing one endpoint never covers the other.
+
+A declaration with no `provider` clause — and an inline `decide`, which names no
+declaration — has no static endpoint identity, because the selection ladder
+picks the backend at runtime. Those keep the abstract `model` principal that
+governance already labels, and no custody class can be demanded of them. If you
+want per-endpoint governance over a coerce, name its provider.
+
 ### Demanding a class
 
 Evidence lives in the registry, written by the commands above. The **bar it is

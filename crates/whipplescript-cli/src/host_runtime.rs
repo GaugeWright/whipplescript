@@ -3044,8 +3044,13 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-/// The effect kind model-endpoint providers register under, and therefore the
-/// one custody evidence is keyed by (DR-0062 §6).
+/// The effect kinds that ship context to a model, and therefore the ones custody
+/// evidence is keyed by (DR-0062 §6). Both are checked: an endpoint delegated
+/// read-authority must clear the demand wherever it is used, and `schema.coerce`
+/// is as real a door as `agent.tell`.
+pub const MODEL_EGRESS_EFFECT_KINDS: [&str; 2] = ["agent.tell", "schema.coerce"];
+
+/// The effect kind an unqualified `whip provider` command defaults to.
 pub const AGENT_TURN_EFFECT_KIND: &str = "agent.tell";
 
 /// What the registry currently supports for one model endpoint.
@@ -3070,16 +3075,17 @@ pub struct ResolvedProviderTrust {
 pub fn resolve_provider_trust(
     store: &SqliteStore,
     provider: &str,
+    effect_kind: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ResolvedProviderTrust, whipplescript_store::StoreError> {
     use whipplescript_kernel::provider_trust::{
         derive, endpoint_digest, evidence_from_registry, RegistryEvidence,
     };
     let live_digest = store
-        .effect_provider_config(AGENT_TURN_EFFECT_KIND, provider)?
+        .effect_provider_config(effect_kind, provider)?
         .map(|config| endpoint_digest(&config));
     let row = store
-        .provider_trust_evidence(AGENT_TURN_EFFECT_KIND, provider)?
+        .provider_trust_evidence(effect_kind, provider)?
         .unwrap_or_default();
     let evidence = evidence_from_registry(
         RegistryEvidence {
@@ -3116,12 +3122,29 @@ fn refuse_inadmissible_provider_delegations(
             // unattested endpoint keeps working (public-only).
             continue;
         };
-        let resolved =
-            resolve_provider_trust(store, provider, now).map_err(HostRuntimeError::Store)?;
-        if let Err(denial) = delegation_admissible(&resolved.derived, Some(demand)) {
-            return Err(HostRuntimeError::PolicyRejected(
-                denial.message(provider, role),
-            ));
+        // Every effect kind this endpoint serves must clear the demand. An
+        // endpoint registered for both `agent.tell` and `schema.coerce` is two
+        // registrations with their own config, so they can be different
+        // deployments and each carries its own evidence.
+        let mut kinds = store
+            .list_provider_effect_kinds(provider)
+            .map_err(HostRuntimeError::Store)?;
+        kinds.retain(|kind| MODEL_EGRESS_EFFECT_KINDS.contains(&kind.as_str()));
+        if kinds.is_empty() {
+            // Registered for nothing whip can identify: the floor, and refused.
+            // A delegation naming an endpoint that does not exist must not pass
+            // merely because there was no row to judge.
+            kinds.push(AGENT_TURN_EFFECT_KIND.to_owned());
+        }
+        for kind in kinds {
+            let resolved = resolve_provider_trust(store, provider, &kind, now)
+                .map_err(HostRuntimeError::Store)?;
+            if let Err(denial) = delegation_admissible(&resolved.derived, Some(demand)) {
+                return Err(HostRuntimeError::PolicyRejected(format!(
+                    "{} (effect kind `{kind}`)",
+                    denial.message(provider, role)
+                )));
+            }
         }
     }
     Ok(())
@@ -3420,6 +3443,47 @@ workflow UnsafeHostChat {
                 .expect("pin");
             store
                 .set_provider_operator_run(AGENT_TURN_EFFECT_KIND, "builtin-agent-harness", true)
+                .expect("operator run");
+        }
+        GovernedHostRuntime::open(&path, 1, &policy_text).expect("admissible now");
+    }
+
+    /// DR-0062: `schema.coerce` is as real a model-egress door as `agent.tell`,
+    /// so custody is demanded of a coerce backend too. This endpoint is
+    /// registered only under `schema.coerce`, and the check has to find it there
+    /// rather than looking only at the turn kind.
+    #[test]
+    fn a_coerce_only_endpoint_must_clear_its_role_too() {
+        let path = temp_store();
+        let policy_text = SignedEnvelope::sign_for_test(
+            "delegate provider:builtin-coerce acts-for Operator for confidentiality\n\
+             require custody zero-retention for Operator\n",
+            "admin",
+        )
+        .to_json();
+
+        let error = GovernedHostRuntime::open(&path, 1, &policy_text)
+            .err()
+            .expect("an unattested coerce backend must not carry Operator data");
+        let message = format!("{error:?}");
+        assert!(message.contains("pinned endpoint"), "{message}");
+        assert!(
+            message.contains("schema.coerce"),
+            "the refusal must name the effect kind it judged: {message}"
+        );
+
+        {
+            let store = SqliteStore::open(&path).expect("store");
+            let config = store
+                .effect_provider_config("schema.coerce", "builtin-coerce")
+                .expect("config")
+                .expect("seeded provider");
+            let digest = whipplescript_kernel::provider_trust::endpoint_digest(&config);
+            store
+                .pin_provider_endpoint("schema.coerce", "builtin-coerce", &digest)
+                .expect("pin");
+            store
+                .set_provider_operator_run("schema.coerce", "builtin-coerce", true)
                 .expect("operator run");
         }
         GovernedHostRuntime::open(&path, 1, &policy_text).expect("admissible now");

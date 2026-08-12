@@ -3125,6 +3125,21 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Every effect kind one provider name is registered under.
+    ///
+    /// A model endpoint can serve both `agent.tell` and `schema.coerce`, and
+    /// custody has to be satisfied for each — they are separate registrations
+    /// with their own config, so they can genuinely be different deployments.
+    pub fn list_provider_effect_kinds(&self, provider: &str) -> StoreResult<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT effect_kind FROM effect_providers WHERE provider = ?1 ORDER BY effect_kind",
+        )?;
+        let rows = statement
+            .query_map(params![provider], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Freeze the endpoint's identity digest (DR-0062 §3, the `pinned` rung).
     /// Idempotent per `(effect_kind, provider)`; re-pinning after a deliberate
     /// endpoint change is how drift is *accepted* rather than worked around.

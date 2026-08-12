@@ -1531,6 +1531,15 @@ pub struct IrCoerce {
     pub params: Vec<IrParam>,
     pub output: IrType,
     pub body: String,
+    /// The backend named by the declaration's `provider <name>` clause, surfaced
+    /// so information-flow analysis can treat THIS endpoint as the principal a
+    /// `coerce` egresses to (DR-0062). `None` when the declaration names none —
+    /// the backend is then whatever the selection ladder resolves at runtime, so
+    /// there is no static endpoint identity to govern by.
+    ///
+    /// Not part of the `.ir` snapshot: like `IrEffectNode::agent`, this is
+    /// analysis-facing metadata, not lowered program shape.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1812,6 +1821,12 @@ pub struct IrEffectNode {
     /// analysis can model the turn's egress to that agent's provider. `None` for
     /// non-`tell` effects. Not part of the `.ir` snapshot.
     pub agent: Option<String>,
+    /// The `coerce` declaration this effect invokes, surfaced for the same reason
+    /// `agent` is: it is how the analysis reaches the declaration's `provider`
+    /// clause and so the endpoint this egress actually reaches. `None` for
+    /// non-coerce effects AND for an inline `decide`, which names no declaration
+    /// and therefore no backend. Not part of the `.ir` snapshot.
+    pub coerce_target: Option<String>,
     /// The workflow an `invoke` addresses, surfaced so information-flow analysis can
     /// enumerate and govern invoke membrane ports. `None` for non-`invoke` effects.
     /// Not part of the `.ir` snapshot.
@@ -9164,6 +9179,94 @@ fn lower_table(
 /// `provider <name>` — not free text. Reject anything else so a typo'd
 /// `promt` (which would otherwise silently produce a coercion with NO prompt)
 /// or a stray field fails at `check`, matching the agent-block posture.
+/// The backend named by a coerce declaration's `provider <name>` clause.
+///
+/// Mirrors `validate_coerce_body_fields`'s prompt tracking exactly: a `provider`
+/// line inside a `"""` prompt is prose the model reads, not a clause, and
+/// reading it as one would let a prompt rename the endpoint its own egress is
+/// judged against.
+fn coerce_declared_provider(body: &str) -> Option<String> {
+    let mut in_prompt = false;
+    let mut awaiting_opener = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if in_prompt {
+            if trimmed.matches('"').count() >= 3 && trimmed.matches("\"\"\"").count() % 2 == 1 {
+                in_prompt = false;
+            }
+            continue;
+        }
+        if awaiting_opener {
+            if trimmed.is_empty() {
+                continue;
+            }
+            awaiting_opener = false;
+            if let Some(after_opener) = trimmed.strip_prefix("\"\"\"") {
+                if after_opener.matches("\"\"\"").count() % 2 == 0 {
+                    in_prompt = true;
+                }
+                continue;
+            }
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "prompt" {
+            awaiting_opener = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("prompt ") {
+            if let Some(after_opener) = rest.strip_prefix("\"\"\"") {
+                if after_opener.matches("\"\"\"").count() % 2 == 0 {
+                    in_prompt = true;
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("provider ") {
+            let mut tokens = rest.split_whitespace();
+            if let (Some(name), None) = (tokens.next(), tokens.next()) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod coerce_provider_tests {
+    use super::coerce_declared_provider;
+
+    #[test]
+    fn reads_a_declared_provider() {
+        assert_eq!(
+            coerce_declared_provider("prompt \"\"\"hi\"\"\"\nprovider onprem-llm\n").as_deref(),
+            Some("onprem-llm")
+        );
+    }
+
+    #[test]
+    fn a_declaration_naming_none_has_no_endpoint_identity() {
+        assert_eq!(coerce_declared_provider("prompt \"\"\"hi\"\"\"\n"), None);
+    }
+
+    #[test]
+    fn a_provider_line_inside_a_prompt_is_prose_not_a_clause() {
+        // The prompt is text the model reads. Reading a `provider` line inside it
+        // as a clause would let a prompt rename the endpoint its own egress is
+        // judged against (DR-0062) — so prompt bodies are skipped.
+        let body = "prompt \"\"\"markdown\n  provider attacker-controlled\n  \"\"\"\n";
+        assert_eq!(coerce_declared_provider(body), None);
+    }
+
+    #[test]
+    fn a_malformed_clause_yields_no_endpoint_rather_than_a_guess() {
+        // `provider a b` is the shape `validate_coerce_body_fields` already
+        // diagnoses; resolving it to `a` would govern by half a name.
+        assert_eq!(coerce_declared_provider("provider a b\n"), None);
+    }
+}
+
 fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagnostic>) {
     let mut in_prompt = false;
     let mut awaiting_opener = false;
@@ -9276,6 +9379,7 @@ fn lower_coerce(
             })
             .collect(),
         output: lower_type(coerce.output),
+        provider: coerce_declared_provider(&coerce.body.text),
         body: coerce.body.text,
     });
 }
@@ -11068,6 +11172,7 @@ fn analyze_rule(
                 transport_onto: None,
                 resource: None,
                 agent: None,
+                coerce_target: None,
                 workflow_target: None,
                 endorsed: false,
                 declassified: false,
@@ -12552,6 +12657,16 @@ fn agent_for_body(kind: &body::BodyEffectKind) -> Option<String> {
     }
 }
 
+/// The `coerce` declaration a coerce effect invokes (DR-0062). An inline
+/// `decide` names no declaration, so it yields `None` and falls back to the
+/// un-named-backend principal.
+fn coerce_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+    match kind {
+        body::BodyEffectKind::Coerce { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Turn-scoped `with skills [...]` pinned onto an `agent.tell` effect (Phase 7).
 fn turn_skills_for_body(kind: &body::BodyEffectKind) -> Vec<String> {
     match kind {
@@ -12864,6 +12979,7 @@ fn walk_effects(
                 let (selection_source, transport_onto) = vcs_selective_for_body(&effect.kind);
                 let resource = resource_for_body(&effect.kind);
                 let agent = agent_for_body(&effect.kind);
+                let coerce_target = coerce_target_for_body(&effect.kind);
                 let workflow_target = workflow_target_for_body(&effect.kind);
                 let endorsed = endorsed_for_body(&effect.kind);
                 let declassified = declassified_for_body(&effect.kind);
@@ -12884,6 +13000,7 @@ fn walk_effects(
                     transport_onto,
                     resource,
                     agent,
+                    coerce_target,
                     workflow_target,
                     endorsed,
                     declassified,

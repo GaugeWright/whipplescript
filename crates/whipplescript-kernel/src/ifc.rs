@@ -1387,6 +1387,15 @@ pub struct VerifiedEnvelope {
     attestation: Option<crate::gov::VerifiedAttestation>,
 }
 
+/// The principal a `coerce` egresses to when its declaration names no
+/// `provider` (and for an inline `decide`, which names no declaration).
+///
+/// The selection ladder picks that backend at runtime, so there is no endpoint
+/// identity to govern by and no custody class to demand of it. Governance labels
+/// this name to speak about "whatever backend the registry resolves"; naming a
+/// provider on the declaration is what buys per-endpoint governance.
+pub const UNNAMED_COERCE_BACKEND: &str = "model";
+
 /// The outcome of crossing the trust boundary.
 pub enum EnvelopeStatus {
     /// No envelope configured: ungoverned dev mode (the gradual model).
@@ -2779,44 +2788,61 @@ pub fn check_with_envelope_imports(
             }
         }
         // Provider egress via coerce/decide/prompt (SchemaCoerce): these ship
-        // the interpolated prompt — which carries the rule's read data — to the
-        // `schema.coerce` model backend, an external LLM (principal `model`).
-        // Exactly like `agent.tell` (DR-0027 provider-as-principal): a
-        // read-confidential rule whose model principal is not cleared for a read
-        // leaks to the model. AgentTell is checked per-effect above via its own
-        // grants; a coerce carries no grants, so — fail-closed — its egress is
-        // the rule's reads. Without this, coerce was an UNMODELED door: governed
-        // data left to the model with `violations: 0` (information-flow-surface.md §56).
-        if let Some(coerce_span) = rule
+        // the interpolated prompt — which carries the rule's read data — to a
+        // real model backend. Exactly like `agent.tell` (DR-0027
+        // provider-as-principal): a read-confidential rule whose model principal
+        // is not cleared for a read leaks to the model. AgentTell is checked
+        // per-effect above via its own grants; a coerce carries no grants, so —
+        // fail-closed — its egress is the rule's reads. Without this, coerce was
+        // an UNMODELED door: governed data left to the model with
+        // `violations: 0` (information-flow-surface.md §56).
+        //
+        // DR-0062: the principal is THE ENDPOINT, not a single abstract `model`.
+        // A declaration's `provider <name>` clause names it, exactly as an
+        // agent's does, so the two doors are governed by the same vocabulary and
+        // a custody demand can attach to a coerce backend at all. A declaration
+        // naming no provider — and an inline `decide`, which names no
+        // declaration — has no static endpoint identity, because the selection
+        // ladder resolves the backend at runtime; those keep the abstract
+        // `model` principal, which is what governance already labels.
+        //
+        // Checked PER EFFECT, not once per rule: two coerces in one rule may
+        // reach different endpoints, and collapsing them would judge one by the
+        // other's clearance.
+        for effect in rule
             .metadata
             .effects
             .iter()
-            .find(|effect| effect.kind == IrEffectKind::SchemaCoerce)
-            .map(|effect| effect.span)
+            .filter(|effect| effect.kind == IrEffectKind::SchemaCoerce)
         {
+            let principal = effect
+                .coerce_target
+                .as_deref()
+                .and_then(|name| ir.coerces.iter().find(|decl| decl.name == name))
+                .and_then(|decl| decl.provider.as_deref())
+                .unwrap_or(UNNAMED_COERCE_BACKEND);
             for resource in reads
                 .iter()
                 .copied()
                 .chain(fact_reads.iter().map(String::as_str))
             {
-                if envelope.leaks(resource, "model") {
+                if envelope.leaks(resource, principal) {
                     diagnostics.push(Diagnostic {
-                        span: coerce_span,
+                        span: effect.span,
                         message: format!(
                             "denied egress in rule `{rule}`: a `coerce`/`decide`/`prompt` reads \
                              `{resource}`, which {rr} only may read — sending the prompt to the \
-                             schema.coerce model provider `model` (clearance {pr}) would disclose \
-                             it to an uncleared model (the checker denies every prompt egress to a \
-                             provider not cleared for its inputs)",
+                             schema.coerce model provider `{principal}` (clearance {pr}) would \
+                             disclose it to an uncleared model (the checker denies every prompt \
+                             egress to a provider not cleared for its inputs)",
                             rule = rule.name,
                             rr = envelope.reader_label(resource),
-                            pr = envelope.reader_label("model"),
+                            pr = envelope.reader_label(principal),
                         ),
-                        suggestion: Some(
-                            "clear the model provider for this resource (`grant provider model -> \
+                        suggestion: Some(format!(
+                            "clear this endpoint for the resource (`grant provider {principal} -> \
                              … readable by <role>`), or declassify before the coerce"
-                                .to_owned(),
-                        ),
+                        )),
                         related: Vec::new(),
                     });
                     break;
@@ -4228,6 +4254,120 @@ rule work
                     && d.message.contains("coerce")
                     && d.message.contains("ledger")),
             "coerce in a rule that reads the confidential ledger should be flagged, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn each_coerce_is_judged_by_its_own_declared_endpoint() {
+        // DR-0062: the principal is THE ENDPOINT, not one abstract `model`. Two
+        // coerces in one rule reach different backends; the cleared one must pass
+        // and the uncleared one must be denied, in the SAME rule. Before this,
+        // both were judged as `model` and one endpoint's clearance silently
+        // covered the other.
+        let program = r#"@service
+workflow CoercePerEndpoint
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { label string }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+coerce onprem(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+  provider onprem-llm
+}
+
+coerce cloud(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+  provider acme-cloud
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  coerce onprem(ticket.id) as cleared
+  coerce cloud(ticket.id) as uncleared
+  after cleared succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        // The on-prem endpoint is cleared for the ledger; the cloud one is not.
+        let envelope = Envelope::from_dsl(
+            "grant file_store ledger -> file:/srv/ledger readable by Operator\n\
+             grant provider onprem-llm -> selfhost:llama readable by Operator\n\
+             grant provider acme-cloud -> https:acme readable by public\n",
+        )
+        .expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        let egress: Vec<&String> = diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .filter(|m| m.contains("denied egress") && m.contains("coerce"))
+            .collect();
+        assert!(
+            egress.iter().any(|m| m.contains("acme-cloud")),
+            "the uncleared endpoint must be denied by name, got: {egress:?}"
+        );
+        assert!(
+            !egress.iter().any(|m| m.contains("`onprem-llm`")),
+            "the cleared endpoint must not be denied, got: {egress:?}"
+        );
+    }
+
+    #[test]
+    fn a_coerce_naming_no_provider_keeps_the_abstract_backend_principal() {
+        // No `provider` clause means the selection ladder picks the backend at
+        // runtime, so there is no endpoint identity to govern by. Such a coerce
+        // stays judged as `model` — which is what existing governance labels, so
+        // per-endpoint principals do not silently un-govern these.
+        let program = r#"@service
+workflow CoerceUnnamed
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+class Verdict { label string }
+
+file store ledger { root "./ledger"  allow read ["**"] }
+
+coerce classify(text string) -> Verdict {
+  prompt """markdown
+  Classify: {{ text }}
+  """
+}
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule work
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  read text from ledger at "data.txt" as loaded
+  coerce classify(ticket.id) as verdict
+  after verdict succeeds as v {
+    complete result { ok true }
+  }
+}
+"#;
+        let ir = compile_program(program).ir.expect("compiles");
+        let envelope = Envelope::from_json(ENVELOPE).expect("valid");
+        let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("denied egress") && d.message.contains("`model`")),
+            "an un-named backend keeps the abstract principal, got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

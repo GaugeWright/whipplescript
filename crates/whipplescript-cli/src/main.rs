@@ -910,7 +910,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "skill" => "usage: whip [--store path] [--json] skill <list | validate <SKILL.md|dir> | install <SKILL.md|dir>>",
         "auth" => "usage: whip auth <status | set <openai|anthropic> <key>>",
         "mcp" => "usage: whip [--json] mcp <list | add <name> (--url <url> | --command <cmd> [--arg <a>]...) [--env K=V]... [--header K=V]... | import <file> | status <name> | pin <name> | sync <name> | attest <name> --trust-annotations | forget <name>>\n  the trust ladder: unattested (added) -> pinned -> attested -> classified (roles in the config file)\n  `env:NAME`/`header env:NAME` values resolve from the environment at connect time; the file is chmod 600",
-        "provider" => "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]>\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
+        "provider" => "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]> [--effect-kind <agent.tell|schema.coerce>]\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
@@ -22780,6 +22780,7 @@ fn provider_command(options: &CliOptions) -> ExitCode {
     let mut custody = None::<String>;
     let mut signer = None::<String>;
     let mut until = None::<String>;
+    let mut effect_kind = None::<String>;
     let mut off = false;
     let mut iter = options.args.iter();
     while let Some(arg) = iter.next() {
@@ -22787,6 +22788,7 @@ fn provider_command(options: &CliOptions) -> ExitCode {
             "--custody" => custody = iter.next().cloned(),
             "--signer" => signer = iter.next().cloned(),
             "--until" => until = iter.next().cloned(),
+            "--effect-kind" => effect_kind = iter.next().cloned(),
             "--off" => off = true,
             other if other.starts_with('-') => {
                 eprintln!("unknown provider option `{other}`");
@@ -22799,13 +22801,57 @@ fn provider_command(options: &CliOptions) -> ExitCode {
     let name = positional.get(1).cloned();
     match subcommand {
         Some("list") => provider_list(options),
-        Some("status") => provider_status(options, name),
-        Some("pin") => provider_pin(options, name),
-        Some("attest") => provider_attest(options, name, custody, signer, until),
-        Some("operator-run") => provider_operator_run(options, name, !off),
+        Some("status") => provider_status(options, name, effect_kind),
+        Some("pin") => provider_pin(options, name, effect_kind),
+        Some("attest") => provider_attest(options, name, custody, signer, until, effect_kind),
+        Some("operator-run") => provider_operator_run(options, name, !off, effect_kind),
         _ => {
             eprintln!("{usage}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Which registration a `whip provider` subcommand acts on.
+///
+/// An endpoint can serve both `agent.tell` and `schema.coerce`, and those are
+/// separate registrations with their own config — so they can genuinely be
+/// different deployments carrying different custody. When a name is ambiguous we
+/// refuse rather than pick: silently pinning one of two deployments would leave
+/// the other unattested while `status` looked healthy.
+fn provider_effect_kind_or_exit(
+    store: &SqliteStore,
+    provider: &str,
+    explicit: Option<String>,
+) -> Result<String, ExitCode> {
+    if let Some(kind) = explicit {
+        return Ok(kind);
+    }
+    let kinds = match store.list_provider_effect_kinds(provider) {
+        Ok(kinds) => kinds
+            .into_iter()
+            .filter(|kind| {
+                whipplescript::host_runtime::MODEL_EGRESS_EFFECT_KINDS.contains(&kind.as_str())
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            eprintln!("cannot read provider registrations: {error:?}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    match kinds.len() {
+        0 => {
+            eprintln!("no model endpoint named `{provider}` is registered");
+            Err(ExitCode::FAILURE)
+        }
+        1 => Ok(kinds.into_iter().next().unwrap_or_default()),
+        _ => {
+            eprintln!(
+                "`{provider}` is registered under {} — pass `--effect-kind <kind>` to say which \
+                 one you mean (they are separate registrations and can be different deployments)",
+                kinds.join(" and ")
+            );
+            Err(ExitCode::from(2))
         }
     }
 }
@@ -22854,22 +22900,27 @@ fn provider_list(options: &CliOptions) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
-    let providers =
-        match store.list_effect_providers(whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND) {
+    let now = chrono::Utc::now();
+    let mut rows = Vec::new();
+    for kind in whipplescript::host_runtime::MODEL_EGRESS_EFFECT_KINDS {
+        let providers = match store.list_effect_providers(kind) {
             Ok(rows) => rows,
             Err(error) => {
                 eprintln!("cannot list providers: {error:?}");
                 return ExitCode::FAILURE;
             }
         };
-    let now = chrono::Utc::now();
-    let mut rows = Vec::new();
-    for provider in &providers {
-        match whipplescript::host_runtime::resolve_provider_trust(&store, provider, now) {
-            Ok(resolved) => rows.push(provider_trust_json(provider, &resolved)),
-            Err(error) => {
-                eprintln!("cannot resolve `{provider}`: {error:?}");
-                return ExitCode::FAILURE;
+        for provider in &providers {
+            match whipplescript::host_runtime::resolve_provider_trust(&store, provider, kind, now) {
+                Ok(resolved) => {
+                    let mut row = provider_trust_json(provider, &resolved);
+                    row["effect_kind"] = json!(kind);
+                    rows.push(row);
+                }
+                Err(error) => {
+                    eprintln!("cannot resolve `{provider}`: {error:?}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
@@ -22880,7 +22931,8 @@ fn provider_list(options: &CliOptions) -> ExitCode {
     } else {
         for row in &rows {
             println!(
-                "{:<28} {:<11} {:<15}{}",
+                "{:<16} {:<28} {:<11} {:<15}{}",
+                row["effect_kind"].as_str().unwrap_or_default(),
                 row["provider"].as_str().unwrap_or_default(),
                 row["rung"].as_str().unwrap_or_default(),
                 row["custody"].as_str().unwrap_or_default(),
@@ -22895,7 +22947,11 @@ fn provider_list(options: &CliOptions) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn provider_status(options: &CliOptions, name: Option<String>) -> ExitCode {
+fn provider_status(
+    options: &CliOptions,
+    name: Option<String>,
+    effect_kind: Option<String>,
+) -> ExitCode {
     let provider = match provider_name_or_exit(name) {
         Ok(name) => name,
         Err(code) => return code,
@@ -22904,9 +22960,14 @@ fn provider_status(options: &CliOptions, name: Option<String>) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
+    let kind = match provider_effect_kind_or_exit(&store, &provider, effect_kind) {
+        Ok(kind) => kind,
+        Err(code) => return code,
+    };
     let resolved = match whipplescript::host_runtime::resolve_provider_trust(
         &store,
         &provider,
+        &kind,
         chrono::Utc::now(),
     ) {
         Ok(resolved) => resolved,
@@ -22915,12 +22976,13 @@ fn provider_status(options: &CliOptions, name: Option<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = provider_trust_json(&provider, &resolved);
+    let mut report = provider_trust_json(&provider, &resolved);
+    report["effect_kind"] = json!(kind);
     if options.json {
         let _ = emit_json(report);
         return ExitCode::SUCCESS;
     }
-    println!("provider:   {provider}");
+    println!("provider:   {provider}  ({kind})");
     println!(
         "rung:       {}{}",
         resolved.derived.rung.as_str(),
@@ -22963,7 +23025,11 @@ fn provider_status(options: &CliOptions, name: Option<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn provider_pin(options: &CliOptions, name: Option<String>) -> ExitCode {
+fn provider_pin(
+    options: &CliOptions,
+    name: Option<String>,
+    effect_kind: Option<String>,
+) -> ExitCode {
     let provider = match provider_name_or_exit(name) {
         Ok(name) => name,
         Err(code) => return code,
@@ -22972,18 +23038,16 @@ fn provider_pin(options: &CliOptions, name: Option<String>) -> ExitCode {
         Ok(store) => store,
         Err(code) => return code,
     };
-    let config = match store.effect_provider_config(
-        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
-        &provider,
-    ) {
+    let kind = match provider_effect_kind_or_exit(&store, &provider, effect_kind) {
+        Ok(kind) => kind,
+        Err(code) => return code,
+    };
+    let config = match store.effect_provider_config(&kind, &provider) {
         Ok(Some(config)) => config,
         Ok(None) => {
             // Refusing here rather than pinning a placeholder: a pin is a claim
             // about an endpoint's identity, and there is no identity to freeze.
-            eprintln!(
-                "no `{}` provider named `{provider}` is registered — nothing to pin",
-                whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND
-            );
+            eprintln!("no `{kind}` provider named `{provider}` is registered — nothing to pin");
             return ExitCode::FAILURE;
         }
         Err(error) => {
@@ -22992,11 +23056,7 @@ fn provider_pin(options: &CliOptions, name: Option<String>) -> ExitCode {
         }
     };
     let digest = whipplescript_kernel::provider_trust::endpoint_digest(&config);
-    if let Err(error) = store.pin_provider_endpoint(
-        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
-        &provider,
-        &digest,
-    ) {
+    if let Err(error) = store.pin_provider_endpoint(&kind, &provider, &digest) {
         eprintln!("cannot pin `{provider}`: {error:?}");
         return ExitCode::FAILURE;
     }
@@ -23014,6 +23074,7 @@ fn provider_attest(
     custody: Option<String>,
     signer: Option<String>,
     until: Option<String>,
+    effect_kind: Option<String>,
 ) -> ExitCode {
     let provider = match provider_name_or_exit(name) {
         Ok(name) => name,
@@ -23040,10 +23101,14 @@ fn provider_attest(
         Ok(store) => store,
         Err(code) => return code,
     };
+    let kind = match provider_effect_kind_or_exit(&store, &provider, effect_kind) {
+        Ok(kind) => kind,
+        Err(code) => return code,
+    };
     let filed_at = chrono::Utc::now().to_rfc3339();
     if let Err(error) =
         store.file_provider_custody_claim(whipplescript_store::ProviderCustodyClaim {
-            effect_kind: whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
+            effect_kind: &kind,
             provider: &provider,
             class: class.as_str(),
             signer: &signer,
@@ -23071,7 +23136,12 @@ fn provider_attest(
     ExitCode::SUCCESS
 }
 
-fn provider_operator_run(options: &CliOptions, name: Option<String>, on: bool) -> ExitCode {
+fn provider_operator_run(
+    options: &CliOptions,
+    name: Option<String>,
+    on: bool,
+    effect_kind: Option<String>,
+) -> ExitCode {
     let provider = match provider_name_or_exit(name) {
         Ok(name) => name,
         Err(code) => return code,
@@ -23080,11 +23150,11 @@ fn provider_operator_run(options: &CliOptions, name: Option<String>, on: bool) -
         Ok(store) => store,
         Err(code) => return code,
     };
-    if let Err(error) = store.set_provider_operator_run(
-        whipplescript::host_runtime::AGENT_TURN_EFFECT_KIND,
-        &provider,
-        on,
-    ) {
+    let kind = match provider_effect_kind_or_exit(&store, &provider, effect_kind) {
+        Ok(kind) => kind,
+        Err(code) => return code,
+    };
+    if let Err(error) = store.set_provider_operator_run(&kind, &provider, on) {
         eprintln!("cannot mark `{provider}`: {error:?}");
         return ExitCode::FAILURE;
     }
