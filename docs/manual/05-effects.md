@@ -107,6 +107,7 @@ The body of a rule can request more than one effect. A sequence of statements
 does **not** run the effects in that sequence. The statements request the
 effects concurrently:
 
+<!-- check: skip — a rule variation that completes the surrounding program's terminal -->
 ```whip
 rule begin
   when started
@@ -119,6 +120,7 @@ rule begin
 The only method to put effects in sequence is to nest them. The program does
 not request an effect in an `after` block until the external effect settles.
 
+<!-- check: skip — a rule variation that completes the surrounding program's terminal -->
 ```whip
 rule begin
   when started

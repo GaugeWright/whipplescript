@@ -8,6 +8,7 @@ optimizer. The command operates strictly in the campaign.
 
 ## How to declare the trade
 
+<!-- check: skip — names gauges the surrounding program declares -->
 ```whip
 campaign release_tuning {
   ascend    priority_correct

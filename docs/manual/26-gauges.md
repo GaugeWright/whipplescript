@@ -9,6 +9,7 @@ each run into an observation.
 
 ## How to declare a gauge
 
+<!-- check: context ch26 -->
 ```whip
 gauge priority_correct {
   judge via exec "python3 ./judge_priority.py"
@@ -48,6 +49,7 @@ declared bar is a hard constraint for the optimizer in chapter 28.
 
 ## Derived gauges and built-in gauges
 
+<!-- check: in ch26 -->
 ```whip
 gauge triage_cost {
   judge via exec "python3 ./cost_model.py"

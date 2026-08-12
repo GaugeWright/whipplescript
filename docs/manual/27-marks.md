@@ -8,6 +8,7 @@ comparison. The remainder of Part IV uses this instrument.
 
 ## Marks: a cut point as a part of the program
 
+<!-- check: skip — rides a gauge site the surrounding program declares -->
 ```whip
 mark "assessed" after triage
 ```

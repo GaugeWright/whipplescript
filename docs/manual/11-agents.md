@@ -10,6 +10,7 @@ configuration and not code.
 
 ## How to declare an agent
 
+<!-- check: fragment -->
 ```whip
 use std.agent
 
@@ -98,6 +99,7 @@ model enters through the configuration. The next section gives the detail.
 The bare declaration gives a default to each item below. Declare an item when
 its reason occurs:
 
+<!-- check: context ch11 -->
 ```whip
 agent researcher {
   provider fixture
@@ -147,6 +149,7 @@ the ceiling. A turn can carry explicit grants. A grant gives access to a
 specified resource with a specified set of operations. Write the grants between
 the target and the prompt:
 
+<!-- check: in ch11 -->
 ```whip
 tell researcher as turn
   with access to project_files {

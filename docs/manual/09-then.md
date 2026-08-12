@@ -68,6 +68,7 @@ coercion two lines below the request. There is no nested `after` block.
 A `then` statement has no new semantics. It is only a different spelling. The
 rule above compiles to exactly the nested form that you can write manually:
 
+<!-- check: skip — shows the `__then_` bindings expansion generates -->
 ```whip
 rule triage
   when Ticket as t
@@ -107,6 +108,7 @@ that only a `succeeds` predicate handles.
 When the failure of a step needs a typed reason or a recovery, write that step
 in the traditional form:
 
+<!-- check: skip — shows the `__then_` bindings expansion generates -->
 ```whip
 rule triage
   when Ticket as t
@@ -131,6 +133,7 @@ statements. The same rule can handle one sensitive step explicitly.
 A `then` statement in an `after` block or in a `case` arm chains the remainder
 of *that* block:
 
+<!-- check: skip — an `after` block; its effect is in the surrounding rule -->
 ```whip
 after upload succeeds {
   then scanned <- exec "scan incoming.bin"

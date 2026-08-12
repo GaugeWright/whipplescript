@@ -15,6 +15,7 @@ standard library is a set of embedded packages. The packages include
 `std.memory`. Thus these packages need only the import statement. The general
 surface of a package is the `call` effect:
 
+<!-- check: skip — excerpt; the package query type is not declared here -->
 ```whip
 use std.memory
 

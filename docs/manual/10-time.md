@@ -19,6 +19,7 @@ duration is due.
 A `timeout` clause limits each type of effect. If the effect does not settle
 when the duration is complete, the effect ends with the `timed_out` status:
 
+<!-- check: skip — completes the terminal its surrounding program declares -->
 ```whip
 rule check
   when started
@@ -61,8 +62,13 @@ the race between timers when the deadline covers more than one step.
 The `timer <duration>` statement counts from the present time. The
 `timer until <time>` statement fires at an instant:
 
+<!-- check: fragment -->
 ```whip
 class Deadline {
+  at time
+}
+
+class Overdue {
   at time
 }
 

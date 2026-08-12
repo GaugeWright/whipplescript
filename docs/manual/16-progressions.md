@@ -268,6 +268,7 @@ is equally absent from the view, as a step that never ran is.
 To tell those apart, read `got.steps`. The view reserves that one field for the
 **status of each step**:
 
+<!-- check: skip — the tail of a region opened in the fence above -->
 ```whip
   } on lapse as got {
     case got.steps.plan == "failed" {
@@ -311,6 +312,7 @@ condition. Usually a deploy that started to apply changes must complete the
 application. Thus the apply step goes after the region. The apply step chains
 on the results of the region:
 
+<!-- check: skip — a region whose steps call the surrounding program's coercion -->
 ```whip
   until exists(Incident where sev == "sev1") {
     then plan <- tell deployer "Plan the deploy."

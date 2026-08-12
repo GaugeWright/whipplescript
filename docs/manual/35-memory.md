@@ -9,6 +9,7 @@ gives the dedicated language surface.
 
 ## A pool and its three verbs
 
+<!-- check: fragment -->
 ```whip
 use std.memory
 
@@ -22,6 +23,7 @@ limit is the maximum quantity of entries that a recall operation injects.
 Memory with no limit degrades a prompt. Three verbs in the body of a rule
 operate on a pool. Each verb is a usual durable effect:
 
+<!-- check: skip — excerpt; its fact class and agent belong to the surrounding program -->
 ```whip
 rule remember_then_recall
   when Note as note

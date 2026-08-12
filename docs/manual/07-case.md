@@ -68,6 +68,7 @@ rule finish
 A field with a literal union operates in the same manner. The patterns are
 strings:
 
+<!-- check: skip — a `case` arm; its binding comes from the surrounding rule -->
 ```whip
 case b.format {
   "print" => { record Shelved { title b.title shelf "stacks" } }
@@ -101,6 +102,7 @@ have no meaning. Use a guard for a value with no limit.
 The enums with a payload in chapter 2 exist for the `case` statement. The
 variant is the value in the test. The `as` keyword binds the payload:
 
+<!-- check: skip — an `after` block; its effect is in the surrounding rule -->
 ```whip
 after verdict succeeds as outcome {
   case outcome {

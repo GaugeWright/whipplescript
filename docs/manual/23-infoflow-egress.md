@@ -74,6 +74,7 @@ The `redact` construct does this operation. The construct is a relative of the
 explicit narrowing family from chapter 4, which contains
 `record X from y { … }`:
 
+<!-- check: skip — excerpt; its fact class and agent belong to the surrounding program -->
 ```whip
 rule publish
   when Customer as c

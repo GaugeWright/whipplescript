@@ -22,6 +22,7 @@ The turn did more than the resolution of an `after` block. The turn derived a
 durable fact with the name `agent.turn.completed`. The fact is the same type of
 fact as each other fact in the instance. Thus a rule can *match* the fact:
 
+<!-- check: skip — excerpt; its fact class and agent belong to the surrounding program -->
 ```whip
 rule assign
   when Topic as topic
@@ -69,6 +70,7 @@ The `capacity` control in chapter 11 limits the quantity of turns that run at
 the same time. The `is available` readiness pattern makes that limit visible to
 the match operation:
 
+<!-- check: skip — excerpt; its fact class and agent belong to the surrounding program -->
 ```whip
 rule assign
   when Topic as topic
@@ -91,6 +93,7 @@ between a controlled pipeline and a large queue.
 Each specialized pattern is a short form of one general form. The general form
 matches a derived fact by its dotted name:
 
+<!-- check: skip — a readiness clause, not a rule body -->
 ```whip
 when fact agent.turn.completed as t
 ```

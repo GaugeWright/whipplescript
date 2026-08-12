@@ -11,6 +11,7 @@ The `prompt` statement sends text to the model and receives text. The statement
 is an effect, like each other effect. It is durable, it can fail, and an
 `after` block observes it. Its success binding *is* the returned string:
 
+<!-- check: skip — excerpt; `Ticket` is the surrounding program's fact -->
 ```whip
 use std.coercion
 
@@ -43,6 +44,7 @@ shape.
 A `coerce` statement is a call to a model. A declared class limits the output
 of the call. The model reasons in language. The workflow receives a value:
 
+<!-- check: context ch08 -->
 ```whip
 use std.coercion
 
@@ -161,6 +163,7 @@ The form with a string after the arrow is sufficient for the usual condition.
 When a coercion needs more than its prompt, the declaration takes a block of
 clauses instead:
 
+<!-- check: in ch08 -->
 ```whip
 coerce judgeTicket(title string, body string) -> Verdict {
   provider fixture
@@ -188,6 +191,7 @@ prompt.
 The design of the decision class is correct for a `case` statement. Thus use a
 `case` statement:
 
+<!-- check: skip — an `after` block; its effect is in the surrounding rule -->
 ```whip
 after verdict succeeds as v {
   case v.priority {
@@ -218,6 +222,7 @@ Sometimes a decision occurs one time, and a named declaration is unnecessary
 ceremony. In this condition, the `decide` statement writes the schema in
 position:
 
+<!-- check: skip — excerpt; `Plan` is the surrounding program's fact -->
 ```whip
 rule review
   when Plan as p

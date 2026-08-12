@@ -82,20 +82,23 @@ EXPECTED = {
     "docs/manual/03-expressions.md": 1,
     "docs/manual/04-rules.md": 5,
     "docs/manual/05-effects.md": 2,
-    "docs/manual/06-error-handling.md": 2,
+    "docs/manual/06-error-handling.md": 3,
     "docs/manual/07-case.md": 2,
-    "docs/manual/08-coerce.md": 1,
+    "docs/manual/08-coerce.md": 3,
     "docs/manual/09-then.md": 1,
-    "docs/manual/10-time.md": 1,
-    "docs/manual/11-agents.md": 1,
+    "docs/manual/10-time.md": 2,
+    "docs/manual/11-agents.md": 4,
     "docs/manual/13-agent-patterns.md": 3,
     "docs/manual/14-coordination.md": 3,
-    "docs/manual/15-trackers.md": 2,
+    "docs/manual/15-trackers.md": 4,
     "docs/manual/16-progressions.md": 2,
     "docs/manual/17-messaging.md": 5,
     "docs/manual/18-composition.md": 2,
     "docs/manual/19-exec.md": 2,
     "docs/manual/20-files.md": 1,
+    "docs/manual/26-gauges.md": 2,
+    "docs/manual/32-providers.md": 1,
+    "docs/manual/35-memory.md": 1,
     "docs/tutorials/root-agent.md": 1,
 }
 
@@ -106,11 +109,22 @@ DECLARATION_KEYWORDS = {
     "use", "class", "enum", "agent", "coerce", "lease", "ledger", "counter",
     "channel", "table", "credential", "memory", "pattern", "action", "redact",
     "include", "input", "output", "failure", "rule", "test", "source", "signal",
-    "event", "@service", "@external", "@internal",
+    "event", "tracker", "gauge", "mark", "campaign", "queue", "workspace",
+    "@service", "@external", "@internal",
 }
 
-WRAPPER_HEAD = """workflow DocFence
+# `file` is both: `file store …` declares one, `file issue into q` is a body
+# statement. The second word decides.
+def is_declaration(first_line: str) -> bool:
+    words = first_line.split()
+    if not words:
+        return False
+    if words[0] == "file":
+        return len(words) > 1 and words[1] == "store"
+    return words[0] in DECLARATION_KEYWORDS
 
+WRAPPER_WORKFLOW = "workflow DocFence\n"
+WRAPPER_CONTRACT = """
 output result FenceOk
 
 class FenceOk {
@@ -208,9 +222,17 @@ def wrap(fragment: str, context: str, binds: list[tuple[str, str]] | None = None
     body = "\n".join(rest)
 
     first = next((l.strip() for l in fragment.splitlines() if l.strip()), "")
-    keyword = first.split()[0] if first else ""
-    if keyword in DECLARATION_KEYWORDS:
-        program = WRAPPER_HEAD + "\n" + body + "\n" + seed_tables(body) + "\n" + WRAPPER_RULE
+    # A fence that declares its own terminal contract does not want the synthetic
+    # one: two `output result` declarations are an error, and the fragment's
+    # `complete result { … }` names fields the synthetic FenceOk does not have.
+    # A context or fragment that declares its own terminal contract keeps it; the
+    # synthetic one would be a second `output result` and its FenceOk lacks the
+    # fields the fragment completes with.
+    own_contract = bool(re.search(r"^\s*output\s", context + "\n" + fragment, re.M))
+    head = WRAPPER_WORKFLOW + ("" if own_contract else WRAPPER_CONTRACT)
+    tail = "" if own_contract else WRAPPER_RULE
+    if is_declaration(first):
+        program = head + "\n" + body + "\n" + seed_tables(body) + "\n" + tail
     else:
         # A rule-body fragment needs a rule to sit in. The context keeps its own
         # top-level position; only the fragment moves inside.
@@ -221,9 +243,9 @@ def wrap(fragment: str, context: str, binds: list[tuple[str, str]] | None = None
         )
         seeds = seed_tables(ctx + "\n" + "".join(f"when {c} as {n}\n" for n, c in (binds or [])))
         program = (
-            WRAPPER_HEAD + "\n" + ctx + "\n" + seeds
+            head + "\n" + ctx + "\n" + seeds
             + "\n\nrule doc_fence\n" + whens + "=> {\n"
-            + fragment + "\n  complete result { ok true }\n}\n"
+            + fragment + ("\n}\n" if own_contract else "\n  complete result { ok true }\n}\n")
         )
     return ("\n".join(uses) + "\n" if uses else "") + program
 
@@ -272,6 +294,27 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
 
         root = None
         expect_failure = False
+        if raw is not None and raw.startswith("context ") and WORKFLOW.search(body):
+            # A PROGRAM may also serve as a context: it is compiled as the program
+            # it is, and its declarations become reusable. The page already shows
+            # them, so nothing invisible is invented.
+            # Types, contracts, agents and coercions — not the rules. A fragment
+            # in this context is usually a variation on one of those rules, and
+            # two declarations of the same rule name are a duplicate node.
+            kept, in_rule = [], False
+            for l in body.splitlines():
+                if re.match(r"^\s*(rule|@external|@service)\s", l) or re.match(r"^\s*rule\s", l):
+                    in_rule = True
+                    continue
+                if in_rule:
+                    if l.startswith("}"):
+                        in_rule = False
+                    continue
+                if re.match(r"^\s*(workflow|@)", l):
+                    continue
+                kept.append(l)
+            contexts[raw.split(None, 1)[1].strip()] = "\n".join(kept) + "\n"
+            raw = None
         if raw is not None:
             if raw.startswith("skip"):
                 reason = raw[4:].strip(" —-").strip()
@@ -319,6 +362,7 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
                 continue
         elif not WORKFLOW.search(body) or ELISION.search(body):
             continue
+
 
         result = run(body, root)
         if expect_failure:

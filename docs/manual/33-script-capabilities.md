@@ -16,6 +16,7 @@ bounds the operations of a workflow. Audit the document with the
 authority of one turn more narrow, use the grant machinery from chapter 11.
 Chapter 20 completed the form of that machinery for a file store:
 
+<!-- check: skip — excerpt; `operator` is the surrounding program's agent -->
 ```whip
 tell operator as turn
   with access to project_files {

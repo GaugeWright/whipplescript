@@ -152,6 +152,7 @@ Sometimes the correct response to contention is a wait and not a stop. The
 `wait <duration>` clause changes the atomic attempt into an attempt with a
 limit:
 
+<!-- check: skip — one statement of a rule that binds `d` above it -->
 ```whip
 acquire deploy_slot for d.env wait 30s as slot
 ```

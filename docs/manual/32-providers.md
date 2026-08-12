@@ -81,6 +81,7 @@ whip. The family only changes the component that thinks.
 A change of the family is correspondingly simple. That simplicity is the
 feature:
 
+<!-- check: fragment -->
 ```whip
 agent implementer {
   provider codex

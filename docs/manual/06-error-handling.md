@@ -77,6 +77,7 @@ fail. The effect is `exec`. The `exec` statement runs a command on the machine.
 Two setup items make the statement available. The two items are deliberate
 safety gates:
 
+<!-- check: fragment -->
 ```whip
 use std.script
 ```

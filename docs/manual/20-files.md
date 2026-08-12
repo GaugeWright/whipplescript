@@ -10,6 +10,7 @@ effect with a success branch and a failure branch.
 
 ## How to declare a store
 
+<!-- check: skip — a store shown without the `use std.files` its program carries -->
 ```whip
 file store project_files {
   root "./data"

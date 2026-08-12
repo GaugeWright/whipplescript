@@ -13,6 +13,7 @@ absent primitive that asks a person a question.
 
 ## How to declare a tracker and file an issue
 
+<!-- check: fragment -->
 ```whip
 tracker backlog
 ```
@@ -49,6 +50,7 @@ omission.
 Work enters from the two sides of the surface. A rule files an issue with a
 statement:
 
+<!-- check: fragment -->
 ```whip
 file issue into backlog {
   title "Fix login 500 on empty password"
