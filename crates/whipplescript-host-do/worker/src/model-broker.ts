@@ -261,19 +261,31 @@ function validatedBrokerResponse(value: unknown): BrokerResponse {
 function directProviderBody(
   body: unknown,
   provider: ModelBrokerBinding["provider"],
+  /** True when this round speaks Anthropic's Messages API, whatever the
+   *  provider id. The metered gateway is one id over two surfaces, and only the
+   *  compat shim wants the OpenAI spelling. */
+  anthropicWire = false,
 ): unknown {
-  const providerLimit = provider === "openai" || provider === "openai-codex"
-    ? "max_output_tokens"
-    : provider === "cloudflare-ai-gateway"
-      ? "max_completion_tokens"
-      : null;
+  const providerLimit =
+    provider === "openai" || provider === "openai-codex"
+      ? "max_output_tokens"
+      : provider === "cloudflare-ai-gateway"
+        ? "max_completion_tokens"
+        : null;
   if (!providerLimit) return body;
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const fields = body as Record<string, unknown>;
   if (!("max_tokens" in fields)) return body;
+  // Two spellings of one limit is contradictory on every surface this id
+  // reaches, so the refusal is keyed off the provider and never off the
+  // rename decision below.
   if (providerLimit in fields) {
     throw new Error("provider request has conflicting output token limits");
   }
+  // Anthropic requires `max_tokens` and rejects the Chat Completions spelling
+  // outright ("max_tokens: Field required"), so the rename that is correct for
+  // the shim is fatal here. Leave the field alone.
+  if (anthropicWire) return body;
   const { max_tokens, ...rest } = fields;
   return { ...rest, [providerLimit]: max_tokens };
 }
@@ -581,7 +593,7 @@ export async function performDirectProviderFetch(
   const response = await fetcher(request.url, {
     method: "POST",
     headers,
-    body: JSON.stringify(directProviderBody(request.body, binding.provider)),
+    body: JSON.stringify(directProviderBody(request.body, binding.provider, anthropicWire)),
   });
   mark("direct_provider_headers");
   if (!response.body) throw new Error("direct provider response had no body");

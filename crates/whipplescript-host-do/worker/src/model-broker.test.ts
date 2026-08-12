@@ -830,6 +830,86 @@ test("managed funding admits the provider-native anthropic surface", async () =>
   assert.equal(calledUrl, `${nativeBinding.base_url}/v1/messages`);
 });
 
+// Live 400 on 2026-08-12: every native round failed with "max_tokens: Field
+// required". The gateway id alone selected the Chat Completions spelling
+// `max_completion_tokens`, which is right for the shim and rejected outright by
+// the Messages API. The surface has to reach the body, not just the path, the
+// auth header, and the SSE grammar.
+test("an anthropic-native round keeps max_tokens unrenamed", async () => {
+  let sent: Record<string, unknown> = {};
+  const nativeBinding = {
+    ...gatewayBinding,
+    model: "claude-opus-5",
+    base_url:
+      "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/anthropic",
+  };
+  await performManagedGatewayFetch(
+    {
+      url: `${nativeBinding.base_url}/v1/messages`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: "claude-opus-5", messages: [], max_tokens: 128000 },
+    },
+    nativeBinding,
+    { token: () => "cf-gateway-token" },
+    async (_url, init) => {
+      sent = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return Response.json({ content: [] });
+    },
+  );
+  assert.equal(sent.max_tokens, 128000);
+  assert.ok(!("max_completion_tokens" in sent), "the Messages API rejects that field");
+});
+
+// Keeping `max_tokens` on the native surface must not weaken the local
+// refusal: a round carrying both spellings is contradictory whichever surface
+// it is bound for, and must not reach the provider.
+test("an anthropic-native round still refuses conflicting output token limits", async () => {
+  const nativeBinding = {
+    ...gatewayBinding,
+    model: "claude-opus-5",
+    base_url:
+      "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/anthropic",
+  };
+  await assert.rejects(
+    performManagedGatewayFetch(
+      {
+        url: `${nativeBinding.base_url}/v1/messages`,
+        headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+        body: {
+          model: "claude-opus-5",
+          messages: [],
+          max_tokens: 128000,
+          max_completion_tokens: 256,
+        },
+      },
+      nativeBinding,
+      { token: () => "cf-gateway-token" },
+      async () => { throw new Error("must not fetch"); },
+    ),
+    /conflicting output token limits/,
+  );
+});
+
+// The shim still needs the rename — the fix above must not disarm it.
+test("a compat round still renames max_tokens for the shim", async () => {
+  let sent: Record<string, unknown> = {};
+  await performManagedGatewayFetch(
+    {
+      url: `${gatewayBinding.base_url}/chat/completions`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: "openai/gpt-4.1", messages: [], max_tokens: 256 },
+    },
+    gatewayBinding,
+    { token: () => "cf-gateway-token" },
+    async (_url, init) => {
+      sent = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return Response.json({ choices: [] });
+    },
+  );
+  assert.equal(sent.max_completion_tokens, 256);
+  assert.ok(!("max_tokens" in sent));
+});
+
 // A surface that is neither is still refused. Widening the regex to admit the
 // native route must not turn it into "any path under the gateway".
 test("managed funding still refuses an unadmitted gateway surface", async () => {
