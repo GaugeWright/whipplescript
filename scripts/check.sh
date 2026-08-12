@@ -36,6 +36,22 @@ command -v cargo-audit >/dev/null || {
     exit 1
 }
 cargo audit
+# npm was not audited here until 2026-08-12, and the root tree had six
+# production advisories — two high — the whole time. They were not tooling's:
+# `scripts/claude-agent-sdk-sidecar.mjs` dynamically imports
+# `@anthropic-ai/claude-agent-sdk`, and the shipped `whip` binary executes that
+# sidecar, so they sat on a path users run. `git ls-files` names the tracked
+# lockfiles, so this audits what the repository owns rather than whatever the
+# working tree holds.
+while IFS= read -r lock; do
+    # The root lockfile comes back as a bare `package-lock.json`, with no
+    # directory to strip, so trimming `/package-lock.json` leaves the filename
+    # and npm is handed a file where it wants a directory. Strip the name, then
+    # the separator, and let an empty result mean the repository root.
+    dir="${lock%package-lock.json}"
+    dir="${dir%/}"
+    npm --prefix "${dir:-.}" audit --omit=dev
+done < <(git ls-files '*package-lock.json')
 
 echo "== formatting =="
 cargo fmt --all -- --check
