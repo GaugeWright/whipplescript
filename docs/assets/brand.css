@@ -1,17 +1,67 @@
-/* WhippleScript docs — the GaugeWright colour scheme (navy ground, blue
-   accent) and its one text family (GaugeWright DR-0071).
+/* WhippleScript docs — the GaugeWright colour scheme (navy ground, blue accent)
+   and its two text faces (GaugeWright DR-0072): GaugeWright Chrome for
+   headings, nav and chrome; IBM Plex Serif for body copy, because documentation
+   is read at length.
 
-   The face itself is not imported here: `theme.font.text` in mkdocs.yml is set
-   to IBM Plex Serif, so Material emits the single Google Fonts request for it.
-   A second @import would only add a redundant stylesheet. */
+   The prose face is not imported here: `theme.font.text` in mkdocs.yml is set to
+   IBM Plex Serif, so Material emits the single Google Fonts request for it.
+   GaugeWright Chrome is a subset of Erewhon, renamed
+   because the OFL reserves the upstream name for unmodified builds; see
+   fonts/OFL-GaugeWrightChrome.txt.
+   The name is ecosystem-wide, not repository-local: one subset, one name, one
+   owner, per the GaugeWright brand specification. It is not on Google Fonts and is
+   self-hosted below, regular and italic only — no bold ships, so every chrome
+   selector Material renders bold is reset to 400 rather than left to synthesise
+   a faux bold. */
+
+@font-face {
+  font-family: "GaugeWright Chrome";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/gaugewright-chrome-latin-regular.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "GaugeWright Chrome";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/gaugewright-chrome-latin-ext-regular.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "GaugeWright Chrome";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/gaugewright-chrome-latin-italic.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "GaugeWright Chrome";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/gaugewright-chrome-latin-ext-italic.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF,
+    U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+    U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
 
 :root {
   --ws-navy: #0e2d50;
   --ws-blue: #1f61c4;
+  --ws-chrome: "GaugeWright Chrome", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
   --ws-text: "IBM Plex Serif", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-  /* --ws-serif is retained as an alias: the serif/sans split it was named for
-     is retired, and every rule below now asks for the same family. */
-  --ws-serif: var(--ws-text);
+  /* --ws-serif keeps its name but points at the chrome face again. */
+  --ws-serif: var(--ws-chrome);
   /* Body copy too, not only the headings. One family carries everything a
      person reads or operates, so the prose stops falling back to Material's
      own sans. */
@@ -32,18 +82,35 @@ body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
   --md-typeset-a-color: #6aa3ff;
 }
 
-/* Headings and chrome titles. Same family as the body now, distinguished by
-   scale and spacing rather than by face. */
+/* Headings and every piece of chrome a reader navigates by: the header title
+   and topic, the sidebar titles and links, and the top-level tabs. Without the
+   nav and tab links the split would only reach headings, and most navigation
+   text would stay on the prose face. */
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3,
 .md-header__title,
-.md-nav__title {
+.md-header__topic,
+.md-nav__title,
+.md-nav__link,
+.md-tabs__link {
   font-family: var(--ws-serif);
+  /* Backstop for anything Material bolds through a more specific selector than
+     the reset below: a missing weight is declined, never faked. */
+  font-synthesis-weight: none;
 }
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3 {
   font-weight: 400;
   letter-spacing: -0.01em;
+}
+/* The chrome face ships at 400 only. These are the selectors Material renders
+   bold, so each is held at 400 to keep the browser from synthesising one. */
+.md-header__title,
+.md-header__topic,
+.md-nav__title,
+.md-nav__link,
+.md-tabs__link {
+  font-weight: 400;
 }
