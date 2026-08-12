@@ -6647,40 +6647,48 @@ fn invoke_binding_workflow(rule: &RuleDecl, binding: &str) -> Option<String> {
 
 /// Resolves the payload class of a child milestone for `after <binding> reaches
 /// "<milestone>"`: follow `binding` to its invoked workflow, then look up the
-/// milestone in that workflow's declared set. `Some("")` means the milestone is
-/// declared but payload-less; `None` means undeclared (reject) or unresolvable.
+/// milestone in that workflow's declared set. Returns the owning workflow with
+/// the class, because the class may be declared inside that child and so
+/// resolves in the child's index, not this workflow's (`SchemaScopes`).
+/// `Some((_, ""))` means the milestone is declared but payload-less; `None`
+/// means undeclared (reject) or unresolvable.
 fn milestone_payload_class(
     rule: &RuleDecl,
     binding: &str,
     milestone: &str,
     semantic: &SemanticContext,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let workflow = invoke_binding_workflow(rule, binding)?;
     let surface = semantic.workflow_inputs.get(&workflow)?;
-    surface.milestones.get(milestone).cloned()
+    let class = surface.milestones.get(milestone).cloned()?;
+    Some((workflow, class))
 }
 
 /// Resolves the OUTPUT-contract class of the child workflow a `succeeds`/`completes`
 /// invoke binding observes, so `after <binding> succeeds as r` can type `r` and
 /// check `r.<field>`. `None` (leave the binding opaque, unchanged) when: the binding
 /// is not an invoke; the child declares zero or several outputs (which output the
-/// child completes is not statically known); the sole output is a scalar (no
-/// fields); or the output class is not resolvable in THIS workflow's scope. That
-/// last guard preserves workflow-local scoping — a child's private output class is
-/// not visible to the parent, so only a shared top-level class is typed here.
+/// child completes is not statically known); or the sole output is a scalar (no
+/// fields).
+///
+/// The class is resolved in the CHILD's index and returned with its owning
+/// workflow. A child that declares its output class workflow-locally — the
+/// ordinary, encapsulated spelling — used to fall through this function and leave
+/// `r.<field>` unchecked; the class still never becomes nameable in the parent,
+/// only resolvable for reads off this binding (`SchemaScopes`).
 fn invoke_output_class(
     rule: &RuleDecl,
     binding: &str,
     semantic: &SemanticContext,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let workflow = invoke_binding_workflow(rule, binding)?;
     let surface = semantic.workflow_inputs.get(&workflow)?;
     if surface.outputs.len() != 1 {
         return None;
     }
     match surface.outputs.values().next()? {
-        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
-            Some(name.name.clone())
+        TypeSyntax::Ref { name } if surface.schemas.class_exists(&name.name) => {
+            Some((workflow, name.name.clone()))
         }
         _ => None,
     }
@@ -6691,24 +6699,25 @@ fn invoke_output_class(
 /// declared failure shape (and check `f.<field>`) instead of the generic DR-0032
 /// `TerminalFailed` base. `None` (fall back to the base) when: the binding is not
 /// an invoke; the child declares zero or several failures (which failure the child
-/// raised is not statically known); the sole failure is a scalar (no fields); or
-/// the failure class is not resolvable in THIS workflow's scope. That last guard
-/// preserves workflow-local scoping — a child's private failure class is not
-/// visible to the parent, so only a shared top-level class is typed here; anything
-/// else keeps the base, which every failure structurally satisfies.
+/// raised is not statically known); or the sole failure is a scalar (no fields).
+/// Anything else keeps the base, which every failure structurally satisfies.
+///
+/// As with `invoke_output_class`, the class is resolved in the CHILD's index and
+/// returned with its owning workflow, so a child that declares its failure class
+/// workflow-locally is typed rather than silently left on the base.
 fn invoke_failure_class(
     rule: &RuleDecl,
     binding: &str,
     semantic: &SemanticContext,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let workflow = invoke_binding_workflow(rule, binding)?;
     let surface = semantic.workflow_inputs.get(&workflow)?;
     if surface.failures.len() != 1 {
         return None;
     }
     match surface.failures.values().next()? {
-        TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
-            Some(name.name.clone())
+        TypeSyntax::Ref { name } if surface.schemas.class_exists(&name.name) => {
+            Some((workflow, name.name.clone()))
         }
         _ => None,
     }
@@ -10608,6 +10617,10 @@ fn analyze_rule(
     };
     let mut seen_bindings = BTreeSet::new();
     let mut binding_types = BTreeMap::new();
+    // Bindings whose schema is declared inside a CHILD workflow (`after <invoke>
+    // succeeds/fails/reaches as x`). Their field paths resolve in that child's
+    // index, not this one — see `SchemaScopes`.
+    let mut foreign_schemas: BTreeMap<String, String> = BTreeMap::new();
     for when in &rule.whens {
         // A pattern that binds (`... as x`) but maps to no known readiness
         // form would otherwise be a silently-dead rule.
@@ -10840,9 +10853,12 @@ fn analyze_rule(
             if alias.is_empty() {
                 continue;
             }
-            if let Some(class) = milestone_payload_class(rule, binding, milestone, semantic) {
+            if let Some((workflow, class)) =
+                milestone_payload_class(rule, binding, milestone, semantic)
+            {
                 if !class.is_empty() {
                     binding_types.insert(alias.to_owned(), class);
+                    foreign_schemas.insert(alias.to_owned(), workflow);
                 }
             }
             continue;
@@ -10896,8 +10912,9 @@ fn analyze_rule(
             // under the base). Invoke bindings with a child-local/unresolvable
             // failure class keep the `TerminalFailed` base.
             "fails" => {
-                if let Some(class) = invoke_failure_class(rule, binding, semantic) {
+                if let Some((workflow, class)) = invoke_failure_class(rule, binding, semantic) {
                     binding_types.insert(alias.to_owned(), class);
+                    foreign_schemas.insert(alias.to_owned(), workflow);
                 } else {
                     let schema = match effect_binding_kinds.get(binding) {
                         Some(IrEffectKind::ExecCommand) => "TerminalFailedExec",
@@ -10911,13 +10928,15 @@ fn analyze_rule(
             _ => {
                 if let Some(IrType::Ref(schema)) = effect_payload_types.get(binding) {
                     binding_types.insert(alias.to_owned(), schema.clone());
-                } else if let Some(class) = invoke_output_class(rule, binding, semantic) {
+                } else if let Some((workflow, class)) = invoke_output_class(rule, binding, semantic)
+                {
                     // Typed invoke result: `after <child> succeeds/completes as r`
                     // binds r to the child workflow's OUTPUT contract class, so
                     // `r.<field>` type-checks. (The runtime already carries the
                     // child's terminal payload into this binding.) The `fails` arm
                     // above keeps the DR-0032 failure base.
                     binding_types.insert(alias.to_owned(), class);
+                    foreign_schemas.insert(alias.to_owned(), workflow);
                 }
             }
         }
@@ -11027,13 +11046,27 @@ fn analyze_rule(
 
         if line.starts_with("case ") || (!line.starts_with("after ") && is_case_branch_start(line))
         {
-            validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
+            validate_known_field_paths_scoped(
+                rule,
+                line,
+                semantic,
+                &binding_types,
+                &foreign_schemas,
+                diagnostics,
+            );
             continue;
         }
 
         let active_afters = after_scopes(&block_stack);
         validate_binding_uses(rule, line, &seen_bindings, &active_afters, diagnostics);
-        validate_known_field_paths(rule, line, semantic, &binding_types, diagnostics);
+        validate_known_field_paths_scoped(
+            rule,
+            line,
+            semantic,
+            &binding_types,
+            &foreign_schemas,
+            diagnostics,
+        );
 
         if let Some(binding) = parse_consume_line(line) {
             match binding_types.get(&binding) {
@@ -11231,6 +11264,7 @@ fn analyze_rule(
             region,
             semantic,
             &binding_types,
+            &foreign_schemas,
             &effect_payload_types,
             diagnostics,
         );
@@ -17666,6 +17700,7 @@ fn validate_lapse_arm(
     region: &IrRegion,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
+    foreign_schemas: &BTreeMap<String, String>,
     effect_payload_types: &BTreeMap<String, IrType>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -17728,7 +17763,14 @@ fn validate_lapse_arm(
             rule,
             line,
             rule.body.span,
-            &schemas,
+            // The synthesized view classes are local to this check; an ambient
+            // binding the arm inherits may still be invoke-derived and resolve in
+            // a child's index.
+            SchemaScopes {
+                local: &schemas,
+                foreign: foreign_schemas,
+                workflows: &semantic.workflow_inputs,
+            },
             &arm_bindings,
             diagnostics,
         );
@@ -17767,6 +17809,47 @@ fn validate_lapse_arm(
     }
 }
 
+/// No binding in this scope carries a foreign (child-workflow) schema.
+static NO_FOREIGN_SCHEMAS: BTreeMap<String, String> = BTreeMap::new();
+static NO_WORKFLOW_SURFACES: BTreeMap<String, WorkflowInputSurface> = BTreeMap::new();
+
+/// Which schema index a binding's field paths resolve in.
+///
+/// A parent that observes a child workflow's result, failure, or milestone
+/// payload holds a value whose class may be declared *inside that child*. The
+/// class is not nameable in the parent — and must not become nameable, or a
+/// child's private types would leak into the parent's declaration space — but
+/// its fields are exactly the contract the parent was handed, so the parent's
+/// reads resolve in the child's own index. That is structural typing across the
+/// workflow boundary, not an import.
+///
+/// A binding with no `foreign` entry resolves locally, which is every ordinary
+/// binding.
+#[derive(Clone, Copy)]
+struct SchemaScopes<'a> {
+    local: &'a SchemaIndex,
+    /// Binding -> the child workflow whose index types it.
+    foreign: &'a BTreeMap<String, String>,
+    workflows: &'a BTreeMap<String, WorkflowInputSurface>,
+}
+
+impl<'a> SchemaScopes<'a> {
+    fn local(local: &'a SchemaIndex) -> Self {
+        Self {
+            local,
+            foreign: &NO_FOREIGN_SCHEMAS,
+            workflows: &NO_WORKFLOW_SURFACES,
+        }
+    }
+
+    fn index_for(&self, binding: &str) -> &'a SchemaIndex {
+        self.foreign
+            .get(binding)
+            .and_then(|workflow| self.workflows.get(workflow))
+            .map_or(self.local, |surface| &surface.schemas)
+    }
+}
+
 fn validate_known_field_paths(
     rule: &RuleDecl,
     line: &str,
@@ -17784,6 +17867,30 @@ fn validate_known_field_paths(
     );
 }
 
+/// `validate_known_field_paths` for a scope that can hold invoke-derived
+/// bindings, whose payload classes may live in the child workflow's index.
+fn validate_known_field_paths_scoped(
+    rule: &RuleDecl,
+    line: &str,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    foreign: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    validate_known_field_paths_in_index(
+        rule,
+        line,
+        rule.body.span,
+        SchemaScopes {
+            local: &semantic.schemas,
+            foreign,
+            workflows: &semantic.workflow_inputs,
+        },
+        binding_types,
+        diagnostics,
+    );
+}
+
 fn validate_known_field_paths_at_span(
     rule: &RuleDecl,
     line: &str,
@@ -17796,21 +17903,22 @@ fn validate_known_field_paths_at_span(
         rule,
         line,
         span,
-        &semantic.schemas,
+        SchemaScopes::local(&semantic.schemas),
         binding_types,
         diagnostics,
     );
 }
 
-/// `validate_known_field_paths_at_span` against an explicit schema index rather
-/// than the program's. The lapse arm resolves its progress view against an index
-/// extended with that region's synthesized view classes, which exist only for the
-/// duration of the check.
+/// `validate_known_field_paths_at_span` against explicit schema scopes rather
+/// than the program's index alone. The lapse arm resolves its progress view
+/// against an index extended with that region's synthesized view classes, which
+/// exist only for the duration of the check; an invoke-derived binding resolves
+/// against the child workflow that produced it.
 fn validate_known_field_paths_in_index(
     rule: &RuleDecl,
     line: &str,
     span: SourceSpan,
-    schemas: &SchemaIndex,
+    scopes: SchemaScopes,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -17818,6 +17926,7 @@ fn validate_known_field_paths_in_index(
         let Some(schema) = binding_types.get(&root) else {
             continue;
         };
+        let schemas = scopes.index_for(&root);
         if !schemas.class_exists(schema) {
             continue;
         }
@@ -32269,6 +32378,127 @@ workflow Child {
             compiled.diagnostics
         );
         assert!(compiled.ir.is_some());
+    }
+
+    /// A child that declares its contract classes WORKFLOW-LOCALLY — the ordinary,
+    /// encapsulated spelling — used to make every parent-side read unchecked. The
+    /// class is not in the parent's index, so the field-path checks bailed and said
+    /// nothing, in all three observation positions: result, failure, and milestone.
+    ///
+    /// The class still never becomes nameable in the parent; only reads off that
+    /// binding resolve, and they resolve in the child's own index.
+    #[test]
+    fn child_local_contract_classes_are_checked_in_the_child_scope() {
+        let program = |parent_reads: &str| {
+            format!(
+                r#"
+class Job {{ id string }}
+
+workflow Parent {{
+  input task Job
+  output result ParentReport
+  failure err ParentError
+  class ParentReport {{ id string }}
+  class ParentError {{ detail string }}
+  class Seen {{ note string }}
+  rule go
+    when Job as t
+  => {{
+    invoke Child {{ task {{ id t.id }} }} as child
+{parent_reads}
+  }}
+}}
+
+workflow Child {{
+  input task Job
+  output result ChildReport
+  failure err ChildError
+  class ChildReport {{ summary string }}
+  class ChildError {{ reason string }}
+  class ChildProgress {{ detail string }}
+  rule work
+    when Job as t
+  => {{
+    emit milestone "started" of ChildProgress {{
+      detail t.id
+    }}
+    complete result {{ summary t.id }}
+  }}
+}}
+"#
+            )
+        };
+        let bad_paths = |reads: &str| {
+            compile_program_with_root(&program(reads), Some("Parent"))
+                .diagnostics
+                .into_iter()
+                .filter(|d| d.message.contains("invalid field path"))
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+
+        // The child's OUTPUT class is workflow-local.
+        let result_read =
+            "    after child succeeds as r {\n      complete result { id r.nope }\n    }";
+        assert_eq!(bad_paths(result_read).len(), 1, "{result_read}");
+
+        // The child's FAILURE class is workflow-local.
+        let failure_read = "    after child fails as f {\n      fail err { detail f.nope }\n    }";
+        assert_eq!(bad_paths(failure_read).len(), 1, "{failure_read}");
+
+        // The child's MILESTONE payload class is workflow-local. This read sits in a
+        // `record` block, walked by a different pass than the terminal positions
+        // above — both needed the child scope.
+        let milestone_read =
+            "    after child reaches \"started\" as m {\n      record Seen { note m.nope }\n    }";
+        assert_eq!(bad_paths(milestone_read).len(), 1, "{milestone_read}");
+
+        // The valid reads of all three still compile.
+        let valid = "    after child succeeds as r {\n      complete result { id r.summary }\n    }\n\
+                         after child fails as f {\n      fail err { detail f.reason }\n    }\n\
+                         after child reaches \"started\" as m {\n      record Seen { note m.detail }\n    }";
+        let compiled = compile_program_with_root(&program(valid), Some("Parent"));
+        assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+        assert_eq!(bad_paths(valid), Vec::<String>::new());
+    }
+
+    /// The child's private class must not become NAMEABLE in the parent just
+    /// because the parent can read fields off a binding typed by it. Structural
+    /// access across the boundary, not an import.
+    #[test]
+    fn child_local_class_is_not_nameable_in_the_parent() {
+        let source = r#"
+class Job { id string }
+
+workflow Parent {
+  input task Job
+  output result ParentReport
+  class ParentReport { id string }
+  class Holder { got ChildReport }
+  rule go
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Child {
+  input task Job
+  output result ChildReport
+  class ChildReport { summary string }
+  rule work
+    when Job as t
+  => {
+    complete result { summary t.id }
+  }
+}
+"#;
+        let compiled = compile_program_with_root(source, Some("Parent"));
+        assert!(
+            compiled.ir.is_none(),
+            "parent must not declare a field of the child's private class: {:?}",
+            compiled.diagnostics
+        );
     }
 
     #[test]
