@@ -98,6 +98,7 @@ jobs:
   # position and ends option parsing, and harness.rs pins that argv in a test.
   green-bar:
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -119,6 +120,7 @@ jobs:
   # sustain, and it is the one gate that touches Worker deploy configuration.
   hosted-runtime-contracts:
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: crates/whipplescript-host-do/worker
@@ -163,6 +165,7 @@ jobs:
   formal-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -183,6 +186,7 @@ jobs:
   tla-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -196,6 +200,7 @@ jobs:
   e2e:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -210,6 +215,7 @@ jobs:
   report-schemas:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -232,6 +238,7 @@ jobs:
   release-readiness:
     if: ${{ github.repository != 'GaugeWright/whipplescript' && inputs.deep }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
