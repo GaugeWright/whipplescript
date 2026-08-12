@@ -27,6 +27,12 @@ This source is the correction:
 ```whip
 workflow TicketTriage
 
+output result TriageDecision
+
+class TriageDecision {
+  ok bool
+}
+
 rule start
   when started
 => {

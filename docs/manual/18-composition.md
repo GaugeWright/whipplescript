@@ -49,6 +49,7 @@ whip run pipeline.whip --root Parent --input '{"task":{"title":"ship the fix"}}'
 The `invoke` statement starts a child instance and reacts to its outcome. The
 four terminal arms are the same as the arms of each other family of effect:
 
+<!-- check: root Parent -->
 ```whip
 workflow Parent {
   input task Task
@@ -156,6 +157,7 @@ A terminal is all or nothing. Sometimes the parent needs evidence of progress
 *during* the run of the child. In that condition, the child projects a
 **milestone**. A milestone is named, typed, and deliberately declared:
 
+<!-- check: root Parent -->
 ```whip
 workflow Parent {
   input task Task

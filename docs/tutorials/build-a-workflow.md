@@ -18,6 +18,7 @@ If you did not install the CLI, [install the CLI](../install.md) first.
 Make the file `triage.whip`. Start with the name of the workflow, the terminal
 contracts of the workflow, and the types of fact that the workflow uses:
 
+<!-- check: skip — step 1 of the build; the finished program is checked below -->
 ```whip
 workflow TicketTriage
 

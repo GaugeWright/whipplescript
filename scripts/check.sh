@@ -82,18 +82,19 @@ echo "== docs =="
 # that does not run on a pull request, so a change that broke a documented
 # program was caught at release time or not at all.
 #
-# What this does NOT do, so nobody reads more into a green bar than it means:
-# the tutorial programs are transcribed into check-docs-snippets.sh rather than
-# extracted, and no fenced ```whip block in language-reference.md or manual/ is
-# compiled by anything. Many of those fences are fragments rather than whole
-# programs, so extracting them needs a convention first. Breaking one is still
-# invisible.
+# The programs PRINTED in the pages are checked too, by check-docs-fences.sh:
+# every ```whip fence that declares a workflow and carries no ellipsis is
+# compiled, and a page that stops contributing one fails on a recorded count, so
+# a fence cannot drop out of the set quietly. A fragment — a rule body, a class,
+# a `case` arm — is not a program in any grammar and is not compiled; that is
+# most of the fences, and it is the honest limit of this gate.
 #
 # `check-docs-site.sh` (mkdocs --strict, which catches a dead cross-reference)
 # stays out: it provisions a virtualenv over the network when mkdocs is absent,
 # and a network install inside the required gate costs more in flakiness than
 # the class of bug it catches. It remains in the release gate.
 scripts/check-docs-snippets.sh
+scripts/check-docs-fences.sh
 
 echo "== hosted runtime contracts =="
 worker=crates/whipplescript-host-do/worker

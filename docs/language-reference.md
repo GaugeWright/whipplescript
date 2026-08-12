@@ -12,6 +12,7 @@ quantity of workflows in braces; classes; enums; agents; coerce functions;
 tables; rules; assertions; patterns; events; coordination resources; harnesses;
 and imports.
 
+<!-- check: skip — sketch; the includes it names are not in the tree -->
 ```whip
 include "shared/review.whip"
 include "review.coerce"
@@ -74,12 +75,14 @@ private workflow.
 You can write the contracts as a compact signature on the workflow line. The
 alternative is separate `input`, `output`, and `failure` lines:
 
+<!-- check: skip — excerpt; `Ticket` is declared elsewhere on the page -->
 ```whip
 workflow Triage(ticket: Ticket) -> Resolution ! TriageFailed
 ```
 
 This line is exactly equivalent to these lines:
 
+<!-- check: skip — excerpt; `Ticket` is declared elsewhere on the page -->
 ```whip
 workflow Triage
   input ticket Ticket
@@ -97,6 +100,7 @@ The contract of a terminal payload is a class or a scalar type. The scalar
 types are `int`, `float`, `string`, and `bool`. Complete a class contract with a
 block of fields. Complete a scalar contract with a value alone:
 
+<!-- check: skip — excerpt; `Ticket` is declared elsewhere on the page -->
 ```whip
 workflow Score(ticket: Ticket) -> float
 
@@ -243,6 +247,7 @@ operation has no syntax in the source.
 The `@private` tag on a workflow prevents an invocation from an adjacent
 workflow:
 
+<!-- check: skip — excerpt; `AuditRequest` is declared elsewhere on the page -->
 ```whip
 @private
 workflow InternalAuditHarness {
@@ -612,6 +617,7 @@ selects an authority. The line is never decoration:
 These are metadata in the source. They apply to a workflow, a table, a rule,
 and an assertion:
 
+<!-- check: skip — excerpt; declarations only, no rule reaches a terminal -->
 ```whip
 @private
 @acceptance

@@ -9,6 +9,7 @@ declared deterministic replacement covers each edge that is not deterministic.
 
 ## A workflow with tests
 
+<!-- check: skip — `Ticket` is seeded by the scenarios' `given fact`, so `whip check` reports rule `work` as unreachable -->
 ```whip
 use std.agent
 use std.coercion
@@ -168,6 +169,7 @@ clause can also read a recorded diagnostic by its code.
 The rule from chapter 10 gives its value here: there is no ambient clock. Time
 enters only as an effect. Thus a test can *inject* the clock:
 
+<!-- check: skip — a `test` block, not a `whip check` input -->
 ```whip
 test "a due order fires the deadline" {
   workflow Deadline

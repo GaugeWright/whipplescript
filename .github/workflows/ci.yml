@@ -22,9 +22,8 @@ on:
   # a reader to run were checked only by `check-release-readiness.sh`, a deep
   # suite that does not run on a pull request, so breaking one was caught at
   # release time or not at all. `scripts/check.sh` now runs
-  # `check-docs-snippets.sh`, so this filter would be hiding real failures
-  # rather than skipping vacuous ones. (A fenced block inside a page is still
-  # compiled by nothing — see the note in check.sh.)
+  # `check-docs-snippets.sh` and `check-docs-fences.sh`, so this filter would be
+  # hiding real failures rather than skipping vacuous ones.
   #
   # The gate is cheap here: `-src` runs on Blacksmith, which is not metered
   # against the Actions allowance, and the mirror runs on GitHub-hosted runners,
