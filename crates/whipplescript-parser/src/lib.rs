@@ -33747,6 +33747,151 @@ rule branch
         }
     }
 
+    /// Seven refusals that a mutation sweep found nothing exercised: disabling
+    /// each one left the whole workspace suite green, so the compiler advertised
+    /// a rule no test proved it applies. They are grouped because they share that
+    /// provenance, not because they share a subject.
+    ///
+    /// Each case asserts the message, not merely that compilation failed — a
+    /// program can fail for a reason other than the one under test, and that is
+    /// how an unexercised refusal hides.
+    #[test]
+    fn refusals_found_unexercised_by_mutation_sweep() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "agent `worker` declares capability `edit` more than once",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+agent worker {
+  provider fixture
+  profile "code"
+  capacity 1
+  capabilities ["edit", "edit"]
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "agent `worker` declares provider more than once",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+agent worker {
+  provider fixture
+  provider fixture
+  profile "code"
+  capacity 1
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "agent `worker` declares both `using` harness and direct provider `fixture`",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+harness coder: claude
+
+agent worker using coder {
+  provider fixture
+  profile "code"
+  capacity 1
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "enum `S` declares variant `A` more than once",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+enum S {
+  A
+  A
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "table `seed` targets unknown class `NoSuch`",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+table seed as NoSuch [ { x "1" } ]
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "ledger `l` records undeclared entry type `NoSuch`",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+
+ledger l { entry NoSuch partition by area retain 90d }
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "rule `r` binds reserved keyword `record`",
+                r#"
+workflow T
+output result R
+class R { ok bool }
+class Task { id string }
+
+table seed as Task [ { id "1" } ]
+
+rule r
+  when Task as record
+=> { complete result { ok true } }
+"#,
+            ),
+        ];
+
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            assert!(
+                compiled.diagnostics.iter().any(|d| d.message == *expected),
+                "expected `{expected}`, got {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn rejects_dangling_root_in_record_value() {
         // A record value referencing a binding that does not exist (a typo or an
