@@ -6027,45 +6027,67 @@ fn substitute_pattern_type(
     }
 }
 
+/// Substitute a pattern's type parameters, hygienic local names, and value
+/// arguments through an item's source text in ONE pass.
+///
+/// Single-pass is what makes the substitution hygienic. Running one
+/// whole-string replacement per map over a shared accumulator — as this did —
+/// let each pass rescan text the previous passes had inserted. A type argument
+/// was therefore capturable by a pattern-local declaration: `apply Review<Task>`
+/// against a pattern declaring its own `Task` had the argument rewritten to the
+/// pattern's gensym, so the rule matched the pattern's local class instead of
+/// the caller's type. Value-argument keys are unvalidated identifiers taken
+/// from the apply body and ran last, so they could rewrite whatever the type
+/// pass had just produced. Both failed closed on downstream name resolution,
+/// but only after handing the author a diagnostic naming an identifier they
+/// never wrote.
+///
+/// Each identifier token is now resolved exactly once, against the maps in the
+/// priority order the multi-pass form implied, and its replacement is emitted
+/// without being re-examined. Token boundaries are unchanged: a maximal run of
+/// identifier characters is precisely what the old boundary test accepted.
 fn substitute_pattern_text(
     text: &str,
     type_substitutions: &BTreeMap<String, TypeSyntax>,
     value_substitutions: &BTreeMap<String, String>,
     local_names: &BTreeMap<String, String>,
 ) -> String {
-    let mut output = text.to_owned();
-    for (name, replacement) in type_substitutions {
-        output = replace_identifier(&output, name, &replacement.to_source());
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(is_identifier_char) {
+        output.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let end = after
+            .find(|ch| !is_identifier_char(ch))
+            .unwrap_or(after.len());
+        let token = &after[..end];
+        match resolve_pattern_token(token, type_substitutions, value_substitutions, local_names) {
+            Some(replacement) => output.push_str(&replacement),
+            None => output.push_str(token),
+        }
+        rest = &after[end..];
     }
-    for (name, replacement) in local_names {
-        output = replace_identifier(&output, name, replacement);
-    }
-    for (name, replacement) in value_substitutions {
-        output = replace_identifier(&output, name, replacement);
-    }
+    output.push_str(rest);
     output
 }
 
-fn replace_identifier(source: &str, from: &str, to: &str) -> String {
-    let mut output = String::new();
-    let mut index = 0usize;
-    while let Some(offset) = source[index..].find(from) {
-        let start = index + offset;
-        let end = start + from.len();
-        output.push_str(&source[index..start]);
-        let before = source[..start].chars().next_back();
-        let after = source[end..].chars().next();
-        if before.is_none_or(|ch| !is_identifier_char(ch))
-            && after.is_none_or(|ch| !is_identifier_char(ch))
-        {
-            output.push_str(to);
-        } else {
-            output.push_str(&source[start..end]);
-        }
-        index = end;
+/// Resolve one identifier token against the substitution maps, in the priority
+/// order the multi-pass form implied: a type parameter first, then a
+/// pattern-local declaration, then a value argument. A token naming none of
+/// them is not substituted.
+fn resolve_pattern_token(
+    token: &str,
+    type_substitutions: &BTreeMap<String, TypeSyntax>,
+    value_substitutions: &BTreeMap<String, String>,
+    local_names: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(ty) = type_substitutions.get(token) {
+        return Some(ty.to_source());
     }
-    output.push_str(&source[index..]);
-    output
+    if let Some(local) = local_names.get(token) {
+        return Some(local.clone());
+    }
+    value_substitutions.get(token).cloned()
 }
 
 fn is_identifier_char(ch: char) -> bool {
@@ -27579,6 +27601,93 @@ workflow Parent {
                 .message
                 .contains("recursively invokes workflow `Parent`")
         }));
+    }
+
+    /// Substitution hygiene: a type argument must not be captured by a
+    /// pattern-local declaration of the same name. Under the multi-pass form
+    /// the type pass inserted `Task` and the local-name pass then rewrote that
+    /// very text to the pattern's gensym, so this program was REFUSED with
+    /// `unknown readiness pattern 'taskReview_Task as item'` — a name the
+    /// author never wrote. The caller's `Task` and the pattern's own `Task` are
+    /// distinct and must both survive.
+    #[test]
+    fn pattern_type_argument_is_not_captured_by_a_local_of_the_same_name() {
+        let source = r#"
+pattern Review<Input> {
+  class Task {
+    note string
+  }
+
+  rule dispatch
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Review<Task> as taskReview {
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "capture refused the program"
+        );
+        let snapshot = compiled.ir.expect("source compiles").to_snapshot();
+        assert!(
+            snapshot.contains("when Task as item"),
+            "the rule matches the CALLER's Task, not the pattern's local: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("taskReview_Task"),
+            "the pattern's own Task still gets its hygienic name: {snapshot}"
+        );
+    }
+
+    /// Value-argument keys are unvalidated identifiers from the apply body and
+    /// ran last, so under the multi-pass form a key colliding with the type
+    /// argument rewrote text the type pass had just inserted — refusing the
+    /// program with `matches unknown class 'Bogus'`. A key naming no pattern
+    /// parameter now substitutes nothing.
+    #[test]
+    fn pattern_value_argument_key_cannot_rewrite_the_type_argument() {
+        let source = r#"
+pattern Review<Input> {
+  rule dispatch
+    when Input as item
+  => {
+  }
+}
+
+workflow Root {
+  class Task {
+    title string
+  }
+
+  apply Review<Task> as taskReview {
+    Task Bogus
+  }
+}
+"#;
+        let compiled = compile_program(source);
+        assert_eq!(compiled.diagnostics, Vec::new());
+        let snapshot = compiled.ir.expect("source compiles").to_snapshot();
+        assert!(
+            snapshot.contains("when Task as item"),
+            "the type argument survives a colliding value-argument key: {snapshot}"
+        );
+        // `Bogus` still appears in the recorded arg list — that is provenance,
+        // not substitution. What must not happen is it reaching the rule.
+        assert!(
+            !snapshot.contains("when Bogus"),
+            "a key naming no pattern parameter substitutes nothing: {snapshot}"
+        );
     }
 
     #[test]

@@ -142,6 +142,7 @@ fn request_substitutes_and_egresses_but_material_never_returns() {
         },
         CustodyOp::Request {
             credential: name("loop_api"),
+            slots: 1,
             request: EgressRequest {
                 method: "POST".into(),
                 url: format!("http://127.0.0.1:{port}/v1/refunds"),
@@ -196,6 +197,7 @@ fn a_denied_host_never_reaches_the_network_and_is_recorded() {
         },
         CustodyOp::Request {
             credential: name("boxed"),
+            slots: 1,
             request: EgressRequest {
                 method: "GET".into(),
                 url: "https://blocked.example/x".into(),

@@ -318,6 +318,7 @@ fn request_substitutes_at_the_marked_slot_only() {
     let sentinel = Sentinel::new(name("stripe_api"), PresentationForm::Bearer).render();
     let reply = c.handle(&call(CustodyOp::Request {
         credential: name("stripe_api"),
+        slots: 1,
         request: EgressRequest {
             method: "POST".into(),
             url: "https://api.stripe.com/v1/refunds".into(),
@@ -350,6 +351,7 @@ fn request_without_a_marked_slot_is_refused() {
     let c = custodian_with(&[("stripe_api", CredentialKind::Bearer, b"sk_live_abc")]);
     let reply = c.handle(&call(CustodyOp::Request {
         credential: name("stripe_api"),
+        slots: 0,
         request: EgressRequest {
             method: "GET".into(),
             url: "https://api.stripe.com/v1/charges".into(),
@@ -363,6 +365,52 @@ fn request_without_a_marked_slot_is_refused() {
     ));
 }
 
+/// A slot the program did not place — one that arrived inside interpolated
+/// data — must refuse the call rather than be filled.
+///
+/// Slots are found by scanning finished request text, which cannot tell an
+/// author-written slot from one carried in by a value. Naming a DIFFERENT
+/// credential is already refused, so the dangerous shape is an injected slot
+/// naming the SAME credential the call legitimately uses: it passes that check,
+/// and `Raw` would place the bare secret wherever the attacker put the marker —
+/// here, in a response-visible body field instead of the Authorization header.
+/// The declared slot count is what makes the two disagree.
+#[test]
+fn a_slot_the_program_did_not_declare_is_refused() {
+    let egress = CapturingEgress::new(EgressResponse {
+        status: 200,
+        headers: vec![],
+        body_b64: Some(B64.encode(b"{\"ok\":true}")),
+    });
+    let c = custodian_with_egress(
+        &[("stripe_api", CredentialKind::Bearer, b"sk_live_abc")],
+        Box::new(Arc::clone(&egress)),
+    );
+    let authored = Sentinel::new(name("stripe_api"), PresentationForm::Bearer).render();
+    // Same credential, so the foreign-slot check does not fire; `Raw` so the
+    // bare secret would land in the body.
+    let injected = Sentinel::new(name("stripe_api"), PresentationForm::Raw).render();
+    let reply = c.handle(&call(CustodyOp::Request {
+        credential: name("stripe_api"),
+        // The program placed exactly one slot: the Authorization header.
+        slots: 1,
+        request: EgressRequest {
+            method: "POST".into(),
+            url: "https://api.stripe.com/v1/refunds".into(),
+            headers: vec![("Authorization".into(), authored)],
+            body_b64: Some(B64.encode(format!("{{\"note\":\"{injected}\"}}").as_bytes())),
+        },
+    }));
+    assert!(
+        matches!(expect_err(&reply), CustodyError::ScopeRefused { .. }),
+        "an undeclared slot must refuse the call"
+    );
+    assert!(
+        egress.seen.lock().expect("lock").is_empty(),
+        "nothing egressed: the refusal precedes the request"
+    );
+}
+
 #[test]
 fn request_carrying_a_foreign_slot_is_refused() {
     let c = custodian_with(&[
@@ -372,6 +420,7 @@ fn request_carrying_a_foreign_slot_is_refused() {
     let foreign = Sentinel::new(name("github"), PresentationForm::Bearer).render();
     let reply = c.handle(&call(CustodyOp::Request {
         credential: name("stripe_api"),
+        slots: 1,
         request: EgressRequest {
             method: "GET".into(),
             url: "https://api.stripe.com/v1/charges".into(),
@@ -405,6 +454,7 @@ fn mint_returns_a_handle_and_the_non_secret_half_only() {
     let sentinel = Sentinel::new(name("stripe_api"), PresentationForm::Bearer).render();
     let reply = c.handle(&call(CustodyOp::Mint {
         credential: name("stripe_api"),
+        exchange_slots: 1,
         scope: vec!["charges:write".into()],
         ttl_secs: 900,
         exchange: EgressRequest {
@@ -437,6 +487,7 @@ fn mint_returns_a_handle_and_the_non_secret_half_only() {
     let sentinel = Sentinel::new(credential.clone(), PresentationForm::Bearer).render();
     let use_minted = c.handle(&call(CustodyOp::Request {
         credential: credential.clone(),
+        slots: 1,
         request: EgressRequest {
             method: "POST".into(),
             url: "https://api.stripe.com/v1/refunds".into(),
@@ -489,6 +540,7 @@ fn refusal_paths_are_typed_and_recorded() {
     c.revoke(&name("bearer_only")).expect("revoke");
     let revoked = c.handle(&call(CustodyOp::Request {
         credential: name("bearer_only"),
+        slots: 1,
         request: EgressRequest {
             method: "GET".into(),
             url: "https://x.test/".into(),

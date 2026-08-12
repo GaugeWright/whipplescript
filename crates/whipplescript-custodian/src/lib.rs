@@ -273,7 +273,9 @@ impl Custodian {
         };
 
         match op {
-            CustodyOp::Request { request, .. } => self.op_request(&name, kind, &material, request),
+            CustodyOp::Request { request, slots, .. } => {
+                self.op_request(&name, kind, &material, request, *slots)
+            }
             CustodyOp::Sign {
                 alg,
                 derivation,
@@ -301,8 +303,17 @@ impl Custodian {
                 ttl_secs,
                 exchange,
                 extraction,
+                exchange_slots,
                 ..
-            } => self.op_mint(&name, &material, scope, *ttl_secs, exchange, extraction),
+            } => self.op_mint(
+                &name,
+                &material,
+                scope,
+                *ttl_secs,
+                exchange,
+                extraction,
+                *exchange_slots,
+            ),
         }
     }
 
@@ -376,8 +387,9 @@ impl Custodian {
         kind: CredentialKind,
         material: &[u8],
         request: &EgressRequest,
+        declared_slots: usize,
     ) -> Result<CustodyOk, CustodyError> {
-        let substituted = substitute_request(name, kind, material, request)?;
+        let substituted = substitute_request(name, kind, material, request, declared_slots)?;
         let response = self
             .egress
             .perform(&substituted)
@@ -457,6 +469,9 @@ impl Custodian {
 
     // -- mint ---------------------------------------------------------------
 
+    // The parameters are the wire op's fields, one for one; bundling them into a
+    // struct here would only re-describe `CustodyOp::Mint`.
+    #[allow(clippy::too_many_arguments)]
     fn op_mint(
         &self,
         name: &CredentialName,
@@ -465,13 +480,15 @@ impl Custodian {
         ttl_secs: u64,
         exchange: &EgressRequest,
         extraction: &MintExtraction,
+        exchange_slots: usize,
     ) -> Result<CustodyOk, CustodyError> {
         // The exchange request is whip's, with sentinels for the parent
         // credential; the custodian substitutes and executes it so the token
         // never appears in whip's address space (DR-0053 *Open*: OAuth
         // response capture).
         let parent_kind = CredentialKind::Bearer;
-        let substituted = substitute_request(name, parent_kind, material, exchange)?;
+        let substituted =
+            substitute_request(name, parent_kind, material, exchange, exchange_slots)?;
         let response = self
             .egress
             .perform(&substituted)
@@ -611,11 +628,23 @@ fn present(form: PresentationForm, material: &[u8]) -> Result<String, CustodyErr
 /// use the credential has no business spending a use of it. This is the
 /// dynamic edge of the static `unmarked` check
 /// (`credential-no-eliminator.maude`).
+///
+/// `declared_slots` is how many slots the constructing program says it placed,
+/// and a disagreement with what is found here is a refusal. Slots are located
+/// by scanning finished request text, which cannot distinguish one the author
+/// wrote from one that arrived inside an interpolated value; without the
+/// declaration, data that reached a header, URL or body could mint a slot and
+/// have real material substituted into a position the author never designated
+/// — with `PresentationForm::Raw` placing the bare secret there. The count is
+/// the authority on how many slots are legitimate, not the text. It detects
+/// rather than prevents: data can add an occurrence but cannot remove the
+/// author's, so any injection makes the totals disagree and the call refuses.
 fn substitute_request(
     name: &CredentialName,
     _kind: CredentialKind,
     material: &[u8],
     request: &EgressRequest,
+    declared_slots: usize,
 ) -> Result<EgressRequest, CustodyError> {
     let mut marked = 0usize;
     let mut substitute_text = |text: &str| -> Result<String, CustodyError> {
@@ -664,6 +693,16 @@ fn substitute_request(
         return Err(CustodyError::ScopeRefused {
             credential: name.clone(),
             detail: "request has no marked slot for this credential".into(),
+        });
+    }
+    if marked != declared_slots {
+        return Err(CustodyError::ScopeRefused {
+            credential: name.clone(),
+            detail: format!(
+                "request carries {marked} credential slot(s) but the caller declared \
+                 {declared_slots} — a slot the program did not place may have arrived \
+                 in interpolated data"
+            ),
         });
     }
     Ok(EgressRequest {

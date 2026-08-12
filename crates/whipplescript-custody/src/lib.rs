@@ -581,6 +581,17 @@ pub enum CustodyOp {
     Request {
         credential: CredentialName,
         request: EgressRequest,
+        /// How many sentinel slots the CONSTRUCTING program placed, declared
+        /// out of band from the request text itself. The custodian finds
+        /// sentinels by scanning finished text, which cannot tell a slot the
+        /// author wrote from one that arrived inside interpolated data; if a
+        /// value could carry a sentinel into a header, URL or body, the
+        /// custodian would fill it with real material at a position the author
+        /// never designated — and the `raw` form would put the bare secret
+        /// there. Declaring the count out of band makes any such injection a
+        /// refusal rather than a substitution: data can add an occurrence but
+        /// cannot remove the author's, so the totals disagree.
+        slots: usize,
     },
     /// Keyed signature, optionally through a derivation chain (§7): the
     /// custodian folds `HMAC` over the chain from the sealed material, then
@@ -631,6 +642,12 @@ pub enum CustodyOp {
         ttl_secs: u64,
         exchange: EgressRequest,
         extraction: MintExtraction,
+        /// Slots the constructing program placed in `exchange`, declared out of
+        /// band for the same reason as [`CustodyOp::Request::slots`]: the
+        /// exchange is whip-constructed text carrying the PARENT credential's
+        /// sentinels, so an injected slot here would present the parent to a
+        /// position the author never designated.
+        exchange_slots: usize,
     },
 }
 
