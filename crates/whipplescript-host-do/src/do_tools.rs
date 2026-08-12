@@ -34,7 +34,7 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::host_package::workspace_tool_specs_from_registry;
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
-use whipplescript_store::items::WorkItems;
+use whipplescript_store::items::{ClaimOutcome, WorkItems};
 use whipplescript_store::RuntimeStore;
 
 use crate::do_store::{DoSql, DoSqliteStore, SqlValue};
@@ -571,16 +571,34 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         let holder = format!("agent:{DO_TRACKER_HOLDER}");
         let mut store = self.store();
         match status {
-            "in_progress" => {
-                store
-                    .claim_item(id, &holder, None)
-                    .map_err(|error| format!("claim: {error:?}"))?;
-            }
+            // Parity with the native tool: the lease outcome IS the answer. A
+            // claim refused because another holder — a workflow instance, a
+            // native actor on the same store — has the item must reach the
+            // model, or it works an item it does not own. Re-claiming what this
+            // holder already has stays idempotent.
+            "in_progress" => match store
+                .claim_item(id, &holder, None)
+                .map_err(|error| format!("claim: {error:?}"))?
+            {
+                ClaimOutcome::Claimed => {}
+                ClaimOutcome::AlreadyClaimed { holder: current } if current == holder => {}
+                ClaimOutcome::AlreadyClaimed { holder: current } => {
+                    return Err(format!("`{id}` is already claimed by {current}"));
+                }
+                ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
+            },
+            // `finish_item` is false when the item is not durably open — missing,
+            // or already closed by whoever got there first.
             "completed" => {
-                store
+                if !store
                     .finish_item(id, None)
-                    .map_err(|error| format!("finish: {error:?}"))?;
+                    .map_err(|error| format!("finish: {error:?}"))?
+                {
+                    return Err(format!("`{id}` is not open (missing, or already closed)"));
+                }
             }
+            // A release with no active lease stays a no-op success, as natively:
+            // the requested end state — this holder holding nothing — holds.
             "pending" => {
                 store
                     .release_item(id)
@@ -1291,6 +1309,65 @@ mod tests {
         let completed = exec.execute(&call("list_todos", json!({ "status": "completed" })));
         let rows: Value = serde_json::from_str(&completed.content).expect("completed json");
         assert_eq!(rows.as_array().expect("array").len(), 1);
+    }
+
+    /// Parity with the native harness tool: a claim the store refused reaches
+    /// the model instead of being reported as a successful `in_progress`. On
+    /// the DO the holder is a constant, so the reachable conflict is a lease
+    /// held by someone else on the same store — a workflow instance, or a
+    /// native actor.
+    #[test]
+    fn update_todo_surfaces_a_refused_claim_and_a_closed_item() {
+        let sql = Rc::new(store().sql);
+        let exec = DoToolExecutor::new(Rc::clone(&sql));
+        let added = exec.execute(&call("add_todo", json!({ "content": "one job" })));
+        assert_eq!(added.status, ToolStatus::Ok, "{}", added.content);
+        let id = serde_json::from_str::<Value>(&added.content).expect("add_todo json")["id"]
+            .as_str()
+            .expect("id string")
+            .to_owned();
+
+        // Someone else takes the lease first.
+        let mut other = DoSqliteStore::new(Rc::clone(&sql));
+        assert!(matches!(
+            other.claim_item(&id, "instance:wf-1", None),
+            Ok(ClaimOutcome::Claimed)
+        ));
+        let taken = exec.execute(&call(
+            "update_todo",
+            json!({ "id": id, "status": "in_progress" }),
+        ));
+        assert_eq!(taken.status, ToolStatus::Error, "{}", taken.content);
+        assert!(
+            taken.content.contains("already claimed by instance:wf-1"),
+            "{}",
+            taken.content
+        );
+
+        // A claim on an item that does not exist is not a success either.
+        let missing = exec.execute(&call(
+            "update_todo",
+            json!({ "id": "no-such-item", "status": "in_progress" }),
+        ));
+        assert_eq!(missing.status, ToolStatus::Error, "{}", missing.content);
+        assert!(
+            missing.content.contains("was not found"),
+            "{}",
+            missing.content
+        );
+
+        // Nor is closing what someone already closed.
+        let done = exec.execute(&call(
+            "update_todo",
+            json!({ "id": id, "status": "completed" }),
+        ));
+        assert_eq!(done.status, ToolStatus::Ok, "{}", done.content);
+        let again = exec.execute(&call(
+            "update_todo",
+            json!({ "id": id, "status": "completed" }),
+        ));
+        assert_eq!(again.status, ToolStatus::Error, "{}", again.content);
+        assert!(again.content.contains("not open"), "{}", again.content);
     }
 
     #[test]
