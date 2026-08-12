@@ -27,6 +27,7 @@ test the handling of a failure. The flags are `--fail`, `--timeout`, and
 
 A workflow binds each logical agent to a family of provider in the source:
 
+<!-- check: fragment -->
 ```whip
 agent implementer {
   provider codex
@@ -71,6 +72,7 @@ is not advisory metadata.
 
 The internal design record for this harness is DR-0024.
 
+<!-- check: fragment -->
 ```whip
 agent helper {
   provider owned
@@ -743,6 +745,7 @@ A `coerce`/`decide`/`prompt` ships its interpolated prompt to a model just as a
 turn does, so it is governed the same way — by the endpoint it actually reaches.
 Name that endpoint on the declaration and it becomes the principal:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 coerce classify(text string) -> Verdict {
   prompt """markdown
@@ -807,6 +810,7 @@ through, and WhippleScript does not offer a way to try. Bind one agent to the
 cleared endpoint, let it read the secret, and pass a narrow result to a second
 agent bound to the cheaper one:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 agent Auditor      -- governance binds this to the on-prem endpoint
 agent Summarizer   -- and this to the cloud one
@@ -851,6 +855,7 @@ contract covers a package, a library, and a provider. A package exposes explicit
 effects. A package never adds a hidden control flow and never adds a new
 grammar.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 use std.memory
 

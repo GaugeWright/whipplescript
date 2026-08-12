@@ -67,6 +67,7 @@ Two items are important:
 
 Add `use std.tracker` at the top of the file. Then add this source:
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
 agent triager {
   provider fixture
@@ -101,6 +102,7 @@ machinery of the gate for the person. The workflow files its question into
 
 ## 3. Write the triage rule
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
 rule triage_open_ticket
   when Ticket as ticket where ticket.status == "open"
@@ -166,6 +168,7 @@ effect, a person becomes a timeout. The durable form is a **round trip through
 a tracker**. The workflow files its question as an issue. The answer of the
 person comes back as an issue. The workflow monitors for that issue.
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
 rule request_signoff
   when TriagedTicket as ticket where ticket.severity == "high"
@@ -227,6 +230,7 @@ Last, route the failure of the turn. The checker gave a warning about this
 failure. In the `triage_open_ticket` rule, add a typed failure terminal
 adjacent to the success arm:
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
   after turn fails as oops {
     fail error {
@@ -247,6 +251,7 @@ and durable.
 Last, add the assertions. An assertion is an executable statement about the
 complete run. The `run` command evaluates the assertions for you:
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
 assert count(Ticket where status == "open") == 0
 assert count(TriagedTicket) == 2

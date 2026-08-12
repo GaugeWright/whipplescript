@@ -92,6 +92,7 @@ right to their own record. A grant alone changes nothing. The
 `governance-with-hatches.policy` file also rejects the unsafe whip. A grant
 authorizes a **crossing with a source mark**:
 
+<!-- check: skip — an intermediate step of the build; the finished program is checked -->
 ```whip
 coerce sanitize(email.content) as clean endorsed          # untrusted -> CRM
 coerce release(customer.content) as summary declassified  # CRM -> customer

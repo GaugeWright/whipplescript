@@ -63,6 +63,7 @@ The cause is a binding of an effect after the closing triple quotation marks.
 
 This source is incorrect:
 
+<!-- check: skip — demonstrates a diagnostic that depends on the surrounding program; the synthetic wrapper errors first -->
 ```whip
 tell worker """markdown
 Do the work.
@@ -71,6 +72,7 @@ Do the work.
 
 This source is the correction:
 
+<!-- check: skip — the correction; `worker` is the surrounding program's agent -->
 ```whip
 tell worker as turn """markdown
 Do the work.
@@ -86,6 +88,7 @@ reference is in a rule, an assertion, a payload, or a template.
 
 This source is incorrect:
 
+<!-- check: skip — demonstrates a diagnostic that depends on the surrounding program; the synthetic wrapper errors first -->
 ```whip
 rule bad
   when MissingTask as task
@@ -121,12 +124,14 @@ second example.
 
 This source is incorrect:
 
+<!-- check: skip — a readiness clause, not a rule body -->
 ```whip
 when Task as task where task.priority == "high"
 ```
 
 The correction is to use the declared domain:
 
+<!-- check: skip — a readiness clause, not a rule body -->
 ```whip
 when Task as task where task.priority == High
 ```
@@ -169,6 +174,7 @@ workflow, a `table` declaration, a `record` statement in a different rule, and a
 declared external event. If external infrastructure truly injects the fact, add
 a tag to the rule:
 
+<!-- check: skip — a rule tag shown without the rule it annotates -->
 ```whip
 @external
 rule import_ticket
@@ -185,6 +191,7 @@ of the rule introduced that binding.
 
 This source is incorrect:
 
+<!-- check: skip — demonstrates a diagnostic that depends on the surrounding program; the synthetic wrapper errors first -->
 ```whip
 after review succeeds as result {
   record Done { summary result.summary }
@@ -193,6 +200,7 @@ after review succeeds as result {
 
 The correction is to bind the effect first:
 
+<!-- check: skip — the correction; `item` is the surrounding program's fact -->
 ```whip
 coerce reviewWork(item.title) as review
 
@@ -232,6 +240,7 @@ for each outcome.
 
 This is the correction:
 
+<!-- check: skip — the correction; `task` is the surrounding program's fact -->
 ```whip
 acquire deploy_slot for task.env as slot
 

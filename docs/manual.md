@@ -87,6 +87,7 @@ short reference. Each subject below also has a full chapter above.
 Facts are typed. Use an enum for a closed set of decisions. Use a literal field
 for a small state machine:
 
+<!-- check: fragment -->
 ```whip
 enum ReviewStatus {
   Accept
@@ -119,6 +120,7 @@ commits.
 
 ## Request agent work
 
+<!-- check: fragment -->
 ```whip
 agent worker {
   provider fixture
@@ -164,6 +166,7 @@ Learn these three results:
 Sometimes a judgment must supply structured data and not prose. In this
 condition, declare a coerce function and branch on its completion:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 coerce reviewWork(title string, summary string) -> WorkReview {
   prompt """markdown
@@ -208,12 +211,14 @@ A guard does the filter operation. A `case` statement covers a finite domain.
 An `after ... completes` block does the exhaustive handling of the terminal
 status:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule accept
   when ReviewedWork as reviewed where reviewed.review.status == Accept
 => { ... }
 ```
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 case review.status {
   Accept => {
@@ -228,6 +233,7 @@ case review.status {
 }
 ```
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 after turn completes {
   case turn.output {
@@ -253,6 +259,7 @@ sequence of such work. The statement `then <binding> <- <effect>` writes the
 sequence from the top to the bottom. The statement desugars to the same nested
 `after` blocks:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule triage
   when Ticket as ticket
@@ -293,6 +300,7 @@ commits, durable effects, and the semantics of `after`.
 Sometimes work comes as a backlog and not as facts that you seed at the start.
 In this condition, declare a `tracker`. The rules then claim from the tracker:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tracker backlog {
   provider builtin
@@ -340,6 +348,7 @@ on the atomic verbs. Do not build a lock from facts:
 Each attempt is atomic. Each outcome is a branch and never an error. Handle the
 two sides. If you do not, the checker flags the rule:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 use std.coord
 
@@ -410,6 +419,7 @@ effect:
 - The `cancel <binding>` statement stops an effect that is pending or in
   operation. You must bind the effect before you cancel it.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell worker as turn timeout 10m "Do the work."
 
@@ -431,6 +441,7 @@ fires a timer without help, through a DO alarm. Refer to
 The language has no built-in retry policy. A retry is a usual fact and a usual
 rule. Thus a retry stays visible and auditable:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule attempt_job
   when Job as job where job.status == "pending" and job.attempts < 3
@@ -491,6 +502,7 @@ statement is an escape hatch for the dev profile. It has deliberate limits:
 
 In a hosted deployment, use a named script capability instead:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 exec backup_repo with request -> Report as backup
 ```
@@ -534,6 +546,7 @@ pattern into usual declarations before the type check. The `invoke` statement
 is composition at run time. The child is a true instance. The parent sees only
 the declared output payload or the declared failure payload of the child:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 invoke ReviewPhase {
   phase PhaseReviewRequest {
@@ -556,6 +569,7 @@ after child fails as failure {
 Declare the data that the workflow supplies. Then make sure that one rule
 supplies that data:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 output result PhaseReviewResult
 failure error ReviewPhaseFailure

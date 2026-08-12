@@ -261,6 +261,7 @@ input ticket SupportTicket
 **The `pattern` construct and the `apply` construct** make a template of a full
 *declaration*. One rule shape then applies to each type:
 
+<!-- check: skip — excerpt; `ChangeRequest` is the surrounding program's fact -->
 ```whip
 pattern AgentReview<Input, Output> {
   rule review
@@ -294,6 +295,7 @@ apply AgentReview<ChangeRequest, ReviewedChange> as changeReview {
 **The `action` construct** makes a template of a *chain of effects in one
 rule*. This unit is smaller than a rule:
 
+<!-- check: skip — excerpt; `ChangeRequest` is the surrounding program's fact -->
 ```whip
 action review_change(who AgentRef<reviewer>, item ChangeRequest) {
   tell who as turn """markdown

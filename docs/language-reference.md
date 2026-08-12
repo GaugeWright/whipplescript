@@ -154,6 +154,7 @@ content and not a comment. A string literal uses double quotation marks. A
 prompt with more than one line uses triple quotation marks. You can annotate
 the opening marks with a content type:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 """markdown
 Prompt body
@@ -164,6 +165,7 @@ The annotation is metadata. The annotation does not validate the body of the
 prompt. Put the body of the prompt on the line after the opening marks. Put the
 binding of an effect on the line of the effect, before the opening marks:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell worker as turn """markdown
 Do the work.
@@ -225,6 +227,7 @@ runs, and lifecycle state.
 A contract declares the data that an instance accepts and the data that an
 instance supplies:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 input phase PhaseReviewRequest
 output result PhaseReviewResult
@@ -264,6 +267,7 @@ wrapper must not invoke the private workflow as an adjacent workflow.
 
 These are the typed shapes for a fact and for a payload:
 
+<!-- check: fragment -->
 ```whip
 enum ReviewStatus {
   Accept
@@ -290,6 +294,7 @@ value of such a union; see [Conditional fields](#conditional-fields).
 
 An agent is a target that an agent turn can address:
 
+<!-- check: fragment -->
 ```whip
 agent reviewer {
   profile "repo-reader"
@@ -351,6 +356,7 @@ compile error. Such a declaration is never a silent no-operation.
 A table holds static seed rows. The rows are typed against a class. The runtime
 records the rows when the instance starts:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 table language_tasks as LanguageTask [
   {
@@ -377,6 +383,7 @@ the JSON output.
 A coercion is a typed model decision that a coercion backend supports. A call
 to a coercion in a rule makes a durable `schema.coerce` effect:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 coerce assessIncident(title string, impact string, mitigation string) -> IncidentAssessment {
   prompt """markdown
@@ -397,6 +404,7 @@ function. The typed output is available only in an `after ... succeeds` branch.
 A coercion with a prompt only can omit the block and the keyword. The string
 after the return type is then the prompt:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 coerce assessIncident(title string) -> IncidentAssessment """markdown
 Assess the incident: {{ title }}
@@ -423,6 +431,7 @@ use the [`prompt` effect](#the-prompt-effect).
 These constructs give reuse at compile time. The `apply` statement expands a
 pattern into usual declarations before the type check:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 pattern AgentReview<Input, Output> {
   input Input as item
@@ -458,6 +467,7 @@ declaration. An `action` construct abstracts a chain of statements. The
 compiler inlines the action at each call site and expands the action fully into
 the durable graph:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 action review_change(who AgentRef<reviewer>, item ChangeRequest) {
   tell who as turn """markdown
@@ -506,6 +516,7 @@ The `redact` statement projects a binding with a record type onto a subset of
 its fields. The statement makes a new binding. The new binding carries **only**
 the fields that you keep:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule triage
   when Customer as c
@@ -583,6 +594,7 @@ These are the semantics:
 
 ### `include` and `use`
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 include "schemas/common.whip"   // contributes declarations to the bundle
 include "review.coerce"           // makes coerce classes/functions available to coerce
@@ -639,6 +651,7 @@ A `signal` declaration declares a typed external signal and its payload schema.
 A `source` block declares the method that admits a signal as a durable fact. A
 rule reacts to the admitted signal. A source never fires a rule directly.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 signal triage.tick {
   scheduled_at time
@@ -705,6 +718,7 @@ entries. The same applies to a second poll of a feed that permits append only.
 A `file` source reads a local path. Its record of the observation binds
 `{ line, line_index, path }`:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 source file as feed {
   path "./inbox.txt"
@@ -725,6 +739,7 @@ and a change to the content admits again. The record of the observation binds
 effects of `std.files`. The v1 glob is a literal directory and one file name
 with a `*` wildcard. The v1 glob has no `**` wildcard.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 source file as drops {
   watch "./drops/*.json"
@@ -740,6 +755,7 @@ An `http` source does a GET operation on a URL that returns a JSON array. Its
 record of the observation binds `{ item, item_index, url }`. The `item` value
 is the JSON element as a string again:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 source http as feed {
   url "https://example.com/feed.json"
@@ -781,6 +797,7 @@ with a guard. A rule then commits a rewrite atomically. Each fact, each effect,
 each dependency, and each terminal action of the selected rule persists, or
 none of them persists.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule resolve_incident
   when IncidentTicket as ticket where ticket.status == "open"
@@ -810,6 +827,7 @@ rule resolve_incident
 You can also group more than one `when` line in a block. The two forms are
 equivalent:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule start
   when {
@@ -896,6 +914,7 @@ points at the expression.
 
 In new code, use the word operators:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 when Job as job where job.status == "pending" and job.attempts < 3
 ```
@@ -1023,6 +1042,7 @@ mechanism generalizes the family of terminal outcomes (`succeeds`, `fails`, and
 `completes`) into a lifecycle family. The family covers the states that the
 child declares explicitly:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 // in the child workflow
 class Progress { detail string }
@@ -1070,6 +1090,7 @@ A `tell` statement can make the authority of the turn more narrow. The
 statement gives one or more `with access to <resource> { <grant clauses> }`
 modifiers. Write the modifiers between the target and the prompt:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell coder as turn
   with access to project_memory {
@@ -1085,6 +1106,7 @@ tell coder as turn
 The parser also accepts the equivalent short form with a group. The short form
 desugars to the same list of grants:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell coder as turn
   with access to {
@@ -1176,6 +1198,7 @@ A turn can also draw tools from an external MCP server. The name of a
 registered server is the resource, and the operations are the names of the
 tools that the turn uses:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell coder
   with access to github { get_issue create_issue }
@@ -1223,6 +1246,7 @@ An `after` block makes the durable dependency edge. The output of an effect is
 visible only in the `after` branch that proves the terminal status of the
 effect:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell worker as turn "Do the task."
 
@@ -1313,6 +1337,7 @@ instance continues to run.
 
 Reactivity in a progression is explicit. The construct is a **region**:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 until exists(Incident where sev == "sev1") {
   then plan <- tell deployer "Plan the deploy."
@@ -1396,6 +1421,7 @@ reads the present, also in a continuation. Thus an arm can check that its
 trigger is still present. The arm can then compensate instead of a record
 operation for progress that is no longer correct:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 after signoff completes {
   case signoff {
@@ -1415,6 +1441,7 @@ after signoff completes {
 withdrawal then *cancels the turn that is in operation*. The result of the turn
 does not land:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 until exists(Withdrawal where version == rc.version) {
   tell reviewer as signoff "Approve {{ rc.version }}?"
@@ -1437,6 +1464,7 @@ are in `spec/decision-records/0044-retraction-examples.md`.
 A `case` statement branches deterministically on the field of an enum or on the
 terminal union of an effect:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 after turn completes {
   case turn {
@@ -1454,6 +1482,7 @@ A `case` statement also branches on a type that is a union of string literals.
 An example is a field with the declaration `status "approve" | "reject"`. The
 same check on exhaustiveness applies:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 case answer.choice {
   "approve" => { complete result { decision answer.choice } }
@@ -1476,6 +1505,7 @@ A `decide` statement is an anonymous typed model decision in the body of a
 rule. The statement is a coercion with its schema in position. Use the
 statement when a named `coerce` declaration would occur one time only:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 decide "Is this plan safe to ship? Explain." -> { fixed bool, reason string } as verdict
 
@@ -1501,6 +1531,7 @@ result and you can use a `case` statement on a `decide` result. To *branch* on
 a decision, give the result a field with a `bool` type, an enum type, or a type
 that is a union of string literals. Then use a `case` statement on that field:
 
+<!-- check: fragment -->
 ```whip
 decide "Is this plan safe to ship? Explain." -> { fixed bool, reason string } as verdict
 after verdict succeeds as v {
@@ -1515,6 +1546,7 @@ A named `coerce` declaration is still correct when you use the shape of the
 decision again. Its declared class is a shared contract, and the declaration is
 a record of the contract:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 class ShipVerdict { decision "ship" | "hold"  reason string }
 
@@ -1540,6 +1572,7 @@ Thus the durability, the sequence of the providers, the capability, and the
 position on IFC egress are the same. The result is a plain string. The success
 binding *is* the string:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 prompt "Summarize this incident for the status page: {{ ticket.title }}" as summary
 
@@ -1564,6 +1597,7 @@ runtime stays the deterministic rule kernel that this page gives. The `flow`
 declaration is no longer in the language. The `then` statement is the surface
 for a sequence.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule triage
   when Ticket as ticket
@@ -1607,6 +1641,7 @@ is independent of a vendor. Use a tracker when work arrives as a backlog of
 issues that a rule claims, works, and finishes. Do not use a tracker when the
 work arrives as facts that a table seeds at the start:
 
+<!-- check: fragment -->
 ```whip
 tracker backlog
 ```
@@ -1624,6 +1659,7 @@ stored status.
 
 The body of a rule uses these verbs on a tracker:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 file issue into backlog { title "Fix login" body "Users report 500s." }
 claim issue as work
@@ -1633,6 +1669,7 @@ finish issue { summary "patched and verified" }      # optional `as x` for chain
 
 React to ready work with this readiness pattern:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule pick_up
   when backlog has ready issue as issue
@@ -1686,6 +1723,7 @@ A `timeout` clause limits each type of effect. If the effect did not complete
 when the duration is complete, the effect ends in the `timed_out` status. An
 `after ... times out` branch or an `on timeout` branch can then react:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 tell worker as turn timeout 10m "Do the work."
 ```
@@ -1703,6 +1741,7 @@ A `timer` statement is an independent effect. The effect completes when its
 duration is due. Use a timer for a delay, for an interval between polls, and
 for a deadline that is not part of a different effect:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 timer 24h as deadline
 
@@ -1731,6 +1770,7 @@ The `exec` statement has two profiles.
 In the dev profile, an `exec` statement runs a local command string as an
 effect with a gate:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 exec "scripts/run-tests.sh" as tests
 
@@ -1759,6 +1799,7 @@ In the hosted profile, the system rejects a raw command string. The source
 names a script capability that the operator pinned. The source passes typed
 input on stdin:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 exec backup_repo with request -> Report as backup
 
@@ -1795,6 +1836,7 @@ A `file store` declaration declares a named directory with a root scope. A
 workflow can read from the directory and write to the directory. The store is a
 policy boundary. The store is not an open handle to the file system:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 file store project_files {
   root "./data"
@@ -1841,6 +1883,7 @@ collection and not a count.
 The `read` statement loads one file into a typed binding as an effect with a
 gate:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 read text from project_files at "notes.md" as fileResult
 
@@ -1856,6 +1899,7 @@ The success binding makes `result.content` and `result.bytes` available. The
 The `write` statement renders a body to a file. The statement needs an explicit
 `mode` value. There is no silent overwrite operation:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 write text to project_files at "summary.md" {
   body result.content
@@ -1915,6 +1959,7 @@ ambiently after each settled run. The `whip gauges` command shows the
 accumulated evidence. The `whip improve` command optimizes against the
 evidence.
 
+<!-- check: fragment -->
 ```whip
 gauge extract_quality on summarize.extract {
   judge via exec "./judge.py"
@@ -1966,6 +2011,7 @@ gauge extract_quality on summarize.extract {
 A `mark` declaration declares a named cut point. The declaration gives the
 position of the important moments of a run, as part of the program:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 mark "triaged" after classify
 ```
@@ -1987,6 +2033,7 @@ version, and you can diff the declaration. The declaration is a division of the
 vector of gauges. The declaration has more ceremony than an invocation of the
 CLI. The `whip improve release_tuning` command adopts the declaration:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 campaign release_tuning {
   ascend    extract_quality, reply_quality
@@ -2021,6 +2068,7 @@ Slack and email are examples. The construct belongs to a package. The bare
 party cannot make semantics that are similar to a channel but that have weaker
 guarantees.
 
+<!-- check: fragment -->
 ```whip
 use std.messaging
 
@@ -2060,6 +2108,7 @@ program, or in the address space of whip. Governance supplies the reality of
 the handle through a grant, and the custodian — a separate security
 principal — performs every operation with the material.
 
+<!-- check: fragment -->
 ```whip
 credential stripe_api      { kind bearer }
 credential release_signing { kind ed25519 }
@@ -2104,6 +2153,7 @@ not invalidate the grants that name it.
 Send an outbound message with a `send via <channel> { ... } as <binding>`
 statement:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule notify
   when Ticket as ticket where ticket.status == "open"
@@ -2153,6 +2203,7 @@ system never supplies a domain type. The change of a message into a typed fact
 is explicit. The methods are `coerce msg.text -> Decision` and a `signal`
 mapping. React to a message with this readiness form:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule react
   when message from release_room as msg
@@ -2176,6 +2227,7 @@ An assertion is an executable statement about a run that completed. The
 `whip run` command and the `whip accept` command evaluate an assertion after
 the instance becomes idle:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 assert count(Ticket where status == "open") == 0
 assert count(IncidentResolution where status == "resolved") >= 1
@@ -2306,6 +2358,7 @@ An `invoke` statement starts a child instance with its own event log and its
 own lifecycle. The parent sees only the declared output payload or the declared
 failure payload of the child:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 invoke ReviewPhase {
   phase PhaseReviewRequest {
@@ -2328,6 +2381,7 @@ statement.
 
 An invocation can also carry a start grant for a specified resource:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 invoke ReviewDocs {
   task task
@@ -2391,6 +2445,7 @@ each workflow. Sometimes one family of provider needs more than one configured
 endpoint. In that condition, declare named harnesses and bind an agent to one
 harness:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 harness coder: codex
 harness reviewer: claude
@@ -2423,6 +2478,7 @@ coverage must be exhaustive, or the statement must have a `_` arm. A run with
 the fixture returns the first declared variant. The `--variant <name>` flag
 selects a different arm.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 enum ReviewOutcome {
   Approved { score float }
@@ -2442,6 +2498,7 @@ case outcome {
 A field can declare that it exists only for one value of a literal union on the
 same class:
 
+<!-- check: fragment -->
 ```whip
 class Change {
   kind "deploy" | "rollback"
@@ -2466,6 +2523,7 @@ A read of a conditional field is legal only where the discriminant is pinned to
 the matching literal, which is the matching arm of a `case` on that
 discriminant:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 case change.kind {
   "deploy" => { record Deployment { region change.region } }
@@ -2516,6 +2574,7 @@ reserves this path for exact properties of a script or a fixture. Such
 properties must hold in CI with no access to a provider. A `coerce` review that
 a model judges and a deterministic validation are for use together.
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 exec "validate-script {{artifact.path}} {{artifact.expectedScript}}" -> ScriptCheck as check
 
@@ -2575,6 +2634,7 @@ line of JSON with the result for each envelope.
 Inject a signal from a different workflow with the effect that injects a
 signal:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 emit signal deploy.finished to s.target {
   service s.service
@@ -2607,6 +2667,7 @@ The coordination resources are a closed family with the scope of a workflow.
 You declare each resource with a typed key and mandatory limits. Only an atomic
 effect that you can branch on changes a resource:
 
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 lease deploy_slot { key Environment  slots 1  ttl 10m }
 ledger decisions  { entry Decision  partition by area  retain 90d }

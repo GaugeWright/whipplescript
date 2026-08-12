@@ -15,12 +15,22 @@
 #
 # The default therefore checks a NEW whole program automatically, which is the
 # direction that matters: an unchecked fence should require someone to say so.
+# And it does — an untagged fragment is an ERROR, not a quiet skip. Two survived
+# the first curation pass because the sweep that tagged the manual decided
+# "already done" per FILE, so a partially curated page kept its untagged fences
+# and nothing said so. A corpus that can silently re-accumulate unchecked
+# examples is the state this whole check exists to leave.
 #
 # SAYING SO. An HTML comment on the line before the fence overrides the default.
 # It renders as nothing, and it is greppable:
 #
 #   <!-- check: skip — sketch, references an include that does not exist -->
-#   <!-- check: fails -->            the page is DEMONSTRATING a diagnostic
+#   <!-- check: fails <text> -->     the page is DEMONSTRATING a diagnostic, and
+#                                    the error must contain <text>. Without the
+#                                    text a `fails` fence passes on ANY error,
+#                                    including one the wrapper caused, which
+#                                    would certify the page teaches a diagnostic
+#                                    it no longer produces.
 #   <!-- check: root <Name> -->      several workflows; name the root
 #   <!-- check: fragment -->         wrap and compile this fragment on its own
 #   <!-- check: context <name> -->   this fence's declarations become reusable
@@ -77,6 +87,8 @@ WORKFLOW = re.compile(r"^\s*workflow\s", re.M)
 # adding one is a deliberate edit rather than a side effect.
 EXPECTED = {
     "docs/diagnostics.md": 2,
+    "docs/language-reference.md": 8,
+    "docs/manual.md": 2,
     "docs/manual/01-smallest-workflow.md": 1,
     "docs/manual/02-facts-and-types.md": 10,
     "docs/manual/03-expressions.md": 1,
@@ -99,6 +111,7 @@ EXPECTED = {
     "docs/manual/26-gauges.md": 2,
     "docs/manual/32-providers.md": 1,
     "docs/manual/35-memory.md": 1,
+    "docs/providers.md": 2,
     "docs/tutorials/root-agent.md": 1,
 }
 
@@ -294,6 +307,7 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
 
         root = None
         expect_failure = False
+        expected_text = ""
         if raw is not None and raw.startswith("context ") and WORKFLOW.search(body):
             # A PROGRAM may also serve as a context: it is compiled as the program
             # it is, and its declarations become reusable. The page already shows
@@ -330,7 +344,15 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
                         continue
                 skips.append((where, reason))
                 continue
-            if raw == "fails":
+            if raw == "fails" or raw.startswith("fails "):
+                expected_text = raw[6:].strip()
+                if not expected_text:
+                    problems.append(
+                        f"{where}: `check: fails` needs the text the error must contain. "
+                        "Without it the fence passes on ANY error, including one the "
+                        "wrapper caused."
+                    )
+                    continue
                 expect_failure = True
             elif raw.startswith("root "):
                 root = raw[5:].strip()
@@ -360,7 +382,13 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
             else:
                 problems.append(f"{where}: unknown directive `check: {raw}`")
                 continue
-        elif not WORKFLOW.search(body) or ELISION.search(body):
+        elif ELISION.search(body):
+            continue
+        elif not WORKFLOW.search(body):
+            problems.append(
+                f"{where}: this fragment carries no `check:` directive. Mark it "
+                "`fragment`, `in <context>`, or `skip <reason>`."
+            )
             continue
 
 
@@ -370,6 +398,12 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
                 problems.append(
                     f"{where}: marked `check: fails` but it compiles — the page no longer "
                     "demonstrates a diagnostic"
+                )
+            elif expected_text and expected_text not in result.stdout + result.stderr:
+                problems.append(
+                    f"{where}: marked `check: fails {expected_text}` but the error is "
+                    f"{first_error(result)} — the page teaches a diagnostic it no longer "
+                    "produces, or the wrapper failed first"
                 )
             else:
                 failed_as_expected += 1
