@@ -31,7 +31,7 @@ use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::files::{FileStore, NativeFileStore};
-use whipplescript_store::items::WorkItemStore;
+use whipplescript_store::items::{ClaimOutcome, WorkItemStore};
 use whipplescript_store::{
     RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
 };
@@ -2016,16 +2016,37 @@ impl FileToolExecutor {
         let (mut store, _queue) = self.tracker()?;
         let holder = format!("agent:{}", self.holder);
         match status {
-            "in_progress" => {
-                store
-                    .claim_item(id, &holder, None)
-                    .map_err(|error| format!("claim: {error:?}"))?;
-            }
+            // The lease outcome IS the answer, not a formality: a claim refused
+            // because another agent holds the item has to reach the model, or
+            // the agent proceeds to do exactly the duplicate work the lease
+            // exists to prevent. Re-claiming what this agent already holds stays
+            // idempotent — the store reports any active lease as `AlreadyClaimed`,
+            // including our own, and a repeated `in_progress` is not a conflict.
+            "in_progress" => match store
+                .claim_item(id, &holder, None)
+                .map_err(|error| format!("claim: {error:?}"))?
+            {
+                ClaimOutcome::Claimed => {}
+                ClaimOutcome::AlreadyClaimed { holder: current } if current == holder => {}
+                ClaimOutcome::AlreadyClaimed { holder: current } => {
+                    return Err(format!("`{id}` is already claimed by {current}"));
+                }
+                ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
+            },
+            // `finish_item` is false when the item is not durably open — missing,
+            // or already closed by whoever got there first.
             "completed" => {
-                store
+                if !store
                     .finish_item(id, None)
-                    .map_err(|error| format!("finish: {error:?}"))?;
+                    .map_err(|error| format!("finish: {error:?}"))?
+                {
+                    return Err(format!("`{id}` is not open (missing, or already closed)"));
+                }
             }
+            // A release with no active lease stays a no-op success: the requested
+            // end state — this agent holding nothing — already holds. Releasing
+            // a lease held by *another* agent is the open gap, recorded as gap
+            // (e) of the tracker-feed item on `spec/vnext-tracker.md`.
             "pending" => {
                 store
                     .release_item(id)
@@ -5455,6 +5476,109 @@ mod tests {
         assert_eq!(finish.status, ToolStatus::Error);
         assert!(finish.content.contains("tracker update is not granted"));
         assert!(finish.content.contains("finish"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A refused claim has to reach the model. The store already reports
+    /// `AlreadyClaimed` when another agent holds the lease; swallowing that
+    /// outcome told the agent it owned work it did not, which is the exact
+    /// duplicate-work collision the lease exists to prevent. Re-claiming what
+    /// this agent already holds stays idempotent.
+    #[test]
+    fn update_todo_surfaces_a_refused_claim_and_stays_idempotent_for_the_holder() {
+        let root = temp_root();
+        let store_path = root.join("items.sqlite");
+        let grants = || {
+            turn_tool_access_from_input(
+                &json!({
+                    "access_grants": [
+                        {
+                            "resource": "tracker",
+                            "operations": [
+                                {"operation": "file"},
+                                {"operation": "claim"},
+                                {"operation": "finish"},
+                                {"operation": "release"}
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+            .expect("tracker grants parse")
+        };
+        let alice = FileToolExecutor::new(&root)
+            .with_tracker("queue", "alice")
+            .with_tracker_store(store_path.clone())
+            .with_turn_tool_access(grants())
+            .with_profile_policy(Some("repo-writer"));
+        let bob = FileToolExecutor::new(&root)
+            .with_tracker("queue", "bob")
+            .with_tracker_store(store_path)
+            .with_turn_tool_access(grants())
+            .with_profile_policy(Some("repo-writer"));
+
+        let filed = alice.execute(&call(TOOL_ADD_TODO, json!({ "content": "one job" })));
+        assert_eq!(filed.status, ToolStatus::Ok, "{}", filed.content);
+        let id = serde_json::from_str::<Value>(&filed.content).expect("json")["id"]
+            .as_str()
+            .expect("filed id")
+            .to_owned();
+
+        let claimed = alice.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": id, "status": "in_progress" }),
+        ));
+        assert_eq!(claimed.status, ToolStatus::Ok, "{}", claimed.content);
+        // Idempotent for the holder: re-marking work it already owns is no conflict.
+        let again = alice.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": id, "status": "in_progress" }),
+        ));
+        assert_eq!(again.status, ToolStatus::Ok, "{}", again.content);
+        // Refused, out loud, for anyone else — with the holder named.
+        let taken = bob.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": id, "status": "in_progress" }),
+        ));
+        assert_eq!(taken.status, ToolStatus::Error, "{}", taken.content);
+        assert!(
+            taken.content.contains("already claimed by agent:alice"),
+            "{}",
+            taken.content
+        );
+        // A claim on an item that does not exist is not a success either.
+        let missing = bob.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": "no-such-item", "status": "in_progress" }),
+        ));
+        assert_eq!(missing.status, ToolStatus::Error, "{}", missing.content);
+        assert!(
+            missing.content.contains("was not found"),
+            "{}",
+            missing.content
+        );
+        // Nor is closing what someone already closed.
+        let done = alice.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": id, "status": "completed" }),
+        ));
+        assert_eq!(done.status, ToolStatus::Ok, "{}", done.content);
+        let again_done = alice.execute(&call(
+            TOOL_UPDATE_TODO,
+            json!({ "id": id, "status": "completed" }),
+        ));
+        assert_eq!(
+            again_done.status,
+            ToolStatus::Error,
+            "{}",
+            again_done.content
+        );
+        assert!(
+            again_done.content.contains("not open"),
+            "{}",
+            again_done.content
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
