@@ -28,6 +28,13 @@ if [ -f AGENTS.md ]; then
     node scripts/check-agent-guide.mjs
 fi
 
+echo "== ci docs gate =="
+# `ci.yml` is path-skipped for documentation-only pull requests, so
+# `ci-docs-gate.yml` reports the required contexts instead. That arrangement is
+# only correct while their path filters stay complements, and a broken one fails
+# silently (a required check that never runs reads as missing, not red).
+scripts/check-ci-docs-gate.sh
+
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command.
