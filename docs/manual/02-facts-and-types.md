@@ -10,6 +10,7 @@ method that the instance uses to tell facts apart.
 
 A class declares a shape:
 
+<!-- check: context books -->
 ```whip
 class Book {
   title string
@@ -21,6 +22,7 @@ Declare the type of a field after the name of the field. The scalar types are
 `string`, `int`, `float`, and `bool`. A field can also hold a list
 (`string[]`) or a different class:
 
+<!-- check: in books -->
 ```whip
 class Shelf {
   label string
@@ -87,6 +89,7 @@ access also operates in a payload, as in `note book.title`.
 
 An enum declares a closed set of named values:
 
+<!-- check: fragment -->
 ```whip
 enum Genre {
   Fiction
@@ -108,6 +111,7 @@ A variant of an enum can also carry a typed **payload**. The payload is a body
 in braces with the grammar of a class field. The payload makes the enum a *sum
 type*:
 
+<!-- check: fragment -->
 ```whip
 enum ReviewOutcome {
   Approved { score float }
@@ -129,6 +133,7 @@ declare a field with the name `variant`, the check gives an error.
 Sometimes a class has a small set of string states. In this condition, the
 field can list its permitted values directly:
 
+<!-- check: fragment -->
 ```whip
 class Ticket {
   title string
@@ -150,11 +155,20 @@ reader to guess which one is real.
 
 A `when` clause ties a field to one value of a literal union:
 
+<!-- check: context change -->
 ```whip
 class Change {
   kind "deploy" | "rollback"
   region string when kind is "deploy"
   revertTo string when kind is "rollback"
+}
+
+class Deployment {
+  region string
+}
+
+class Reversion {
+  target string
 }
 ```
 
@@ -169,6 +183,7 @@ The second is reading. A conditional field is readable only where its
 discriminant is pinned to the matching value, which means inside the matching
 arm of a `case` on that discriminant:
 
+<!-- check: in change binds change Change -->
 ```whip
 case change.kind {
   "deploy" => {
@@ -200,6 +215,7 @@ conditional field is required in exactly one.
 
 A `?` symbol marks a field that can be absent:
 
+<!-- check: context books2 -->
 ```whip
 class Book {
   title string
@@ -219,6 +235,7 @@ correct. But it is better to declare source data as a **table**. A table
 contains static rows. The rows are typed against a class. The instance records
 the rows automatically when the instance starts:
 
+<!-- check: in books2 -->
 ```whip
 table books as Book [
   {

@@ -10,11 +10,20 @@ to copy. This chapter gives the true operation of a rule, one part at a time.
 The rule in chapter 1 reacted to `started`. A rule can react to a fact instead.
 The rule gives the class of the fact:
 
+<!-- check: context ch04 -->
 ```whip
 class Ticket {
   title string
   impact "high" | "low"
   status "queued" | "routed"
+}
+
+class Seen {
+  title string
+}
+
+class Escalation {
+  title string
 }
 
 rule notice
@@ -42,6 +51,7 @@ rule does not need to exist before the fact.
 A `where` clause makes the match more narrow. The clause uses the expression
 language from chapter 3 on the bound fact:
 
+<!-- check: in ch04 -->
 ```whip
 rule escalate
   when Ticket as t where t.impact == "high" and t.status == "queued"
@@ -69,6 +79,7 @@ To this point, a rule only adds facts. The `done` operation consumes a fact.
 The operation retires the matched fact. No rule matches that fact again. A
 consume operation and a record operation together change the state of a fact:
 
+<!-- check: in ch04 -->
 ```whip
 rule route
   when Ticket as t where t.status == "queued"
@@ -114,6 +125,7 @@ that consumed the facts.
 A rule can state more than one `when` clause. Each clause must be true at the
 same time. If not, the rule does not fire:
 
+<!-- check: in ch04 -->
 ```whip
 class Responder {
   name string

@@ -22,6 +22,28 @@
 #   <!-- check: skip — sketch, references an include that does not exist -->
 #   <!-- check: fails -->            the page is DEMONSTRATING a diagnostic
 #   <!-- check: root <Name> -->      several workflows; name the root
+#   <!-- check: fragment -->         wrap and compile this fragment on its own
+#   <!-- check: context <name> -->   this fence's declarations become reusable
+#   <!-- check: in <name> -->        compile this fragment inside that context
+#   <!-- check: … binds <b> <Class> -->  the synthetic rule matches <Class> as <b>
+#
+# A rule-BODY fragment (a `case` arm, an `after` block, a `tell`) reads bindings
+# its surrounding rule established, which no amount of context can supply — the
+# binding comes from a `when` clause, not a declaration. `binds` writes that
+# clause into the synthetic rule, so `case change.kind { … }` can be compiled by
+# saying it assumes `when Change as change`.
+#
+# FRAGMENTS AND CONTEXT. A fragment is not a program, but most of them are only
+# missing a few declarations — overwhelmingly "rule X matches unknown class Y",
+# a rule shown without the class it reads. `context`/`in` supply those: a fence
+# marked `context ch` contributes its declarations to the page-scoped context
+# named `ch`, and a later fence marked `in ch` is compiled inside it, wrapped in
+# a synthetic workflow (and, for a rule-body fragment, a synthetic rule).
+#
+# The context is NAMED and OPT-IN rather than accumulated down the page. Simply
+# accumulating was tried and is worse than nothing: pages legitimately redeclare
+# a class between illustrations, and a `pattern` fence swallows whatever follows
+# it, so accumulation turned 24 compiling fragments into 12.
 #
 # `skip` requires a reason after an em dash. An unknown directive is an error, so
 # a typo disables nothing silently. A `skip` on a fence that would in fact
@@ -56,9 +78,9 @@ WORKFLOW = re.compile(r"^\s*workflow\s", re.M)
 EXPECTED = {
     "docs/diagnostics.md": 2,
     "docs/manual/01-smallest-workflow.md": 1,
-    "docs/manual/02-facts-and-types.md": 1,
+    "docs/manual/02-facts-and-types.md": 10,
     "docs/manual/03-expressions.md": 1,
-    "docs/manual/04-rules.md": 1,
+    "docs/manual/04-rules.md": 5,
     "docs/manual/05-effects.md": 2,
     "docs/manual/06-error-handling.md": 2,
     "docs/manual/07-case.md": 2,
@@ -76,6 +98,135 @@ EXPECTED = {
     "docs/manual/20-files.md": 1,
     "docs/tutorials/root-agent.md": 1,
 }
+
+# Declaration keywords, for deciding whether a fragment is wrapped in a
+# synthetic workflow (a class, an agent, a coerce) or additionally inside a
+# synthetic rule (a `tell`, an `after`, a `case` arm).
+DECLARATION_KEYWORDS = {
+    "use", "class", "enum", "agent", "coerce", "lease", "ledger", "counter",
+    "channel", "table", "credential", "memory", "pattern", "action", "redact",
+    "include", "input", "output", "failure", "rule", "test", "source", "signal",
+    "event", "@service", "@external", "@internal",
+}
+
+WRAPPER_HEAD = """workflow DocFence
+
+output result FenceOk
+
+class FenceOk {
+  ok bool
+}
+"""
+WRAPPER_RULE = """
+rule doc_fence_terminates
+  when started
+=> {
+  complete result { ok true }
+}
+"""
+
+
+CLASS_BLOCK = re.compile(r"^class\s+(\w+)\s*\{(.*?)^\}", re.S | re.M)
+ENUM_BLOCK = re.compile(r"^enum\s+(\w+)\s*\{(.*?)^\}", re.S | re.M)
+MATCHES = re.compile(r"^\s*when\s+([A-Z]\w*)\s+as\s", re.M)
+
+
+def seed_value(ty: str, classes: dict, enums: dict, depth: int = 0) -> str | None:
+    """A literal of `ty` for a seed row. None means "omit this field"."""
+    ty = ty.strip()
+    if ty.endswith("?") or ty.endswith("[]"):
+        return None if ty.endswith("?") else "[]"
+    if ty.startswith('"'):                      # literal union: take the first
+        return ty.split("|")[0].strip()
+    if ty in ("string",):
+        return '"x"'
+    if ty == "int":
+        return "1"
+    if ty == "float":
+        return "1.0"
+    if ty == "bool":
+        return "true"
+    if ty == "time":
+        return '"2027-01-01T00:00:00Z"'
+    if ty == "duration":
+        return "1s"
+    if ty in enums:
+        return enums[ty]
+    if ty in classes and depth < 3:
+        return seed_row(ty, classes, enums, depth + 1)
+    return None
+
+
+def seed_row(name: str, classes: dict, enums: dict, depth: int = 0) -> str:
+    fields = []
+    for line in classes.get(name, "").splitlines():
+        line = line.split("#")[0].strip()
+        if not line or line.startswith("//"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        value = seed_value(parts[1], classes, enums, depth)
+        if value is not None:
+            fields.append(f"{parts[0]} {value}")
+    return "{ " + "  ".join(fields) + " }"
+
+
+def seed_tables(source: str) -> str:
+    """A one-row seed for each class the source MATCHES but nothing produces.
+
+    A fragment shows a rule without the table, effect, or signal that feeds it,
+    and `whip check` rightly refuses a rule that can never fire. The seed stands
+    in for the producer the surrounding program would have. It is generated from
+    the class declaration rather than guessed, so a class the generator cannot
+    represent yields no table and the fence fails visibly instead of silently.
+    """
+    classes = {m.group(1): m.group(2) for m in CLASS_BLOCK.finditer(source)}
+    enums = {
+        m.group(1): next(
+            (l.strip() for l in m.group(2).splitlines() if l.strip() and not l.strip().startswith("#")),
+            "",
+        )
+        for m in ENUM_BLOCK.finditer(source)
+    }
+    produced = set(re.findall(r"^\s*record\s+(\w+)", source, re.M))
+    produced |= set(re.findall(r"^\s*table\s+\w+\s+as\s+(\w+)", source, re.M))
+    out = []
+    for name in dict.fromkeys(MATCHES.findall(source)):
+        if name in produced or name not in classes:
+            continue
+        out.append(f"table doc_seed_{name.lower()} as {name} [ {seed_row(name, classes, enums)} ]")
+    return "\n".join(out)
+
+
+def wrap(fragment: str, context: str, binds: list[tuple[str, str]] | None = None) -> str:
+    """A fragment plus its context, as the smallest program that carries them."""
+    lines = (context + "\n" + fragment).splitlines()
+    # `use` has to lead the file, so hoist it out of wherever the fences put it.
+    uses = list(dict.fromkeys(l for l in lines if l.strip().startswith("use ")))
+    rest = [l for l in lines if not l.strip().startswith("use ")]
+    body = "\n".join(rest)
+
+    first = next((l.strip() for l in fragment.splitlines() if l.strip()), "")
+    keyword = first.split()[0] if first else ""
+    if keyword in DECLARATION_KEYWORDS:
+        program = WRAPPER_HEAD + "\n" + body + "\n" + seed_tables(body) + "\n" + WRAPPER_RULE
+    else:
+        # A rule-body fragment needs a rule to sit in. The context keeps its own
+        # top-level position; only the fragment moves inside.
+        ctx = "\n".join(l for l in context.splitlines() if not l.strip().startswith("use "))
+        whens = (
+            "".join(f"  when {cls} as {name}\n" for name, cls in binds)
+            if binds else "  when started\n"
+        )
+        seeds = seed_tables(ctx + "\n" + "".join(f"when {c} as {n}\n" for n, c in (binds or [])))
+        program = (
+            WRAPPER_HEAD + "\n" + ctx + "\n" + seeds
+            + "\n\nrule doc_fence\n" + whens + "=> {\n"
+            + fragment + "\n  complete result { ok true }\n}\n"
+        )
+    return ("\n".join(uses) + "\n" if uses else "") + program
+
 
 checked = failed_as_expected = 0
 per_file: dict[str, int] = {}
@@ -113,6 +264,7 @@ def first_error(result) -> str:
 
 for md in sorted(pathlib.Path("docs").rglob("*.md")):
     text = md.read_text()
+    contexts: dict[str, str] = {}
     for match in FENCE.finditer(text):
         body = match.group(1)
         where = f"{md}:{text[:match.start()].count(chr(10)) + 1}"
@@ -139,6 +291,29 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
                 expect_failure = True
             elif raw.startswith("root "):
                 root = raw[5:].strip()
+            elif raw == "fragment" or raw.startswith("context ") or raw.startswith("in "):
+                spec = raw.split(None, 1)[1].strip() if " " in raw else ""
+                binds = []
+                if " binds " in f" {spec} ":
+                    spec, _, bindspec = spec.partition(" binds ")
+                    words = bindspec.split()
+                    binds = list(zip(words[0::2], words[1::2]))
+                name = spec.strip()
+                if raw.startswith("in ") and name not in contexts:
+                    problems.append(
+                        f"{where}: `check: in {name}` names a context this page has not "
+                        "defined above it"
+                    )
+                    continue
+                result = run(wrap(body, contexts.get(name, ""), binds), None)
+                if raw.startswith("context "):
+                    contexts[name] = (contexts.get(name, "") + "\n" + body).strip() + "\n"
+                if result.returncode != 0:
+                    problems.append(f"{where}: {first_error(result)}")
+                else:
+                    checked += 1
+                    per_file[str(md)] = per_file.get(str(md), 0) + 1
+                continue
             else:
                 problems.append(f"{where}: unknown directive `check: {raw}`")
                 continue
