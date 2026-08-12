@@ -104,31 +104,55 @@ fn is_openai_reasoning_model(bare: &str) -> bool {
     })
 }
 
-/// Maximum synchronous output the selected model actually supports. This is a
-/// provider protocol value, not an author/deployment token budget: Anthropic's
-/// Messages API requires `max_tokens`, so WhippleScript supplies the model
-/// capability instead of inventing a smaller product ceiling at the host.
-pub fn model_output_limit(provider: CoerceProvider, model: &str) -> u64 {
+/// The output ceiling of a Claude model, in tokens.
+///
+/// Anthropic's Messages API requires `max_tokens`, so this wire must name a
+/// number even when nobody chose one. It can: the Claude ceilings are few and
+/// published, unlike the OpenAI catalogue — see [`model_output_limit`].
+fn anthropic_output_limit(model: &str) -> u64 {
     let model = model.to_ascii_lowercase();
-    let is_claude = model.contains("claude") || model.starts_with("anthropic/");
-    if is_claude {
-        if model.contains("opus-5")
-            || model.contains("sonnet-5")
-            || model.contains("opus-4-6")
-            || model.contains("opus-4-7")
-            || model.contains("opus-4-8")
-            || model.contains("sonnet-4-6")
-        {
-            128_000
-        } else {
-            64_000
-        }
+    if model.contains("opus-5")
+        || model.contains("sonnet-5")
+        || model.contains("opus-4-6")
+        || model.contains("opus-4-7")
+        || model.contains("opus-4-8")
+        || model.contains("sonnet-4-6")
+    {
+        128_000
     } else {
-        // The OpenAI Responses surface requires a finite output request too.
-        // Until its Models API is a runtime dependency, use the model's known
-        // context capability as the non-product ceiling and let the provider
-        // enforce its exact output capability.
-        model_context_window(provider, &model)
+        64_000
+    }
+}
+
+/// The output limit to request, or `None` to send none at all.
+///
+/// **Only Anthropic gets a number.** Its API requires the field, and Claude's
+/// ceilings are known. Every OpenAI-family wire treats the field as optional,
+/// and we do not know those ceilings — so naming one is a guess, and a wrong
+/// guess is not clamped, it is refused:
+///
+/// ```text
+/// 400  max_tokens is too large: 200000. This model supports at most
+///      128000 completion tokens, whereas you provided 200000.
+/// ```
+///
+/// That was live on the `gpt-5-mini` panel, from this function returning the
+/// *context window* as if it were an output ceiling. They are different
+/// capabilities and the window is the larger one, so the substitution failed in
+/// the one direction the provider rejects. `gpt-4o` was equally broken and
+/// simply had no traffic: a 128,000 window against a 16,384 output ceiling.
+///
+/// Omitting is not a fallback, it is the accurate answer. The provider then
+/// applies its own true ceiling — which is precisely the capability the guess
+/// was reaching for, sourced from the party that actually knows it. An operator
+/// who wants a smaller budget still sets one explicitly, and that value is sent.
+pub fn model_output_limit(provider: CoerceProvider, model: &str) -> Option<u64> {
+    let lowered = model.to_ascii_lowercase();
+    let is_claude = lowered.contains("claude") || lowered.starts_with("anthropic/");
+    if is_claude || provider == CoerceProvider::Anthropic {
+        Some(anthropic_output_limit(&lowered))
+    } else {
+        None
     }
 }
 
@@ -140,7 +164,10 @@ pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
     api_key: String,
     model: String,
     base_url: String,
-    max_tokens: u64,
+    /// Absent means "send no output limit": the wire does not require one and
+    /// no operator chose one. Only the Anthropic builder substitutes a value,
+    /// because its API requires the field.
+    max_tokens: Option<u64>,
     /// Stable cache key for this turn-thread (Decision 7): the run/effect id.
     /// Sent as `prompt_cache_key` on OpenAI; Anthropic caches by prefix hash
     /// (via `cache_control` breakpoints) and does not use it.
@@ -161,7 +188,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        max_tokens: u64,
+        max_tokens: impl Into<Option<u64>>,
         cache_key: Option<String>,
     ) -> Self {
         Self {
@@ -170,7 +197,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
-            max_tokens,
+            max_tokens: max_tokens.into(),
             cache_key,
             codex: None,
         }
@@ -187,7 +214,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
         session_id: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        max_tokens: u64,
+        max_tokens: impl Into<Option<u64>>,
         cache_key: Option<String>,
     ) -> Self {
         Self {
@@ -196,7 +223,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
             api_key: access_token.into(),
             model: model.into(),
             base_url: base_url.into(),
-            max_tokens,
+            max_tokens: max_tokens.into(),
             cache_key,
             codex: Some(CodexBackend {
                 account_id: account_id.into(),
@@ -283,7 +310,8 @@ pub struct MessagesApiClient {
     api_key: String,
     model: String,
     base_url: String,
-    max_tokens: u64,
+    /// See [`RealHarnessModelClient::max_tokens`]: absent means send none.
+    max_tokens: Option<u64>,
     /// Stable per-turn/effect cache scope (Decision 7). It remains the provider
     /// prompt-cache scope, while each distinct model round derives its own
     /// deterministic idempotency key from this scope and the exact model input.
@@ -302,7 +330,7 @@ impl MessagesApiClient {
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        max_tokens: u64,
+        max_tokens: impl Into<Option<u64>>,
         cache_key: Option<String>,
     ) -> Self {
         Self {
@@ -310,7 +338,7 @@ impl MessagesApiClient {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
-            max_tokens,
+            max_tokens: max_tokens.into(),
             cache_key,
             codex: None,
         }
@@ -325,7 +353,7 @@ impl MessagesApiClient {
         session_id: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
-        max_tokens: u64,
+        max_tokens: impl Into<Option<u64>>,
         cache_key: Option<String>,
     ) -> Self {
         Self {
@@ -333,7 +361,7 @@ impl MessagesApiClient {
             api_key: access_token.into(),
             model: model.into(),
             base_url: base_url.into(),
-            max_tokens,
+            max_tokens: max_tokens.into(),
             cache_key,
             codex: Some(CodexBackend {
                 account_id: account_id.into(),
@@ -507,7 +535,7 @@ fn build_request(
     base_url: &str,
     api_key: &str,
     model: &str,
-    max_tokens: u64,
+    max_tokens: Option<u64>,
     cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
@@ -542,7 +570,7 @@ fn build_openai_compat_request(
     base_url: &str,
     api_key: &str,
     model: &str,
-    max_tokens: u64,
+    max_tokens: Option<u64>,
     cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
@@ -565,8 +593,14 @@ fn build_openai_compat_request(
     let mut body = json!({
         "model": model,
         "messages": msgs,
-        "max_tokens": max_tokens,
     });
+    // Optional on this wire, so send it only when an operator chose one.
+    // Guessing was the defect: an over-large value is refused outright rather
+    // than clamped, and omitting lets the provider apply its own true ceiling —
+    // which is exactly the capability we were trying to name.
+    if let Some(limit) = max_tokens {
+        body["max_tokens"] = json!(limit);
+    }
     if !tool_defs.is_empty() {
         body["tools"] = json!(tool_defs);
     }
@@ -676,7 +710,7 @@ fn build_anthropic_request(
     base_url: &str,
     api_key: &str,
     model: &str,
-    max_tokens: u64,
+    max_tokens: Option<u64>,
     cache_key: Option<&str>,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
@@ -694,7 +728,14 @@ fn build_anthropic_request(
         .collect();
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
-    body.insert("max_tokens".into(), json!(max_tokens));
+    // Required by the Messages API, so an absent operator value is filled from
+    // the model's own capability rather than omitted. Claude output ceilings are
+    // known and few, which is why this wire can answer the question and the
+    // OpenAI ones below cannot.
+    body.insert(
+        "max_tokens".into(),
+        json!(max_tokens.unwrap_or_else(|| anthropic_output_limit(model))),
+    );
     if let Some(system) = system {
         // Cache breakpoint at the end of the system prompt (Decision 7). The
         // deterministic assembler makes [tools, system] a byte-stable prefix, so
@@ -1455,7 +1496,7 @@ mod tests {
         );
         assert_eq!(
             model_output_limit(CoerceProvider::OpenAiCompat, "anthropic/claude-opus-5"),
-            128_000
+            Some(128_000)
         );
         // OpenAI families map to their real windows.
         assert_eq!(
@@ -1498,8 +1539,8 @@ mod tests {
             );
             assert_eq!(
                 model_output_limit(provider, "openai/gpt-5-mini"),
-                128_000,
-                "the request must not exceed what the model can produce"
+                None,
+                "an OpenAI ceiling we do not know is not one we may invent"
             );
             // The prefix must not hide a capability either: a genuinely
             // prefixed o-series model keeps its own window.
@@ -1507,6 +1548,55 @@ mod tests {
             // And a bare name is unaffected.
             assert_eq!(model_context_window(provider, "gpt-5-mini"), 128_000);
         }
+    }
+
+    /// The two wires answer the output-limit question differently, and the
+    /// difference is the whole fix: Anthropic requires the field so an absent
+    /// operator value is filled from a capability we actually know, while the
+    /// OpenAI wire treats it as optional so an unknown ceiling is simply not
+    /// named. Sending a guess there is refused, not clamped.
+    #[test]
+    fn an_unknown_output_ceiling_is_omitted_rather_than_guessed() {
+        let compat = build_request(
+            CoerceProvider::OpenAiCompat,
+            "https://gateway.example/compat",
+            "key",
+            "openai/gpt-5-mini",
+            None,
+            None,
+            &convo(),
+            &[],
+        );
+        assert!(
+            compat.body.get("max_tokens").is_none(),
+            "an invented ceiling is refused outright by the provider"
+        );
+
+        // An operator who chose a budget still gets it.
+        let chosen = build_request(
+            CoerceProvider::OpenAiCompat,
+            "https://gateway.example/compat",
+            "key",
+            "openai/gpt-5-mini",
+            Some(4_096),
+            None,
+            &convo(),
+            &[],
+        );
+        assert_eq!(chosen.body["max_tokens"], json!(4_096));
+
+        // Anthropic must always name one, so the capability fills the gap.
+        let anthropic = build_request(
+            CoerceProvider::Anthropic,
+            "https://api.anthropic.com",
+            "key",
+            "claude-opus-5",
+            None,
+            None,
+            &convo(),
+            &[],
+        );
+        assert_eq!(anthropic.body["max_tokens"], json!(128_000));
     }
 
     #[test]
@@ -1567,7 +1657,7 @@ mod tests {
             "https://api.anthropic.com",
             "sk-ant-api-key",
             "claude-opus-4-8",
-            4096,
+            Some(4096),
             None,
             &convo(),
             &tool_specs(),
@@ -1642,7 +1732,7 @@ mod tests {
             "https://api.together.xyz/v1",
             "sk-key",
             "llama-3.3-70b",
-            8192,
+            Some(8192),
             None,
             &convo(),
             &tool_specs(),
@@ -1933,7 +2023,7 @@ mod tests {
             "https://api.anthropic.com",
             "k",
             "m",
-            4096,
+            Some(4096),
             Some("turn-42"),
             &convo(),
             &tool_specs(),
@@ -1956,7 +2046,7 @@ mod tests {
             "https://api.anthropic.com",
             "k",
             "m",
-            4096,
+            Some(4096),
             None,
             &convo(),
             &tool_specs(),

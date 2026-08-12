@@ -774,12 +774,10 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let api_key = field("api_key").ok_or("agent config needs api_key")?;
     let model = field("model").ok_or("agent config needs model")?;
     let base_url = field("base_url").ok_or("agent config needs base_url")?;
-    let max_tokens = value
-        .get("max_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_else(|| {
-            whipplescript_kernel::harness_model::model_output_limit(provider, &model)
-        });
+    // Absent stays absent. Which wires require an output limit, and which can
+    // answer for themselves, is a property of the wire — so the request builder
+    // decides rather than this parser inventing a number for every provider.
+    let max_tokens = value.get("max_tokens").and_then(serde_json::Value::as_u64);
     let cache_key = field("cache_key");
     if provider_id == Some("openai-codex") {
         return Ok(MessagesApiClient::new_codex(
