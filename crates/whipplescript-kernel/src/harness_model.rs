@@ -123,6 +123,13 @@ pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
     /// Sent as `prompt_cache_key` on OpenAI; Anthropic caches by prefix hash
     /// (via `cache_control` breakpoints) and does not use it.
     cache_key: Option<String>,
+    /// ChatGPT-plan Codex backend. When set, the turn targets
+    /// `chatgpt.com/backend-api/codex/responses` rather than the OpenAI public
+    /// API — the same routing `MessagesApiClient` already performs for coerce.
+    /// A ChatGPT-plan OAuth token is not a public-API credential, so without
+    /// this the owned harness presented one to `api.openai.com` and the
+    /// provider refused it for want of `api.responses.write`.
+    codex: Option<CodexBackend>,
 }
 
 impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
@@ -143,12 +150,54 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
             base_url: base_url.into(),
             max_tokens,
             cache_key,
+            codex: None,
+        }
+    }
+
+    /// ChatGPT-plan Codex backend for the owned harness. Credential
+    /// acquisition, refresh and storage stay host-owned; this client owns only
+    /// the provider wire contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_codex(
+        transport: &'a T,
+        access_token: impl Into<String>,
+        account_id: impl Into<String>,
+        session_id: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: u64,
+        cache_key: Option<String>,
+    ) -> Self {
+        Self {
+            transport,
+            provider: CoerceProvider::OpenAi,
+            api_key: access_token.into(),
+            model: model.into(),
+            base_url: base_url.into(),
+            max_tokens,
+            cache_key,
+            codex: Some(CodexBackend {
+                account_id: account_id.into(),
+                session_id: session_id.into(),
+            }),
         }
     }
 }
 
 impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_, T> {
     fn build_request(&self, messages: &[ChatMessage], tools: &[ToolSpec]) -> HttpRequest {
+        if let Some(codex) = &self.codex {
+            return build_codex_request(
+                &self.base_url,
+                &self.api_key,
+                &self.model,
+                self.cache_key.as_deref(),
+                &codex.account_id,
+                &codex.session_id,
+                messages,
+                tools,
+            );
+        }
         build_request(
             self.provider,
             &self.base_url,
@@ -165,6 +214,17 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
         &self,
         response: Result<HttpResponse, CoerceTransportError>,
     ) -> Result<ModelReply, HarnessModelError> {
+        // The codex backend answers as an event stream even over the
+        // synchronous transport, so its body is assembled before the shared
+        // mapping. Every other surface on this client returns one JSON document.
+        let response = response.map(|mut response| {
+            if self.codex.is_some() {
+                if let Some(raw) = response.body.as_str() {
+                    response.body = assemble_codex_responses_sse(raw);
+                }
+            }
+            response
+        });
         map_transport_response(self.provider, response)
     }
 
@@ -628,7 +688,7 @@ fn build_anthropic_request(
             }]),
         );
     }
-    body.insert("messages".into(), json!(msgs));
+    body.insert("messages".into(), json!(mark_conversation_cache(msgs)));
     body.insert("tools".into(), json!(tool_defs));
     let mut headers = vec![
         ("x-api-key".into(), api_key.to_owned()),
@@ -648,6 +708,42 @@ fn build_anthropic_request(
     }
 }
 
+/// Put a cache breakpoint on the last content block of the last message.
+///
+/// The `[tools, system]` breakpoint caches the frozen prefix, which for a real
+/// agent turn is the smaller half: measured on a live Theo round, 3,602 cached
+/// tokens against 8,087 that were not, because everything the turn *accumulates*
+/// — the conversation, tool results, files read into context — lands after that
+/// breakpoint and was re-billed at full rate on every round.
+///
+/// Marking the newest message extends the cached span to the whole conversation
+/// so far. Each round then reads the previous round's entry and writes a new one
+/// covering what it appended, so the cached prefix grows with the turn instead of
+/// staying frozen at the system prompt. Moving the mark is the documented
+/// multi-turn shape and does not invalidate anything: the marker is a directive
+/// about where to cut, not part of the content that is hashed.
+///
+/// Nothing is marked when the last message has no blocks — an assistant turn
+/// with neither text nor tool calls — since there is no block to carry it.
+///
+/// One limit worth knowing: a breakpoint looks back a bounded number of blocks
+/// for a prior entry, so a single round that appends a very large number of
+/// blocks (many parallel tool calls and their results) can outrun the window and
+/// simply write a fresh entry. That costs a write, not correctness.
+fn mark_conversation_cache(mut messages: Vec<Value>) -> Vec<Value> {
+    let Some(last) = messages.last_mut() else {
+        return messages;
+    };
+    if let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(block) = blocks.last_mut() {
+            if let Some(object) = block.as_object_mut() {
+                object.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+            }
+        }
+    }
+    messages
+}
+
 /// Serialize the conversation into Anthropic's (system, messages[]) shape.
 fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut system_parts: Vec<String> = Vec::new();
@@ -656,11 +752,19 @@ fn anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) 
         match message {
             ChatMessage::System(text) => system_parts.push(text.clone()),
             ChatMessage::User { text, images } => {
-                // Text-only user messages keep the plain-string content shape
-                // (byte-stable requests → provider cache stability); images
-                // switch to content blocks (pi-conformance §6).
+                // Always content blocks, including the text-only case that used
+                // to send a plain string. A cache breakpoint attaches to a
+                // *block*, so the conversation breakpoint below can only mark a
+                // message that has them — and a shape that depended on whether
+                // the message happened to be last would rewrite the prefix on
+                // the very next round, invalidating the cache it was added to
+                // build. One stable shape costs a single miss when this ships
+                // and is byte-identical forever after.
                 if images.is_empty() {
-                    out.push(json!({ "role": "user", "content": text }));
+                    out.push(json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": text }],
+                    }));
                 } else {
                     let mut content: Vec<Value> = vec![json!({ "type": "text", "text": text })];
                     for image in images {
@@ -1628,10 +1732,75 @@ mod tests {
         assert_eq!(input[1]["output"], json!("error: read of `x` failed"));
     }
 
+    /// The conversation breakpoint is worthless if a message's bytes depend on
+    /// whether it is currently last: the next round would rewrite the prefix and
+    /// every read would miss, silently and while still paying the write. This is
+    /// the regression that shape change exists to prevent, so assert the
+    /// serialization of a message is identical in both positions.
+    #[test]
+    fn a_message_serializes_the_same_whether_or_not_it_is_last() {
+        let first = ChatMessage::user_text("what changed?");
+        let when_last = anthropic_messages(std::slice::from_ref(&first)).1;
+        let when_not_last = anthropic_messages(&[
+            first,
+            ChatMessage::Assistant {
+                text: "a lot".into(),
+                tool_calls: Vec::new(),
+            },
+        ])
+        .1;
+        assert_eq!(
+            when_last[0], when_not_last[0],
+            "the cached prefix must not be rewritten as the turn grows"
+        );
+        // And the breakpoint itself rides on the *last* message, so it is not
+        // part of what the earlier message contributes to the prefix.
+        let marked = mark_conversation_cache(when_not_last);
+        assert!(marked[0]["content"][0].get("cache_control").is_none());
+        assert_eq!(
+            marked[1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn the_conversation_breakpoint_marks_the_newest_turn() {
+        let messages = vec![
+            ChatMessage::user_text("first"),
+            ChatMessage::ToolResults(vec![crate::harness_loop::ToolResultMsg {
+                tool_call_id: "call-1".into(),
+                tool_name: "read".into(),
+                content: "done".into(),
+                is_error: false,
+            }]),
+        ];
+        let (_, msgs) = anthropic_messages(&messages);
+        let marked = mark_conversation_cache(msgs);
+        assert_eq!(
+            marked[1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "a tool-result round extends the cached span"
+        );
+    }
+
+    /// An assistant turn can carry neither text nor tool calls. There is no
+    /// block to hold a breakpoint, and inventing one would change the prefix.
+    #[test]
+    fn an_empty_last_message_takes_no_breakpoint() {
+        let messages = vec![ChatMessage::Assistant {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }];
+        let (_, msgs) = anthropic_messages(&messages);
+        let marked = mark_conversation_cache(msgs);
+        assert_eq!(marked[0]["content"], json!([]));
+    }
+
     #[test]
     fn anthropic_user_images_emit_base64_source_blocks() {
         // pi-conformance §6: an image-bearing user message becomes content
-        // blocks; a text-only one keeps the plain-string shape (cache stability).
+        // blocks, and a text-only one now does too — see
+        // `a_message_serializes_the_same_whether_or_not_it_is_last`.
         let messages = vec![
             ChatMessage::user_text("plain"),
             ChatMessage::User {
@@ -1643,7 +1812,10 @@ mod tests {
             },
         ];
         let (_, msgs) = anthropic_messages(&messages);
-        assert_eq!(msgs[0]["content"], json!("plain"));
+        assert_eq!(
+            msgs[0]["content"],
+            json!([{ "type": "text", "text": "plain" }])
+        );
         assert_eq!(
             msgs[1]["content"][0],
             json!({ "type": "text", "text": "what is this?" })
@@ -1950,6 +2122,85 @@ mod tests {
         let reply = client.next(&convo(), &tool_specs()).expect("reply");
         assert_eq!(reply.text, "done");
         assert!(reply.is_final());
+    }
+
+    /// The owned harness resolves ChatGPT-plan OAuth tokens, and those are not
+    /// public-API credentials: presented to `api.openai.com` the provider
+    /// refuses them for want of `api.responses.write`. The routing existed for
+    /// coerce's client and this one had no way to reach it, so a subscription
+    /// credential could be resolved and then spent on a request that could only
+    /// fail. Both directions are pinned: a codex-backed client reaches the
+    /// codex wire, and an ordinary one is untouched.
+    #[test]
+    fn owned_harness_client_reaches_the_codex_wire_when_host_material_is_present() {
+        let transport = FakeTransport {
+            response: Ok(HttpResponse {
+                status: 200,
+                body: Value::Null,
+            }),
+            seen: RefCell::new(None),
+        };
+        let client = RealHarnessModelClient::new_codex(
+            &transport,
+            "oauth-access",
+            "account-1",
+            "session-1",
+            "gpt-5.5",
+            "https://chatgpt.com",
+            8_192,
+            Some("effect-1".to_owned()),
+        );
+        let request = client.build_request(&convo(), &tool_specs());
+        assert_eq!(
+            request.url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "chatgpt-account-id" && value == "account-1"));
+
+        // and the codex wire answers as a stream even on this synchronous
+        // transport, so the body is assembled before the shared mapping.
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],",
+            "\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+        );
+        let reply = client
+            .parse_response(Ok(HttpResponse {
+                status: 200,
+                body: Value::String(raw.to_owned()),
+            }))
+            .unwrap();
+        assert_eq!(reply.text, "hi");
+        assert_eq!(reply.usage["output_tokens"], 2);
+    }
+
+    #[test]
+    fn owned_harness_client_without_host_material_keeps_the_public_api_wire() {
+        let transport = FakeTransport {
+            response: Ok(HttpResponse {
+                status: 200,
+                body: Value::Null,
+            }),
+            seen: RefCell::new(None),
+        };
+        let client = RealHarnessModelClient::new(
+            &transport,
+            CoerceProvider::OpenAi,
+            "sk-key",
+            "gpt-5.5",
+            "https://api.openai.com",
+            4096,
+            None,
+        );
+        let request = client.build_request(&convo(), &tool_specs());
+        assert!(!request.url.contains("backend-api/codex"));
+        assert!(!request
+            .headers
+            .iter()
+            .any(|(name, _)| name == "chatgpt-account-id"));
     }
 
     #[test]
