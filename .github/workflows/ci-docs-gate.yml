@@ -37,6 +37,10 @@ on:
       - 'LICENSE-MIT'
 
 # A superseded run on a docs branch is as wasted as any other.
+
+permissions:
+  # Read-only by default; a job that needs more declares it.
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
