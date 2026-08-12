@@ -59,4 +59,61 @@ check_example examples/revision-validation-approval.whip --root RevisionValidati
 check_example examples/revision-running-cancel.whip
 check_example examples/revision-repair-planner.whip
 
+# The governance tutorial's programs are checked for their *outcome*, not merely
+# for compiling: docs/tutorials/governance.md teaches that the same whip passes
+# ungoverned and is refused under an envelope, so a gate that only compiled them
+# would miss the regression that matters. They also cannot go through
+# `check_example`: they grant `**` on their file stores, which `lint.broad_file_grant`
+# reports, and narrowing those globs is not what the tutorial is teaching.
+#
+# `expect` is `pass` or `refuse`; `envelope` is a policy under examples/infoflow/
+# or empty for the ungoverned dev-mode reading; `violations` is asserted only
+# where the tutorial prints the count in its transcript.
+check_governed() {
+  local expect="$1"
+  local envelope="$2"
+  local path="$3"
+  local violations="${4:-}"
+  local label="$path${envelope:+ under $envelope}"
+  local out status=0
+  if [ -n "$envelope" ]; then
+    out="$(WHIPPLESCRIPT_IFC_ENVELOPE="$ROOT/$envelope" "${WHIP[@]}" check "$ROOT/$path" 2>&1)" || status=$?
+  else
+    out="$("${WHIP[@]}" check "$ROOT/$path" 2>&1)" || status=$?
+  fi
+  if [ "$expect" = pass ] && [ "$status" -ne 0 ]; then
+    printf 'expected the check of %s to pass; it refused:\n%s\n' "$label" "$out" >&2
+    exit 1
+  fi
+  if [ "$expect" = refuse ] && [ "$status" -eq 0 ]; then
+    printf 'expected the check of %s to be refused; it passed:\n%s\n' "$label" "$out" >&2
+    exit 1
+  fi
+  if [ -n "$violations" ] &&
+    ! printf '%s' "$out" | grep -q "violations caught in this program: $violations"; then
+    printf 'expected %s to report %s violations; the report was:\n%s\n' \
+      "$label" "$violations" "$out" >&2
+    exit 1
+  fi
+}
+
+# docs/tutorials/governance.md, in the order the tutorial walks them.
+# 1. No envelope is dev mode: the trifecta passes and the check claims nothing.
+check_governed pass "" examples/infoflow/support-triage-unsafe.whip
+# 3. Under the envelope the same whip is refused, on both halves of the flow.
+check_governed refuse examples/infoflow/governance.policy \
+  examples/infoflow/support-triage-unsafe.whip 2
+# 4. The safe shape passes that same policy with nothing caught.
+check_governed pass examples/infoflow/governance.policy \
+  examples/infoflow/support-triage-safe.whip 0
+# 5. A crossing with a source mark passes only where a grant authorizes it: the
+# hatched whip needs the hatches policy, the strict one still refuses it, and a
+# grant alone never blesses the unsafe whip.
+check_governed pass examples/infoflow/governance-with-hatches.policy \
+  examples/infoflow/support-triage-hatched.whip 0
+check_governed refuse examples/infoflow/governance.policy \
+  examples/infoflow/support-triage-hatched.whip
+check_governed refuse examples/infoflow/governance-with-hatches.policy \
+  examples/infoflow/support-triage-unsafe.whip 2
+
 printf 'docs examples check + lint passed\n'

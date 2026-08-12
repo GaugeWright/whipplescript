@@ -28,13 +28,6 @@ if [ -f AGENTS.md ]; then
     node scripts/check-agent-guide.mjs
 fi
 
-echo "== ci docs gate =="
-# `ci.yml` is path-skipped for documentation-only pull requests, so
-# `ci-docs-gate.yml` reports the required contexts instead. That arrangement is
-# only correct while their path filters stay complements, and a broken one fails
-# silently (a required check that never runs reads as missing, not red).
-scripts/check-ci-docs-gate.sh
-
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command.
@@ -62,6 +55,30 @@ cargo test --workspace
 # toolchain and runs exactly this sequence. It sets WHIPPLESCRIPT_CHECK_SKIP_HOSTED
 # so the green bar does not demand the same toolchain a second time. Nothing
 # else should set it — unset, a missing tool is still a hard failure.
+echo "== docs =="
+# The programs the documentation tells a reader to run are part of the product.
+# This checks and lint-cleans every file under examples/ that the docs cite,
+# asserts the governance tutorial's programs against their documented pass or
+# refusal outcome under each envelope, runs the quickstart end to end against a
+# real store, and compiles the tutorial programs (it invokes
+# check-docs-quickstart.sh and check-docs-examples.sh
+# itself). Until now it lived only in check-release-readiness.sh, a deep suite
+# that does not run on a pull request, so a change that broke a documented
+# program was caught at release time or not at all.
+#
+# What this does NOT do, so nobody reads more into a green bar than it means:
+# the tutorial programs are transcribed into check-docs-snippets.sh rather than
+# extracted, and no fenced ```whip block in language-reference.md or manual/ is
+# compiled by anything. Many of those fences are fragments rather than whole
+# programs, so extracting them needs a convention first. Breaking one is still
+# invisible.
+#
+# `check-docs-site.sh` (mkdocs --strict, which catches a dead cross-reference)
+# stays out: it provisions a virtualenv over the network when mkdocs is absent,
+# and a network install inside the required gate costs more in flakiness than
+# the class of bug it catches. It remains in the release gate.
+scripts/check-docs-snippets.sh
+
 echo "== hosted runtime contracts =="
 worker=crates/whipplescript-host-do/worker
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then
