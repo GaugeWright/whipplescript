@@ -107,6 +107,11 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The green bar audits the dependency tree, so the tool it needs is
+      # installed here rather than in a workflow that runs the audit separately.
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: cargo-audit
       - name: Green bar
         # The hosted runtime contracts are the `hosted-runtime-contracts` job
         # below, which runs the same four steps with the wasm-bindgen/wrangler/
