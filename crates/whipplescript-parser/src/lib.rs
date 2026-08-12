@@ -10533,25 +10533,19 @@ fn validate_scalar_terminal_payload(
             ),
         });
     } else if let Some((root, path)) = expression_path(value) {
-        if let Some(schema) = binding_types.get(&root) {
-            if semantic.schemas.class_exists(schema) {
-                if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
-                    diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: rule.body.span,
-                        message: format!(
-                            "rule `{}` has invalid field path `{root}.{}`: {message}",
-                            rule.name.name,
-                            path.join(".")
-                        ),
-                        suggestion: Some(
-                            "use a field declared on the bound schema or add it to the class declaration"
-                                .to_owned(),
-                        ),
-                    });
-                }
-            }
-        }
+        // Local scopes only. A terminal payload line is also walked by the
+        // scoped field-path pass in `analyze_rule`, which is where an
+        // invoke-derived binding resolves; making this one scope-aware too would
+        // report the same read twice.
+        check_field_path(
+            rule,
+            &root,
+            &path,
+            rule.body.span,
+            SchemaScopes::local(&semantic.schemas),
+            binding_types,
+            diagnostics,
+        );
     }
 }
 
@@ -17928,6 +17922,72 @@ fn validate_known_field_paths_at_span(
 /// against an index extended with that region's synthesized view classes, which
 /// exist only for the duration of the check; an invoke-derived binding resolves
 /// against the child workflow that produced it.
+/// What resolving one `<root>.<path>` read established. Callers that only want
+/// the diagnostic ignore this; the record-field walk acts on it, because a read
+/// it cannot resolve suppresses the literal and expected-value checks that
+/// follow it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FieldPathCheck {
+    /// `root` is not a typed binding here. Nothing was checked or reported —
+    /// the caller decides whether that means a dangling reference.
+    Unbound,
+    /// `root` is typed, but its schema is absent from the index consulted. A
+    /// child workflow's private class reads this way in a scope that was not
+    /// given the child's index. Nothing was checked or reported.
+    ///
+    /// Distinct from `Resolved` for one caller only: `validate_record_field`
+    /// stops the field here rather than running the literal and expected-value
+    /// checks against a schema it cannot see. That is observable in a narrow
+    /// shape — `expression_path` accepts any expression holding exactly ONE
+    /// dotted path, so a brace- or bracket-valued field carrying one reaches
+    /// `validate_expected_assignment`, which acts on it. For a bare path both of
+    /// those validators return immediately and the distinction does not show.
+    SchemaNotIndexed,
+    /// The path was resolved. A diagnostic was pushed if it did not.
+    Resolved,
+}
+
+/// Resolve one `<root>.<path>` read against the index that types `root`, and
+/// report an unresolvable one.
+///
+/// This is the single implementation. It used to exist three times — here, in
+/// `validate_scalar_terminal_payload`, and in `validate_record_field` — with the
+/// same message and suggestion but three different control flows, so a change to
+/// one (scope awareness, say) silently left the other two behind.
+fn check_field_path(
+    rule: &RuleDecl,
+    root: &str,
+    path: &[String],
+    span: SourceSpan,
+    scopes: SchemaScopes,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> FieldPathCheck {
+    let Some(schema) = binding_types.get(root) else {
+        return FieldPathCheck::Unbound;
+    };
+    let schemas = scopes.index_for(root);
+    if !schemas.class_exists(schema) {
+        return FieldPathCheck::SchemaNotIndexed;
+    }
+    if let Err(message) = schemas.resolve_field_path(schema, path) {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "rule `{}` has invalid field path `{root}.{}`: {message}",
+                rule.name.name,
+                path.join(".")
+            ),
+            suggestion: Some(
+                "use a field declared on the bound schema or add it to the class declaration"
+                    .to_owned(),
+            ),
+        });
+    }
+    FieldPathCheck::Resolved
+}
+
 fn validate_known_field_paths_in_index(
     rule: &RuleDecl,
     line: &str,
@@ -17937,28 +17997,7 @@ fn validate_known_field_paths_in_index(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (root, path) in dotted_paths(line) {
-        let Some(schema) = binding_types.get(&root) else {
-            continue;
-        };
-        let schemas = scopes.index_for(&root);
-        if !schemas.class_exists(schema) {
-            continue;
-        }
-        if let Err(message) = schemas.resolve_field_path(schema, &path) {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span,
-                message: format!(
-                    "rule `{}` has invalid field path `{root}.{}`: {message}",
-                    rule.name.name,
-                    path.join(".")
-                ),
-                suggestion: Some(
-                    "use a field declared on the bound schema or add it to the class declaration"
-                        .to_owned(),
-                ),
-            });
-        }
+        check_field_path(rule, &root, &path, span, scopes, binding_types, diagnostics);
     }
 }
 
@@ -18149,38 +18188,39 @@ fn validate_record_field(
     };
 
     if let Some((root, path)) = expression_path(expr) {
-        if let Some(schema) = binding_types.get(&root) {
-            if !semantic.schemas.class_exists(schema) {
-                return;
-            }
-            if let Err(message) = semantic.schemas.resolve_field_path(schema, &path) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` has invalid field path `{root}.{}`: {message}",
-                        rule.name.name,
-                        path.join(".")
-                    ),
-                    suggestion: Some(
-                        "use a field declared on the bound schema or add it to the class declaration"
-                            .to_owned(),
-                    ),
-                });
-            }
-        } else if let Some(root) = dangling_value_root(expr, known_roots) {
+        // Local scopes only, for the same reason as the terminal payload above.
+        match check_field_path(
+            rule,
+            &root,
+            &path,
+            rule.body.span,
+            SchemaScopes::local(&semantic.schemas),
+            binding_types,
+            diagnostics,
+        ) {
+            // A read this scope cannot resolve says nothing about the literal
+            // and expected-value checks below either, so it stops the field
+            // here rather than letting them judge a schema they cannot see.
+            FieldPathCheck::SchemaNotIndexed => return,
+            FieldPathCheck::Resolved => {}
             // A field access whose root is neither a bound name nor a special
-            // root is a dangling reference (the binding does not exist).
-            diagnostics.push(Diagnostic { related: Vec::new(),
-                span: rule.body.span,
-                message: format!(
-                    "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
-                    rule.name.name
-                ),
-                suggestion: Some(
-                    "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                        .to_owned(),
-                ),
-            });
+            // root is a dangling reference: the binding does not exist.
+            FieldPathCheck::Unbound => {
+                if let Some(root) = dangling_value_root(expr, known_roots) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
+                            rule.name.name
+                        ),
+                        suggestion: Some(
+                            "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
         }
     }
 
