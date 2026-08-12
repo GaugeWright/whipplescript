@@ -115,6 +115,16 @@ outcome passes through silently.
 `models/lean/Whipple/Narrowing.lean`, which proves that exhaustive implies
 total. These compose with `models/maude/rule-autofail.maude`.
 
+**A conditional field is unreadable where it may not exist.**
+A field declared `when <discriminant> is "<literal>"` is required at admission
+exactly when its discriminant holds that literal. A read of it is accepted only
+where the discriminant is pinned to that literal, which is the matching arm of a
+`case` on it. A `_` arm pins nothing and grants no read. This holds in each read
+position of a rule body, including an effect operand and a `from` projection
+that copies the field implicitly, so the value cannot leave the instance under a
+state in which it may be absent.
+*Carried by:* `models/maude/discriminant-schema.maude`.
+
 **Typed effect failures are additive by construction.**
 Each effect failure carries the same base. The base has `reason`, `summary`,
 `effect_id`, `run_id`, and `kind`. Each kind adds its own extras. The

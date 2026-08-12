@@ -141,6 +141,61 @@ method to model a small state machine on a fact. The declaration shows the
 states. A spelling error such as `"qeued"` is a compile error and not a silent
 bug. Chapter 4 uses this pattern frequently.
 
+## Fields that exist only for one state
+
+A literal union names the states. Often a field belongs to just one of them: a
+deploy carries a region, a rollback carries the release it reverts to. Declaring
+both as ordinary fields forces every producer to supply both, and forces every
+reader to guess which one is real.
+
+A `when` clause ties a field to one value of a literal union:
+
+```whip
+class Change {
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+  revertTo string when kind is "rollback"
+}
+```
+
+`kind` is the discriminant. It has to be a string literal union on the same
+class — an enum does not serve, because the check compares the literal text.
+
+The clause carries two meanings. The first is admission. A `Change` whose `kind`
+is `"deploy"` must carry a `region`, and one whose `kind` is `"rollback"` must
+carry a `revertTo`. A missing one is a rejected fact, not an absent field later.
+
+The second is reading. A conditional field is readable only where its
+discriminant is pinned to the matching value, which means inside the matching
+arm of a `case` on that discriminant:
+
+```whip
+case change.kind {
+  "deploy" => {
+    record Deployment {
+      region change.region
+    }
+  }
+  "rollback" => {
+    record Reversion {
+      target change.revertTo
+    }
+  }
+}
+```
+
+Reading `change.region` anywhere else is a compile error, including in the
+`"rollback"` arm and in a `_` arm — a `_` arm matches every remaining value, so
+it pins nothing. The error names the arm to move the read into.
+
+This is the same trade the literal union itself makes. The declaration states
+which fields go together, and the compiler holds the reader to it, instead of
+each rule remembering on its own.
+
+Chapter 7 covers `case`. Chapter 3 covers optional fields, which answer a
+different question: an optional field may be absent in any state, while a
+conditional field is required in exactly one.
+
 ## Optional fields
 
 A `?` symbol marks a field that can be absent:

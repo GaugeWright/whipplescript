@@ -278,7 +278,8 @@ scalars (`string`, `int`, `float`, `bool`), an array (`string[]`), a class, an
 enum, an optional, a string literal, a literal union
 (`status "open" | "done"`), and an agent domain
 (`AgentRef<codex | claude>`). A field with a literal type is the idiomatic
-method to model a small state machine.
+method to model a small state machine. A `when` clause binds a field to one
+value of such a union; see [Conditional fields](#conditional-fields).
 
 ### `agent`
 
@@ -2429,6 +2430,56 @@ case outcome {
   Blocked => { fail error { reason "blocked" } }
 }
 ```
+
+### Conditional fields
+
+A field can declare that it exists only for one value of a literal union on the
+same class:
+
+```whip
+class Change {
+  kind "deploy" | "rollback"
+  region string when kind is "deploy"
+  revertTo string when kind is "rollback"
+}
+```
+
+The named field is the discriminant. It has to be a string literal union on the
+same class. An enum is not a discriminant, because the comparison is on the
+literal text. A conditioned field on an undeclared discriminant, a literal
+outside the union, or a discriminant that is not a literal union is a check
+error. The keyword is `is`; `==` in that position is a parse error.
+
+Admission requires the field exactly when the discriminant holds the literal. A
+`Change` with `kind` of `"deploy"` and no `region` is a rejected fact. The rule
+is positive only: when the discriminant holds another value the field is not
+required, and a value present under that other value is neither rejected nor
+validated. An undeclared key is still rejected, as for any closed class.
+
+A read of a conditional field is legal only where the discriminant is pinned to
+the matching literal, which is the matching arm of a `case` on that
+discriminant:
+
+```whip
+case change.kind {
+  "deploy" => { record Deployment { region change.region } }
+  "rollback" => { record Reversion { target change.revertTo } }
+}
+```
+
+The arm guard is checked in the same narrowed scope. A `_` or `default` arm
+pins nothing and grants no read. The check covers every read position a rule
+body has: a `record`, terminal, `done` replacement, and `emit milestone` value;
+a branch condition and a `case` guard; every effect operand, such as a coercion
+argument, a coordination key, a timer deadline, and an invoke payload; and a
+`from` projection, both the field a block names and the same-named fields such
+a projection copies implicitly. A model prompt and an `exec` command line are
+free text, so the check reads only inside `{{ … }}` there.
+
+A readiness guard is not a body position and is not narrowed. In
+`when Change as c where c.region == "x"` the read is accepted; pair the test
+with its discriminant (`where c.kind == "deploy" && c.region == "x"`) to say
+what is meant.
 
 ### JSON ingestion on `exec`
 
