@@ -47,6 +47,16 @@ fn openai_request_key(cache_key: Option<&str>) -> Option<String> {
 /// conservative family default.
 pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
     let model = model.to_ascii_lowercase();
+    // Match on the bare id. A metered-gateway name carries its provider
+    // (`openai/gpt-5-mini`) because unified billing routes by that form, and the
+    // capability belongs to the model rather than to the routing prefix.
+    //
+    // Live 400s on 2026-08-11/12: the o-series test below was `starts_with('o')`,
+    // which every `openai/`-prefixed name satisfies. So `openai/gpt-5-mini` was
+    // read as a reasoning model with a 200k window, and — because the output
+    // limit reuses this number — the turn asked for 200,000 completion tokens
+    // against that model's 128,000 ceiling and was refused outright.
+    let bare = model.rsplit('/').next().unwrap_or(model.as_str());
     let is_claude = model.contains("claude") || model.starts_with("anthropic/");
     if is_claude {
         return if model.contains("opus-5")
@@ -68,18 +78,30 @@ pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
         // we can't know; fall back to the OpenAI heuristic (conservative default for
         // an unrecognized id).
         CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
-            if model.contains("gpt-4.1") {
+            if bare.contains("gpt-4.1") {
                 1_000_000
-            } else if model.contains("gpt-4o") || model.contains("gpt-4-turbo") {
+            } else if bare.contains("gpt-4o") || bare.contains("gpt-4-turbo") {
                 128_000
-            } else if model.starts_with('o') || model.contains("-o1") || model.contains("-o3") {
-                // o1 / o3 / o4 reasoning models.
+            } else if is_openai_reasoning_model(bare) {
                 200_000
             } else {
                 128_000
             }
         }
     }
+}
+
+/// An OpenAI o-series reasoning model (`o1`, `o3`, `o4`, and their variants).
+///
+/// Matched as a leading token rather than a leading letter. The letter form was
+/// satisfied by the `openai/` routing prefix that every metered-gateway model
+/// name carries, so it silently claimed the whole catalogue.
+fn is_openai_reasoning_model(bare: &str) -> bool {
+    ["o1", "o3", "o4"].iter().any(|series| {
+        bare.strip_prefix(*series)
+            // `o3` and `o3-mini` are the series; `o3x` would be some other model.
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    })
 }
 
 /// Maximum synchronous output the selected model actually supports. This is a
@@ -1445,6 +1467,10 @@ mod tests {
             1_000_000
         );
         assert_eq!(model_context_window(CoerceProvider::OpenAi, "o3"), 200_000);
+        assert_eq!(
+            model_context_window(CoerceProvider::OpenAi, "o3-mini"),
+            200_000
+        );
         // An unrecognized OpenAI model takes the conservative family default.
         assert_eq!(
             model_context_window(CoerceProvider::OpenAi, "some-future-model"),
@@ -1455,6 +1481,43 @@ mod tests {
             model_context_window(CoerceProvider::OpenAiCompat, "llama-3.3-70b"),
             128_000
         );
+    }
+
+    /// The live 400: `openai/gpt-5-mini` satisfied a `starts_with('o')` test for
+    /// o-series reasoning models, so it was read as a 200k-window model and the
+    /// turn asked for 200,000 completion tokens against a 128,000 ceiling. Every
+    /// round of that deployment was refused. The routing prefix is not part of
+    /// the model's identity.
+    #[test]
+    fn a_routing_prefix_is_not_read_as_an_o_series_model() {
+        for provider in [CoerceProvider::OpenAi, CoerceProvider::OpenAiCompat] {
+            assert_eq!(
+                model_context_window(provider, "openai/gpt-5-mini"),
+                128_000,
+                "the `openai/` prefix must not claim the o-series window"
+            );
+            assert_eq!(
+                model_output_limit(provider, "openai/gpt-5-mini"),
+                128_000,
+                "the request must not exceed what the model can produce"
+            );
+            // The prefix must not hide a capability either: a genuinely
+            // prefixed o-series model keeps its own window.
+            assert_eq!(model_context_window(provider, "openai/o3"), 200_000);
+            // And a bare name is unaffected.
+            assert_eq!(model_context_window(provider, "gpt-5-mini"), 128_000);
+        }
+    }
+
+    #[test]
+    fn the_o_series_test_matches_a_series_not_a_leading_letter() {
+        assert!(is_openai_reasoning_model("o1"));
+        assert!(is_openai_reasoning_model("o3-mini"));
+        assert!(is_openai_reasoning_model("o4-mini-high"));
+        // Any model that merely begins with the letter is not the series.
+        assert!(!is_openai_reasoning_model("openai/gpt-5-mini"));
+        assert!(!is_openai_reasoning_model("omni-moderation-latest"));
+        assert!(!is_openai_reasoning_model("o3x-experimental"));
     }
 
     struct FakeTransport {
