@@ -89,11 +89,27 @@ body[data-md-color-scheme="slate"][data-md-color-primary="black"] {
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6,
+.md-header,
 .md-header__title,
 .md-header__topic,
+.md-nav,
 .md-nav__title,
 .md-nav__link,
-.md-tabs__link {
+.md-tabs,
+.md-tabs__link,
+/* Operated or scanned, so chrome — these were reading in the prose face
+   because --md-text-font sets the whole theme and only some of the chrome had
+   been claimed back. A search field, a result label, a footer link and a
+   repository label are all glanced at, never read at length. */
+.md-search__input,
+.md-search-result__title,
+.md-search-result__meta,
+.md-footer,
+.md-source,
+.md-typeset .md-button {
   font-family: var(--ws-serif);
   /* Backstop for anything Material bolds through a more specific selector than
      the reset below: a missing weight is declined, never faked. */
