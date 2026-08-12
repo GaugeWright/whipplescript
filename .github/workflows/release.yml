@@ -63,6 +63,18 @@ concurrency:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    # The mirror is the release origin. cargo-dist hosts into the repository
+    # named by Cargo.toml's `repository` field, which is
+    # GaugeWright/whipplescript, and a run on `-src` therefore tries to publish
+    # into a repository its own GITHUB_TOKEN has no rights over. That is what
+    # the v0.1.0 and v0.2.0 tags did here: both failed, and every release that
+    # exists lives on the mirror.
+    #
+    # Guarding `plan` is enough to stop the whole workflow. Every other job
+    # needs it, and the two that run under `always()` test
+    # `needs.plan.result == 'success'`, so a skipped plan skips all of them
+    # rather than leaving one to evaluate an empty manifest.
+    if: github.repository == 'GaugeWright/whipplescript'
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 15
     outputs:
