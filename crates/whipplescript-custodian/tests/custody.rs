@@ -639,6 +639,9 @@ fn in_process_transport_speaks_the_wire_protocol() {
     assert!(reply.degraded);
 }
 
+// The daemon transport itself; the vocabulary tests above cover every
+// platform.
+#[cfg(target_family = "unix")]
 #[test]
 fn unix_socket_daemon_serves_and_refuses_get() {
     use std::io::{BufRead, BufReader, Write};

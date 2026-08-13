@@ -13,8 +13,10 @@ use crate::{CustodyCall, CustodyReply, CustodyTransport, TransportError};
 /// Matches the daemon's per-line cap.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-/// The conventional environment variable naming the custodian socket.
-pub const CUSTODIAN_SOCKET_ENV: &str = "WHIPPLESCRIPT_CUSTODIAN_SOCKET";
+/// The variable is crate-root vocabulary — a non-Unix build has no transport but
+/// still needs to know whether a custodian was asked for — and is re-exported
+/// here because this is where a reader of the transport looks for it.
+pub use crate::CUSTODIAN_SOCKET_ENV;
 
 pub struct UnixSocketTransport {
     socket_path: PathBuf,

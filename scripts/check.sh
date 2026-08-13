@@ -80,6 +80,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 echo "== tests =="
 cargo test --workspace
 
+# What a release compiles, which is more than what it distributes: every
+# workspace member for every target in dist-workspace.toml. The command lives in
+# the script below because the `windows-compiles` gate job runs that same script
+# rather than a cargo invocation of its own, so the Windows leg cannot drift from
+# this bar. On a non-Windows host it says why it cannot answer instead of
+# pretending to.
+echo "== release compile for windows =="
+scripts/check-windows-compile.sh
+
 # The hosted Durable Object worker is part of the same per-change gate: its
 # production route inventory, authenticated compositions, types, and deployable
 # artifact. Missing tooling fails loudly here rather than being skipped quietly.

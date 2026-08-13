@@ -8,27 +8,16 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 
-# The custodian is a Unix-domain-socket daemon by construction: serve.rs binds a
-# UnixListener and sets 0o600 on the socket path, which is the custody boundary
-# rather than an implementation detail. It does not build for Windows and cannot
-# without a different transport, so it is distributed for the Unix targets only.
-# Without this the workspace targets applied to it too, and every release build
-# for x86_64-pc-windows-msvc failed on std::os::unix — which is what happened
-# from 2026-08-06, when DR-0053 added this crate, until it was found on
-# 2026-08-13 by dry-running the release.
-# Not distributed. The custodian is a Unix-domain-socket daemon — serve.rs binds
-# a UnixListener and sets 0o600 on the socket path — so it does not compile for
-# x86_64-pc-windows-msvc, and it has never shipped: the crate arrived on
-# 2026-08-06 with DR-0053, two weeks after the last release.
+# Not distributed: the custodian has never shipped, and shipping a daemon that
+# holds credential material is a decision to take deliberately rather than by
+# leaving a default on.
 #
-# Restricting `targets` here is not enough and was tried first. That filters the
-# artifacts dist packages, not the crates it builds, so the Windows leg still
-# compiled this one and still failed on std::os::unix. `dist = false` is what
-# takes it out of the build.
-#
-# If it should ship, that is a decision with work behind it: the Unix-only paths
-# need cfg-gating so the crate compiles everywhere it is built, and then it can
-# be distributed for the Unix targets deliberately.
+# This says nothing about whether the crate builds. `dist build` runs
+# `cargo build --workspace`, so it compiles every member for every target no
+# matter what is configured here — neither this key nor a `targets` restriction
+# has any effect on that, and both were tried before the compile itself was
+# fixed. The Unix-only paths are cfg-gated in src/, which is what makes the
+# workspace build for x86_64-pc-windows-msvc.
 [package.metadata.dist]
 dist = false
 

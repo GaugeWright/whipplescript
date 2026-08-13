@@ -12,11 +12,16 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+// Only `serve` builds a shared custodian across connection threads.
+#[cfg(target_family = "unix")]
 use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
 use whipplescript_custodian::store::SealedStore;
+// Only `serve` builds a running custodian; the store commands act on the
+// sealed store directly.
+#[cfg(target_family = "unix")]
 use whipplescript_custodian::{Custodian, DeniedEgress};
 use whipplescript_custody::{CredentialKind, CredentialName};
 
@@ -183,73 +188,94 @@ fn run() -> Result<(), String> {
                 Err(format!("no credential named {}", name.resource_id()))
             }
         }
-        "serve" => {
-            let socket = PathBuf::from(args.need("socket")?);
-            let store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
-            // Egress is deny-by-default (DR-0053 §9 / the mTLS-concentration
-            // bound): without --egress-allow the custodian refuses every
-            // request/mint at the network layer, loudly.
-            let egress: Box<dyn whipplescript_custodian::Egress> =
-                match args.flags.get("egress-allow") {
-                    Some(hosts) => {
-                        let allow: Vec<String> = hosts
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|h| !h.is_empty())
-                            .map(str::to_owned)
-                            .collect();
-                        eprintln!("whip-custodian: egress allowed to {allow:?}");
-                        Box::new(whipplescript_custodian::egress::UreqEgress::new(allow))
-                    }
-                    None => Box::new(DeniedEgress),
-                };
-            let mut custodian = Custodian::new(store, egress);
-            // r3: connect to OpenBao when the environment names one. A
-            // configured-but-unreachable OpenBao is a startup error, not a
-            // daemon that silently serves remote entries it cannot reach.
-            if let Some(client) =
-                whipplescript_custodian::openbao::Client::from_env().map_err(|e| e.to_string())?
-            {
-                let lookup = client
-                    .token_lookup_self()
-                    .map_err(|e| format!("openbao token lookup failed ({}): {e}", client.addr()))?;
-                let posture = whipplescript_custodian::openbao::TokenPosture::from_lookup(&lookup);
-                eprintln!(
-                    "openbao transit connected (r3): {} lease {}s, renewable={}",
-                    client.addr(),
-                    posture.ttl_secs,
-                    posture.renewable
-                );
-                // A renewable token outlives its lease only if something
-                // renews it. That belongs here rather than in the custody
-                // path: renewal is per-connection and time-driven, and a
-                // custodian that only renews when someone happens to sign
-                // has already expired by the time it matters.
-                let client = Arc::new(client);
-                match whipplescript_custodian::openbao::spawn_token_renewal(
-                    Arc::clone(&client),
-                    posture,
-                ) {
-                    // The handle is deliberately dropped: the thread runs for
-                    // the life of the process and there is nothing to join.
-                    Some(_handle) => eprintln!("openbao token renewal: started"),
-                    None => eprintln!(
-                        "openbao token renewal: nothing to renew (renewable={}, lease={}s) — if \
-                         this token was meant to expire, r3 stops working when it does",
-                        posture.renewable, posture.ttl_secs
-                    ),
-                }
-                custodian = custodian.with_openbao(client);
-            }
-            let custodian = Arc::new(custodian);
-            eprintln!(
-                "whip-custodian: r0 process sealing (degraded), serving on {}",
-                socket.display()
-            );
-            whipplescript_custodian::serve::serve(custodian, &socket).map_err(|e| e.to_string())
-        }
+        "serve" => serve_command(&args, &store_path, &pass),
         other => Err(format!("unknown command {other:?}\n{USAGE}")),
     }
+}
+
+/// The daemon. Unix-only because the listener is a Unix domain socket and the
+/// 0o600 mode on it is the custody boundary (DR-0053 §4).
+#[cfg(target_family = "unix")]
+fn serve_command(
+    args: &Args,
+    store_path: &std::path::Path,
+    pass: &Zeroizing<String>,
+) -> Result<(), String> {
+    let socket = PathBuf::from(args.need("socket")?);
+    let store = SealedStore::open(store_path, pass).map_err(|e| e.to_string())?;
+    // Egress is deny-by-default (DR-0053 §9 / the mTLS-concentration
+    // bound): without --egress-allow the custodian refuses every
+    // request/mint at the network layer, loudly.
+    let egress: Box<dyn whipplescript_custodian::Egress> = match args.flags.get("egress-allow") {
+        Some(hosts) => {
+            let allow: Vec<String> = hosts
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned)
+                .collect();
+            eprintln!("whip-custodian: egress allowed to {allow:?}");
+            Box::new(whipplescript_custodian::egress::UreqEgress::new(allow))
+        }
+        None => Box::new(DeniedEgress),
+    };
+    let mut custodian = Custodian::new(store, egress);
+    // r3: connect to OpenBao when the environment names one. A
+    // configured-but-unreachable OpenBao is a startup error, not a
+    // daemon that silently serves remote entries it cannot reach.
+    if let Some(client) =
+        whipplescript_custodian::openbao::Client::from_env().map_err(|e| e.to_string())?
+    {
+        let lookup = client
+            .token_lookup_self()
+            .map_err(|e| format!("openbao token lookup failed ({}): {e}", client.addr()))?;
+        let posture = whipplescript_custodian::openbao::TokenPosture::from_lookup(&lookup);
+        eprintln!(
+            "openbao transit connected (r3): {} lease {}s, renewable={}",
+            client.addr(),
+            posture.ttl_secs,
+            posture.renewable
+        );
+        // A renewable token outlives its lease only if something
+        // renews it. That belongs here rather than in the custody
+        // path: renewal is per-connection and time-driven, and a
+        // custodian that only renews when someone happens to sign
+        // has already expired by the time it matters.
+        let client = Arc::new(client);
+        match whipplescript_custodian::openbao::spawn_token_renewal(Arc::clone(&client), posture) {
+            // The handle is deliberately dropped: the thread runs for
+            // the life of the process and there is nothing to join.
+            Some(_handle) => eprintln!("openbao token renewal: started"),
+            None => eprintln!(
+                "openbao token renewal: nothing to renew (renewable={}, lease={}s) — if \
+                     this token was meant to expire, r3 stops working when it does",
+                posture.renewable, posture.ttl_secs
+            ),
+        }
+        custodian = custodian.with_openbao(client);
+    }
+    let custodian = Arc::new(custodian);
+    eprintln!(
+        "whip-custodian: r0 process sealing (degraded), serving on {}",
+        socket.display()
+    );
+    whipplescript_custodian::serve::serve(custodian, &socket).map_err(|e| e.to_string())
+}
+
+/// Everywhere else the store commands still work and the daemon refuses to
+/// start. Refusing loudly beats a custodian that appears to serve over some
+/// substitute transport nobody reviewed as an authority boundary.
+#[cfg(not(target_family = "unix"))]
+fn serve_command(
+    _args: &Args,
+    _store_path: &std::path::Path,
+    _pass: &Zeroizing<String>,
+) -> Result<(), String> {
+    Err(
+        "whip-custodian serve requires a Unix domain socket; this platform has none. \
+         The store commands (init/import/list/revoke) work here."
+            .to_string(),
+    )
 }
 
 fn main() -> ExitCode {

@@ -15,6 +15,12 @@
 
 pub mod egress;
 pub mod openbao;
+// The daemon's listener is a Unix domain socket by construction — the 0o600
+// socket *is* the authority boundary (§4), not an implementation detail — so
+// it compiles only where that transport exists, exactly as the protocol
+// crate's client half does. Sealing, the operation vocabulary, and the store
+// are portable and stay compiled everywhere.
+#[cfg(target_family = "unix")]
 pub mod serve;
 pub mod store;
 

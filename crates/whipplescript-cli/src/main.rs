@@ -13599,7 +13599,7 @@ fn gov_agent(_options: &CliOptions) -> ExitCode {
     // is enforced by the custodian. Without one, fall back to the env-gated
     // degraded shim.
     let custodian_configured =
-        std::env::var_os(whipplescript_custody::client::CUSTODIAN_SOCKET_ENV).is_some();
+        std::env::var_os(whipplescript_custody::CUSTODIAN_SOCKET_ENV).is_some();
     if !custodian_configured && !gov::has_governance_privilege() {
         eprintln!(
             "the governance agent requires admin authority: a custodian socket \
@@ -13688,6 +13688,95 @@ fn gov_escalations(options: &CliOptions) -> ExitCode {
     }
 }
 
+/// Sign through a configured custodian, or `None` when no custodian was asked
+/// for — which sends the caller down the degraded path below.
+///
+/// Reaching a custodian means connecting to a Unix domain socket, so
+/// `whipplescript-custody` compiles its client half only for
+/// `target_family = "unix"`; this pair and its verify sibling are the only
+/// places in the CLI that name that transport.
+#[cfg(target_family = "unix")]
+fn custodian_sign(config_text: &str, signer: &str) -> Option<Result<gov::SignedEnvelope, String>> {
+    let transport = whipplescript_custody::client::UnixSocketTransport::from_env()?;
+    let credential =
+        match whipplescript_custody::CredentialName::new(gov::GOVERNANCE_SIGNING_CREDENTIAL) {
+            Ok(credential) => credential,
+            Err(err) => return Some(Err(format!("governance credential name: {err}"))),
+        };
+    Some(gov::SignedEnvelope::sign_with_custodian(
+        config_text,
+        signer,
+        &transport,
+        &credential,
+    ))
+}
+
+/// Off Unix a configured socket is a refusal, not a `None`. `None` means no
+/// custodian was asked for and falls through to the DEGRADED env-gated path;
+/// answering a request for custodian authority with a checksum would be exactly
+/// the substitution this seam exists to prevent, so an operator who configured a
+/// custodian is told this platform cannot reach one.
+#[cfg(not(target_family = "unix"))]
+fn custodian_sign(
+    _config_text: &str,
+    _signer: &str,
+) -> Option<Result<gov::SignedEnvelope, String>> {
+    Some(Err(custodian_socket_unreachable()?))
+}
+
+/// The refusal for a custodian that is configured but unreachable on this
+/// target, or `None` when none was configured.
+#[cfg(not(target_family = "unix"))]
+fn custodian_socket_unreachable() -> Option<String> {
+    std::env::var_os(whipplescript_custody::CUSTODIAN_SOCKET_ENV)
+        .is_some()
+        .then(|| {
+            format!(
+                "{} names a custodian socket, but the custody client transport is a Unix domain \
+                 socket (DR-0053 §10) and this is not a Unix target: whip cannot reach a \
+                 custodian here. Run it on Unix, or unset the variable to accept the degraded \
+                 env-gated path deliberately.",
+                whipplescript_custody::CUSTODIAN_SOCKET_ENV
+            )
+        })
+}
+
+/// Verify through a configured custodian. `None` means the legacy checksum path
+/// below should answer: either no custodian was asked for, or the custodian
+/// refused an envelope that is not custodian-signed at all. A custodian envelope
+/// can never pass the legacy path — it demands its pinned verifier — so that
+/// fallback cannot mask a forgery.
+#[cfg(target_family = "unix")]
+fn custodian_verify(signed_text: &str) -> Option<Result<gov::VerifiedAttestation, String>> {
+    let transport = whipplescript_custody::client::UnixSocketTransport::from_env()?;
+    let verifier = gov::CustodianEnvelopeVerifier::new(&transport);
+    match gov::SignedEnvelope::verify_attestation_with(signed_text, &verifier) {
+        Ok(attestation) => Some(Ok(attestation)),
+        Err(custodian_error) => signed_text
+            .contains(gov::GOVERNANCE_CUSTODIAN_ALGORITHM)
+            .then_some(Err(custodian_error)),
+    }
+}
+
+/// Off Unix only the custodian that holds the key could verify a custodian
+/// attestation, and it cannot be reached, so such an envelope is refused rather
+/// than allowed to fall through to a weaker check that would accept it for a
+/// different reason than it was signed. A legacy checksum envelope needs no
+/// custodian and still verifies below.
+#[cfg(not(target_family = "unix"))]
+fn custodian_verify(signed_text: &str) -> Option<Result<gov::VerifiedAttestation, String>> {
+    signed_text
+        .contains(gov::GOVERNANCE_CUSTODIAN_ALGORITHM)
+        .then(|| {
+            Err(format!(
+                "this envelope carries a {} attestation, which only the custodian holding the \
+                 governance key can verify, and the custody client transport is a Unix domain \
+                 socket (DR-0053 §10): verify it on Unix.",
+                gov::GOVERNANCE_CUSTODIAN_ALGORITHM
+            ))
+        })
+}
+
 /// Sign a governance config through whichever authority this process has:
 /// the custodian (DR-0053 §10 — the governance key is custodian-held and
 /// admin is the `sign` capability on it) when
@@ -13696,16 +13785,8 @@ fn gov_escalations(options: &CliOptions) -> ExitCode {
 /// tamper-evidence, not authorship, and an env var is not an authority
 /// boundary under escape.
 fn gov_sign_text(config_text: &str, signer: &str) -> Result<gov::SignedEnvelope, String> {
-    if let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env() {
-        let credential =
-            whipplescript_custody::CredentialName::new(gov::GOVERNANCE_SIGNING_CREDENTIAL)
-                .map_err(|err| format!("governance credential name: {err}"))?;
-        return gov::SignedEnvelope::sign_with_custodian(
-            config_text,
-            signer,
-            &transport,
-            &credential,
-        );
+    if let Some(signed) = custodian_sign(config_text, signer) {
+        return signed;
     }
     eprintln!(
         "warning: no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET); signing with the \
@@ -13756,26 +13837,20 @@ fn gov_verify(options: &CliOptions) -> ExitCode {
     // socket is configured — a custodian envelope can never pass the legacy
     // path (it demands its pinned verifier), so the order cannot mask a
     // forgery.
-    if let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env() {
-        let verifier = gov::CustodianEnvelopeVerifier::new(&transport);
-        match gov::SignedEnvelope::verify_attestation_with(&signed_text, &verifier) {
-            Ok(attestation) => {
-                println!(
-                    "verified: signed by {} under {}",
-                    attestation.signer,
-                    attestation.key_id.as_deref().unwrap_or("unknown-key")
-                );
-                return ExitCode::SUCCESS;
-            }
-            Err(custodian_error) => {
-                // Fall back to the legacy path only for envelopes that are
-                // not custodian-signed at all.
-                if signed_text.contains(gov::GOVERNANCE_CUSTODIAN_ALGORITHM) {
-                    eprintln!("{custodian_error}");
-                    return ExitCode::from(1);
-                }
-            }
+    match custodian_verify(&signed_text) {
+        Some(Ok(attestation)) => {
+            println!(
+                "verified: signed by {} under {}",
+                attestation.signer,
+                attestation.key_id.as_deref().unwrap_or("unknown-key")
+            );
+            return ExitCode::SUCCESS;
         }
+        Some(Err(custodian_error)) => {
+            eprintln!("{custodian_error}");
+            return ExitCode::from(1);
+        }
+        None => {}
     }
     match gov::SignedEnvelope::verify(&signed_text) {
         Ok(signer) => {

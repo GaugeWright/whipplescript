@@ -32,6 +32,16 @@ use serde::{Deserialize, Serialize};
 /// a caller from a different protocol generation.
 pub const CUSTODY_PROTOCOL: &str = "whipplescript.custody.v1";
 
+/// The conventional environment variable naming the custodian socket.
+///
+/// Vocabulary, not transport: the *name* a caller reads to learn whether an
+/// operator asked for a custodian is meaningful on every target, while the
+/// Unix-socket [`client`] that connects to it is not. It lives here so a
+/// non-Unix build can still tell a configured custodian from an absent one and
+/// refuse accordingly, rather than losing the distinction along with the
+/// transport.
+pub const CUSTODIAN_SOCKET_ENV: &str = "WHIPPLESCRIPT_CUSTODIAN_SOCKET";
+
 // ---------------------------------------------------------------------------
 // Names and kinds
 // ---------------------------------------------------------------------------

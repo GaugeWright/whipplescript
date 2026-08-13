@@ -138,6 +138,36 @@ jobs:
           WHIPPLESCRIPT_CHECK_SKIP_HOSTED: "1"
         run: scripts/check.sh
 
+  # The Windows leg of the green bar. `scripts/check.sh` runs
+  # scripts/check-windows-compile.sh too, and that script — not this job — owns
+  # the command and the reasoning for it: a release compiles every workspace
+  # member for every target in dist-workspace.toml, so a member that uses
+  # std::os::unix outside a cfg passed every gate and then failed the release.
+  #
+  # This job exists because that script cannot answer on a Linux host: rusqlite's
+  # `bundled` build script compiles C for the target, and an MSVC target wants
+  # cl.exe. So the coverage runs here, through the repository's own script, and a
+  # change to the command changes both callers at once. It runs that one script
+  # rather than the whole bar because the rest of the bar needs a toolchain this
+  # runner deliberately does without. windows-latest on both repositories — the
+  # -src runner pool is Linux-only.
+  windows-compiles:
+    runs-on: windows-latest
+    # An optimised `dist`-profile build of the whole workspace, cold on the
+    # first run of a cache key. Twenty minutes, the rest of this file's figure,
+    # is a check's budget rather than a build's.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check the workspace for x86_64-pc-windows-msvc
+        shell: bash
+        run: scripts/check-windows-compile.sh
+
   # Runs on BOTH: it finishes in about two minutes, inside what `-src` can
   # sustain, and it is the one gate that touches Worker deploy configuration.
   hosted-runtime-contracts:
