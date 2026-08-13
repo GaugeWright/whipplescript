@@ -109,10 +109,27 @@ coord_bite CoordLedger  'notin appended'                   NoLostEntry
 # removing the StartUse copy proves nothing -- the claim is specifically that
 # these are RE-EVALUATED at completion.
 #
-# Keep custody_bite_in patterns BACKSLASH-FREE. awk's -v unescapes once, so a
-# pattern written `c \\notin revoked` reaches the regex engine as `c \notin
-# revoked`, where `\n` is a newline escape and the match silently never fires.
-# Replacements are unaffected (`\\*` correctly yields the TLA comment `\*`).
+# custody_bite_in matches LITERALLY, and passes its strings through the
+# environment rather than through awk's `-v`. Both halves of that matter, and
+# the reason is a bug this check shipped with.
+#
+# `-v` unescapes its value once, and the awks disagree about what to do with an
+# escape they do not know. mawk leaves `\[` alone; gawk rewrites it to `[` and
+# warns. So `sealedAt\[c\] >= MinRung` stayed a literal on a developer's mawk
+# and became the character class `[c]` on the runner's gawk, and the anchor
+# `^CompleteUse\(c\) ==` became the group `(c)`. Neither matched there, `b` was
+# never set, and NO mutation was produced at all -- every scoped bite silently
+# tested nothing while reporting the file unchanged. The mirror caught it only
+# because `custody_run` checks that a MUTANT line exists.
+#
+# Replacements were exposed to the same rule, in the direction that is worse: a
+# replacement written `  \* MUTANT: ...` reaches gawk as `  * MUTANT: ...`,
+# which is not a TLA comment. That mutant fails to parse, and a parse failure is
+# not the invariant doing its job.
+#
+# ENVIRON values are not escape-processed by any awk, and index() has no
+# metacharacters, so patterns are now written exactly as they appear in the
+# spec and mean exactly that.
 CUSTODY_MODEL="$ROOT/models/tla/CredentialCustody.tla"
 
 custody_run() {
@@ -148,16 +165,19 @@ custody_bite() {
 custody_bite_in() {
   local action="$1" pattern="$2" replacement="$3" what="$4" dir
   dir="$(mktemp -d)"
-  awk -v act="^${action}\\(c\\) ==" -v pat="$pattern" -v rep="$replacement" \
-    '$0 ~ act {b=1} b && $0 ~ pat {print rep; b=0; next} {print}' \
+  CB_ACT="${action}(c) ==" CB_PAT="$pattern" CB_REP="$replacement" \
+  awk 'BEGIN { act = ENVIRON["CB_ACT"]; pat = ENVIRON["CB_PAT"]; rep = ENVIRON["CB_REP"] }
+       index($0, act) == 1 { b = 1 }
+       b && index($0, pat) { print rep; b = 0; next }
+       { print }' \
     "$CUSTODY_MODEL" > "$dir/CredentialCustody.tla"
   custody_run "$dir" "$what"
 }
 
 custody_bite 's|^SubstitutionPrincipal == "custodian"$|SubstitutionPrincipal == "whip" \\* MUTANT: direct-fetch fallback|' NoPlaintextInWhip
-custody_bite_in CompleteUse 'sealedAt\[c\] >= MinRung' '  \* MUTANT: completion-time rung check removed' RungFloor
+custody_bite_in CompleteUse 'sealedAt[c] >= MinRung' '  \* MUTANT: completion-time rung check removed' RungFloor
 custody_bite 's|^  /\\ leased. = leased \\ {c}$|  /\\ UNCHANGED leased \\* MUTANT: revocation keeps the lease|' NoUseAfterRevoke
-custody_bite_in CompleteUse 'notin revoked' '  \* MUTANT: mid-flight revocation check removed' NoCompletionAfterRevoke
-custody_bite_in CompleteUse 'admitted. = admitted' '  /\ UNCHANGED admitted \* MUTANT: use not recorded' UsesAreRecorded
+custody_bite_in CompleteUse 'c \notin revoked' '  \* MUTANT: mid-flight revocation check removed' NoCompletionAfterRevoke
+custody_bite_in CompleteUse "admitted' = admitted" '  /\ UNCHANGED admitted \* MUTANT: use not recorded' UsesAreRecorded
 custody_bite 's|^  /\\ Cardinality(versions\[c\]) > 1$|  \\* MUTANT: overlap guard removed|' RotationNeverEmpty
 custody_bite 's|^  /\\ uses\[c\] < Budget$|  \\* MUTANT: budget guard removed|' BudgetRespected
