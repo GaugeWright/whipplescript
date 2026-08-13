@@ -16,9 +16,11 @@
 //! normalization masks, and the size parameters all participate in chunk
 //! boundaries, and the root derivation participates in file identity —
 //! changing any of them re-keys every large blob. The chunk/root hash is
-//! the house 64-bit FNV-1a content-id primitive (matching the content
-//! store's blob ids); upgrading the hash family is a separate, explicit
-//! re-keying decision, not a knob.
+//! the house content-id primitive, SHA-256/128 (matching the content
+//! store's blob ids); the hash family was upgraded from 64-bit FNV-1a in
+//! the collision-hardening pass (9b2ba18), which re-keyed those blobs and
+//! retired the stores holding them. Any further change to the family is
+//! the same kind of explicit re-keying decision, not a knob.
 //!
 //! Pure and host-agnostic — no store handle, no feature gate.
 
@@ -69,12 +71,12 @@ impl ChunkTree {
     }
 }
 
-/// 64-bit FNV-1a over raw bytes — the byte-level twin of the store's
-/// `stable_hash_hex` (identical constants, identical result for UTF-8
-/// input), so chunk ids and blob ids share one id space.
+/// SHA-256 truncated to 128 bits over raw bytes — the byte-level twin of the
+/// store's `stable_hash_hex` (same digest, same truncation, identical result
+/// for UTF-8 input), so chunk ids and blob ids share one id space.
 ///
-/// SHA-256 truncated to 128 bits — the identity migration the v0.1 note here
-/// deferred ("re-key this primitive to a cryptographic hash"), executed in the
+/// This is the identity migration the v0.1 note here deferred ("re-key this
+/// primitive to a cryptographic hash"), executed in the
 /// FNV-collision hardening pass: content ids anchor `import_bundle` integrity
 /// (external bytes admitted only if `content_hash_hex(body) == blob.id`),
 /// dedup, and erasure identity, and the old 64-bit FNV made collisions and

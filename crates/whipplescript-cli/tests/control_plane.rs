@@ -1730,8 +1730,8 @@ rule pick
     );
 
     // The blob table (same runtime store DB) must hold BOTH versions, keyed by
-    // the same FNV-1a content hash the file.write.completed fact records — so the
-    // superseded body X survived even though the live file is now Y.
+    // the same SHA-256/128 content hash the file.write.completed fact records —
+    // so the superseded body X survived even though the live file is now Y.
     let store_db = SqliteStore::open(&store_path).expect("reopen runtime store");
     let hash_x = whipplescript_kernel::rule_lowering::stable_hash_hex(body_x);
     let hash_y = whipplescript_kernel::rule_lowering::stable_hash_hex(body_y);

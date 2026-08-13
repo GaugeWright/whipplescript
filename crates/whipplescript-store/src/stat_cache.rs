@@ -16,8 +16,9 @@
 //!
 //! The caller passes the scan instant (clock at the worker boundary) and
 //! persists the returned cache however it likes (`to_json`/`from_json`).
-//! Content ids use the house FNV-1a primitive so import-back diffs speak
-//! the same id space as manifests and blobs.
+//! Content ids use the house primitive, `chunking::content_hash_hex`
+//! (SHA-256/128), so import-back diffs speak the same id space as manifests
+//! and blobs.
 
 #[cfg(feature = "native")]
 use std::collections::BTreeMap;
