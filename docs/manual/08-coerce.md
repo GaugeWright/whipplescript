@@ -154,7 +154,7 @@ The fixture returns the first literal of a union and the value `"fixture"` for
 a free string. A true model binds through the configuration. An environment
 variable selects a provider. The providers are Anthropic, OpenAI, and each
 endpoint that is compatible with OpenAI. A local endpoint is also possible. The
-[providers guide](../providers.md#openai-compatible--local-models-ollama-vllm-openrouter-groq-)
+[providers guide](../providers.md#openai-compatible-local-models-ollama-vllm-openrouter-groq)
 gives the procedures. The configuration changes. The rules do not change.
 
 ## When a coercion needs more than a prompt
