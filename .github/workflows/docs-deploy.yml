@@ -6,8 +6,9 @@ name: Deploy docs to Cloudflare Pages
 # One-time setup (see docs-site notes):
 #   1. Cloudflare → Workers & Pages → create a Pages project named
 #      "whipplescript-docs" (Direct Upload).
-#   2. Add repo secrets: CLOUDFLARE_API_TOKEN (Pages:Edit) and
-#      CLOUDFLARE_ACCOUNT_ID.
+#   2. Add the repo secret CLOUDFLARE_API_TOKEN (Pages:Edit), and the repo
+#      *variable* CLOUDFLARE_ACCOUNT_ID — a variable, not a secret, per DR-0067
+#      (see the deploy step below).
 #   3. Attach docs.whipplescript.com as a custom domain on that project.
 
 on:
@@ -50,5 +51,10 @@ jobs:
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # A Cloudflare account id is an identifier, not a credential, so it is a
+          # variable under DR-0067. It was a secret until 2026-08-13, which hid a
+          # stale value: the organisation moved accounts and the secret still held
+          # the old one, so this lane would have kept failing after the API token
+          # was provisioned, for a reason nobody could read.
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy site --project-name=whipplescript-docs
