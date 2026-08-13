@@ -6611,6 +6611,313 @@ pub fn split_args(args: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod ir_reference_admission_tests {
+    //! `parsed_effect_input_json` re-checks, at lowering time, four references
+    //! the parser has already refused: the signal an `emit` names, and the
+    //! lease, ledger, and counter a coordination effect names. No compiled
+    //! program reaches them — the parser rejected it first — which is why a
+    //! mutation sweep found all four unexercised.
+    //!
+    //! They are reachable, and load-bearing, from the other direction. The
+    //! kernel lowers IR that arrives as a stored artifact, not only IR this
+    //! compiler just produced, and an artifact can be truncated or edited after
+    //! the compiler signed off on it. Each test below models that directly:
+    //! compile a valid program, assert it lowers clean, then delete the one
+    //! declaration the rule refers to and assert the re-check catches it. The
+    //! accept half matters as much as the refusal — it shows the error comes
+    //! from the deletion rather than from a fixture that never worked.
+
+    use super::{lower_rule, ready_contexts};
+    use whipplescript_parser::{compile_program, IrProgram};
+    use whipplescript_store::FactView;
+
+    fn ir_of(source: &str) -> IrProgram {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    fn fact(name: &str, key: &str, value_json: &str) -> FactView {
+        FactView {
+            fact_id: format!("fact-{key}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: name.to_owned(),
+            key: key.to_owned(),
+            value_json: value_json.to_owned(),
+            provenance_class: "rule".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        }
+    }
+
+    fn lowering_errors(ir: &IrProgram, rule_name: &str, facts: &[FactView]) -> Vec<String> {
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == rule_name)
+            .expect("fixture rule");
+        let ready = ready_contexts(ir, rule, facts, &[], None);
+        assert_eq!(
+            ready.contexts.len(),
+            1,
+            "fixture must make rule `{rule_name}` ready exactly once"
+        );
+        lower_rule(
+            "ins_test",
+            "ver_test",
+            "0",
+            "fixture",
+            ir,
+            rule,
+            &ready.contexts[0],
+            facts,
+            &[],
+            None,
+        )
+        .errors
+    }
+
+    fn assert_only_after_deleting(
+        ir: &mut IrProgram,
+        rule_name: &str,
+        facts: &[FactView],
+        expected: &str,
+        delete: impl FnOnce(&mut IrProgram),
+    ) {
+        let before = lowering_errors(ir, rule_name, facts);
+        assert!(
+            !before.iter().any(|error| error == expected),
+            "fixture must lower clean before the declaration is deleted, got {before:?}"
+        );
+        delete(ir);
+        let after = lowering_errors(ir, rule_name, facts);
+        assert!(
+            after.iter().any(|error| error == expected),
+            "expected `{expected}`, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn emit_of_a_signal_the_artifact_no_longer_declares_is_refused() {
+        let mut ir = ir_of(
+            r#"use std.ingress
+
+@service
+workflow EmitSignal
+
+signal task.done {
+  id string
+}
+
+class Task {
+  id string
+  peer string
+}
+
+rule relay
+  when Task as t
+=> {
+  emit signal task.done to t.peer {
+    id t.id
+  }
+}
+"#,
+        );
+        let facts = vec![fact("Task", "Task:t1", r#"{"id":"t1","peer":"ins_peer"}"#)];
+        assert_only_after_deleting(
+            &mut ir,
+            "relay",
+            &facts,
+            "emit signal of undeclared signal `task.done`",
+            |ir| ir.events.clear(),
+        );
+    }
+
+    #[test]
+    fn acquire_of_a_lease_the_artifact_no_longer_declares_is_refused() {
+        let mut ir = ir_of(
+            r#"use std.coord
+
+workflow Grab
+
+output result Done
+failure error Busy
+
+class Ticket {
+  id string
+}
+
+class Done {
+  note string
+}
+
+class Busy {
+  reason string
+}
+
+lease deploy_slot {
+  key Ticket
+  slots 1
+  ttl 10m
+}
+
+rule grab
+  when Ticket as t
+=> {
+  acquire deploy_slot for t.id as slot
+
+  after slot held {
+    release slot
+    complete result {
+      note "took and released the slot"
+    }
+  }
+  after slot contended {
+    fail error {
+      reason "could not take the slot"
+    }
+  }
+}
+"#,
+        );
+        let facts = vec![fact("Ticket", "Ticket:t1", r#"{"id":"t1"}"#)];
+        assert_only_after_deleting(
+            &mut ir,
+            "grab",
+            &facts,
+            "acquire of undeclared lease `deploy_slot`",
+            |ir| ir.leases.clear(),
+        );
+    }
+
+    #[test]
+    fn append_to_a_ledger_the_artifact_no_longer_declares_is_refused() {
+        let mut ir = ir_of(
+            r#"use std.coord
+
+workflow Log
+
+output result Done
+
+class Ticket {
+  id string
+  area string
+}
+
+class Done {
+  note string
+}
+
+class ReviewDecision {
+  ticketId string
+  area string
+  verdict string
+}
+
+ledger review_log {
+  entry ReviewDecision
+  partition by area
+  retain 30d
+}
+
+rule log_it
+  when Ticket as t
+=> {
+  append ReviewDecision {
+    ticketId t.id
+    area t.area
+    verdict "merge"
+  } to review_log as log_entry
+
+  after log_entry succeeds {
+    complete result {
+      note "logged"
+    }
+  }
+}
+"#,
+        );
+        let facts = vec![fact(
+            "Ticket",
+            "Ticket:t1",
+            r#"{"id":"t1","area":"frontend"}"#,
+        )];
+        assert_only_after_deleting(
+            &mut ir,
+            "log_it",
+            &facts,
+            "append to undeclared ledger `review_log`",
+            |ir| ir.ledgers.clear(),
+        );
+    }
+
+    #[test]
+    fn consume_of_a_counter_the_artifact_no_longer_declares_is_refused() {
+        let mut ir = ir_of(
+            r#"use std.coord
+
+workflow Budget
+
+output result Done
+failure error Busy
+
+class Service {
+  service string
+}
+
+class Done {
+  note string
+}
+
+class Busy {
+  reason string
+}
+
+counter failure_budget {
+  key Service
+  cap 3
+  reset daily
+}
+
+rule strike
+  when Service as f
+=> {
+  consume failure_budget for f.service amount 1 as strike
+
+  after strike ok {
+    complete result {
+      note "recorded"
+    }
+  }
+  after strike over {
+    fail error {
+      reason "budget exhausted"
+    }
+  }
+}
+"#,
+        );
+        let facts = vec![fact("Service", "Service:api", r#"{"service":"api"}"#)];
+        assert_only_after_deleting(
+            &mut ir,
+            "strike",
+            &facts,
+            "consume of undeclared counter `failure_budget`",
+            |ir| ir.counters.clear(),
+        );
+    }
+}
+
+#[cfg(test)]
 mod ir_admission_tests {
     use super::{validate_json_for_ir_type, validate_json_for_object};
     use serde_json::{json, Value};

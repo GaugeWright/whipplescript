@@ -2777,3 +2777,732 @@ pub fn json_schema_fragment(value: Option<&Value>) -> Option<String> {
         Some(schema) => Some(schema.to_string()),
     }
 }
+
+#[cfg(test)]
+mod registry_vocabulary_refusal_tests {
+    //! A package manifest is externally supplied, so the contract registry
+    //! derived from it is evidence about a third party's construct — not an
+    //! internal assertion. These refusals are the vocabulary door: they decide
+    //! which constructs a package may mint, and in particular which lowerings
+    //! it may reach. A refusal that does not fire hands a package a
+    //! platform-internal lowering it was never authorized to use.
+    //!
+    //! A mutation sweep found the whole file unexercised; it had no test module
+    //! at all.
+    //!
+    //! Every case pairs with an accept. A validator that rejects everything
+    //! satisfies a rejection-only suite while refusing every legitimate
+    //! package, and the accept half is the only thing that tells the two apart.
+
+    use super::{
+        verify_contract_registry_construct_interface_vocabulary,
+        verify_contract_registry_construct_lowering_interfaces,
+        verify_contract_registry_platform_vocabulary,
+    };
+    use serde_json::{json, Value};
+    use whipplescript_core::PLATFORM_CONSTRUCT_CATALOG;
+
+    /// A registry whose one library is a package (not `standard`, not
+    /// `unlocked`) — the only shape the vocabulary rules look at.
+    fn registry(constructs: Value, effect_contracts: Value) -> Value {
+        json!({
+            "libraries": [{"id": "acme.widgets", "version": "0.1.0", "standard": false}],
+            "effect_contracts": effect_contracts,
+            "constructs": constructs,
+        })
+    }
+
+    /// The simplest construct a package is actually allowed to mint:
+    /// `declaration_block` lowered `metadata_only`, which is package-authorable,
+    /// forbids a `target_capability`, and requires no interfaces.
+    fn package_construct() -> Value {
+        json!({
+            "library_id": "acme.widgets",
+            "keyword": "widget",
+            "construct_family": "declaration_block",
+            "lowering_target": "metadata_only",
+            "scope": "top_level",
+        })
+    }
+
+    fn verify(constructs: Value, effect_contracts: Value) -> Result<(), String> {
+        verify_contract_registry_platform_vocabulary(
+            &registry(constructs, effect_contracts),
+            "registry",
+            &[],
+        )
+    }
+
+    fn reason(constructs: Value, effect_contracts: Value) -> String {
+        verify(constructs, effect_contracts).expect_err("expected a rejection")
+    }
+
+    #[test]
+    fn a_legitimate_package_construct_is_admitted() {
+        verify(json!([package_construct()]), json!([])).expect("must admit");
+    }
+
+    #[test]
+    fn effect_contract_vocabulary_is_refused() {
+        assert_eq!(
+            reason(json!([]), json!(["not an object"])),
+            "registry.effect_contracts[0] must be an object"
+        );
+        assert_eq!(
+            reason(
+                json!([]),
+                json!([{"library_id": "acme.widgets", "effect_kind": "http.request"}])
+            ),
+            "registry.effect_contracts[0].effect_kind uses unsupported package effect kind \
+             `http.request`; expected `capability.call`"
+        );
+        assert_eq!(
+            reason(
+                json!([]),
+                json!([{
+                    "library_id": "acme.widgets",
+                    "effect_kind": "capability.call",
+                    "id": "acme.widgets.call",
+                    "required_capabilities": ["acme.widgets.absent"],
+                }])
+            ),
+            "registry.effect_contracts[0].required_capabilities references `acme.widgets.absent` \
+             but no matching package `capability.call` effect contract is declared"
+        );
+
+        // A contract that declares the capability it requires is admitted, as
+        // is the `*` wildcard.
+        verify(
+            json!([]),
+            json!([{
+                "library_id": "acme.widgets",
+                "effect_kind": "capability.call",
+                "id": "acme.widgets.call",
+                "required_capabilities": ["acme.widgets.call", "*"],
+            }]),
+        )
+        .expect("must admit a self-declared capability");
+
+        // A contract belonging to a STANDARD library is not a package contract
+        // and the package vocabulary does not govern it.
+        let mut std_registry = registry(
+            json!([]),
+            json!([{"library_id": "std.files", "effect_kind": "file.read"}]),
+        );
+        std_registry["libraries"] =
+            json!([{"id": "std.files", "version": "0.1.0", "standard": true}]);
+        verify_contract_registry_platform_vocabulary(&std_registry, "registry", &[])
+            .expect("standard libraries are out of scope for the package vocabulary");
+    }
+
+    #[test]
+    fn construct_vocabulary_is_refused() {
+        assert_eq!(
+            reason(json!(["not an object"]), json!([])),
+            "registry.constructs[0] must be an object"
+        );
+
+        let with = |field: &str, value: Value| {
+            let mut construct = package_construct();
+            construct[field] = value;
+            reason(json!([construct]), json!([]))
+        };
+
+        assert_eq!(
+            with("lowering_target", json!("teleport")),
+            "registry.constructs[0].lowering_target uses unsupported construct lowering `teleport`"
+        );
+        assert_eq!(
+            with("construct_family", json!("incantation")),
+            "registry.constructs[0].construct_family uses unsupported construct family `incantation`"
+        );
+        // A real family and a real lowering that do not go together.
+        assert_eq!(
+            with("construct_family", json!("effect_operation")),
+            "registry.constructs[0] uses lowering_target `metadata_only` incompatible with \
+             construct_family `effect_operation`"
+        );
+        assert_eq!(
+            with("scope", json!("incantation")),
+            "registry.constructs[0].scope uses unsupported construct scope `incantation`"
+        );
+        // The reserved-keyword refusal names the whole privilege tuple, not just
+        // the word — the same keyword is authorizable for a different (library,
+        // family, scope, lowering), so the coordinates ARE the message.
+        assert_eq!(
+            with("keyword", json!("class")),
+            "registry.constructs[0].keyword uses reserved construct keyword `class` without \
+             platform catalog authorization for library `acme.widgets` as top_level \
+             declaration_block lowering `metadata_only`"
+        );
+        assert_eq!(
+            reason(
+                json!([{
+                    "library_id": "acme.widgets",
+                    "keyword": "widget",
+                    "construct_family": "declaration_block",
+                    "lowering_target": "metadata_only",
+                    "scope": "top_level",
+                    "fields": [{"kind": "sigil"}],
+                }]),
+                json!([])
+            ),
+            "registry.constructs[0].fields[0].kind uses unsupported construct field kind `sigil`"
+        );
+    }
+
+    /// The authorability door. `metadata` is a real platform lowering that
+    /// packages may NOT author, and nothing but an embedded std copy or a
+    /// platform-catalog privilege tuple may reach it.
+    #[test]
+    fn a_platform_internal_lowering_is_closed_to_packages() {
+        let error = reason(
+            json!([{
+                "library_id": "acme.widgets",
+                "keyword": "widget",
+                "construct_family": "effect_contract",
+                "lowering_target": "metadata",
+                "scope": "top_level",
+            }]),
+            json!([]),
+        );
+        assert!(
+            error.starts_with(
+                "registry.constructs[0].lowering_target `metadata` is platform-internal and \
+                 cannot be used by package constructs"
+            ),
+            "got {error}"
+        );
+    }
+
+    /// `capability_call` pins `scope` to `rule_body`, so the same construct in
+    /// any other scope is refused by the required-scope rule rather than the
+    /// unsupported-scope rule.
+    #[test]
+    fn a_lowering_with_a_required_scope_refuses_every_other_scope() {
+        let error = reason(
+            json!([{
+                "library_id": "acme.widgets",
+                "keyword": "widget",
+                "construct_family": "effect_operation",
+                "lowering_target": "capability_call",
+                "scope": "top_level",
+            }]),
+            json!([]),
+        );
+        assert_eq!(
+            error,
+            "registry.constructs[0].scope `top_level` is unsupported for lowering_target \
+             `capability_call`; expected `rule_body`"
+        );
+    }
+
+    #[test]
+    fn interface_vocabulary_is_refused() {
+        let check = |interface: Value| {
+            verify_contract_registry_construct_interface_vocabulary(&interface, "iface")
+        };
+
+        check(json!({
+            "kind": "Capability",
+            "phase": "compile",
+            "cardinality": "exactly-one",
+            "name": "acme.widgets.call",
+        }))
+        .expect("must admit a well-formed capability interface");
+        // An interface that declares no `kind` is not this rule's business.
+        check(json!({})).expect("must admit");
+
+        assert_eq!(
+            check(json!({"kind": "Sigil"})).expect_err("rejection"),
+            "iface.kind uses unsupported construct interface kind `Sigil`"
+        );
+        assert_eq!(
+            check(json!({"kind": "Capability", "phase": "midnight"})).expect_err("rejection"),
+            "iface.phase uses unsupported construct interface phase `midnight`"
+        );
+        assert_eq!(
+            check(json!({
+                "kind": "Capability",
+                "phase": "compile",
+                "cardinality": "several",
+            }))
+            .expect_err("rejection"),
+            "iface.cardinality uses unsupported construct interface cardinality `several`"
+        );
+        assert_eq!(
+            check(json!({
+                "kind": "Capability",
+                "phase": "compile",
+                "cardinality": "exactly-one",
+            }))
+            .expect_err("rejection"),
+            "iface Capability interface must declare `name`"
+        );
+    }
+
+    #[test]
+    fn lowering_interface_obligations_are_refused() {
+        let capability_call = PLATFORM_CONSTRUCT_CATALOG
+            .lowering("capability_call")
+            .expect("platform lowering");
+        let metadata_only = PLATFORM_CONSTRUCT_CATALOG
+            .lowering("metadata_only")
+            .expect("platform lowering");
+        let ids = ["acme.widgets.call".to_owned()].into_iter().collect();
+
+        let complete = json!({
+            "library_id": "acme.widgets",
+            "target_capability": "acme.widgets.call",
+            "requires": [{"kind": "Capability", "name": "acme.widgets.call"}],
+            "provides": [{"kind": "EffectHandle"}],
+        });
+        verify_contract_registry_construct_lowering_interfaces(
+            &complete,
+            capability_call,
+            &ids,
+            "c",
+        )
+        .expect("must admit a construct that meets every obligation");
+
+        let without = |field: &str| {
+            let mut construct = complete.clone();
+            construct.as_object_mut().expect("object").remove(field);
+            verify_contract_registry_construct_lowering_interfaces(
+                &construct,
+                capability_call,
+                &ids,
+                "c",
+            )
+            .expect_err("rejection")
+        };
+
+        assert_eq!(
+            without("requires"),
+            "c uses lowering_target `capability_call` but declares no required `Capability` interface"
+        );
+        assert_eq!(
+            without("provides"),
+            "c uses lowering_target `capability_call` but declares no provided `EffectHandle` interface"
+        );
+        assert_eq!(
+            without("target_capability"),
+            "c uses lowering_target `capability_call` but has no target_capability"
+        );
+
+        // A target capability with no matching declared `capability.call`
+        // contract is a dangling grant.
+        let mut dangling = complete.clone();
+        dangling["target_capability"] = json!("acme.widgets.absent");
+        assert_eq!(
+            verify_contract_registry_construct_lowering_interfaces(
+                &dangling,
+                capability_call,
+                &ids,
+                "c",
+            )
+            .expect_err("rejection"),
+            "c target_capability `acme.widgets.absent` has no matching package `capability.call` \
+             effect contract"
+        );
+
+        // The required `Capability` interface must name the SAME capability the
+        // construct targets — a construct may not require one grant and call
+        // another.
+        let mut mismatched = complete.clone();
+        mismatched["requires"] = json!([{"kind": "Capability", "name": "acme.widgets.other"}]);
+        let error = verify_contract_registry_construct_lowering_interfaces(
+            &mismatched,
+            capability_call,
+            &ids,
+            "c",
+        )
+        .expect_err("rejection");
+        assert!(error.contains("declares no required"), "got {error}");
+
+        // `metadata_only` FORBIDS a target capability, so the same field that is
+        // mandatory above is a refusal here.
+        let mut forbidden = json!({"library_id": "acme.widgets"});
+        forbidden["target_capability"] = json!("acme.widgets.call");
+        let error = verify_contract_registry_construct_lowering_interfaces(
+            &forbidden,
+            metadata_only,
+            &ids,
+            "c",
+        )
+        .expect_err("rejection");
+        assert!(
+            error.contains("forbids a `target_capability`"),
+            "got {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grammar_refusal_tests {
+    //! DR-0011 construct grammar. A package declares the SYNTAX its construct
+    //! occupies, so these rules decide what a third party may make the language
+    //! look like. The vocabularies are closed on purpose — a package that could
+    //! mint its own slot kind or connective would be extending the grammar, not
+    //! using it.
+    //!
+    //! Two shapes share one entry point. `effect_operation` is order-sensitive
+    //! (slots, payload, binding, target capability); `declaration_block` is
+    //! order-free (clauses). Both must transcribe the construct's keyword, which
+    //! is the rule keeping the grammar and the construct row from drifting apart.
+
+    use super::{package_construct_grammar, package_declaration_grammar};
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    fn effect_grammar(value: Value) -> Result<(), String> {
+        package_construct_grammar(
+            Path::new("acme.json"),
+            &value,
+            "acme.widgets.emit",
+            "emit_widget",
+            Some("acme.widgets.call"),
+        )
+        .map(|_| ())
+    }
+
+    fn declaration_grammar(value: Value) -> Result<(), String> {
+        package_declaration_grammar(
+            &value,
+            "construct `acme.widgets.block` grammar",
+            "in `acme.json`",
+            "declaration_block".to_owned(),
+            "widget",
+        )
+        .map(|_| ())
+    }
+
+    fn valid_effect_grammar() -> Value {
+        json!({
+            "shape": "effect_operation",
+            "keyword": "emit_widget",
+            "slots": [{"name": "target", "kind": "identifier", "connective": "to"}],
+            "payload": {"fields": [{"name": "body", "kind": "expression"}]},
+            "binding": "optional",
+            "target_capability": "acme.widgets.call",
+        })
+    }
+
+    fn valid_clause() -> Value {
+        json!({
+            "name": "path",
+            "kind": "expression",
+            "required": true,
+            "list": false,
+            "unknown_hint": "unknown clause",
+            "missing_summary": "missing clause",
+        })
+    }
+
+    fn valid_declaration_grammar() -> Value {
+        json!({
+            "shape": "declaration_block",
+            "keyword": "widget",
+            "clauses": [valid_clause()],
+        })
+    }
+
+    #[test]
+    fn both_shapes_admit_a_well_formed_grammar() {
+        effect_grammar(valid_effect_grammar()).expect("must admit");
+        declaration_grammar(valid_declaration_grammar()).expect("must admit");
+        // The shared entry point routes `declaration_block` to the other half.
+        package_construct_grammar(
+            Path::new("acme.json"),
+            &valid_declaration_grammar(),
+            "acme.widgets.block",
+            "widget",
+            None,
+        )
+        .expect("must admit through the shared entry point");
+    }
+
+    #[test]
+    fn an_unsupported_shape_is_refused() {
+        let mut grammar = valid_effect_grammar();
+        grammar["shape"] = json!("incantation");
+        assert_eq!(
+            effect_grammar(grammar).expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar uses unsupported shape `incantation`; \
+             expected `effect_operation` in `acme.json`"
+        );
+    }
+
+    /// Both shapes carry this rule independently, and both must keep it: a
+    /// grammar whose keyword drifts from its construct row would parse syntax
+    /// the construct never claimed.
+    #[test]
+    fn a_grammar_keyword_must_transcribe_the_construct_keyword() {
+        let mut grammar = valid_effect_grammar();
+        grammar["keyword"] = json!("emit_gadget");
+        assert_eq!(
+            effect_grammar(grammar).expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar keyword `emit_gadget` does not match the \
+             construct keyword `emit_widget` in `acme.json`"
+        );
+
+        let mut grammar = valid_declaration_grammar();
+        grammar["keyword"] = json!("gadget");
+        assert_eq!(
+            declaration_grammar(grammar).expect_err("rejection"),
+            "construct `acme.widgets.block` grammar keyword `gadget` does not match the construct \
+             keyword `widget` in `acme.json`"
+        );
+    }
+
+    #[test]
+    fn effect_operation_slot_and_payload_vocabularies_are_closed() {
+        let with_slot = |slot: Value| {
+            let mut grammar = valid_effect_grammar();
+            grammar["slots"] = json!([slot]);
+            effect_grammar(grammar).expect_err("rejection")
+        };
+
+        assert!(
+            with_slot(json!({"name": "target", "kind": "sigil"})).starts_with(
+                "construct `acme.widgets.emit` grammar slots[0] uses unsupported kind `sigil`;"
+            ),
+            "slot kind vocabulary must be closed"
+        );
+        assert!(
+            with_slot(json!({"name": "target", "kind": "identifier", "connective": "athwart"}))
+                .starts_with(
+                    "construct `acme.widgets.emit` grammar slots[0] uses unsupported connective \
+                     `athwart`;"
+                ),
+            "slot connective vocabulary must be closed"
+        );
+
+        let mut grammar = valid_effect_grammar();
+        grammar["payload"] = json!({"fields": [{"name": "body", "kind": "identifier"}]});
+        assert_eq!(
+            effect_grammar(grammar).expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar payload.fields[0] uses unsupported kind \
+             `identifier`; payload fields are `expression` in `acme.json`"
+        );
+    }
+
+    #[test]
+    fn effect_operation_binding_and_target_capability_are_pinned() {
+        let mut grammar = valid_effect_grammar();
+        grammar["binding"] = json!("mandatory");
+        assert!(
+            effect_grammar(grammar).expect_err("rejection").starts_with(
+                "construct `acme.widgets.emit` grammar uses unsupported binding `mandatory`;"
+            ),
+            "binding vocabulary must be closed"
+        );
+
+        // The grammar's target capability must be the construct's own — a
+        // grammar may not point the syntax at a capability the construct row
+        // never declared.
+        let mut grammar = valid_effect_grammar();
+        grammar["target_capability"] = json!("acme.widgets.other");
+        assert_eq!(
+            effect_grammar(grammar).expect_err("rejection"),
+            "construct `acme.widgets.emit` grammar target_capability `acme.widgets.other` does \
+             not match the construct target_capability `acme.widgets.call` in `acme.json`"
+        );
+    }
+
+    #[test]
+    fn declaration_clause_vocabularies_are_closed() {
+        let with_clause = |patch: &[(&str, Value)]| {
+            let mut clause = valid_clause();
+            for (field, value) in patch {
+                clause[*field] = value.clone();
+            }
+            let mut grammar = valid_declaration_grammar();
+            grammar["clauses"] = json!([clause]);
+            declaration_grammar(grammar).expect_err("rejection")
+        };
+
+        assert!(
+            with_clause(&[("kind", json!("sigil"))]).starts_with(
+                "construct `acme.widgets.block` grammar clauses[0] uses unsupported kind `sigil`;"
+            ),
+            "clause kind vocabulary must be closed"
+        );
+        assert!(
+            with_clause(&[("connective", json!("athwart"))]).starts_with(
+                "construct `acme.widgets.block` grammar clauses[0] uses unsupported connective \
+                 `athwart`;"
+            ),
+            "clause connective vocabulary must be closed"
+        );
+    }
+
+    /// A `flag` clause carries no value, so two otherwise-legal fields become
+    /// contradictions on it. These are the amendment rules that keep a package
+    /// from declaring a valueless clause that nonetheless takes a value.
+    #[test]
+    fn a_flag_clause_can_neither_be_a_list_nor_take_a_connective() {
+        let flag = |patch: &[(&str, Value)]| {
+            let mut clause = valid_clause();
+            clause["kind"] = json!("flag");
+            for (field, value) in patch {
+                clause[*field] = value.clone();
+            }
+            let mut grammar = valid_declaration_grammar();
+            grammar["clauses"] = json!([clause]);
+            declaration_grammar(grammar)
+        };
+
+        // A plain flag is fine.
+        flag(&[]).expect("must admit a valueless flag");
+
+        assert_eq!(
+            flag(&[("list", json!(true))]).expect_err("rejection"),
+            "construct `acme.widgets.block` grammar clauses[0] is a `flag` and cannot set \
+             `list: true` (a flag carries no value) in `acme.json`"
+        );
+        assert_eq!(
+            flag(&[("connective", json!("from"))]).expect_err("rejection"),
+            "construct `acme.widgets.block` grammar clauses[0] is a `flag` and cannot carry a \
+             connective (a flag carries no value) in `acme.json`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod manifest_refusal_tests {
+    //! The manifest-level refusals: the schema door a manifest must pass to be
+    //! read at all, two uniqueness rules, and the DR-0011 exclusivity rule
+    //! between a construct's `grammar` and its derived `fields`.
+    //!
+    //! The uniqueness rules matter because both collections are keyed maps
+    //! downstream. A duplicate does not merely repeat itself — it silently wins,
+    //! so a second declaration of a capability replaces the first with whatever
+    //! contract it likes.
+
+    use super::{
+        package_capability_contracts, package_construct, package_manifest_from_json_with_embedded,
+        package_manifest_workflow_tool_decls, PACKAGE_MANIFEST_SCHEMA,
+    };
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    fn path() -> &'static Path {
+        Path::new("acme.json")
+    }
+
+    #[test]
+    fn a_manifest_of_an_unknown_schema_is_refused() {
+        let manifest = |schema: &str| {
+            json!({
+                "schema": schema,
+                "package_id": "acme.widgets",
+                "name": "acme.widgets",
+                "version": "0.1.0",
+                "libraries": [{"id": "acme.widgets", "version": "0.1.0"}],
+                "capabilities": [],
+                "providers": [],
+            })
+            .to_string()
+        };
+
+        package_manifest_from_json_with_embedded(path(), manifest(PACKAGE_MANIFEST_SCHEMA), &[])
+            .expect("the current schema must be admitted");
+
+        assert_eq!(
+            package_manifest_from_json_with_embedded(
+                path(),
+                manifest("whipplescript.package_manifest.v1"),
+                &[],
+            )
+            .expect_err("rejection"),
+            "package manifest `acme.json` has unsupported schema \
+             `whipplescript.package_manifest.v1`; expected `whipplescript.package_manifest.v0`"
+        );
+    }
+
+    #[test]
+    fn a_workflow_tool_exported_twice_is_refused() {
+        let tools = |entries: Value| {
+            package_manifest_workflow_tool_decls(path(), &json!({"workflow_tools": entries}))
+        };
+
+        tools(json!([
+            {"name": "summarize", "source": "./summarize.whip"},
+            {"name": "classify", "source": "./classify.whip"},
+        ]))
+        .expect("distinct exports must be admitted");
+
+        assert_eq!(
+            tools(json!([
+                {"name": "summarize", "source": "./summarize.whip"},
+                {"name": "summarize", "source": "./other.whip"},
+            ]))
+            .expect_err("rejection"),
+            "package manifest `acme.json` exports workflow tool `summarize` more than once"
+        );
+    }
+
+    #[test]
+    fn a_capability_declared_twice_is_refused() {
+        let capabilities = |entries: Value| {
+            package_capability_contracts(path(), &json!({"capabilities": entries}))
+        };
+
+        capabilities(json!([{"id": "acme.widgets.call"}, {"id": "acme.widgets.read"}]))
+            .expect("distinct capabilities must be admitted");
+
+        assert_eq!(
+            capabilities(json!([{"id": "acme.widgets.call"}, {"id": "acme.widgets.call"}]))
+                .expect_err("rejection"),
+            "package manifest `acme.json` declares capability `acme.widgets.call` more than once"
+        );
+    }
+
+    /// DR-0011: the grammar is the single source of a construct's shape, and
+    /// `fields[]` is derived from it. A construct spelling both is ambiguous —
+    /// there would be two answers to what shape it has.
+    #[test]
+    fn a_construct_may_not_spell_both_fields_and_grammar() {
+        let construct = |extra: Value| {
+            let mut value = json!({
+                "id": "acme.widgets.block",
+                "construct_family": "declaration_block",
+                "keyword": "widget",
+                "grammar": {
+                    "shape": "declaration_block",
+                    "keyword": "widget",
+                    "clauses": [{
+                        "name": "path",
+                        "kind": "expression",
+                        "required": true,
+                        "list": false,
+                        "unknown_hint": "unknown clause",
+                        "missing_summary": "missing clause",
+                    }],
+                },
+            });
+            if let Some(extra) = extra.as_object() {
+                for (key, field) in extra {
+                    value[key.as_str()] = field.clone();
+                }
+            }
+            package_construct(path(), &value, "acme.widgets", "0.1.0")
+        };
+
+        // A grammar alone derives its fields.
+        let derived = construct(json!({})).expect("grammar alone must be admitted");
+        assert_eq!(
+            derived.fields.len(),
+            1,
+            "fields must derive from the grammar"
+        );
+
+        assert_eq!(
+            construct(json!({"fields": [{"name": "path", "kind": "expression"}]}))
+                .expect_err("rejection"),
+            "construct `acme.widgets.block` declares both `fields` and `grammar` in `acme.json`; \
+             `fields` is derived from `grammar`"
+        );
+    }
+}
