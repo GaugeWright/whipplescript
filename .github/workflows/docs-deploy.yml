@@ -57,4 +57,10 @@ jobs:
           # the old one, so this lane would have kept failing after the API token
           # was provisioned, for a reason nobody could read.
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy site --project-name=whipplescript-docs
+          # `--branch main` is explicit rather than inferred. Direct Upload decides
+          # production versus preview from the branch, and wrangler infers it from
+          # the checkout when the flag is absent — so a run from a detached HEAD or
+          # any other ref would publish a preview and leave docs.whipplescript.com
+          # untouched, reporting success either way. gaugedesk's docs lane already
+          # states it; this one did not.
+          command: pages deploy site --project-name=whipplescript-docs --branch=main
