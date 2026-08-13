@@ -8,6 +8,27 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 
+# The custodian is a Unix-domain-socket daemon by construction: serve.rs binds a
+# UnixListener and sets 0o600 on the socket path, which is the custody boundary
+# rather than an implementation detail. It does not build for Windows and cannot
+# without a different transport, so it is distributed for the Unix targets only.
+# Without this the workspace targets applied to it too, and every release build
+# for x86_64-pc-windows-msvc failed on std::os::unix — which is what happened
+# from 2026-08-06, when DR-0053 added this crate, until it was found on
+# 2026-08-13 by dry-running the release.
+[package.metadata.dist]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]
+# The PowerShell installer is dropped with the Windows target it installs on.
+# Left inherited, dist warns "skipping powershell installer: not building any
+# supported platforms" once per artifact, which is noise describing a decision
+# already made here.
+installers = ["shell", "homebrew"]
+
 [dependencies]
 whipplescript-custody = { version = "0.4.1", path = "../whipplescript-custody" }
 serde = { version = "1", features = ["derive"] }
