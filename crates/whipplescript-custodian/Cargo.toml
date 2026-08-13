@@ -16,18 +16,21 @@ readme.workspace = true
 # for x86_64-pc-windows-msvc failed on std::os::unix — which is what happened
 # from 2026-08-06, when DR-0053 added this crate, until it was found on
 # 2026-08-13 by dry-running the release.
+# Not distributed. The custodian is a Unix-domain-socket daemon — serve.rs binds
+# a UnixListener and sets 0o600 on the socket path — so it does not compile for
+# x86_64-pc-windows-msvc, and it has never shipped: the crate arrived on
+# 2026-08-06 with DR-0053, two weeks after the last release.
+#
+# Restricting `targets` here is not enough and was tried first. That filters the
+# artifacts dist packages, not the crates it builds, so the Windows leg still
+# compiled this one and still failed on std::os::unix. `dist = false` is what
+# takes it out of the build.
+#
+# If it should ship, that is a decision with work behind it: the Unix-only paths
+# need cfg-gating so the crate compiles everywhere it is built, and then it can
+# be distributed for the Unix targets deliberately.
 [package.metadata.dist]
-targets = [
-  "aarch64-apple-darwin",
-  "x86_64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-unknown-linux-gnu",
-]
-# The PowerShell installer is dropped with the Windows target it installs on.
-# Left inherited, dist warns "skipping powershell installer: not building any
-# supported platforms" once per artifact, which is noise describing a decision
-# already made here.
-installers = ["shell", "homebrew"]
+dist = false
 
 [dependencies]
 whipplescript-custody = { version = "0.4.1", path = "../whipplescript-custody" }
