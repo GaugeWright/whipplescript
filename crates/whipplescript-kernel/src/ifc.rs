@@ -4825,6 +4825,402 @@ grant channel secsrc -> imap:sec from Sec\n";
         assert!(with.endorse_raises("secsrc", "sink"));
     }
 
+    // ---- DR-0063 SOUND_MEET, against the shipped label algebra ----------------
+    //
+    // DR-0063 defines envelope composition by refusal: a composed policy accepts
+    // only what every constituent accepts. `models/maude/envelope-composition.maude`
+    // proves that over an abstract model of the envelope arms. These checks close
+    // the other half — that the composition rules the record states are rules about
+    // the `dominates` THIS CRATE computes, not about a model of it — by running the
+    // theorem against `dominates` and `can_act` themselves.
+    //
+    // The record's general rule, realized here: at a crossing the kernel asks
+    // `dominates(provider, required)`, so the `required` side composes by UNION and
+    // the `provider` side by INTERSECTION. Confidentiality puts the sink on the
+    // provider side (`leaks` is `!dominates(reader_set(sink), reader_set(source))`)
+    // and integrity puts the source there (`injects` is
+    // `!dominates(integrity_set(read), integrity_set(write))`), which is exactly why
+    // the two fields compose in opposite directions. Delegation composes by
+    // unanimity, which is intersection on the edge set.
+    //
+    // EXHAUSTIVE RATHER THAN SAMPLED, PER ARM. `dominates` is reachable from here
+    // directly, so a case costs a few set operations instead of a DSL parse, and
+    // each arm's universe closes. The label sweep
+    // (`a_composed_envelope_never_admits_what_a_constituent_refuses`) visits every
+    // assignment of every label set over three principals to three constituents.
+    // The delegation sweep below visits every assignment of every non-reflexive
+    // directed edge set over the same principals — 64 edge sets per constituent, so
+    // 64^3 assignments — and derives the unanimous intersection of each, rather than
+    // sampling a few hand-written graphs. Reverse edges, cycles and multi-hop paths
+    // are all in that universe, because every subset of the six edges is.
+    //
+    // WHY THE PRODUCT OF THE TWO NEED NOT BE VISITED. `dominates` reaches the
+    // delegation arm only through `can_act`, and both of its quantifiers are
+    // pointwise: a crossing the meet admits and a constituent refuses therefore has
+    // a single (provider principal, required compartment) pair behind it. The meet
+    // hands each constituent a SUBSET of its own provider side and a SUPERSET of
+    // its own required side — checked exhaustively over the label universe by
+    // `the_meet_narrows_the_provider_side_and_widens_the_required_side` — so the
+    // provider principal witnessing the meet's verdict is one that constituent
+    // holds too, and the compartment it covers is one the meet was asked about. The
+    // only remaining way the refusal could survive is an acts-for edge the
+    // unanimous intersection has and a constituent does not, which is what the
+    // delegation sweep enumerates against over the closed edge-set universe. A
+    // closed space needs no seed, no shrinking and no property-testing dependency,
+    // in a repository whose property checking is otherwise Maude, TLA+ and Lean.
+
+    const MEET_PRINCIPALS: [&str; 3] = ["P", "Q", "R"];
+    const MEET_SUBSETS: usize = 1 << MEET_PRINCIPALS.len();
+    const MEET_CONSTITUENTS: usize = 3;
+
+    fn meet_subset(mask: usize) -> BTreeSet<String> {
+        (0..MEET_PRINCIPALS.len())
+            .filter(|i| (mask >> i) & 1 == 1)
+            .map(|i| MEET_PRINCIPALS[i].to_owned())
+            .collect()
+    }
+
+    fn meet_all_subsets() -> Vec<BTreeSet<String>> {
+        (0..MEET_SUBSETS).map(meet_subset).collect()
+    }
+
+    /// Decode a base-`MEET_SUBSETS` counter into one subset index per constituent,
+    /// so a single range enumerates every assignment.
+    fn meet_indices(mut code: usize) -> [usize; MEET_CONSTITUENTS] {
+        let mut out = [0usize; MEET_CONSTITUENTS];
+        for slot in &mut out {
+            *slot = code % MEET_SUBSETS;
+            code /= MEET_SUBSETS;
+        }
+        out
+    }
+
+    fn meet_union(sets: &[&BTreeSet<String>]) -> BTreeSet<String> {
+        sets.iter().flat_map(|s| s.iter().cloned()).collect()
+    }
+
+    fn meet_intersection(sets: &[&BTreeSet<String>]) -> BTreeSet<String> {
+        let (first, rest) = sets.split_first().expect("at least one constituent");
+        first
+            .iter()
+            .filter(|item| rest.iter().all(|s| s.contains(*item)))
+            .cloned()
+            .collect()
+    }
+
+    /// The acts-for backdrop the LABEL sweep runs against: one DSL fragment per
+    /// constituent, with the composed envelope carrying the UNANIMOUS edges — those
+    /// every constituent declares — which is DR-0063 §1's rule for the
+    /// `delegations` arm. Four shapes, enough that the label sweep sees both a
+    /// covering and a non-covering acts-for order rather than only equality; the
+    /// edge-set universe itself is closed by
+    /// `unanimous_delegation_never_admits_what_a_constituent_refuses`, not here.
+    const MEET_DELEGATION_BACKDROP: [([&str; MEET_CONSTITUENTS], &str); 4] = [
+        // Nothing delegated anywhere: acts-for collapses to equality plus `public`.
+        (["", "", ""], ""),
+        // One edge, declared by all three, so it survives the meet.
+        (
+            [
+                "delegate P acts-for Q\n",
+                "delegate P acts-for Q\n",
+                "delegate P acts-for Q\n",
+            ],
+            "delegate P acts-for Q\n",
+        ),
+        // A second edge only one constituent declares: unanimity drops it, so the
+        // composition is strictly less able to cover a compartment than that
+        // constituent is.
+        (
+            [
+                "delegate P acts-for Q\n",
+                "delegate P acts-for Q\ndelegate Q acts-for R\n",
+                "delegate P acts-for Q\n",
+            ],
+            "delegate P acts-for Q\n",
+        ),
+        // Nothing unanimous at all, though two constituents each delegate.
+        (
+            ["delegate P acts-for Q\n", "delegate Q acts-for R\n", ""],
+            "",
+        ),
+    ];
+
+    /// The delegation universe: every non-reflexive ordered pair over
+    /// `MEET_PRINCIPALS`, in mask-bit order. Six edges over three principals, so
+    /// `MEET_EDGE_SETS` = 64 declarable edge sets per constituent — reverse edges,
+    /// cycles and multi-hop paths included, since every subset of the six is one of
+    /// them.
+    const MEET_EDGE_COUNT: usize = MEET_PRINCIPALS.len() * (MEET_PRINCIPALS.len() - 1);
+    const MEET_EDGE_SETS: usize = 1 << MEET_EDGE_COUNT;
+
+    fn meet_edge_pairs() -> Vec<(usize, usize)> {
+        (0..MEET_PRINCIPALS.len())
+            .flat_map(|p| (0..MEET_PRINCIPALS.len()).map(move |q| (p, q)))
+            .filter(|(p, q)| p != q)
+            .collect()
+    }
+
+    /// The edge set a mask declares.
+    fn meet_edges(mask: usize) -> BTreeSet<(String, String)> {
+        meet_edge_pairs()
+            .into_iter()
+            .enumerate()
+            .filter(|(bit, _)| (mask >> bit) & 1 == 1)
+            .map(|(_, (p, q))| (MEET_PRINCIPALS[p].to_owned(), MEET_PRINCIPALS[q].to_owned()))
+            .collect()
+    }
+
+    /// An envelope declaring exactly those edges and nothing else, built through
+    /// the DSL the checker parses.
+    fn meet_delegation_envelope(mask: usize) -> Envelope {
+        let dsl: String = meet_edges(mask)
+            .iter()
+            .map(|(p, q)| format!("delegate {p} acts-for {q}\n"))
+            .collect();
+        Envelope::from_dsl(&dsl).expect("valid delegation fragment")
+    }
+
+    /// `can_act` over every ordered principal pair, as this crate computes it.
+    fn meet_acts_for(env: &Envelope) -> [[bool; MEET_PRINCIPALS.len()]; MEET_PRINCIPALS.len()] {
+        let mut table = [[false; MEET_PRINCIPALS.len()]; MEET_PRINCIPALS.len()];
+        for (p, row) in table.iter_mut().enumerate() {
+            for (q, cell) in row.iter_mut().enumerate() {
+                *cell = env.can_act(MEET_PRINCIPALS[p], MEET_PRINCIPALS[q]);
+            }
+        }
+        table
+    }
+
+    /// Decode a base-`MEET_EDGE_SETS` counter into one edge-set mask per
+    /// constituent, so a single range enumerates every assignment.
+    fn meet_edge_masks(mut code: usize) -> [usize; MEET_CONSTITUENTS] {
+        let mut out = [0usize; MEET_CONSTITUENTS];
+        for slot in &mut out {
+            *slot = code % MEET_EDGE_SETS;
+            code /= MEET_EDGE_SETS;
+        }
+        out
+    }
+
+    #[test]
+    fn the_unanimous_edge_set_is_the_intersection_of_the_declared_ones() {
+        // The sweep below composes delegation by ANDing masks, which is only the
+        // record's unanimity rule if a mask means the set it decodes to. Checked
+        // over every pair of masks, so the bit representation carries no meaning the
+        // set intersection does not.
+        for a in 0..MEET_EDGE_SETS {
+            for b in 0..MEET_EDGE_SETS {
+                let declared_a = meet_edges(a);
+                let declared_b = meet_edges(b);
+                assert_eq!(
+                    meet_edges(a & b),
+                    declared_a
+                        .intersection(&declared_b)
+                        .cloned()
+                        .collect::<BTreeSet<(String, String)>>(),
+                    "masks {a:#b} and {b:#b} disagree with their set intersection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unanimous_delegation_never_admits_what_a_constituent_refuses() {
+        // The delegation arm's universe, closed: every assignment of an edge set to
+        // each of the three constituents — 64^3 = 262144 assignments — with the
+        // composed envelope carrying the unanimous intersection. The acts-for order
+        // each mask induces is computed once, by `can_act`, so every verdict below
+        // is one the checker reaches.
+        let acts_for: Vec<[[bool; MEET_PRINCIPALS.len()]; MEET_PRINCIPALS.len()]> = (0
+            ..MEET_EDGE_SETS)
+            .map(|mask| meet_acts_for(&meet_delegation_envelope(mask)))
+            .collect();
+
+        for code in 0..MEET_EDGE_SETS.pow(MEET_CONSTITUENTS as u32) {
+            let masks = meet_edge_masks(code);
+            let unanimous = masks
+                .iter()
+                .fold(MEET_EDGE_SETS - 1, |acc, mask| acc & mask);
+
+            for (party, mask) in masks.iter().enumerate() {
+                for (p, principal) in MEET_PRINCIPALS.iter().enumerate() {
+                    for (q, compartment) in MEET_PRINCIPALS.iter().enumerate() {
+                        assert!(
+                            !acts_for[unanimous][p][q] || acts_for[*mask][p][q],
+                            "SOUND_MEET violated in the delegation arm: under the unanimous \
+                             edges {:?} the meet lets {principal} cover {compartment}, but \
+                             constituent {party}, declaring {:?}, does not",
+                            meet_edges(unanimous),
+                            meet_edges(*mask),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_meet_narrows_the_provider_side_and_widens_the_required_side() {
+        // The witness transfer that lets the two sweeps be run separately rather
+        // than as a product: whatever the label assignment, the meet asks
+        // `dominates` about a provider side no constituent lacks and a required side
+        // no constituent exceeds. So a provider principal that satisfies the meet is
+        // available to the constituent, and a compartment the constituent requires
+        // is one the meet was asked to cover.
+        let subsets = meet_all_subsets();
+        for code in 0..MEET_SUBSETS.pow(MEET_CONSTITUENTS as u32) {
+            let idx = meet_indices(code);
+            let parts: Vec<&BTreeSet<String>> = idx.iter().map(|i| &subsets[*i]).collect();
+            let provider = meet_intersection(&parts);
+            let required = meet_union(&parts);
+            for part in parts {
+                assert!(
+                    provider.is_subset(part),
+                    "the intersected provider side {provider:?} escapes constituent {part:?}"
+                );
+                assert!(
+                    part.is_subset(&required),
+                    "constituent {part:?} escapes the unioned required side {required:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_composed_envelope_never_admits_what_a_constituent_refuses() {
+        let subsets = meet_all_subsets();
+        for (constituent_dsl, composed_dsl) in MEET_DELEGATION_BACKDROP {
+            let constituents: Vec<Envelope> = constituent_dsl
+                .iter()
+                .map(|dsl| Envelope::from_dsl(dsl).expect("valid delegation fragment"))
+                .collect();
+            let composed = Envelope::from_dsl(composed_dsl).expect("valid delegation fragment");
+
+            // The `required` side of every crossing, composed by union.
+            let required_codes: Vec<([usize; MEET_CONSTITUENTS], BTreeSet<String>)> = (0
+                ..MEET_SUBSETS.pow(MEET_CONSTITUENTS as u32))
+                .map(|code| {
+                    let idx = meet_indices(code);
+                    let parts: Vec<&BTreeSet<String>> = idx.iter().map(|i| &subsets[*i]).collect();
+                    (idx, meet_union(&parts))
+                })
+                .collect();
+
+            for provider_code in 0..MEET_SUBSETS.pow(MEET_CONSTITUENTS as u32) {
+                let provider_idx = meet_indices(provider_code);
+                let provider_parts: Vec<&BTreeSet<String>> =
+                    provider_idx.iter().map(|i| &subsets[*i]).collect();
+                // The `provider` side, composed by intersection.
+                let composed_provider = meet_intersection(&provider_parts);
+
+                for (required_idx, composed_required) in &required_codes {
+                    if !composed.dominates(&composed_provider, composed_required) {
+                        continue;
+                    }
+                    for party in 0..MEET_CONSTITUENTS {
+                        assert!(
+                            constituents[party].dominates(
+                                &subsets[provider_idx[party]],
+                                &subsets[required_idx[party]],
+                            ),
+                            "SOUND_MEET violated under {composed_dsl:?}: the meet admits \
+                             provider {:?} over required {:?}, but constituent {party} \
+                             refuses provider {:?} over required {:?}",
+                            composed_provider,
+                            composed_required,
+                            subsets[provider_idx[party]],
+                            subsets[required_idx[party]],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // The three teeth. Each is the Rust counterpart of a sibling module in
+    // `envelope-composition.maude`, and each is stated as a concrete pair of
+    // constituents rather than as a search, because a counterexample is all that is
+    // needed to show the direction is load-bearing.
+
+    #[test]
+    fn intersecting_the_required_side_admits_what_a_constituent_refuses() {
+        // Confidentiality. Two parties each attach their own compartment to one
+        // source. Composed by intersection the source label is empty — `public`, the
+        // bottom — which every sink vacuously dominates, so a read both constituents
+        // would have judged separately is admitted while the second refuses it.
+        let env = Envelope::from_dsl("").expect("valid");
+        let source_a = BTreeSet::from(["P".to_owned()]);
+        let source_b = BTreeSet::from(["Q".to_owned()]);
+        let sink = BTreeSet::from(["P".to_owned()]);
+
+        let wrong = meet_intersection(&[&source_a, &source_b]);
+        assert!(wrong.is_empty(), "the intersection is the public bottom");
+        assert!(
+            env.dominates(&sink, &wrong),
+            "and a public source is dominated by anything"
+        );
+        assert!(
+            !env.dominates(&sink, &source_b),
+            "yet the second constituent refuses this very crossing"
+        );
+
+        let right = meet_union(&[&source_a, &source_b]);
+        assert!(
+            !env.dominates(&sink, &right),
+            "composing the required side by union refuses it, as C1 demands"
+        );
+    }
+
+    #[test]
+    fn unioning_the_provider_side_admits_what_a_constituent_refuses() {
+        // Integrity. The source is the provider, so composing it by union lets one
+        // party's voucher stand in for another's — the composed source carries what
+        // ANYBODY vouched, and the sink demand is met over its own author's refusal.
+        let env = Envelope::from_dsl("").expect("valid");
+        let vouched_a = BTreeSet::from(["P".to_owned()]);
+        let vouched_b = BTreeSet::from(["Q".to_owned()]);
+        let demanded = BTreeSet::from(["P".to_owned()]);
+
+        let wrong = meet_union(&[&vouched_a, &vouched_b]);
+        assert!(env.dominates(&wrong, &demanded));
+        assert!(
+            !env.dominates(&vouched_b, &demanded),
+            "the second constituent's own source does not carry P"
+        );
+
+        let right = meet_intersection(&[&vouched_a, &vouched_b]);
+        assert!(
+            !env.dominates(&right, &demanded),
+            "composing the provider side by intersection refuses it, as C1 demands"
+        );
+    }
+
+    #[test]
+    fn unioning_delegation_edges_admits_what_a_constituent_refuses() {
+        // The acts-for order is the third arm, and it composes by unanimity for the
+        // same reason: pooling two parties' delegations lets a compartment be covered
+        // by an edge one of them never granted.
+        let delegating = Envelope::from_dsl("delegate P acts-for Q\n").expect("valid");
+        let plain = Envelope::from_dsl("").expect("valid");
+        let provider = BTreeSet::from(["P".to_owned()]);
+        let required = BTreeSet::from(["Q".to_owned()]);
+
+        assert!(
+            delegating.dominates(&provider, &required),
+            "the delegating constituent covers Q through its own edge"
+        );
+        assert!(
+            !plain.dominates(&provider, &required),
+            "the other constituent grants nothing and refuses"
+        );
+        // Unanimity keeps only the edges every constituent declares — here, none.
+        let composed = Envelope::from_dsl("").expect("valid");
+        assert!(
+            !composed.dominates(&provider, &required),
+            "so the meet refuses too; pooling the edges instead would have admitted it"
+        );
+    }
+
     #[test]
     fn acts_for_delegation_clears_a_flow() {
         // ledger is Operator-readable; auditbox is Auditor-readable. Operator data
