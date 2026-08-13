@@ -31,6 +31,10 @@ use whipplescript_kernel::sansio::{
 };
 use whipplescript_store::files::FileStore;
 
+/// Parity checks holding the mirrored content-identity seam together: the
+/// SHA-256/128 hash twins and the four `content_blobs` declarations.
+#[cfg(test)]
+mod content_parity;
 pub mod do_branches;
 pub mod do_instance;
 pub mod do_memory;
