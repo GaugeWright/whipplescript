@@ -60,6 +60,15 @@ markdown_extensions:
   - pymdownx.superfences
   - pymdownx.details
 
+# A link to a heading that does not exist still resolves — it lands the reader
+# at the top of the target page instead of the section it names, which is worse
+# than a dead link because nothing looks wrong. mkdocs reports that at INFO by
+# default, so `--strict` does not fail on it and one shipped unnoticed in the
+# WhippleScript manual. Raised to a warning, which `--strict` escalates to an
+# error, so anchor drift fails the build that introduces it.
+validation:
+  anchors: warn
+
 nav:
   - Home: README.md
   - Start here:

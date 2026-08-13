@@ -33,6 +33,17 @@ if [ -f AGENTS.md ]; then
     # (DR-0069 OPS-8).
     echo "== mirror projection =="
     node scripts/check-mirror-projection.mjs
+
+    # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
+    # repository, which owns it. It fails when a cargo workspace or a lockfile is
+    # watched by nothing. Edit it there and re-render; a local edit fails here.
+    #
+    # Same guard again, and for the same reason as the guide: what a repository
+    # is obliged to compile and audit is a property of the active repository, not
+    # of a curated projection that receives neither the rendered check nor the
+    # npm trees whose lockfiles are half of those obligations.
+    echo "== build coverage =="
+    node scripts/check-build-coverage.mjs
 fi
 
 echo "== production dependency advisories =="
