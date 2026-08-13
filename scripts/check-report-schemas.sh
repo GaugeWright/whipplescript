@@ -1840,7 +1840,30 @@ def fail(message):
 
 
 def assert_reporting_schema_index_complete(schema_paths):
-    reporting = Path("spec/reporting.md").read_text()
+    # This asserts that THIS repository's reporting contract indexes every
+    # schema it ships. That is internal documentation consistency, and it can
+    # only be answered where the document is.
+    #
+    # `publish-mirror.sh` publishes `spec/report-schemas/` and not the rest of
+    # `spec/`, so the mirror has the schemas and not the index. The
+    # `report-schemas` job is mirror-only, so this read is reached only there —
+    # and it died on it: every scheduled mirror run since at least 2026-08-04
+    # failed with `FileNotFoundError: 'spec/reporting.md'`. Nothing reported
+    # that, because the mirror's scheduled runs gate nothing and `mirror-verdict`
+    # carries only the push runs.
+    #
+    # Say the skip out loud rather than passing silently. A check that quietly
+    # does nothing on one of the two repositories it runs in is the thing this
+    # whole split keeps producing.
+    reporting_path = Path("spec/reporting.md")
+    if not reporting_path.exists():
+        print(
+            "skipped: spec/reporting.md is not in this tree, so the schema index "
+            "cannot be checked here. It is unpublished by design; this assertion "
+            "belongs to whipplescript-src, where the document lives."
+        )
+        return
+    reporting = reporting_path.read_text()
     missing = [
         str(path)
         for path in schema_paths

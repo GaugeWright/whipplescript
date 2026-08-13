@@ -26,6 +26,13 @@ export WHIPPLESCRIPT_ITEMS_STORE="$items_store_root/items.sqlite"
 if [ -f AGENTS.md ]; then
     echo "== agent guide =="
     node scripts/check-agent-guide.mjs
+
+    # Same guard, opposite reason: this one needs the FULL tree, because it
+    # answers what the projection withheld. Only `-src` can run it — the mirror
+    # is the thing being checked, and it cannot see what it is missing
+    # (DR-0069 OPS-8).
+    echo "== mirror projection =="
+    node scripts/check-mirror-projection.mjs
 fi
 
 echo "== production dependency advisories =="
