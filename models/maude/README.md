@@ -175,6 +175,22 @@ infoflow-coord-carriage.maude    workflow-encapsulation E-COORD partition fork:
                                  outcomes are read sources, `shared` carries
                                  remaining/holders across workflows, and
                                  partition prevents that carriage
+envelope-composition.maude       DR-0063 multi-party governance: a run is
+                                 governed by a SET of signed envelopes and the
+                                 effective policy is their meet, defined by
+                                 refusal -- the composed policy never admits
+                                 what a constituent refuses. Teeth for source
+                                 vouchers composed by union, compartments by
+                                 intersection, unqualified roles aliasing across
+                                 authorities, a declassify grant from a
+                                 non-labelling authority, an owner's grant
+                                 applied to the composed label rather than to
+                                 its own contribution, and a composition record
+                                 consulted as a defaulting map rather than
+                                 checked as the set that was checked; plus
+                                 omission widening the meet, `require
+                                 authority`, the P-256-only trust root, and
+                                 order-independence
 action-expansion.maude           action-call inlining (DR-0023): hygienic
                                  binding per call site, acyclic gate, and that
                                  inlining runs no provider work

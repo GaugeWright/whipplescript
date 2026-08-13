@@ -35,6 +35,7 @@ discriminant-schema.maude	SSSSSNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
 effect-key.maude	SSSNNSNN
+envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
 expression-kernel.maude	NNSSNNSNSSNSSSSSNNSNSNSSNNSSNSNSNS
 external-event-loop.maude	NSS
 guard-commit-bite.maude	NNSS

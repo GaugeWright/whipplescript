@@ -1,0 +1,353 @@
+load ../envelope-composition.maude
+
+--- Fixture discipline. Every envelope is `signedV2` at epoch e1 and every
+--- composition record states e1, unless the search is about signatures or
+--- epochs; every composed fixture is well formed unless the search is about
+--- ill-formedness. A No-solution below therefore says "the composed policy
+--- refuses", never "the fixture never got as far as being checked".
+---
+--- Reading the confidentiality fixtures: `readers(r1, q(a1, nOp))` is a
+--- COMPARTMENT set, so it means "a party must act-for a1's Operator to read r1",
+--- not "a1's Operator is on the list". Two envelopes labelling one resource
+--- therefore make it HARDER to read, which is the direction the composed fold
+--- has to preserve.
+
+--- Coverage: the intended path. a1's Operator reads a1's resource under a
+--- two-envelope composition, and a2's envelope -- which says nothing about r1 --
+--- contributes no compartment and so refuses nothing.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg admitted(read(r1, q(a1, nOp))) .
+
+--- Bite: NO_ROLE_ALIASING. a2's Operator does not act for a1's Operator, so it
+--- does not clear a1's compartment. Same-spelled roles from two authorities are
+--- never unified. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nOp)))
+  =>* admitted(read(r1, q(a2, nOp))) RESIDUAL:Cfg .
+
+--- Tooth: the same fixture where a compartment is cleared by matching its NAME,
+--- which is what a bare unqualified role string gives you. a2's Operator reads
+--- a1's resource, granted by nobody. This is why DR-0063 section 2 qualifies
+--- roles before v1 envelopes are widely signed rather than after.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-ALIASED-ROLES :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nOp)))
+  =>* C:Cfg admitted(read(r1, q(a2, nOp))) .
+
+--- Coverage: DR-0063 section 3, the half that must keep working. a1 declassifies
+--- its OWN resource to a2's Requester, and a2's envelope grants nothing. The
+--- grant is not composed away by the other party's silence.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)) & dgrant(r1, q(a2, nReq)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* C:Cfg admitted(read(r1, q(a2, nReq))) .
+
+--- Bite: NO_CROSS_GRANT. a2 issues a declassify grant over r1, which a1 labels
+--- and a2 does not. It authorizes nothing. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq)) & dgrant(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* admitted(read(r1, q(a2, nReq))) RESIDUAL:Cfg .
+
+--- Coverage: and it is a NAMED error rather than a dropped arm. The distinction
+--- is the whole of DR-0063 section 3's second clause: an ignored grant is one
+--- its issuer goes on believing it holds.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq)) & dgrant(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* C:Cfg compositionError .
+
+--- Tooth: ownership dropped. The foreign grant is no longer ill-formed and it
+--- carries the read, so one party holds a downgrade over another's data.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-OPEN-GRANTS :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq)) & dgrant(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* C:Cfg admitted(read(r1, q(a2, nReq))) .
+
+--- HEADLINE 1, SOUND_MEET on the confidentiality arm. Both parties attach a
+--- compartment to r1 -- shared data each of them has an interest in. a2's
+--- envelope alone refuses this read, because a1's Operator does not clear a2's
+--- compartment. No reachable state holds the composed admission and that solo
+--- refusal together. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) soloRefuses(A:Auth, read(r1, q(a1, nOp)))
+      RESIDUAL:Cfg .
+
+--- Tooth: compartments composed by intersection instead of union -- the fold
+--- that reads as "restrict to what both allow" and is exactly backwards for a
+--- conjunctive set. The intersection of the two compartments is empty, empty is
+--- the public bottom, and a label neither constituent would have accepted admits
+--- the read over a2's refusal. A literal C1 counterexample.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-INTERSECTED-READERS :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg admitted(read(r1, q(a1, nOp))) soloRefuses(a2, read(r1, q(a1, nOp))) .
+
+--- HEADLINE 2, SOUND_MEET on the integrity arm. a1 vouches v1 for r1 and demands
+--- both v1 and v2 at its sink, so a1's envelope ALONE refuses this write. a2
+--- carries its own, different view of the same source, vouching only v2 -- a
+--- party does not have to accept another's integrity claim about its own data.
+--- No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, vouches(r1, v1) & demands(k1, v1 ; v2))
+            + env(a2, signedV2, e1, vouches(r1, v2)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* admitted(write(r1, k1)) soloRefuses(A:Auth, write(r1, k1)) RESIDUAL:Cfg .
+
+--- Tooth: source vouchers composed by union instead of intersection. The
+--- composed source now carries v1 ; v2 because SOMEBODY vouched each, a1's sink
+--- demand is met, and the write is admitted over a1's own refusal.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-UNION-VOUCHERS :
+  composition(env(a1, signedV2, e1, vouches(r1, v1) & demands(k1, v1 ; v2))
+            + env(a2, signedV2, e1, vouches(r1, v2)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg admitted(write(r1, k1)) soloRefuses(a1, write(r1, k1)) .
+
+--- HEADLINE 3, SOUND_MEET on the grant arm. Both parties label r1 -- shared data
+--- again -- and a1 declassifies it to a2's Requester. Section 3 says that grant
+--- is a1's to give and is not intersected away by a2's silence, but a2 is not
+--- silent about r1 here: it attaches its own compartment, which a2's Requester
+--- does not clear. a2's envelope alone refuses this read, so a1's grant over its
+--- own data must not carry it. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1,
+                  readers(r1, q(a1, nOp)) & dgrant(r1, q(a2, nReq)))
+            + env(a2, signedV2, e1, readers(r1, q(a2, nOp))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* admitted(read(r1, q(a2, nReq))) soloRefuses(A:Auth, read(r1, q(a2, nReq)))
+      RESIDUAL:Cfg .
+
+--- Coverage: and the grant is not simply cancelled by the co-label either. Same
+--- shared resource, and this time a2's own compartment is the one the reader
+--- clears, so both constituents accept and the composition does too. The grant
+--- clears a1's compartment because a1 issued it -- what it never clears is a2's.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1,
+                  readers(r1, q(a1, nOp)) & dgrant(r1, q(a2, nReq)))
+            + env(a2, signedV2, e1, readers(r1, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* C:Cfg admitted(read(r1, q(a2, nReq))) .
+
+--- Tooth: the same grant applied to the COMPOSED label instead of to its
+--- issuer's own contribution. a1's grant clears a2's compartment along with its
+--- own and the read is admitted over a2's refusal -- one party holding a
+--- downgrade over another's data while the ownership check it passes says it
+--- holds none. A literal C1 counterexample, and the reason passing that check is
+--- not the property.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-GLOBAL-GRANTS :
+  composition(env(a1, signedV2, e1,
+                  readers(r1, q(a1, nOp)) & dgrant(r1, q(a2, nReq)))
+            + env(a2, signedV2, e1, readers(r1, q(a2, nOp))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a2, nReq)))
+  =>* C:Cfg admitted(read(r1, q(a2, nReq)))
+      soloRefuses(a2, read(r1, q(a2, nReq))) .
+
+--- Coverage: the integrity arm is not simply refusing everything. Both parties
+--- vouch v1 for r1, the sink demands v1, and the write is admitted.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1))
+            + env(a2, signedV2, e1, vouches(r1, v1)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg admitted(write(r1, k1)) .
+
+--- Bite: OMISSION_WIDENS, the full set. a1 vouches v1 and v2 and demands v1;
+--- a2's lower opinion of r1 vouches only v2. The intersection carries v2 alone,
+--- the demand for v1 is unmet, and the write is refused. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1))
+            + env(a2, signedV2, e1, vouches(r1, v2)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* admitted(write(r1, k1)) RESIDUAL:Cfg .
+
+--- Coverage: and the same run with a2's envelope simply left out is admitted.
+--- Nothing was forged and no rule was broken -- the set was short. This is why
+--- DR-0063 section 4 makes the composition record part of the run's evidence
+--- rather than a convenience.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1)),
+              rec(a1, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg admitted(write(r1, k1)) .
+
+--- Coverage: `require authority` is what closes that hole from a1's side. With
+--- a2 present the same write is admitted.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1,
+                  vouches(r1, v1 ; v2) & demands(k1, v1) & needs(a2))
+            + env(a2, signedV2, e1, vouches(r1, v1)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg admitted(write(r1, k1)) .
+
+--- Bite: and with a2 absent nothing is admitted, though the arms alone would
+--- have carried it. Fail closed on the omission. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1,
+                  vouches(r1, v1 ; v2) & demands(k1, v1) & needs(a2)),
+              rec(a1, e1))
+  attempt(write(r1, k1))
+  =>* admitted(write(r1, k1)) RESIDUAL:Cfg .
+
+--- Coverage: the refusal names itself rather than looking like an ordinary
+--- policy denial, so the missing authority can be reported.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1,
+                  vouches(r1, v1 ; v2) & demands(k1, v1) & needs(a2)),
+              rec(a1, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg compositionError .
+
+--- Bite: DR-0063 section 5, first arm. a1's envelope carries only the keyless
+--- checksum, whose real trust root is who can write the file -- fine for one
+--- admin, empty across authorities. It may not sit in a composed set, and the
+--- read it would otherwise have carried is refused. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, checksumOnly, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Coverage: named, again, rather than silently degraded to a weaker tag.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, checksumOnly, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg compositionError .
+
+--- Bite: section 5, second arm. a1's envelope is at epoch e1 and the composition
+--- record states e2 for a1. Under the `:v2` preimage the signature covers the
+--- epoch, so the mismatch is caught and nothing is admitted. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e2) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Tooth: the shipped preimage, which stops at the content hash. The same valid
+--- signature verifies under whatever epoch the record states, so a1's envelope
+--- is admitted while being cited as a policy version it is not. That is the
+--- non-retroactivity claim section 4's record is meant to carry, quietly false.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-V1-PREIMAGE :
+  composition(env(a1, signedV1, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV1, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e2) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg admitted(read(r1, q(a1, nOp))) .
+
+--- Bite: section 4's record is the run's EVIDENCE, so it must name exactly the
+--- set the run was checked under. This run is checked with both envelopes and
+--- its record states only a1 -- the shorter-record case section 4 calls the
+--- attack, and the read a1's envelope would have carried is refused. No
+--- solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Coverage: named, so the run can report which constituent its record failed to
+--- evidence rather than presenting the refusal as an ordinary policy denial.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg compositionError .
+
+--- Bite: the other direction. An entry for an authority the composition does not
+--- carry evidences an envelope that never applied, which is the same lie told
+--- the long way round. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp))),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Bite: and two entries for one authority leave the checked epoch undetermined.
+--- The envelope set's idempotence does not cover this -- duplicate ENVELOPES are
+--- the same policy twice, duplicate RECORD entries can state different epochs.
+--- No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp))),
+              rec(a1, e1) * rec(a1, e2))
+  attempt(read(r1, q(a1, nOp)))
+  =>* admitted(read(r1, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Tooth: the record consulted as a defaulting per-authority map rather than
+--- checked as a set. a2 is missing from the record, the lookup defaults its
+--- epoch to e1, the default happens to match, and the run is admitted while its
+--- evidence cites a set it was not checked under. This is OMISSION_WIDENS' tooth
+--- as section 4 states it: a run whose recorded set is shorter than the set it
+--- was checked under.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION-LOOSE-RECORD :
+  composition(env(a1, signedV2, e1, readers(r1, q(a1, nOp)))
+            + env(a2, signedV2, e1, readers(r2, q(a2, nReq))),
+              rec(a1, e1))
+  attempt(read(r1, q(a1, nOp)))
+  =>* C:Cfg admitted(read(r1, q(a1, nOp))) .
+
+--- MEET_COMMUTATIVE_AND_IDEMPOTENT. Order-independence is structural in this
+--- encoding -- the envelope set is an assoc-comm soup, so no rule CAN see an
+--- order. That is the honest limit of these three searches: they confirm the
+--- encoding did not smuggle an order dependence back in through a fold, which is
+--- the one place it could hide. Reversing an accepting set still accepts.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a2, signedV2, e1, vouches(r1, v1))
+            + env(a1, signedV2, e1,
+                  vouches(r1, v1 ; v2) & demands(k1, v1) & needs(a2)),
+              rec(a2, e1) * rec(a1, e1))
+  attempt(write(r1, k1))
+  =>* C:Cfg admitted(write(r1, k1)) .
+
+--- Reversing a refusing set still refuses. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a2, signedV2, e1, vouches(r1, v2))
+            + env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1)),
+              rec(a2, e1) * rec(a1, e1))
+  attempt(write(r1, k1))
+  =>* admitted(write(r1, k1)) RESIDUAL:Cfg .
+
+--- And a set carrying one party's envelope twice decides as the set does.
+--- Idempotence is what lets a composition record be assembled without first
+--- proving it holds no duplicates. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-COMPOSITION :
+  composition(env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1))
+            + env(a1, signedV2, e1, vouches(r1, v1 ; v2) & demands(k1, v1))
+            + env(a2, signedV2, e1, vouches(r1, v2)),
+              rec(a1, e1) * rec(a2, e1))
+  attempt(write(r1, k1))
+  =>* admitted(write(r1, k1)) RESIDUAL:Cfg .

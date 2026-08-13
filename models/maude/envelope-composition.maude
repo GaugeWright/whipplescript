@@ -1,0 +1,708 @@
+--- DR-0063: a run is governed by a SET of signed envelopes, one per party
+--- authority, and the effective policy is their MEET. The record defines
+--- composition by refusal rather than by schema:
+---
+---   C1  check(P, meet(S)) accepts  =>  every e in S accepts.
+---
+--- That is a one-way implication and it is the whole content of the design. A
+--- meet that refuses where a constituent accepts is fine -- stricter is always
+--- allowed. A meet that ACCEPTS where a constituent REFUSES is a party's policy
+--- being overridden by someone it never authorized, which is the failure the
+--- record exists to make impossible.
+---
+--- WHAT THIS MODEL IS FOR. C1 is a theorem about the composition function, not a
+--- definition of it, so the model must make the function concrete enough to get
+--- wrong. Composition therefore runs over the envelope ARMS, and the
+--- per-envelope (solo) verdict is computed by the SAME shared equations in every
+--- module below. Only the composed half varies. A sibling that composes one arm
+--- the other way then produces a state carrying `admitted(X)` and
+--- `soloRefuses(A, X)` together, which is a literal C1 counterexample rather
+--- than an argument about one.
+---
+--- THE TWO DUAL-GATED FIELDS COMPOSE IN OPPOSITE DIRECTIONS, and getting that
+--- backwards is the mistake this model exists to catch. The record's general
+--- rule: at a crossing the kernel asks `dominates(provider, required)`, so the
+--- `required` side composes by union and the `provider` side by intersection.
+---
+---   readers   is a CONJUNCTIVE COMPARTMENT SET -- a party reads only if it
+---             acts-for EVERY compartment (`reader_set` in ifc.rs, proved in
+---             models/lean/Whipple/ReaderSets.lean, where union is the join and
+---             the empty set is the public bottom). As a source tag it therefore
+---             composes by UNION. Intersecting two envelopes' compartments
+---             widens: A::Operator intersect B::Auditor is empty, which is
+---             public, a label both constituents refuse.
+---   vouchers  are the provider side at a sink, so a source tag composes by
+---             INTERSECTION -- data is only as trusted as the LEAST-trusting
+---             party, and A vouching for A's own data does not bind B. Sink
+---             demands compose by union, being the `required` side.
+---
+--- The model covers the SOURCE reading of both fields and the SINK reading of
+--- integrity. The sink reading of readers is the mirror of the source reading of
+--- vouchers and is not separately modelled; that is an honest limit, not a claim
+--- that it needs no rule.
+---
+--- DOWNGRADE GRANTS ARE OWNED, NOT COMPOSED (section 3), and "not composed" has
+--- to be read INSIDE the fold: a grant clears the compartments of the envelope
+--- that ISSUED it and no others. On a resource two envelopes both label, a grant
+--- applied to the composed label would clear its co-owner's compartment as well,
+--- which is a party's policy being overridden by someone it never authorized --
+--- the very thing ownership is meant to prevent. Passing the ownership check is
+--- therefore not enough; the issuer must still be known when the grant applies.
+---
+--- THE COMPOSITION RECORD IS EVIDENCE (section 4), so it must name exactly the
+--- set the run was checked under. A record short of the composition is the
+--- omission section 4 calls the attack; an entry for an authority the
+--- composition does not carry evidences an envelope that never applied; and two
+--- entries for one authority leave the checked epoch undetermined. There is no
+--- default entry -- a constituent the record does not name is refused, because a
+--- defaulted entry is a policy version nobody stated.
+---
+--- Grounding, against the shipped envelope schema in
+--- spec/information-flow-governance.md:
+---   readers(R, RS)     confidentiality compartments on a resource this envelope
+---                      labels
+---   vouches(R, VS)     integrity as a SOURCE TAG   -- what R's output carries
+---   demands(R, VS)     integrity as a SINK DEMAND  -- what writing R requires
+---   dgrant(R, P)       a declassify grant over R
+---   needs(B)           `require authority B` -- DR-0063 section 4
+---   env(A, S, EP, AR)  one envelope: authority, signature tier, epoch, arms
+---   rec(A, EP)         one entry of the run's composition record -- section 4
+---
+--- MODELLING ASSUMPTION, stated because it is not a fact: every envelope names
+--- resources under one spelling, so two envelopes that label `r1` are labelling
+--- the same bytes. Two authorities naming one physical resource differently, or
+--- one name meaning different bytes on different executors, is DR-0063 O2 --
+--- resolving it is prior to composing it.
+
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA is
+  protecting BOOL .
+
+  sorts Name Auth Role RoleSet Res Voucher VSet Sig Epoch .
+  sorts Arm ArmSet Env EnvSet Rec RecSet Attempt Fact Cfg .
+  subsort Role < RoleSet .
+  subsort Voucher < VSet .
+  subsort Arm < ArmSet .
+  subsort Env < EnvSet .
+  subsort Rec < RecSet .
+  subsort Fact < Cfg .
+
+  ops a1 a2 : -> Auth [ctor] .
+  ops nOp nReq : -> Name [ctor] .
+
+  --- DR-0063 section 2. A role reference is qualified by the authority that
+  --- issued it, so two envelopes naming `Operator` do not name one principal.
+  op q : Auth Name -> Role [ctor] .
+
+  op mtRole : -> RoleSet [ctor] .
+  op _|_ : RoleSet RoleSet -> RoleSet [ctor assoc comm id: mtRole] .
+  eq P:Role | P:Role = P:Role .
+
+  ops v1 v2 : -> Voucher [ctor] .
+  op mtV : -> VSet [ctor] .
+  op _;_ : VSet VSet -> VSet [ctor assoc comm id: mtV] .
+  eq V:Voucher ; V:Voucher = V:Voucher .
+
+  ops r1 r2 k1 : -> Res [ctor] .
+  ops e1 e2 : -> Epoch [ctor] .
+
+  --- The three attestation tiers of spec/information-flow-governance.md's trust
+  --- root, plus the domain-tag split DR-0063 section 5 adds. `signedV1` is the
+  --- shipped P-256 signature, whose preimage covers signer, key, algorithm and
+  --- content hash but NOT the epoch. `signedV2` is the same signature over the
+  --- preimage that also binds the epoch and the authority.
+  ops signedV2 signedV1 checksumOnly : -> Sig [ctor] .
+
+  --- CONFIDENTIALITY. A label is a set of compartments and a party may read only
+  --- if it acts-for every one of them. Delegation is not modelled, so acts-for
+  --- is equality here: the empty set is the public bottom, and a singleton is
+  --- that party's own compartment. This is `canRead` from the Lean model.
+  op canRead : Role RoleSet -> Bool .
+  eq canRead(P:Role, mtRole) = true .
+  eq canRead(P:Role, C:Role | RS:RoleSet) =
+       (P:Role == C:Role) and canRead(P:Role, RS:RoleSet) .
+
+  op inRole : Role RoleSet -> Bool .
+  eq inRole(P:Role, P:Role | RS:RoleSet) = true .
+  eq inRole(P:Role, RS:RoleSet) = false [owise] .
+
+  op interRole : RoleSet RoleSet -> RoleSet .
+  eq interRole(mtRole, RS:RoleSet) = mtRole .
+  eq interRole(P:Role | RS1:RoleSet, RS2:RoleSet) =
+       if inRole(P:Role, RS2:RoleSet)
+       then P:Role | interRole(RS1:RoleSet, RS2:RoleSet)
+       else interRole(RS1:RoleSet, RS2:RoleSet) fi .
+
+  op inV : Voucher VSet -> Bool .
+  eq inV(V:Voucher, V:Voucher ; VS:VSet) = true .
+  eq inV(V:Voucher, VS:VSet) = false [owise] .
+
+  op subV : VSet VSet -> Bool .
+  eq subV(mtV, VS:VSet) = true .
+  eq subV(V:Voucher ; VS1:VSet, VS2:VSet) =
+       inV(V:Voucher, VS2:VSet) and subV(VS1:VSet, VS2:VSet) .
+
+  op interV : VSet VSet -> VSet .
+  eq interV(mtV, VS:VSet) = mtV .
+  eq interV(V:Voucher ; VS1:VSet, VS2:VSet) =
+       if inV(V:Voucher, VS2:VSet)
+       then V:Voucher ; interV(VS1:VSet, VS2:VSet)
+       else interV(VS1:VSet, VS2:VSet) fi .
+
+  op readers : Res RoleSet -> Arm [ctor] .
+  op vouches : Res VSet -> Arm [ctor] .
+  op demands : Res VSet -> Arm [ctor] .
+  op dgrant : Res Role -> Arm [ctor] .
+  op needs : Auth -> Arm [ctor] .
+  op mtArm : -> ArmSet [ctor] .
+  op _&_ : ArmSet ArmSet -> ArmSet [ctor assoc comm id: mtArm] .
+
+  op env : Auth Sig Epoch ArmSet -> Env [ctor] .
+  op mtEnv : -> EnvSet [ctor] .
+  op _+_ : EnvSet EnvSet -> EnvSet [ctor assoc comm id: mtEnv] .
+
+  op rec : Auth Epoch -> Rec [ctor] .
+  op mtRec : -> RecSet [ctor] .
+  op _*_ : RecSet RecSet -> RecSet [ctor assoc comm id: mtRec] .
+
+  vars A B : Auth .   var N : Name .   var S : Sig .   vars EP EP2 : Epoch .
+  var AR : ArmSet .   var E : Env .    var ES : EnvSet .
+  var RC : RecSet .   vars R K : Res . var P : Role .
+  var RS : RoleSet .  var VS : VSet .
+
+  op authOf : Env -> Auth .
+  eq authOf(env(A, S, EP, AR)) = A .
+
+  op sigOf : Env -> Sig .
+  eq sigOf(env(A, S, EP, AR)) = S .
+
+  op epochOf : Env -> Epoch .
+  eq epochOf(env(A, S, EP, AR)) = EP .
+
+  --- `hasReaders` asks whether this envelope LABELS the resource, which is the
+  --- ownership question section 3 turns on. It is not the same as the reader set
+  --- being non-empty: an empty compartment set is the public bottom, so for the
+  --- composition itself no arm and an empty arm coincide, and `readersOf` alone
+  --- carries that correctly.
+  op hasReaders : Env Res -> Bool .
+  eq hasReaders(env(A, S, EP, readers(R, RS) & AR), R) = true .
+  eq hasReaders(E, R) = false [owise] .
+
+  op readersOf : Env Res -> RoleSet .
+  eq readersOf(env(A, S, EP, readers(R, RS) & AR), R) = RS .
+  eq readersOf(E, R) = mtRole [owise] .
+
+  --- Integrity is the other way round: the intersection that composes source
+  --- vouchers has the universe as its identity, so "vouches nothing" and "says
+  --- nothing" must stay distinguishable.
+  op hasVouch : Env Res -> Bool .
+  eq hasVouch(env(A, S, EP, vouches(R, VS) & AR), R) = true .
+  eq hasVouch(E, R) = false [owise] .
+
+  op vouchOf : Env Res -> VSet .
+  eq vouchOf(env(A, S, EP, vouches(R, VS) & AR), R) = VS .
+  eq vouchOf(E, R) = mtV [owise] .
+
+  op demandOf : Env Res -> VSet .
+  eq demandOf(env(A, S, EP, demands(K, VS) & AR), K) = VS .
+  eq demandOf(E, K) = mtV [owise] .
+
+  op grantsD : Env Res Role -> Bool .
+  eq grantsD(env(A, S, EP, dgrant(R, P) & AR), R, P) = true .
+  eq grantsD(E, R, P) = false [owise] .
+
+  --- DR-0063 section 3. A declassify grant over a resource this envelope does
+  --- not itself label is a grant over another party's data. Checked per
+  --- envelope, because ownership is local: it does not depend on who else is in
+  --- the composition.
+  op selfGrantOnly : Env -> Bool .
+  eq selfGrantOnly(env(A, S, EP, dgrant(R, P) & AR)) =
+       hasReaders(env(A, S, EP, dgrant(R, P) & AR), R)
+       and selfGrantOnly(env(A, S, EP, AR)) .
+  eq selfGrantOnly(E) = true [owise] .
+
+  op selfGrantsOnly : EnvSet -> Bool .
+  eq selfGrantsOnly(mtEnv) = true .
+  eq selfGrantsOnly(E + ES) = selfGrantOnly(E) and selfGrantsOnly(ES) .
+
+  --- DR-0063 section 5, first arm: only the authenticated trust root, and only
+  --- under the preimage that binds the epoch.
+  op allV2 : EnvSet -> Bool .
+  eq allV2(mtEnv) = true .
+  eq allV2(E + ES) = (sigOf(E) == signedV2) and allV2(ES) .
+
+  --- The sibling policy: accept the shipped signature too. Used by the
+  --- -V1-PREIMAGE module below.
+  op allSigned : EnvSet -> Bool .
+  eq allSigned(mtEnv) = true .
+  eq allSigned(E + ES) =
+       ((sigOf(E) == signedV2) or (sigOf(E) == signedV1)) and allSigned(ES) .
+
+  --- Second arm: the composition record states an epoch per authority, and it
+  --- must be the one the signature covers. Under `signedV1` the preimage does
+  --- not reach the epoch, so any stated epoch verifies -- which is what lets a
+  --- replayed constituent be presented as a different policy version.
+  ---
+  --- The record is CHECKED, not consulted: `recStates` asks whether the record
+  --- holds this authority at this epoch, and a constituent the record does not
+  --- name has no stated epoch at all rather than a defaulted one.
+  op recStates : Auth Epoch RecSet -> Bool .
+  eq recStates(A, EP, rec(A, EP) * RC) = true .
+  eq recStates(A, EP, RC) = false [owise] .
+
+  op epochBound : Env RecSet -> Bool .
+  eq epochBound(E, RC) =
+       if sigOf(E) == signedV2
+       then recStates(authOf(E), epochOf(E), RC)
+       else true fi .
+
+  op epochsBound : EnvSet RecSet -> Bool .
+  eq epochsBound(mtEnv, RC) = true .
+  eq epochsBound(E + ES, RC) = epochBound(E, RC) and epochsBound(ES, RC) .
+
+  --- The lenient lookup, for the -LOOSE-RECORD tooth below: a defaulting
+  --- per-authority map, which is what a record consulted rather than checked
+  --- gives you. A missing entry defaults, and duplicate entries for one
+  --- authority make the lookup itself undetermined -- which is the second half
+  --- of why the record is a set obligation and not a map read.
+  op statedEpoch : Auth RecSet -> Epoch .
+  eq statedEpoch(A, rec(A, EP) * RC) = EP .
+  eq statedEpoch(A, RC) = e1 [owise] .
+
+  op epochBoundLoose : Env RecSet -> Bool .
+  eq epochBoundLoose(E, RC) =
+       if sigOf(E) == signedV2
+       then epochOf(E) == statedEpoch(authOf(E), RC)
+       else true fi .
+
+  op epochsBoundLoose : EnvSet RecSet -> Bool .
+  eq epochsBoundLoose(mtEnv, RC) = true .
+  eq epochsBoundLoose(E + ES, RC) =
+       epochBoundLoose(E, RC) and epochsBoundLoose(ES, RC) .
+
+  op present : Auth EnvSet -> Bool .
+  eq present(A, env(A, S, EP, AR) + ES) = true .
+  eq present(A, ES) = false [owise] .
+
+  --- DR-0063 section 4. The record is what the run's evidence cites, so it must
+  --- name exactly the set that was checked: every constituent covered, no entry
+  --- for an authority the composition does not carry, and no authority named
+  --- twice. Envelope duplication stays harmless -- the envelope set is
+  --- idempotent -- but RECORD duplication is not, because two entries for one
+  --- authority can state different epochs.
+  op recNames : Auth RecSet -> Bool .
+  eq recNames(A, rec(A, EP) * RC) = true .
+  eq recNames(A, RC) = false [owise] .
+
+  op recCovers : EnvSet RecSet -> Bool .
+  eq recCovers(mtEnv, RC) = true .
+  eq recCovers(E + ES, RC) = recNames(authOf(E), RC) and recCovers(ES, RC) .
+
+  op recOnlyPresent : RecSet EnvSet -> Bool .
+  eq recOnlyPresent(mtRec, ES) = true .
+  eq recOnlyPresent(rec(A, EP) * RC, ES) =
+       present(A, ES) and recOnlyPresent(RC, ES) .
+
+  op recDuplicated : RecSet -> Bool .
+  eq recDuplicated(rec(A, EP) * rec(A, EP2) * RC) = true .
+  eq recDuplicated(RC) = false [owise] .
+
+  op recordExact : EnvSet RecSet -> Bool .
+  eq recordExact(ES, RC) =
+       recCovers(ES, RC) and recOnlyPresent(RC, ES)
+       and not recDuplicated(RC) .
+
+  op envNeedsMet : Env EnvSet -> Bool .
+  eq envNeedsMet(env(A, S, EP, needs(B) & AR), ES) =
+       present(B, ES) and envNeedsMet(env(A, S, EP, AR), ES) .
+  eq envNeedsMet(E, ES) = true [owise] .
+
+  op needsMet : EnvSet EnvSet -> Bool .
+  eq needsMet(mtEnv, ES) = true .
+  eq needsMet(E + ES1:EnvSet, ES) =
+       envNeedsMet(E, ES) and needsMet(ES1:EnvSet, ES) .
+
+  op read : Res Role -> Attempt [ctor] .
+  op write : Res Res -> Attempt [ctor] .
+
+  --- THE SOLO VERDICT. Shared by every module below and never overridden, so a
+  --- sibling cannot make a C1 counterexample disappear by quietly weakening the
+  --- constituent it is supposed to be compared against.
+  op soloCarried : Env Res -> VSet .
+  eq soloCarried(E, R) = if hasVouch(E, R) then vouchOf(E, R) else mtV fi .
+
+  op envAccepts : Env Attempt -> Bool .
+  eq envAccepts(E, read(R, P)) =
+       canRead(P, readersOf(E, R)) or grantsD(E, R, P) .
+  eq envAccepts(E, write(R, K)) = subV(demandOf(E, K), soloCarried(E, R)) .
+
+  --- THE COMPOSED ARMS. Both folds of each dual-gated field live here, so a
+  --- policy module below differs from the main one in exactly one equation and
+  --- the tooth is legible as a diff rather than as a second model.
+
+  --- DR-0063 section 3, applied where the issuer is still known: a downgrade
+  --- grant clears the compartments of the envelope that issued it, and that
+  --- envelope's contribution to the composed label only. `selfGrantsOnly` has
+  --- already made a grant from a non-labelling envelope a hard error, so inside
+  --- a well-formed composition this is always the owner clearing its own data.
+  op ownReaders : Env Res Role -> RoleSet .
+  eq ownReaders(E, R, P) =
+       if grantsD(E, R, P) then mtRole else readersOf(E, R) fi .
+
+  --- Confidentiality source tag: UNION of compartments. mtRole is both the
+  --- identity of the fold and the public bottom, so an unlabelled resource needs
+  --- no guard -- it composes to public, which refuses nothing.
+  op readerJoin : EnvSet Res Role -> RoleSet .
+  eq readerJoin(mtEnv, R, P) = mtRole .
+  eq readerJoin(E + ES, R, P) = ownReaders(E, R, P) | readerJoin(ES, R, P) .
+
+  --- The other way round, for the -INTERSECTED-READERS tooth. Intersection has
+  --- the universe as its identity, so this one needs the guard the correct fold
+  --- does not.
+  op anyReaders : EnvSet Res -> Bool .
+  eq anyReaders(mtEnv, R) = false .
+  eq anyReaders(E + ES, R) = hasReaders(E, R) or anyReaders(ES, R) .
+
+  op readerMeetRaw : EnvSet Res Role -> RoleSet .
+  eq readerMeetRaw(mtEnv, R, P) =
+       q(a1, nOp) | q(a1, nReq) | q(a2, nOp) | q(a2, nReq) .
+  eq readerMeetRaw(E + ES, R, P) =
+       if hasReaders(E, R)
+       then interRole(ownReaders(E, R, P), readerMeetRaw(ES, R, P))
+       else readerMeetRaw(ES, R, P) fi .
+
+  op readerMeet : EnvSet Res Role -> RoleSet .
+  eq readerMeet(ES, R, P) =
+       if anyReaders(ES, R) then readerMeetRaw(ES, R, P) else mtRole fi .
+
+  --- Integrity source tag: INTERSECTION over the envelopes that vouch.
+  op anyVouch : EnvSet Res -> Bool .
+  eq anyVouch(mtEnv, R) = false .
+  eq anyVouch(E + ES, R) = hasVouch(E, R) or anyVouch(ES, R) .
+
+  op vouchMeetRaw : EnvSet Res -> VSet .
+  eq vouchMeetRaw(mtEnv, R) = v1 ; v2 .
+  eq vouchMeetRaw(E + ES, R) =
+       if hasVouch(E, R)
+       then interV(vouchOf(E, R), vouchMeetRaw(ES, R))
+       else vouchMeetRaw(ES, R) fi .
+
+  op vouchMeet : EnvSet Res -> VSet .
+  eq vouchMeet(ES, R) = if anyVouch(ES, R) then vouchMeetRaw(ES, R) else mtV fi .
+
+  --- And the other way round, for the -UNION-VOUCHERS tooth.
+  op vouchJoin : EnvSet Res -> VSet .
+  eq vouchJoin(mtEnv, R) = mtV .
+  eq vouchJoin(E + ES, R) = vouchOf(E, R) ; vouchJoin(ES, R) .
+
+  --- Integrity sink demand: UNION, the `required` side.
+  op demanded : EnvSet Res -> VSet .
+  eq demanded(mtEnv, K) = mtV .
+  eq demanded(E + ES, K) = demandOf(E, K) ; demanded(ES, K) .
+
+  --- For the -GLOBAL-GRANTS tooth: an owner's grant applied to the COMPOSED
+  --- label rather than to its issuer's own contribution. The ownership check is
+  --- honoured -- only a labelling envelope's grant counts -- and it is still
+  --- wrong, because on a resource two envelopes label it clears the co-owner's
+  --- compartment too.
+  op ownerGrants : EnvSet Res Role -> Bool .
+  eq ownerGrants(mtEnv, R, P) = false .
+  eq ownerGrants(E + ES, R, P) =
+       (hasReaders(E, R) and grantsD(E, R, P)) or ownerGrants(ES, R, P) .
+
+  --- The -OPEN-GRANTS sibling substitutes this: any envelope's grant counts.
+  op looseGrants : EnvSet Res Role -> Bool .
+  eq looseGrants(mtEnv, R, P) = false .
+  eq looseGrants(E + ES, R, P) = grantsD(E, R, P) or looseGrants(ES, R, P) .
+
+  op composition : EnvSet RecSet -> Fact [ctor] .
+  op attempt : Attempt -> Fact [ctor] .
+  op admitted : Attempt -> Fact [ctor] .
+  op soloRefuses : Auth Attempt -> Fact [ctor] .
+  op compositionError : -> Fact [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  var X : Attempt .
+  eq admitted(X) admitted(X) = admitted(X) .
+  eq soloRefuses(A, X) soloRefuses(A, X) = soloRefuses(A, X) .
+  eq compositionError compositionError = compositionError .
+endm
+
+--- THE COMPOSITION UNDER TEST.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canRead(P, readerJoin(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  --- DR-0063 sections 3, 4 and 5. Fail-closed and NAMED: an ill-formed
+  --- composition produces `compositionError` rather than dropping the offending
+  --- arm, because a silently dropped grant is one a party goes on believing it
+  --- holds.
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  --- The constituent verdicts, recorded alongside the composed one so that a C1
+  --- counterexample is a single reachable state rather than a comparison run by
+  --- hand between two searches.
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 1, SOUND_MEET on the confidentiality arm. Compartment sets composed by
+--- intersection instead of union -- the direction that reads as "restrict to
+--- what both allow" and is exactly backwards for a conjunctive set. Two parties
+--- each attach their own compartment to one resource, the intersection is empty,
+--- and empty is the public bottom: a label neither constituent would have
+--- accepted admits everyone.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-INTERSECTED-READERS is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canRead(P, readerMeet(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 2, SOUND_MEET on the integrity arm. Source vouchers composed by union
+--- instead of intersection: the composed source carries what ANY party vouched,
+--- so one party's lower opinion of a shared source is discarded and its own
+--- sink demand is met over its own refusal.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-UNION-VOUCHERS is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canRead(P, readerJoin(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchJoin(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 3, NO_ROLE_ALIASING. A compartment is satisfied by matching its NAME,
+--- which is what a bare unqualified role string gives you. One authority's
+--- Operator then clears another authority's compartment, having been granted
+--- nothing by anyone.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-ALIASED-ROLES is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  vars A B : Auth .  vars M N : Name .
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var RS : RoleSet .  var X : Attempt .
+
+  op canReadByName : Role RoleSet -> Bool .
+  eq canReadByName(P, mtRole) = true .
+  eq canReadByName(q(A, N), q(B, M) | RS) =
+       (N == M) and canReadByName(q(A, N), RS) .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canReadByName(P, readerJoin(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 4, NO_CROSS_GRANT. Ownership is dropped from both places it appears: a
+--- foreign declassify grant no longer makes the composition ill-formed, and it
+--- authorizes a crossing on the resource it names. This is the "silently
+--- ignored" alternative built out honestly -- the weaker of the two failures,
+--- and it still hands one party a downgrade over another's data.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-OPEN-GRANTS is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) =
+       canRead(P, readerJoin(ES, R, P)) or looseGrants(ES, R, P) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 5, SOUND_MEET on the grant arm. A downgrade grant applied to the
+--- COMPOSED label rather than to the compartments of the envelope that issued
+--- it. Section 3's "grants are not intersected" is true, and this is the wrong
+--- reading of it: the ownership check is honoured -- only a labelling envelope's
+--- grant counts -- and on a resource two envelopes both label, the issuer's
+--- grant clears its co-owner's compartment as well as its own. The same failure
+--- -OPEN-GRANTS reaches by dropping the ownership check, reached here while
+--- passing it, which is why passing it is not the property.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-GLOBAL-GRANTS is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) =
+       canRead(P, readerJoin(ES, R, P)) or ownerGrants(ES, R, P) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 6, OMISSION_WIDENS. The composition record is consulted as a defaulting
+--- per-authority map rather than checked as a set: a constituent the record does
+--- not name gets a default epoch, an entry naming an absent authority is never
+--- looked at, and a doubly-named authority resolves to whichever entry the
+--- lookup reaches. The run is then admitted while citing evidence for a set it
+--- was not checked under, which is the shorter-record case section 4 names.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-LOOSE-RECORD is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canRead(P, readerJoin(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allV2(ES) and epochsBoundLoose(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
+
+--- TOOTH 7, the epoch. The shipped P-256 preimage covers signer, key, algorithm
+--- and content hash but not the epoch, and this module admits it. The same valid
+--- signature then verifies under whatever epoch the composition record states,
+--- so a constituent can be replayed as a different -- including an earlier --
+--- policy version, which is the non-retroactivity claim section 4's record is
+--- meant to carry.
+mod WHIPPLESCRIPT-ENVELOPE-COMPOSITION-V1-PREIMAGE is
+  protecting WHIPPLESCRIPT-ENVELOPE-COMPOSITION-DATA .
+
+  var E : Env .   var ES : EnvSet .   var RC : RecSet .
+  vars R K : Res . var P : Role .     var X : Attempt .
+
+  op meetAccepts : EnvSet Attempt -> Bool .
+  eq meetAccepts(ES, read(R, P)) = canRead(P, readerJoin(ES, R, P)) .
+  eq meetAccepts(ES, write(R, K)) = subV(demanded(ES, K), vouchMeet(ES, R)) .
+
+  op wellFormed : EnvSet RecSet -> Bool .
+  eq wellFormed(ES, RC) =
+       allSigned(ES) and epochsBound(ES, RC) and recordExact(ES, RC)
+       and selfGrantsOnly(ES) and needsMet(ES, ES) .
+
+  crl [meet-admit] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) admitted(X)
+    if wellFormed(ES, RC) and meetAccepts(ES, X) .
+
+  crl [ill-formed] : composition(ES, RC) attempt(X)
+    => composition(ES, RC) attempt(X) compositionError
+    if not wellFormed(ES, RC) .
+
+  crl [solo-refuse] : composition(E + ES, RC) attempt(X)
+    => composition(E + ES, RC) attempt(X) soloRefuses(authOf(E), X)
+    if not envAccepts(E, X) .
+endm
