@@ -5000,7 +5000,7 @@ fn expand_source_emit_from(ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>
                 related: Vec::new(),
                 span: source.span,
                 message: format!(
-                    "source `{}` emits `from {from}`, but the only binding in scope is the                      observe binding `{}`",
+                    "source `{}` emits `from {from}`, but the only binding in scope is the observe binding `{}`",
                     source.name, source.observe_binding
                 ),
                 suggestion: Some(format!("write `emit {} from {}`", source.emit_signal, source.observe_binding)),
@@ -32189,6 +32189,583 @@ rule r
             "{:?}",
             compiled.diagnostics
         );
+    }
+
+    /// `pattern` and `apply` are the compile-time reuse surface: an `apply`
+    /// expands into ordinary declarations before the type check, so a mistake here
+    /// produces declarations the author never wrote. A mutation sweep found none
+    /// of these refusals exercised.
+    ///
+    /// Two further guards in this area — `pattern ... is not allowed inside this
+    /// declaration scope` and `pattern application ... was not expanded` — are
+    /// deliberately absent. They sit after the expansion pass in `lower_program`
+    /// and fire only if expansion left an item behind; a failed expansion removes
+    /// the item, so no source program reaches them. They are internal invariants
+    /// rather than refusals, which is why the sweep could not tell them apart from
+    /// the five below.
+    #[test]
+    fn pattern_and_apply_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "pattern `Twice` is declared more than once",
+                r#"
+workflow P
+output result R
+class R { ok bool }
+
+pattern Twice<A> {
+  rule x
+    when started
+  => { complete result { ok true } }
+}
+
+pattern Twice<A> {
+  rule y
+    when started
+  => { complete result { ok true } }
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "pattern `Missing` was not found",
+                r#"
+workflow P
+output result R
+class R { ok bool }
+
+apply Missing<R> as Thing { }
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "pattern `Two` expects 2 type arguments but got 1",
+                r#"
+workflow P
+output result R
+class R { ok bool }
+
+pattern Two<A, B> {
+  rule x
+    when started
+  => { complete result { ok true } }
+}
+
+apply Two<R> as Thing { }
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "pattern application `Thing` passes argument `reviewer` more than once",
+                r#"
+workflow P
+output result R
+class R { ok bool }
+
+pattern One<A> {
+  rule x
+    when started
+  => { complete result { ok true } }
+}
+
+apply One<R> as Thing {
+  reviewer codex
+  reviewer claude
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            (
+                "pattern application `Thing` has malformed argument `!!!`",
+                r#"
+workflow P
+output result R
+class R { ok bool }
+
+pattern One<A> {
+  rule x
+    when started
+  => { complete result { ok true } }
+}
+
+apply One<R> as Thing {
+  !!!
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+        ];
+
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            assert!(
+                compiled.diagnostics.iter().any(|d| d.message == *expected),
+                "expected `{expected}`, got {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The declaration surface — `source`, `signal`, `agent`, `lease`,
+    /// `counter`, `test`, and `AgentRef` — is where a workflow names the world
+    /// outside itself. A refusal here separates a typo from a workflow that
+    /// observes nothing, contends for a slot nobody holds, or routes to an
+    /// agent that does not exist. A mutation sweep found none of these
+    /// exercised, and one of them had a wrapped line's indentation sitting
+    /// The rule body is where a workflow says what it DOES, so these refusals
+    /// are the ones an author meets most: an unknown terminal, an agent that
+    /// does not exist, a `case` arm over a value that cannot be matched, an
+    /// `after` predicate that observes the wrong outcome. A mutation sweep
+    /// found none of them exercised, and a second sweep across the whole
+    /// workspace confirmed it — a parser-suite-only verdict called nine more
+    /// unexercised that CLI and kernel tests do reach, so the cheap answer is
+    /// not the answer.
+    ///
+    /// Three neighbours are deliberately absent, and were not merely skipped.
+    /// `has malformed tell target`, `has malformed field assignment in
+    /// \`record ...\``, and `has invalid expression for field` each sit behind a
+    /// line-shape helper whose failure condition the parser rejects earlier, so
+    /// no fixture reached them. That is a weaker claim than the unreachable
+    /// `pattern` guards: these may yet be reachable by a shape not tried here,
+    /// which is why they are recorded rather than asserted impossible.
+    #[test]
+    fn rule_body_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            ("rule `r` completes unknown workflow terminal `missing`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> { complete missing { ok true } }\n"),
+            // Same message, a DIFFERENT refusal: the scalar terminal form
+            // (`complete <name> <value>`, no block) is checked on its own path
+            // from the block form below, so covering one leaves the other dead.
+            // The bite test found exactly that -- this table asserted the text
+            // and the scalar site stayed unexercised.
+            ("rule `r` completes unknown workflow terminal `missing`",
+             "workflow W\noutput result bool\nrule r\n  when started\n=> { complete missing true }\n"),
+            ("rule `r` has malformed `complete` action", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> { complete result extra words { ok true } }\n"),
+            ("rule `r` has unknown binding `nope` in `complete result` value", "workflow W\noutput result bool\nclass T { title string }\nrule r\n  when T as t\n=> { complete result nope.flag }\n"),
+            ("rule `r` has unknown readiness pattern `42 as x`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when 42 as x\n=> { complete result { ok true } }\n"),
+            ("rule `r` has `after out reaches \"half\"` for `out`, which is not a workflow-invoke binding in this rule", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce classify(t.title) as out\n  after out reaches \"half\" { complete result { ok true } }\n}\n"),
+            ("rule `r` observes acquire `s` with `succeeds`, which also matches a Contended outcome (the acquire op completes either way)", "use std.coord\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nlease slot { key T slots 1 ttl 10m }\nrule r\n  when T as t\n=> {\n  acquire slot for t.id as s\n  after s succeeds { complete result { ok true } }\n}\n"),
+            ("rule `r` observes counter consume `c` with `succeeds`, which also matches an Over outcome (the consume op completes either way)", "use std.coord\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { name string }\ncounter budget { key T cap 3 reset daily }\nrule r\n  when T as t\n=> {\n  consume budget for t.name amount 1 as c\n  after c succeeds { complete result { ok true } }\n}\n"),
+            ("rule `r` has unsupported `after` dependency predicate", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce classify(t.title) as out\n  after out explodes { complete result { ok true } }\n}\n"),
+            ("rule `r` records unknown class `Missing`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> {\n  record Missing { ok true }\n  complete result { ok true }\n}\n"),
+            ("rule `r` has malformed coerce call", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce notacall as out\n  after out completes { complete result { ok true } }\n}\n"),
+            ("rule `r` has malformed workflow invocation", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> {\n  invoke as child\n  after child succeeds { complete result { ok true } }\n}\n"),
+            ("rule `r` uses a string literal as a tell target", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> { tell \"someone\" \"do a thing\" }\n"),
+            ("rule `r` tells unknown agent `ghost`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> { tell ghost \"do a thing\" }\n"),
+            ("rule `r` checks availability for non-AgentRef `t.title`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n  when t.title is available\n=> { complete result { ok true } }\n"),
+            ("rule `r` checks unknown agent `ghost`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n  when ghost is available\n=> { complete result { ok true } }\n"),
+            ("rule `r` has case scrutinee `\"lit\"` that is not a typed path", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  case \"lit\" {\n    _ => { complete result { ok true } }\n  }\n}\n"),
+            ("rule `r` uses `None` for a non-optional case", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  case t.title {\n    None => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` has unsupported case pattern `u.other`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { speed \"fast\" | \"slow\" }\nclass U { other string }\nrule r\n  when T as t\n  when U as u\n=> {\n  case t.speed {\n    u.other => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` has unsupported AgentRef case pattern `x.y`", "use std.agent\n\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture profile \"repo-writer\" capacity 1 }\nclass T { owner AgentRef<a> }\nrule r\n  when T as t\n=> {\n  case t.owner {\n    x.y => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` cannot pattern-match this scrutinee type", "workflow W\noutput result R\nclass R { ok bool }\nclass T { count int }\nrule r\n  when T as t\n=> {\n  case t.count {\n    1 => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` case pattern must be one of its literal variants", "workflow W\noutput result R\nclass R { ok bool }\nclass T { speed \"fast\" | \"slow\" }\nrule r\n  when T as t\n=> {\n  case t.speed {\n    42 => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` case pattern cannot be `medium`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { speed \"fast\" | \"slow\" }\nrule r\n  when T as t\n=> {\n  case t.speed {\n    \"medium\" => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` has non-agent case pattern", "use std.agent\n\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture profile \"repo-writer\" capacity 1 }\nclass T { owner AgentRef<a> }\nrule r\n  when T as t\n=> {\n  case t.owner {\n    42 => { complete result { ok true } }\n    _ => { complete result { ok false } }\n  }\n}\n"),
+            ("rule `r` redacts `nope`, which has no known schema", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> {\n  redact nope keep [ok] as clean\n  complete result { ok true }\n}\n"),
+            ("rule `r` appends to undeclared ledger `nope`", "workflow W\noutput result R\nclass R { ok bool }\nclass Entry { area string }\nrule r\n  when started\n=> {\n  append Entry { area \"a\" } to nope as e\n  after e succeeds { complete result { ok true } }\n}\n"),
+            ("rule `r` appends unknown entry class `Missing`", "use std.coord\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass Entry { area string }\nledger log { entry Entry partition by area retain 30d }\nrule r\n  when started\n=> {\n  append Missing { area \"a\" } to log as e\n  after e succeeds { complete result { ok true } }\n}\n"),
+            ("rule `r` consumes undeclared counter `nope`", "use std.coord\n\nworkflow W\noutput result R\nfailure error R\nclass R { ok bool }\nclass T { name string }\nrule r\n  when T as t\n=> {\n  consume nope for t.name amount 1 as c\n  after c ok { complete result { ok true } }\n  after c over { fail error { ok false } }\n}\n"),
+            ("rule `r` has invalid `timer until` operand `t`: `t` is a `T` record, not a `time` value", "workflow W\noutput result R\nclass R { ok bool }\nclass T { due time }\nrule r\n  when T as t\n=> {\n  timer until t as d\n  after d succeeds { complete result { ok true } }\n}\n"),
+        ];
+
+        // Report EVERY mismatch, not just the first. A table this size fails
+        // one case at a time otherwise, and each rerun costs a full rebuild.
+        let mut missing = Vec::new();
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+                missing.push(format!(
+                    "expected `{expected}`\n     got {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} rule-body refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// inside its message text, which is what an unasserted message looks like.
+    #[test]
+    fn declaration_refusals_fire() {
+        const SOURCE_PRELUDE: &str = r#"use std.ingress
+
+@service
+workflow S
+
+signal ingress.fed {
+  text string
+}
+
+class FedLine {
+  text string
+}
+
+rule record_line
+  when ingress.fed as f
+=> {
+  record FedLine {
+    text f.text
+  }
+}
+"#;
+
+        let cases: &[(&str, String)] = &[
+            (
+                "lease `slot` keys on undeclared type `Missing`",
+                r#"use std.coord
+
+workflow L
+output result R
+
+class R { ok bool }
+
+lease slot {
+  key Missing
+  slots 1
+  ttl 10m
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "counter `budget` keys on undeclared type `Missing`",
+                r#"use std.coord
+
+workflow C
+output result R
+
+class R { ok bool }
+
+counter budget {
+  key Missing
+  cap 3
+  reset daily
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "signal `ingress.fed` is declared more than once",
+                format!(
+                    "{SOURCE_PRELUDE}
+signal ingress.fed {{
+  text string
+}}
+"
+                ),
+            ),
+            (
+                "signal `ingress.dup` declares field `text` more than once",
+                format!(
+                    "{SOURCE_PRELUDE}
+signal ingress.dup {{
+  text string
+  text string
+}}
+"
+                ),
+            ),
+            (
+                "source `feed` is declared more than once",
+                format!(
+                    "{SOURCE_PRELUDE}
+source file as feed {{
+  path \"./inbox.txt\"
+  observe as obs
+  emit ingress.fed {{
+    text obs.line
+  }}
+}}
+
+source file as feed {{
+  path \"./other.txt\"
+  observe as obs
+  emit ingress.fed {{
+    text obs.line
+  }}
+}}
+"
+                ),
+            ),
+            (
+                "source `feed` declares a `path` clause but its provider is `http`, not `file`",
+                format!(
+                    "{SOURCE_PRELUDE}
+source http as feed {{
+  url \"http://127.0.0.1:8080/feed.json\"
+  path \"./inbox.txt\"
+  observe as obs
+  emit ingress.fed {{
+    text obs.item
+  }}
+}}
+"
+                ),
+            ),
+            (
+                "source `feed` declares a `url` clause but its provider is `file`, not `http`",
+                format!(
+                    "{SOURCE_PRELUDE}
+source file as feed {{
+  path \"./inbox.txt\"
+  url \"http://127.0.0.1:8080/feed.json\"
+  observe as obs
+  emit ingress.fed {{
+    text obs.line
+  }}
+}}
+"
+                ),
+            ),
+            (
+                "source `feed` emits `from other`, but the only binding in scope is the observe binding `obs`",
+                format!(
+                    "{SOURCE_PRELUDE}
+source file as feed {{
+  path \"./inbox.txt\"
+  observe as obs
+  emit ingress.fed from other {{
+    text obs.line
+  }}
+}}
+"
+                ),
+            ),
+            (
+                "source `feed` emit reads unknown binding `other`",
+                format!(
+                    "{SOURCE_PRELUDE}
+source file as feed {{
+  path \"./inbox.txt\"
+  observe as obs
+  emit ingress.fed {{
+    text other.line
+  }}
+}}
+"
+                ),
+            ),
+            (
+                "agent `reviewer` is declared more than once",
+                r#"use std.agent
+
+workflow A
+output result R
+
+class R { ok bool }
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "agent `reviewer` declares compaction more than once",
+                r#"use std.agent
+
+workflow A
+output result R
+
+class R { ok bool }
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  compaction summarize
+  compaction none
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "agent `reviewer` declares thread more than once",
+                r#"use std.agent
+
+workflow A
+output result R
+
+class R { ok bool }
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  thread continue
+  thread fresh
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "AgentRef lists agent `reviewer` more than once",
+                r#"use std.agent
+
+workflow A
+output result R
+
+class R { ok bool }
+
+class Ticket {
+  owner AgentRef<reviewer | reviewer>
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#
+                .to_owned(),
+            ),
+            (
+                "AgentRef has no agent `nobody`",
+                r#"use std.agent
+
+workflow A
+output result R
+
+class R { ok bool }
+
+class Ticket {
+  owner AgentRef<reviewer>
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule r
+  when Ticket as t
+=> {
+  case t.owner {
+    nobody => { complete result { ok true } }
+    _ => { complete result { ok false } }
+  }
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "test `a run` is declared more than once",
+                r#"workflow T
+output result R
+
+class R { ok bool }
+
+rule r
+  when started
+=> { complete result { ok true } }
+
+test "a run" {
+  workflow T
+  run until idle
+  expect workflow completed
+}
+
+test "a run" {
+  workflow T
+  run until idle
+  expect workflow completed
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "test `a run` has no `expect` clause",
+                r#"workflow T
+output result R
+
+class R { ok bool }
+
+rule r
+  when started
+=> { complete result { ok true } }
+
+test "a run" {
+  workflow T
+  run until idle
+}
+"#
+                .to_owned(),
+            ),
+        ];
+
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            assert!(
+                compiled.diagnostics.iter().any(|d| d.message == *expected),
+                "expected `{expected}`, got {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
