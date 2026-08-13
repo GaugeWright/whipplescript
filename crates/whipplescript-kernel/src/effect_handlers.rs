@@ -2685,6 +2685,160 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
 }
 
 #[cfg(test)]
+mod ingest_admission_tests {
+    use super::validate_ingest_value;
+    use serde_json::{json, Value};
+
+    /// `validate_ingest_value` is the effect-output admission gate: the authority
+    /// that decides whether a provider's JSON becomes a durable typed fact
+    /// (spec/type-system.md, "Boundary Validation"). WhippleScript cannot make an
+    /// illegal state unrepresentable — the producer is a model — so this refusal
+    /// is what stands in for a private constructor.
+    ///
+    /// A mutation sweep found that NONE of its rejections were exercised. Every
+    /// path that reached it fed it valid input, so deleting any single rejection
+    /// changed nothing observable in the whole workspace suite. These cases assert
+    /// each rejection by message, and the accept cases keep them from passing by
+    /// rejecting everything.
+    fn errors_for(value: Value, shape: Value) -> Vec<String> {
+        let mut errors = Vec::new();
+        validate_ingest_value(&value, &shape, "$", &mut errors);
+        errors
+    }
+
+    fn rejects(value: Value, shape: Value, expected: &str) {
+        let errors = errors_for(value, shape);
+        assert!(
+            errors.iter().any(|e| e == expected),
+            "expected `{expected}`, got {errors:?}"
+        );
+    }
+
+    fn accepts(value: Value, shape: Value) {
+        assert_eq!(errors_for(value, shape), Vec::<String>::new());
+    }
+
+    #[test]
+    fn scalar_shapes_reject_the_wrong_json_type() {
+        rejects(json!("7"), json!("int"), "$ must be int");
+        rejects(json!("x"), json!("float"), "$ must be float");
+        rejects(json!("true"), json!("bool"), "$ must be bool");
+        rejects(json!(0), json!("null"), "$ must be null");
+        rejects(json!(1), json!("string"), "$ must be string");
+        // `time` is a string that must parse as an instant, not merely a string.
+        rejects(json!("tuesday"), json!("time"), "$ must be time");
+
+        accepts(json!(7), json!("int"));
+        accepts(json!(1.5), json!("float"));
+        accepts(json!(true), json!("bool"));
+        accepts(json!(null), json!("null"));
+        accepts(json!("x"), json!("string"));
+        accepts(json!("2027-01-01T00:00:00Z"), json!("time"));
+        // `json` accepts any shape by construction — it is the opaque escape.
+        accepts(json!({"anything": [1, 2]}), json!("json"));
+    }
+
+    #[test]
+    fn literal_and_enum_shapes_reject_values_outside_their_domain() {
+        rejects(
+            json!("rollback"),
+            json!({"literal": "deploy"}),
+            "$ must be literal \"deploy\"",
+        );
+        rejects(
+            json!("urgent"),
+            json!({"enum": ["low", "high"]}),
+            "$ must be one of: low, high",
+        );
+
+        accepts(json!("deploy"), json!({"literal": "deploy"}));
+        accepts(json!("high"), json!({"enum": ["low", "high"]}));
+    }
+
+    #[test]
+    fn container_shapes_reject_the_wrong_container() {
+        rejects(
+            json!({"a": 1}),
+            json!({"array": "int"}),
+            "$ must be an array",
+        );
+        rejects(json!([1]), json!({"map": "int"}), "$ must be an object map");
+
+        // Containers validate their contents, and the path names the offender.
+        rejects(json!([1, "x"]), json!({"array": "int"}), "$[1] must be int");
+        rejects(json!({"k": "x"}), json!({"map": "int"}), "$.k must be int");
+
+        accepts(json!([1, 2]), json!({"array": "int"}));
+        accepts(json!({"k": 1}), json!({"map": "int"}));
+    }
+
+    #[test]
+    fn a_union_rejects_a_value_matching_no_arm() {
+        let shape = json!({"union": ["int", {"literal": "none"}]});
+        rejects(
+            json!("other"),
+            shape.clone(),
+            "$ matches no arm of the declared union",
+        );
+        accepts(json!(3), shape.clone());
+        accepts(json!("none"), shape);
+    }
+
+    #[test]
+    fn a_class_shape_rejects_a_non_object() {
+        rejects(
+            json!("not an object"),
+            json!({"class": "Report", "fields": {"id": "string"}}),
+            "$ must be an object (Report)",
+        );
+    }
+
+    /// The closed-class rejection. spec/type-system.md makes this the gate that
+    /// "rejects unknown fields AFTER any backend normalization" — a provider that
+    /// invents a field must not have it silently admitted.
+    #[test]
+    fn a_closed_class_rejects_an_undeclared_field() {
+        rejects(
+            json!({"id": "1", "smuggled": true}),
+            json!({"class": "Report", "fields": {"id": "string"}}),
+            "$.smuggled is not declared (Report)",
+        );
+        accepts(
+            json!({"id": "1"}),
+            json!({"class": "Report", "fields": {"id": "string"}}),
+        );
+    }
+
+    #[test]
+    fn a_missing_required_field_is_rejected_and_an_optional_one_is_not() {
+        let shape = json!({
+            "fields": {"id": "string", "note": {"optional": "string"}}
+        });
+        rejects(json!({"note": "n"}), shape.clone(), "$.id is required");
+        // An optional field may be absent, and may be null when present.
+        accepts(json!({"id": "1"}), shape.clone());
+        accepts(json!({"id": "1", "note": null}), shape.clone());
+        // Present-but-wrong is still rejected through the optional.
+        rejects(
+            json!({"id": "1", "note": 5}),
+            shape,
+            "$.note must be string",
+        );
+    }
+
+    /// Nesting is where a boundary check usually stops being honest: the path has
+    /// to name the offending leaf, or a rejection cannot be acted on.
+    #[test]
+    fn nested_shapes_report_the_path_to_the_offending_value() {
+        rejects(
+            json!({"rows": [{"id": 1}]}),
+            json!({"fields": {"rows": {"array": {"fields": {"id": "string"}}}}}),
+            "$.rows[0].id must be string",
+        );
+    }
+}
+
+#[cfg(test)]
 mod file_policy_tests {
     use super::file_path_policy_error;
 

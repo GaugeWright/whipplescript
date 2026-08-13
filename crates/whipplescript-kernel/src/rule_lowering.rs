@@ -6611,6 +6611,230 @@ pub fn split_args(args: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod ir_admission_tests {
+    use super::{validate_json_for_ir_type, validate_json_for_object};
+    use serde_json::{json, Value};
+    use whipplescript_parser::{compile_program, IrClass, IrProgram, IrSchema, IrType};
+
+    /// `validate_json_for_ir_type` is the admission gate's IR-typed half: the same
+    /// authority as `validate_ingest_value`, applied where the expected shape is a
+    /// compiled `IrType` rather than a JSON shape descriptor. A mutation sweep found
+    /// eleven of its rejections unexercised, including the closed-class rejection
+    /// that spec/type-system.md names.
+    ///
+    /// The IR is COMPILED from source rather than hand-built, so these assert the
+    /// validator against types the compiler actually emits.
+    fn ir_of(source: &str) -> IrProgram {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled.diagnostics
+        );
+        compiled.ir.expect("ir")
+    }
+
+    fn class_of<'a>(ir: &'a IrProgram, name: &str) -> &'a IrClass {
+        ir.schemas
+            .iter()
+            .find_map(|schema| match schema {
+                IrSchema::Class(class) if class.name == name => Some(class),
+                _ => None,
+            })
+            .expect("class in ir")
+    }
+
+    fn field_ty(ir: &IrProgram, class: &str, field: &str) -> IrType {
+        class_of(ir, class)
+            .fields
+            .iter()
+            .find(|candidate| candidate.name == field)
+            .expect("field in class")
+            .ty
+            .clone()
+    }
+
+    fn errors_for(ir: &IrProgram, value: Value, ty: &IrType) -> Vec<String> {
+        let mut errors = Vec::new();
+        validate_json_for_ir_type(ir, &value, ty, "$", &mut errors);
+        errors
+    }
+
+    fn rejects(ir: &IrProgram, value: Value, ty: &IrType, expected: &str) {
+        let errors = errors_for(ir, value, ty);
+        assert!(
+            errors.iter().any(|e| e == expected),
+            "expected `{expected}`, got {errors:?}"
+        );
+    }
+
+    fn accepts(ir: &IrProgram, value: Value, ty: &IrType) {
+        assert_eq!(errors_for(ir, value, ty), Vec::<String>::new());
+    }
+
+    const FIXTURE: &str = r#"
+workflow Admission
+
+output result Done
+
+class Done { ok bool }
+
+enum Priority {
+  Low
+  High
+}
+
+agent worker {
+  provider fixture
+  profile "code"
+  capacity 1
+}
+
+agent auditor {
+  provider fixture
+  profile "code"
+  capacity 1
+}
+
+class Shapes {
+  kind "deploy"
+  mode "fast" | "slow"
+  rank Priority
+  who AgentRef<worker | auditor>
+  tags string[]
+  counts map<int>
+  note string?
+  nested Done
+}
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#;
+
+    #[test]
+    fn a_literal_field_rejects_any_other_value() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "kind");
+        rejects(&ir, json!("rollback"), &ty, "$ must be literal \"deploy\"");
+        accepts(&ir, json!("deploy"), &ty);
+    }
+
+    #[test]
+    fn an_agent_ref_rejects_a_stranger_and_a_non_string() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "who");
+        rejects(
+            &ir,
+            json!("intruder"),
+            &ty,
+            "$ must name one of these agents: worker, auditor",
+        );
+        rejects(&ir, json!(7), &ty, "$ must be an agent name string");
+        accepts(&ir, json!("worker"), &ty);
+        accepts(&ir, json!("auditor"), &ty);
+    }
+
+    #[test]
+    fn an_enum_rejects_an_unknown_variant_and_a_non_string() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "rank");
+        rejects(&ir, json!("Urgent"), &ty, "$ must be one of: Low, High");
+        rejects(&ir, json!(1), &ty, "$ must be a string enum variant");
+        accepts(&ir, json!("High"), &ty);
+    }
+
+    #[test]
+    fn container_types_reject_the_wrong_container() {
+        let ir = ir_of(FIXTURE);
+        let tags = field_ty(&ir, "Shapes", "tags");
+        let counts = field_ty(&ir, "Shapes", "counts");
+        rejects(&ir, json!({"a": 1}), &tags, "$ must be an array");
+        rejects(&ir, json!([1]), &counts, "$ must be an object map");
+        accepts(&ir, json!(["a"]), &tags);
+        accepts(&ir, json!({"a": 1}), &counts);
+    }
+
+    /// A multi-literal field lowers to `IrType::Union`, so this is the union arm
+    /// on real compiler output rather than a hand-built type.
+    #[test]
+    fn a_union_rejects_a_value_matching_no_arm() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "mode");
+        rejects(
+            &ir,
+            json!("medium"),
+            &ty,
+            "$ must match one of: fast | slow",
+        );
+        accepts(&ir, json!("fast"), &ty);
+        accepts(&ir, json!("slow"), &ty);
+    }
+
+    #[test]
+    fn a_reference_to_a_type_the_ir_does_not_hold_is_rejected() {
+        let ir = ir_of(FIXTURE);
+        let ty = IrType::Ref("NoSuchClass".to_owned());
+        rejects(
+            &ir,
+            json!({}),
+            &ty,
+            "$ references unknown type `NoSuchClass`",
+        );
+    }
+
+    /// The closed-class rejection, on the IR-typed side. The same rule
+    /// `validate_ingest_value` carries: a producer that invents a field must not
+    /// have it silently admitted.
+    #[test]
+    fn a_class_rejects_a_non_object_and_an_undeclared_field() {
+        let ir = ir_of(FIXTURE);
+        let fields = &class_of(&ir, "Done").fields;
+
+        let mut errors = Vec::new();
+        validate_json_for_object(&ir, &json!("not an object"), fields, "$", &mut errors);
+        assert!(
+            errors.iter().any(|e| e == "$ must be an object"),
+            "{errors:?}"
+        );
+
+        let mut errors = Vec::new();
+        validate_json_for_object(
+            &ir,
+            &json!({"ok": true, "smuggled": 1}),
+            fields,
+            "$",
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e == "$.smuggled is not declared"),
+            "{errors:?}"
+        );
+
+        let mut errors = Vec::new();
+        validate_json_for_object(&ir, &json!({"ok": true}), fields, "$", &mut errors);
+        assert_eq!(errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_optional_field_may_be_absent_or_null_but_not_wrongly_typed() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "note");
+        accepts(&ir, json!(null), &ty);
+        rejects(&ir, json!(5), &ty, "$ must be string");
+        accepts(&ir, json!("n"), &ty);
+    }
+
+    /// Nesting has to name the offending leaf, or a rejection cannot be acted on.
+    #[test]
+    fn a_nested_class_reports_the_path_to_the_offending_value() {
+        let ir = ir_of(FIXTURE);
+        let ty = field_ty(&ir, "Shapes", "nested");
+        rejects(&ir, json!({"ok": "yes"}), &ty, "$.ok must be bool");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

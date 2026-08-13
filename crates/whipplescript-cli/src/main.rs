@@ -44208,6 +44208,1734 @@ fn line_column(source: &str, byte_index: usize) -> (usize, usize) {
 }
 
 #[cfg(test)]
+mod lowered_ir_correspondence_refusal_tests {
+    use super::validate_lowered_ir_artifact;
+    use serde_json::{json, Value};
+
+    /// A lowered-IR report claims to be the lowering OF a particular construct
+    /// graph. These refusals hold that correspondence: every node, edge and
+    /// dependency the report lowers must exist in the graph, and every dependency
+    /// the graph declares must be lowered. `whip verify` reads both from files, so
+    /// a report naming work the graph never contained is exactly what a forged
+    /// pairing looks like — and the sweep found none of these exercised.
+    fn codes(report: Value, graph: Value) -> Vec<String> {
+        validate_lowered_ir_artifact(&report, &graph)
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn graph_with(dependency_refs: Vec<&str>) -> Value {
+        json!({
+            "nodes": [{"node_id": "n1"}],
+            "edges": [{"required_port_id": "req", "provided_port_id": "prov"}],
+            "effect_dependencies": dependency_refs
+                .iter()
+                .map(|r| json!({"dependency_ref": r}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn a_report_lowering_a_node_the_graph_does_not_have_is_refused() {
+        assert!(codes(
+            json!({"node_lowerings": [{"node_id": "ghost"}]}),
+            graph_with(vec![]),
+        )
+        .contains(&"lowered_ir.node_unknown".to_owned()));
+    }
+
+    #[test]
+    fn a_node_lowering_without_an_id_is_refused() {
+        assert!(codes(json!({"node_lowerings": [{}]}), graph_with(vec![]))
+            .contains(&"lowered_ir.node_missing".to_owned()));
+    }
+
+    #[test]
+    fn a_report_lowering_an_edge_the_graph_does_not_have_is_refused() {
+        assert!(codes(
+            json!({"edge_lowerings": [
+                {"required_port_id": "ghost", "provided_port_id": "other"}
+            ]}),
+            graph_with(vec![]),
+        )
+        .contains(&"lowered_ir.edge_unknown".to_owned()));
+    }
+
+    #[test]
+    fn a_report_lowering_a_dependency_the_graph_does_not_declare_is_refused() {
+        assert!(codes(
+            json!({"dependency_lowerings": [{"dependency_ref": "ghost"}]}),
+            graph_with(vec![]),
+        )
+        .contains(&"lowered_ir.dependency_unknown".to_owned()));
+    }
+
+    #[test]
+    fn the_same_dependency_lowered_twice_is_refused() {
+        assert!(codes(
+            json!({"dependency_lowerings": [
+                {"dependency_ref": "d1"},
+                {"dependency_ref": "d1"}
+            ]}),
+            graph_with(vec!["d1"]),
+        )
+        .contains(&"lowered_ir.dependency_duplicate".to_owned()));
+    }
+
+    /// The correspondence runs both ways: a dependency the graph declares and the
+    /// report never lowers is work silently dropped, which a one-directional check
+    /// would not notice.
+    #[test]
+    fn a_dependency_the_report_never_lowers_is_refused() {
+        assert!(
+            codes(json!({"dependency_lowerings": []}), graph_with(vec!["d1"]))
+                .contains(&"lowered_ir.dependency_unlowered".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod lowered_ir_field_refusal_tests {
+    use super::{
+        validate_lowered_ir_enum_field, validate_lowered_ir_nonempty_string_field,
+        validate_lowered_ir_span_field, validate_lowered_ir_string_ref_set_field,
+    };
+    use serde_json::{json, Value};
+
+    /// The `<field>_invalid` codes across the lowered-IR verifier all come from
+    /// four small field helpers, parameterised by owner kind and field name. The
+    /// sweep counted their instances separately, but there are four behaviours
+    /// here, not thirty: exercising the helpers covers every instance, and
+    /// exercising the instances would assert the same four branches repeatedly.
+    fn codes(run: impl FnOnce(&mut Vec<Value>)) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        run(&mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn refs() -> Value {
+        json!({"nodes": ["n1"]})
+    }
+
+    #[test]
+    fn a_non_empty_string_field_rejects_empty_and_non_string() {
+        for bad in [json!(""), json!(7), json!(null)] {
+            let found = codes(|d| {
+                validate_lowered_ir_nonempty_string_field(
+                    &json!({"name": bad}),
+                    "node",
+                    "n1",
+                    refs(),
+                    "name",
+                    d,
+                )
+            });
+            assert!(
+                found.contains(&"lowered_ir.node.name_invalid".to_owned()),
+                "{bad} must be refused, got {found:?}"
+            );
+        }
+
+        // Present and non-empty is accepted; absent is not this helper's business.
+        assert_eq!(
+            codes(|d| validate_lowered_ir_nonempty_string_field(
+                &json!({"name": "n"}),
+                "node",
+                "n1",
+                refs(),
+                "name",
+                d
+            )),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            codes(|d| validate_lowered_ir_nonempty_string_field(
+                &json!({}),
+                "node",
+                "n1",
+                refs(),
+                "name",
+                d
+            )),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_enum_field_rejects_a_value_outside_its_domain() {
+        let found = codes(|d| {
+            validate_lowered_ir_enum_field(
+                &json!({"kind": "mystery"}),
+                "node",
+                "n1",
+                refs(),
+                "kind",
+                &["fact", "rule"],
+                d,
+            )
+        });
+        assert!(
+            found.contains(&"lowered_ir.node.kind_invalid".to_owned()),
+            "{found:?}"
+        );
+
+        for allowed in ["fact", "rule"] {
+            assert_eq!(
+                codes(|d| validate_lowered_ir_enum_field(
+                    &json!({"kind": allowed}),
+                    "node",
+                    "n1",
+                    refs(),
+                    "kind",
+                    &["fact", "rule"],
+                    d
+                )),
+                Vec::<String>::new(),
+                "`{allowed}` is in the declared domain"
+            );
+        }
+    }
+
+    #[test]
+    fn a_span_field_rejects_a_malformed_span() {
+        let found = codes(|d| {
+            validate_lowered_ir_span_field(
+                &json!({"span": "not a span"}),
+                "node",
+                "n1",
+                refs(),
+                "span",
+                d,
+            )
+        });
+        assert!(
+            found.contains(&"lowered_ir.node.span_invalid".to_owned()),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_string_ref_set_field_rejects_a_non_set() {
+        for bad in [json!("nope"), json!([1]), json!(["a", "a"])] {
+            let found = codes(|d| {
+                validate_lowered_ir_string_ref_set_field(
+                    &json!({"refs": bad}),
+                    "node",
+                    "n1",
+                    refs(),
+                    "refs",
+                    d,
+                )
+            });
+            assert!(
+                found.contains(&"lowered_ir.node.refs_invalid".to_owned()),
+                "{bad} must be refused, got {found:?}"
+            );
+        }
+
+        assert_eq!(
+            codes(|d| validate_lowered_ir_string_ref_set_field(
+                &json!({"refs": ["a", "b"]}),
+                "node",
+                "n1",
+                refs(),
+                "refs",
+                d
+            )),
+            Vec::<String>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod graph_cardinality_and_dependency_refusal_tests {
+    use super::{
+        validate_construct_graph_cardinality, validate_construct_graph_effect_dependencies,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// Cardinality says how many providers a required port may have. It is the
+    /// rule that stops a graph from quietly wiring two providers into a port that
+    /// admits one — an ambiguity the runtime would have to resolve arbitrarily.
+    /// The sweep found these unexercised.
+    fn cardinality_codes(ports: Vec<Value>, edges: Vec<Value>) -> Vec<String> {
+        let port_by_id: BTreeMap<String, &Value> = ports
+            .iter()
+            .filter_map(|p| {
+                p.get("port_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), p))
+            })
+            .collect();
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_cardinality(&port_by_id, &edges, &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn required_port(cardinality: &str) -> Value {
+        json!({"port_id": "req", "direction": "required", "cardinality": cardinality})
+    }
+
+    fn edge_to_req() -> Value {
+        json!({"required_port_id": "req", "provider_node_id": "p", "provided_port_id": "prov"})
+    }
+
+    #[test]
+    fn an_exactly_one_port_wired_once_is_accepted() {
+        assert_eq!(
+            cardinality_codes(vec![required_port("exactly-one")], vec![edge_to_req()]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_exactly_one_port_wired_twice_is_refused() {
+        assert!(cardinality_codes(
+            vec![required_port("exactly-one")],
+            vec![edge_to_req(), edge_to_req()],
+        )
+        .contains(&"construct_graph.cardinality.exactly_one".to_owned()));
+    }
+
+    #[test]
+    fn an_optional_one_port_wired_twice_is_refused() {
+        assert!(cardinality_codes(
+            vec![required_port("optional-one")],
+            vec![edge_to_req(), edge_to_req()],
+        )
+        .contains(&"construct_graph.cardinality.optional_one".to_owned()));
+        // Optional means zero is fine.
+        assert_eq!(
+            cardinality_codes(vec![required_port("optional-one")], vec![]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_unknown_cardinality_is_refused() {
+        assert!(
+            cardinality_codes(vec![required_port("several")], vec![edge_to_req()])
+                .contains(&"construct_graph.cardinality.unknown".to_owned())
+        );
+    }
+
+    /// A scalar port takes no ordering metadata: an `order_index` on an edge into
+    /// a one-provider port is metadata the graph cannot mean.
+    #[test]
+    fn ordering_metadata_on_a_scalar_edge_is_refused() {
+        let mut edge = edge_to_req();
+        edge["order_index"] = json!(0);
+        assert!(
+            cardinality_codes(vec![required_port("exactly-one")], vec![edge])
+                .contains(&"construct_graph.cardinality.scalar_edge_metadata".to_owned())
+        );
+    }
+
+    /// An effect dependency names one effect waiting on another under a predicate.
+    /// An unknown predicate would make the wait condition unreadable.
+    fn dependency_codes(dependencies: Vec<Value>) -> Vec<String> {
+        let node_by_id: BTreeMap<String, &Value> = BTreeMap::new();
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_effect_dependencies(&dependencies, &node_by_id, &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn dependency(reference: &str, predicate: Option<&str>) -> Value {
+        let mut value = json!({"dependency_ref": reference, "evidence": []});
+        if let Some(predicate) = predicate {
+            value["predicate"] = json!(predicate);
+        }
+        value
+    }
+
+    #[test]
+    fn a_dependency_must_declare_a_known_predicate() {
+        assert!(dependency_codes(vec![dependency("d1", Some("maybe"))])
+            .contains(&"construct_graph.effect_dependency.predicate_unknown".to_owned()));
+        assert!(dependency_codes(vec![dependency("d1", None)])
+            .contains(&"construct_graph.effect_dependency.predicate_missing".to_owned()));
+        for predicate in ["succeeds", "fails", "completes"] {
+            assert!(
+                !dependency_codes(vec![dependency("d1", Some(predicate))])
+                    .iter()
+                    .any(|c| c.starts_with("construct_graph.effect_dependency.predicate")),
+                "`{predicate}` is a declared predicate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_dependency_twice_is_refused() {
+        assert!(dependency_codes(vec![
+            dependency("d1", Some("succeeds")),
+            dependency("d1", Some("succeeds")),
+        ])
+        .contains(&"construct_graph.effect_dependency.duplicate".to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod graph_edge_refusal_tests {
+    use super::validate_construct_graph_edges;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// An edge claims that one node's produced port satisfies another's required
+    /// port. Every refusal here is a way that claim can be false: the ports do not
+    /// exist, they face the wrong way, the provider does not own what it offers,
+    /// or the two sides disagree about what is being exchanged. The sweep found
+    /// none of them exercised, so a graph asserting an unsatisfiable wiring was
+    /// believed.
+    fn edge_codes(edges: Vec<Value>, nodes: Vec<Value>, ports: Vec<Value>) -> Vec<String> {
+        let node_by_id: BTreeMap<String, &Value> = nodes
+            .iter()
+            .filter_map(|n| {
+                n.get("node_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), n))
+            })
+            .collect();
+        let port_by_id: BTreeMap<String, &Value> = ports
+            .iter()
+            .filter_map(|p| {
+                p.get("port_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), p))
+            })
+            .collect();
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_edges(&edges, &node_by_id, &port_by_id, &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn port(id: &str, owner: &str, direction: &str) -> Value {
+        json!({
+            "port_id": id,
+            "owner_node_id": owner,
+            "direction": direction,
+            "kind": "fact",
+            "type": "T",
+            "contract_version": "1",
+            "phase": "build",
+        })
+    }
+
+    fn edge() -> Value {
+        json!({
+            "required_port_id": "req",
+            "provider_node_id": "provider",
+            "provided_port_id": "prov",
+        })
+    }
+
+    fn wired() -> (Vec<Value>, Vec<Value>) {
+        (
+            vec![
+                json!({"node_id": "consumer"}),
+                json!({"node_id": "provider"}),
+            ],
+            vec![
+                port("req", "consumer", "required"),
+                port("prov", "provider", "produced"),
+            ],
+        )
+    }
+
+    /// The accept case: a consistent wiring draws nothing.
+    #[test]
+    fn a_consistent_edge_is_accepted() {
+        let (nodes, ports) = wired();
+        assert_eq!(edge_codes(vec![edge()], nodes, ports), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_edge_naming_something_absent_is_refused() {
+        let (nodes, ports) = wired();
+        assert!(
+            edge_codes(vec![edge()], nodes.clone(), vec![ports[1].clone()])
+                .contains(&"construct_graph.edge.required_port_missing".to_owned())
+        );
+        assert!(
+            edge_codes(vec![edge()], nodes.clone(), vec![ports[0].clone()])
+                .contains(&"construct_graph.edge.provided_port_missing".to_owned())
+        );
+        assert!(edge_codes(
+            vec![edge()],
+            vec![json!({"node_id": "consumer"})],
+            ports.clone(),
+        )
+        .contains(&"construct_graph.edge.provider_node_missing".to_owned()));
+    }
+
+    #[test]
+    fn the_same_edge_twice_is_refused() {
+        let (nodes, ports) = wired();
+        assert!(edge_codes(vec![edge(), edge()], nodes, ports)
+            .contains(&"construct_graph.edge.duplicate".to_owned()));
+    }
+
+    /// Direction is what makes an edge mean anything: a required port must be
+    /// required, and a provided port must be produced. Reversed, the graph claims
+    /// a wiring that cannot carry a value.
+    #[test]
+    fn ports_facing_the_wrong_way_are_refused() {
+        let (nodes, _) = wired();
+        assert!(edge_codes(
+            vec![edge()],
+            nodes.clone(),
+            vec![
+                port("req", "consumer", "produced"),
+                port("prov", "provider", "produced")
+            ],
+        )
+        .contains(&"construct_graph.edge.required_not_required".to_owned()));
+
+        assert!(edge_codes(
+            vec![edge()],
+            nodes,
+            vec![
+                port("req", "consumer", "required"),
+                port("prov", "provider", "required")
+            ],
+        )
+        .contains(&"construct_graph.edge.provided_not_produced".to_owned()));
+    }
+
+    #[test]
+    fn a_provider_that_does_not_own_the_offered_port_is_refused() {
+        let (nodes, _) = wired();
+        assert!(edge_codes(
+            vec![edge()],
+            nodes,
+            vec![
+                port("req", "consumer", "required"),
+                port("prov", "someone_else", "produced")
+            ],
+        )
+        .contains(&"construct_graph.edge.provider_owner_mismatch".to_owned()));
+    }
+
+    /// The two sides must agree about what is exchanged. Each disagreement has its
+    /// own code so a reader learns which half to fix.
+    #[test]
+    fn the_two_sides_must_agree_on_what_is_exchanged() {
+        let (nodes, _) = wired();
+        for (field, value, code) in [
+            ("kind", "effect", "construct_graph.edge.kind_mismatch"),
+            ("type", "Other", "construct_graph.edge.type_mismatch"),
+            (
+                "contract_version",
+                "2",
+                "construct_graph.edge.version_mismatch",
+            ),
+        ] {
+            let mut provided = port("prov", "provider", "produced");
+            provided[field] = json!(value);
+            let found = edge_codes(
+                vec![edge()],
+                nodes.clone(),
+                vec![port("req", "consumer", "required"), provided],
+            );
+            assert!(
+                found.contains(&code.to_owned()),
+                "disagreeing `{field}` must raise `{code}`, got {found:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_port_and_output_refusal_tests {
+    use super::{validate_construct_graph_node_outputs, validate_construct_graph_node_ports};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// Ports tie a construct-graph node to what it requires and produces. If a
+    /// port names an owner that is not in the graph, or an owner that does not
+    /// list it back, the graph is internally inconsistent — and on a boundary
+    /// where reports arrive from elsewhere, that inconsistency is what a forged
+    /// graph looks like. The sweep found none of these exercised.
+    fn port_codes(nodes: Vec<Value>, ports: Vec<Value>) -> Vec<String> {
+        let node_by_id: BTreeMap<String, &Value> = nodes
+            .iter()
+            .filter_map(|n| {
+                n.get("node_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), n))
+            })
+            .collect();
+        let port_by_id: BTreeMap<String, &Value> = ports
+            .iter()
+            .filter_map(|p| {
+                p.get("port_id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_owned(), p))
+            })
+            .collect();
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_node_ports(&nodes, &node_by_id, &port_by_id, &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn node(id: &str, required: Vec<&str>, produced: Vec<&str>) -> Value {
+        json!({"node_id": id, "required_ports": required, "produced_ports": produced})
+    }
+
+    fn port(id: &str, owner: Option<&str>, direction: Option<&str>) -> Value {
+        let mut value = json!({"port_id": id});
+        if let Some(owner) = owner {
+            value["owner_node_id"] = json!(owner);
+        }
+        if let Some(direction) = direction {
+            value["direction"] = json!(direction);
+        }
+        value
+    }
+
+    /// The accept case: a node and a port that agree.
+    #[test]
+    fn a_port_its_owner_lists_is_accepted() {
+        assert_eq!(
+            port_codes(
+                vec![node("n1", vec!["p1"], vec![])],
+                vec![port("p1", Some("n1"), Some("required"))],
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_port_must_name_an_owner_that_exists_and_lists_it() {
+        assert!(port_codes(vec![], vec![port("p1", None, Some("required"))])
+            .contains(&"construct_graph.port.owner_missing".to_owned()));
+
+        assert!(
+            port_codes(vec![], vec![port("p1", Some("ghost"), Some("required"))])
+                .contains(&"construct_graph.port.owner_unknown".to_owned())
+        );
+
+        // The owner exists but does not list the port back.
+        assert!(port_codes(
+            vec![node("n1", vec![], vec![])],
+            vec![port("p1", Some("n1"), Some("required"))],
+        )
+        .contains(&"construct_graph.port.not_listed_by_owner".to_owned()));
+    }
+
+    #[test]
+    fn a_port_must_declare_a_known_direction() {
+        assert!(port_codes(
+            vec![node("n1", vec!["p1"], vec![])],
+            vec![port("p1", Some("n1"), Some("sideways"))],
+        )
+        .contains(&"construct_graph.port.direction_unknown".to_owned()));
+    }
+
+    /// A node declares which core-object kinds and runtime entrypoints it may
+    /// emit. `output_runtime_state` is the authority check of the pair: a node
+    /// claiming it can emit a `run` or a `claim` is claiming to produce state the
+    /// runtime owns.
+    fn output_codes(node: Value) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_node_outputs(&[node], &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn a_node_declaring_supported_outputs_is_accepted() {
+        assert_eq!(
+            output_codes(json!({
+                "node_id": "n1",
+                "allowed_core_object_kinds": ["fact"],
+                "allowed_runtime_entrypoints": ["fact_record"],
+            })),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_node_cannot_declare_it_emits_runtime_state() {
+        for kind in ["run", "claim", "terminal"] {
+            assert!(
+                output_codes(json!({
+                    "node_id": "n1",
+                    "allowed_core_object_kinds": [kind],
+                    "allowed_runtime_entrypoints": ["fact_record"],
+                }))
+                .contains(&"construct_graph.node.output_runtime_state".to_owned()),
+                "a node must not claim it emits `{kind}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_cannot_declare_an_unknown_output_kind() {
+        assert!(output_codes(json!({
+            "node_id": "n1",
+            "allowed_core_object_kinds": ["mystery"],
+            "allowed_runtime_entrypoints": ["fact_record"],
+        }))
+        .contains(&"construct_graph.node.output_kind_unknown".to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod core_object_refusal_tests {
+    use super::validate_lowered_ir_core_object_kind_and_entrypoint;
+    use serde_json::{json, Value};
+
+    /// A lowered-IR core object declares what it is (`object_kind`) and which
+    /// runtime entrypoint lowers it. These refusals hold that pairing honest, on
+    /// the same trust boundary as the rest of the artifact verifier: a report can
+    /// arrive from elsewhere, and an object claiming a kind it does not lower to
+    /// would otherwise be believed.
+    ///
+    /// The sweep found none of them exercised. Table-driven because the branches
+    /// are one decision — kind, then entrypoint, then the rules that pair them.
+    fn codes(object: Value) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        validate_lowered_ir_core_object_kind_and_entrypoint(&object, "o1", &mut diagnostics);
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn assert_code(object: Value, expected: &str) {
+        let found = codes(object);
+        assert!(
+            found.iter().any(|c| c == expected),
+            "expected `{expected}`, got {found:?}"
+        );
+    }
+
+    /// The accept case, and the reason the rejections below mean something: a
+    /// validator refusing every object would satisfy all of them.
+    /// A `fact` object also has to name what it records. Writing the accept case
+    /// first surfaced this: the pairing alone is not enough, and a fact without
+    /// `entrypoint_refs` names no schema.
+    fn valid_fact() -> Value {
+        json!({
+            "object_kind": "fact",
+            "runtime_entrypoint": "fact_record",
+            "entrypoint_refs": {"fact": "f1", "schema": "S"},
+        })
+    }
+
+    #[test]
+    fn a_well_paired_core_object_is_accepted() {
+        assert_eq!(codes(valid_fact()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_fact_object_must_name_what_it_records() {
+        let mut object = valid_fact();
+        object
+            .as_object_mut()
+            .expect("object")
+            .remove("entrypoint_refs");
+        assert_code(object, "lowered_ir.core_object.entrypoint_refs_missing");
+
+        // Present but naming nothing is refused for each required ref.
+        for key in ["fact", "schema"] {
+            let mut object = valid_fact();
+            object["entrypoint_refs"]
+                .as_object_mut()
+                .expect("refs")
+                .insert(key.to_owned(), json!(""));
+            let found = codes(object);
+            assert!(
+                found
+                    .iter()
+                    .any(|c| c.starts_with("lowered_ir.core_object.entrypoint_ref")),
+                "an empty `{key}` ref must be refused, got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_object_must_declare_its_kind_and_entrypoint() {
+        assert_code(json!({}), "lowered_ir.core_object.kind_missing");
+        assert_code(
+            json!({"object_kind": "fact"}),
+            "lowered_ir.core_object.runtime_entrypoint_missing",
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_refused() {
+        assert_code(
+            json!({"object_kind": "mystery", "runtime_entrypoint": "fact_record"}),
+            "lowered_ir.core_object.kind_unknown",
+        );
+    }
+
+    /// A kind and an entrypoint that do not belong together is the forgery this
+    /// pairing exists to catch.
+    #[test]
+    fn a_kind_paired_with_the_wrong_entrypoint_is_refused() {
+        assert_code(
+            json!({"object_kind": "fact", "runtime_entrypoint": "rule_template"}),
+            "lowered_ir.core_object.runtime_entrypoint_mismatch",
+        );
+    }
+
+    /// Runtime state must not be materialized into a lowered artifact: a `run`,
+    /// a `claim`, a `terminal` are things the runtime owns, and an artifact
+    /// declaring one is claiming authority over state it does not hold.
+    #[test]
+    fn a_materialized_runtime_object_is_refused() {
+        for kind in ["run", "claim", "terminal"] {
+            assert_code(
+                json!({"object_kind": kind, "runtime_entrypoint": "fact_record"}),
+                "lowered_ir.core_object.runtime_state_materialized",
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_object_must_own_itself_as_a_dependency() {
+        assert_code(
+            json!({
+                "object_kind": "dependency",
+                "runtime_entrypoint": "effect_dependency_template",
+                "owner_kind": "rule",
+            }),
+            "lowered_ir.core_object.dependency_owner_kind",
+        );
+    }
+}
+
+#[cfg(test)]
+mod artifact_shape_refusal_tests {
+    use super::{
+        validate_construct_graph_artifact, validate_construct_graph_object_shape,
+        validate_lowered_ir_object_shape,
+    };
+    use serde_json::{json, Value};
+
+    /// These validators sit on a TRUST BOUNDARY. `whip verify` reads a report from
+    /// a file and decides whether to believe evidence produced elsewhere, so a
+    /// refusal that does not fire means a corrupt or forged artifact is accepted.
+    /// A mutation sweep found ~100 of their rejections unexercised.
+    ///
+    /// The `object_expected` / `field_missing` / `field_unknown` families are
+    /// emitted by one shared helper per artifact, parameterised by owner kind, so
+    /// exercising the helper covers every kind at once. Testing a hundred
+    /// near-identical call sites separately would assert the same three branches
+    /// over and over while leaving the distinct consistency rules untouched.
+    fn graph_shape(value: &Value, required: &[&str], allowed: &[&str]) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        validate_construct_graph_object_shape(
+            value,
+            "node",
+            "n1",
+            "nodes",
+            required,
+            allowed,
+            &mut diagnostics,
+        );
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    fn lowered_shape(value: &Value, required: &[&str], allowed: &[&str]) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        validate_lowered_ir_object_shape(
+            value,
+            "node",
+            "n1",
+            json!({"nodes": ["n1"]}),
+            required,
+            allowed,
+            &mut diagnostics,
+        );
+        diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn a_construct_graph_object_must_be_an_object_with_exactly_the_declared_fields() {
+        assert!(graph_shape(&json!("nope"), &["id"], &["id"])
+            .contains(&"construct_graph.node.object_expected".to_owned()));
+        assert!(graph_shape(&json!({}), &["id"], &["id"])
+            .contains(&"construct_graph.node.field_missing".to_owned()));
+        assert!(
+            graph_shape(&json!({"id": "n1", "extra": 1}), &["id"], &["id"])
+                .contains(&"construct_graph.node.field_unknown".to_owned())
+        );
+        // The accept case: a validator refusing every object would satisfy all three.
+        assert_eq!(
+            graph_shape(&json!({"id": "n1"}), &["id"], &["id"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_lowered_ir_object_must_be_an_object_with_exactly_the_declared_fields() {
+        assert!(lowered_shape(&json!("nope"), &["id"], &["id"])
+            .contains(&"lowered_ir.node.object_expected".to_owned()));
+        assert!(lowered_shape(&json!({}), &["id"], &["id"])
+            .contains(&"lowered_ir.node.field_missing".to_owned()));
+        assert!(
+            lowered_shape(&json!({"id": "n1", "extra": 1}), &["id"], &["id"])
+                .contains(&"lowered_ir.node.field_unknown".to_owned())
+        );
+        assert_eq!(
+            lowered_shape(&json!({"id": "n1"}), &["id"], &["id"]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A construct graph missing a whole section is refused before any per-element
+    /// check runs, so each top-level key needs its own case.
+    #[test]
+    fn a_construct_graph_missing_a_section_is_refused() {
+        // Every root field the graph declares, so the only diagnostics below come
+        // from the section this case removes.
+        let complete = json!({
+            "schema": "whip.construct_graph/v0",
+            "graph_id": "g1",
+            "platform_version": "0",
+            "package_lock_digest": "0",
+            "package_contract_digest": "0",
+            "source_digest": "0",
+            "nodes": [],
+            "ports": [],
+            "edges": [],
+            "effect_dependencies": [],
+            "derived_facts": [],
+            "diagnostics": [],
+        });
+        for (key, code) in [
+            ("nodes", "construct_graph.nodes_missing"),
+            ("ports", "construct_graph.ports_missing"),
+            ("edges", "construct_graph.edges_missing"),
+            (
+                "effect_dependencies",
+                "construct_graph.effect_dependencies_missing",
+            ),
+        ] {
+            let mut graph = complete.clone();
+            graph.as_object_mut().expect("object").remove(key);
+            let codes: Vec<String> = validate_construct_graph_artifact(&graph)
+                .diagnostics
+                .iter()
+                .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            assert!(
+                codes.contains(&code.to_owned()),
+                "dropping `{key}` must raise `{code}`, got {codes:?}"
+            );
+        }
+
+        // A graph with every section present raises none of the four.
+        let codes: Vec<String> = validate_construct_graph_artifact(&complete)
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.get("code").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        assert!(
+            !codes.iter().any(|c| c.ends_with("_missing")),
+            "a complete graph must raise no section-missing code, got {codes:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod start_input_refusal_tests {
+    use super::validate_workflow_start_input;
+    use serde_json::json;
+    use whipplescript_parser::{compile_program, IrProgram};
+
+    /// The entry side of the admission boundary: `whip run --input` hands a
+    /// caller's JSON to `validate_workflow_start_input`, which holds the workflow's
+    /// declared inputs closed. A mutation sweep found its unexpected-input
+    /// rejection unexercised, so a caller could name a key the workflow never
+    /// declared and have it accepted in silence.
+    fn ir() -> IrProgram {
+        let compiled = compile_program(
+            r#"
+workflow Start
+input task Task
+output result R
+class Task { id string }
+class R { ok bool }
+rule r
+  when Task as t
+=> { complete result { ok true } }
+"#,
+        );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled.diagnostics
+        );
+        compiled.ir.expect("ir")
+    }
+
+    #[test]
+    fn an_undeclared_input_key_is_refused() {
+        let error = validate_workflow_start_input(&ir(), &json!({"task": {"id": "1"}, "extra": 1}))
+            .expect_err("an undeclared input key must be refused");
+        assert!(
+            error.contains("unexpected workflow input `extra`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_input_is_refused() {
+        let error = validate_workflow_start_input(&ir(), &json!("not an object"))
+            .expect_err("a non-object input must be refused");
+        assert!(
+            error.contains("expects an input object keyed by declared input names"),
+            "{error}"
+        );
+    }
+
+    /// The accept case: without it, a validator refusing every input would satisfy
+    /// both rejections above.
+    #[test]
+    fn a_declared_input_is_accepted() {
+        let facts = validate_workflow_start_input(&ir(), &json!({"task": {"id": "1"}}))
+            .expect("a declared input resolves");
+        assert_eq!(facts.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod package_set_semantic_refusal_tests {
+    use super::{read_package_set, stable_hash_hex, PACKAGE_SET_SCHEMA};
+    use serde_json::json;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
+
+    /// `read_package_set` decides which manifests a program may load. Its refusals
+    /// are not shape checks — each encodes a distinct rule about what a package set
+    /// may claim — and a mutation sweep found none of them exercised.
+    ///
+    /// `package_source.escapes_project` is the one that matters most: it is the
+    /// containment boundary on where a package may live.
+    fn project(
+        slug: &str,
+        set: serde_json::Value,
+        manifests: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "whipplescript-pkgset-{slug}-{}",
+            stable_hash_hex(slug)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("packages")).expect("packages dir");
+        for (name, body) in manifests {
+            fs::write(root.join("packages").join(name), body).expect("manifest writes");
+        }
+        let set_path = root.join("whip.packages.json");
+        fs::write(&set_path, serde_json::to_string_pretty(&set).expect("json"))
+            .expect("set writes");
+        (root, set_path)
+    }
+
+    fn notes_manifest(name: &str) -> String {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/packages/notes.json");
+        let text = fs::read_to_string(src).expect("notes manifest");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("manifest json");
+        value["name"] = json!(name);
+        serde_json::to_string_pretty(&value).expect("json")
+    }
+
+    fn codes(set: serde_json::Value, slug: &str, manifests: &[(&str, &str)]) -> Vec<&'static str> {
+        let (root, set_path) = project(slug, set, manifests);
+        let result = read_package_set(&set_path, &root);
+        let _ = fs::remove_dir_all(&root);
+        match result {
+            Ok(_) => Vec::new(),
+            Err(diagnostics) => diagnostics.into_iter().map(|d| d.code).collect(),
+        }
+    }
+
+    fn entry(name: &str, path: &str) -> serde_json::Value {
+        json!({"name": name, "source": {"type": "path", "path": path}})
+    }
+
+    /// The accept case. Without it, a reader that refused every set would satisfy
+    /// each rejection below.
+    #[test]
+    fn a_well_formed_package_set_resolves() {
+        let manifest = notes_manifest("notes");
+        assert_eq!(
+            codes(
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [entry("notes", "packages/notes.json")]}),
+                "ok",
+                &[("notes.json", manifest.as_str())],
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn two_packages_of_the_same_name_are_refused() {
+        let manifest = notes_manifest("notes");
+        assert!(codes(
+            json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                entry("notes", "packages/notes.json"),
+                entry("notes", "packages/notes.json")
+            ]}),
+            "dup",
+            &[("notes.json", manifest.as_str())],
+        )
+        .contains(&"package_set.duplicate_name"));
+    }
+
+    /// Containment, in two layers. A textual escape — `..` or an absolute path —
+    /// is refused as non-portable before resolution. What reaches
+    /// `escapes_project` is the escape the text cannot show: a project-relative
+    /// path that leaves the root through a SYMLINK. Both are asserted, because
+    /// covering only the textual layer would leave the check that exists
+    /// precisely for the harder case as unexercised as the sweep found it.
+    #[test]
+    fn a_textually_escaping_source_is_refused_as_non_portable() {
+        let manifest = notes_manifest("notes");
+        for escaping in ["../outside/notes.json", "/etc/hostname"] {
+            let found = codes(
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [entry("notes", escaping)]}),
+                "escape-text",
+                &[("notes.json", manifest.as_str())],
+            );
+            assert!(
+                found.contains(&"package_source.nonportable_path"),
+                "`{escaping}` must be refused as non-portable, got {found:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_leaving_the_project_through_a_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let manifest = notes_manifest("notes");
+        let root = env::temp_dir().join(format!(
+            "whipplescript-pkgset-symlink-{}",
+            stable_hash_hex("symlink")
+        ));
+        let outside = env::temp_dir().join(format!(
+            "whipplescript-pkgset-outside-{}",
+            stable_hash_hex("symlink")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("packages")).expect("packages dir");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::write(outside.join("notes.json"), &manifest).expect("outside manifest");
+        symlink(outside.join("notes.json"), root.join("packages/notes.json")).expect("symlink");
+
+        let set_path = root.join("whip.packages.json");
+        fs::write(
+            &set_path,
+            serde_json::to_string_pretty(&json!({
+                "schema": PACKAGE_SET_SCHEMA,
+                "packages": [entry("notes", "packages/notes.json")],
+            }))
+            .expect("json"),
+        )
+        .expect("set writes");
+
+        let result = read_package_set(&set_path, &root);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+
+        let found: Vec<&str> = match result {
+            Ok(_) => Vec::new(),
+            Err(diagnostics) => diagnostics.into_iter().map(|d| d.code).collect(),
+        };
+        assert!(
+            found.contains(&"package_source.escapes_project"),
+            "a symlinked escape must be refused, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_load_is_refused() {
+        assert!(codes(
+            json!({"schema": PACKAGE_SET_SCHEMA, "packages": [entry("notes", "packages/notes.json")]}),
+            "badmanifest",
+            &[("notes.json", "{ not json")],
+        )
+        .contains(&"package_manifest.invalid"));
+    }
+
+    /// The set names a package; the manifest declares its own name. A mismatch
+    /// means the set is loading something other than what it claims.
+    #[test]
+    fn a_manifest_declaring_another_name_is_refused() {
+        let manifest = notes_manifest("something-else");
+        assert!(codes(
+            json!({"schema": PACKAGE_SET_SCHEMA, "packages": [entry("notes", "packages/notes.json")]}),
+            "identity",
+            &[("notes.json", manifest.as_str())],
+        )
+        .contains(&"package_set.identity_mismatch"));
+    }
+}
+
+#[cfg(test)]
+mod package_shape_refusal_tests {
+    use super::{
+        validate_package_lock_source_shape, validate_package_set_closed_shape,
+        validate_package_type_name, PACKAGE_SET_SCHEMA,
+    };
+    use serde_json::{json, Value};
+
+    /// The package-set and lock shape validators are closed: an unexpected field,
+    /// a wrong type, or a missing required key must be refused, because these
+    /// files name the code a program is allowed to load. A mutation sweep found
+    /// none of their refusals exercised — every caller fed them a well-formed
+    /// document, so deleting any single rejection changed nothing observable.
+    ///
+    /// Table-driven rather than one test per rejection: the rejections are one
+    /// family (this field, this type, this key), so a table states the contract
+    /// in a form that stays readable as the shape grows. Each row is verified to
+    /// fail on its own.
+    fn valid_set() -> Value {
+        json!({
+            "schema": PACKAGE_SET_SCHEMA,
+            "packages": [
+                {"name": "notes", "source": {"type": "path", "path": "packages/notes.json"}}
+            ],
+        })
+    }
+
+    fn problems_for(value: &Value) -> Vec<String> {
+        let mut problems = Vec::new();
+        validate_package_set_closed_shape(value, &mut problems);
+        problems
+    }
+
+    #[test]
+    fn a_well_formed_package_set_is_accepted() {
+        // The accept case. Without it, a validator that refused everything would
+        // satisfy every rejection below.
+        assert_eq!(problems_for(&valid_set()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_package_set_shape_is_closed() {
+        let mut set;
+        let cases: Vec<(Value, &str)> = vec![
+            (json!("not an object"), "package set must be a JSON object"),
+            (
+                json!({"packages": []}),
+                "package set must have a `schema` string",
+            ),
+            (
+                json!({"schema": "whip.packages/v99", "packages": []}),
+                "package set schema must be",
+            ),
+            (
+                {
+                    set = valid_set();
+                    set["extra"] = json!(1);
+                    set.clone()
+                },
+                "package set has unexpected field `extra`",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA}),
+                "package set must have a `packages` array",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": {}}),
+                "package set `packages` must be an array",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": ["nope"]}),
+                "must be an object",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": {"type": "path", "path": "p"}, "extra": 1}
+                ]}),
+                "has unexpected field `extra`",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "", "source": {"type": "path", "path": "p"}}
+                ]}),
+                "name must be a non-empty string",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": "nope"}
+                ]}),
+                "source must be an object",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": {"type": "path", "path": "p", "extra": 1}}
+                ]}),
+                "source has unexpected field `extra`",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": {"type": "git", "path": "p"}}
+                ]}),
+                "source.type must be `path`",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": {"type": 5, "path": "p"}}
+                ]}),
+                "source.type must be a non-empty string",
+            ),
+            (
+                json!({"schema": PACKAGE_SET_SCHEMA, "packages": [
+                    {"name": "n", "source": {"type": "path", "path": ""}}
+                ]}),
+                "source.path must be a non-empty string",
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let problems = problems_for(&value);
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "expected `{expected}`, got {problems:?}"
+            );
+        }
+    }
+
+    /// The lock's source block carries the same closed shape, in its own
+    /// validator. Both are checked, because covering one would leave the other
+    /// exactly as unexercised as the sweep found it.
+    #[test]
+    fn the_lock_source_shape_is_closed() {
+        let cases: Vec<(Value, &str)> = vec![
+            (
+                json!({"source": "nope"}),
+                "field `source` must be an object",
+            ),
+            (
+                json!({"source": {"type": "path", "path": "p", "extra": 1}}),
+                "source has unexpected field `extra`",
+            ),
+            (
+                json!({"source": {"type": "git", "path": "p"}}),
+                "source.type must be `path`",
+            ),
+            (
+                json!({"source": {"type": 5, "path": "p"}}),
+                "source.type must be a non-empty string",
+            ),
+            (
+                json!({"source": {"type": "path", "path": ""}}),
+                "source.path must be a non-empty string",
+            ),
+            // Containment: a lock may only name a path inside the project.
+            (
+                json!({"source": {"type": "path", "path": "../outside/notes.json"}}),
+                "source.path must be a portable project-relative path",
+            ),
+            (
+                json!({"source": {"type": "path", "path": "/etc/passwd"}}),
+                "source.path must be a portable project-relative path",
+            ),
+        ];
+        for (value, expected) in cases {
+            let mut problems = Vec::new();
+            validate_package_lock_source_shape(&value, "package `notes`", &mut problems);
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "expected `{expected}`, got {problems:?}"
+            );
+        }
+
+        let mut problems = Vec::new();
+        validate_package_lock_source_shape(
+            &json!({"source": {"type": "path", "path": "packages/notes.json"}}),
+            "package `notes`",
+            &mut problems,
+        );
+        assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_package_output_type_rejects_the_wrong_json_and_an_unknown_name() {
+        let mut errors = Vec::new();
+        validate_package_type_name(&json!("x"), "int", "$", &mut errors);
+        assert!(errors.iter().any(|e| e.contains("must be")), "{errors:?}");
+
+        let mut errors = Vec::new();
+        validate_package_type_name(&json!("x"), "widget", "$", &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("unsupported package output type")),
+            "{errors:?}"
+        );
+
+        let mut errors = Vec::new();
+        validate_package_type_name(&json!(1), "int", "$", &mut errors);
+        assert_eq!(errors, Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod lint_refusal_tests {
+    use super::{lint_agent_tool_grants, lint_workflow_liveness};
+    use whipplescript_parser::{compile_program, compile_program_with_root, IrProgram};
+
+    /// `whip lint` ships zero-false-positive analyses, which means every one of
+    /// these is meant to be a hard signal. A mutation sweep found that none of
+    /// them was exercised: deleting any single diagnostic left the whole workspace
+    /// suite green. A lint that never fires is not a strict lint, it is a broken
+    /// one, and nothing here could tell the difference.
+    fn ir_of(source: &str) -> IrProgram {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.ir.is_some(),
+            "fixture must lower: {:?}",
+            compiled.diagnostics
+        );
+        compiled.ir.expect("ir")
+    }
+
+    fn ir_rooted(source: &str, root: &str) -> IrProgram {
+        let compiled = compile_program_with_root(source, Some(root));
+        assert!(
+            compiled.ir.is_some(),
+            "fixture must lower: {:?}",
+            compiled.diagnostics
+        );
+        compiled.ir.expect("ir")
+    }
+
+    fn asserts(ir: &IrProgram, expected: &str) {
+        let found = lint_workflow_liveness(ir);
+        assert!(
+            found.iter().any(|d| d.message.contains(expected)),
+            "expected `{expected}`, got {:?}",
+            found.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    fn is_clean(ir: &IrProgram) {
+        let found = lint_workflow_liveness(ir);
+        assert!(
+            found.is_empty(),
+            "a well-formed workflow must draw no liveness lint, got {:?}",
+            found.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The accept case for every rejection below: without it, a lint that fired on
+    /// everything would satisfy the whole module.
+    const WELL_FORMED: &str = r#"
+workflow Fine
+output result R
+class R { ok bool }
+rule r
+  when started
+=> { complete result { ok true } }
+"#;
+
+    #[test]
+    fn a_workflow_with_no_terminal_is_flagged() {
+        asserts(
+            &ir_of(
+                r#"
+workflow NoEnd
+class Note { id string }
+table seed as Note [ { id "1" } ]
+rule r
+  when Note as n
+=> { record Note { id "2" } }
+"#,
+            ),
+            "has no rule that reaches `complete` or `fail`",
+        );
+        is_clean(&ir_of(WELL_FORMED));
+    }
+
+    #[test]
+    fn a_tool_workflow_cannot_also_be_a_service() {
+        asserts(
+            &ir_of(
+                r#"
+@tool
+@service
+workflow Both
+output result R
+class R { ok bool }
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            "is both `@tool` and `@service`",
+        );
+    }
+
+    /// v1 `@tool` workflows must be leaves, must not be driven by an external
+    /// event, and must not await a message: each would make a tool's completion
+    /// depend on something its caller cannot see.
+    #[test]
+    fn a_tool_workflow_must_be_a_leaf() {
+        asserts(
+            &ir_rooted(
+                r#"
+class T { id string }
+class R { ok bool }
+
+@tool
+workflow Leaf {
+  input task T
+  output result R
+  rule r
+    when T as t
+  => {
+    invoke Child { task { id t.id } } as c
+    after c succeeds { complete result { ok true } }
+    after c fails { complete result { ok true } }
+  }
+}
+
+workflow Child {
+  input task T
+  output result R
+  rule w
+    when T as t
+  => { complete result { ok true } }
+}
+"#,
+                "Leaf",
+            ),
+            "invokes a sub-workflow; v1 `@tool` workflows must be leaves",
+        );
+    }
+
+    #[test]
+    fn a_tool_workflow_rule_cannot_be_external() {
+        asserts(
+            &ir_of(
+                r#"
+@tool
+workflow Ext
+input task T
+output result R
+class T { id string }
+class R { ok bool }
+@external
+rule r
+  when T as t
+=> { complete result { ok true } }
+"#,
+            ),
+            "is `@external`; a `@tool` workflow",
+        );
+    }
+
+    #[test]
+    fn a_tool_workflow_rule_cannot_await_a_message() {
+        asserts(
+            &ir_of(
+                r##"
+use std.messaging
+
+@tool
+workflow Msg
+input task T
+output result R
+class T { id string }
+class R { ok bool }
+channel peer {
+  provider local
+  workspace ops
+  destination "#peer"
+}
+rule r
+  when message from peer as m
+=> { complete result { ok true } }
+"##,
+            ),
+            "awaits an inbound message",
+        );
+    }
+
+    #[test]
+    fn a_rule_matching_a_fact_nothing_produces_is_flagged() {
+        asserts(
+            &ir_of(
+                r#"
+workflow Dead
+output result R
+class R { ok bool }
+class Ghost { id string }
+rule r
+  when Ghost as g
+=> { complete result { ok true } }
+rule s
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            "can never fire: nothing produces `Ghost`",
+        );
+    }
+
+    /// The same message has two producers: the ordinary `when <Class>` match and
+    /// the runtime `when fact <Class>` form. Covering one leaves the other
+    /// unexercised, which a message-level assertion alone would not reveal.
+    #[test]
+    fn a_rule_matching_a_runtime_fact_nothing_produces_is_flagged() {
+        asserts(
+            &ir_of(
+                r#"
+workflow DeadFact
+output result R
+class R { ok bool }
+class Ghost { id string }
+rule r
+  when fact Ghost as g
+=> { complete result { ok true } }
+rule s
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            "can never fire: nothing produces `Ghost`",
+        );
+    }
+
+    #[test]
+    fn a_rule_awaiting_a_turn_no_rule_creates_is_flagged() {
+        asserts(
+            &ir_of(
+                r#"
+workflow NoTurn
+output result R
+class R { ok bool }
+agent worker {
+  provider fixture
+  profile "code"
+  capacity 1
+}
+rule r
+  when worker completed turn as t
+=> { complete result { ok true } }
+rule s
+  when started
+=> { complete result { ok true } }
+"#,
+            ),
+            "can never fire: no rule creates an agent turn",
+        );
+    }
+
+    /// A granted tool must be a `@tool` workflow that passes the convergence
+    /// check. Granting an agent a name that is not one hands it authority the
+    /// checker never resolved.
+    #[test]
+    fn an_agent_granted_a_non_tool_is_flagged() {
+        // The grant resolver reads the program back off disk, so the fixture has
+        // to be a real bundle: a granted name that resolves to an untagged
+        // workflow is the only way to reach the `@tool` refusal rather than the
+        // earlier "not a workflow in this program" one.
+        let dir = std::env::temp_dir().join(format!(
+            "whip-tool-grant-lint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("grants.whip");
+        let source = r#"
+class R { ok bool }
+
+workflow Grants {
+  output result R
+  agent worker {
+    provider fixture
+    profile "code"
+    capacity 1
+    tools [Helper]
+  }
+  rule r
+    when started
+  => { complete result { ok true } }
+}
+
+workflow Helper {
+  output result R
+  rule h
+    when started
+  => { complete result { ok true } }
+}
+"#;
+        std::fs::write(&path, source).expect("write fixture");
+
+        let ir = ir_rooted(source, "Grants");
+        let found = lint_agent_tool_grants(&path, &ir, None);
+        assert!(
+            found.iter().any(|d| d
+                .message
+                .contains("is granted `Helper`: `Helper` is not tagged `@tool`")),
+            "{:?}",
+            found.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+
+        // A name no workflow in the bundle carries is refused for that reason
+        // instead: a distinct refusal, and it must not be mistaken for the one
+        // above.
+        let missing = ir_rooted(
+            &source.replace("tools [Helper]", "tools [NoSuchTool]"),
+            "Grants",
+        );
+        let found = lint_agent_tool_grants(&path, &missing, None);
+        assert!(
+            found.iter().any(|d| d.message.contains(
+                "is granted `NoSuchTool`: `NoSuchTool` is not a workflow in this program"
+            )),
+            "{:?}",
+            found.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+
+        // A program granting nothing draws no grant lint.
+        let clean = ir_of(WELL_FORMED);
+        assert!(lint_agent_tool_grants(&path, &clean, None).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// The `whip mcp` subcommands are the only writers of trust evidence — the
     /// pin, the attestation, the role file — so they are exactly the surface
