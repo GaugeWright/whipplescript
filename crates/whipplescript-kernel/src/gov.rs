@@ -98,14 +98,28 @@ pub struct VerifiedAttestation {
     /// The external governance key that signed the envelope. `None` only for
     /// the legacy root-only CLI governance agent.
     pub key_id: Option<String>,
+    /// The policy epoch the signature COVERS, present only under the `:v2`
+    /// preimage. `None` means the epoch is not authenticated by this envelope,
+    /// so nothing may rest on it (DR-0063 §5).
+    pub epoch: Option<u64>,
+    /// The authority the envelope speaks for, present only under `:v2`.
+    pub authority: Option<String>,
 }
 
 /// A cryptographic attestation supplied by an embedding governance authority.
+///
+/// `epoch` and `authority` are the `:v2` preimage's additions (DR-0063 §5).
+/// Both present selects `:v2`; both absent selects `:v1`, which stays valid on
+/// the single-envelope path. Exactly one present is malformed and refused
+/// rather than silently downgraded — a half-stated v2 is how an epoch would
+/// come to look signed without being.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalAttestation {
     pub algorithm: String,
     pub key_id: String,
     pub signature: String,
+    pub epoch: Option<u64>,
+    pub authority: Option<String>,
 }
 
 /// Cryptographic agility seam for embedding governance authorities.
@@ -179,8 +193,36 @@ impl SignedEnvelope {
                 algorithm: algorithm.to_owned(),
                 key_id: key_id.to_owned(),
                 signature: signature.to_owned(),
+                epoch: None,
+                authority: None,
             }),
         })
+    }
+
+    /// Assemble an envelope signed under the `:v2` preimage (DR-0063 §5), which
+    /// also covers the policy `epoch` and the `authority` the envelope speaks
+    /// for. The signature must cover [`external_signing_bytes_v2`]. A composed
+    /// set admits only this form; `from_external_signature` remains the
+    /// single-envelope path.
+    pub fn from_external_signature_v2(
+        config_text: &str,
+        signer: &str,
+        algorithm: &str,
+        key_id: &str,
+        signature: &str,
+        epoch: u64,
+        authority: &str,
+    ) -> Result<Self, String> {
+        if authority.trim().is_empty() {
+            return Err("a :v2 governance attestation requires an authority".to_owned());
+        }
+        let mut envelope =
+            Self::from_external_signature(config_text, signer, algorithm, key_id, signature)?;
+        if let Some(external) = envelope.external.as_mut() {
+            external.epoch = Some(epoch);
+            external.authority = Some(authority.to_owned());
+        }
+        Ok(envelope)
     }
 
     /// Sign through the custodian (DR-0053 §10): the governance signing key
@@ -239,6 +281,8 @@ impl SignedEnvelope {
                 algorithm: GOVERNANCE_CUSTODIAN_ALGORITHM.to_owned(),
                 key_id,
                 signature: signature_b64,
+                epoch: None,
+                authority: None,
             }),
         })
     }
@@ -267,6 +311,12 @@ impl SignedEnvelope {
                 attestation["algorithm"] = serde_json::json!(external.algorithm);
                 attestation["key_id"] = serde_json::json!(external.key_id);
                 attestation["signature"] = serde_json::json!(external.signature);
+                // Emitted only under `:v2`, so a v1 envelope round-trips
+                // byte-identically and keeps verifying against v1 bytes.
+                if let (Some(epoch), Some(authority)) = (external.epoch, &external.authority) {
+                    attestation["epoch"] = serde_json::json!(epoch);
+                    attestation["authority"] = serde_json::json!(authority);
+                }
             }
             obj.insert("attestation".to_owned(), attestation);
         }
@@ -295,6 +345,8 @@ impl SignedEnvelope {
             envelope_hash: parsed.envelope_hash,
             signer: parsed.signer,
             key_id: None,
+            epoch: None,
+            authority: None,
         })
     }
 
@@ -308,17 +360,33 @@ impl SignedEnvelope {
         let external = parsed.external.ok_or_else(|| {
             "trusted embedding requires an external cryptographic attestation".to_owned()
         })?;
-        let signing_bytes = signing_bytes_from_hash(
-            &parsed.envelope_hash,
-            &parsed.signer,
-            &external.algorithm,
-            &external.key_id,
-        );
+        // The preimage is selected by what the attestation states, never by a
+        // caller preference: a `:v1` attestation cannot be verified against
+        // `:v2` bytes or the reverse, because the domain tag differs and the
+        // signature simply fails.
+        let signing_bytes = match (external.epoch, external.authority.as_deref()) {
+            (Some(epoch), Some(authority)) => signing_bytes_from_hash_v2(
+                &parsed.envelope_hash,
+                &parsed.signer,
+                &external.algorithm,
+                &external.key_id,
+                epoch,
+                authority,
+            ),
+            _ => signing_bytes_from_hash(
+                &parsed.envelope_hash,
+                &parsed.signer,
+                &external.algorithm,
+                &external.key_id,
+            ),
+        };
         verifier.verify(&signing_bytes, &external)?;
         Ok(VerifiedAttestation {
             envelope_hash: parsed.envelope_hash,
             signer: parsed.signer,
             key_id: Some(external.key_id),
+            epoch: external.epoch,
+            authority: external.authority,
         })
     }
 }
@@ -418,10 +486,28 @@ fn parse_attestation(signed_json: &str) -> Result<ParsedAttestation, String> {
         (Some(algorithm), Some(key_id), Some(signature))
             if !algorithm.is_empty() && !key_id.is_empty() && !signature.is_empty() =>
         {
+            let epoch = attestation.get("epoch").and_then(serde_json::Value::as_u64);
+            let authority = attestation
+                .get("authority")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            // Half a v2 attestation is refused rather than downgraded to v1.
+            // Downgrading would verify a signature that never covered the epoch
+            // while the envelope carries one, which is the exact confusion the
+            // domain tag exists to prevent.
+            if epoch.is_some() != authority.is_some() {
+                return Err(
+                    "governance attestation states one of epoch/authority; :v2 requires both"
+                        .to_owned(),
+                );
+            }
             Some(ExternalAttestation {
                 algorithm: algorithm.to_owned(),
                 key_id: key_id.to_owned(),
                 signature: signature.to_owned(),
+                epoch,
+                authority,
             })
         }
         _ => return Err("external governance attestation is incomplete".to_owned()),
@@ -467,14 +553,79 @@ pub fn external_signing_bytes(
     ))
 }
 
+/// The exact bytes an embedding governance authority signs under `:v2`
+/// (DR-0063 §5). A composed set admits only this form; `:v1` remains valid on
+/// the single-envelope path.
+pub fn external_signing_bytes_v2(
+    config_text: &str,
+    signer: &str,
+    algorithm: &str,
+    key_id: &str,
+    epoch: u64,
+    authority: &str,
+) -> Result<Vec<u8>, String> {
+    let canonical = canonicalize(config_text)?;
+    let envelope_hash = hash_hex(&canonical);
+    Ok(signing_bytes_from_hash_v2(
+        &envelope_hash,
+        signer,
+        algorithm,
+        key_id,
+        epoch,
+        authority,
+    ))
+}
+
 fn signing_bytes_from_hash(
     envelope_hash: &str,
     signer: &str,
     algorithm: &str,
     key_id: &str,
 ) -> Vec<u8> {
-    let mut bytes = b"whipplescript-governance-envelope:v1;".to_vec();
-    for value in [envelope_hash, signer, algorithm, key_id] {
+    tagged_signing_bytes(
+        b"whipplescript-governance-envelope:v1;",
+        &[envelope_hash, signer, algorithm, key_id],
+    )
+}
+
+/// The `:v2` preimage (DR-0063 §5): everything `:v1` covers, plus the policy
+/// **epoch** and the **authority** the envelope speaks for.
+///
+/// The epoch matters because a composition record cites
+/// `(authority, envelope_hash, envelope_version, epoch)` per constituent, and
+/// under `:v1` the same valid signature verifies under whatever epoch a caller
+/// names — so a constituent can be presented as a different, including an
+/// earlier, policy version. That is exactly the non-retroactivity claim the
+/// record is meant to carry. The authority matters because a composed set is
+/// keyed by it, and a signature that does not cover it authenticates the
+/// signer without authenticating whose policy this is.
+fn signing_bytes_from_hash_v2(
+    envelope_hash: &str,
+    signer: &str,
+    algorithm: &str,
+    key_id: &str,
+    epoch: u64,
+    authority: &str,
+) -> Vec<u8> {
+    let epoch_text = epoch.to_string();
+    tagged_signing_bytes(
+        b"whipplescript-governance-envelope:v2;",
+        &[
+            envelope_hash,
+            signer,
+            algorithm,
+            key_id,
+            &epoch_text,
+            authority,
+        ],
+    )
+}
+
+/// Length-prefixed concatenation under a domain tag. The prefixes make the
+/// tuple unambiguous, so no two distinct field lists produce one preimage.
+fn tagged_signing_bytes(tag: &[u8], values: &[&str]) -> Vec<u8> {
+    let mut bytes = tag.to_vec();
+    for value in values {
         bytes.extend_from_slice(value.len().to_string().as_bytes());
         bytes.push(b':');
         bytes.extend_from_slice(value.as_bytes());
@@ -599,6 +750,64 @@ grant file_store outbox -> file:/srv/outbox public\n";
         assert_eq!(attestation.signer, "alice@admin");
         assert_eq!(attestation.envelope_hash, signed.envelope_hash);
         assert_eq!(attestation.key_id, None);
+    }
+
+    #[test]
+    fn a_half_stated_v2_attestation_is_refused_rather_than_downgraded() {
+        // DR-0063 §5. An attestation naming an epoch but no authority (or the
+        // reverse) is malformed. Treating it as `:v1` would verify a signature
+        // that never covered the epoch while the envelope carries one — the
+        // exact confusion the domain tag exists to prevent, arrived at by
+        // omission rather than by forgery.
+        let signed = SignedEnvelope::from_external_signature(
+            CONFIG,
+            "gaugedesk-root",
+            "p256-sha256",
+            "key-1",
+            "valid-signature",
+        )
+        .expect("artifact")
+        .to_json();
+        let half = signed.replace(
+            "\"signature\":\"valid-signature\"",
+            "\"signature\":\"valid-signature\",\"epoch\":12",
+        );
+        let error = SignedEnvelope::verify_attestation_with(
+            &half,
+            &ExactVerifier {
+                expected: Vec::new(),
+            },
+        )
+        .expect_err("half a v2 attestation is not a v1 attestation");
+        assert!(
+            error.contains("epoch/authority"),
+            "the refusal says which half is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn the_v2_preimage_covers_the_epoch_and_the_authority() {
+        // Changing either input changes the bytes a signature must cover, which
+        // is the whole mechanism: an epoch outside the preimage is an epoch a
+        // caller may choose.
+        let base =
+            external_signing_bytes_v2(CONFIG, "gaugedesk-root", "p256-sha256", "key-1", 12, "acme")
+                .expect("bytes");
+        let other_epoch =
+            external_signing_bytes_v2(CONFIG, "gaugedesk-root", "p256-sha256", "key-1", 13, "acme")
+                .expect("bytes");
+        let other_authority =
+            external_signing_bytes_v2(CONFIG, "gaugedesk-root", "p256-sha256", "key-1", 12, "beta")
+                .expect("bytes");
+        assert_ne!(base, other_epoch, "the epoch is inside the preimage");
+        assert_ne!(
+            base, other_authority,
+            "the authority is inside the preimage"
+        );
+
+        let v1 = external_signing_bytes(CONFIG, "gaugedesk-root", "p256-sha256", "key-1")
+            .expect("bytes");
+        assert_ne!(base, v1, "the two preimages are domain-separated");
     }
 
     #[test]

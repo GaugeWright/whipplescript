@@ -55,6 +55,20 @@ impl GaugeDeskGovernanceRoot {
                 "governance key does not match the placement's pinned authority".to_owned(),
             );
         }
+        // DR-0063 §5. Under `:v2` the signature covers the epoch, so the epoch
+        // this call names must be the one that was signed — the caller stops
+        // being able to choose which policy version a valid signature stands
+        // for. Under `:v1` the signature does not reach the epoch at all, and
+        // this call keeps its historic behaviour on the single-envelope path;
+        // `attestation.epoch` being `None` is what a consumer checks before
+        // resting anything on it.
+        if let Some(signed_epoch) = attestation.epoch {
+            if signed_epoch != epoch {
+                return Err(format!(
+                    "governance attestation is signed for epoch {signed_epoch}, not {epoch}"
+                ));
+            }
+        }
         let policy =
             PolicyEpochRef::from_verified(epoch, &envelope).map_err(|error| error.to_string())?;
         Ok(VerifiedHostedPolicy { policy, envelope })
@@ -100,9 +114,36 @@ mod tests {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::sec1::ToSec1Point;
-    use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+    use whipplescript_kernel::gov::{
+        external_signing_bytes, external_signing_bytes_v2, SignedEnvelope,
+    };
 
     fn signed_policy(seed: u8, signer: &str) -> (String, String) {
+        let (key, public_key, policy) = policy_material(seed);
+        let signing_bytes = external_signing_bytes(
+            &policy,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+        )
+        .expect("canonical bytes");
+        let signature: Signature = key.sign(&signing_bytes);
+        let signed = SignedEnvelope::from_external_signature(
+            &policy,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+            &hex::encode(signature.to_bytes()),
+        )
+        .expect("signed")
+        .to_json();
+        (public_key, signed)
+    }
+
+    /// The signing key, its pinned public form, and the policy text every test
+    /// in this module signs. Shared so a `:v1` and a `:v2` attestation cover
+    /// byte-identical content and differ only in their preimage.
+    fn policy_material(seed: u8) -> (SigningKey, String, String) {
         let key = SigningKey::from_slice(&[seed; 32]).expect("test key");
         let public_key = hex::encode(
             key.verifying_key()
@@ -137,24 +178,109 @@ mod tests {
             }
         })
         .to_string();
-        let signing_bytes = external_signing_bytes(
+        (key, public_key, policy)
+    }
+
+    /// The same policy signed under the `:v2` preimage, which covers the epoch
+    /// and the authority as well (DR-0063 §5).
+    fn signed_policy_v2(seed: u8, signer: &str, epoch: u64, authority: &str) -> (String, String) {
+        let (key, public_key, policy) = policy_material(seed);
+        let signing_bytes = external_signing_bytes_v2(
             &policy,
             signer,
             GAUGEDESK_ATTESTATION_ALGORITHM,
             &public_key,
+            epoch,
+            authority,
         )
         .expect("canonical bytes");
         let signature: Signature = key.sign(&signing_bytes);
-        let signed = SignedEnvelope::from_external_signature(
+        let signed = SignedEnvelope::from_external_signature_v2(
             &policy,
             signer,
             GAUGEDESK_ATTESTATION_ALGORITHM,
             &public_key,
             &hex::encode(signature.to_bytes()),
+            epoch,
+            authority,
         )
         .expect("signed")
         .to_json();
         (public_key, signed)
+    }
+
+    #[test]
+    fn a_v2_policy_verifies_at_the_epoch_it_was_signed_for() {
+        let (key, signed) = signed_policy_v2(7, "authority:gaugedesk", 12, "acme");
+        let verified = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key)
+            .verify_epoch(12, &signed)
+            .expect("verified");
+        assert_eq!(verified.policy.epoch, 12);
+        assert_eq!(
+            verified.envelope.attestation().and_then(|a| a.epoch),
+            Some(12),
+            "the epoch is authenticated, so a consumer may rest on it"
+        );
+        assert_eq!(
+            verified
+                .envelope
+                .attestation()
+                .and_then(|a| a.authority.as_deref()),
+            Some("acme"),
+        );
+    }
+
+    #[test]
+    fn a_v2_policy_is_refused_at_any_other_epoch() {
+        // The headline of DR-0063 §5. Under `:v1` this same call succeeds
+        // (below), which is how a constituent could be replayed as a different
+        // — including an earlier — policy version while its signature stayed
+        // valid. The composition record cites the epoch, so an unauthenticated
+        // one makes the record's non-retroactivity claim untrue.
+        let (key, signed) = signed_policy_v2(7, "authority:gaugedesk", 12, "acme");
+        let root = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key);
+        let error = match root.verify_epoch(11, &signed) {
+            Ok(_) => panic!("a v2 signature must not verify at an epoch it does not name"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("signed for epoch 12"),
+            "the refusal names the epoch actually signed: {error}"
+        );
+        assert!(root.verify_epoch(13, &signed).is_err());
+    }
+
+    #[test]
+    fn a_v1_policy_still_verifies_and_authenticates_no_epoch() {
+        // The single-envelope path, unchanged and deliberately so. What changes
+        // is that `epoch: None` now SAYS the epoch is unauthenticated, instead
+        // of the caller's argument looking like a verified fact.
+        let (key, signed) = signed_policy(7, "authority:gaugedesk");
+        let verified = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key)
+            .verify_epoch(12, &signed)
+            .expect("verified");
+        assert_eq!(
+            verified.envelope.attestation().and_then(|a| a.epoch),
+            None,
+            "a v1 signature does not reach the epoch, and says so"
+        );
+    }
+
+    #[test]
+    fn a_v2_signature_does_not_verify_as_v1() {
+        // Domain separation. The tag differs, so bytes signed under one
+        // preimage cannot be replayed as the other — which is what lets both
+        // live in one verifier without a downgrade path between them.
+        let (key, signed) = signed_policy_v2(7, "authority:gaugedesk", 12, "acme");
+        let stripped = signed
+            .replace(",\"epoch\":12", "")
+            .replace(",\"authority\":\"acme\"", "");
+        assert!(!stripped.contains("\"epoch\""), "v2 fields removed");
+        let root = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key);
+        assert!(
+            root.verify_epoch(12, &stripped).is_err(),
+            "stripping the v2 fields must not downgrade the envelope into a valid v1 one"
+        );
     }
 
     #[test]
