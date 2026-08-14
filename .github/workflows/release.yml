@@ -264,6 +264,24 @@ jobs:
       - custom-dist-smoke
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-dist-smoke.result == 'skipped' || needs.custom-dist-smoke.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # `host` is the only job that runs actions/attest-build-provenance, so the
+    # permission to persist an attestation is granted here rather than at
+    # workflow scope: the build jobs run downloaded tooling and package build
+    # code, and a compromised dependency there must not be able to sign
+    # repository-wide provenance. A job-level block replaces the workflow
+    # default outright, so the two permissions `host` already relied on are
+    # restated: `contents: write` for `gh release create`, `id-token: write`
+    # for the attestation's OIDC token.
+    #
+    # Without `attestations: write` the attest step fails with "Resource not
+    # accessible by integration" and takes `host` — and therefore the whole
+    # release — down with it. Deliberately not paired with a continue-on-error
+    # on the step: an attestation that silently does not persist is a
+    # provenance claim nobody can check, which is worse than a failed release.
+    permissions:
+      "contents": "write"
+      "id-token": "write"
+      "attestations": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
