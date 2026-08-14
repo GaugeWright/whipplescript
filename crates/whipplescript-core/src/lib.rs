@@ -1877,3 +1877,197 @@ mod tests {
         assert_eq!(registry.validate(), Vec::new());
     }
 }
+
+#[cfg(test)]
+mod registry_wellformedness_refusal_tests {
+    //! `ContractRegistry::validate` is the layer beneath the package
+    //! authorability door: `package_registry.rs` decides whether a package MAY
+    //! declare a construct, and this decides whether what it declared is
+    //! well-formed at all. A mutation sweep found twelve of its refusals
+    //! unexercised, confirmed against the whole workspace — every one an
+    //! "identifier must not be empty" rule.
+    //!
+    //! An empty id is not a hypothetical. The registry is assembled from
+    //! externally-supplied manifest JSON, where a missing key and a present-but-
+    //! empty string are different inputs that reach here identically, and the
+    //! ids are what everything downstream keys on: a construct with an empty
+    //! keyword claims the empty keyword.
+    //!
+    //! Each case perturbs a CLEAN registry in exactly one way, and the clean
+    //! registry is asserted to validate silently first. Without that, a
+    //! validator that reported every code on every input would pass the lot.
+
+    use super::*;
+
+    fn library() -> LibraryRegistration {
+        LibraryRegistration {
+            id: "acme.widgets".to_owned(),
+            version: "0.1.0".to_owned(),
+            standard: false,
+        }
+    }
+
+    fn construct() -> ConstructRegistration {
+        ConstructRegistration {
+            id: "acme.widgets.block".to_owned(),
+            library_id: "acme.widgets".to_owned(),
+            version: "0.1.0".to_owned(),
+            construct_family: "declaration_block".to_owned(),
+            keyword: "widget".to_owned(),
+            scope: "top_level".to_owned(),
+            grammar: None,
+            fields: vec![ConstructField {
+                name: "path".to_owned(),
+                kind: "expression".to_owned(),
+                required: true,
+            }],
+            requires: Vec::new(),
+            provides: Vec::new(),
+            lowering_target: "metadata_only".to_owned(),
+            target_capability: None,
+        }
+    }
+
+    fn effect_contract() -> EffectContract {
+        EffectContract {
+            id: "acme.widgets.call".to_owned(),
+            library_id: "acme.widgets".to_owned(),
+            version: "0.1.0".to_owned(),
+            effect_kind: "capability.call".to_owned(),
+            source_forms: vec!["acme.widgets.block".to_owned()],
+            input_schema: None,
+            output_schema: None,
+            required_capabilities: Vec::new(),
+            provider_kinds: Vec::new(),
+            projected_facts: Vec::new(),
+            validation: TypedOutputValidation::None,
+        }
+    }
+
+    fn registry() -> ContractRegistry {
+        ContractRegistry {
+            libraries: vec![library()],
+            constructs: vec![construct()],
+            effect_contracts: vec![effect_contract()],
+        }
+    }
+
+    fn codes(registry: &ContractRegistry) -> BTreeSet<String> {
+        registry
+            .validate()
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
+    #[test]
+    fn a_well_formed_registry_validates_silently() {
+        assert_eq!(
+            registry().validate(),
+            Vec::new(),
+            "the baseline every case below perturbs must itself be clean"
+        );
+    }
+
+    /// One perturbation per case, each naming the single field it empties.
+    #[test]
+    fn an_empty_identifier_is_refused_wherever_it_appears() {
+        let cases: Vec<(&str, ContractRegistry)> = vec![
+            ("library_id_empty", {
+                let mut r = registry();
+                r.libraries[0].id = String::new();
+                // The construct and contract point at the now-empty id, so the
+                // unknown-library codes ride along; the assertion is
+                // containment, not equality, for exactly that reason.
+                r.constructs[0].library_id = String::new();
+                r.effect_contracts[0].library_id = String::new();
+                r
+            }),
+            ("library_version_empty", {
+                let mut r = registry();
+                r.libraries[0].version = String::new();
+                r
+            }),
+            ("library_duplicate", {
+                let mut r = registry();
+                r.libraries.push(library());
+                r
+            }),
+            ("construct_id_empty", {
+                let mut r = registry();
+                r.constructs[0].id = String::new();
+                r
+            }),
+            ("construct_version_empty", {
+                let mut r = registry();
+                r.constructs[0].version = String::new();
+                r
+            }),
+            ("construct_keyword_empty", {
+                let mut r = registry();
+                r.constructs[0].keyword = String::new();
+                r
+            }),
+            ("construct_scope_empty", {
+                let mut r = registry();
+                r.constructs[0].scope = String::new();
+                r
+            }),
+            // Present-but-empty, NOT absent: `None` is a construct that targets
+            // no capability, which is legitimate, and the baseline proves it.
+            ("construct_target_capability_empty", {
+                let mut r = registry();
+                r.constructs[0].target_capability = Some("   ".to_owned());
+                r
+            }),
+            ("construct_field_name_empty", {
+                let mut r = registry();
+                r.constructs[0].fields[0].name = String::new();
+                r
+            }),
+            ("effect_contract_id_empty", {
+                let mut r = registry();
+                r.effect_contracts[0].id = String::new();
+                r
+            }),
+            ("effect_contract_version_empty", {
+                let mut r = registry();
+                r.effect_contracts[0].version = String::new();
+                r
+            }),
+            ("effect_kind_empty", {
+                let mut r = registry();
+                r.effect_contracts[0].effect_kind = String::new();
+                r
+            }),
+        ];
+
+        // Report every miss, not just the first: a table this size otherwise
+        // fails one case per run.
+        let mut missing = Vec::new();
+        for (expected, perturbed) in &cases {
+            let found = codes(perturbed);
+            if !found.contains(*expected) {
+                missing.push(format!("{expected} (got {found:?})"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} registry refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// Whitespace is empty. A manifest key whose value is `" "` is the same
+    /// author mistake as `""`, and `trim().is_empty()` is what these rules
+    /// actually test — so one case pins that rather than leaving it to
+    /// inference from the `String::new()` cases above.
+    #[test]
+    fn a_whitespace_only_identifier_is_empty() {
+        let mut r = registry();
+        r.constructs[0].keyword = "  \t ".to_owned();
+        assert!(codes(&r).contains("construct_keyword_empty"));
+    }
+}

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,11 @@ from dataclasses import dataclass
 
 # A refusal is either pushed onto a diagnostic list or returned as an error.
 PUSH_PATTERNS = ("diagnostics.push(", "errors.push(")
+
+# The same call WITH its receiver path, so `self.diagnostics.push(` and
+# `self.inner.errors.push(` are neutralised whole rather than leaving a
+# `self.drop(` that does not compile.
+PUSH_CALL = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*(?:diagnostics|errors)\.push\(")
 
 # `Err(` in expression position. Both `return Err(...)` and a tail-position
 # `Err(...)` are refusals; `Err(e) =>` and `if let Err(e)` are patterns.
@@ -165,10 +171,14 @@ def neutralise(line: str) -> str | None:
     which only catches tests that assert on the text. That is a real limit and it
     is reported rather than papered over.
     """
-    for pattern in PUSH_PATTERNS:
-        if pattern in line:
-            return line.replace(pattern, "drop(", 1)
-    return None
+    # The RECEIVER goes too. `self.diagnostics.push(x)` rewritten to
+    # `self.drop(x)` is a call to a method that does not exist, so the mutation
+    # does not compile and the site cannot be measured at all — 48 of the
+    # parser's refusals were unknown for exactly this reason, every one of them
+    # a `self.`-qualified push. Replacing the whole receiver path leaves the
+    # free function `drop`, which consumes the argument and typechecks anywhere.
+    mutated = PUSH_CALL.sub("drop(", line, count=1)
+    return mutated if mutated != line else None
 
 
 def mutate_message(line: str) -> str | None:
@@ -214,12 +224,17 @@ def run_suite(filter_expr: str) -> str:
     cargo's nonzero status as "a test caught this refusal" invents coverage that
     does not exist.
     """
-    result = subprocess.run(
-        ["cargo", "test", "-q", filter_expr] if filter_expr.startswith("-")
-        else ["cargo", "test", "-q", "--", filter_expr],
-        capture_output=True,
-        text=True,
-    )
+    # A flag-style filter is a cargo argument LIST (`-p whipplescript-parser`)
+    # and has to be split: passed whole, cargo receives one argv element
+    # containing a space and rejects it, which reads as BUILD_FAILED for every
+    # site and reports a whole file unmeasured. Anything else is a test-name
+    # filter and goes after `--`; an empty filter runs the workspace.
+    command = ["cargo", "test", "-q"]
+    if filter_expr.startswith("-"):
+        command += shlex.split(filter_expr)
+    elif filter_expr:
+        command += ["--", filter_expr]
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode == 0:
         return PASSED
     if "could not compile" in result.stdout + result.stderr:
@@ -324,6 +339,14 @@ def main() -> int:
     parser.add_argument("--target", required=True, help="source file to sweep")
     parser.add_argument("--filter", required=True, help="cargo test filter to run per mutation")
     parser.add_argument("--limit", type=int, default=0, help="sweep only the first N sites")
+    parser.add_argument(
+        "--only-lines",
+        default="",
+        help="comma-separated 1-indexed lines; sweep only the sites on them. "
+        "Confirming a cheap per-crate run's candidates against the workspace "
+        "otherwise re-runs every site in the file, and the whole point of the "
+        "two-phase shape is that the expensive phase is small.",
+    )
     args = parser.parse_args()
 
     target = args.target
@@ -332,6 +355,7 @@ def main() -> int:
         return 2
 
     backup = target + ".sweepbak"
+    missing: set[int] = set()
     shutil.copy(target, backup)
     try:
         print("== self test ==", flush=True)
@@ -340,6 +364,21 @@ def main() -> int:
         shutil.copy(backup, target)
 
         sites = find_sites(open(backup).read().split("\n"))
+        if args.only_lines:
+            wanted = {int(part) for part in args.only_lines.split(",") if part.strip()}
+            sites = [site for site in sites if site.line in wanted]
+            # A line that names no site is a stale candidate list — the file
+            # moved under it. Say so rather than silently confirming fewer
+            # refusals than were asked about, which would read as "the rest are
+            # fine". It also fails the run: a requested site that was never
+            # measured is unknown, and unknown must not exit 0.
+            missing = wanted - {site.line for site in sites}
+            if missing:
+                print(
+                    f"note: {len(missing)} requested line(s) hold no refusal site "
+                    f"and were NOT measured: {sorted(missing)}",
+                    flush=True,
+                )
         if args.limit:
             print(f"note: sweeping {args.limit} of {len(sites)} sites", flush=True)
             sites = sites[: args.limit]
@@ -360,7 +399,15 @@ def main() -> int:
         )
         for site in unmeasured:
             print(f"  {target}:{site.line}  {site.label}")
-    return 1 if survivors or unmeasured else 0
+    if missing:
+        print(
+            f"\n{len(missing)} requested line(s) held no refusal site and were "
+            f"NOT measured — the candidate list is stale against this file. "
+            f"These are unknown, not covered."
+        )
+        for line in sorted(missing):
+            print(f"  {target}:{line}  (no refusal site)")
+    return 1 if survivors or unmeasured or missing else 0
 
 
 if __name__ == "__main__":

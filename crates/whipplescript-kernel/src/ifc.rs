@@ -9178,3 +9178,281 @@ rule settle
         assert!(delegation_admissible(&onprem, demand).is_ok());
     }
 }
+
+#[cfg(test)]
+mod governance_refusal_tests {
+    //! Governance-envelope refusals, and the one NMIF check that guards which
+    //! crossing an attacker may steer.
+    //!
+    //! A mutation sweep found none of these pinned. The `Err`-returning ones are
+    //! a weaker finding than it first appears: the sweep mutates an error's
+    //! MESSAGE, so "unexercised" there means no test compares the text, not that
+    //! no test reaches the refusal. Two of them are in fact reached by
+    //! `is_err()` assertions elsewhere in this file. That is worth closing
+    //! anyway — the envelope is operator-authored policy, and `is_err()` cannot
+    //! tell "your `custody_demand` must be an object" from "unknown custody
+    //! class", which are different mistakes with different fixes.
+    //!
+    //! The NMIF selector check at the end is the strong finding: it is a pushed
+    //! diagnostic, nothing failed when it stopped firing, and it is the rule
+    //! stopping untrusted data from choosing which declassify runs.
+
+    use super::{Envelope, VerifiedEnvelope};
+
+    /// Every rejection pairs with an accept. A parser that rejects everything
+    /// satisfies a rejection-only suite while refusing every legitimate policy.
+    const VALID_DSL: &str = "\
+grant file_store ledger -> file:/srv/ledger.db readable by Operator\n\
+grant declassify ledger to public\n\
+guarantee writes_within:repo **/*.rs\n\
+party bob@acme.com : Requester\n\
+delegate alice acts-for Operator\n";
+
+    fn dsl_error(text: &str) -> String {
+        Envelope::from_dsl(text)
+            .map(|_| ())
+            .expect_err("expected a rejection")
+    }
+
+    fn json_error(text: &str) -> String {
+        Envelope::from_json(text)
+            .map(|_| ())
+            .expect_err("expected a rejection")
+    }
+
+    #[test]
+    fn a_valid_envelope_is_admitted_in_both_syntaxes() {
+        Envelope::from_dsl(VALID_DSL).expect("valid DSL must be admitted");
+        Envelope::from_json(
+            r#"{ "resources": { "ledger": { "confidential": true } },
+                 "mcp_min_rung": "attested",
+                 "credential_min_rung": "os-keyring",
+                 "custody_demand": { "Operator": "zero-retention" } }"#,
+        )
+        .expect("valid JSON must be admitted");
+    }
+
+    /// A policy key of the wrong TYPE is an error, never an ignored key. The
+    /// comments at these sites give the reason: a policy that meant to require
+    /// `attested` and got a typo must not silently degrade to no requirement.
+    /// Pinning the message keeps "must be a string" distinct from the sibling
+    /// "unknown mcp_min_rung `x`", which is a different author mistake.
+    #[test]
+    fn a_mistyped_policy_key_is_refused_rather_than_ignored() {
+        assert_eq!(
+            json_error(r#"{ "resources": {}, "mcp_min_rung": ["attested"] }"#),
+            "mcp_min_rung must be a string"
+        );
+        assert_eq!(
+            json_error(r#"{ "resources": {}, "credential_min_rung": 3 }"#),
+            "credential_min_rung must be a string"
+        );
+        assert_eq!(
+            json_error(r#"{ "resources": {}, "custody_demand": { "Operator": 7 } }"#),
+            "custody_demand for `Operator` must be a string"
+        );
+        assert_eq!(
+            json_error(r#"{ "resources": {}, "custody_demand": "zero-retention" }"#),
+            "custody_demand must be an object"
+        );
+
+        // The sibling rung refusals are the OTHER half of the same discipline:
+        // a recognized key with an unrecognized value is equally an error.
+        assert_eq!(
+            json_error(r#"{ "resources": {}, "mcp_min_rung": "attestd" }"#),
+            "unknown mcp_min_rung `attestd`"
+        );
+    }
+
+    #[test]
+    fn a_malformed_governance_statement_is_refused() {
+        // A crossing grant with no `to <role>`: the grant would arm a crossing
+        // for nobody, which is not a safe default to guess at.
+        assert_eq!(
+            dsl_error("grant declassify ledger\n"),
+            "line 1: declassify grant needs `to <role>`"
+        );
+        assert_eq!(
+            dsl_error("grant endorse to Operator\n"),
+            "line 1: endorse grant needs `grant endorse <resource> to <role>`"
+        );
+        assert_eq!(dsl_error("guarantee\n"), "line 1: guarantee needs a name");
+        assert_eq!(
+            dsl_error("delegate acts-for\n"),
+            "line 1: delegate needs `delegate <P> acts-for <Q>`"
+        );
+        assert_eq!(
+            dsl_error("bless everything\n"),
+            "line 1: unrecognized governance statement"
+        );
+        assert_eq!(
+            dsl_error("grant file_store ledger confidential\n"),
+            "line 1: grant needs `grant <kind> <handle> -> <resource-id> <label>`"
+        );
+
+        // The line NUMBER is part of the message and must track the input: an
+        // operator editing a long policy needs the offending line, and a comment
+        // or blank line must not shift the count.
+        assert_eq!(
+            dsl_error("# a comment\n\ngrant declassify ledger\n"),
+            "line 3: declassify grant needs `to <role>`"
+        );
+    }
+
+    /// The two signed-verification paths. `verify_text` deliberately ACCEPTS an
+    /// unsigned envelope for development use, so the refusal is what separates
+    /// the production entry points from it — and it must hold on both, including
+    /// the host-verifier path, which no test reached with unsigned input.
+    #[test]
+    fn an_unsigned_envelope_is_refused_on_both_signed_paths() {
+        let unsigned = r#"{ "resources": { "ledger": { "confidential": true } } }"#;
+
+        // The development path admits it; that contrast is the whole point.
+        VerifiedEnvelope::verify_text(unsigned)
+            .map(|_| ())
+            .expect("unsigned is fine for dev use");
+
+        assert_eq!(
+            VerifiedEnvelope::verify_signed_text(unsigned)
+                .map(|_| ())
+                .expect_err("must refuse"),
+            "governance envelope is not signed (no attestation)"
+        );
+
+        // The host-verifier path must refuse BEFORE consulting the verifier: an
+        // envelope with no attestation gives the verifier nothing to check, and
+        // a verifier that is never asked must not read as a pass.
+        struct NeverCalled;
+        impl crate::gov::GovernanceAttestationVerifier for NeverCalled {
+            fn verify(
+                &self,
+                _signing_bytes: &[u8],
+                _attestation: &crate::gov::ExternalAttestation,
+            ) -> Result<(), String> {
+                panic!("the unsigned refusal must fire before the verifier is consulted");
+            }
+        }
+        assert_eq!(
+            VerifiedEnvelope::verify_signed_text_with(unsigned, &NeverCalled)
+                .map(|_| ())
+                .expect_err("must refuse"),
+            "governance envelope is not signed (no attestation)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nmif_selector_refusal_tests {
+    //! NMIF-on-the-selector (DR §5.6 / §7.4). The refusal that stops untrusted
+    //! data from choosing WHICH declassify or endorse runs.
+    //!
+    //! This is the strong finding of the governance sweep. Unlike the envelope
+    //! parse refusals — which return `Err` and so were only "message unpinned" —
+    //! this one pushes a diagnostic, and neutralising it failed nothing in the
+    //! whole workspace. A crossing is the audited hole in the flow lattice; if
+    //! an attacker picks which hole opens, the audit is of the wrong thing.
+    //!
+    //! Its sibling at the `NMIF-on-invoke-selector` site is a DIFFERENT rule
+    //! (a selector that does not dominate a sink's integrity, rather than a
+    //! crossing steered by untrusted data), and covering one would not cover the
+    //! other — the two share a message prefix, which is exactly how a covered
+    //! refusal hides an uncovered one.
+
+    use super::{check_with_envelope, Envelope, VerifiedEnvelope};
+    use whipplescript_parser::compile_program;
+
+    /// An inbound signal the envelope does not vouch, whose payload field
+    /// chooses whether the sanitizing `endorsed` crossing runs.
+    const STEERED: &str = r#"@service
+workflow NmifSelector
+
+output result R
+class R { ok bool }
+class CleanNote { note string }
+
+signal inbound.received {
+  kind "urgent" | "normal"
+  content string
+}
+
+file store crm { root "./crm"  allow read ["**"]  allow write ["**"] }
+
+coerce sanitize(content string) -> CleanNote {
+  prompt """markdown
+  Extract the note: {{ content }}
+  """
+}
+
+rule steer
+  when inbound.received as inbound
+=> {
+  case inbound.kind {
+    "urgent" => {
+      coerce sanitize(inbound.content) as clean endorsed
+      after clean succeeds as vetted {
+        write text to crm at "notes.txt" {
+          body vetted.note
+          mode append
+        } as noted
+        after noted succeeds { complete result { ok true } }
+      }
+    }
+    _ => { complete result { ok false } }
+  }
+}
+"#;
+
+    const BASE_POLICY: &str = "\
+grant file_store crm -> file:/srv/crm.db readable by Operator from Operator\n\
+grant provider fixture -> selfhost:llama readable by Operator from Operator\n\
+grant provider model -> selfhost:llama readable by Operator from Operator\n\
+grant endorse crm to Operator\n";
+
+    fn messages(policy: &str) -> Vec<String> {
+        let compiled = compile_program(STEERED);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(policy).expect("valid policy");
+        check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn an_untrusted_discriminant_may_not_steer_a_crossing() {
+        let denied = messages(BASE_POLICY);
+        assert!(
+            denied.iter().any(|m| m.contains(
+                "the low-integrity discriminant `inbound.kind` (arm `\"urgent\"`) may not select \
+                 a endorse crossing"
+            ) && m.contains("NMIF-on-the-selector")),
+            "the steered crossing must be denied, got {denied:?}"
+        );
+    }
+
+    /// The accept half, and the one that makes the rule meaningful rather than a
+    /// blanket ban on `case` around a crossing: vouching the signal's integrity
+    /// makes the discriminant trusted, and the SAME program is then allowed to
+    /// steer. Without this, a checker that denied every crossing inside every
+    /// `case` would satisfy the test above.
+    #[test]
+    fn a_vouched_discriminant_may_steer_the_same_crossing() {
+        let vouched = messages(&format!(
+            "{BASE_POLICY}grant signal inbound.received -> signal:inbound.received readable by \
+             public from Operator\n"
+        ));
+        assert!(
+            !vouched.iter().any(|m| m.contains("NMIF-on-the-selector")),
+            "a governance-vouched signal may steer a crossing, got {vouched:?}"
+        );
+    }
+}

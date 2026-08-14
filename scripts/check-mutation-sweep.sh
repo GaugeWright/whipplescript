@@ -10,11 +10,16 @@
 # Deliberately NOT in scripts/check.sh: one crate rebuild per refusal puts a
 # whole file in the hours. Run it against the area you changed, on dispatch.
 #
-#   scripts/check-mutation-sweep.sh <file> <cargo-test-filter> [limit]
+#   scripts/check-mutation-sweep.sh <file> <cargo-test-filter> [limit] [lines]
 #
-# Exits non-zero when it finds an unexercised refusal, or a refusal it could not
-# measure because no mutation applied or the mutation did not compile — unknown
-# is not covered. So it can gate a subsystem once that subsystem is clean.
+# `lines` is a comma-separated list of 1-indexed line numbers: confirm a cheap
+# per-crate run's candidates against the workspace without re-running the whole
+# file.
+#
+# Exits non-zero when it finds an unexercised refusal, a refusal it could not
+# measure because no mutation applied or the mutation did not compile, or a
+# requested line that holds no refusal site — unknown is not covered. So it can
+# gate a subsystem once that subsystem is clean.
 set -Eeuo pipefail
 
 mutation_sweep_error() {
@@ -42,6 +47,8 @@ fi
 TARGET="$1"
 FILTER="$2"
 LIMIT="${3:-0}"
+# Optional 4th argument: confirm only these lines (see --only-lines).
+ONLY_LINES="${4:-}"
 
 # A sweep leaves the tree mutated if it is killed mid-run, and a stale mutation
 # reads as a broken build rather than an interrupted sweep. Refuse to start on a
@@ -64,7 +71,8 @@ STATUS=0
 python3 scripts/mutation_sweep.py \
   --target "$TARGET" \
   --filter "$FILTER" \
-  --limit "$LIMIT" || STATUS=$?
+  --limit "$LIMIT" \
+  --only-lines "$ONLY_LINES" || STATUS=$?
 
 case "$STATUS" in
   0) echo "== no unexercised refusals in $TARGET ==" ;;
