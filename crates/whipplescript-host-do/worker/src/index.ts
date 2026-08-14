@@ -68,7 +68,6 @@ __wbg_set_wasm(wasmInstance.exports);
 const verifyHostPolicy = (
   bindings as unknown as {
     verify_host_policy: (
-      epoch: bigint,
       signedEnvelope: string,
       expectedSigner: string,
       publicKeyHex: string,
@@ -78,7 +77,6 @@ const verifyHostPolicy = (
 const hostFunctions = bindings as unknown as {
   host_open_instance: (
     bridge: unknown,
-    epoch: bigint,
     signedEnvelope: string,
     expectedSigner: string,
     publicKeyHex: string,
@@ -89,7 +87,6 @@ const hostFunctions = bindings as unknown as {
   ) => string;
   host_validate_turn: (
     bridge: unknown,
-    epoch: bigint,
     signedEnvelope: string,
     expectedSigner: string,
     publicKeyHex: string,
@@ -100,7 +97,6 @@ const hostFunctions = bindings as unknown as {
   ) => string;
   host_begin_turn: (
     bridge: unknown,
-    epoch: bigint,
     signedEnvelope: string,
     expectedSigner: string,
     publicKeyHex: string,
@@ -129,7 +125,6 @@ const hostFunctions = bindings as unknown as {
   ) => string;
   host_export_thread: (
     bridge: unknown,
-    epoch: bigint,
     signedEnvelope: string,
     expectedSigner: string,
     publicKeyHex: string,
@@ -140,7 +135,6 @@ const hostFunctions = bindings as unknown as {
   ) => string;
   host_import_fork: (
     bridge: unknown,
-    epoch: bigint,
     signedEnvelope: string,
     expectedSigner: string,
     publicKeyHex: string,
@@ -3544,7 +3538,6 @@ export class WorkflowInstance implements DurableObject {
     try {
       verifiedPolicy = JSON.parse(
         verifyHostPolicy(
-          BigInt(policy.epoch),
           policy.signed_envelope,
           policy.expected_signer,
           policy.signer_public_key_hex,
@@ -3574,7 +3567,6 @@ export class WorkflowInstance implements DurableObject {
       opened = JSON.parse(
         hostFunctions.host_open_instance(
           makeBridge(this.ctx.storage.sql),
-          BigInt(policy.epoch),
           policy.signed_envelope,
           policy.expected_signer,
           policy.signer_public_key_hex,
@@ -3787,7 +3779,6 @@ export class WorkflowInstance implements DurableObject {
       const opened = JSON.parse(
         hostFunctions.host_open_instance(
           makeBridge(this.ctx.storage.sql),
-          BigInt(policy.epoch),
           policy.signed_envelope,
           root.signer,
           root.key,
@@ -3878,7 +3869,6 @@ export class WorkflowInstance implements DurableObject {
     if (root instanceof Response) return root;
     ensureSchema(this.ctx.storage.sql);
     const common = [
-      BigInt(policy.epoch),
       policy.signed_envelope,
       root.signer,
       root.key,
@@ -4081,7 +4071,6 @@ export class WorkflowInstance implements DurableObject {
     try {
       return Response.json(JSON.parse(hostFunctions.host_export_thread(
         makeBridge(this.ctx.storage.sql),
-        BigInt(epoch as number),
         policy.signed_envelope,
         root.signer,
         root.key,
@@ -4110,8 +4099,7 @@ export class WorkflowInstance implements DurableObject {
     try {
       const forked = JSON.parse(hostFunctions.host_import_fork(
         makeBridge(this.ctx.storage.sql),
-        BigInt(policy.epoch),
-        policy.signed_envelope,
+          policy.signed_envelope,
         root.signer,
         root.key,
         JSON.stringify(request.command),
@@ -4147,7 +4135,7 @@ export class WorkflowInstance implements DurableObject {
     let policy: HostPolicyBootstrap["policy"];
     try {
       policy = JSON.parse(
-        verifyHostPolicy(BigInt(epoch), signedEnvelope, root.signer, root.key),
+        verifyHostPolicy(signedEnvelope, root.signer, root.key),
       ) as HostPolicyBootstrap["policy"];
     } catch (error) {
       return Response.json(

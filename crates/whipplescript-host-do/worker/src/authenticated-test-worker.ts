@@ -61,17 +61,25 @@ async function signTestHomeGrant(
   });
 }
 
+const TEST_HOME_EPOCH = 1;
+const TEST_HOME_AUTHORITY = "gaugedesk";
+
+/// The `:v2` preimage (DR-0063 §5): `:v1`'s fields plus the policy epoch and
+/// the authority, so the hosted path can read the epoch from the signature
+/// rather than take it from its caller.
 function governanceSigningBytes(
   envelopeHash: string,
   signer: string,
   keyId: string,
 ): Uint8Array {
-  let value = "whipplescript-governance-envelope:v1;";
+  let value = "whipplescript-governance-envelope:v2;";
   for (const item of [
     envelopeHash,
     signer,
     "p256-sha256",
     keyId,
+    String(TEST_HOME_EPOCH),
+    TEST_HOME_AUTHORITY,
   ]) {
     value += `${new TextEncoder().encode(item).byteLength}:${item};`;
   }
@@ -129,7 +137,9 @@ async function testHomePolicy(): Promise<Response> {
       ...unsigned,
       attestation: {
         algorithm: "p256-sha256",
+        authority: TEST_HOME_AUTHORITY,
         envelope_hash: envelopeHash,
+        epoch: TEST_HOME_EPOCH,
         key_id: testHomeGovernanceKey,
         signature: [...new Uint8Array(signature)]
           .map((byte) => byte.toString(16).padStart(2, "0"))

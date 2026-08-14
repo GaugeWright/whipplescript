@@ -44,27 +44,28 @@ use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
 /// from the request body.
 #[wasm_bindgen]
 pub fn verify_host_policy(
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
 ) -> Result<String, JsValue> {
     let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
-        .verify_epoch(epoch, signed_envelope)
+        .verify(signed_envelope)
         .map_err(|error| JsValue::from_str(&error))?;
     serde_json::to_string(&verified.policy).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 fn hosted_facade(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
 ) -> Result<GovernedHostFacade<crate::do_store::DoSqliteStore<JsDoSql>>, JsValue> {
     let verified = GaugeDeskGovernanceRoot::new(expected_signer, public_key_hex)
-        .verify_epoch(epoch, signed_envelope)
+        .verify(signed_envelope)
         .map_err(|error| JsValue::from_str(&error))?;
+    // The epoch the facade runs under is the one the signature covers, so
+    // there is no second source for it to disagree with.
+    let epoch = verified.policy.epoch;
     GovernedHostFacade::from_verified_store(
         crate::do_store::DoSqliteStore::new(JsDoSql { bridge }),
         epoch,
@@ -88,7 +89,6 @@ fn authored_package(
 #[allow(clippy::too_many_arguments)]
 pub fn host_open_instance(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
@@ -97,13 +97,7 @@ pub fn host_open_instance(
     package_source: &str,
     system_prompt: &str,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(
-        bridge,
-        epoch,
-        signed_envelope,
-        expected_signer,
-        public_key_hex,
-    )?;
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: OpenInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(package_manifest, package_source, system_prompt)?;
@@ -120,7 +114,6 @@ pub fn host_open_instance(
 #[allow(clippy::too_many_arguments)]
 pub fn host_validate_turn(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
@@ -129,13 +122,7 @@ pub fn host_validate_turn(
     package_source: &str,
     system_prompt: &str,
 ) -> Result<String, JsValue> {
-    let facade = hosted_facade(
-        bridge,
-        epoch,
-        signed_envelope,
-        expected_signer,
-        public_key_hex,
-    )?;
+    let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(package_manifest, package_source, system_prompt)?;
@@ -152,7 +139,6 @@ pub fn host_validate_turn(
 #[allow(clippy::too_many_arguments)]
 pub fn host_begin_turn(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
@@ -164,13 +150,7 @@ pub fn host_begin_turn(
     model: &str,
     base_url: &str,
 ) -> Result<bool, JsValue> {
-    let mut facade = hosted_facade(
-        bridge,
-        epoch,
-        signed_envelope,
-        expected_signer,
-        public_key_hex,
-    )?;
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: StartTurnCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let package = authored_package(package_manifest, package_source, system_prompt)?;
@@ -253,7 +233,6 @@ pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<S
 #[allow(clippy::too_many_arguments)]
 pub fn host_export_thread(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
@@ -262,13 +241,7 @@ pub fn host_export_thread(
     package_source: &str,
     system_prompt: &str,
 ) -> Result<String, JsValue> {
-    let facade = hosted_facade(
-        bridge,
-        epoch,
-        signed_envelope,
-        expected_signer,
-        public_key_hex,
-    )?;
+    let facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let source: EventPosition = serde_json::from_str(source_position_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     if source.sequence == 0 {
@@ -339,7 +312,6 @@ pub fn host_export_thread(
 #[allow(clippy::too_many_arguments)]
 pub fn host_import_fork(
     bridge: DoSqlBridge,
-    epoch: u64,
     signed_envelope: &str,
     expected_signer: &str,
     public_key_hex: &str,
@@ -349,13 +321,7 @@ pub fn host_import_fork(
     package_source: &str,
     system_prompt: &str,
 ) -> Result<String, JsValue> {
-    let mut facade = hosted_facade(
-        bridge,
-        epoch,
-        signed_envelope,
-        expected_signer,
-        public_key_hex,
-    )?;
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
     let command: ForkInstanceCommand = serde_json::from_str(command_json)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     command

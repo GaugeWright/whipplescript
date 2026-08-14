@@ -12,11 +12,15 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import runtimeSurface from "../contracts/runtime-route-surface.json";
 
+// A `:v2` attestation (DR-0063 §5): the signature covers the policy epoch and
+// the authority as well, so the hosted path reads the epoch from the signature
+// rather than from its caller. Regenerate with a fresh keypair rather than
+// hand-editing — any edit to the body invalidates the signature.
 const SIGNER = "authority:gaugedesk:test";
 const PUBLIC_KEY =
-  "031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e";
+  "039927e05f9269c68b201def47f7154e1092ba98bf684b272aadef5b1ac5514374";
 const SIGNED_ENVELOPE =
-  "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"envelope_hash\":\"95aa6b54f92aed0a47c8733b848b1e25b45c5eac81b63aa394125f4064d0e1b5\",\"key_id\":\"031e18532fd4754c02f3041d9c75ceb33b83ffd81ac7ce4fe882ccb1c98bc5896e\",\"signature\":\"c5897c642972e55b03b224cac5a8fcd70ab4859b90252d1f324e401e2ad13650175c38dbbe027a3906b94cd7e7b3db6d42f97bd46de98732bf77beae9bfc5b6b\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
+  "{\"attestation\":{\"algorithm\":\"p256-sha256\",\"authority\":\"gaugedesk\",\"envelope_hash\":\"95aa6b54f92aed0a47c8733b848b1e25b45c5eac81b63aa394125f4064d0e1b5\",\"epoch\":1,\"key_id\":\"039927e05f9269c68b201def47f7154e1092ba98bf684b272aadef5b1ac5514374\",\"signature\":\"0d3d2ed5131334399f7e4837b99ec82ffbfb95fe0f35b04d1aca1bd9539fd5959ea16bdd5a88693b24ec9a356cd1f3867c21101ff847bf59fc1e2dcf8d9f2c74\",\"signer\":\"authority:gaugedesk:test\"},\"bindings\":{\"do\":\"placement:do\",\"model\":\"provider:openai\"},\"declassifications\":[],\"delegations\":[],\"endorsements\":[],\"parties\":{},\"placements\":{\"do\":{\"kind\":\"durable_object\",\"provider_bindings\":[\"model\"]}},\"provider_bindings\":{\"model\":{\"base_url\":\"https://api.openai.com/v1/responses\",\"credential_ref\":\"managed-openai\",\"model\":\"gpt-test\",\"provider\":\"openai\"}},\"resources\":{\"placement:do\":{\"principal\":true,\"reader\":[],\"writer\":[]},\"provider:openai\":{\"principal\":true,\"reader\":[],\"writer\":[]}}}";
 const RELEASE_ID = `sha256:${"a".repeat(64)}`;
 const HOST_PROTOCOL = "whipplescript.host.v1";
 const POLICY_ENVELOPE = JSON.parse(SIGNED_ENVELOPE) as {

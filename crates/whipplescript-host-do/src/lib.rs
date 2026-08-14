@@ -63,7 +63,7 @@ mod governed_host_tests {
     use p256::elliptic_curve::sec1::ToSec1Point;
     use serde_json::json;
     use whipplescript_kernel::coerce_native::CoerceProvider;
-    use whipplescript_kernel::gov::{external_signing_bytes, SignedEnvelope};
+    use whipplescript_kernel::gov::{external_signing_bytes_v2, SignedEnvelope};
     use whipplescript_kernel::harness_model::MessagesApiClient;
     use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
     use whipplescript_kernel::host_package::{
@@ -155,20 +155,26 @@ workflow Method {
                 .as_bytes(),
         );
         let unsigned = policy.to_json().expect("policy");
-        let signing_bytes = external_signing_bytes(
+        // `:v2`, because the hosted path reads its epoch from the signature
+        // (DR-0063 §5).
+        let signing_bytes = external_signing_bytes_v2(
             &unsigned,
             signer,
             GAUGEDESK_ATTESTATION_ALGORITHM,
             &public_key,
+            7,
+            "gaugedesk",
         )
         .expect("bytes");
         let signature: Signature = key.sign(&signing_bytes);
-        let signed = SignedEnvelope::from_external_signature(
+        let signed = SignedEnvelope::from_external_signature_v2(
             &unsigned,
             signer,
             GAUGEDESK_ATTESTATION_ALGORITHM,
             &public_key,
             &hex::encode(signature.to_bytes()),
+            7,
+            "gaugedesk",
         )
         .expect("signed")
         .to_json();
@@ -178,7 +184,7 @@ workflow Method {
     #[test]
     fn gaugedesk_host_protocol_admits_the_same_package_on_the_do_store() {
         let (root, signed) = signed_policy();
-        let verified = root.verify_epoch(7, &signed).expect("verified");
+        let verified = root.verify(&signed).expect("verified");
         let sql = Rc::new(test_support::store().sql);
         for statement in [
             "INSERT INTO capability_schemas (capability, description, schema_json) \
