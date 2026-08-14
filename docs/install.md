@@ -38,9 +38,18 @@ sha256sum --check whipplescript-x86_64-unknown-linux-gnu.tar.xz.sha256
 On macOS, the `sha256sum` command can be absent. In that condition, use
 `shasum -a 256 -c`.
 
-A Homebrew tap is planned. The commands will be
-`brew tap GaugeWright/tap && brew install whipplescript`. The project will
-enable the tap after the tagged releases become stable.
+## Homebrew
+
+For macOS and Linux, the tap is available:
+
+```sh
+brew tap GaugeWright/tap && brew install whipplescript
+```
+
+The release that builds the archives above also publishes the formula, so the
+tap serves those same binaries under those same checksums rather than a
+separately built copy. Homebrew does not cover Windows; use the PowerShell
+installer for that platform.
 
 ## From source
 
