@@ -46,6 +46,13 @@ pub struct Envelope {
     /// is the leaf case, behaving exactly as the role it replaces.
     readers: BTreeMap<String, BTreeSet<String>>,
     governed: BTreeSet<String>,
+    /// The authority this envelope speaks for (DR-0063 §2). Roles are qualified
+    /// against it, so `acme::Operator` and `beta::Operator` are different
+    /// principals and a composition can never unify them by name. `None` is a
+    /// single-authority deployment that named no authority: every role stays
+    /// bare, and the envelope behaves exactly as it did before qualification
+    /// existed.
+    authority: Option<String>,
     /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
     deleg: Vec<(String, String)>,
     /// declassify grants `(resource, role)`: `resource` may be released to any
@@ -171,6 +178,14 @@ impl Envelope {
     pub fn from_json(text: &str) -> Result<Self, String> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|err| format!("invalid IFC envelope: {err}"))?;
+        // DR-0063 §2. Parsed before anything that mentions a role, so every
+        // role in the document qualifies against the same authority.
+        let authority = value
+            .get("authority")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let authority_ref = authority.as_deref();
         let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
@@ -293,7 +308,7 @@ impl Envelope {
         if let Some(map) = value.get("parties").and_then(|p| p.as_object()) {
             for (identity, role) in map {
                 if let Some(role) = role.as_str() {
-                    party_of.insert(identity.clone(), role.to_owned());
+                    party_of.insert(identity.clone(), qualify_role(role, authority_ref));
                 }
             }
         }
@@ -309,7 +324,8 @@ impl Envelope {
                 {
                     principals.insert(name.clone());
                 }
-                let mut reader_set = parse_role_set(label, "reader");
+                let mut reader_set =
+                    qualify_role_set(parse_role_set(label, "reader"), authority_ref);
                 // back-compat: `confidential: true` is the single-compartment label
                 // `{confidential}` (the original binary form).
                 if reader_set.is_empty()
@@ -323,7 +339,7 @@ impl Envelope {
                 if !reader_set.is_empty() {
                     readers.insert(name.clone(), reader_set);
                 }
-                let writer_set = parse_role_set(label, "writer");
+                let writer_set = qualify_role_set(parse_role_set(label, "writer"), authority_ref);
                 if !writer_set.is_empty() {
                     integrity.insert(name.clone(), writer_set);
                 }
@@ -352,7 +368,7 @@ impl Envelope {
                     ) {
                         reject_pattern_resource(res)
                             .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
-                        endorse.push((res.to_owned(), role.to_owned()));
+                        endorse.push((res.to_owned(), qualify_role(role, authority_ref)));
                     }
                 }
             }
@@ -364,7 +380,19 @@ impl Envelope {
                         items.first().and_then(serde_json::Value::as_str),
                         items.get(1).and_then(serde_json::Value::as_str),
                     ) {
-                        deleg.push((left.to_owned(), right.to_owned()));
+                        let from = qualify_role(left, authority_ref);
+                        // §2's ownership rule, same as the DSL path.
+                        if let Some(owner) = authority_ref {
+                            if let Some((from_authority, _)) = from.split_once("::") {
+                                if from_authority != owner {
+                                    return Err(format!(
+                                        "invalid IFC envelope: {owner} may not delegate out of \
+                                         {from_authority}'s principal"
+                                    ));
+                                }
+                            }
+                        }
+                        deleg.push((from, qualify_role(right, authority_ref)));
                     }
                 }
             }
@@ -378,7 +406,7 @@ impl Envelope {
                     ) {
                         reject_pattern_resource(res)
                             .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
-                        declassify.push((res.to_owned(), role.to_owned()));
+                        declassify.push((res.to_owned(), qualify_role(role, authority_ref)));
                     }
                 }
             }
@@ -396,6 +424,7 @@ impl Envelope {
             mcp_min_rung,
             credential_min_rung,
             custody_demand,
+            authority,
             address_of,
             party_of,
             guarantees,
@@ -427,6 +456,23 @@ impl Envelope {
         let mut address_of: BTreeMap<String, String> = BTreeMap::new();
         let mut party_of: BTreeMap<String, String> = BTreeMap::new();
         let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
+        // A pre-pass, so `authority` qualifies every role in the file rather
+        // than only the ones written after it.
+        let mut authority: Option<String> = None;
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.first().copied() == Some("authority") {
+                let Some(name) = tokens.get(1) else {
+                    return Err("authority needs a name".to_owned());
+                };
+                if authority.is_some() {
+                    return Err("an envelope speaks for exactly one authority".to_owned());
+                }
+                authority = Some((*name).to_owned());
+            }
+        }
+        let authority_ref = authority.as_deref();
         for (index, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -452,7 +498,10 @@ impl Envelope {
                 }
                 reject_pattern_resource(tokens[2])
                     .map_err(|problem| format!("line {}: {problem}", index + 1))?;
-                let pair = (tokens[2].to_owned(), tokens[to + 1].to_owned());
+                let pair = (
+                    tokens[2].to_owned(),
+                    qualify_role(tokens[to + 1], authority_ref),
+                );
                 if kind == "declassify" {
                     declassify.push(pair);
                 } else {
@@ -552,7 +601,10 @@ impl Envelope {
                     if let Some(colon) = tokens.iter().position(|tok| *tok == ":") {
                         if colon >= 2 {
                             if let Some(role) = tokens.get(colon + 1) {
-                                party_of.insert(tokens[1].to_owned(), (*role).to_owned());
+                                party_of.insert(
+                                    tokens[1].to_owned(),
+                                    qualify_role(role, authority_ref),
+                                );
                             }
                         }
                     }
@@ -568,9 +620,26 @@ impl Envelope {
                             index + 1
                         ));
                     }
-                    deleg.push((tokens[pos - 1].to_owned(), tokens[pos + 1].to_owned()));
+                    let from = qualify_role(tokens[pos - 1], authority_ref);
+                    let to = qualify_role(tokens[pos + 1], authority_ref);
+                    // DR-0063 §2: an acts-for edge may be issued only by the
+                    // authority that owns the principal on its `from` side.
+                    // Issuing one out of another authority's role would let this
+                    // envelope hand its own principals that authority's reach.
+                    if let Some(owner) = authority_ref {
+                        if let Some((from_authority, _)) = from.split_once("::") {
+                            if from_authority != owner {
+                                return Err(format!(
+                                    "line {}: {owner} may not delegate out of {from_authority}'s principal",
+                                    index + 1
+                                ));
+                            }
+                        }
+                    }
+                    deleg.push((from, to));
                     continue;
                 }
+                Some("authority") => continue,
                 Some("grant") => {}
                 _ => {
                     return Err(format!(
@@ -608,7 +677,8 @@ impl Envelope {
                     .skip(by + 1)
                     .position(|tok| *tok == "from")
                     .map_or(label.len(), |rel| by + 1 + rel);
-                let roles = collect_role_set(&label[by + 1..until]);
+                let roles =
+                    qualify_role_set(collect_role_set(&label[by + 1..until]), authority_ref);
                 if !roles.is_empty() {
                     readers.insert(address.clone(), roles);
                 }
@@ -625,7 +695,7 @@ impl Envelope {
             // `from <Role>[, <Role>...]` sets the integrity (vouching) SET: the
             // compartments after `from` to the end.
             if let Some(from) = label.iter().position(|tok| *tok == "from") {
-                let roles = collect_role_set(&label[from + 1..]);
+                let roles = qualify_role_set(collect_role_set(&label[from + 1..]), authority_ref);
                 if !roles.is_empty() {
                     integrity.insert(address, roles);
                 }
@@ -644,6 +714,7 @@ impl Envelope {
             mcp_min_rung,
             credential_min_rung,
             custody_demand,
+            authority,
             address_of,
             party_of,
             guarantees,
@@ -1077,6 +1148,30 @@ fn reject_pattern_resource(identifier: &str) -> Result<(), String> {
 /// Collect a set of authority roles from DSL tokens, splitting each token on commas
 /// (so `Operator,Auditor` and `Operator Auditor` both yield two compartments) and
 /// dropping `public` (the bottom).
+/// Qualify a role with the authority that issued it (DR-0063 §2).
+///
+/// Left alone: `public` (the universal bottom belongs to nobody), an already
+/// qualified `authority::Role`, and a typed principal id such as
+/// `provider:onprem-llm` — those name a concrete endpoint rather than a role in
+/// somebody's namespace. Everything else is a bare role, and a bare role in
+/// this envelope is *this* authority's role.
+fn qualify_role(role: &str, authority: Option<&str>) -> String {
+    let Some(authority) = authority else {
+        return role.to_owned();
+    };
+    if role == PUBLIC || role.contains("::") || role.contains(':') {
+        return role.to_owned();
+    }
+    format!("{authority}::{role}")
+}
+
+fn qualify_role_set(roles: BTreeSet<String>, authority: Option<&str>) -> BTreeSet<String> {
+    roles
+        .into_iter()
+        .map(|role| qualify_role(&role, authority))
+        .collect()
+}
+
 fn collect_role_set(tokens: &[&str]) -> BTreeSet<String> {
     let mut roles = BTreeSet::new();
     for token in tokens {
@@ -1526,6 +1621,20 @@ impl VerifiedEnvelope {
         } else {
             Envelope::from_dsl(text)
         }?;
+        // DR-0063 §2 and §5 have to agree: the authority the `:v2` signature
+        // covers is the one this envelope's roles are qualified against. If
+        // they could differ, a signature would authenticate one authority while
+        // the labels named another's principals.
+        if let (Some(signed), Some(declared)) = (
+            attestation.authority.as_deref(),
+            envelope.authority.as_deref(),
+        ) {
+            if signed != declared {
+                return Err(format!(
+                    "governance envelope declares authority {declared} but is signed for {signed}"
+                ));
+            }
+        }
         Ok(Self {
             envelope,
             attestation: Some(attestation),
@@ -1542,6 +1651,11 @@ impl VerifiedEnvelope {
     /// module read it, and only once they hold a `VerifiedEnvelope`.
     fn envelope(&self) -> &Envelope {
         &self.envelope
+    }
+
+    /// The authority this envelope speaks for, if it named one.
+    pub fn authority(&self) -> Option<&str> {
+        self.envelope.authority.as_deref()
     }
 
     /// Whether the verified envelope governs `resource`, after applying
@@ -5351,6 +5465,100 @@ grant channel secsrc -> imap:sec from Sec\n";
             !composed.dominates(&provider, &required),
             "so the meet refuses too; pooling the edges instead would have admitted it"
         );
+    }
+
+    // ---- DR-0063 §2, authority-qualified roles -------------------------------
+
+    #[test]
+    fn an_authority_qualifies_its_own_bare_roles() {
+        // The migration, and why it is mechanical: an existing envelope that
+        // names an authority qualifies every bare role with it and decides
+        // exactly as it did before, because everything moved together.
+        let env = Envelope::from_dsl(
+            "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             grant file_store Ops -> file:/srv/ops.db readable by Operator\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_label("Ledger"), "acme::Operator");
+        assert!(
+            !env.leaks("Ledger", "Ops"),
+            "one authority's own roles still compare equal to each other"
+        );
+    }
+
+    #[test]
+    fn two_authorities_operators_are_two_principals() {
+        // The headline. Under one authority these labels would be the same
+        // compartment; qualified, a composition can never unify them by name,
+        // which is what stops a meet merging two companies' operators.
+        let acme = Envelope::from_dsl(
+            "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n",
+        )
+        .expect("valid");
+        let beta = Envelope::from_dsl(
+            "authority beta\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n",
+        )
+        .expect("valid");
+        assert_eq!(acme.reader_label("Ledger"), "acme::Operator");
+        assert_eq!(beta.reader_label("Ledger"), "beta::Operator");
+        assert_ne!(acme.reader_label("Ledger"), beta.reader_label("Ledger"));
+    }
+
+    #[test]
+    fn an_unqualified_envelope_is_unchanged() {
+        // No `authority` statement is the single-authority deployment the
+        // shipped model describes: roles stay bare and nothing about it moves.
+        let env = Envelope::from_dsl(
+            "grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_label("Ledger"), "Operator");
+    }
+
+    #[test]
+    fn public_and_typed_principals_are_never_qualified() {
+        // `public` is the universal bottom and belongs to nobody; a
+        // `provider:` id names a concrete endpoint rather than a role in some
+        // authority's namespace. Qualifying either would invent a principal.
+        let env = Envelope::from_dsl(
+            "authority acme\n\
+             grant channel Pub -> smtp:pub public\n\
+             grant agent Reviewer -> provider:onprem-llm\n\
+             delegate provider:onprem-llm acts-for Operator for confidentiality\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_label("Pub"), "public");
+        assert!(
+            !env.leaks("Ledger", "Ledger"),
+            "the delegation's provider end kept its typed id and still resolves"
+        );
+    }
+
+    #[test]
+    fn an_authority_may_not_delegate_out_of_another_authoritys_principal() {
+        // §2: an acts-for edge may be issued only by the authority that owns
+        // the principal on its `from` side. Otherwise acme writes itself beta's
+        // reach, and beta never granted anything.
+        let error = match Envelope::from_dsl(
+            "authority acme\n\
+             delegate beta::Operator acts-for acme::Auditor\n",
+        ) {
+            Ok(_) => panic!("acme does not own beta's Operator"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("may not delegate out of"),
+            "the refusal names the ownership rule: {error}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_speaks_for_one_authority() {
+        assert!(Envelope::from_dsl("authority acme\nauthority beta\n").is_err());
     }
 
     #[test]
