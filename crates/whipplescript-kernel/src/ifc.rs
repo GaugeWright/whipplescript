@@ -280,6 +280,11 @@ impl Envelope {
         if let Some(map) = value.get("bindings").and_then(|b| b.as_object()) {
             for (handle, address) in map {
                 if let Some(address) = address.as_str() {
+                    // the same exactness the DSL enforces: a hand-written JSON
+                    // envelope is the other door onto the same map keys, and a
+                    // pattern accepted here would be the gap the DSL refuses.
+                    reject_pattern_resource(address)
+                        .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
                     address_of.insert(handle.clone(), address.to_owned());
                 }
             }
@@ -294,6 +299,8 @@ impl Envelope {
         }
         if let Some(map) = value.get("resources").and_then(|res| res.as_object()) {
             for (name, label) in map {
+                reject_pattern_resource(name)
+                    .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
                 governed.insert(name.clone());
                 if label
                     .get("principal")
@@ -343,6 +350,8 @@ impl Envelope {
                         items.first().and_then(serde_json::Value::as_str),
                         items.get(1).and_then(serde_json::Value::as_str),
                     ) {
+                        reject_pattern_resource(res)
+                            .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
                         endorse.push((res.to_owned(), role.to_owned()));
                     }
                 }
@@ -367,6 +376,8 @@ impl Envelope {
                         items.first().and_then(serde_json::Value::as_str),
                         items.get(1).and_then(serde_json::Value::as_str),
                     ) {
+                        reject_pattern_resource(res)
+                            .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
                         declassify.push((res.to_owned(), role.to_owned()));
                     }
                 }
@@ -439,6 +450,8 @@ impl Envelope {
                         index + 1
                     ));
                 }
+                reject_pattern_resource(tokens[2])
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
                 let pair = (tokens[2].to_owned(), tokens[to + 1].to_owned());
                 if kind == "declassify" {
                     declassify.push(pair);
@@ -577,6 +590,8 @@ impl Envelope {
             // the `<kind:address>` after `->` is the canonical resource identity;
             // bind the handle to it and key all labels by the ADDRESS (E5).
             let address = tokens[arrow + 1].to_owned();
+            reject_pattern_resource(&address)
+                .map_err(|problem| format!("line {}: {problem}", index + 1))?;
             address_of.insert(handle, address.clone());
             governed.insert(address.clone());
             // a `provider` or `human` grant names a principal, not protected data.
@@ -1032,6 +1047,31 @@ fn parse_role_set(label: &serde_json::Value, key: &str) -> BTreeSet<String> {
             .collect(),
         _ => BTreeSet::new(),
     }
+}
+
+/// Refuse a pattern-shaped resource identifier.
+///
+/// Governance binds and looks up resource identities as exact map keys —
+/// `address_of` on the way in, `resolve`/`reader_set`/`integrity_set` on every
+/// lookup — so nothing here ever matches a pattern. A `file:/data/**` grant
+/// would therefore label the literal eleven characters and govern no actual
+/// file, while reading as a working label in the policy text and appearing as a
+/// protected resource in the `gov compile` guarantee report. That is a silent
+/// coverage gap, so the address surface is exact and a pattern is refused at
+/// parse time rather than accepted and ignored.
+///
+/// Globs were retracted from `spec/information-flow-surface.md` rather than
+/// implemented. If they are ever reintroduced, DR-0063 §8(7) already settles
+/// their shape: owner-local, never exposable to a second authority.
+fn reject_pattern_resource(identifier: &str) -> Result<(), String> {
+    if identifier.contains('*') {
+        return Err(format!(
+            "governance resource `{identifier}` is a pattern; resource identities are \
+             matched exactly, so this would govern the literal text and no real \
+             resource (name the resource, or its stable binding, exactly)"
+        ));
+    }
+    Ok(())
 }
 
 /// Collect a set of authority roles from DSL tokens, splitting each token on commas
@@ -4200,6 +4240,98 @@ party bob@acme.com : Requester\n";
     #[test]
     fn dsl_rejects_a_malformed_grant() {
         assert!(Envelope::from_dsl("grant file_store ledger confidential").is_err());
+    }
+
+    /// A glob address is refused rather than accepted and silently ignored.
+    ///
+    /// Governance keys every label by the exact address, so this grant used to
+    /// parse and then govern the literal string `file:/data/**` — no actual
+    /// file — while reading as a working label in the policy and listing as a
+    /// protected resource in the guarantee report. The message is compared
+    /// exactly because the route out of the refusal is the whole value of it:
+    /// an `is_err()` assertion would stay green over a message that stopped
+    /// saying what to write instead.
+    #[test]
+    fn dsl_rejects_a_glob_address() {
+        let Err(error) =
+            Envelope::from_dsl("grant file_store data -> file:/data/** readable by Operator\n")
+        else {
+            panic!("a pattern address is refused");
+        };
+        assert_eq!(
+            error,
+            "line 1: governance resource `file:/data/**` is a pattern; resource identities \
+             are matched exactly, so this would govern the literal text and no real \
+             resource (name the resource, or its stable binding, exactly)"
+        );
+    }
+
+    /// The refusal covers every resource position in the DSL, not just the
+    /// address after `->`: a downgrade grant names a resource too, and
+    /// `declassify_releases`/`endorse_raises` resolve it through the same exact
+    /// map, so a pattern there arms nothing just as quietly.
+    #[test]
+    fn dsl_rejects_a_glob_in_a_downgrade_grant() {
+        for (statement, resource) in [
+            (
+                "grant declassify file:/data/** to public\n",
+                "file:/data/**",
+            ),
+            ("grant endorse inbox* to Operator\n", "inbox*"),
+        ] {
+            let Err(error) = Envelope::from_dsl(statement) else {
+                panic!("a pattern resource is refused: {statement:?}");
+            };
+            assert!(
+                error.starts_with(&format!(
+                    "line 1: governance resource `{resource}` is a pattern"
+                )),
+                "unexpected refusal for {statement:?}: {error}"
+            );
+        }
+    }
+
+    /// The JSON envelope is the other door onto the same map keys — a signed
+    /// artifact, but also hand-writable, and `gov compile` canonicalizes it. It
+    /// holds the address in three places, and each is refused.
+    #[test]
+    fn json_rejects_a_glob_resource_identity() {
+        for envelope in [
+            r#"{ "resources": { "file:/data/**": { "reader": "Operator" } } }"#,
+            r#"{ "resources": {}, "bindings": { "data": "file:/data/**" } }"#,
+            r#"{ "resources": {}, "declassifications": [["file:/data/**", "public"]] }"#,
+            r#"{ "resources": {}, "endorsements": [["file:/data/**", "Operator"]] }"#,
+        ] {
+            let Err(error) = Envelope::from_json(envelope) else {
+                panic!("a pattern address is refused: {envelope}");
+            };
+            assert!(
+                error.starts_with(
+                    "invalid IFC envelope: governance resource `file:/data/**` is a pattern"
+                ),
+                "unexpected refusal for {envelope}: {error}"
+            );
+        }
+    }
+
+    /// The refusal is scoped to resource identities. A `guarantee` line carries
+    /// path globs by design (DR-0036 §2 `writes_within:<scope>`) — those are
+    /// matched at turn time by the guarantee evaluator, not looked up as
+    /// governance keys — so they must keep parsing.
+    #[test]
+    fn dsl_keeps_guarantee_path_globs() {
+        let envelope = Envelope::from_dsl(
+            "guarantee writes_within:src src/** docs/*\n\
+             grant file_store code -> file:/srv/repo readable by Operator\n",
+        )
+        .expect("guarantee globs are not resource identities");
+        assert_eq!(
+            envelope.guarantees,
+            vec![(
+                "writes_within:src".to_owned(),
+                vec!["src/**".to_owned(), "docs/*".to_owned()]
+            )]
+        );
     }
 
     #[test]
