@@ -1,0 +1,142 @@
+load ../envelope-minting.maude
+
+--- Fixture discipline. Every fixture is well formed unless the search is about
+--- ill-formedness, and every read names the KEY it targets — `read(a1, adA, P)`
+--- is a read of the resource a1 minted at adA, whatever anyone else calls that
+--- address. A No-solution therefore says "the composed label refuses", never
+--- "the fixture named nothing".
+---
+--- Reading the compartments: `binds(adA, q(a1, nOp))` means "a party must
+--- act-for a1's Operator to read a1's adA", so an attachment ADDING a
+--- compartment makes a key harder to read, and a compartment that silently fails
+--- to apply is a leak rather than an inconvenience.
+
+--- Coverage: the intended path. a1 mints adA under its own compartment and its
+--- own Operator reads it.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg admitted(read(a1, adA, q(a1, nOp))) .
+
+--- Coverage: ONE_MINTER's first clause. Both authorities bind the SAME address
+--- in their own namespaces, which under `(authority, address)` are two keys
+--- about two different byte-sets. a2's label does not reach a1's key, and a1's
+--- own Operator still reads a1's resource.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)))
+            + env(a2, binds(adA, q(a2, nReq))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg admitted(read(a1, adA, q(a1, nOp))) .
+
+--- Coverage: an attachment does work. a1 exposes its key and a2 attaches its own
+--- compartment to it; a1's Operator no longer clears the key alone, because a
+--- compartment set is conjunctive. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & exposes(adA, x1, g1))
+            + env(a2, attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* admitted(read(a1, adA, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Coverage: section 8(9), and the reason attaching is worth doing. a1 releases
+--- its OWN contribution to the key by declassifying to a2's Requester; a2's
+--- attached compartment stands, so the read is still refused. An owner cannot
+--- release the combined artifact alone. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & exposes(adA, x1, g1)
+                      & dgrant(adA, q(a2, nReq)))
+            + env(a2, attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a2, nReq)))
+  =>* admitted(read(a1, adA, q(a2, nReq))) RESIDUAL:Cfg .
+
+--- Coverage: and the grant does clear what it owns. Same fixture with no
+--- attachment — a1's declassify releases a1's compartment, and a2's Requester
+--- reads.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & dgrant(adA, q(a2, nReq))))
+  attempt(read(a1, adA, q(a2, nReq)))
+  =>* C:Cfg admitted(read(a1, adA, q(a2, nReq))) .
+
+--- Bite: a dangling reference. a2 attaches to exposure x2, which a1 never
+--- published. Nothing is admitted. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & exposes(adA, x1, g1))
+            + env(a2, attaches(a1, x2, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* admitted(read(a1, adA, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Coverage: and it names itself rather than passing quietly. A reference that
+--- resolves to nothing is a label that disappeared, so the refusal has to be
+--- visible to the party that wrote it.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & exposes(adA, x1, g1))
+            + env(a2, attaches(a1, x2, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg compositionError .
+
+--- Bite: the pinned digest no longer matches — a1 re-pointed exposure x1 at a
+--- different binding after a2 labelled it. Nothing is admitted. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & binds(adB, q(a1, nReq))
+                      & exposes(adB, x1, g2))
+            + env(a2, attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* admitted(read(a1, adA, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Coverage: the mismatch is named too. The commitment is what a counterparty
+--- pins when it cannot read what it is pinning.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & binds(adB, q(a1, nReq))
+                      & exposes(adB, x1, g2))
+            + env(a2, attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg compositionError .
+
+--- Bite: an attachment never mints, so it cannot carry a downgrade. a2 issues a
+--- declassify over adA, an address a2 does not bind. Nothing is admitted.
+--- No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)))
+            + env(a2, dgrant(adA, q(a2, nReq))))
+  attempt(read(a1, adA, q(a2, nReq)))
+  =>* admitted(read(a1, adA, q(a2, nReq))) RESIDUAL:Cfg .
+
+--- Bite: the impersonation fixture, under the rule. a2 publishes x1 for its own
+--- adB and also attaches to what it takes to be a1's x1. a1 never published x1,
+--- so the reference resolves to nothing and the composition refuses — scoping
+--- turns an impersonation into a dangling reference. No solution.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING :
+  composition(env(a1, binds(adA, q(a1, nOp)))
+            + env(a2, binds(adB, q(a2, nReq)) & exposes(adB, x1, g1)
+                        & attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* admitted(read(a1, adA, q(a1, nOp))) RESIDUAL:Cfg .
+
+--- Tooth 1: the same fixture with a global exposure-id space. x1 now resolves to
+--- whoever published it — a2's own adB — so a2's compartment lands on a2's
+--- resource, a1's key carries nothing but a1's own compartment, and the read a2
+--- attached to prevent is admitted.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING-UNSCOPED-EXPOSURES :
+  composition(env(a1, binds(adA, q(a1, nOp)))
+            + env(a2, binds(adB, q(a2, nReq)) & exposes(adB, x1, g1)
+                        & attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg admitted(read(a1, adA, q(a1, nOp))) .
+
+--- Tooth 2: a dangling reference dropped rather than refused. Nothing is forged
+--- and no rule is broken — a2's compartment is simply not there, and the read it
+--- was attached to prevent is admitted. This is aliasing in its purest form.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING-SILENT-DANGLING :
+  composition(env(a1, binds(adA, q(a1, nOp)) & exposes(adA, x1, g1))
+            + env(a2, attaches(a1, x2, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg admitted(read(a1, adA, q(a1, nOp))) .
+
+--- Tooth 3: the pinned digest ignored. a1 re-points x1 at adB after a2 labelled
+--- it; a2's compartment follows the exposure to adB, and adA — the bytes a2
+--- meant to protect — is read without it.
+search [1] in WHIPPLESCRIPT-ENVELOPE-MINTING-LOOSE-DIGEST :
+  composition(env(a1, binds(adA, q(a1, nOp)) & binds(adB, q(a1, nReq))
+                      & exposes(adB, x1, g2))
+            + env(a2, attaches(a1, x1, g1, q(a2, nOp))))
+  attempt(read(a1, adA, q(a1, nOp)))
+  =>* C:Cfg admitted(read(a1, adA, q(a1, nOp))) .

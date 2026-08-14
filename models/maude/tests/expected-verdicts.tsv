@@ -36,6 +36,7 @@ effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
 effect-key.maude	SSSNNSNN
 envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
+envelope-minting.maude	SSNNSNSNSNNSSS
 expression-kernel.maude	NNSSNNSNSSNSSSSSNNSNSNSSNNSSNSNSNS
 external-event-loop.maude	NSS
 guard-commit-bite.maude	NNSS

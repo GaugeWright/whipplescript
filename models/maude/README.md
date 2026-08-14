@@ -191,6 +191,18 @@ envelope-composition.maude       DR-0063 multi-party governance: a run is
                                  omission widening the meet, `require
                                  authority`, the P-256-only trust root, and
                                  order-independence
+envelope-minting.maude           DR-0063 section 8 `ONE_MINTER`: the KEY the
+                                 composed label is about. A key is
+                                 (authority, address) so minting is owning; a
+                                 second authority attaches by reference to an
+                                 opaque exposure, pinning a digest, and can
+                                 neither mint nor downgrade; an unresolved
+                                 reference is a named error. Teeth for a global
+                                 exposure-id space (an impersonation instead of
+                                 a dangling reference), a dangling reference
+                                 dropped rather than refused, and an ignored
+                                 digest. Discharges the modelling assumption
+                                 envelope-composition.maude states
 action-expansion.maude           action-call inlining (DR-0023): hygienic
                                  binding per call site, acyclic gate, and that
                                  inlining runs no provider work

@@ -1,0 +1,436 @@
+--- DR-0063 section 8, `ONE_MINTER`. The companion witness to
+--- `envelope-composition.maude`, which proves how labels compose GIVEN a key and
+--- says so in its own modelling assumption: "every envelope names resources under
+--- one spelling". This model discharges that assumption. It is about the KEY.
+---
+---   ONE_MINTER  a composed key is minted by exactly one authority; an
+---               attachment adds compartments to the key it names and never
+---               mints one; and an attachment that does not resolve fails the
+---               composition closed rather than being dropped.
+---
+--- WHY THE KEY IS A SAFETY QUESTION AND NOT A NAMING ONE. Section 8 separates two
+--- failures. *Collision* -- two envelopes spelling different resources the same --
+--- is harmless on the label arms, which are stricter under a wrong join.
+--- *Aliasing* -- one resource reachable under two spellings, or a reference that
+--- resolves somewhere unintended -- is the dangerous one: a compartment a party
+--- believes it attached simply does not apply, silently, and the read it meant to
+--- refuse is admitted. Every tooth below is that one failure reached three ways.
+---
+--- THE SHAPE, from section 8:
+---   an address is a name in exactly ONE authority's namespace, so the key is
+---   `(authority, address)` and MINTING IS OWNING;
+---   a second authority ATTACHES BY REFERENCE to an opaque exposure the minter
+---   published, never by naming the address, and can neither mint nor downgrade;
+---   an attachment PINS A DIGEST of the binding it attached to, so the owner
+---   cannot silently re-point that exposure at other bytes;
+---   a reference that does not resolve is a NAMED ERROR.
+---
+--- Section 8(9) is carried here too, because it is what makes attaching worth
+--- doing: an owner's downgrade grant clears the owner's OWN contribution to a
+--- key's label and leaves every attachment standing. Its tooth lives in the
+--- sibling model (`-GLOBAL-GRANTS` there); here it is coverage.
+---
+--- A NOTE ON WHAT THIS MODEL DOES NOT SHOW, because the record overstates it
+--- slightly. Section 8's context says a collision "hands one party a declassify
+--- over another's bytes". Under 8(9) that is narrowed: a co-owner's grant clears
+--- only its own contribution, so the other party's compartments survive. What
+--- remains wrong with an unqualified key is not the grant but the *determination*
+--- -- ownership decided by a spelling anyone may claim -- and that is what the
+--- exposure teeth below actually exploit.
+
+mod WHIPPLESCRIPT-ENVELOPE-MINTING-DATA is
+  protecting BOOL .
+
+  sorts Name Auth Role RoleSet Addr ExpId Digest .
+  sorts Arm ArmSet Env EnvSet Attempt Fact Cfg .
+  subsort Role < RoleSet .
+  subsort Arm < ArmSet .
+  subsort Env < EnvSet .
+  subsort Fact < Cfg .
+
+  ops a1 a2 : -> Auth [ctor] .
+  ops nOp nReq : -> Name [ctor] .
+  op q : Auth Name -> Role [ctor] .
+
+  op mtRole : -> RoleSet [ctor] .
+  op _|_ : RoleSet RoleSet -> RoleSet [ctor assoc comm id: mtRole] .
+  eq P:Role | P:Role = P:Role .
+
+  ops adA adB : -> Addr [ctor] .
+  ops x1 x2 : -> ExpId [ctor] .
+  ops g1 g2 : -> Digest [ctor] .
+
+  --- Confidentiality is a conjunctive compartment set, as in the sibling model
+  --- and in `models/lean/Whipple/ReaderSets.lean`: a party reads only if it
+  --- acts-for EVERY compartment. Delegation is not modelled, so acts-for is
+  --- equality and the empty set is the public bottom. That is what makes an
+  --- attachment protective -- adding a compartment can only narrow who reads.
+  op canRead : Role RoleSet -> Bool .
+  eq canRead(P:Role, mtRole) = true .
+  eq canRead(P:Role, C:Role | RS:RoleSet) =
+       (P:Role == C:Role) and canRead(P:Role, RS:RoleSet) .
+
+  --- `binds` MINTS the key (this envelope's authority, Addr) and labels it.
+  --- `exposes` publishes an opaque id for a key this envelope mints, committing
+  --- to a digest of the binding. `attaches` references another authority's
+  --- exposure and contributes compartments to the key behind it. `dgrant` is the
+  --- downgrade, valid only over a key this envelope mints.
+  op binds : Addr RoleSet -> Arm [ctor] .
+  op exposes : Addr ExpId Digest -> Arm [ctor] .
+  op attaches : Auth ExpId Digest RoleSet -> Arm [ctor] .
+  op dgrant : Addr Role -> Arm [ctor] .
+  op mtArm : -> ArmSet [ctor] .
+  op _&_ : ArmSet ArmSet -> ArmSet [ctor assoc comm id: mtArm] .
+
+  op env : Auth ArmSet -> Env [ctor] .
+  op mtEnv : -> EnvSet [ctor] .
+  op _+_ : EnvSet EnvSet -> EnvSet [ctor assoc comm id: mtEnv] .
+
+  vars A B C : Auth .   var AR : ArmSet .   vars E F : Env .
+  vars ES REST : EnvSet .   vars AD AD2 : Addr .   var X : ExpId .
+  vars G G2 : Digest .   var P : Role .   var RS : RoleSet .
+
+  op authOf : Env -> Auth .
+  eq authOf(env(A, AR)) = A .
+
+  op mints : Env Addr -> Bool .
+  eq mints(env(A, binds(AD, RS) & AR), AD) = true .
+  eq mints(E, AD) = false [owise] .
+
+  op ownLabel : Env Addr -> RoleSet .
+  eq ownLabel(env(A, binds(AD, RS) & AR), AD) = RS .
+  eq ownLabel(E, AD) = mtRole [owise] .
+
+  op grantsD : Env Addr Role -> Bool .
+  eq grantsD(env(A, dgrant(AD, P) & AR), AD, P) = true .
+  eq grantsD(E, AD, P) = false [owise] .
+
+  --- Exposure lookup, SCOPED BY AUTHORITY. `x1` published by a1 and `x1`
+  --- published by a2 are different exposures; there is no global id space to
+  --- collide in, which is the whole of section 8's answer to aliasing.
+  op exposesId : Env ExpId -> Bool .
+  eq exposesId(env(A, exposes(AD, X, G) & AR), X) = true .
+  eq exposesId(E, X) = false [owise] .
+
+  op exposedAddrIn : Env ExpId -> Addr .
+  eq exposedAddrIn(env(A, exposes(AD, X, G) & AR), X) = AD .
+  eq exposedAddrIn(E, X) = adA [owise] .
+
+  op exposedDigestIn : Env ExpId -> Digest .
+  eq exposedDigestIn(env(A, exposes(AD, X, G) & AR), X) = G .
+  eq exposedDigestIn(E, X) = g1 [owise] .
+
+  op hasExposure : EnvSet Auth ExpId -> Bool .
+  eq hasExposure(mtEnv, B, X) = false .
+  eq hasExposure(env(B, AR) + REST, B, X) =
+       exposesId(env(B, AR), X) or hasExposure(REST, B, X) .
+  eq hasExposure(E + REST, B, X) = hasExposure(REST, B, X) [owise] .
+
+  op exposedAddr : EnvSet Auth ExpId -> Addr .
+  eq exposedAddr(mtEnv, B, X) = adA .
+  eq exposedAddr(env(B, AR) + REST, B, X) =
+       if exposesId(env(B, AR), X) then exposedAddrIn(env(B, AR), X)
+       else exposedAddr(REST, B, X) fi .
+  eq exposedAddr(E + REST, B, X) = exposedAddr(REST, B, X) [owise] .
+
+  op exposedDigest : EnvSet Auth ExpId -> Digest .
+  eq exposedDigest(mtEnv, B, X) = g1 .
+  eq exposedDigest(env(B, AR) + REST, B, X) =
+       if exposesId(env(B, AR), X) then exposedDigestIn(env(B, AR), X)
+       else exposedDigest(REST, B, X) fi .
+  eq exposedDigest(E + REST, B, X) = exposedDigest(REST, B, X) [owise] .
+
+  --- The owner's own contribution to a key, and whether the owner released it.
+  op ownerLabel : EnvSet Auth Addr -> RoleSet .
+  eq ownerLabel(mtEnv, A, AD) = mtRole .
+  eq ownerLabel(env(A, AR) + REST, A, AD) =
+       ownLabel(env(A, AR), AD) | ownerLabel(REST, A, AD) .
+  eq ownerLabel(E + REST, A, AD) = ownerLabel(REST, A, AD) [owise] .
+
+  op ownerGrants : EnvSet Auth Addr Role -> Bool .
+  eq ownerGrants(mtEnv, A, AD, P) = false .
+  eq ownerGrants(env(A, AR) + REST, A, AD, P) =
+       (mints(env(A, AR), AD) and grantsD(env(A, AR), AD, P))
+       or ownerGrants(REST, A, AD, P) .
+  eq ownerGrants(E + REST, A, AD, P) = ownerGrants(REST, A, AD, P) [owise] .
+
+  --- A dgrant is valid only over a key its own envelope mints (section 3).
+  op selfGrantOnly : Env -> Bool .
+  eq selfGrantOnly(env(A, dgrant(AD, P) & AR)) =
+       mints(env(A, dgrant(AD, P) & AR), AD) and selfGrantOnly(env(A, AR)) .
+  eq selfGrantOnly(E) = true [owise] .
+
+  op selfGrantsOnly : EnvSet -> Bool .
+  eq selfGrantsOnly(mtEnv) = true .
+  eq selfGrantsOnly(E + REST) = selfGrantOnly(E) and selfGrantsOnly(REST) .
+
+  --- ONE_MINTER's first clause, and the reason it is trivially true here: a key
+  --- carries the authority that minted it, so two envelopes cannot mint one key
+  --- unless they are one authority. The `-UNSCOPED-EXPOSURES` sibling is where
+  --- that stops holding, and it stops holding on the reference rather than on
+  --- the binding, which is the finding this model exists to make legible.
+  op mintedOnce : EnvSet EnvSet -> Bool .
+  eq mintedOnce(mtEnv, ES) = true .
+  eq mintedOnce(env(A, AR) + REST, ES) =
+       not clashes(REST, A, AR) and mintedOnce(REST, ES) .
+
+  op clashes : EnvSet Auth ArmSet -> Bool .
+  eq clashes(mtEnv, A, AR) = false .
+  eq clashes(env(A, binds(AD, RS) & AR2:ArmSet) + REST, A, binds(AD, RS2:RoleSet) & AR) = true .
+  eq clashes(E + REST, A, AR) = clashes(REST, A, AR) [owise] .
+
+  op read : Auth Addr Role -> Attempt [ctor] .
+
+  op composition : EnvSet -> Fact [ctor] .
+  op attempt : Attempt -> Fact [ctor] .
+  op admitted : Attempt -> Fact [ctor] .
+  op compositionError : -> Fact [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  var T : Attempt .
+  eq admitted(T) admitted(T) = admitted(T) .
+  eq compositionError compositionError = compositionError .
+endm
+
+--- THE RULE UNDER TEST.
+mod WHIPPLESCRIPT-ENVELOPE-MINTING is
+  protecting WHIPPLESCRIPT-ENVELOPE-MINTING-DATA .
+
+  vars A B : Auth .   var AR : ArmSet .   vars E : Env .   vars ES REST : EnvSet .
+  var AD : Addr .     var X : ExpId .     var G : Digest .
+  var P : Role .      var RS : RoleSet .  var T : Attempt .
+
+  --- An attachment resolves iff the authority it names published that exposure
+  --- AND the digest it pinned still matches. Both conjuncts are load-bearing and
+  --- each has its own tooth.
+  op resolves : EnvSet Auth ExpId Digest -> Bool .
+  eq resolves(ES, B, X, G) =
+       hasExposure(ES, B, X) and (exposedDigest(ES, B, X) == G) .
+
+  op contributes : Env EnvSet Auth Addr -> RoleSet .
+  eq contributes(env(A, attaches(B, X, G, RS) & AR), ES, B, AD) =
+       (if resolves(ES, B, X, G) and (exposedAddr(ES, B, X) == AD)
+        then RS else mtRole fi)
+       | contributes(env(A, AR), ES, B, AD) .
+  eq contributes(E, ES, B, AD) = mtRole [owise] .
+
+  op attached : EnvSet EnvSet Auth Addr -> RoleSet .
+  eq attached(mtEnv, ES, A, AD) = mtRole .
+  eq attached(E + REST, ES, A, AD) =
+       contributes(E, ES, A, AD) | attached(REST, ES, A, AD) .
+
+  --- Section 8(9): the owner's grant clears the OWNER's contribution and leaves
+  --- every attachment standing. That is what makes attaching worth doing.
+  op composedLabel : EnvSet Auth Addr Role -> RoleSet .
+  eq composedLabel(ES, A, AD, P) =
+       (if ownerGrants(ES, A, AD, P) then mtRole
+        else ownerLabel(ES, A, AD) fi)
+       | attached(ES, ES, A, AD) .
+
+  op refsResolve : EnvSet EnvSet -> Bool .
+  eq refsResolve(mtEnv, ES) = true .
+  eq refsResolve(E + REST, ES) = envRefsResolve(E, ES) and refsResolve(REST, ES) .
+
+  op envRefsResolve : Env EnvSet -> Bool .
+  eq envRefsResolve(env(A, attaches(B, X, G, RS) & AR), ES) =
+       resolves(ES, B, X, G) and envRefsResolve(env(A, AR), ES) .
+  eq envRefsResolve(E, ES) = true [owise] .
+
+  op wellFormed : EnvSet -> Bool .
+  eq wellFormed(ES) =
+       refsResolve(ES, ES) and selfGrantsOnly(ES) and mintedOnce(ES, ES) .
+
+  crl [admit] : composition(ES) attempt(read(A, AD, P))
+    => composition(ES) attempt(read(A, AD, P)) admitted(read(A, AD, P))
+    if wellFormed(ES) and canRead(P, composedLabel(ES, A, AD, P)) .
+
+  crl [ill-formed] : composition(ES) attempt(T)
+    => composition(ES) attempt(T) compositionError
+    if not wellFormed(ES) .
+endm
+
+--- TOOTH 1. Exposure ids are a GLOBAL space rather than one per authority, so an
+--- attachment meant for one authority's exposure resolves to whoever published
+--- that id. A party attaches a compartment believing it protects a counterparty's
+--- resource; it lands on the impersonator's own, and the resource it meant to
+--- protect stays bare. Scoping is what turns this into an unresolved reference
+--- the composition refuses, which is the whole trade: an impersonation becomes a
+--- dangling reference.
+mod WHIPPLESCRIPT-ENVELOPE-MINTING-UNSCOPED-EXPOSURES is
+  protecting WHIPPLESCRIPT-ENVELOPE-MINTING-DATA .
+
+  vars A B : Auth .   var AR : ArmSet .   vars E : Env .   vars ES REST : EnvSet .
+  var AD : Addr .     var X : ExpId .     var G : Digest .
+  var P : Role .      var RS : RoleSet .  var T : Attempt .
+
+  --- The id alone identifies the exposure; the authority named is ignored.
+  op anyExposure : EnvSet ExpId -> Bool .
+  eq anyExposure(mtEnv, X) = false .
+  eq anyExposure(env(A, AR) + REST, X) =
+       exposesId(env(A, AR), X) or anyExposure(REST, X) .
+
+  op anyExposedAddr : EnvSet ExpId -> Addr .
+  eq anyExposedAddr(mtEnv, X) = adA .
+  eq anyExposedAddr(env(A, AR) + REST, X) =
+       if exposesId(env(A, AR), X) then exposedAddrIn(env(A, AR), X)
+       else anyExposedAddr(REST, X) fi .
+
+  op anyExposedAuth : EnvSet ExpId -> Auth .
+  eq anyExposedAuth(mtEnv, X) = a1 .
+  eq anyExposedAuth(env(A, AR) + REST, X) =
+       if exposesId(env(A, AR), X) then A else anyExposedAuth(REST, X) fi .
+
+  op anyExposedDigest : EnvSet ExpId -> Digest .
+  eq anyExposedDigest(mtEnv, X) = g1 .
+  eq anyExposedDigest(env(A, AR) + REST, X) =
+       if exposesId(env(A, AR), X) then exposedDigestIn(env(A, AR), X)
+       else anyExposedDigest(REST, X) fi .
+
+  op resolves : EnvSet Auth ExpId Digest -> Bool .
+  eq resolves(ES, B, X, G) =
+       anyExposure(ES, X) and (anyExposedDigest(ES, X) == G) .
+
+  op contributes : Env EnvSet Auth Addr -> RoleSet .
+  eq contributes(env(A, attaches(B, X, G, RS) & AR), ES, B:Auth, AD) =
+       (if resolves(ES, B, X, G) and (anyExposedAddr(ES, X) == AD)
+           and (anyExposedAuth(ES, X) == B:Auth)
+        then RS else mtRole fi)
+       | contributes(env(A, AR), ES, B:Auth, AD) .
+  eq contributes(E, ES, B, AD) = mtRole [owise] .
+
+  op attached : EnvSet EnvSet Auth Addr -> RoleSet .
+  eq attached(mtEnv, ES, A, AD) = mtRole .
+  eq attached(E + REST, ES, A, AD) =
+       contributes(E, ES, A, AD) | attached(REST, ES, A, AD) .
+
+  op composedLabel : EnvSet Auth Addr Role -> RoleSet .
+  eq composedLabel(ES, A, AD, P) =
+       (if ownerGrants(ES, A, AD, P) then mtRole
+        else ownerLabel(ES, A, AD) fi)
+       | attached(ES, ES, A, AD) .
+
+  op refsResolve : EnvSet EnvSet -> Bool .
+  eq refsResolve(mtEnv, ES) = true .
+  eq refsResolve(E + REST, ES) = envRefsResolve(E, ES) and refsResolve(REST, ES) .
+
+  op envRefsResolve : Env EnvSet -> Bool .
+  eq envRefsResolve(env(A, attaches(B, X, G, RS) & AR), ES) =
+       resolves(ES, B, X, G) and envRefsResolve(env(A, AR), ES) .
+  eq envRefsResolve(E, ES) = true [owise] .
+
+  op wellFormed : EnvSet -> Bool .
+  eq wellFormed(ES) =
+       refsResolve(ES, ES) and selfGrantsOnly(ES) and mintedOnce(ES, ES) .
+
+  crl [admit] : composition(ES) attempt(read(A, AD, P))
+    => composition(ES) attempt(read(A, AD, P)) admitted(read(A, AD, P))
+    if wellFormed(ES) and canRead(P, composedLabel(ES, A, AD, P)) .
+
+  crl [ill-formed] : composition(ES) attempt(T)
+    => composition(ES) attempt(T) compositionError
+    if not wellFormed(ES) .
+endm
+
+--- TOOTH 2. A reference that does not resolve is DROPPED rather than refused.
+--- Nothing is forged and no rule is broken; the counterparty's compartment simply
+--- is not there, and the read it was attached to prevent is admitted. This is
+--- section 8's aliasing failure in its purest form: silent, and it looks like it
+--- worked.
+mod WHIPPLESCRIPT-ENVELOPE-MINTING-SILENT-DANGLING is
+  protecting WHIPPLESCRIPT-ENVELOPE-MINTING-DATA .
+
+  vars A B : Auth .   var AR : ArmSet .   vars E : Env .   vars ES REST : EnvSet .
+  var AD : Addr .     var X : ExpId .     var G : Digest .
+  var P : Role .      var RS : RoleSet .  var T : Attempt .
+
+  op resolves : EnvSet Auth ExpId Digest -> Bool .
+  eq resolves(ES, B, X, G) =
+       hasExposure(ES, B, X) and (exposedDigest(ES, B, X) == G) .
+
+  op contributes : Env EnvSet Auth Addr -> RoleSet .
+  eq contributes(env(A, attaches(B, X, G, RS) & AR), ES, B, AD) =
+       (if resolves(ES, B, X, G) and (exposedAddr(ES, B, X) == AD)
+        then RS else mtRole fi)
+       | contributes(env(A, AR), ES, B, AD) .
+  eq contributes(E, ES, B, AD) = mtRole [owise] .
+
+  op attached : EnvSet EnvSet Auth Addr -> RoleSet .
+  eq attached(mtEnv, ES, A, AD) = mtRole .
+  eq attached(E + REST, ES, A, AD) =
+       contributes(E, ES, A, AD) | attached(REST, ES, A, AD) .
+
+  op composedLabel : EnvSet Auth Addr Role -> RoleSet .
+  eq composedLabel(ES, A, AD, P) =
+       (if ownerGrants(ES, A, AD, P) then mtRole
+        else ownerLabel(ES, A, AD) fi)
+       | attached(ES, ES, A, AD) .
+
+  --- THE REJECTED RULE: an unresolved reference is not a well-formedness fault.
+  op wellFormed : EnvSet -> Bool .
+  eq wellFormed(ES) = selfGrantsOnly(ES) and mintedOnce(ES, ES) .
+
+  crl [admit] : composition(ES) attempt(read(A, AD, P))
+    => composition(ES) attempt(read(A, AD, P)) admitted(read(A, AD, P))
+    if wellFormed(ES) and canRead(P, composedLabel(ES, A, AD, P)) .
+
+  crl [ill-formed] : composition(ES) attempt(T)
+    => composition(ES) attempt(T) compositionError
+    if not wellFormed(ES) .
+endm
+
+--- TOOTH 3. The pinned digest is ignored, so an attachment follows its exposure
+--- wherever the owner later points it. A counterparty labelled one resource and
+--- finds its compartment sitting on another, while the bytes it meant to protect
+--- carry nothing. The digest is a commitment rather than a disclosure precisely
+--- so that this is a refusal and not a surprise.
+mod WHIPPLESCRIPT-ENVELOPE-MINTING-LOOSE-DIGEST is
+  protecting WHIPPLESCRIPT-ENVELOPE-MINTING-DATA .
+
+  vars A B : Auth .   var AR : ArmSet .   vars E : Env .   vars ES REST : EnvSet .
+  var AD : Addr .     var X : ExpId .     var G : Digest .
+  var P : Role .      var RS : RoleSet .  var T : Attempt .
+
+  --- THE REJECTED RULE: resolution ignores what the attachment pinned.
+  op resolves : EnvSet Auth ExpId Digest -> Bool .
+  eq resolves(ES, B, X, G) = hasExposure(ES, B, X) .
+
+  op contributes : Env EnvSet Auth Addr -> RoleSet .
+  eq contributes(env(A, attaches(B, X, G, RS) & AR), ES, B, AD) =
+       (if resolves(ES, B, X, G) and (exposedAddr(ES, B, X) == AD)
+        then RS else mtRole fi)
+       | contributes(env(A, AR), ES, B, AD) .
+  eq contributes(E, ES, B, AD) = mtRole [owise] .
+
+  op attached : EnvSet EnvSet Auth Addr -> RoleSet .
+  eq attached(mtEnv, ES, A, AD) = mtRole .
+  eq attached(E + REST, ES, A, AD) =
+       contributes(E, ES, A, AD) | attached(REST, ES, A, AD) .
+
+  op composedLabel : EnvSet Auth Addr Role -> RoleSet .
+  eq composedLabel(ES, A, AD, P) =
+       (if ownerGrants(ES, A, AD, P) then mtRole
+        else ownerLabel(ES, A, AD) fi)
+       | attached(ES, ES, A, AD) .
+
+  op refsResolve : EnvSet EnvSet -> Bool .
+  eq refsResolve(mtEnv, ES) = true .
+  eq refsResolve(E + REST, ES) = envRefsResolve(E, ES) and refsResolve(REST, ES) .
+
+  op envRefsResolve : Env EnvSet -> Bool .
+  eq envRefsResolve(env(A, attaches(B, X, G, RS) & AR), ES) =
+       resolves(ES, B, X, G) and envRefsResolve(env(A, AR), ES) .
+  eq envRefsResolve(E, ES) = true [owise] .
+
+  op wellFormed : EnvSet -> Bool .
+  eq wellFormed(ES) =
+       refsResolve(ES, ES) and selfGrantsOnly(ES) and mintedOnce(ES, ES) .
+
+  crl [admit] : composition(ES) attempt(read(A, AD, P))
+    => composition(ES) attempt(read(A, AD, P)) admitted(read(A, AD, P))
+    if wellFormed(ES) and canRead(P, composedLabel(ES, A, AD, P)) .
+
+  crl [ill-formed] : composition(ES) attempt(T)
+    => composition(ES) attempt(T) compositionError
+    if not wellFormed(ES) .
+endm
