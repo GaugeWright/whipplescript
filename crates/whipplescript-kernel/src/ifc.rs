@@ -38,13 +38,43 @@ type FieldReadMap = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
 /// (DR-0027 I-IFC1): each governed resource has a **reader authority** (a role);
 /// the secret is readable by any party that acts-for that role. The delegation
 /// context is the acts-for edge set, closed reflexive-transitively by `can_act`.
+/// A dual-gated label: what a resource's reads TAG data with, and what its
+/// writes DEMAND of data (DR-0063 §1, O1). A resource is read and written, so
+/// each of `readers` and `integrity` faces both ways.
+///
+/// Under one authority the two readings cannot differ, which is why one value
+/// sufficed and why the migration simply duplicates it — `both`. They can
+/// differ only under composition, where they compose in OPPOSITE directions:
+/// at a crossing the kernel asks `dominates(provider, required)`, so the
+/// `required` side composes by union and the `provider` side by intersection.
+/// Confidentiality puts the sink on the provider side; integrity puts the
+/// source there.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DualLabel {
+    /// What a read of this resource tags data with.
+    source: BTreeSet<String>,
+    /// What a write to this resource demands of data.
+    sink: BTreeSet<String>,
+}
+
+impl DualLabel {
+    /// The migration, and the only constructor a single-authority envelope
+    /// needs: one declared set is both readings of it.
+    fn both(set: BTreeSet<String>) -> Self {
+        Self {
+            source: set.clone(),
+            sink: set,
+        }
+    }
+}
+
 pub struct Envelope {
     /// resource handle -> reader-authority SET (a set of compartments; absent or
     /// empty = `public`, the bottom). A party may read the resource iff it acts-for
     /// EVERY compartment — the intersection of up-sets (DR-0027 E6, the set form
     /// proven in `models/lean/Whipple/ReaderSets.lean`). A single-compartment label
     /// is the leaf case, behaving exactly as the role it replaces.
-    readers: BTreeMap<String, BTreeSet<String>>,
+    readers: BTreeMap<String, DualLabel>,
     governed: BTreeSet<String>,
     /// The authority this envelope speaks for (DR-0063 §2). Roles are qualified
     /// against it, so `acme::Operator` and `beta::Operator` are different
@@ -63,7 +93,7 @@ pub struct Envelope {
     /// accepts data only from a source whose integrity set DOMINATES `ws` — provides
     /// some voucher acting-for each required one (DR-0027 I-IFC1/E6, the dual of the
     /// reader axis).
-    integrity: BTreeMap<String, BTreeSet<String>>,
+    integrity: BTreeMap<String, DualLabel>,
     /// endorse grants `(resource, role)`: `resource`'s data may be raised to `role`
     /// integrity — the audited integrity-axis crossing.
     endorse: Vec<(String, String)>,
@@ -337,11 +367,35 @@ impl Envelope {
                     reader_set.insert("confidential".to_owned());
                 }
                 if !reader_set.is_empty() {
-                    readers.insert(name.clone(), reader_set);
+                    let sink =
+                        qualify_role_set(parse_role_set(label, "reader_sink"), authority_ref);
+                    readers.insert(
+                        name.clone(),
+                        if sink.is_empty() {
+                            DualLabel::both(reader_set)
+                        } else {
+                            DualLabel {
+                                source: reader_set,
+                                sink,
+                            }
+                        },
+                    );
                 }
                 let writer_set = qualify_role_set(parse_role_set(label, "writer"), authority_ref);
                 if !writer_set.is_empty() {
-                    integrity.insert(name.clone(), writer_set);
+                    let sink =
+                        qualify_role_set(parse_role_set(label, "writer_sink"), authority_ref);
+                    integrity.insert(
+                        name.clone(),
+                        if sink.is_empty() {
+                            DualLabel::both(writer_set)
+                        } else {
+                            DualLabel {
+                                source: writer_set,
+                                sink,
+                            }
+                        },
+                    );
                 }
                 // a signal resource marked `internal` derives its integrity from its
                 // emitters (H8 stage b) rather than defaulting to the external-entry
@@ -680,7 +734,7 @@ impl Envelope {
                 let roles =
                     qualify_role_set(collect_role_set(&label[by + 1..until]), authority_ref);
                 if !roles.is_empty() {
-                    readers.insert(address.clone(), roles);
+                    readers.insert(address.clone(), DualLabel::both(roles));
                 }
             }
             // `internal` marks a signal an internal channel (H8 stage b): its
@@ -697,7 +751,7 @@ impl Envelope {
             if let Some(from) = label.iter().position(|tok| *tok == "from") {
                 let roles = qualify_role_set(collect_role_set(&label[from + 1..]), authority_ref);
                 if !roles.is_empty() {
-                    integrity.insert(address, roles);
+                    integrity.insert(address, DualLabel::both(roles));
                 }
             }
         }
@@ -736,6 +790,22 @@ impl Envelope {
                 "reader": self.reader_set(name).into_iter().collect::<Vec<_>>(),
                 "writer": self.integrity_set(name).into_iter().collect::<Vec<_>>(),
             });
+            // The sink readings appear only when they differ from the source
+            // ones, which under a single authority they cannot. So the emitted
+            // document is byte-identical to what it was before the split, and
+            // every signature over an existing envelope still verifies.
+            if let Some(label) = self.readers.get(name) {
+                if label.source != label.sink {
+                    entry["reader_sink"] =
+                        serde_json::json!(label.sink.iter().cloned().collect::<Vec<_>>());
+                }
+            }
+            if let Some(label) = self.integrity.get(name) {
+                if label.source != label.sink {
+                    entry["writer_sink"] =
+                        serde_json::json!(label.sink.iter().cloned().collect::<Vec<_>>());
+                }
+            }
             if self.principals.contains(name) {
                 entry["principal"] = serde_json::Value::Bool(true);
             }
@@ -846,10 +916,21 @@ impl Envelope {
 
     /// The reader-authority SET of a resource; the empty set (`public`, the bottom)
     /// if unlabeled. A party may read iff it acts-for every compartment.
+    /// The compartments a READ of this resource tags data with — the `required`
+    /// side of a confidentiality crossing.
     fn reader_set(&self, resource: &str) -> BTreeSet<String> {
         self.readers
             .get(self.resolve(resource))
-            .cloned()
+            .map(|label| label.source.clone())
+            .unwrap_or_default()
+    }
+
+    /// The compartments a WRITE to this resource must be covered by — the
+    /// `provider` side of a confidentiality crossing.
+    fn reader_sink(&self, resource: &str) -> BTreeSet<String> {
+        self.readers
+            .get(self.resolve(resource))
+            .map(|label| label.sink.clone())
             .unwrap_or_default()
     }
 
@@ -926,7 +1007,7 @@ impl Envelope {
     /// that lower confidentiality are explicit in the source"). The rule walk
     /// applies `declassify_releases` to marked releases; nothing else crosses.
     fn leaks(&self, source: &str, sink: &str) -> bool {
-        !self.dominates(&self.reader_set(sink), &self.reader_set(source))
+        !self.dominates(&self.reader_sink(sink), &self.reader_set(source))
     }
 
     /// Whether an audited declassify grant releases `source` to an audience the
@@ -938,7 +1019,7 @@ impl Envelope {
     /// release-to-the-world: any sink qualifies (the empty reader set — the
     /// world — covers no named role, so this is the only way it can arm).
     fn declassify_releases(&self, source: &str, sink: &str) -> bool {
-        let sink_readers = self.reader_set(sink);
+        let sink_readers = self.reader_sink(sink);
         self.declassify.iter().any(|(resource, role)| {
             self.resolve(resource) == self.resolve(source)
                 && (role == PUBLIC
@@ -948,10 +1029,21 @@ impl Envelope {
 
     /// The integrity (vouching) authority SET of a resource; the empty set
     /// (`public`, the untrusted bottom) if unlabeled.
+    /// The vouchers a READ of this resource carries — the `provider` side of an
+    /// integrity crossing.
     fn integrity_set(&self, resource: &str) -> BTreeSet<String> {
         self.integrity
             .get(self.resolve(resource))
-            .cloned()
+            .map(|label| label.source.clone())
+            .unwrap_or_default()
+    }
+
+    /// The vouchers a WRITE to this resource demands — the `required` side of an
+    /// integrity crossing.
+    fn integrity_sink(&self, resource: &str) -> BTreeSet<String> {
+        self.integrity
+            .get(self.resolve(resource))
+            .map(|label| label.sink.clone())
             .unwrap_or_default()
     }
 
@@ -1061,7 +1153,7 @@ impl Envelope {
     /// An integrity label rendered for diagnostics: `public` for the empty set, else
     /// the compartments joined by `, `.
     fn integrity_label(&self, resource: &str) -> String {
-        label_text(&self.integrity_set(resource))
+        label_text(&self.integrity_sink(resource))
     }
 
     /// Does reading `read` and writing `write` inject? Untrusted data pollutes a
@@ -1072,7 +1164,7 @@ impl Envelope {
     /// `output:` token strip; unit tests keep asserting the raw relation.
     #[cfg(test)]
     fn injects(&self, read: &str, write: &str) -> bool {
-        !self.dominates(&self.integrity_set(read), &self.integrity_set(write))
+        !self.dominates(&self.integrity_set(read), &self.integrity_sink(write))
     }
 
     /// Whether an audited endorse grant raises `read`'s integrity enough to
@@ -1089,7 +1181,7 @@ impl Envelope {
                 granted = true;
             }
         }
-        granted && self.dominates(&raised, &self.integrity_set(write))
+        granted && self.dominates(&raised, &self.integrity_sink(write))
     }
 }
 
@@ -2572,7 +2664,7 @@ fn flag_redacted_egress_projections(
             .filter_map(|root| projected_for(root))
             .flatten()
             .collect();
-        let sink_readers = envelope.reader_set(sink);
+        let sink_readers = envelope.reader_sink(sink);
         if !envelope.dominates(&sink_readers, &projected) {
             // Name exactly which kept fields the sink cannot read, and suggest the
             // safe keep-set — the sound "auto-suggest" form of auto-redaction, which
@@ -3102,7 +3194,7 @@ pub fn check_with_envelope_imports(
         // per-field label join. Also purely additive (no read exemption).
         for bounded in &rule.metadata.bounded_egresses {
             let projected = envelope.projected_reader_set(&bounded.source_schema, &bounded.keep);
-            let sink_readers = envelope.reader_set(&bounded.sink);
+            let sink_readers = envelope.reader_sink(&bounded.sink);
             if envelope.dominates(&sink_readers, &projected) {
                 continue;
             }
@@ -3356,12 +3448,12 @@ pub fn check_with_envelope_imports(
                     let injects = if internal_signal.contains(src) {
                         match &src_integrity {
                             None => false,
-                            Some(set) => !envelope.dominates(set, &envelope.integrity_set(sink)),
+                            Some(set) => !envelope.dominates(set, &envelope.integrity_sink(sink)),
                         }
                     } else {
                         !(envelope.dominates(
                             &envelope.integrity_set(integrity_id),
-                            &envelope.integrity_set(sink),
+                            &envelope.integrity_sink(sink),
                         ) || (carried_only_by(sink, endorsed_outputs)
                             && envelope.endorse_raises(integrity_id, sink)))
                     };
@@ -3400,7 +3492,7 @@ pub fn check_with_envelope_imports(
             .chain(milestone_sinks.iter().map(String::as_str))
             .chain(result_sinks.iter().map(String::as_str))
         {
-            let requirement = envelope.integrity_set(sink);
+            let requirement = envelope.integrity_sink(sink);
             if requirement.is_empty() {
                 continue;
             }
@@ -3594,7 +3686,7 @@ pub fn check_with_envelope_imports(
                 continue;
             }
             for sink in selected_effect_integrity_sinks(effect, &shared_coordination) {
-                let required = envelope.integrity_set(&sink);
+                let required = envelope.integrity_sink(&sink);
                 if envelope.dominates(&selector_integrity, &required) {
                     continue;
                 }
@@ -5465,6 +5557,83 @@ grant channel secsrc -> imap:sec from Sec\n";
             !composed.dominates(&provider, &required),
             "so the meet refuses too; pooling the edges instead would have admitted it"
         );
+    }
+
+    // ---- DR-0063 §1/O1, the dual-gated split ---------------------------------
+
+    #[test]
+    fn a_declared_label_is_both_its_readings() {
+        // The migration. One declared set becomes the source tag and the sink
+        // demand, so a single-authority envelope decides exactly as before —
+        // and, because the two cannot differ, the emitted document is unchanged
+        // and every signature over it still verifies.
+        let env = Envelope::from_dsl(
+            "grant file_store Ledger -> file:/srv/ledger.db readable by Operator from Ops\n",
+        )
+        .expect("valid");
+        assert_eq!(env.reader_set("Ledger"), env.reader_sink("Ledger"));
+        assert_eq!(env.integrity_set("Ledger"), env.integrity_sink("Ledger"));
+        let round_trip = Envelope::from_json(&env.to_canonical_json()).expect("round trip");
+        assert_eq!(round_trip.reader_set("Ledger"), env.reader_set("Ledger"));
+        assert!(
+            !env.to_canonical_json().contains("reader_sink"),
+            "an undifferentiated label emits no second reading, so the hash is unchanged"
+        );
+    }
+
+    #[test]
+    fn the_two_readings_survive_a_round_trip_once_they_differ() {
+        // What the split is for. The readings can only diverge under
+        // composition, and when they do the document has to carry both or the
+        // meet would recover one of them from nothing.
+        let source = Envelope::from_json(
+            r#"{ "resources": { "file:/srv/ledger.db": {
+                 "reader": ["Operator"], "reader_sink": ["Auditor"],
+                 "writer": ["Ops"], "writer_sink": ["Sec"] } } }"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            source.reader_set("file:/srv/ledger.db"),
+            BTreeSet::from(["Operator".to_owned()])
+        );
+        assert_eq!(
+            source.reader_sink("file:/srv/ledger.db"),
+            BTreeSet::from(["Auditor".to_owned()])
+        );
+        assert_eq!(
+            source.integrity_sink("file:/srv/ledger.db"),
+            BTreeSet::from(["Sec".to_owned()])
+        );
+        let json = source.to_canonical_json();
+        assert!(json.contains("reader_sink") && json.contains("writer_sink"));
+        let round_trip = Envelope::from_json(&json).expect("round trip");
+        assert_eq!(
+            round_trip.reader_sink("file:/srv/ledger.db"),
+            source.reader_sink("file:/srv/ledger.db")
+        );
+    }
+
+    #[test]
+    fn each_crossing_reads_the_side_it_provides() {
+        // The general rule, made observable: at a crossing the kernel asks
+        // `dominates(provider, required)`. Confidentiality puts the SINK on the
+        // provider side, integrity puts the SOURCE there — which is why the two
+        // fields compose in opposite directions once they can differ.
+        let env = Envelope::from_json(
+            r#"{ "resources": {
+                 "file:/srv/src.db": { "reader": ["Operator"], "reader_sink": ["public-ish"],
+                                       "writer": ["Ops"], "writer_sink": ["nobody"] },
+                 "file:/srv/sink.db": { "reader": ["nobody"], "reader_sink": ["Operator"],
+                                        "writer": ["nobody"], "writer_sink": ["Ops"] } } }"#,
+        )
+        .expect("valid");
+        // Confidentiality: the sink's SINK reading must cover the source's
+        // SOURCE reading. Both are `Operator` here, so the flow is safe — and it
+        // would not be if either side were read from the other's direction.
+        assert!(!env.leaks("file:/srv/src.db", "file:/srv/sink.db"));
+        // Integrity: the source's SOURCE reading must cover the sink's SINK
+        // demand. Both are `Ops`.
+        assert!(!env.injects("file:/srv/src.db", "file:/srv/sink.db"));
     }
 
     // ---- DR-0063 §2, authority-qualified roles -------------------------------
