@@ -83,6 +83,11 @@ pub struct Envelope {
     /// bare, and the envelope behaves exactly as it did before qualification
     /// existed.
     authority: Option<String>,
+    /// Authorities whose envelopes must be present **and governed** in a
+    /// composed set for this envelope's grants to be valid (DR-0063 §4). This
+    /// is how one party's policy can depend on another's constraints actually
+    /// holding, rather than on the other party merely being named somewhere.
+    requires_authority: BTreeSet<String>,
     /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
     deleg: Vec<(String, String)>,
     /// declassify grants `(resource, role)`: `resource` may be released to any
@@ -216,6 +221,17 @@ impl Envelope {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         let authority_ref = authority.as_deref();
+        let requires_authority: BTreeSet<String> = value
+            .get("requires_authority")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut readers = BTreeMap::new();
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
@@ -479,6 +495,7 @@ impl Envelope {
             credential_min_rung,
             custody_demand,
             authority,
+            requires_authority,
             address_of,
             party_of,
             guarantees,
@@ -512,6 +529,7 @@ impl Envelope {
         let mut guarantees: Vec<(String, Vec<String>)> = Vec::new();
         // A pre-pass, so `authority` qualifies every role in the file rather
         // than only the ones written after it.
+        let mut requires_authority: BTreeSet<String> = BTreeSet::new();
         let mut authority: Option<String> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -694,6 +712,16 @@ impl Envelope {
                     continue;
                 }
                 Some("authority") => continue,
+                Some("requires") if tokens.get(1).copied() == Some("authority") => {
+                    let Some(name) = tokens.get(2) else {
+                        return Err(format!(
+                            "line {}: requires authority needs a name",
+                            index + 1
+                        ));
+                    };
+                    requires_authority.insert((*name).to_owned());
+                    continue;
+                }
                 Some("grant") => {}
                 _ => {
                     return Err(format!(
@@ -769,6 +797,7 @@ impl Envelope {
             credential_min_rung,
             custody_demand,
             authority,
+            requires_authority,
             address_of,
             party_of,
             guarantees,
@@ -852,6 +881,24 @@ impl Envelope {
             "declassifications": declassifications,
             "endorsements": endorsements,
         });
+        // The authority this envelope speaks for, and the authorities it
+        // requires in a composed set (DR-0063 §2, §4). Canonicalization is what
+        // the signature covers, so a field absent here is a field the signed
+        // document does not carry — which would leave the signed-versus-declared
+        // authority check with nothing to compare. Emitted only when declared,
+        // so an envelope that names no authority keeps its existing hash.
+        if let Some(authority) = &self.authority {
+            canonical["authority"] = serde_json::Value::String(authority.clone());
+        }
+        if !self.requires_authority.is_empty() {
+            canonical["requires_authority"] = serde_json::Value::Array(
+                self.requires_authority
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
         // Dynamic guarantee declarations (DR-0036 §2), sorted for a stable hash.
         // Emitted only when declared, so envelopes predating the feature keep
         // their signed hashes.
@@ -1613,6 +1660,269 @@ pub fn envelope_path_from_env() -> Option<PathBuf> {
 pub struct VerifiedEnvelope {
     envelope: Envelope,
     attestation: Option<crate::gov::VerifiedAttestation>,
+}
+
+/// One entry of a run's composition record (DR-0063 §4): which envelope, from
+/// which authority, at which version and epoch, the run was checked under.
+///
+/// The record is the set actually checked, not the set the embedder derived —
+/// an ungoverned stakeholder has no hash, version, or epoch, and belongs on the
+/// roster beside it rather than here as a nullable row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEntry {
+    pub authority: String,
+    pub envelope_hash: String,
+    pub epoch: u64,
+}
+
+/// A run governed by a SET of signed envelopes, whose effective policy is their
+/// MEET (DR-0063 §1). Composition is defined by refusal: the composed policy
+/// refuses whenever any constituent would.
+///
+/// Every per-arm rule follows from one question — at a crossing the kernel asks
+/// `dominates(provider, required)`, so the `required` side composes by UNION and
+/// the `provider` side by INTERSECTION. Confidentiality puts the sink on the
+/// provider side and integrity puts the source there, which is why the two
+/// fields compose in opposite directions rather than by two rules kept in step.
+pub struct Composition {
+    constituents: Vec<Envelope>,
+    record: Vec<CompositionEntry>,
+}
+
+impl Composition {
+    /// Compose a checked set. Fails closed on any ill-formedness rather than
+    /// dropping the offending arm, because a silently dropped grant is one its
+    /// issuer goes on believing it holds.
+    pub fn compose(
+        envelopes: Vec<VerifiedEnvelope>,
+        record: Vec<CompositionEntry>,
+    ) -> Result<Self, String> {
+        let mut constituents = Vec::new();
+        let mut authorities = BTreeSet::new();
+        for verified in envelopes {
+            // §5: a composed set admits only the authenticated trust root, under
+            // the preimage that binds the epoch and the authority.
+            let attestation = verified
+                .attestation()
+                .ok_or("a composed set admits only signed envelopes")?;
+            let (Some(epoch), Some(authority)) =
+                (attestation.epoch, attestation.authority.as_deref())
+            else {
+                return Err(
+                    "a composed set admits only :v2 envelopes, whose signature covers the \
+                     epoch and the authority"
+                        .to_owned(),
+                );
+            };
+            // §4: the record is checked as a SET, not consulted as a defaulting
+            // map. A constituent the record does not name, or names twice, or
+            // names at another epoch, is a run citing evidence for a set it was
+            // not checked under.
+            let entries: Vec<&CompositionEntry> = record
+                .iter()
+                .filter(|entry| entry.authority == authority)
+                .collect();
+            let [entry] = entries.as_slice() else {
+                return Err(format!(
+                    "the composition record names {authority} {} times, not once",
+                    entries.len()
+                ));
+            };
+            if entry.epoch != epoch {
+                return Err(format!(
+                    "{authority} is signed for epoch {epoch}, but the composition record cites \
+                     epoch {}",
+                    entry.epoch
+                ));
+            }
+            if entry.envelope_hash != attestation.envelope_hash {
+                return Err(format!(
+                    "the composition record cites a different envelope for {authority}"
+                ));
+            }
+            if !authorities.insert(authority.to_owned()) {
+                return Err(format!("{authority} appears twice in the composed set"));
+            }
+            constituents.push(verified.envelope);
+        }
+        for entry in &record {
+            if !authorities.contains(&entry.authority) {
+                return Err(format!(
+                    "the composition record names {}, which supplied no envelope",
+                    entry.authority
+                ));
+            }
+        }
+        let composed = Self {
+            constituents,
+            record,
+        };
+        composed.check_grants_are_owned()?;
+        composed.check_required_authorities(&authorities)?;
+        Ok(composed)
+    }
+
+    /// §3: only the envelope that labels a resource may carry a downgrade grant
+    /// over it, and a foreign grant is a hard error rather than a dropped arm.
+    fn check_grants_are_owned(&self) -> Result<(), String> {
+        for envelope in &self.constituents {
+            for (resource, _) in envelope.declassify.iter().chain(envelope.endorse.iter()) {
+                if !envelope.readers.contains_key(envelope.resolve(resource))
+                    && !envelope.integrity.contains_key(envelope.resolve(resource))
+                {
+                    let who = envelope.authority.as_deref().unwrap_or("an envelope");
+                    return Err(format!(
+                        "{who} grants a downgrade over {resource}, which it does not label"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// §4: `requires authority` means present **and governed** — satisfied by an
+    /// envelope in the checked set, never by a name in the embedder's roster.
+    fn check_required_authorities(&self, present: &BTreeSet<String>) -> Result<(), String> {
+        for envelope in &self.constituents {
+            for required in &envelope.requires_authority {
+                if !present.contains(required) {
+                    let who = envelope.authority.as_deref().unwrap_or("an envelope");
+                    return Err(format!(
+                        "{who} requires authority {required}, which supplied no envelope"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The record this composition was checked under, for a run's evidence.
+    pub fn record(&self) -> &[CompositionEntry] {
+        &self.record
+    }
+
+    fn union(&self, of: impl Fn(&Envelope) -> BTreeSet<String>) -> BTreeSet<String> {
+        self.constituents.iter().flat_map(of).collect()
+    }
+
+    fn intersection(&self, of: impl Fn(&Envelope) -> BTreeSet<String>) -> BTreeSet<String> {
+        let mut sets = self.constituents.iter().map(&of);
+        let Some(first) = sets.next() else {
+            return BTreeSet::new();
+        };
+        sets.fold(first, |acc, set| acc.intersection(&set).cloned().collect())
+    }
+
+    /// The `required` side of a confidentiality crossing: UNION, because
+    /// `readers` is a conjunctive compartment set and a party reads only if it
+    /// acts-for every compartment. Intersecting would widen to the public
+    /// bottom — a label every constituent refuses.
+    fn reader_source(&self, resource: &str) -> BTreeSet<String> {
+        self.union(|envelope| envelope.reader_set(resource))
+    }
+
+    /// The `provider` side: INTERSECTION, because a larger sink set covers more
+    /// and is therefore more permissive.
+    fn reader_sink(&self, resource: &str) -> BTreeSet<String> {
+        self.intersection(|envelope| envelope.reader_sink(resource))
+    }
+
+    /// The `provider` side of an integrity crossing: INTERSECTION. Data is only
+    /// as trusted as the least-trusting party, and one authority vouching for
+    /// its own data does not bind another.
+    fn integrity_source(&self, resource: &str) -> BTreeSet<String> {
+        self.intersection(|envelope| envelope.integrity_set(resource))
+    }
+
+    /// The `required` side: UNION, the strongest demand made of a sink.
+    fn integrity_sink(&self, resource: &str) -> BTreeSet<String> {
+        self.union(|envelope| envelope.integrity_sink(resource))
+    }
+
+    /// Acts-for edges compose by UNANIMITY: an edge survives only if every
+    /// constituent declares it. Pooling them would let a compartment be covered
+    /// by an edge one party never granted.
+    fn edges(&self) -> Vec<(String, String)> {
+        let Some(first) = self.constituents.first() else {
+            return Vec::new();
+        };
+        first
+            .deleg
+            .iter()
+            .filter(|edge| {
+                self.constituents
+                    .iter()
+                    .all(|envelope| envelope.deleg.contains(edge))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn dominates(&self, provider: &BTreeSet<String>, required: &BTreeSet<String>) -> bool {
+        let edges = self.edges();
+        let acts_for = |p: &str, q: &str| {
+            if q == PUBLIC || p == q {
+                return true;
+            }
+            if p == PUBLIC {
+                return false;
+            }
+            let mut frontier = vec![p.to_owned()];
+            let mut visited = BTreeSet::new();
+            while let Some(current) = frontier.pop() {
+                if current == q {
+                    return true;
+                }
+                if !visited.insert(current.clone()) {
+                    continue;
+                }
+                for (left, right) in &edges {
+                    if *left == current {
+                        frontier.push(right.clone());
+                    }
+                }
+            }
+            false
+        };
+        required
+            .iter()
+            .all(|req| provider.iter().any(|prov| acts_for(prov, req)))
+    }
+
+    /// Whether data read from `source` leaks when written to `sink`, under the
+    /// meet. A constituent that would refuse this flow makes the meet refuse it.
+    pub fn leaks(&self, source: &str, sink: &str) -> bool {
+        !self.dominates(&self.reader_sink(sink), &self.reader_source(source))
+    }
+
+    /// Whether data read from `read` may drive `write`, under the meet.
+    pub fn injects(&self, read: &str, write: &str) -> bool {
+        !self.dominates(&self.integrity_source(read), &self.integrity_sink(write))
+    }
+
+    /// §7: what one authority may be told about this composition. It sees its
+    /// own resources and the identity of every other authority — never their
+    /// inventory, because the report is itself an information flow.
+    pub fn projection_for(&self, authority: &str) -> CompositionProjection {
+        CompositionProjection {
+            authorities: self.record.iter().map(|e| e.authority.clone()).collect(),
+            own_resources: self
+                .constituents
+                .iter()
+                .filter(|envelope| envelope.authority.as_deref() == Some(authority))
+                .flat_map(|envelope| envelope.governed.iter().cloned())
+                .collect(),
+        }
+    }
+}
+
+/// One authority's view of a composition's guarantee report (DR-0063 §7).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionProjection {
+    /// Every authority in the composition, by name. Presence is not disclosure.
+    pub authorities: Vec<String>,
+    /// Only the viewing authority's own governed resources.
+    pub own_resources: BTreeSet<String>,
 }
 
 /// The principal a `coerce` egresses to when its declaration names no
@@ -5556,6 +5866,252 @@ grant channel secsrc -> imap:sec from Sec\n";
         assert!(
             !composed.dominates(&provider, &required),
             "so the meet refuses too; pooling the edges instead would have admitted it"
+        );
+    }
+
+    // ---- DR-0063 §1/§3/§4/§5, the composed set --------------------------------
+
+    /// A verifier that accepts any signature: these tests are about the MEET,
+    /// not about the trust root, which slice 1 covers.
+    struct AnyVerifier;
+
+    impl crate::gov::GovernanceAttestationVerifier for AnyVerifier {
+        fn verify(
+            &self,
+            _bytes: &[u8],
+            _attestation: &crate::gov::ExternalAttestation,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn composed_member(authority: &str, epoch: u64, body: &str) -> (VerifiedEnvelope, String) {
+        let signed = crate::gov::SignedEnvelope::from_external_signature_v2(
+            body,
+            "root",
+            "p256-sha256",
+            "key-1",
+            "signature",
+            epoch,
+            authority,
+        )
+        .expect("artifact")
+        .to_json();
+        let verified =
+            VerifiedEnvelope::verify_signed_text_with(&signed, &AnyVerifier).expect("verified");
+        let hash = verified
+            .attestation()
+            .expect("attested")
+            .envelope_hash
+            .clone();
+        (verified, hash)
+    }
+
+    fn entry(authority: &str, epoch: u64, hash: &str) -> CompositionEntry {
+        CompositionEntry {
+            authority: authority.to_owned(),
+            envelope_hash: hash.to_owned(),
+            epoch,
+        }
+    }
+
+    #[test]
+    fn the_meet_refuses_a_read_either_party_refuses() {
+        // Both authorities compartment one resource — shared data each has an
+        // interest in. `readers` is conjunctive, so the composed source label is
+        // their UNION and neither party's own Operator clears it alone. This is
+        // the case that made intersection the wrong fold.
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            r#"{ "authority": "acme",
+                 "resources": { "file:/shared": { "reader": ["Operator"] } } }"#,
+        );
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            r#"{ "authority": "beta",
+                 "resources": { "file:/shared": { "reader": ["Auditor"] },
+                                "file:/sink": { "reader": ["Operator", "Auditor"] } } }"#,
+        );
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert!(
+            composed.leaks("file:/shared", "file:/sink"),
+            "the sink covers neither party's compartment once both are required"
+        );
+    }
+
+    #[test]
+    fn the_meet_carries_only_what_every_party_vouches() {
+        // Integrity's source is the `provider` side, so it composes by
+        // INTERSECTION: data is only as trusted as the least-trusting party,
+        // and acme vouching for its own source does not bind beta.
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            r#"{ "authority": "acme",
+                 "resources": { "file:/src": { "writer": ["Ops"] },
+                                "file:/sink": { "writer": ["Ops"] } } }"#,
+        );
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            r#"{ "authority": "beta",
+                 "resources": { "file:/src": { "writer": ["Sec"] } } }"#,
+        );
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert!(
+            composed.injects("file:/src", "file:/sink"),
+            "acme's own voucher does not survive beta's different view of the source"
+        );
+    }
+
+    #[test]
+    fn a_delegation_only_one_party_declares_does_not_survive() {
+        // Unanimity. Pooling edges would let a compartment be covered by an
+        // acts-for one party never granted.
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            "authority acme\n\
+             delegate acme::Operator acts-for acme::Auditor\n\
+             grant file_store Src -> file:/src readable by acme::Auditor\n\
+             grant file_store Sink -> file:/sink readable by acme::Operator\n",
+        );
+        let (beta, beta_hash) = composed_member("beta", 1, "authority beta\n");
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert!(
+            composed.leaks("file:/src", "file:/sink"),
+            "beta never declared the edge, so the meet does not carry it"
+        );
+    }
+
+    #[test]
+    fn the_record_is_checked_as_a_set() {
+        // §4. A constituent the record does not name, names twice, or names at
+        // another epoch is a run citing evidence for a set it was not checked
+        // under — the failure the `-LOOSE-RECORD` tooth models.
+        let (acme, acme_hash) = composed_member("acme", 7, r#"{ "authority": "acme" }"#);
+        let (again, _) = composed_member("acme", 7, r#"{ "authority": "acme" }"#);
+        assert!(
+            Composition::compose(vec![acme], vec![]).is_err(),
+            "an unnamed constituent"
+        );
+        let (acme, acme_hash2) = composed_member("acme", 7, r#"{ "authority": "acme" }"#);
+        assert!(
+            Composition::compose(vec![acme], vec![entry("acme", 8, &acme_hash2)]).is_err(),
+            "an epoch the signature does not cover"
+        );
+        let (acme, _) = composed_member("acme", 7, r#"{ "authority": "acme" }"#);
+        assert!(
+            Composition::compose(vec![acme], vec![entry("acme", 7, "not-the-hash")]).is_err(),
+            "a different envelope"
+        );
+        assert!(
+            Composition::compose(
+                vec![again],
+                vec![entry("acme", 7, &acme_hash), entry("acme", 7, &acme_hash)],
+            )
+            .is_err(),
+            "named twice"
+        );
+    }
+
+    #[test]
+    fn requires_authority_means_present_and_governed() {
+        // §4, as folded: satisfied by an envelope in the CHECKED SET, never by a
+        // name in the embedder's roster. Otherwise acme insists beta is in the
+        // engagement and receives a beta that restricts nothing.
+        let (acme, acme_hash) =
+            composed_member("acme", 1, "authority acme\nrequires authority beta\n");
+        let error = match Composition::compose(vec![acme], vec![entry("acme", 1, &acme_hash)]) {
+            Ok(_) => panic!("beta supplied no envelope"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires authority beta"), "{error}");
+
+        let (acme, acme_hash) =
+            composed_member("acme", 1, "authority acme\nrequires authority beta\n");
+        let (beta, beta_hash) = composed_member("beta", 1, "authority beta\n");
+        assert!(Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_foreign_downgrade_grant_is_a_hard_error() {
+        // §3: only the envelope that labels a resource may carry a downgrade
+        // over it, and a foreign one errors rather than being dropped — a
+        // silently ignored grant is one its issuer goes on believing it holds.
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            "authority beta\ngrant declassify file:/acme-owned to beta::Requester\n",
+        );
+        let error = match Composition::compose(vec![beta], vec![entry("beta", 1, &beta_hash)]) {
+            Ok(_) => panic!("beta does not label that resource"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not label"), "{error}");
+    }
+
+    #[test]
+    fn a_v1_envelope_may_not_join_a_composed_set() {
+        // §5. Without a signed epoch and authority there is nothing to check the
+        // composition record against.
+        let signed = crate::gov::SignedEnvelope::from_external_signature(
+            r#"{ "authority": "acme" }"#,
+            "root",
+            "p256-sha256",
+            "key-1",
+            "signature",
+        )
+        .expect("artifact")
+        .to_json();
+        let verified =
+            VerifiedEnvelope::verify_signed_text_with(&signed, &AnyVerifier).expect("verified");
+        assert!(Composition::compose(vec![verified], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_report_projection_names_the_others_without_their_inventory() {
+        // §7. Presence is not disclosure: an authority learns who else is in the
+        // composition, and nothing about what they govern.
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            r#"{ "authority": "acme", "resources": { "file:/acme": { "reader": ["Operator"] } } }"#,
+        );
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            r#"{ "authority": "beta", "resources": { "file:/beta": { "reader": ["Auditor"] } } }"#,
+        );
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        let view = composed.projection_for("acme");
+        assert_eq!(view.authorities, vec!["acme".to_owned(), "beta".to_owned()]);
+        assert!(view.own_resources.contains("file:/acme"));
+        assert!(
+            !view.own_resources.contains("file:/beta"),
+            "acme's report does not enumerate beta's inventory"
         );
     }
 
