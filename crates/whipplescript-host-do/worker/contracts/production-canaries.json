@@ -33,7 +33,10 @@
         "GW_SYNTHETIC_OIDC_CLIENT_SECRET",
         "GW_SYNTHETIC_OIDC_REFRESH_TOKEN"
       ],
-      "cleanup": "Use only the collection-enabled synthetic deployment, erase every anonymous and authenticated session, fsync sealed collection custody before acknowledgement, and retain only bounded synthetic audit metadata."
+      "cleanup": "Use only the collection-enabled synthetic deployment, erase every anonymous and authenticated session, fsync sealed collection custody before acknowledgement, and retain only bounded synthetic audit metadata.",
+      "surfaces": [
+        "whip-runtime"
+      ]
     },
     {
       "id": "managed-host-lifecycle",
@@ -64,7 +67,10 @@
         "GW_SYNTHETIC_WHIP_PLACEMENT",
         "GW_SYNTHETIC_WHIP_SIGNED_POLICY"
       ],
-      "cleanup": "Reuse one stable synthetic placement and deterministic instance, turn, and fork identities; checkpoint its clean baseline before mutation, close every stream, restore the baseline, remove synced files, and retain only bounded synthetic runtime projections."
+      "cleanup": "Reuse one stable synthetic placement and deterministic instance, turn, and fork identities; checkpoint its clean baseline before mutation, close every stream, restore the baseline, remove synced files, and retain only bounded synthetic runtime projections.",
+      "surfaces": [
+        "whip-runtime"
+      ]
     },
     {
       "id": "placement-forwarding",
@@ -87,7 +93,10 @@
         "GW_SYNTHETIC_WHIP_PLACEMENT",
         "GW_SYNTHETIC_WHIP_SIGNED_POLICY"
       ],
-      "cleanup": "Forward bounded GET and POST probes through the stable synthetic placement, prove missing-token denial, then rely on the shared managed-host checkpoint restore and file cleanup; no nonexistent placement deletion route is assumed."
+      "cleanup": "Forward bounded GET and POST probes through the stable synthetic placement, prove missing-token denial, then rely on the shared managed-host checkpoint restore and file cleanup; no nonexistent placement deletion route is assumed.",
+      "surfaces": [
+        "whip-runtime"
+      ]
     },
     {
       "id": "private-home-forwarding",
@@ -111,7 +120,10 @@
         "GW_SYNTHETIC_WHIP_PRIVATE_GOVERNANCE_SIGNER",
         "GW_SYNTHETIC_WHIP_PRIVATE_SIGNER_JWK"
       ],
-      "cleanup": "Use one stable command-scoped Durable object and deterministic package, issue a fresh five-minute request-bound grant on every call, perform no model effect or spend, and retain only the bounded synthetic policy, instance, and position projections."
+      "cleanup": "Use one stable command-scoped Durable object and deterministic package, issue a fresh five-minute request-bound grant on every call, perform no model effect or spend, and retain only the bounded synthetic policy, instance, and position projections.",
+      "surfaces": [
+        "whip-private-runtime"
+      ]
     }
   ]
 }
