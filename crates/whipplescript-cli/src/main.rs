@@ -38800,15 +38800,33 @@ fn run_artifact_model_search(
     result
 }
 
+/// A scratch path under the system temp directory that no concurrent call can
+/// collide with.
+///
+/// Keying a scratch file on `(pid, hash(label))` alone is not unique: one
+/// process that runs two of these at once for the same label derives one path,
+/// and whichever finishes first deletes the file the other is still reading.
+/// That is not hypothetical — every test in this binary shares a pid, and the
+/// artifact-bundle writer and the lowered-IR bridge both name their source, so
+/// two tests naming the same source raced and failed the bridge with a missing
+/// file. The counter gives every call its own file; the hash is kept only so a
+/// leftover file still says which source produced it.
+fn temp_scratch_path(prefix: &str, label: &str, extension: &str) -> PathBuf {
+    static NEXT_SCRATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch_id = NEXT_SCRATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label_hash = stable_hash_hex(label);
+    env::temp_dir().join(format!(
+        "{prefix}-{}-{label_hash}-{scratch_id}.{extension}",
+        std::process::id()
+    ))
+}
+
 fn write_verified_artifact_model_search_bundle(
     path: &str,
     artifact_report: &Value,
 ) -> Result<PathBuf, String> {
-    let path_hash = stable_hash_hex(path);
-    let report_path = env::temp_dir().join(format!(
-        "whipplescript-verified-artifact-model-search-{}-{path_hash}.json",
-        std::process::id()
-    ));
+    let report_path =
+        temp_scratch_path("whipplescript-verified-artifact-model-search", path, "json");
     let label = display_path(path);
     let verified_entry = match artifact_report.get("schema").and_then(Value::as_str) {
         Some(CHECK_REPORT_SCHEMA) => {
@@ -38837,11 +38855,7 @@ fn write_verified_artifact_model_search_bundle(
 }
 
 fn write_artifact_bridge_platform_catalog(path: &str) -> Result<PathBuf, String> {
-    let path_hash = stable_hash_hex(path);
-    let catalog_path = env::temp_dir().join(format!(
-        "whipplescript-platform-construct-catalog-{}-{path_hash}.json",
-        std::process::id()
-    ));
+    let catalog_path = temp_scratch_path("whipplescript-platform-construct-catalog", path, "json");
     let bytes = serde_json::to_vec(&platform_construct_catalog_json())
         .map_err(|error| format!("failed to render platform construct catalog: {error}"))?;
     fs::write(&catalog_path, bytes)

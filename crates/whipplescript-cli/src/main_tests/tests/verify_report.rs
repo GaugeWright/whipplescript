@@ -86,16 +86,13 @@ fn verify_report_lowered_ir_bundle_carries_graph_dependency() {
 
 #[test]
 fn artifact_model_search_writer_emits_verified_bundle() {
-    // The bundle's temp path is `hash(source path) + pid`, so two tests in this
-    // one binary that name the same source collide: whichever finishes first
-    // deletes the file the other is still reading. `event-ingress.whip` is
-    // already taken by the lowered-IR bridge test, hence a label of our own.
-    // Nothing here asserts on the label — it only has to be unique.
+    // Deliberately shares `event-ingress.whip` with the lowered-IR bridge test:
+    // that pair is what caught the scratch-path collision, so leaving both on
+    // one label keeps `temp_scratch_path`'s uniqueness under test.
     let (graph, lowered) = signal_source_construct_graph_and_lowered_report_for_test();
-    let entry =
-        artifact_model_search_check_report_entry("artifact-writer-bundle.whip", &graph, &lowered);
+    let entry = artifact_model_search_check_report_entry("event-ingress.whip", &graph, &lowered);
 
-    let path = write_verified_artifact_model_search_bundle("artifact-writer-bundle.whip", &entry)
+    let path = write_verified_artifact_model_search_bundle("event-ingress.whip", &entry)
         .expect("verified artifact bundle writes");
     let bundle = serde_json::from_str::<Value>(
         &fs::read_to_string(&path).expect("verified artifact bundle reads"),

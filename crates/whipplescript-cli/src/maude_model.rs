@@ -11,11 +11,7 @@ pub(crate) struct MaudeRunOutput {
 }
 
 pub(crate) fn run_maude_source(label: &str, source: &str) -> Result<MaudeRunOutput, String> {
-    let path_hash = stable_hash_hex(label);
-    let model_path = env::temp_dir().join(format!(
-        "whipplescript-model-search-{}-{path_hash}.maude",
-        std::process::id()
-    ));
+    let model_path = temp_scratch_path("whipplescript-model-search", label, "maude");
     fs::write(&model_path, source)
         .map_err(|error| format!("failed to write generated Maude file: {error}"))?;
     let maude = match find_executable_in_path(&["maude"], &path_value()) {
