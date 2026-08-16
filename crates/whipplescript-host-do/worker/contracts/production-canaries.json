@@ -2,10 +2,11 @@
   "schemaVersion": 1,
   "owner": "whipplescript-src",
   "activation": {
-    "orchestratorRepository": "gaugewright-cloud",
-    "enabledVariable": "GW_PRODUCTION_WIRING_CANARIES_ENABLED",
+    "orchestratorRepository": "whipplescript-src",
+    "enabledVariable": "GW_WHIPPLESCRIPT_PRODUCTION_WIRING_CANARIES_ENABLED",
     "infisicalPath": "/synthetics/wiring",
-    "namespace": "whipplescript-production-wiring-canary"
+    "namespace": "whipplescript-production-wiring-canary",
+    "workflow": ".github/workflows/production-wiring-canary.yml"
   },
   "suites": [
     {

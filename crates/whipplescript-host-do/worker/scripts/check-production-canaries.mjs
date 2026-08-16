@@ -20,8 +20,20 @@ const allowedBoundaries = new Set([
 export function validateProductionCanaries(manifest, canaries, localRunnerSource = "") {
   assert.equal(canaries.schemaVersion, 1);
   assert.equal(canaries.owner, manifest.owner);
-  assert.equal(canaries.activation.orchestratorRepository, "gaugewright-cloud");
-  assert.equal(canaries.activation.enabledVariable, "GW_PRODUCTION_WIRING_CANARIES_ENABLED");
+  // This repository orchestrates its own canaries. It used to declare
+  // `gaugewright-cloud`, which loaded this manifest as a second owner; that
+  // coupling meant these twelve unprovisioned credentials refused cloud's whole
+  // run, and a failure of this runtime opened its alert on cloud's repository,
+  // where nobody who owns the runtime would look. Cloud stopped loading it
+  // (gaugewright-cloud#121), which left this declaration naming an orchestrator
+  // that no longer orchestrated -- true of the assertion and the manifest
+  // together, and false of the world.
+  assert.equal(canaries.activation.orchestratorRepository, "whipplescript-src");
+  assert.equal(
+    canaries.activation.enabledVariable,
+    "GW_WHIPPLESCRIPT_PRODUCTION_WIRING_CANARIES_ENABLED",
+  );
+  assert.match(canaries.activation.workflow, /^\.github\/workflows\/[a-z-]+\.yml$/);
   assert.equal(canaries.activation.infisicalPath, "/synthetics/wiring");
   assert.match(canaries.activation.namespace, /^[a-z0-9-]+$/);
 
@@ -102,6 +114,11 @@ async function main() {
     readFile(resolve(root, localRunner), "utf8"),
   ]);
   const result = validateProductionCanaries(manifest, canaries, runnerSource);
+  // A lane cannot be declared into being. The workflow the manifest names has to
+  // exist, or the declaration is the same kind of true-on-paper the orchestrator
+  // field was before this: agreeing with its own assertion and with nothing else.
+  const workflow = resolve(root, "../../..", canaries.activation.workflow);
+  await readFile(workflow, "utf8");
   console.log(
     `Production canary contract tracks ${result.covered} critical routes in `
       + `${result.suites} suites, including every one of ${result.gaps} routes `
