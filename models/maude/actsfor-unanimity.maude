@@ -1,0 +1,138 @@
+--- DR-0063 O4: what acts-for ORDERING means across a meet.
+---
+--- §1 composes delegation by unanimity — an edge survives only if every
+--- constituent declares it — and §2 stops an authority issuing an edge out of
+--- another's principal. Neither says what happens to the *closure*. An authority
+--- may legally write `acme::Operator acts-for beta::Auditor`, claiming a
+--- counterparty's clearance for its own principal, and the question O4 asks is
+--- whether the meet can end up deriving a reach no constituent had.
+---
+---   ACTSFOR_MEET_IS_WEAKER  if the composed edge set reaches q from p, then
+---                           every constituent's edge set reaches q from p.
+---
+--- The claim is that closure over an INTERSECTION is contained in the
+--- intersection of the closures — the safe direction, because a composed
+--- relation that reaches less can only refuse more. `envelope-composition.maude`
+--- states that delegation composes by unanimity but models acts-for as equality
+--- and says so; this model is where the ordering is actually checked.
+---
+--- WHY IT NEEDS A WITNESS AT ALL. The rule is easy to state and easy to get
+--- backwards in code, because the obvious implementation of "combine the
+--- parties' delegations" is a union. Under a union the closure derives edges
+--- nobody declared: acme declares p→q, beta declares q→r, and the pool reaches
+--- r from p though neither party ever granted that. The `-POOLED-EDGES` sibling
+--- is that implementation, and it is why the arm is unanimity rather than
+--- accumulation.
+---
+--- MODELLING BOUND, stated because it is load-bearing: three principals, so a
+--- simple path carries at most two edges and `reaches` is exact at that depth.
+--- A larger universe would need an iterated closure; the property does not
+--- change with it, and the counterexample below already fits in three.
+
+mod WHIPPLESCRIPT-ACTSFOR-UNANIMITY-DATA is
+  protecting BOOL .
+
+  sorts Auth Prin Edge EdgeSet Env EnvSet Fact Cfg .
+  subsort Edge < EdgeSet .
+  subsort Env < EnvSet .
+  subsort Fact < Cfg .
+
+  ops a1 a2 : -> Auth [ctor] .
+  ops p q r : -> Prin [ctor] .
+
+  op e : Prin Prin -> Edge [ctor] .
+  op mtEdge : -> EdgeSet [ctor] .
+  op _;_ : EdgeSet EdgeSet -> EdgeSet [ctor assoc comm id: mtEdge] .
+  eq E:Edge ; E:Edge = E:Edge .
+
+  op env : Auth EdgeSet -> Env [ctor] .
+  op mtEnv : -> EnvSet [ctor] .
+  op _+_ : EnvSet EnvSet -> EnvSet [ctor assoc comm id: mtEnv] .
+
+  vars A B : Auth .   vars X Y Z : Prin .   vars ES REST : EdgeSet .
+  var E : Env .       var S : EnvSet .
+
+  op authOf : Env -> Auth .
+  eq authOf(env(A, ES)) = A .
+
+  op edgesOf : Env -> EdgeSet .
+  eq edgesOf(env(A, ES)) = ES .
+
+  op has : EdgeSet Edge -> Bool .
+  eq has(E:Edge ; ES, E:Edge) = true .
+  eq has(ES, E:Edge) = false [owise] .
+
+  --- Exact for three principals: a simple path repeats no node, so it carries at
+  --- most two edges.
+  op reaches : EdgeSet Prin Prin -> Bool .
+  eq reaches(ES, X, Y) =
+       (X == Y) or has(ES, e(X, Y))
+       or (has(ES, e(X, p)) and has(ES, e(p, Y)))
+       or (has(ES, e(X, q)) and has(ES, e(q, Y)))
+       or (has(ES, e(X, r)) and has(ES, e(r, Y))) .
+
+  --- Unanimity: an edge survives only if EVERY constituent declares it.
+  op declaredByAll : EnvSet Edge -> Bool .
+  eq declaredByAll(mtEnv, E:Edge) = true .
+  eq declaredByAll(E + S, E:Edge) =
+       has(edgesOf(E), E:Edge) and declaredByAll(S, E:Edge) .
+
+  op keepUnanimous : EdgeSet EnvSet -> EdgeSet .
+  eq keepUnanimous(mtEdge, S) = mtEdge .
+  eq keepUnanimous(E:Edge ; ES, S) =
+       (if declaredByAll(S, E:Edge) then E:Edge else mtEdge fi)
+       ; keepUnanimous(ES, S) .
+
+  op meetEdges : EnvSet -> EdgeSet .
+  eq meetEdges(mtEnv) = mtEdge .
+  eq meetEdges(E + S) = keepUnanimous(edgesOf(E), E + S) .
+
+  --- The sibling's fold: pool every declared edge.
+  op poolEdges : EnvSet -> EdgeSet .
+  eq poolEdges(mtEnv) = mtEdge .
+  eq poolEdges(E + S) = edgesOf(E) ; poolEdges(S) .
+
+  op composition : EnvSet -> Fact [ctor] .
+  op ask : Prin Prin -> Fact [ctor] .
+  op composedReaches : Prin Prin -> Fact [ctor] .
+  op constituentLacks : Auth Prin Prin -> Fact [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  eq composedReaches(X, Y) composedReaches(X, Y) = composedReaches(X, Y) .
+  eq constituentLacks(A, X, Y) constituentLacks(A, X, Y) = constituentLacks(A, X, Y) .
+endm
+
+--- THE RULE UNDER TEST: unanimity.
+mod WHIPPLESCRIPT-ACTSFOR-UNANIMITY is
+  protecting WHIPPLESCRIPT-ACTSFOR-UNANIMITY-DATA .
+
+  vars X Y : Prin .   var E : Env .   var S : EnvSet .
+
+  crl [composed] : composition(S) ask(X, Y)
+    => composition(S) ask(X, Y) composedReaches(X, Y)
+    if reaches(meetEdges(S), X, Y) .
+
+  --- Recorded beside the composed verdict, so a violation is one reachable
+  --- state rather than two searches compared by hand.
+  crl [solo] : composition(E + S) ask(X, Y)
+    => composition(E + S) ask(X, Y) constituentLacks(authOf(E), X, Y)
+    if not reaches(edgesOf(E), X, Y) .
+endm
+
+--- THE TOOTH: delegations pooled rather than required unanimously. This is the
+--- obvious implementation of "combine the parties' delegations", and its closure
+--- derives a reach neither party granted.
+mod WHIPPLESCRIPT-ACTSFOR-POOLED-EDGES is
+  protecting WHIPPLESCRIPT-ACTSFOR-UNANIMITY-DATA .
+
+  vars X Y : Prin .   var E : Env .   var S : EnvSet .
+
+  crl [composed] : composition(S) ask(X, Y)
+    => composition(S) ask(X, Y) composedReaches(X, Y)
+    if reaches(poolEdges(S), X, Y) .
+
+  crl [solo] : composition(E + S) ask(X, Y)
+    => composition(E + S) ask(X, Y) constituentLacks(authOf(E), X, Y)
+    if not reaches(edgesOf(E), X, Y) .
+endm

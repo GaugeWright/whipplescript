@@ -4,6 +4,7 @@
 # Regenerate with: scripts/check-formal-models.sh --update-verdicts
 # filename<TAB>signature
 action-expansion.maude	SSNNN
+actsfor-unanimity.maude	SSNNS
 admission.maude	SSSSNNNNNSSNNNSSNNN
 agent-provider-binding.maude	SSSNNNSS
 alpha-canonicalization.maude	SNSNSSSNSSNS

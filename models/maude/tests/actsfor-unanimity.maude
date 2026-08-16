@@ -1,0 +1,45 @@
+load ../actsfor-unanimity.maude
+
+--- Fixture discipline: two authorities, three principals, and each fixture says
+--- exactly which edges each authority declares. `ask(X, Y)` asks whether the
+--- composition lets X act for Y.
+
+--- Coverage: an edge both authorities declare survives the meet.
+search [1] in WHIPPLESCRIPT-ACTSFOR-UNANIMITY :
+  composition(env(a1, e(p, q)) + env(a2, e(p, q)))
+  ask(p, q)
+  =>* C:Cfg composedReaches(p, q) .
+
+--- Coverage: and so does a chain, when both declare both links. Transitivity is
+--- not what unanimity takes away.
+search [1] in WHIPPLESCRIPT-ACTSFOR-UNANIMITY :
+  composition(env(a1, e(p, q) ; e(q, r)) + env(a2, e(p, q) ; e(q, r)))
+  ask(p, r)
+  =>* C:Cfg composedReaches(p, r) .
+
+--- Bite: an edge only one authority declares does not survive. This is the case
+--- §2 permits at authoring time — a1 writing an edge that claims a2's principal
+--- — and it is unanimity, not the authoring rule, that makes it inert.
+--- No solution.
+search [1] in WHIPPLESCRIPT-ACTSFOR-UNANIMITY :
+  composition(env(a1, e(p, q)) + env(a2, mtEdge))
+  ask(p, q)
+  =>* composedReaches(p, q) RESIDUAL:Cfg .
+
+--- THE HEADLINE, ACTSFOR_MEET_IS_WEAKER. a1 declares p→q and a2 declares q→r:
+--- each has half a chain and neither reaches r from p. No reachable state holds
+--- the composed reach together with a constituent that lacks it, so closure over
+--- the intersection stays inside the intersection of the closures.
+--- No solution.
+search [1] in WHIPPLESCRIPT-ACTSFOR-UNANIMITY :
+  composition(env(a1, e(p, q)) + env(a2, e(q, r)))
+  ask(p, r)
+  =>* composedReaches(p, r) constituentLacks(A:Auth, p, r) RESIDUAL:Cfg .
+
+--- Tooth: the same fixture with the edges pooled. The closure now walks a1's
+--- p→q into a2's q→r and reaches r from p — a delegation neither authority
+--- granted, assembled out of two halves that were never meant to meet.
+search [1] in WHIPPLESCRIPT-ACTSFOR-POOLED-EDGES :
+  composition(env(a1, e(p, q)) + env(a2, e(q, r)))
+  ask(p, r)
+  =>* C:Cfg composedReaches(p, r) constituentLacks(A:Auth, p, r) .
