@@ -32951,6 +32951,93 @@ test "a run" {
         );
     }
 
+    /// through a shape I had not tried.
+    #[test]
+    fn declaration_reference_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            ("tracker `t` uses unavailable provider `nonexistent`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ntracker t {\n  provider nonexistent\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("a test scenario binds at most one `workflow`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nrule r\n  when started\n=> { complete result { ok true } }\ntest \"t\" {\n  workflow W\n  workflow W\n  run until idle\n  expect workflow completed\n}\n"),
+            ("`recall` names unknown memory pool `nonexistent`", "use std.memory\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nclass Note { note string }\nrule m\n  when Note as note\n=> {\n  recall nonexistent for note as ctx\n  complete result { ok true }\n}\n"),
+            ("multiple implicit workflow headers are not supported", "class T { id string }\nclass R { ok bool }\n\nworkflow A\noutput result R\n\nworkflow B\noutput result R\n\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("stream `s` must declare its members", "use std.vcs\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nstream s {\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("duplicate stream `s`", "use std.vcs\nuse std.agent\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture  profile \"repo-writer\"  capacity 1 }\nstream s {\n  members [a]\n}\nstream s {\n  members [a]\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("workflow invocation `Child` repeats input `task`", "class T { id string }\nclass R { ok bool }\n\nworkflow Child {\n  input task T\n  output result R\n\n  rule c\n    when T as t\n  => { complete result { ok true } }\n}\n\nworkflow W {\n  output result R\n\n  rule r\n    when started\n  => {\n    invoke Child { task { id \"a\" }  task { id \"b\" } } as ch\n    after ch succeeds { complete result { ok true } }\n  }\n}\n"),
+        ];
+
+        let mut missing = Vec::new();
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+                missing.push(format!(
+                    "expected `{expected}`\n     got {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} reference refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// diagnostic list.
+    #[test]
+    fn declaration_completeness_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            ("counter `c` must declare `key`, `cap`, and `reset`", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ncounter c {\n  key T\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("unknown reset period `fortnightly`", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ncounter c {\n  key T\n  cap 3\n  reset fortnightly\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("cap value must fit in u32", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ncounter c {\n  key T\n  cap 99999999999\n  reset daily\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("lease `l` must declare a `key` type and a `ttl` backstop", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nlease l {\n  slots 1\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("invalid duration `10x`", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nlease l {\n  key T\n  slots 1\n  ttl 10x\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("ledger `g` must declare `entry`, `partition by`, and `retain`", "use std.coord\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nclass E { area string }\nledger g {\n  entry E\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("file store `f` is missing a root", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nfile store f {\n  allow read [\"**\"]\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("signal name `Bad.Name` must be dotted lowercase", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nsignal Bad.Name {\n  x string\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("source `feed` must declare `observe as <binding>`", "use std.ingress\n@service\nworkflow W\nsignal s.fed {\n  t string\n}\nclass C { t string }\nsource file as feed {\n  path \"./in.txt\"\n  emit s.fed {\n    t \"x\"\n  }\n}\nrule r\n  when s.fed as f\n=> {\n  record C { t f.t }\n}\n"),
+            ("source `feed` must declare `emit <signal> { ... }`", "use std.ingress\n@service\nworkflow W\nsignal s.fed {\n  t string\n}\nclass C { t string }\nsource file as feed {\n  path \"./in.txt\"\n  observe as obs\n}\nrule r\n  when s.fed as f\n=> {\n  record C { t f.t }\n}\n"),
+            ("source `feed` uses clock-only clauses but its provider is `file`, not `clock`", "use std.ingress\n@service\nworkflow W\nsignal s.fed {\n  t string\n}\nclass C { t string }\nsource file as feed {\n  path \"./in.txt\"\n  every 5m\n  observe as obs\n  emit s.fed {\n    t obs.line\n  }\n}\nrule r\n  when s.fed as f\n=> {\n  record C { t f.t }\n}\n"),
+            ("gauge `g` declares no judge", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ngauge g {\n  expect P(ok) at least 0.9\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("gauge declares more than one judge", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ngauge g {\n  judge via exec \"a\"\n  judge via exec \"b\"\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("unknown gauge clause", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ngauge g {\n  judge via exec \"a\"\n  sparkle yes\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("unknown judge form", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ngauge g {\n  judge via telepathy\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("unknown campaign clause", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ngauge g {\n  judge via exec \"a\"\n}\ncampaign c {\n  sparkle g\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("tag is missing a name", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\n@\nclass Z { a string }\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("tag `@bad!tag` contains unsupported characters", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\n@bad!tag\nclass Z { a string }\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("unknown field tag `@weird`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nclass Z {\n  a string @weird\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("class `Z` declares field `a` more than once", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nclass Z {\n  a string\n  a int\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("table `seed` has no rows", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\ntable seed as T [\n]\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("coerce `f` declares parameter `a` more than once", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nclass Out { v string }\ncoerce f(a string, a string) -> Out {\n  prompt \"x\"\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+        ];
+
+        let mut missing = Vec::new();
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+                missing.push(format!(
+                    "expected `{expected}`\n     got {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} declaration refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
     #[test]
     fn rejects_transitive_workflow_invocation_cycle() {
         // A invokes B invokes A — a runtime invoke cycle with no compile-time
