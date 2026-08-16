@@ -78,8 +78,46 @@ pub fn canonicalize(config_text: &str) -> Result<String, String> {
     } else {
         Envelope::from_dsl(config_text)?
     };
-    Ok(envelope.to_canonical_json())
+    let canonical = envelope.to_canonical_json();
+    debug_assert_lossless(&envelope, &canonical);
+    Ok(canonical)
 }
+
+/// The canonical form is what a governance signature covers, so anything this
+/// function drops is silently outside the signature: the field parses, the
+/// envelope behaves correctly in memory, and the check that rests on it passes
+/// vacuously once the document is signed and reloaded.
+///
+/// That is not hypothetical. It has taken four arms of DR-0063 — `authority`,
+/// `requires_authority`, §8's `exposes`/`attachments`, and `policy_lifetime` —
+/// each of which parsed correctly and then vanished at signing, taking its check
+/// with it. A hand-maintained list of arms is no defence, because forgetting to
+/// extend the list is exactly as easy as forgetting to extend the emitter.
+///
+/// So the property is total and mechanical: reparsing the canonical form must
+/// reproduce the envelope it came from. Any field the emitter does not write
+/// fails here, including fields nobody has thought of yet. Envelopes are
+/// normalized at parse rather than at emit, which is what makes the comparison
+/// exact instead of modulo ordering.
+///
+/// Debug-only: the cost is one reparse per canonicalization, and every test that
+/// signs, verifies, or composes anything exercises it for free.
+#[cfg(debug_assertions)]
+fn debug_assert_lossless(envelope: &Envelope, canonical: &str) {
+    match Envelope::from_json(canonical) {
+        Ok(reparsed) => assert!(
+            reparsed == *envelope,
+            "canonicalization is LOSSY: reparsing the canonical form does not \
+             reproduce the envelope. A field is parsed but not emitted, so it is \
+             outside what the signature covers. Add it to \
+             `Envelope::to_canonical_json` and to the reader on both parse paths."
+        ),
+        Err(error) => panic!("the canonical form does not reparse: {error}"),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_lossless(_envelope: &Envelope, _canonical: &str) {}
 
 /// A signed governance envelope: the canonical content + an attestation binding
 /// its hash to the signer.

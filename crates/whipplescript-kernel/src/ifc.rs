@@ -81,6 +81,7 @@ impl DualLabel {
     }
 }
 
+#[derive(PartialEq, Eq)]
 pub struct Envelope {
     /// resource handle -> reader-authority SET (a set of compartments; absent or
     /// empty = `public`, the bottom). A party may read the resource iff it acts-for
@@ -278,7 +279,7 @@ impl Envelope {
                     .collect()
             })
             .unwrap_or_default();
-        let attachments: Vec<Attachment> = value
+        let mut attachments: Vec<Attachment> = value
             .get("attachments")
             .and_then(serde_json::Value::as_array)
             .map(|items| {
@@ -554,6 +555,24 @@ impl Envelope {
                 }
             }
         }
+        // Normalized HERE rather than in the emitter, so a parsed envelope is
+        // already in the shape `to_canonical_json` would put it in. That is what
+        // lets `canonicalize` compare a reparse against the original exactly,
+        // and so what lets it prove itself lossless rather than assume it.
+        deleg.sort();
+        deleg.dedup();
+        declassify.sort();
+        declassify.dedup();
+        endorse.sort();
+        endorse.dedup();
+        guarantees.sort();
+        attachments.sort_by(|left, right| {
+            (&left.authority, &left.exposure, &left.digest).cmp(&(
+                &right.authority,
+                &right.exposure,
+                &right.digest,
+            ))
+        });
         Ok(Self {
             readers,
             governed,
@@ -917,6 +936,24 @@ impl Envelope {
                 }
             }
         }
+        // Normalized HERE rather than in the emitter, so a parsed envelope is
+        // already in the shape `to_canonical_json` would put it in. That is what
+        // lets `canonicalize` compare a reparse against the original exactly,
+        // and so what lets it prove itself lossless rather than assume it.
+        deleg.sort();
+        deleg.dedup();
+        declassify.sort();
+        declassify.dedup();
+        endorse.sort();
+        endorse.dedup();
+        guarantees.sort();
+        attachments.sort_by(|left, right| {
+            (&left.authority, &left.exposure, &left.digest).cmp(&(
+                &right.authority,
+                &right.exposure,
+                &right.digest,
+            ))
+        });
         Ok(Self {
             readers,
             governed,
@@ -6395,13 +6432,14 @@ grant channel secsrc -> imap:sec from Sec\n";
 
     #[test]
     fn every_composition_arm_survives_canonicalization() {
-        // A GUARD, not a feature. `gov::canonicalize` round-trips through
-        // `to_canonical_json`, so an arm the emitter forgets is an arm the
-        // SIGNED document does not carry. That has now bitten three of this
-        // record's arms — `authority`, `requires_authority`, and §8's exposures,
-        // each of which parsed correctly and then vanished at signing, taking
-        // its check with it silently. This asserts the round trip for every arm
-        // DR-0063 adds, so the fourth one fails here instead of in production.
+        // DOCUMENTATION OF INTENT, no longer the mechanism. The list below is
+        // exactly as easy to forget to extend as the emitter was, which is why
+        // it caught three of DR-0063's four dropped arms and not the fourth.
+        // `gov::canonicalize` now asserts the total property — reparsing the
+        // canonical form reproduces the envelope — so a field nobody thought to
+        // list here still fails, and fails at every call site that signs
+        // anything. This test remains because naming the arms says what the
+        // record promised, which a structural assertion cannot.
         let body = "authority acme\n\
              requires authority beta\n\
              policy lifetime 900\n\
