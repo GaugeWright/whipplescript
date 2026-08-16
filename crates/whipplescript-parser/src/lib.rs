@@ -32768,6 +32768,189 @@ test "a run" {
         }
     }
 
+    /// The expression type checker's operand rules: whether `a + b` is
+    /// arithmetic on numbers, whether `x in y` compares compatible types,
+    /// whether `!e` applies to a boolean, whether a map is indexed by a string.
+    /// A mutation sweep found every one of them unexercised, confirmed against
+    /// the whole workspace. These are type-system enforcement, not artifact
+    /// plumbing — a rule guard is the condition deciding whether a workflow
+    /// acts at all.
+    ///
+    /// One neighbour is deliberately absent and is PROVABLY unreachable, not
+    /// merely unreached: `calls unsupported expression function` sits on the
+    /// `_` arm of a match over a call's name, but the expression parser only
+    /// ever constructs a call for `count`, `exists`, or `empty` (the guard at
+    /// the `Ident` arm of `parse_primary`). Every other name fails to tokenize
+    /// first, so no source program reaches that arm.
+    ///
+    /// One finding is not covered here because it is a defect rather than a
+    /// gap: `indexes a map with a non-string key` is emitted from TWO sites,
+    /// one validating and one inferring, and both fire on the same expression —
+    /// the author is told twice. The case below asserts the message appears; it
+    /// deliberately does not assert how many times, because pinning 2 would
+    /// enshrine the duplication. Neither site can be bite-tested alone while
+    /// The record-construction type checks: what may be assigned to a field of
+    /// a map, class, enum, literal-union, or AgentRef type. A mutation sweep
+    /// found these unexercised, confirmed workspace-wide.
+    ///
+    /// Every one applies only INSIDE an object or array literal.
+    /// `validate_expected_assignment` returns early unless the value starts
+    /// with `{` or `[`, so a scalar assigned to the same field is handled by a
+    /// different, already-covered check. Four fixtures of mine produced no
+    /// diagnostic at all before I found that gate, which is worth recording:
+    /// the obvious fixture for these rules tests a different rule entirely.
+    #[test]
+    fn record_field_type_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            ("field `E.m` expects a map literal", "workflow W\noutput result R\nclass R { ok bool }\nclass E { m map<string> }\nrule r\n  when started\n=> {\n  record E { m [\"a\", \"b\"] }\n  complete result { ok true }\n}\n"),
+            ("field `E.m` expects a map literal: expected object field name", "workflow W\noutput result R\nclass R { ok bool }\nclass E { m map<string> }\nrule r\n  when started\n=> {\n  record E { m { 5 } }\n  complete result { ok true }\n}\n"),
+            ("field `E.i` repeats object field `a`", "workflow W\noutput result R\nclass R { ok bool }\nclass Inner { a string }\nclass E { i Inner }\nrule r\n  when started\n=> {\n  record E { i { a \"1\"  a \"2\" } }\n  complete result { ok true }\n}\n"),
+            ("field `Inner.n` receives incompatible expression type", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nclass Inner { n int }\nclass E { i Inner }\nrule r\n  when T as t\n=> {\n  record E { i { n t.title } }\n  complete result { ok true }\n}\n"),
+            // NESTED, not top level. The same message is emitted from two
+            // sites -- the literal-assignment path and the expression path --
+            // and existing tests already cover the literal one, so a top-level
+            // fixture pins a refusal that was never the gap.
+            ("field `Inner.s` expects literal string `fixed`", "workflow W\noutput result R\nclass R { ok bool }\nclass Inner { s \"fixed\" }\nclass E { i Inner }\nrule r\n  when started\n=> {\n  record E { i { s \"other\" } }\n  complete result { ok true }\n}\n"),
+            // A NON-string literal. `expects an AgentRef value` has two
+            // variants: one naming the offending string, which existing tests
+            // cover, and this bare one for a literal that is not a string at
+            // all. Covering the first leaves the second dead.
+            ("field `Inner.who` expects an AgentRef value", "use std.agent\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture  profile \"repo-writer\"  capacity 1 }\nclass Inner { who AgentRef<a> }\nclass E { i Inner }\nrule r\n  when started\n=> {\n  record E { i { who 5 } }\n  complete result { ok true }\n}\n"),
+            ("field `Inner.k` expects enum `Kind`", "workflow W\noutput result R\nclass R { ok bool }\nenum Kind {\n  Alpha\n  Beta\n}\nclass Inner { k Kind }\nclass E { i Inner }\nrule r\n  when started\n=> {\n  record E { i { k \"nope\" } }\n  complete result { ok true }\n}\n"),
+            ("rule `r` has invalid expression for field `E.i`: expected expression in `{ n t.count + }`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { count int }\nclass Inner { n int }\nclass E { i Inner }\nrule r\n  when T as t\n=> {\n  record E { i { n t.count + } }\n  complete result { ok true }\n}\n"),
+        ];
+
+        let mut missing = Vec::new();
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+                missing.push(format!(
+                    "expected `{expected}`\n     got {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} record-field refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// The accept half: the same nested shapes, well typed. Without it a
+    /// checker that refused every object literal would satisfy the table above.
+    #[test]
+    fn well_typed_record_fields_are_admitted() {
+        let source = "use std.agent\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture  profile \"repo-writer\"  capacity 1 }\nenum Kind {\n  Alpha\n  Beta\n}\nclass Inner { n int  who AgentRef<a>  k Kind  u \"a\" | \"b\" }\nclass E { i Inner  m map<string>  s \"fixed\" }\nclass T { count int }\nrule r\n  when T as t\n=> {\n  record E {\n    i { n t.count  who a  k Alpha  u \"a\" }\n    m { key \"value\" }\n    s \"fixed\"\n  }\n  complete result { ok true }\n}\n";
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "a well-typed nested record must be admitted, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// the other survives, which is itself the evidence they are redundant.
+    #[test]
+    fn expression_type_refusals_fire() {
+        let cases: &[(&str, &str)] = &[
+            ("rule `r` uses arithmetic with a non-numeric operand", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string  count int }\nrule r\n  when T as t where t.title + 1 > 2\n=> { complete result { ok true } }\n"),
+            ("rule `r` uses boolean operator with non-boolean operand", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where t.title and true\n=> { complete result { ok true } }\n"),
+            ("rule `r` applies `!` to a non-boolean expression", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where !t.title\n=> { complete result { ok true } }\n"),
+            ("rule `r` uses membership with incompatible item type", "workflow W\noutput result R\nclass R { ok bool }\nclass T { count int  tags string[] }\nrule r\n  when T as t where t.count in t.tags\n=> { complete result { ok true } }\n"),
+            ("rule `r` indexes a non-map expression", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where t.title[\"k\"] == \"x\"\n=> { complete result { ok true } }\n"),
+            ("rule `r` indexes a map with a non-string key", "workflow W\noutput result R\nclass R { ok bool }\nclass T { meta map<string> }\nrule r\n  when T as t where t.meta[1] == \"x\"\n=> { complete result { ok true } }\n"),
+            ("rule `r` calls `count` with 0 arguments, expected 1", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where count() > 0\n=> { complete result { ok true } }\n"),
+            ("rule `r` calls `count` with unsupported argument type `string`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where count(t.title) > 0\n=> { complete result { ok true } }\n"),
+            ("rule `r` calls `exists` with 0 arguments, expected 1", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where exists()\n=> { complete result { ok true } }\n"),
+            ("rule `r` calls `exists` with unsupported argument type `string`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where exists(t.title)\n=> { complete result { ok true } }\n"),
+            ("rule `r` queries unknown fact schema `Missing`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where count(Missing) > 0\n=> { complete result { ok true } }\n"),
+            ("rule `r` fact query `T` has unknown field `nofield`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where count(T where nofield == \"x\") > 0\n=> { complete result { ok true } }\n"),
+            ("rule `r` has unsafe optional path `t.owner.name`: `owner` must be proven present before accessing `name`", "workflow W\noutput result R\nclass R { ok bool }\nclass Owner { name string }\nclass T { owner Owner? }\nrule r\n  when T as t where t.owner.name == \"x\"\n=> { complete result { ok true } }\n"),
+            // The SAME rule in the other scope. `unsafe optional path` and
+            // `invalid expression path` are each emitted from two mirrored
+            // sites — one for a binding-rooted path in a rule guard, one for a
+            // bare path inside a fact query — and covering one leaves the other
+            // dead. The bite test found exactly that: this table pinned the
+            // message and one of the two sites stayed unexercised.
+            ("assertion has unsafe optional path `owner.name`: `owner` must be proven present before accessing `name`", "workflow W\noutput result R\nclass R { ok bool }\nclass Owner { name string }\nclass T { owner Owner? }\nassert count(T where owner.name == \"x\") <= 1\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("rule `r` has invalid expression path `t.nofield`: schema `T` has no field `nofield`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where t.nofield == \"x\"\n=> { complete result { ok true } }\n"),
+            ("assertion has invalid expression path `title.nested`: field `title` is not a schema value", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nassert count(T where title.nested == \"x\") <= 1\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+        ];
+
+        let mut missing = Vec::new();
+        for (expected, source) in cases {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+                missing.push(format!(
+                    "expected `{expected}`\n     got {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} of {} expression refusals did not fire:\n  {}",
+            missing.len(),
+            cases.len(),
+            missing.join("\n  ")
+        );
+    }
+
+    /// The accept half. Every rule above rejects a SHAPE, and a checker that
+    /// rejected the shape's legitimate twin would satisfy the table while
+    /// refusing correct programs — so each accepted form here is the nearest
+    /// legal neighbour of a rejection above.
+    #[test]
+    fn well_typed_expressions_are_admitted() {
+        let accepted: &[&str] = &[
+            // arithmetic on numbers, membership in a matching array,
+            // a boolean operand for `and`/`!`, a string map key
+            "workflow W\noutput result R\nclass R { ok bool }\nclass T { count int  tags string[]  flag bool  meta map<string> }\nrule r\n  when T as t where t.count + 1 > 2 and !t.flag and \"a\" in t.tags and t.meta[\"k\"] == \"v\"\n=> { complete result { ok true } }\n",
+            // `count` and `exists` over a declared fact schema
+            "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where count(T where title == \"x\") > 0 and exists(T)\n=> { complete result { ok true } }\n",
+            // an optional read PROVEN present first: the same path the unsafe
+            // case rejects, made safe by the proof rather than by weakening the
+            // rule.
+            "workflow W\noutput result R\nclass R { ok bool }\nclass Owner { name string }\nclass T { owner Owner? }\nrule r\n  when T as t where exists t.owner and t.owner.name == \"x\"\n=> { complete result { ok true } }\n",
+        ];
+
+        let mut rejected = Vec::new();
+        for source in accepted {
+            let compiled = compile_program(source);
+            if !compiled.diagnostics.is_empty() {
+                rejected.push(format!(
+                    "{:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "{} well-typed program(s) were refused:\n  {}",
+            rejected.len(),
+            rejected.join("\n  ")
+        );
+    }
+
     #[test]
     fn rejects_transitive_workflow_invocation_cycle() {
         // A invokes B invokes A — a runtime invoke cycle with no compile-time
