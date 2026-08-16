@@ -101,6 +101,15 @@ pub struct Envelope {
     /// is how one party's policy can depend on another's constraints actually
     /// holding, rather than on the other party merely being named somewhere.
     requires_authority: BTreeSet<String>,
+    /// How long this authority's policy may be relied on without re-admitting
+    /// under a freshly composed set (DR-0063 §9), in seconds. `None` is
+    /// unbounded — the single-authority posture, where a run holding its policy
+    /// for its whole life is exactly DR-0028 D4's non-retroactivity.
+    ///
+    /// It exists because §9 pins a composition at admission: without a bound, an
+    /// unbounded `@service` loop holds its composed set forever and
+    /// "non-retroactive" quietly becomes "never".
+    policy_lifetime: Option<u64>,
     /// Resources this envelope EXPOSES for another authority to reference
     /// (DR-0063 §8): resource -> the opaque id it is exposed under. Minting an
     /// exposure is an act of the owner and of nobody else, which is what makes
@@ -255,6 +264,9 @@ impl Envelope {
                     .collect()
             })
             .unwrap_or_default();
+        let policy_lifetime = value
+            .get("policy_lifetime")
+            .and_then(serde_json::Value::as_u64);
         let exposes: BTreeMap<String, String> = value
             .get("exposes")
             .and_then(serde_json::Value::as_object)
@@ -557,6 +569,7 @@ impl Envelope {
             custody_demand,
             authority,
             requires_authority,
+            policy_lifetime,
             exposes,
             attachments,
             address_of,
@@ -593,6 +606,7 @@ impl Envelope {
         // A pre-pass, so `authority` qualifies every role in the file rather
         // than only the ones written after it.
         let mut requires_authority: BTreeSet<String> = BTreeSet::new();
+        let mut policy_lifetime: Option<u64> = None;
         let mut exposes: BTreeMap<String, String> = BTreeMap::new();
         let mut attachments: Vec<Attachment> = Vec::new();
         let mut authority: Option<String> = None;
@@ -777,6 +791,18 @@ impl Envelope {
                     continue;
                 }
                 Some("authority") => continue,
+                // `policy lifetime <seconds>` — how long this policy may be
+                // relied on before a session re-admits (DR-0063 §9).
+                Some("policy") if tokens.get(1).copied() == Some("lifetime") => {
+                    let Some(seconds) = tokens.get(2).and_then(|s| s.parse::<u64>().ok()) else {
+                        return Err(format!(
+                            "line {}: policy lifetime needs a whole number of seconds",
+                            index + 1
+                        ));
+                    };
+                    policy_lifetime = Some(seconds);
+                    continue;
+                }
                 // `expose <handle> as <id>` mints the reference another
                 // authority attaches to (DR-0063 §8).
                 Some("expose") => {
@@ -906,6 +932,7 @@ impl Envelope {
             custody_demand,
             authority,
             requires_authority,
+            policy_lifetime,
             exposes,
             attachments,
             address_of,
@@ -1047,6 +1074,9 @@ impl Envelope {
         // signature covers the canonical form, so an arm the emitter drops is an
         // arm the signed document does not carry — and an attachment that never
         // reaches the verifier is a compartment that silently does not apply.
+        if let Some(seconds) = self.policy_lifetime {
+            canonical["policy_lifetime"] = serde_json::json!(seconds);
+        }
         if !self.exposes.is_empty() {
             canonical["exposes"] = serde_json::json!(self.exposes);
         }
@@ -2024,6 +2054,22 @@ impl Composition {
             }
         }
         added
+    }
+
+    /// How long this composition may be relied on before the session must
+    /// re-admit under a freshly composed set (DR-0063 §9): the **strongest**
+    /// demand any constituent makes, which is the same rule §1 gives every other
+    /// floor. `None` only when no constituent bounds it.
+    ///
+    /// Whether that span has elapsed is not this crate's to say. Deadlines enter
+    /// as observations stamped at the host boundary rather than read from an
+    /// ambient clock, so the kernel states the bound and the host decides when it
+    /// is spent.
+    pub fn policy_lifetime(&self) -> Option<u64> {
+        self.constituents
+            .iter()
+            .filter_map(|envelope| envelope.policy_lifetime)
+            .min()
     }
 
     /// The record this composition was checked under, for a run's evidence.
@@ -6358,6 +6404,7 @@ grant channel secsrc -> imap:sec from Sec\n";
         // DR-0063 adds, so the fourth one fails here instead of in production.
         let body = "authority acme\n\
              requires authority beta\n\
+             policy lifetime 900\n\
              grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
              expose Ledger as res-7\n\
              attach beta res-3 deadbeef readable by Auditor\n";
@@ -6376,6 +6423,7 @@ grant channel secsrc -> imap:sec from Sec\n";
             Some("res-7"),
             "exposes"
         );
+        assert_eq!(round_trip.policy_lifetime, Some(900), "policy_lifetime");
         assert_eq!(round_trip.attachments.len(), 1, "attachments");
         assert_eq!(round_trip.attachments[0].digest, "deadbeef");
         assert_eq!(
@@ -6388,6 +6436,49 @@ grant channel secsrc -> imap:sec from Sec\n";
             parsed.reader_set("file:/srv/ledger.db"),
             "labels"
         );
+    }
+
+    // ---- DR-0063 §9, the policy lifetime -------------------------------------
+
+    #[test]
+    fn the_composed_lifetime_is_the_strongest_demand() {
+        // §9's bound composes like every other floor in §1: the strongest
+        // demand wins, so no party can lengthen another's willingness to have
+        // its policy relied on. Intersection of restrictions, once more, and so
+        // no precedence question between the parties.
+        let (acme, acme_hash) =
+            composed_member("acme", 1, "authority acme\npolicy lifetime 3600\n");
+        let (beta, beta_hash) = composed_member("beta", 1, "authority beta\npolicy lifetime 600\n");
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert_eq!(composed.policy_lifetime(), Some(600));
+    }
+
+    #[test]
+    fn one_bounded_party_bounds_the_composition() {
+        // A party that declares no lifetime is not asking for an unbounded one;
+        // it simply makes no demand, and one party's demand is enough.
+        let (acme, acme_hash) = composed_member("acme", 1, "authority acme\n");
+        let (beta, beta_hash) = composed_member("beta", 1, "authority beta\npolicy lifetime 900\n");
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert_eq!(composed.policy_lifetime(), Some(900));
+    }
+
+    #[test]
+    fn an_unbounded_composition_says_so() {
+        // The single-authority posture, unchanged: a run holds its policy for
+        // its whole life, which is exactly DR-0028 D4's non-retroactivity.
+        let (acme, acme_hash) = composed_member("acme", 1, "authority acme\n");
+        let composed =
+            Composition::compose(vec![acme], vec![entry("acme", 1, &acme_hash)]).expect("ok");
+        assert_eq!(composed.policy_lifetime(), None);
     }
 
     // ---- DR-0063 §8, exposures and attachments -------------------------------
