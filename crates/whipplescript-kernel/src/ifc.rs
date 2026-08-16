@@ -38,6 +38,19 @@ type FieldReadMap = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
 /// (DR-0027 I-IFC1): each governed resource has a **reader authority** (a role);
 /// the secret is readable by any party that acts-for that role. The delegation
 /// context is the acts-for edge set, closed reflexive-transitively by `can_act`.
+/// A reference to another authority's exposed resource, with what this envelope
+/// adds to it (DR-0063 §8). The digest pins the *signed entry* the attachment
+/// was made against (§10), so an owner cannot silently re-point an exposure at
+/// other bytes after a counterparty has labelled it: the digest is a commitment,
+/// not a disclosure, and a counterparty pins what it cannot read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Attachment {
+    authority: String,
+    exposure: String,
+    digest: String,
+    readers: BTreeSet<String>,
+}
+
 /// A dual-gated label: what a resource's reads TAG data with, and what its
 /// writes DEMAND of data (DR-0063 §1, O1). A resource is read and written, so
 /// each of `readers` and `integrity` faces both ways.
@@ -88,6 +101,16 @@ pub struct Envelope {
     /// is how one party's policy can depend on another's constraints actually
     /// holding, rather than on the other party merely being named somewhere.
     requires_authority: BTreeSet<String>,
+    /// Resources this envelope EXPOSES for another authority to reference
+    /// (DR-0063 §8): resource -> the opaque id it is exposed under. Minting an
+    /// exposure is an act of the owner and of nobody else, which is what makes
+    /// "the envelope that labels a resource" answerable when a downgrade grant
+    /// asks. A counterparty references the id and never learns the address.
+    exposes: BTreeMap<String, String>,
+    /// References this envelope makes to ANOTHER authority's exposure, each
+    /// pinning the digest it attached to, with the compartments it adds. An
+    /// attachment can neither mint nor downgrade — it only narrows.
+    attachments: Vec<Attachment>,
     /// acts-for edges `(p, q)`: `p` acts-for `q` (has at least `q`'s authority).
     deleg: Vec<(String, String)>,
     /// declassify grants `(resource, role)`: `resource` may be released to any
@@ -229,6 +252,44 @@ impl Envelope {
                     .iter()
                     .filter_map(serde_json::Value::as_str)
                     .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exposes: BTreeMap<String, String> = value
+            .get("exposes")
+            .and_then(serde_json::Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(handle, id)| {
+                        id.as_str().map(|id| (handle.clone(), id.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let attachments: Vec<Attachment> = value
+            .get("attachments")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(Attachment {
+                            authority: item.get("authority")?.as_str()?.to_owned(),
+                            exposure: item.get("exposure")?.as_str()?.to_owned(),
+                            digest: item.get("digest")?.as_str()?.to_owned(),
+                            readers: item
+                                .get("reader")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|roles| {
+                                    roles
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -496,6 +557,8 @@ impl Envelope {
             custody_demand,
             authority,
             requires_authority,
+            exposes,
+            attachments,
             address_of,
             party_of,
             guarantees,
@@ -530,6 +593,8 @@ impl Envelope {
         // A pre-pass, so `authority` qualifies every role in the file rather
         // than only the ones written after it.
         let mut requires_authority: BTreeSet<String> = BTreeSet::new();
+        let mut exposes: BTreeMap<String, String> = BTreeMap::new();
+        let mut attachments: Vec<Attachment> = Vec::new();
         let mut authority: Option<String> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -712,6 +777,49 @@ impl Envelope {
                     continue;
                 }
                 Some("authority") => continue,
+                // `expose <handle> as <id>` mints the reference another
+                // authority attaches to (DR-0063 §8).
+                Some("expose") => {
+                    let (Some(handle), Some("as"), Some(id)) = (
+                        tokens.get(1).copied(),
+                        tokens.get(2).copied(),
+                        tokens.get(3).copied(),
+                    ) else {
+                        return Err(format!(
+                            "line {}: expose needs `expose <handle> as <id>`",
+                            index + 1
+                        ));
+                    };
+                    exposes.insert(handle.to_owned(), id.to_owned());
+                    continue;
+                }
+                // `attach <authority> <id> <digest> readable by <Role>` adds
+                // compartments to a key this envelope did not mint.
+                Some("attach") => {
+                    let (Some(auth), Some(id), Some(digest)) = (
+                        tokens.get(1).copied(),
+                        tokens.get(2).copied(),
+                        tokens.get(3).copied(),
+                    ) else {
+                        return Err(format!(
+                            "line {}: attach needs `attach <authority> <id> <digest> readable by <Role>`",
+                            index + 1
+                        ));
+                    };
+                    let by = tokens.iter().position(|tok| *tok == "by");
+                    let readers_added = by
+                        .map(|pos| {
+                            qualify_role_set(collect_role_set(&tokens[pos + 1..]), authority_ref)
+                        })
+                        .unwrap_or_default();
+                    attachments.push(Attachment {
+                        authority: auth.to_owned(),
+                        exposure: id.to_owned(),
+                        digest: digest.to_owned(),
+                        readers: readers_added,
+                    });
+                    continue;
+                }
                 Some("requires") if tokens.get(1).copied() == Some("authority") => {
                     let Some(name) = tokens.get(2) else {
                         return Err(format!(
@@ -798,6 +906,8 @@ impl Envelope {
             custody_demand,
             authority,
             requires_authority,
+            exposes,
+            attachments,
             address_of,
             party_of,
             guarantees,
@@ -809,6 +919,48 @@ impl Envelope {
 
     /// The canonical signed-artifact JSON: every governed resource with its reader
     /// authority, plus the delegation edges, all sorted (deterministic hash).
+    /// The signed entry for one resource — exactly the object
+    /// [`to_canonical_json`](Self::to_canonical_json) emits for it, and
+    /// therefore exactly what this envelope's signature covers about it.
+    ///
+    /// DR-0063 §10 digests this rather than the binding expression, which is
+    /// what makes the rule kind-sensitive without a per-kind table: a
+    /// `provider:` entry carries its binding record, and a `file:` entry
+    /// carries nothing beyond its label, so the digest degenerates to the
+    /// expression exactly where the expression was the whole agreement.
+    fn signed_entry(&self, name: &str) -> serde_json::Value {
+        self.canonical_resource_entry(name)
+    }
+
+    fn canonical_resource_entry(&self, name: &str) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "reader": self.reader_set(name).into_iter().collect::<Vec<_>>(),
+            "writer": self.integrity_set(name).into_iter().collect::<Vec<_>>(),
+        });
+        if let Some(label) = self.readers.get(name) {
+            if label.source != label.sink {
+                entry["reader_sink"] =
+                    serde_json::json!(label.sink.iter().cloned().collect::<Vec<_>>());
+            }
+        }
+        if let Some(label) = self.integrity.get(name) {
+            if label.source != label.sink {
+                entry["writer_sink"] =
+                    serde_json::json!(label.sink.iter().cloned().collect::<Vec<_>>());
+            }
+        }
+        if self.principals.contains(name) {
+            entry["principal"] = serde_json::Value::Bool(true);
+        }
+        if self.internal_signals.contains(name) || self.internal_workflows.contains(name) {
+            entry["internal"] = serde_json::Value::Bool(true);
+        }
+        if let Some(binding) = self.provider_bindings.get(name) {
+            entry["provider_binding"] = serde_json::json!(binding);
+        }
+        entry
+    }
+
     pub fn to_canonical_json(&self) -> String {
         let mut resources = serde_json::Map::new();
         for name in &self.governed {
@@ -889,6 +1041,29 @@ impl Envelope {
         // so an envelope that names no authority keeps its existing hash.
         if let Some(authority) = &self.authority {
             canonical["authority"] = serde_json::Value::String(authority.clone());
+        }
+        // §8's arms. Emitted only when present, so an envelope that exposes and
+        // attaches nothing keeps its existing hash. They MUST be here: the
+        // signature covers the canonical form, so an arm the emitter drops is an
+        // arm the signed document does not carry — and an attachment that never
+        // reaches the verifier is a compartment that silently does not apply.
+        if !self.exposes.is_empty() {
+            canonical["exposes"] = serde_json::json!(self.exposes);
+        }
+        if !self.attachments.is_empty() {
+            canonical["attachments"] = serde_json::Value::Array(
+                self.attachments
+                    .iter()
+                    .map(|attachment| {
+                        serde_json::json!({
+                            "authority": attachment.authority,
+                            "exposure": attachment.exposure,
+                            "digest": attachment.digest,
+                            "reader": attachment.readers.iter().cloned().collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect(),
+            );
         }
         if !self.requires_authority.is_empty() {
             canonical["requires_authority"] = serde_json::Value::Array(
@@ -1759,6 +1934,7 @@ impl Composition {
         };
         composed.check_grants_are_owned()?;
         composed.check_required_authorities(&authorities)?;
+        composed.check_attachments_resolve()?;
         Ok(composed)
     }
 
@@ -1796,6 +1972,60 @@ impl Composition {
         Ok(())
     }
 
+    /// Resolve one attachment to the resource behind it: the named authority's
+    /// envelope, exposing that id, with the digest still matching the entry it
+    /// was pinned against.
+    fn resolve_attachment(&self, attachment: &Attachment) -> Option<String> {
+        let owner = self
+            .constituents
+            .iter()
+            .find(|envelope| envelope.authority.as_deref() == Some(&attachment.authority))?;
+        let resource = owner
+            .exposes
+            .iter()
+            .find(|(_, id)| **id == attachment.exposure)
+            .map(|(handle, _)| owner.resolve(handle).to_owned())?;
+        let entry = owner.signed_entry(&resource);
+        let digest = crate::gov::hash_hex(&entry.to_string());
+        (digest == attachment.digest).then_some(resource)
+    }
+
+    /// §8/§6. An attachment that names an authority absent from the set, an id
+    /// nobody exposes, or an entry whose digest has moved fails the composition
+    /// CLOSED. Dropping it instead would be the aliasing failure §8 exists to
+    /// make impossible: a compartment a party believes it attached, silently
+    /// absent, and the read it meant to refuse admitted.
+    fn check_attachments_resolve(&self) -> Result<(), String> {
+        for envelope in &self.constituents {
+            for attachment in &envelope.attachments {
+                if self.resolve_attachment(attachment).is_none() {
+                    let who = envelope.authority.as_deref().unwrap_or("an envelope");
+                    return Err(format!(
+                        "{who} attaches to {}::{}, which does not resolve to the entry it pinned",
+                        attachment.authority, attachment.exposure
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The compartments every attachment adds to `resource`. These stand even
+    /// when the owner declassifies — §8(9) — which is what makes attaching worth
+    /// doing: a counterparty attaches precisely so the owner cannot release the
+    /// combined artifact alone.
+    fn attached_readers(&self, resource: &str) -> BTreeSet<String> {
+        let mut added = BTreeSet::new();
+        for envelope in &self.constituents {
+            for attachment in &envelope.attachments {
+                if self.resolve_attachment(attachment).as_deref() == Some(resource) {
+                    added.extend(attachment.readers.iter().cloned());
+                }
+            }
+        }
+        added
+    }
+
     /// The record this composition was checked under, for a run's evidence.
     pub fn record(&self) -> &[CompositionEntry] {
         &self.record
@@ -1818,7 +2048,9 @@ impl Composition {
     /// acts-for every compartment. Intersecting would widen to the public
     /// bottom — a label every constituent refuses.
     fn reader_source(&self, resource: &str) -> BTreeSet<String> {
-        self.union(|envelope| envelope.reader_set(resource))
+        let mut composed = self.union(|envelope| envelope.reader_set(resource));
+        composed.extend(self.attached_readers(resource));
+        composed
     }
 
     /// The `provider` side: INTERSECTION, because a larger sink set covers more
@@ -6112,6 +6344,177 @@ grant channel secsrc -> imap:sec from Sec\n";
         assert!(
             !view.own_resources.contains("file:/beta"),
             "acme's report does not enumerate beta's inventory"
+        );
+    }
+
+    #[test]
+    fn every_composition_arm_survives_canonicalization() {
+        // A GUARD, not a feature. `gov::canonicalize` round-trips through
+        // `to_canonical_json`, so an arm the emitter forgets is an arm the
+        // SIGNED document does not carry. That has now bitten three of this
+        // record's arms — `authority`, `requires_authority`, and §8's exposures,
+        // each of which parsed correctly and then vanished at signing, taking
+        // its check with it silently. This asserts the round trip for every arm
+        // DR-0063 adds, so the fourth one fails here instead of in production.
+        let body = "authority acme\n\
+             requires authority beta\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             expose Ledger as res-7\n\
+             attach beta res-3 deadbeef readable by Auditor\n";
+        let parsed = Envelope::from_dsl(body).expect("valid");
+        let round_trip =
+            Envelope::from_json(&parsed.to_canonical_json()).expect("canonical round trip");
+
+        assert_eq!(round_trip.authority.as_deref(), Some("acme"), "authority");
+        assert_eq!(
+            round_trip.requires_authority,
+            BTreeSet::from(["beta".to_owned()]),
+            "requires_authority"
+        );
+        assert_eq!(
+            round_trip.exposes.get("Ledger").map(String::as_str),
+            Some("res-7"),
+            "exposes"
+        );
+        assert_eq!(round_trip.attachments.len(), 1, "attachments");
+        assert_eq!(round_trip.attachments[0].digest, "deadbeef");
+        assert_eq!(
+            round_trip.attachments[0].readers,
+            BTreeSet::from(["acme::Auditor".to_owned()]),
+            "an attachment's compartments are the ATTACHING authority's"
+        );
+        assert_eq!(
+            round_trip.reader_set("file:/srv/ledger.db"),
+            parsed.reader_set("file:/srv/ledger.db"),
+            "labels"
+        );
+    }
+
+    // ---- DR-0063 §8, exposures and attachments -------------------------------
+
+    /// The digest a counterparty pins: the owner's signed entry for the
+    /// resource behind an exposure (§10).
+    fn pinned_digest(body: &str, handle: &str) -> String {
+        let envelope = Envelope::from_dsl(body).expect("valid");
+        let resource = envelope.resolve(handle).to_owned();
+        crate::gov::hash_hex(&envelope.signed_entry(&resource).to_string())
+    }
+
+    #[test]
+    fn an_attachment_narrows_a_resource_it_did_not_mint() {
+        // The case §8 exists for. beta attaches its own compartment to a
+        // resource acme minted and exposed; the composed source label carries
+        // both, so acme's own Operator no longer clears it alone.
+        let acme_body = "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             expose Ledger as res-7\n";
+        let digest = pinned_digest(acme_body, "Ledger");
+        let (acme, acme_hash) = composed_member("acme", 1, acme_body);
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            &format!(
+                "authority beta\n\
+                 attach acme res-7 {digest} readable by Auditor\n\
+                 grant file_store Sink -> file:/srv/sink.db readable by Operator\n"
+            ),
+        );
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert!(
+            composed.leaks("file:/srv/ledger.db", "file:/srv/sink.db"),
+            "beta's attached compartment is on acme's resource"
+        );
+    }
+
+    #[test]
+    fn a_dangling_attachment_fails_the_composition_closed() {
+        // §6. Dropping it instead is the aliasing failure: a compartment a party
+        // believes it attached, silently absent.
+        let acme_body = "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             expose Ledger as res-7\n";
+        let digest = pinned_digest(acme_body, "Ledger");
+        let (acme, acme_hash) = composed_member("acme", 1, acme_body);
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            &format!("authority beta\nattach acme res-9 {digest} readable by Auditor\n"),
+        );
+        let error = match Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        ) {
+            Ok(_) => panic!("acme exposes no res-9"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not resolve"), "{error}");
+    }
+
+    #[test]
+    fn re_pointing_an_exposure_breaks_the_pin() {
+        // §10, the commitment. beta pinned the entry it attached to; acme then
+        // changes what that resource's signed entry says, and the composition
+        // refuses rather than letting beta's compartment follow silently.
+        let pinned = pinned_digest(
+            "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             expose Ledger as res-7\n",
+            "Ledger",
+        );
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Auditor\n\
+             expose Ledger as res-7\n",
+        );
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            &format!("authority beta\nattach acme res-7 {pinned} readable by Auditor\n"),
+        );
+        assert!(
+            Composition::compose(
+                vec![acme, beta],
+                vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+            )
+            .is_err(),
+            "the entry moved under the pin"
+        );
+    }
+
+    #[test]
+    fn an_owners_declassify_leaves_an_attachment_standing() {
+        // §8(9), and the reason attaching is worth doing at all: an owner
+        // releases its OWN contribution and the counterparty's compartment
+        // stays, so the owner cannot release the combined artifact alone.
+        let acme_body = "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             expose Ledger as res-7\n\
+             grant declassify file:/srv/ledger.db to acme::Everyone\n";
+        let digest = pinned_digest(acme_body, "Ledger");
+        let (acme, acme_hash) = composed_member("acme", 1, acme_body);
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            &format!(
+                "authority beta\n\
+                 attach acme res-7 {digest} readable by Auditor\n\
+                 grant file_store Sink -> file:/srv/sink.db readable by acme::Everyone\n"
+            ),
+        );
+        let composed = Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        )
+        .expect("well formed");
+        assert!(
+            composed.leaks("file:/srv/ledger.db", "file:/srv/sink.db"),
+            "beta::Auditor survives acme's declassify"
         );
     }
 

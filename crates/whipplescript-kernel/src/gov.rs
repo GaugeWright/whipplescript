@@ -60,7 +60,7 @@ pub const GOVERNANCE_SIGNING_CREDENTIAL: &str = "whip/governance-signing";
 /// The attestation algorithm tag for custodian-held governance keys.
 pub const GOVERNANCE_CUSTODIAN_ALGORITHM: &str = "ed25519-custodian";
 
-fn hash_hex(content: &str) -> String {
+pub(crate) fn hash_hex(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     hasher
