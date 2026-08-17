@@ -3,7 +3,7 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-## [0.5.0] — unreleased
+## [0.5.0] — 2026-08-17
 
 Multi-party governance. A run stops being governed by one envelope and starts
 being governed by a **set** of them, whose effective policy is their meet
