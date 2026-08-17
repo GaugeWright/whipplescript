@@ -3,6 +3,124 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.0] — unreleased
+
+Multi-party governance. A run stops being governed by one envelope and starts
+being governed by a **set** of them, whose effective policy is their meet
+(DR-0063). The single-authority posture is unchanged and unqualified: one
+envelope naming no authority behaves exactly as it did.
+
+### Breaking
+
+- **The governance signing preimage gains the epoch and the authority**, under a
+  new domain tag (`whipplescript-governance-envelope:v2`). Under `:v1` the same
+  valid signature verified under whatever epoch the caller named, so a
+  constituent could be presented as a different — including an earlier — policy
+  revision. That is precisely the non-retroactivity claim a composition record is
+  meant to carry, so the epoch had to move inside the signature rather than
+  beside it. `:v1` stays verifiable for the single-envelope path and is
+  **inadmissible in a composed set**.
+
+  A half-stated `:v2` — epoch present without authority, or the reverse — is
+  refused rather than silently downgraded, because that is how an epoch would
+  come to look signed without being.
+
+- **The hosted path is `:v2`-only.** `verify_epoch(epoch, signed)` became
+  `verify(signed)` and reads the epoch from the attestation, so every `host_*`
+  export dropped its `epoch: u64` parameter and the Worker moved with it. A
+  `:v1`-signed envelope is refused there and must be re-signed. The caller no
+  longer gets to say which policy revision it is holding.
+
+- **A role is qualified by the authority whose envelope declares it.** `acme::
+  Operator` and `beta::Operator` are different principals, and a composition can
+  never unify them by name. An envelope that names no authority keeps bare roles
+  and is unaffected.
+
+### Added
+
+- **Envelope composition** (DR-0063): `Composition::compose` checks a set of
+  signed envelopes as their meet, defined by refusal — the composed policy
+  refuses whenever any constituent would. Every per-arm rule follows from one
+  question: at a crossing the kernel asks `dominates(provider, required)`, so the
+  `required` side composes by union and the `provider` side by intersection.
+  Confidentiality puts the sink on the provider side and integrity puts the
+  source there, which is why the two compose in opposite directions rather than
+  by two rules kept in step.
+
+  Composition fails closed on any ill-formedness rather than dropping the
+  offending arm, because a silently dropped grant is one its issuer goes on
+  believing it holds.
+
+- **`requires authority <id>`** — an envelope's grants are valid only inside a
+  composition that includes that authority, present *and governed*. This is how
+  one party's policy depends on another's constraints actually holding, rather
+  than on the other party merely being named somewhere.
+
+- **A composition record**, `(authority, envelope_hash, epoch)` per constituent:
+  what the run was actually checked under, and what its evidence and guarantee
+  report cite.
+
+- **Dual labels.** A resource's confidentiality and integrity readings may
+  differ, so a handle is no longer forced to carry one label for both axes.
+
+- **`exposes`** — a counterparty may narrow a resource it does not own,
+  referencing it by an opaque id rather than an address. Minting stays with the
+  owner; a second authority can only reference a key, never mint one.
+
+- **`policy lifetime`** — how long a pinned composition may be relied on without
+  re-admitting under a freshly composed set. Unbounded is the single-authority
+  posture; without a bound an unbounded `@service` loop holds its composed set
+  forever and "non-retroactive" quietly becomes "never".
+
+- **`CompositionProjection`** — what one authority may see of a composed set.
+  Presence is not disclosure: the projection names every authority but only the
+  viewer's own governed resources.
+
+### Fixed
+
+- **Canonicalization is proven lossless rather than assumed.** `gov::canonicalize`
+  round-trips an envelope through its canonical JSON, so any field the emitter did
+  not write was dropped from the *signed* document — it parsed, then vanished at
+  signing, and its check passed vacuously. This cost four fields before it was
+  closed structurally: `authority`, `requires_authority`, `exposes`/`attachments`,
+  and `policy_lifetime`.
+
+  The repair is a total property asserted inside `canonicalize` — reparsing the
+  canonical form must reproduce the envelope — rather than another per-field
+  test. Envelopes now normalize at *parse* instead of at emit, which is what makes
+  the comparison exact. A new arm needs no test edit: omitting it from the emitter
+  fails everywhere at once.
+
+- **A glob resource address is refused rather than accepted and ignored.**
+  `information-flow-surface.md` promised `file:/data/**` with most-specific-wins;
+  the checker only ever matched exactly, so a policy author could write a pattern
+  that governed nothing and read as though it governed everything. Globs were
+  retracted from the spec rather than implemented, and the address surface now
+  refuses a pattern at declaration — the route out of a refusal being the whole
+  value of it.
+
+- Contract-registry identifiers are held to being non-empty.
+
+- **Scratch paths are unique per call, not per `(pid, label)`.** Three helpers —
+  the verified-artifact bundle writer, the artifact-bridge platform catalog, and
+  the Maude runner — derived a temp path from the pid and a hash of a
+  caller-supplied label. One process running two of them at once for the same
+  label derived *one* path, and whichever finished first deleted the file the
+  other was still reading. It had already bitten: splitting the CLI test module
+  changed scheduling enough that two tests naming the same source began to
+  overlap and the bridge failed about one run in four.
+
+### Documented
+
+- The release checklist no longer tells the next cut to publish the private tree.
+  The mirror is not a git mirror — its history is a disjoint sequence of squashed
+  snapshots — so a tag made on a `-src` commit and pushed to the mirror publishes
+  that object, `spec/` and all.
+- The Homebrew tap is documented as existing, because it does.
+- Witnesses added for which bytes a composed label is about, the governance
+  envelope's refusals, the declaration surface's refusals including the
+  half-written ones, and the type checker's operand and record-construction rules.
+
 ## [0.4.1] — 2026-07-29
 
 ### Fixed
