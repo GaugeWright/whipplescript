@@ -1,0 +1,151 @@
+name: Publish crates
+
+# The crates.io half of a release. `release.yml` builds and hosts the GitHub
+# Release, the installers, and the Homebrew formula; this publishes the library
+# crates, which is what downstream consumers (GaugeDesk) actually resolve
+# against. Until this existed the step was a manual nine-`cargo publish` chain
+# filed in the release checklist as a "follow-on", which is how a cut could look
+# complete while every consumer stayed pinned to the previous version.
+#
+# DISPATCH ONLY, AND DELIBERATELY NOT ON TAG PUSH. A published version cannot be
+# withdrawn — only yanked, which leaves it resolvable for anything that already
+# has it in a lockfile. That is the one step in a release with no undo, so a
+# human names the version every time rather than a tag implying it.
+#
+# `dry_run` defaults to true. The dry run resolves and packages every crate
+# without uploading, which catches the failure this workflow is most likely to
+# hit: a crate whose dependencies are not yet on the index.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (must equal the workspace version at the tag, e.g. 0.5.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Package and resolve without uploading."
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  # Never two publishes at once: they would race on the index and the second
+  # would fail halfway with some crates up and some not.
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # The token lives here, and `Cargo.toml`'s `repository` field names this
+    # repository, so a publish from `-src` would claim the wrong provenance.
+    # Same guard release.yml uses.
+    if: github.repository == 'GaugeWright/whipplescript'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag being published
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Refuse a version that is not what the tag carries
+        run: |
+          set -euo pipefail
+          declared="$(node scripts/crates-publish-order.mjs --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+          echo "workspace version at tag: $declared"
+          echo "requested version:        ${{ inputs.version }}"
+          if [[ "$declared" != "${{ inputs.version }}" ]]; then
+            echo "::error::the tag v${{ inputs.version }} carries workspace version $declared" >&2
+            echo "A publish names a version in three places — the input, the tag, and the" >&2
+            echo "manifest. If they disagree, one of them is a typo, and the wrong one" >&2
+            echo "cannot be taken back." >&2
+            exit 1
+          fi
+
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$DRY_RUN" != "true" && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set on this repository" >&2
+            exit 1
+          fi
+
+          mapfile -t crates < <(node scripts/crates-publish-order.mjs)
+          echo "publish order (${#crates[@]} crates): ${crates[*]}"
+
+          # Already on the index at this version? Then skip it. A publish that
+          # fails at crate six leaves five up and unwithdrawable, so the only
+          # useful recovery is re-running the same command — which means
+          # "already published" has to be a skip, not an error.
+          published() {
+            local crate="$1"
+            curl -sSf --retry 3 --retry-delay 2 \
+              -H 'User-Agent: whipplescript-release (github actions)' \
+              "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null 2>&1
+          }
+
+          # cargo waits for the index after an upload, but the API read above is
+          # what the NEXT crate's resolution depends on, so confirm that too
+          # rather than assuming the two are in step.
+          await_index() {
+            local crate="$1"
+            for _ in $(seq 1 60); do
+              if published "$crate"; then return 0; fi
+              sleep 5
+            done
+            echo "::error::${crate} ${VERSION} did not appear on crates.io within 5 minutes" >&2
+            return 1
+          }
+
+          for crate in "${crates[@]}"; do
+            if published "$crate"; then
+              echo "== $crate $VERSION already published — skipping"
+              continue
+            fi
+            if [[ "$DRY_RUN" == "true" ]]; then
+              # --no-verify would skip the build; the build is the point, because
+              # it is what proves the dependencies resolve from the index. It
+              # cannot pass for a crate whose own deps are not up yet, so a dry
+              # run of the whole chain legitimately fails after the first
+              # unpublished crate — see the note in the release checklist.
+              echo "== $crate $VERSION (dry run)"
+              cargo publish -p "$crate" --dry-run --locked
+            else
+              echo "== $crate $VERSION"
+              cargo publish -p "$crate" --locked
+              await_index "$crate"
+            fi
+          done
+
+      - name: Confirm every crate is on the index
+        if: inputs.dry_run == 'false'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r crate; do
+            if curl -sSf -H 'User-Agent: whipplescript-release (github actions)' \
+                 "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null 2>&1; then
+              echo "  ok      $crate $VERSION"
+            else
+              echo "  MISSING $crate $VERSION"
+              missing=1
+            fi
+          done < <(node scripts/crates-publish-order.mjs)
+          if [[ "$missing" != "0" ]]; then
+            echo "::error::the publish did not complete; re-run this workflow to resume" >&2
+            exit 1
+          fi
+          echo "all crates published at $VERSION"
