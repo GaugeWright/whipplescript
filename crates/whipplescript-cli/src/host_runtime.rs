@@ -4803,8 +4803,31 @@ workflow Method {
             let mut request = Vec::new();
             let mut chunk = [0u8; 1024];
             // Read until the blank line; the body length rides the headers.
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let body_start = loop {
                 let n = socket.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break request.len();
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            // Drain the body too. ureq writes headers and body in separate
+            // syscalls, so stopping at the blank line can leave the body
+            // unread — and closing a socket with unread inbound data sends
+            // RST rather than FIN, which may discard the queued response
+            // tail (a truncated stream) or reset the client mid-headers.
+            let content_length: usize = String::from_utf8_lossy(&request[..body_start])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while request.len() < body_start + content_length {
+                let n = socket.read(&mut chunk).expect("read body");
                 if n == 0 {
                     break;
                 }
