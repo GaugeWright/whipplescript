@@ -3,6 +3,34 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.1] — 2026-08-17
+
+Stop lands mid-stream. Cancellation of a brokered turn was cooperative only
+between model rounds, so a Stop aimed at a long single-response turn waited for
+the entire response to stream — indistinguishable, from an embedding UI, from
+the Stop doing nothing.
+
+### Fixed
+
+- **The native transport releases a cancelled turn's provider stream** instead
+  of draining it. The transport polls the durable cancellation surface between
+  streamed SSE lines (its own throttled store connection, latching on first
+  observation) and releases the stream at a complete-line boundary; what fully
+  arrived assembles exactly as a naturally ended body.
+- **A released round settles `cancelled`, keeping the text that arrived** as
+  that round's durable assistant message, and starts no offered tool — a
+  truncated text tail parses exactly like a final answer, and settling it
+  `completed` would launder a stop into a normal terminal. An unreleased
+  natural terminal still wins over a racing request, and transports without a
+  release surface keep the between-rounds observation unchanged
+  (`spec/agent-harness.md` "Cancellation").
+
+### Added
+
+- `BrokeredTurnMachine::with_stream_released` and the
+  `BrokeredTurnContext::stream_released` probe, for hosts whose transports can
+  release an in-flight stream. `None` preserves prior behavior exactly.
+
 ## [0.5.0] — 2026-08-17
 
 Multi-party governance. A run stops being governed by one envelope and starts
