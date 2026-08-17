@@ -20,13 +20,13 @@ readme.workspace = true
 [dependencies]
 # The sans-IO core, built WITHOUT the native (rusqlite) backend — the DO supplies
 # its own storage. `sansio` (HostDriver / IoRequest / HttpRequest) lives here.
-whipplescript-kernel = { version = "0.5.2", path = "../whipplescript-kernel", default-features = false }
+whipplescript-kernel = { version = "0.5.3", path = "../whipplescript-kernel", default-features = false }
 # Content hashes byte-identical to the native store's (pure-Rust, wasm-safe).
 sha2 = "0.11"
 # The store TRAITS (RuntimeStore / Coordination / WorkItems / FileStore) + data
 # types, no rusqlite.
-whipplescript-store = { version = "0.5.2", path = "../whipplescript-store", default-features = false }
-whipplescript-parser = { version = "0.5.2", path = "../whipplescript-parser" }
+whipplescript-store = { version = "0.5.3", path = "../whipplescript-store", default-features = false }
+whipplescript-parser = { version = "0.5.3", path = "../whipplescript-parser" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
@@ -39,7 +39,7 @@ serde_json = "1"
 # is verified against an actual SQL engine (native-only test dependency).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Provides `Severity` for constructing `DiagnosticRecord` in the store tests.
-whipplescript-core = { version = "0.5.2", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.5.3", path = "../whipplescript-core" }
 
 [lib]
 path = "src/lib.rs"

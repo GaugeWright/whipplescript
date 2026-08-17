@@ -11,13 +11,13 @@ keywords = ["agents", "automation", "cli", "orchestration", "workflow"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-whipplescript-core = { version = "0.5.2", path = "../whipplescript-core" }
-whipplescript-custody = { version = "0.5.2", path = "../whipplescript-custody" }
-whipplescript-kernel = { version = "0.5.2", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
-whipplescript-parser = { version = "0.5.2", path = "../whipplescript-parser" }
-whipplescript-provider-claude = { version = "0.5.2", path = "../whipplescript-provider-claude", optional = true }
-whipplescript-provider-codex = { version = "0.5.2", path = "../whipplescript-provider-codex", optional = true }
-whipplescript-store = { version = "0.5.2", path = "../whipplescript-store" }
+whipplescript-core = { version = "0.5.3", path = "../whipplescript-core" }
+whipplescript-custody = { version = "0.5.3", path = "../whipplescript-custody" }
+whipplescript-kernel = { version = "0.5.3", path = "../whipplescript-kernel", default-features = false, features = ["native"] }
+whipplescript-parser = { version = "0.5.3", path = "../whipplescript-parser" }
+whipplescript-provider-claude = { version = "0.5.3", path = "../whipplescript-provider-claude", optional = true }
+whipplescript-provider-codex = { version = "0.5.3", path = "../whipplescript-provider-codex", optional = true }
+whipplescript-store = { version = "0.5.3", path = "../whipplescript-store" }
 regex = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
@@ -55,7 +55,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # build matrix: a `--no-default-features` whip test target must agree with the
 # binary about which provider kinds exist); `native` is re-enabled explicitly
 # to match the regular dependency.
-whipplescript-kernel = { version = "0.5.2", path = "../whipplescript-kernel", default-features = false, features = ["test-support", "native"] }
+whipplescript-kernel = { version = "0.5.3", path = "../whipplescript-kernel", default-features = false, features = ["test-support", "native"] }
 
 [[bin]]
 name = "whip"

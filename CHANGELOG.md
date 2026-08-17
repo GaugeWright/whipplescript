@@ -3,6 +3,23 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.3] — 2026-08-17
+
+The authored half of durable-store upgrades (compiler half: 0.5.2). An
+embedding host whose package assembly evolved resolves different authored
+content under the reference an older build recorded; the replayed open
+refuses — correctly, and permanently, stranding the instance's thread.
+
+### Added
+
+- `GovernedHostRuntime::adopt_instance_from` — a fork that waives only
+  source-content reproduction: identity, policy binding, position, and
+  quiescence are checked exactly as an ordinary fork; the source is never
+  executed again; its thread seeds a target resolved in full under the
+  current authoring; `host.instance.forked` audits the move.
+- `GovernedHostRuntime::newest_recorded_instance` — names the adoption
+  source for a host that cannot replay an open to find it.
+
 ## [0.5.2] — 2026-08-17
 
 Durable stores survive toolchain upgrades. Consuming 0.5.1 from GaugeDesk
