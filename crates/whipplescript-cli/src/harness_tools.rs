@@ -3988,6 +3988,9 @@ pub fn run_owned_agent_turn(
         agent,
         profile,
         thread_continue,
+        // Delegated/worker turns run through drivers with no mid-stream
+        // release surface; cancellation stays a between-rounds observation.
+        stream_released: None,
     };
 
     // Slice-2 envelope: hold a durable workspace lease for the unit of work so

@@ -178,6 +178,12 @@ pub struct BrokeredTurnContext<'a> {
     /// agent's latest completed-turn transcript in this instance, appending the
     /// new user message — the chat-shaped continuation. `false` = fresh turn.
     pub thread_continue: bool,
+    /// Whether the host's transport released this turn's in-flight provider
+    /// stream early on an observed cancellation request
+    /// (spec/agent-harness.md "Cancellation"). `None` = the transport cannot
+    /// release a stream mid-flight; cancellation then remains a between-rounds
+    /// observation exactly as before.
+    pub stream_released: Option<&'a dyn Fn() -> bool>,
 }
 
 /// A host-governed seed for a newly forked agent thread. The seed is runtime
@@ -506,6 +512,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 host,
                 compactor,
                 Some(&cancel_probe),
+                ctx.stream_released,
             )
         };
 

@@ -46,18 +46,46 @@ jobs:
     if: github.repository == 'GaugeWright/whipplescript'
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the tag being published
+      # TWO checkouts, and the split is the point. The crates must come from the
+      # tag, because crates.io has to receive exactly what was released. The
+      # tooling must come from THIS workflow's ref, because a tag is cut before
+      # the publish and therefore cannot be relied on to contain the scripts the
+      # publish needs.
+      #
+      # The first run of this workflow died on exactly that: v0.5.0 was tagged
+      # three commits before `crates-publish-order.mjs` existed, so checking out
+      # the tag produced MODULE_NOT_FOUND. It is not a one-off — every release
+      # tags first and publishes second, so any tooling change lands after the
+      # tag it is used on.
+      - name: Check out the release tag (the crates)
         uses: actions/checkout@v4
         with:
           ref: v${{ inputs.version }}
+          path: release
+
+      - name: Check out this workflow's ref (the tooling)
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: Confirm the tooling is present
+        run: |
+          set -euo pipefail
+          if [[ ! -f tooling/scripts/crates-publish-order.mjs ]]; then
+            echo "::error::tooling/scripts/crates-publish-order.mjs is missing from ${{ github.ref }}" >&2
+            exit 1
+          fi
+          echo "tooling from ${{ github.ref }}; crates from v${{ inputs.version }}"
 
       - name: Install the pinned toolchain
+        working-directory: release
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Refuse a version that is not what the tag carries
+        working-directory: release
         run: |
           set -euo pipefail
-          declared="$(node scripts/crates-publish-order.mjs --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+          declared="$(node ../tooling/scripts/crates-publish-order.mjs --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
           echo "workspace version at tag: $declared"
           echo "requested version:        ${{ inputs.version }}"
           if [[ "$declared" != "${{ inputs.version }}" ]]; then
@@ -69,6 +97,7 @@ jobs:
           fi
 
       - name: Publish in dependency order
+        working-directory: release
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -81,7 +110,7 @@ jobs:
             exit 1
           fi
 
-          mapfile -t crates < <(node scripts/crates-publish-order.mjs)
+          mapfile -t crates < <(node ../tooling/scripts/crates-publish-order.mjs)
           echo "publish order (${#crates[@]} crates): ${crates[*]}"
 
           # Already on the index at this version? Then skip it. A publish that
@@ -130,6 +159,7 @@ jobs:
 
       - name: Confirm every crate is on the index
         if: inputs.dry_run == 'false'
+        working-directory: release
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -143,7 +173,7 @@ jobs:
               echo "  MISSING $crate $VERSION"
               missing=1
             fi
-          done < <(node scripts/crates-publish-order.mjs)
+          done < <(node ../tooling/scripts/crates-publish-order.mjs)
           if [[ "$missing" != "0" ]]; then
             echo "::error::the publish did not complete; re-run this workflow to resume" >&2
             exit 1

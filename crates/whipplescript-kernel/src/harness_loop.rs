@@ -631,6 +631,15 @@ where
     /// cancellation surface). Probed between rounds only, so an in-flight tool
     /// settles before the check — the settle-before-release discipline.
     cancel_check: Option<&'a dyn Fn() -> bool>,
+    /// Whether the host's transport released the just-fulfilled provider
+    /// stream early because a cancellation request was observed mid-stream
+    /// (spec/agent-harness.md "Cancellation"). Consulted once per parsed
+    /// reply: a released round keeps the text that fully arrived — durably,
+    /// as that round's assistant message — dispatches no tool batch, and
+    /// settles `Cancelled`. `None`/`false` leaves every path exactly as
+    /// before, including final-terminal-wins for a naturally completed
+    /// stream that a request only raced.
+    stream_released: Option<&'a dyn Fn() -> bool>,
     /// Durable steering/follow-up source. Hosts without interactive commands
     /// leave this absent and retain the ordinary one-shot lifecycle.
     command_source: Option<&'a mut dyn TurnCommandSource>,
@@ -667,6 +676,7 @@ where
             applied_command_ids: std::collections::BTreeSet::new(),
             provider_retries: 0,
             cancel_check: None,
+            stream_released: None,
             command_source: None,
         }
     }
@@ -705,6 +715,7 @@ where
             applied_command_ids: snapshot.applied_command_ids,
             provider_retries: 0,
             cancel_check: None,
+            stream_released: None,
             command_source: None,
         }
     }
@@ -714,6 +725,14 @@ where
     /// surface; the machine consults it before each main model call.
     pub fn with_cancel_check(mut self, probe: &'a dyn Fn() -> bool) -> Self {
         self.cancel_check = Some(probe);
+        self
+    }
+
+    /// Arm the stream-release probe: `true` says the transport released the
+    /// round's provider stream early on an observed cancellation request, so
+    /// the parsed reply is a truncation — never a natural terminal.
+    pub fn with_stream_released(mut self, probe: &'a dyn Fn() -> bool) -> Self {
+        self.stream_released = Some(probe);
         self
     }
 
@@ -1004,6 +1023,32 @@ where
         // The real-usage compaction signal is the MAIN reply's input token count.
         self.last_input_tokens = input_tokens_of(&reply.usage);
 
+        // A round whose stream the transport released early on an observed
+        // cancellation request is a truncation, whatever shape it parsed to —
+        // a text-only tail reads exactly like a final answer, and settling it
+        // `Completed` would launder a stop into a normal terminal. Keep the
+        // text that fully arrived (durably, as this round's assistant
+        // message), start no offered tool, and settle cancelled. A naturally
+        // completed stream never trips this: its release probe stays false,
+        // so final-terminal-wins is untouched.
+        if self.stream_released.is_some_and(|probe| probe()) {
+            if !reply.text.is_empty() {
+                self.messages.push(ChatMessage::Assistant {
+                    text: reply.text.clone(),
+                    tool_calls: Vec::new(),
+                });
+                (self.checkpoint)(&self.messages);
+            }
+            self.step += 1;
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Cancelled,
+                summary: "turn cancelled by request".to_owned(),
+                steps: self.step,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+            });
+        }
+
         if reply.is_final() {
             // Persist the final assistant reply into the transcript before
             // settling (pi-conformance §4): the completed conversation is what
@@ -1086,6 +1131,7 @@ where
 /// same [`BrokeredTurnOutcome`] as [`run_brokered_loop`] over an equivalent
 /// client; the durable-object host (Phase 5) drives the same machine across
 /// isolate wakes instead of in one pass.
+#[allow(clippy::too_many_arguments)]
 pub fn run_brokered_turn_http<M, E>(
     model: &M,
     executor: &E,
@@ -1094,6 +1140,7 @@ pub fn run_brokered_turn_http<M, E>(
     host: &impl HostDriver,
     compactor: &dyn Compactor,
     cancel_check: Option<&dyn Fn() -> bool>,
+    stream_released: Option<&dyn Fn() -> bool>,
 ) -> BrokeredTurnOutcome
 where
     M: HttpModelClient + ?Sized,
@@ -1102,6 +1149,9 @@ where
     let mut machine = BrokeredTurnMachine::new(model, executor, input, checkpoint, compactor);
     if let Some(probe) = cancel_check {
         machine = machine.with_cancel_check(probe);
+    }
+    if let Some(probe) = stream_released {
+        machine = machine.with_stream_released(probe);
     }
     run_to_completion(&mut machine, host)
 }
@@ -2036,6 +2086,7 @@ mod tests {
             &DummyHost,
             &NoopCompactor,
             None,
+            None,
         );
         assert!(matches!(out.status, TurnStatus::Completed), "{out:?}");
         assert_eq!(out.summary, "ok after retry");
@@ -2056,6 +2107,7 @@ mod tests {
             &mut |_msgs: &[ChatMessage]| {},
             &DummyHost,
             &NoopCompactor,
+            None,
             None,
         );
         assert!(matches!(out.status, TurnStatus::Failed), "{out:?}");
@@ -2083,6 +2135,7 @@ mod tests {
             &mut |messages: &[ChatMessage]| checkpoints.push(chat_messages_to_json(messages)),
             &DummyHost,
             &NoopCompactor,
+            None,
             None,
         );
         assert!(matches!(out.status, TurnStatus::Completed));
@@ -2131,6 +2184,7 @@ mod tests {
             &DummyHost,
             &NoopCompactor,
             Some(&probe),
+            None,
         );
         assert!(
             matches!(out.status, TurnStatus::Cancelled),
@@ -2147,6 +2201,106 @@ mod tests {
             checkpoints.len() >= 2,
             "the partial transcript persisted before cancellation"
         );
+    }
+
+    /// A round whose stream the transport released early settles cancelled —
+    /// however final the truncation happens to look — keeping the text that
+    /// fully arrived as this round's durable assistant message, and never
+    /// running a tool the truncation offered.
+    #[test]
+    fn released_stream_settles_cancelled_keeping_arrived_text() {
+        let truncated = ModelReply {
+            text: "the first half of an ans".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }],
+            usage: json!({ "output_tokens": 2 }),
+        };
+        let http = ScriptedHttpClient::new(vec![Ok(truncated)]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "never".to_string(),
+        });
+        let released = || true;
+        let mut checkpoints: Vec<Value> = Vec::new();
+        let mut record =
+            |messages: &[ChatMessage]| checkpoints.push(chat_messages_to_json(messages));
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut record,
+            &DummyHost,
+            &NoopCompactor,
+            None,
+            Some(&released),
+        );
+        assert!(
+            matches!(out.status, TurnStatus::Cancelled),
+            "a released stream is a truncation, not a terminal: {:?}",
+            out.status
+        );
+        assert_eq!(out.summary, "turn cancelled by request");
+        assert!(
+            exec.calls.borrow().is_empty(),
+            "no offered tool starts after a release"
+        );
+        let last = checkpoints.last().expect("the arrived text checkpointed");
+        let rebuilt = chat_messages_from_json(last);
+        match rebuilt.last().expect("assistant message recorded") {
+            ChatMessage::Assistant { text, tool_calls } => {
+                assert_eq!(text, "the first half of an ans");
+                assert!(
+                    tool_calls.is_empty(),
+                    "a truncated round's tool offers are not recorded as calls"
+                );
+            }
+            other => panic!("expected the assistant's partial text, got {other:?}"),
+        }
+    }
+
+    /// A stream that completed naturally is a real terminal even when a
+    /// cancellation request raced it: the release probe stays false, so
+    /// final-terminal-wins holds exactly as specified.
+    #[test]
+    fn natural_final_still_wins_over_a_racing_cancel_request() {
+        use std::cell::Cell;
+        let http = ScriptedHttpClient::new(vec![Ok(final_reply("the whole answer"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let cancelled = Cell::new(false);
+        let probe = || cancelled.get();
+        let released = || false;
+        let seen = Cell::new(0u32);
+        let mut record = |_: &[ChatMessage]| {
+            // The seed checkpoint precedes the first model call; the request
+            // lands while the (only) round is in flight — at the checkpoint
+            // that records its reply — and the stream completes naturally.
+            seen.set(seen.get() + 1);
+            if seen.get() >= 2 {
+                cancelled.set(true);
+            }
+        };
+        let out = run_brokered_turn_http(
+            &http,
+            &exec,
+            &input(5),
+            &mut record,
+            &DummyHost,
+            &NoopCompactor,
+            Some(&probe),
+            Some(&released),
+        );
+        assert!(
+            matches!(out.status, TurnStatus::Completed),
+            "an unreleased natural terminal wins: {:?}",
+            out.status
+        );
+        assert_eq!(out.summary, "the whole answer");
     }
 
     /// Drive the same scenario through both the imperative `run_brokered_loop`
@@ -2182,6 +2336,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
                 None,
             )
         };
@@ -2250,6 +2405,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
                 None,
             )
         };
@@ -2754,6 +2910,7 @@ mod tests {
             &DummyHost,
             &NoopCompactor,
             None,
+            None,
         );
         assert_eq!(machine_seed[1], expected_seed);
     }
@@ -2958,6 +3115,7 @@ mod tests {
                 &DummyHost,
                 &compactor,
                 None,
+                None,
             )
         };
 
@@ -3025,6 +3183,7 @@ mod tests {
                 &DummyHost,
                 &compactor,
                 None,
+                None,
             );
         }
         let folded = folded.expect("a compaction occurred");
@@ -3051,6 +3210,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &compactor,
+                None,
                 None,
             )
         };
@@ -3245,6 +3405,7 @@ mod tests {
                 &DummyHost,
                 &NoopCompactor,
                 None,
+                None,
             )
         };
         // The turn recovered rather than failing on the overflow.
@@ -3296,6 +3457,7 @@ mod tests {
                 &mut record,
                 &DummyHost,
                 &NoopCompactor,
+                None,
                 None,
             )
         };

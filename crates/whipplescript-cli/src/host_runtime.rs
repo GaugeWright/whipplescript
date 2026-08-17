@@ -1352,6 +1352,77 @@ pub struct HostCancellationHandle {
     command_id: String,
 }
 
+/// The mid-stream companion to [`HostCancellationHandle`]: polls the same
+/// durable cancellation surface from inside the transport's read loop, so an
+/// in-flight provider stream is released at a complete-event boundary instead
+/// of running to its end (spec/agent-harness.md "Cancellation").
+///
+/// Opens its own store connection for the same reason the handle does — the
+/// runtime-owning thread is inside provider I/O while the embedding host
+/// writes the request. Reads are throttled so a fast stream is never gated on
+/// SQLite, and the first observation latches: the transport's release decision
+/// and the machine's released-round settlement must agree about one stream.
+/// Failures read as "not cancelled", matching the kernel's between-rounds
+/// probe — a probe failure must not kill a healthy turn.
+struct StreamCancelProbe {
+    store_path: PathBuf,
+    instance_ref: String,
+    command_id: String,
+    last_read: std::cell::Cell<Option<std::time::Instant>>,
+    latched: std::cell::Cell<bool>,
+    store: std::cell::RefCell<Option<SqliteStore>>,
+}
+
+impl StreamCancelProbe {
+    const READ_INTERVAL: Duration = Duration::from_millis(250);
+
+    fn new(store_path: PathBuf, instance_ref: String, command_id: String) -> Self {
+        Self {
+            store_path,
+            instance_ref,
+            command_id,
+            last_read: std::cell::Cell::new(None),
+            latched: std::cell::Cell::new(false),
+            store: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Consulted by the transport between streamed lines: `true` = release.
+    fn observed(&self) -> bool {
+        if self.latched.get() {
+            return true;
+        }
+        if self
+            .last_read
+            .get()
+            .is_some_and(|at| at.elapsed() < Self::READ_INTERVAL)
+        {
+            return false;
+        }
+        self.last_read.set(Some(std::time::Instant::now()));
+        let mut slot = self.store.borrow_mut();
+        if slot.is_none() {
+            *slot = SqliteStore::open(&self.store_path).ok();
+        }
+        let Some(store) = slot.as_mut() else {
+            return false;
+        };
+        let open = store
+            .effect_has_open_cancellation_request(&self.instance_ref, &self.command_id)
+            .unwrap_or(false);
+        if open {
+            self.latched.set(true);
+        }
+        open
+    }
+
+    /// Whether this probe released a stream — the machine-side fact that the
+    /// parsed reply is a truncation, never a natural terminal.
+    fn released(&self) -> bool {
+        self.latched.get()
+    }
+}
+
 impl HostCancellationHandle {
     pub fn request(&self) -> Result<(), HostRuntimeError> {
         let mut store = SqliteStore::open(&self.store_path).map_err(HostRuntimeError::Store)?;
@@ -1827,8 +1898,28 @@ impl GovernedHostRuntime {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
         let sink = |delta: &str| resources.observe_text_delta(delta);
-        let driver = NativeHttpDriver::new(binding.timeout).with_delta_sink(&sink);
-        self.run_admitted_turn(command, packages, resources, binding, &driver)
+        // Mid-stream cooperative cancel (spec/agent-harness.md "Cancellation"):
+        // the transport polls the durable request surface between streamed
+        // lines and releases the stream early; the machine converts that
+        // released round to `Cancelled`, keeping the text that fully arrived.
+        let probe = StreamCancelProbe::new(
+            self.store_path.clone(),
+            command.instance_ref.clone(),
+            command.command_id.clone(),
+        );
+        let observed = || probe.observed();
+        let released = || probe.released();
+        let driver = NativeHttpDriver::new(binding.timeout)
+            .with_delta_sink(&sink)
+            .with_cancel_probe(&observed);
+        self.run_admitted_turn(
+            command,
+            packages,
+            resources,
+            binding,
+            &driver,
+            Some(&released),
+        )
     }
 
     /// The same governed path with a caller-supplied sans-I/O driver. Native
@@ -1850,7 +1941,7 @@ impl GovernedHostRuntime {
     {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
-        self.run_admitted_turn(command, packages, resources, binding, driver)
+        self.run_admitted_turn(command, packages, resources, binding, driver, None)
     }
 
     fn admit_command<P>(
@@ -1912,6 +2003,7 @@ impl GovernedHostRuntime {
         resources: &R,
         binding: ResolvedProviderBinding,
         driver: &H,
+        stream_released: Option<&dyn Fn() -> bool>,
     ) -> Result<TurnExecution, HostRuntimeError>
     where
         P: PackageResolver + ?Sized,
@@ -2076,6 +2168,7 @@ impl GovernedHostRuntime {
                     agent: &package.agent,
                     profile: None,
                     thread_continue: true,
+                    stream_released,
                 },
                 &client,
                 &executor,
@@ -2845,6 +2938,13 @@ struct NativeHttpDriver<'a> {
     /// `ResourceResolver::observe_text_delta` seam). `None` observes nothing
     /// and reads the body exactly as before.
     delta_sink: Option<&'a dyn Fn(&str)>,
+    /// Cooperative cancellation probe consulted between streamed lines
+    /// (spec/agent-harness.md "Cancellation"). `true` releases the stream at a
+    /// complete-line boundary: the lines that fully arrived feed the same
+    /// assembly as a naturally ended body, and the machine settles the round
+    /// cancelled through its paired release probe. `None` reads to the end
+    /// exactly as before.
+    cancel_probe: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> NativeHttpDriver<'a> {
@@ -2860,11 +2960,17 @@ impl<'a> NativeHttpDriver<'a> {
                 .user_agent("whipplescript-host-runtime")
                 .build(),
             delta_sink: None,
+            cancel_probe: None,
         }
     }
 
     fn with_delta_sink(mut self, sink: &'a dyn Fn(&str)) -> Self {
         self.delta_sink = Some(sink);
+        self
+    }
+
+    fn with_cancel_probe(mut self, probe: &'a dyn Fn() -> bool) -> Self {
+        self.cancel_probe = Some(probe);
         self
     }
 
@@ -2895,6 +3001,16 @@ impl<'a> NativeHttpDriver<'a> {
                         }
                     }
                     raw.push_str(&line);
+                    // Cooperative cancel: release the stream at this
+                    // complete-line boundary. The truncated tail cannot
+                    // half-parse (the assembler reads only complete `data:`
+                    // lines), so what has arrived assembles exactly as a
+                    // naturally ended body would. A stalled stream is not
+                    // released here — `read_line` blocks until the agent's
+                    // whole-call timeout bounds it.
+                    if self.cancel_probe.is_some_and(|probe| probe()) {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -4727,6 +4843,155 @@ workflow Method {
         );
         assert_eq!(response.body, assemble_responses_sse(raw));
         assert_eq!(response.body["output_text"], "GaugeWright is live.");
+    }
+
+    /// A cancellation observed mid-stream releases the read at a complete-line
+    /// boundary: the transport returns promptly with the lines that fully
+    /// arrived — assembled exactly as a naturally ended body — instead of
+    /// waiting out the rest of the provider's stream.
+    #[test]
+    fn native_driver_releases_the_stream_on_an_observed_cancellation() {
+        use std::io::{Read, Write};
+        let first = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial \"}\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        // Detached on purpose: the server holds the stream open far longer than
+        // the assertion tolerates, so a driver that ignores the probe fails on
+        // elapsed time rather than passing by luck. Its writes after the client
+        // hangs up are allowed to fail.
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                first.len() + 4096
+            );
+            let _ = socket.write_all(first.as_bytes());
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let cancelled = std::cell::Cell::new(false);
+        // The request "lands" the moment the first delta is observed — the
+        // same mid-stream instant an embedding host's Stop would occupy.
+        let sink = |_: &str| cancelled.set(true);
+        let probe = || cancelled.get();
+        let driver = NativeHttpDriver::new(Duration::from_secs(60))
+            .with_delta_sink(&sink)
+            .with_cancel_probe(&probe);
+        let request = IoRequest::Http(HttpRequest {
+            url: format!("http://{addr}/v1/responses"),
+            headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
+            body: json!({}),
+        });
+        let started = std::time::Instant::now();
+        let IoResult::Http(result) = driver.fulfill(&request);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the release must not wait for the provider: {:?}",
+            started.elapsed()
+        );
+        let response = result.expect("http response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, assemble_responses_sse(first));
+        assert_eq!(response.body["output_text"], "partial ");
+    }
+
+    /// The mid-stream probe reads the same durable surface the handle writes,
+    /// throttles its store reads, and latches on first observation — the
+    /// release decision and the machine's released-round settlement must agree
+    /// about one stream. Asserted from inside a turn's provider round, which
+    /// is the only moment the probe exists for (a cancellation request needs a
+    /// committed effect to name).
+    struct ProbeAssertingDriver<'a> {
+        handle: HostCancellationHandle,
+        probe: &'a StreamCancelProbe,
+        checked: Cell<bool>,
+    }
+
+    impl HostDriver for ProbeAssertingDriver<'_> {
+        fn fulfill(&self, _request: &IoRequest) -> IoResult {
+            assert!(!self.probe.observed(), "no request yet");
+            assert!(!self.probe.released());
+            self.handle.request().expect("cancel request records");
+            assert!(
+                !self.probe.observed(),
+                "a read inside the throttle answers from the last read"
+            );
+            std::thread::sleep(StreamCancelProbe::READ_INTERVAL + Duration::from_millis(50));
+            assert!(self.probe.observed(), "the durable request is observed");
+            assert!(self.probe.released(), "the observation latches");
+            assert!(
+                self.probe.observed(),
+                "latched answers need no further reads"
+            );
+            self.checked.set(true);
+            IoResult::Http(Ok(HttpResponse {
+                status: 200,
+                body: json!({
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-before-cancel",
+                        "name": "read",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }],
+                    "usage": { "input_tokens": 10, "output_tokens": 2 }
+                }),
+            }))
+        }
+    }
+
+    #[test]
+    fn stream_cancel_probe_latches_on_the_durable_request() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-probe-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).expect("instance");
+        let command = turn(&instance.instance_ref, &open.policy, 1);
+        let probe = StreamCancelProbe::new(
+            path.clone(),
+            command.instance_ref.clone(),
+            command.command_id.clone(),
+        );
+        let driver = ProbeAssertingDriver {
+            handle: runtime.cancellation_handle(&command.instance_ref, &command.command_id),
+            probe: &probe,
+            checked: Cell::new(false),
+        };
+        let execution = runtime
+            .run_turn_with_driver(
+                &command,
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("turn settles");
+        assert!(driver.checked.get(), "the probe assertions ran mid-round");
+        let receipt = execution.receipt.as_ref().expect("terminal receipt");
+        assert_eq!(receipt.status, TurnStatus::Cancelled);
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     /// A provider may speak the user-facing reply on the same message as its
