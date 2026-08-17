@@ -1905,11 +1905,17 @@ pub struct VerifiedEnvelope {
 }
 
 /// One entry of a run's composition record (DR-0063 §4): which envelope, from
-/// which authority, at which version and epoch, the run was checked under.
+/// which authority, at which epoch, the run was checked under.
+///
+/// There is deliberately no separate `envelope_version`. This record *replaces*
+/// DR-0028 D4's single per-run policy binding rather than carrying it: the hash
+/// pins which document, and the epoch — inside the `:v2` signed preimage — pins
+/// which revision. A third number would restate the epoch while being covered by
+/// nothing, which is the unauthenticated-version flaw §5 exists to close.
 ///
 /// The record is the set actually checked, not the set the embedder derived —
-/// an ungoverned stakeholder has no hash, version, or epoch, and belongs on the
-/// roster beside it rather than here as a nullable row.
+/// an ungoverned stakeholder has no hash or epoch, and belongs on the roster
+/// beside it rather than here as a nullable row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionEntry {
     pub authority: String,

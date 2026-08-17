@@ -630,7 +630,7 @@ fn signing_bytes_from_hash(
 /// **epoch** and the **authority** the envelope speaks for.
 ///
 /// The epoch matters because a composition record cites
-/// `(authority, envelope_hash, envelope_version, epoch)` per constituent, and
+/// `(authority, envelope_hash, epoch)` per constituent, and
 /// under `:v1` the same valid signature verifies under whatever epoch a caller
 /// names — so a constituent can be presented as a different, including an
 /// earlier, policy version. That is exactly the non-retroactivity claim the
