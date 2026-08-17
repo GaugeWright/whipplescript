@@ -18709,6 +18709,24 @@ fn validate_record_blocks(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (schema, from_binding, body) in record_blocks(&rule.body.text) {
+        // A token where a field NAME was expected is a value the author wrote
+        // that nothing consumes. The splitter skips it silently, so
+        // `record Out { title  "hello" }` compiled clean and recorded the
+        // shorthand's value instead of the literal — a different value than the
+        // source says, with no diagnostic anywhere.
+        for stray in body::stray_value_tokens(&body) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "rule `{}` has a value with no field name in `record {schema}`: `{stray}`",
+                    rule.name.name
+                ),
+                suggestion: Some(format!(
+                    "give it a field name (`<field> {stray}`), or remove it"
+                )),
+            });
+        }
         for assignment in collect_field_assignments(&body) {
             let (field, value) = match assignment {
                 RecordFieldAssignment::Value { field, value } => (field, value),
@@ -33035,6 +33053,45 @@ test "a run" {
             missing.len(),
             cases.len(),
             missing.join("\n  ")
+        );
+    }
+
+    /// A value token where a field NAME was expected used to be dropped in
+    /// silence, and the recorded fact then took the SHORTHAND's value instead
+    /// of the literal the author wrote. Compiling clean and storing a different
+    /// value than the source states is the failure this project exists to
+    /// prevent, so the stray token is now a refusal.
+    #[test]
+    fn a_value_with_no_field_name_is_refused() {
+        let source = "workflow W\noutput result R\nclass R { ok bool }\nclass Src { title string }\nclass Out { title string }\n\nrule r\n  when Src as s\n=> {\n  record Out {\n    title\n    \"hello\"\n  }\n  complete result { ok true }\n}\n";
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.iter().any(|d| d.message
+                == "rule `r` has a value with no field name in `record Out`: `\"hello\"`"),
+            "the stray literal must be refused, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The accept half, and the reason this is a stray-token rule rather than a
+    /// ban on shorthand: a line-delimited bare name IS a field, and a `from`
+    /// block of them must stay legal.
+    #[test]
+    fn line_delimited_shorthand_fields_are_still_admitted() {
+        let source = "workflow W\noutput result R\nclass R { ok bool }\nclass Src { title string  note string }\nclass Out { title string  note string }\n\nrule r\n  when Src as s\n=> {\n  record Out from s {\n    title\n    note\n  }\n  complete result { ok true }\n}\n";
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "a from-block of shorthand fields must be admitted, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -2903,6 +2903,64 @@ pub fn claim_item_bindings(effects: &[ParsedEffect]) -> std::collections::BTreeS
         .collect()
 }
 
+/// Split a block body into whitespace-separated tokens, treating a quoted
+/// string as ONE token.
+///
+/// The `body`/`where`/`mode` scans below look for a BARE keyword token. Plain
+/// `split_whitespace` finds those keywords inside a quoted string too, so
+///
+/// ```text
+/// write text to fs at "p.txt" { mode append  body "x mode create y" }
+/// ```
+///
+/// compiled without a diagnostic and lowered with `mode` = `create` and `body`
+/// = `x`: the author's write mode replaced by one they never wrote, and their
+/// content truncated at the embedded token. The parser validates the write mode
+/// before this runs, so re-deriving it from raw text must not disagree with the
+/// gate that enforced it — a refusal weakened downstream of its own check is
+/// still a weakened refusal.
+///
+/// A string carrying no keyword tokenises to the same joined text as before,
+/// because the callers re-join with a single space.
+fn block_tokens(inner: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut chars = inner.char_indices().peekable();
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            chars.next();
+            let mut end = inner.len();
+            while let Some((index, ch)) = chars.next() {
+                if ch == '\\' {
+                    // Skip the escaped character, so an escaped quote does not
+                    // close the string early.
+                    chars.next();
+                    continue;
+                }
+                if ch == '"' {
+                    end = index + ch.len_utf8();
+                    break;
+                }
+            }
+            tokens.push(&inner[start..end]);
+        } else {
+            let mut end = inner.len();
+            while let Some(&(index, ch)) = chars.peek() {
+                if ch.is_whitespace() || ch == '"' {
+                    end = index;
+                    break;
+                }
+                chars.next();
+            }
+            tokens.push(&inner[start..end]);
+        }
+    }
+    tokens
+}
+
 pub fn parse_effect_statements(
     body: &str,
     context: &RuleContext,
@@ -3021,7 +3079,7 @@ pub fn parse_effect_statements(
             // Extract `text`/`markdown`/`thread_id`, tolerant of order: scan tokens,
             // collecting each field expression up to the next field keyword.
             let inner = invoke_body(&statement).unwrap_or_default();
-            let tokens = inner.split_whitespace().collect::<Vec<_>>();
+            let tokens = block_tokens(&inner);
             let field_keywords = ["text", "markdown", "thread_id"];
             let mut text_expr = String::new();
             let mut markdown_expr = String::new();
@@ -3085,7 +3143,7 @@ pub fn parse_effect_statements(
             // Extract `body` / `mode` from the block, tolerant of either order:
             // scan tokens, collecting the body expression up to `mode`.
             let inner = invoke_body(&statement).unwrap_or_default();
-            let tokens = inner.split_whitespace().collect::<Vec<_>>();
+            let tokens = block_tokens(&inner);
             let mut body_tokens = Vec::new();
             let mut mode = String::new();
             let mut cursor = 0;
@@ -3179,7 +3237,7 @@ pub fn parse_effect_statements(
                 .to_owned();
             // Block fields: optional `where <pred>` then `mode <mode>`.
             let inner = invoke_body(&statement).unwrap_or_default();
-            let tokens = inner.split_whitespace().collect::<Vec<_>>();
+            let tokens = block_tokens(&inner);
             let mut where_tokens = Vec::new();
             let mut mode = String::new();
             let mut cursor = 0;
@@ -7588,5 +7646,117 @@ renew slot until 300s as r
         ] {
             assert_eq!(interpolate_prompt(source, &context), source, "for {source}");
         }
+    }
+}
+
+#[cfg(test)]
+mod block_token_regression_tests {
+    //! The parser validates a write `mode` before lowering runs, and lowering
+    //! then re-derives it from the raw statement text. When that re-derivation
+    //! was not string-aware, the two disagreed: a bare `mode` token inside the
+    //! quoted `body` replaced the validated mode and truncated the body at that
+    //! token, with no diagnostic anywhere. A refusal enforced at one layer and
+    //! discarded at the next is the failure this project exists to prevent.
+
+    use super::{block_tokens, lower_rule, ready_contexts};
+    use whipplescript_parser::compile_program;
+    use whipplescript_store::FactView;
+
+    fn fact(name: &str, key: &str, value_json: &str) -> FactView {
+        FactView {
+            fact_id: format!("fact-{key}"),
+            program_version_id: None,
+            revision_epoch: 0,
+            name: name.to_owned(),
+            key: key.to_owned(),
+            value_json: value_json.to_owned(),
+            provenance_class: "rule".to_owned(),
+            source_span_json: None,
+            source_event_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_quoted_string_is_one_token_and_keeps_its_keywords() {
+        assert_eq!(
+            block_tokens(r#"mode append body "x mode create y""#),
+            vec!["mode", "append", "body", r#""x mode create y""#]
+        );
+        // An escaped quote does not close the string early.
+        assert_eq!(
+            block_tokens(r#"body "a \" mode create b" mode append"#),
+            vec!["body", r#""a \" mode create b""#, "mode", "append"]
+        );
+        // Unquoted text tokenises exactly as before, so the callers that
+        // re-join with a single space are unaffected.
+        assert_eq!(
+            block_tokens("where a == b mode replace"),
+            vec!["where", "a", "==", "b", "mode", "replace"]
+        );
+    }
+
+    #[test]
+    fn a_mode_token_inside_the_body_cannot_replace_the_declared_mode() {
+        let source = r#"workflow W
+output result R
+class R { ok bool }
+class Src { title string }
+
+file store fs {
+  root "./fsroot"
+  allow write ["**"]
+}
+
+rule r
+  when Src as s
+=> {
+  write text to fs at "p.txt" {
+    mode append
+    body "x mode create y"
+  } as w
+
+  after w succeeds { complete result { ok true } }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let facts = vec![fact("Src", "Src:a", r#"{"title":"real"}"#)];
+        let ready = ready_contexts(&ir, &ir.rules[0], &facts, &[], None);
+        assert_eq!(ready.contexts.len(), 1);
+        let lowering = lower_rule(
+            "ins",
+            "ver",
+            "0",
+            "fixture",
+            &ir,
+            &ir.rules[0],
+            &ready.contexts[0],
+            &facts,
+            &[],
+            None,
+        );
+        let write = lowering
+            .effects
+            .iter()
+            .find(|effect| effect.kind == "file.write")
+            .expect("a file.write effect");
+        let input: serde_json::Value =
+            serde_json::from_str(&write.input_json).expect("effect input is json");
+
+        // The declared mode, not the one embedded in the body. `create` and
+        // `append` differ on whether the path may already exist, so this is a
+        // semantic swap, not a cosmetic one.
+        assert_eq!(input["mode"], "append");
+        // And the body keeps every word the author wrote.
+        assert_eq!(input["body"], "x mode create y");
     }
 }

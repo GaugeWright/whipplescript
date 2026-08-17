@@ -658,7 +658,41 @@ pub struct SplitFieldAssignment {
 /// multi-line blocks behave identically. Shorthand (bare name, `from` blocks
 /// only at the call site) is line-delimited: a name with no same-line value
 /// is shorthand.
+/// The source text of every token that appeared where a FIELD NAME was
+/// expected, and was therefore skipped.
+///
+/// The splitter drops such a token silently, which loses what the author wrote
+/// with no diagnostic anywhere:
+///
+/// ```text
+/// record Out {
+///   title
+///   "hello"
+/// }
+/// ```
+///
+/// `title` is a line-delimited shorthand field (documented, and correct), and
+/// `"hello"` is then a value with no field name. That compiled clean and the
+/// recorded fact took the shorthand's value instead, so the author's literal
+/// was silently replaced by a different one.
+///
+/// This shares ONE scan with `split_field_assignments` rather than mirroring
+/// it. A second copy would drift, and two scans of the same text disagreeing is
+/// the defect this exists to report.
+pub fn stray_value_tokens(source: &str) -> Vec<String> {
+    let mut stray = Vec::new();
+    split_fields_inner(source, Some(&mut stray));
+    stray
+}
+
 pub fn split_field_assignments(source: &str) -> Vec<SplitFieldAssignment> {
+    split_fields_inner(source, None)
+}
+
+fn split_fields_inner(
+    source: &str,
+    mut stray: Option<&mut Vec<String>>,
+) -> Vec<SplitFieldAssignment> {
     let mut diagnostics = Vec::new();
     let tokens = lex_body(source, 0, &mut diagnostics);
     let mut parser = BodyParser {
@@ -671,7 +705,16 @@ pub fn split_field_assignments(source: &str) -> Vec<SplitFieldAssignment> {
     let mut assignments = Vec::new();
     while let Some(token) = parser.peek() {
         let name_line = token.line;
+        let (stray_start, stray_end) = (token.start, token.end);
         let Tok::Ident(name) = token.tok.clone() else {
+            if let Some(sink) = stray.as_deref_mut() {
+                sink.push(
+                    source
+                        .get(stray_start..stray_end)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+            }
             parser.pos += 1;
             continue;
         };
