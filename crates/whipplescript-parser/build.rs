@@ -121,7 +121,7 @@ fn main() {
          // The compiled-in table of `declaration_block` grammars (DR-0011 Shape 1):\n\
          // each row transcribes one grammar-only std manifest construct's `grammar`\n\
          // object. Head-word dispatch (`declaration_block_spec_at`) reads this table.\n\
-         const DECLARATION_BLOCK_GRAMMAR: &[DeclarationBlockSpec] = &[\n{decl_rows}];\n"
+         pub(crate) const DECLARATION_BLOCK_GRAMMAR: &[DeclarationBlockSpec] = &[\n{decl_rows}];\n"
     );
     let decl_out_path = PathBuf::from(&out_dir).join("declaration_block_grammar.rs");
     fs::write(&decl_out_path, decl_generated).unwrap_or_else(|error| {
