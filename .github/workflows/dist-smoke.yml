@@ -17,7 +17,7 @@ jobs:
   # runs against is the compatibility floor the release is tested at. A newer
   # image would pass a binary that fails on 22.04 and call the release good.
   packaged-linux-x64:
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-22.04' || 'blacksmith-4vcpu-ubuntu-2204' }}
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

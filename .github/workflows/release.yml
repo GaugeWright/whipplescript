@@ -75,7 +75,7 @@ jobs:
     # `needs.plan.result == 'success'`, so a skipped plan skips all of them
     # rather than leaving one to evaluate an empty manifest.
     if: github.repository == 'GaugeWright/whipplescript'
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -201,7 +201,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -284,7 +284,7 @@ jobs:
       "attestations": "write"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       val: ${{ steps.host.outputs.manifest }}
@@ -374,7 +374,7 @@ jobs:
     needs:
       - plan
       - host
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -426,7 +426,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
-    runs-on: ${{ github.repository == 'GaugeWright/whipplescript' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
