@@ -1,6 +1,11 @@
 pkg/*
 !pkg/
 !pkg/whipplescript_host_do_bg.d.ts
+# The same wasm built for the *nodejs* target, which `mint-canary-governance-root`
+# loads to prove an envelope against the runtime's real verifier before writing
+# it. Separate from `pkg/` on purpose: that holds the bundler target the Worker
+# is deployed from, and building the nodejs target over it breaks the deploy.
+pkg-node/
 node_modules/
 # `capture:collection-vector` writes here; the vector is committed in gaugedesk,
 # which is where the Rust opener that must agree with it lives.
