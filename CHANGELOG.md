@@ -3,6 +3,29 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.2] — 2026-08-17
+
+Durable stores survive toolchain upgrades. Consuming 0.5.1 from GaugeDesk
+surfaced that the replayed-open guard stranded every pre-existing instance
+after a compiler-evolving upgrade: the recorded `ir_hash` could never match
+what the new toolchain derives for the identical authored program.
+
+### Fixed
+
+- **A replayed instance open re-attests the IR under the current compiler**
+  when the authored identity (`source_hash`) matches and only the compiled
+  identity (`ir_hash`) differs. The current compile is registered as a program
+  version, the instance is re-pointed, and `instance.program.reattested` is
+  appended naming both IRs — an auditable event, never a silent acceptance.
+  A differing `source_hash` stays refused: different authored content under a
+  replayed request is the integrity breach the guard exists for
+  (`spec/agent-harness.md` "Program identity across toolchains").
+
+### Added
+
+- `RuntimeStore::reattest_instance_program`, implemented for the native
+  `SqliteStore` and the durable-object `DoSqliteStore`.
+
 ## [0.5.1] — 2026-08-17
 
 Stop lands mid-stream. Cancellation of a brokered turn was cooperative only
