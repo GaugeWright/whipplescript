@@ -44,6 +44,10 @@ codex = ["dep:whipplescript-provider-codex"]
 claude = ["dep:whipplescript-provider-claude"]
 
 [dev-dependencies]
+# Raw store access for upgrade-shaped fixtures: the re-attestation tests age a
+# recorded ir_hash the way an older toolchain would have written it, which no
+# store API does (and none should).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Enables the private legacy-envelope fixture constructor only while compiling
 # this crate's tests; normal library/binary builds do not expose it.
 # `default-features = false` keeps the kernel's codex/claude adapter features

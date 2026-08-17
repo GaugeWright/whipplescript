@@ -4191,6 +4191,116 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         })
     }
 
+    fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        // Same semantics as `SqliteStore::reattest_instance_program`: the DO's
+        // single-writer serializes these statements, standing in for the
+        // native transaction.
+        let recorded_rows = self
+            .sql
+            .query(
+                "SELECT instances.program_id, instances.version_id, \
+                 program_versions.source_hash, program_versions.ir_hash FROM instances \
+                 JOIN program_versions ON program_versions.version_id = instances.version_id \
+                 WHERE instances.instance_id = ?1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = recorded_rows.first() else {
+            return Err(StoreError::Conflict(format!(
+                "cannot re-attest unknown instance {instance_id}"
+            )));
+        };
+        let program_id = as_text(&row[0]);
+        let from_version_id = as_text(&row[1]);
+        let recorded_source = as_text(&row[2]);
+        let recorded_ir = as_text(&row[3]);
+        if recorded_source != version.source_hash {
+            return Err(StoreError::Conflict(
+                "re-attestation requires the same authored program".to_owned(),
+            ));
+        }
+        if recorded_ir == version.ir_hash {
+            return Ok(ProgramVersionRecord {
+                program_id,
+                version_id: from_version_id,
+            });
+        }
+        self.sql
+            .execute(
+                "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
+                 compiler_version, declared_capabilities, declared_profiles, declared_skills, \
+                 declared_schemas, analysis_summary, generated_artifacts, artifact_root) VALUES \
+                 ('ver_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                 ?11) ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING",
+                &[
+                    text(&program_id),
+                    text(version.source_hash),
+                    text(version.ir_hash),
+                    text(version.compiler_version),
+                    text(version.declared_capabilities_json),
+                    text(version.declared_profiles_json),
+                    text(version.declared_skills_json),
+                    text(version.declared_schemas_json),
+                    text(version.analysis_summary_json),
+                    text(version.generated_artifacts_json),
+                    opt_text(version.artifact_root),
+                ],
+            )
+            .map_err(sql_err)?;
+        let version_rows = self
+            .sql
+            .query(
+                "SELECT version_id FROM program_versions \
+                 WHERE program_id = ?1 AND source_hash = ?2 AND ir_hash = ?3",
+                &[
+                    text(&program_id),
+                    text(version.source_hash),
+                    text(version.ir_hash),
+                ],
+            )
+            .map_err(sql_err)?;
+        let to_version_id = version_rows
+            .first()
+            .map(|r| as_text(&r[0]))
+            .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))?;
+        let payload = serde_json::json!({
+            "from_version_id": &from_version_id,
+            "to_version_id": &to_version_id,
+            "source_hash": version.source_hash,
+            "from_ir_hash": &recorded_ir,
+            "to_ir_hash": version.ir_hash,
+            "compiler_version": version.compiler_version,
+        })
+        .to_string();
+        let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
+        do_append_event_idempotent(
+            &self.sql,
+            NewEvent {
+                instance_id,
+                event_type: "instance.program.reattested",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&idempotency),
+            },
+        )?;
+        self.sql
+            .execute(
+                "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
+                &[text(&to_version_id), text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(ProgramVersionRecord {
+            program_id,
+            version_id: to_version_id,
+        })
+    }
+
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         let rows = self
             .sql

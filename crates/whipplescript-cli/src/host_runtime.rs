@@ -1824,7 +1824,7 @@ impl GovernedHostRuntime {
     }
 
     fn replayed_open_instance(
-        &self,
+        &mut self,
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
     ) -> Result<Option<OpenedInstance>, HostRuntimeError> {
@@ -1868,12 +1868,35 @@ impl GovernedHostRuntime {
                     .store()
                     .get_program_version(&instance.version_id)
                     .map_err(HostRuntimeError::Store)?
-                    .ok_or_else(|| HostRuntimeError::UnknownInstance(instance.instance_id))?;
-                if version.source_hash != package.source_hash || version.ir_hash != package.ir_hash
-                {
+                    .ok_or_else(|| {
+                        HostRuntimeError::UnknownInstance(instance.instance_id.clone())
+                    })?;
+                // Different authored content under a replayed request is the
+                // integrity breach this guard exists for.
+                if version.source_hash != package.source_hash {
                     return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
                         "replayed package content",
                     )));
+                }
+                // Same authored program, different IR: the toolchain compiling
+                // it has moved since the instance was opened. Refusing here
+                // would strand every instance across every compiler-evolving
+                // upgrade, which contradicts the store's durability — so the
+                // current compile is re-attested (an auditable event plus a
+                // version re-point, spec/agent-harness.md "Program identity
+                // across toolchains").
+                if version.ir_hash != package.ir_hash {
+                    self.kernel
+                        .reattest_instance_program(
+                            &instance.instance_id,
+                            ProgramVersionInput {
+                                program_name: &package.agent,
+                                source_hash: &package.source_hash,
+                                ir_hash: &package.ir_hash,
+                                compiler_version: HOST_PROTOCOL,
+                            },
+                        )
+                        .map_err(HostRuntimeError::Store)?;
                 }
                 return Ok(Some(opened));
             }
@@ -4970,6 +4993,117 @@ workflow Method {
                 }),
             }))
         }
+    }
+
+    /// A runtime upgrade changes the compiled identity of the same authored
+    /// package. A replayed open re-attests the IR under the current compiler
+    /// and the instance keeps running turns — it is not stranded
+    /// (spec/agent-harness.md "Program identity across toolchains").
+    #[test]
+    fn replayed_open_reattests_an_older_toolchains_ir() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-reattest-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let first = runtime.open_instance(&open, &Packages).expect("instance");
+        drop(runtime);
+        // Stand in for an older toolchain: the recorded IR differs from what
+        // the current compiler derives for the identical authored package.
+        {
+            let connection = rusqlite::Connection::open(&path).expect("raw store");
+            connection
+                .execute(
+                    "UPDATE program_versions SET ir_hash = 'ir-of-an-older-toolchain'",
+                    [],
+                )
+                .expect("age the recorded ir");
+        }
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("reopen");
+        let replayed = runtime
+            .open_instance(&open, &Packages)
+            .expect("the replayed open re-attests instead of refusing");
+        assert_eq!(replayed.instance_ref, first.instance_ref);
+        // The re-attestation is an auditable event, and the instance runs.
+        {
+            let connection = rusqlite::Connection::open(&path).expect("raw store");
+            let reattested: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'instance.program.reattested'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count events");
+            assert_eq!(reattested, 1, "one re-attestation event");
+        }
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "still here",
+            "usage": { "input_tokens": 4, "output_tokens": 2 }
+        })]);
+        let execution = runtime
+            .run_turn_with_driver(
+                &turn(&replayed.instance_ref, &open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("a turn runs on the re-attested instance");
+        let receipt = execution.receipt.as_ref().expect("terminal receipt");
+        assert_eq!(receipt.status, TurnStatus::Completed);
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+    }
+
+    /// Different authored content under a replayed request stays refused — the
+    /// re-attestation path never widens the guard for a changed source.
+    #[test]
+    fn replayed_open_still_refuses_changed_authored_content() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-changed-source-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        runtime.open_instance(&open, &Packages).expect("instance");
+        drop(runtime);
+        {
+            let connection = rusqlite::Connection::open(&path).expect("raw store");
+            connection
+                .execute(
+                    "UPDATE program_versions SET source_hash = 'someone-elses-program'",
+                    [],
+                )
+                .expect("change the recorded authored identity");
+        }
+        let mut runtime = GovernedHostRuntime::open(&path, 8, &policy_text).expect("reopen");
+        let refused = runtime.open_instance(&open, &Packages);
+        assert!(
+            matches!(
+                refused,
+                Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "replayed package content"
+                )))
+            ),
+            "changed authored content is refused: {refused:?}"
+        );
+        drop(runtime);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]

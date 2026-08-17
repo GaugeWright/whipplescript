@@ -1256,6 +1256,144 @@ impl SqliteStore {
         })
     }
 
+    /// Re-attest an instance's program under the current compiler
+    /// (spec/execution-contract.md "Program identity across toolchains"). The
+    /// instance's recorded version and the freshly resolved package share one
+    /// authored identity (`source_hash`); only the compiled `ir_hash` differs,
+    /// which happens exactly when the toolchain compiling the same authored
+    /// program has moved. Registers the current compile as a program version
+    /// (idempotent on its identity), re-points the instance, and appends
+    /// `instance.program.reattested` naming both IRs — an auditable event,
+    /// never a silent row edit. A differing `source_hash` is refused: that is
+    /// different authored content, which replay must keep rejecting.
+    pub fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let recorded = tx
+            .query_row(
+                r#"
+                SELECT
+                    instances.program_id,
+                    instances.version_id,
+                    program_versions.source_hash,
+                    program_versions.ir_hash
+                FROM instances
+                JOIN program_versions
+                    ON program_versions.version_id = instances.version_id
+                WHERE instances.instance_id = ?1
+                "#,
+                [instance_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((program_id, from_version_id, recorded_source, recorded_ir)) = recorded else {
+            return Err(StoreError::Conflict(format!(
+                "cannot re-attest unknown instance {instance_id}"
+            )));
+        };
+        if recorded_source != version.source_hash {
+            return Err(StoreError::Conflict(
+                "re-attestation requires the same authored program".to_owned(),
+            ));
+        }
+        if recorded_ir == version.ir_hash {
+            return Ok(ProgramVersionRecord {
+                program_id,
+                version_id: from_version_id,
+            });
+        }
+        tx.execute(
+            r#"
+            INSERT INTO program_versions (
+                version_id,
+                program_id,
+                source_hash,
+                ir_hash,
+                compiler_version,
+                declared_capabilities,
+                declared_profiles,
+                declared_skills,
+                declared_schemas,
+                analysis_summary,
+                generated_artifacts,
+                artifact_root
+            )
+            VALUES (
+                'ver_' || lower(hex(randomblob(16))),
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+            )
+            ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING
+            "#,
+            params![
+                &program_id,
+                version.source_hash,
+                version.ir_hash,
+                version.compiler_version,
+                version.declared_capabilities_json,
+                version.declared_profiles_json,
+                version.declared_skills_json,
+                version.declared_schemas_json,
+                version.analysis_summary_json,
+                version.generated_artifacts_json,
+                version.artifact_root,
+            ],
+        )?;
+        let to_version_id = tx.query_row(
+            r#"
+            SELECT version_id
+            FROM program_versions
+            WHERE program_id = ?1
+              AND source_hash = ?2
+              AND ir_hash = ?3
+            "#,
+            params![&program_id, version.source_hash, version.ir_hash],
+            |row| row.get::<_, String>(0),
+        )?;
+        let payload = serde_json::json!({
+            "from_version_id": &from_version_id,
+            "to_version_id": &to_version_id,
+            "source_hash": version.source_hash,
+            "from_ir_hash": &recorded_ir,
+            "to_ir_hash": version.ir_hash,
+            "compiler_version": version.compiler_version,
+        })
+        .to_string();
+        let idempotency = format!("reattest:{instance_id}:{from_version_id}:{to_version_id}");
+        append_event_on(
+            &tx,
+            NewEvent {
+                instance_id,
+                event_type: "instance.program.reattested",
+                payload_json: &payload,
+                source: "kernel",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&idempotency),
+            },
+        )?;
+        tx.execute(
+            "UPDATE instances SET version_id = ?1 WHERE instance_id = ?2",
+            params![&to_version_id, instance_id],
+        )?;
+        tx.commit()?;
+        Ok(ProgramVersionRecord {
+            program_id,
+            version_id: to_version_id,
+        })
+    }
+
     pub fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.connection
             .query_row(
@@ -6231,6 +6369,13 @@ pub trait RuntimeStore {
         &mut self,
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord>;
+    /// Re-attest an instance's program under the current compiler: same
+    /// authored identity, new IR (see `SqliteStore::reattest_instance_program`).
+    fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord>;
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>>;
     fn create_instance(&self, instance: NewInstance<'_>) -> StoreResult<InstanceRecord>;
     fn create_instance_with_authority(
@@ -6507,6 +6652,13 @@ impl RuntimeStore for SqliteStore {
         version: NewProgramVersion<'_>,
     ) -> StoreResult<ProgramVersionRecord> {
         self.create_program_version(version)
+    }
+    fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.reattest_instance_program(instance_id, version)
     }
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.get_program_version(version_id)

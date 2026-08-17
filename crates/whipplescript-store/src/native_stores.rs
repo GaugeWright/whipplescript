@@ -63,6 +63,14 @@ impl RuntimeStore for NativeStores {
         self.runtime.create_program_version(version)
     }
 
+    fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        version: NewProgramVersion<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.runtime.reattest_instance_program(instance_id, version)
+    }
+
     fn get_program_version(&self, version_id: &str) -> StoreResult<Option<ProgramVersionView>> {
         self.runtime.get_program_version(version_id)
     }

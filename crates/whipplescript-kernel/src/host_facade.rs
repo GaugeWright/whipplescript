@@ -402,7 +402,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
     }
 
     fn replayed_open_instance(
-        &self,
+        &mut self,
         command: &OpenInstanceCommand,
         package: &ResolvedPackage,
     ) -> Result<Option<OpenedInstance>, HostFacadeError> {
@@ -452,12 +452,31 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     .store()
                     .get_program_version(&instance.version_id)
                     .map_err(HostFacadeError::Store)?
-                    .ok_or_else(|| HostFacadeError::UnknownInstance(instance.instance_id))?;
-                if version.source_hash != package.source_hash || version.ir_hash != package.ir_hash
-                {
+                    .ok_or_else(|| {
+                        HostFacadeError::UnknownInstance(instance.instance_id.clone())
+                    })?;
+                // Different authored content under a replayed request is the
+                // integrity breach this guard exists for.
+                if version.source_hash != package.source_hash {
                     return Err(HostFacadeError::Protocol(ProtocolError::Mismatch(
                         "replayed package content",
                     )));
+                }
+                // Same authored program, different IR: re-attest under the
+                // current compiler rather than strand the instance
+                // (spec/agent-harness.md "Program identity across toolchains").
+                if version.ir_hash != package.ir_hash {
+                    self.kernel
+                        .reattest_instance_program(
+                            &instance.instance_id,
+                            ProgramVersionInput {
+                                program_name: &package.agent,
+                                source_hash: &package.source_hash,
+                                ir_hash: &package.ir_hash,
+                                compiler_version: HOST_PROTOCOL,
+                            },
+                        )
+                        .map_err(HostFacadeError::Store)?;
                 }
                 return Ok(Some(opened));
             }

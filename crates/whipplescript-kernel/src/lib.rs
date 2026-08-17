@@ -890,6 +890,32 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })
     }
 
+    /// Re-attest an instance's program under the current compiler: same
+    /// authored identity (`source_hash`), new `ir_hash`. See
+    /// `RuntimeStore::reattest_instance_program`.
+    pub fn reattest_instance_program(
+        &mut self,
+        instance_id: &str,
+        input: ProgramVersionInput<'_>,
+    ) -> StoreResult<ProgramVersionRecord> {
+        self.store.reattest_instance_program(
+            instance_id,
+            NewProgramVersion {
+                program_name: input.program_name,
+                source_hash: input.source_hash,
+                ir_hash: input.ir_hash,
+                compiler_version: input.compiler_version,
+                declared_capabilities_json: "[]",
+                declared_profiles_json: "[]",
+                declared_skills_json: "[]",
+                declared_schemas_json: "[]",
+                analysis_summary_json: "{}",
+                generated_artifacts_json: "[]",
+                artifact_root: None,
+            },
+        )
+    }
+
     pub fn create_instance(
         &self,
         version: &ProgramVersionRecord,
