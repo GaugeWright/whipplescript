@@ -1341,6 +1341,14 @@ impl TurnExecution {
     }
 }
 
+/// A store-recorded instance identity, as [`GovernedHostRuntime::newest_recorded_instance`]
+/// reports it: enough to name an adoption source, never enough to execute one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedInstance {
+    pub instance_ref: String,
+    pub package_version_ref: String,
+}
+
 /// Out-of-band cooperative cancellation capability for one admitted host
 /// command. It opens an independent store connection, so an embedding UI can
 /// request cancellation while the runtime-owning thread is blocked in provider
@@ -1510,6 +1518,28 @@ impl GovernedHostRuntime {
 
     /// The latest durable coordinate for an instance. Hosts use this to bind a
     /// fork to one explicit source point rather than an implicit moving head.
+    /// The newest instance this store records, with its recorded package
+    /// reference — the adoption seam's source lookup for an embedding host
+    /// whose authored package identity has drifted past what a replayed open
+    /// can reproduce (see [`Self::adopt_instance_from`]). `None` for a store
+    /// that has never opened an instance.
+    pub fn newest_recorded_instance(&self) -> Result<Option<RecordedInstance>, HostRuntimeError> {
+        let mut instances = self
+            .kernel
+            .store()
+            .list_instances()
+            .map_err(HostRuntimeError::Store)?;
+        let Some(instance) = instances.pop() else {
+            return Ok(None);
+        };
+        let metadata: InstanceMetadata =
+            serde_json::from_str(&instance.input_json).map_err(HostRuntimeError::Json)?;
+        Ok(Some(RecordedInstance {
+            instance_ref: instance.instance_id,
+            package_version_ref: metadata.package_version_ref,
+        }))
+    }
+
     pub fn current_position(&self, instance_ref: &str) -> Result<EventPosition, HostRuntimeError> {
         let events = self
             .kernel
@@ -1661,21 +1691,8 @@ impl GovernedHostRuntime {
         validate_package(&target_package, &command.package_version_ref)?;
         self.check_package_ifc(&target_package)?;
 
-        let source_instance = source_runtime
-            .kernel
-            .store()
-            .get_instance(&command.source.instance_ref)
-            .map_err(HostRuntimeError::Store)?
-            .ok_or_else(|| {
-                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
-            })?;
-        let source_metadata: InstanceMetadata =
-            serde_json::from_str(&source_instance.input_json).map_err(HostRuntimeError::Json)?;
-        if source_metadata.protocol != HOST_PROTOCOL || source_metadata.policy != command.policy {
-            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                "fork source package/policy binding",
-            )));
-        }
+        let source_metadata =
+            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
         let source_package = packages
             .resolve_package(&source_metadata.package_version_ref)
             .map_err(HostRuntimeError::Resolver)?;
@@ -1688,6 +1705,104 @@ impl GovernedHostRuntime {
             packages,
         )?;
 
+        self.fork_to_target(
+            source_runtime,
+            command,
+            packages,
+            &target_package,
+            &source_package.agent,
+        )
+    }
+
+    /// Fork a recorded instance to the current package **without requiring the
+    /// source's authored package to be reproducible** — the adoption seam for
+    /// an embedding host whose package authoring has evolved past what a
+    /// replayed open can reproduce (spec/agent-harness.md "Program identity
+    /// across toolchains"). The source is identified, protocol- and
+    /// policy-checked, and required quiescent exactly as an ordinary fork;
+    /// only source-content reproduction is waived. That is sound because an
+    /// adopted source is never executed again: its thread is seeded into the
+    /// target, and the target's package resolves and validates in full under
+    /// the current authoring.
+    pub fn adopt_instance_from<P: PackageResolver + ?Sized>(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
+        command.validate()?;
+        self.require_policy(&command.policy)?;
+        source_runtime.require_policy(&command.policy)?;
+
+        let target_package = packages
+            .resolve_package(&command.package_version_ref)
+            .map_err(HostRuntimeError::Resolver)?;
+        validate_package(&target_package, &command.package_version_ref)?;
+        self.check_package_ifc(&target_package)?;
+
+        let source_metadata =
+            Self::fork_source_metadata(source_runtime, &command.source.instance_ref, command)?;
+        let _ = source_metadata; // identity + policy checked; content deliberately not re-derived
+                                 // The recorded program name stands in for the unresolvable source
+                                 // package's agent: it names whose thread is being carried.
+        let source_instance = source_runtime
+            .kernel
+            .store()
+            .get_instance(&command.source.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| {
+                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
+            })?;
+        let source_version = source_runtime
+            .kernel
+            .store()
+            .get_program_version(&source_instance.version_id)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| {
+                HostRuntimeError::UnknownInstance(command.source.instance_ref.clone())
+            })?;
+
+        self.fork_to_target(
+            source_runtime,
+            command,
+            packages,
+            &target_package,
+            &source_version.program_name,
+        )
+    }
+
+    /// The shared fork tail: source position and quiescence checks, target
+    /// open (fully validated), replay short-circuit, thread seeding, and the
+    /// `host.instance.forked` record.
+    fn fork_source_metadata(
+        source_runtime: &GovernedHostRuntime,
+        instance_ref: &str,
+        command: &ForkInstanceCommand,
+    ) -> Result<InstanceMetadata, HostRuntimeError> {
+        let source_instance = source_runtime
+            .kernel
+            .store()
+            .get_instance(instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
+        let source_metadata: InstanceMetadata =
+            serde_json::from_str(&source_instance.input_json).map_err(HostRuntimeError::Json)?;
+        if source_metadata.protocol != HOST_PROTOCOL || source_metadata.policy != command.policy {
+            return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                "fork source package/policy binding",
+            )));
+        }
+        Ok(source_metadata)
+    }
+
+    fn fork_to_target<P: PackageResolver + ?Sized>(
+        &mut self,
+        source_runtime: &GovernedHostRuntime,
+        command: &ForkInstanceCommand,
+        packages: &P,
+        target_package: &ResolvedPackage,
+        source_agent: &str,
+    ) -> Result<ForkedInstance, HostRuntimeError> {
         let current = source_runtime.current_position(&command.source.instance_ref)?;
         if command.source.sequence > current.sequence {
             return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
@@ -1723,7 +1838,7 @@ impl GovernedHostRuntime {
             .kernel
             .snapshot_agent_thread(
                 &command.source.instance_ref,
-                &source_package.agent,
+                source_agent,
                 Some(command.source.sequence as i64),
             )
             .map_err(HostRuntimeError::Store)?;
@@ -4038,6 +4153,131 @@ workflow UnsafeHostChat {
             .to_string();
         assert!(serialized.contains("source answer"));
         assert!(serialized.contains("turn 2"));
+
+        drop(target);
+        drop(source);
+        for path in [&source_path, &target_path] {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = fs::remove_file(path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// An embedding host whose package authoring drifted cannot reproduce the
+    /// source's recorded content: an ordinary fork keeps refusing, and
+    /// adoption carries the thread to the current, fully validated package
+    /// (spec/agent-harness.md "Program identity across toolchains").
+    #[test]
+    fn adoption_forks_a_source_whose_authored_package_drifted() {
+        let source_path = temp_store();
+        let target_path = temp_store();
+        let policy_text = signed_policy();
+        let mut source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("source runtime");
+        let source_open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-drifted-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: source.policy_ref().clone(),
+        };
+        let source_instance = source
+            .open_instance(&source_open, &Packages)
+            .expect("source instance");
+        source
+            .run_turn_with_driver(
+                &turn(&source_instance.instance_ref, &source_open.policy, 1),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &ScriptedDriver::new(vec![json!({
+                    "output_text": "answer from before the drift",
+                    "usage": { "input_tokens": 10, "output_tokens": 3 }
+                })]),
+            )
+            .expect("source turn");
+        let source_position = source
+            .current_position(&source_instance.instance_ref)
+            .expect("source position");
+        drop(source);
+        // Today's host assembles different authored bytes under the same
+        // reference — recorded by an older build, unreproducible now.
+        {
+            let connection = rusqlite::Connection::open(&source_path).expect("raw store");
+            connection
+                .execute(
+                    "UPDATE program_versions SET source_hash = 'authored-by-an-older-build'",
+                    [],
+                )
+                .expect("age the authored identity");
+        }
+        let source =
+            GovernedHostRuntime::open(&source_path, 9, &policy_text).expect("reopen source");
+        assert_eq!(
+            source
+                .newest_recorded_instance()
+                .expect("recorded instance")
+                .expect("store has one")
+                .instance_ref,
+            source_instance.instance_ref,
+        );
+
+        let mut target =
+            GovernedHostRuntime::open(&target_path, 9, &policy_text).expect("target runtime");
+        let fork = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "adopt-drifted-into-target".to_owned(),
+            source: source_position,
+            target_request_id: "open-adopted-chat".to_owned(),
+            package_version_ref: "package:v2".to_owned(),
+            policy: target.policy_ref().clone(),
+        };
+        assert!(
+            target
+                .fork_instance_from(&source, &fork, &Packages)
+                .is_err(),
+            "an ordinary fork must keep refusing an unreproducible source"
+        );
+        let adopted = target
+            .adopt_instance_from(&source, &fork, &Packages)
+            .expect("adoption succeeds");
+        adopted.validate_for(&fork).expect("fork binding");
+        assert_ne!(adopted.target.instance_ref, source_instance.instance_ref);
+        let replayed = target
+            .adopt_instance_from(&source, &fork, &Packages)
+            .expect("adoption replays");
+        assert_eq!(replayed, adopted);
+
+        let driver = ScriptedDriver::new(vec![json!({
+            "output_text": "answer after adoption",
+            "usage": { "input_tokens": 20, "output_tokens": 3 }
+        })]);
+        target
+            .run_turn_with_driver(
+                &turn_with_package(&adopted.target.instance_ref, &fork.policy, 2, "package:v2"),
+                &Packages,
+                &Secrets {
+                    calls: Cell::new(0),
+                },
+                &Resources {
+                    calls: Cell::new(0),
+                },
+                &driver,
+            )
+            .expect("target turn");
+        let serialized = driver
+            .requests
+            .borrow()
+            .first()
+            .expect("target request")
+            .to_string();
+        assert!(
+            serialized.contains("answer from before the drift"),
+            "the adopted thread is carried"
+        );
 
         drop(target);
         drop(source);
