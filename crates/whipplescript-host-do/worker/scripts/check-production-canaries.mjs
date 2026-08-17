@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -117,8 +118,21 @@ async function main() {
   // A lane cannot be declared into being. The workflow the manifest names has to
   // exist, or the declaration is the same kind of true-on-paper the orchestrator
   // field was before this: agreeing with its own assertion and with nothing else.
-  const workflow = resolve(root, "../../..", canaries.activation.workflow);
-  await readFile(workflow, "utf8");
+  //
+  // The public mirror is the one place that cannot hold. It is a curated
+  // projection that carries this contract -- `crates` ships wholesale -- but not
+  // `.github/workflows/`, so the read found nothing there and took the whole
+  // `hosted-runtime-contracts` job down on every sync. Publishing the workflow
+  // to fix that would be the wrong direction twice: it puts this runtime's
+  // production wiring in a public repository, and it contradicts
+  // `activation.orchestratorRepository`, which says `whipplescript-src` owns
+  // these canaries. `AGENTS.md` is never published, so its absence is how the
+  // projection identifies itself -- the same discriminator three checks in
+  // `scripts/check-mirror-projection.mjs` already rely on.
+  if (existsSync(resolve(root, "../../../AGENTS.md"))) {
+    const workflow = resolve(root, "../../..", canaries.activation.workflow);
+    await readFile(workflow, "utf8");
+  }
   console.log(
     `Production canary contract tracks ${result.covered} critical routes in `
       + `${result.suites} suites, including every one of ${result.gaps} routes `
