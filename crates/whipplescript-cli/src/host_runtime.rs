@@ -595,6 +595,16 @@ pub trait ResourceResolver {
     fn take_turn_witness(&self) -> TurnWitness {
         TurnWitness::Unavailable
     }
+
+    /// Live projection of the assistant's answer text while a turn is
+    /// running: called once per provider `output_text` delta, in order, as
+    /// the stream arrives. This is the native host's synchronous activity
+    /// seam for `streaming_output` (spec/agent-harness.md "Live Turn
+    /// Observation"): ephemeral by contract — never durable, never ordered
+    /// evidence, and once the turn settles the durable assistant output
+    /// replaces whatever was projected. Reasoning deltas are never offered.
+    /// The default observes nothing.
+    fn observe_text_delta(&self, _delta: &str) {}
 }
 
 /// WhippleScript-owned native implementation of the workspace capability used
@@ -1816,7 +1826,8 @@ impl GovernedHostRuntime {
     {
         self.admit_command(command, packages)?;
         let binding = self.resolve_provider(command, secrets)?;
-        let driver = NativeHttpDriver::new(binding.timeout);
+        let sink = |delta: &str| resources.observe_text_delta(delta);
+        let driver = NativeHttpDriver::new(binding.timeout).with_delta_sink(&sink);
         self.run_admitted_turn(command, packages, resources, binding, &driver)
     }
 
@@ -2658,6 +2669,12 @@ impl GovernedHostRuntime {
             .rposition(|message| matches!(message, ChatMessage::User { .. }))
             .map_or(0, |index| index + 1);
         let mut assistant_text = String::new();
+        // Answer text spoken alongside tool calls. A provider may put the
+        // user-facing reply on the same message as its calls and close the
+        // turn with an empty final message; dropping that text projected a
+        // completed turn as a blank reply. A closing text-only message still
+        // wins — this is only the projection's floor, never its override.
+        let mut text_with_calls = String::new();
         let mut tool_calls: Vec<ProjectedToolCall> = Vec::new();
         for message in &messages[turn_start..] {
             match message {
@@ -2666,8 +2683,13 @@ impl GovernedHostRuntime {
                     tool_calls: calls,
                 } => {
                     if calls.is_empty() {
-                        assistant_text.clone_from(text);
+                        if !text.is_empty() {
+                            assistant_text.clone_from(text);
+                        }
                     } else {
+                        if !text.is_empty() {
+                            text_with_calls.clone_from(text);
+                        }
                         tool_calls.extend(calls.iter().map(|call| ProjectedToolCall {
                             call_id: call.id.clone(),
                             name: call.name.clone(),
@@ -2691,6 +2713,9 @@ impl GovernedHostRuntime {
                 }
                 ChatMessage::System(_) | ChatMessage::User { .. } => {}
             }
+        }
+        if assistant_text.is_empty() {
+            assistant_text = text_with_calls;
         }
         Ok(Some(LabeledTurnOutput {
             output_handle,
@@ -2814,11 +2839,15 @@ impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> 
     }
 }
 
-struct NativeHttpDriver {
+struct NativeHttpDriver<'a> {
     agent: ureq::Agent,
+    /// Live `streaming_output` projection out of an active turn (the
+    /// `ResourceResolver::observe_text_delta` seam). `None` observes nothing
+    /// and reads the body exactly as before.
+    delta_sink: Option<&'a dyn Fn(&str)>,
 }
 
-impl NativeHttpDriver {
+impl<'a> NativeHttpDriver<'a> {
     fn new(timeout: Duration) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
@@ -2830,11 +2859,69 @@ impl NativeHttpDriver {
                 .redirects(0)
                 .user_agent("whipplescript-host-runtime")
                 .build(),
+            delta_sink: None,
         }
+    }
+
+    fn with_delta_sink(mut self, sink: &'a dyn Fn(&str)) -> Self {
+        self.delta_sink = Some(sink);
+        self
+    }
+
+    /// Read an SSE body to its end, projecting each assistant answer-text
+    /// delta into the live sink as its line arrives. The returned raw body
+    /// feeds the same whole-body assembly as before — the sink observes the
+    /// stream, it never interprets it, so the assembled result cannot differ
+    /// from the unobserved read. Parity with `into_string`: a body past the
+    /// same 10 MiB ceiling is dropped whole. A mid-stream transport failure
+    /// keeps the lines that fully arrived — the assembler reads only complete
+    /// `data:` lines, so a truncated tail cannot half-parse.
+    fn read_sse_body(&self, response: ureq::Response) -> String {
+        const BODY_LIMIT: usize = 10 * 1_024 * 1_024;
+        let mut reader = std::io::BufReader::new(response.into_reader());
+        let mut raw = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if raw.len() + line.len() > BODY_LIMIT {
+                        return String::new();
+                    }
+                    if let Some(sink) = self.delta_sink {
+                        if let Some(delta) = sse_output_text_delta(&line) {
+                            sink(&delta);
+                        }
+                    }
+                    raw.push_str(&line);
+                }
+                Err(_) => break,
+            }
+        }
+        raw
     }
 }
 
-impl HostDriver for NativeHttpDriver {
+/// The one SSE event type whose payload is user-visible answer text.
+/// Reasoning deltas arrive as different event types and are deliberately
+/// never projected (spec/agent-harness.md "Live Turn Observation").
+fn sse_output_text_delta(line: &str) -> Option<String> {
+    let payload = line.trim().strip_prefix("data:")?.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(payload).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
+        return None;
+    }
+    event
+        .get("delta")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+impl HostDriver for NativeHttpDriver<'_> {
     fn fulfill(&self, request: &IoRequest) -> IoResult {
         let IoRequest::Http(request) = request;
         let mut builder = self.agent.post(&request.url);
@@ -2858,7 +2945,7 @@ impl HostDriver for NativeHttpDriver {
         });
         let status = response.status();
         let body = if expects_sse {
-            assemble_responses_sse(&response.into_string().unwrap_or_default())
+            assemble_responses_sse(&self.read_sse_body(response))
         } else {
             response.into_json::<Value>().unwrap_or(Value::Null)
         };
@@ -3157,6 +3244,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use whipplescript_kernel::sansio::HttpRequest;
 
     use crate::gov::SignedEnvelope;
     use crate::host_policy::{
@@ -4575,6 +4664,123 @@ workflow Method {
             .resolve(package.version_ref())
             .expect("resolve tool-free package");
         assert!(resolved.tools.is_empty());
+    }
+
+    /// The delta sink observes the SSE stream as it arrives; it never
+    /// interprets it. Served over a real socket so the read path under test
+    /// is the one `run_turn` uses: sink order equals stream order, and the
+    /// assembled body is identical to an unobserved read of the same bytes.
+    #[test]
+    fn native_driver_projects_each_answer_delta_and_assembles_identically() {
+        use std::io::{Read, Write};
+        let raw = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Gauge\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Wright is live.\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hidden\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("loopback addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // Read until the blank line; the body length rides the headers.
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                raw.len()
+            )
+            .expect("write head");
+            // Two flushes so the client observably reads before the stream ends.
+            let (first, rest) = raw.split_at(raw.len() / 2);
+            socket
+                .write_all(first.as_bytes())
+                .expect("write first half");
+            socket.flush().expect("flush first half");
+            socket.write_all(rest.as_bytes()).expect("write rest");
+        });
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let sink = |delta: &str| seen.borrow_mut().push(delta.to_owned());
+        let driver = NativeHttpDriver::new(Duration::from_secs(10)).with_delta_sink(&sink);
+        let request = IoRequest::Http(HttpRequest {
+            url: format!("http://{addr}/v1/responses"),
+            headers: vec![("accept".to_owned(), "text/event-stream".to_owned())],
+            body: json!({}),
+        });
+        let IoResult::Http(result) = driver.fulfill(&request);
+        server.join().expect("server thread");
+        let response = result.expect("http response");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            ["Gauge", "Wright is live."],
+            "answer deltas project in stream order; reasoning deltas never do"
+        );
+        assert_eq!(response.body, assemble_responses_sse(raw));
+        assert_eq!(response.body["output_text"], "GaugeWright is live.");
+    }
+
+    /// A provider may speak the user-facing reply on the same message as its
+    /// tool calls and close the turn with an empty final message. The turn
+    /// projection must keep that text rather than projecting a completed turn
+    /// as a blank reply — while a closing text-only answer still wins.
+    #[test]
+    fn turn_projection_keeps_answer_text_spoken_with_tool_calls() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-preamble".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).expect("instance");
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let resources = Resources {
+            calls: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(vec![
+            json!({
+                "output_text": "Reading the register now.",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "read",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }],
+                "usage": { "input_tokens": 10, "output_tokens": 4 }
+            }),
+            json!({
+                "output_text": "",
+                "usage": { "input_tokens": 14, "output_tokens": 0 }
+            }),
+        ]);
+        let execution = runtime
+            .run_turn_with_driver(
+                &turn(&instance.instance_ref, &open.policy, 1),
+                &Packages,
+                &secrets,
+                &resources,
+                &driver,
+            )
+            .expect("turn");
+        let receipt = execution.receipt.as_ref().expect("terminal receipt");
+        assert_eq!(receipt.status, TurnStatus::Completed);
+        let output = execution.output.expect("labeled output projection");
+        assert_eq!(output.assistant_text, "Reading the register now.");
+        assert_eq!(output.tool_calls.len(), 1);
     }
 
     #[test]

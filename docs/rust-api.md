@@ -46,7 +46,7 @@ The `host_runtime::GovernedHostRuntime` type is the native facade that persists:
 | `PackageResolver` | Resolves the immutable bytes and the IR of a WhippleScript package, and the schemas of the tools that the package declares. |
 | `SecretResolver` | Resolves the credentials of a provider ephemerally, after the admission by the policy. |
 | `ResolvedProviderBinding::new_codex(...)` | The short-life Codex material that the host resolved. WhippleScript owns the Codex request and the SSE wire. WhippleScript never acquires, refreshes, looks up, or persists a credential. |
-| `ResourceResolver` | Resolves the bytes of an image. Realizes a tool that the system already admitted. Projects a question for a person that a package declares against only the references that the system admitted for the turn. |
+| `ResourceResolver` | Resolves the bytes of an image. Realizes a tool that the system already admitted. Projects a question for a person that a package declares against only the references that the system admitted for the turn. Receives, through `observe_text_delta`, each delta of the answer text of the assistant while the native turn streams — an ephemeral projection under "Live Turn Observation" of `spec/agent-harness.md`; the durable output of the settled turn replaces it, and a delta of reasoning never arrives. |
 | `NativeWorkspaceResolver` / `native_workspace_tool_specs_with_capabilities` | The native surface for files and commands that WhippleScript owns: confined file operations and governed simple commands through an executor of the host. |
 
 The facade fails closed unless the signed envelope governs each resource, each
