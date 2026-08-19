@@ -44,6 +44,17 @@ if [ -f AGENTS.md ]; then
     # npm trees whose lockfiles are half of those obligations.
     echo "== build coverage =="
     node scripts/check-build-coverage.mjs
+
+    # A filtered `cargo test` exits 0 when its filter matches nothing, so a gate
+    # built on one silently stops asserting anything after a rename or crate
+    # split (DR-0024). scripts/lib-cargo-test.sh's cargo_test_named closes that,
+    # and this static lint keeps the guard from rotting: it fails the bar if any
+    # tracked gate script reintroduces a raw filtered run. The --selftest guards
+    # the classifier's own logic. Both are toolchain-free static scans, so they
+    # belong in the required bar rather than a deep suite.
+    echo "== gate test filters are guarded =="
+    node scripts/check-cargo-test-guarded.mjs --selftest
+    node scripts/check-cargo-test-guarded.mjs
 fi
 
 echo "== workflow action pins =="
