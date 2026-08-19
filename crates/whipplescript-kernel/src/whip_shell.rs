@@ -147,8 +147,8 @@ impl WhipShell {
         #[cfg(target_family = "wasm")]
         let (result, files) = futures::executor::block_on(execution)?;
         Ok(ShellOutput {
-            stdout: result.stdout,
-            stderr: result.stderr,
+            stdout: result.stdout.text_lossy().into_owned(),
+            stderr: result.stderr.text_lossy().into_owned(),
             exit_code: result.exit_code,
             files,
         })
