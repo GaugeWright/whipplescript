@@ -340,7 +340,7 @@ fn registry_backend_name(
             .ok_or_else(|| {
                 "registry schema.coerce binding selects provider `native` but its \
                  effect_providers config_json names no `backend` (`openai`, `openai-generic`, \
-                 or `anthropic`)"
+                 `anthropic`, or `xai`)"
                     .to_owned()
             });
     }
@@ -444,6 +444,9 @@ fn missing_credential_message(provider: CoerceProvider) -> String {
              `whip auth set openai <key>`, or sign in with `codex login`"
                 .to_owned()
         }
+        CoerceProvider::Xai => "coerce provider `xai` needs an API key: set XAI_API_KEY or run \
+             `whip auth set xai <key>`"
+            .to_owned(),
     }
 }
 
@@ -452,9 +455,10 @@ fn parse_provider(name: &str) -> Result<CoerceProvider, String> {
         "openai" => Ok(CoerceProvider::OpenAi),
         "openai-generic" => Ok(CoerceProvider::OpenAiCompat),
         "anthropic" => Ok(CoerceProvider::Anthropic),
+        "xai" => Ok(CoerceProvider::Xai),
         other => Err(format!(
             "unknown coerce provider `{other}` \
-             (expected `openai`, `openai-generic`, or `anthropic`)"
+             (expected `openai`, `openai-generic`, `anthropic`, or `xai`)"
         )),
     }
 }

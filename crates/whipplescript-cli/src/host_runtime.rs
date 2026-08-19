@@ -411,6 +411,8 @@ pub enum ModelProvider {
     OpenAiCompat,
     Anthropic,
     Codex,
+    /// xAI's Grok API (Chat Completions wire, first-class credential surface).
+    Xai,
 }
 
 impl ModelProvider {
@@ -420,6 +422,7 @@ impl ModelProvider {
             Self::OpenAiCompat => "openai-generic",
             Self::Anthropic => "anthropic",
             Self::Codex => "openai-codex",
+            Self::Xai => "xai",
         }
     }
 }
@@ -2264,6 +2267,14 @@ impl GovernedHostRuntime {
             ),
             ModelProvider::OpenAiCompat => MessagesApiClient::new(
                 CoerceProvider::OpenAiCompat,
+                binding.api_key,
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
+            ModelProvider::Xai => MessagesApiClient::new(
+                CoerceProvider::Xai,
                 binding.api_key,
                 binding.model,
                 binding.base_url,

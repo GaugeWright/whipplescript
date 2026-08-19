@@ -3,6 +3,31 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [Unreleased]
+
+xAI's Grok models become a first-class model backend. The endpoint already
+worked through `openai-generic` plus a hand-set base URL, but that spelling
+made the credential an "OpenAI key" and left the operator to know the URL;
+a first-class `xai` backend owns its credential surface and its default.
+
+### Added
+
+- **`xai` model backend** — xAI's Grok API as a first-class backend on the
+  model-backend axis (`spec/std-coercion.md` "Providers"): the Chat
+  Completions wire at `https://api.x.ai/v1`, reachable everywhere the other
+  backends are — native coerce (`WHIPPLESCRIPT_COERCE_PROVIDER=xai`), the
+  owned agent harness (provider profiles and
+  `WHIPPLESCRIPT_HARNESS_PROVIDER`), and the hosted Durable Object doors
+  (`coerce_config_json` / agent config / model broker). The credential is
+  `XAI_API_KEY` or `whip auth set xai` — its own surface, never the OpenAI
+  one, and the Codex OAuth token never satisfies it. Grok context windows are
+  derived per family (fast variants 2M, grok-4/grok-code 256k, conservative
+  131k otherwise). Provider subprocess spawns (codex, claude) strip
+  `XAI_API_KEY` the way they strip each other's keys.
+- **`spec/std-coercion.md` "Adding a model backend"** — the exhaustive wiring
+  checklist a new backend must cover, distilled from this addition and from
+  the `openai-generic` reachability lesson.
+
 ## [0.5.3] — 2026-08-17
 
 The authored half of durable-store upgrades (compiler half: 0.5.2). An

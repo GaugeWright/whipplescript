@@ -328,10 +328,15 @@ impl StdioCodexAppServerTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         whipplescript_kernel::harness::strip_control_plane_secrets(&mut builder);
-        // Codex is the OpenAI-family backend; it never needs an Anthropic key.
+        // Codex is the OpenAI-family backend; it never needs an Anthropic or
+        // xAI key.
         whipplescript_kernel::harness::strip_env_vars(
             &mut builder,
             whipplescript_kernel::harness::ANTHROPIC_CREDENTIAL_ENV,
+        );
+        whipplescript_kernel::harness::strip_env_vars(
+            &mut builder,
+            whipplescript_kernel::harness::XAI_CREDENTIAL_ENV,
         );
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {

@@ -74,6 +74,18 @@ pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
     match provider {
         // Claude models are 200k standard context.
         CoerceProvider::Anthropic => 200_000,
+        // xAI publishes few, stable windows: the fast variants carry 2M, the
+        // grok-4 family and grok-code 256k, and everything earlier or
+        // unrecognized falls back to grok-3's 131k (conservative default).
+        CoerceProvider::Xai => {
+            if bare.contains("grok-4-fast") || bare.contains("grok-4.1-fast") {
+                2_000_000
+            } else if bare.contains("grok-4") || bare.contains("grok-code") {
+                256_000
+            } else {
+                131_072
+            }
+        }
         // A generic OpenAI-compatible endpoint serves arbitrary models whose windows
         // we can't know; fall back to the OpenAI heuristic (conservative default for
         // an unrecognized id).
@@ -411,7 +423,10 @@ impl HttpModelClient for MessagesApiClient {
         request
             .headers
             .push(("accept".to_owned(), "text/event-stream".to_owned()));
-        if self.provider == CoerceProvider::OpenAiCompat {
+        if matches!(
+            self.provider,
+            CoerceProvider::OpenAiCompat | CoerceProvider::Xai
+        ) {
             // A Chat Completions stream reports no usage at all unless the
             // request asks for it — the ordinary non-streamed response carries
             // `usage` unconditionally, so turning streaming on for this provider
@@ -433,7 +448,9 @@ impl HttpModelClient for MessagesApiClient {
             if let Some(raw) = response.body.as_str() {
                 response.body = match self.provider {
                     CoerceProvider::OpenAi => assemble_codex_responses_sse(raw),
-                    CoerceProvider::OpenAiCompat => assemble_openai_chat_sse(raw),
+                    CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+                        assemble_openai_chat_sse(raw)
+                    }
                     CoerceProvider::Anthropic => assemble_anthropic_messages_sse(raw),
                 };
             }
@@ -554,7 +571,7 @@ fn build_request(
         CoerceProvider::OpenAi => {
             build_openai_request(base_url, api_key, model, cache_key, messages, tools)
         }
-        CoerceProvider::OpenAiCompat => build_openai_compat_request(
+        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => build_openai_compat_request(
             base_url, api_key, model, max_tokens, cache_key, messages, tools,
         ),
     }
@@ -1013,7 +1030,9 @@ fn parse_response(
     match provider {
         CoerceProvider::Anthropic => Ok(parse_anthropic_response(body)),
         CoerceProvider::OpenAi => Ok(parse_openai_response(body)),
-        CoerceProvider::OpenAiCompat => Ok(parse_openai_compat_response(body)),
+        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+            Ok(parse_openai_compat_response(body))
+        }
     }
 }
 
@@ -1522,6 +1541,25 @@ mod tests {
             model_context_window(CoerceProvider::OpenAiCompat, "llama-3.3-70b"),
             128_000
         );
+        // xAI: fast variants carry 2M, grok-4/grok-code 256k, and anything
+        // unrecognized takes grok-3's conservative 131k. `grok-4-fast` must be
+        // tested before the `grok-4` prefix claims it.
+        assert_eq!(
+            model_context_window(CoerceProvider::Xai, "grok-4-fast"),
+            2_000_000
+        );
+        assert_eq!(model_context_window(CoerceProvider::Xai, "grok-4"), 256_000);
+        assert_eq!(
+            model_context_window(CoerceProvider::Xai, "grok-code-fast-1"),
+            256_000
+        );
+        assert_eq!(model_context_window(CoerceProvider::Xai, "grok-3"), 131_072);
+        assert_eq!(
+            model_context_window(CoerceProvider::Xai, "some-future-grok"),
+            131_072
+        );
+        // The output limit stays provider-derived: only Anthropic names one.
+        assert_eq!(model_output_limit(CoerceProvider::Xai, "grok-4"), None);
     }
 
     /// The live 400: `openai/gpt-5-mini` satisfied a `starts_with('o')` test for
@@ -1807,6 +1845,20 @@ mod tests {
         assert_eq!(reply.text, "hi");
         assert_eq!(reply.usage["prompt_tokens"], json!(11));
         assert_eq!(reply.usage["completion_tokens"], json!(3));
+
+        // xAI speaks the same Chat Completions stream, so it must ask too.
+        let xai = MessagesApiClient::new(
+            CoerceProvider::Xai,
+            "xai-key",
+            "grok-4",
+            "https://api.x.ai/v1",
+            4096,
+            None,
+        );
+        assert_eq!(
+            xai.build_request(&convo(), &tool_specs()).body["stream_options"],
+            json!({ "include_usage": true }),
+        );
 
         // The Responses and Messages streams end with usage unasked, and neither
         // accepts this Chat Completions field.

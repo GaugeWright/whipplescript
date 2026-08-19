@@ -424,6 +424,11 @@ WHIPPLESCRIPT_COERCE_PROVIDER=openai OPENAI_API_KEY=sk-... \
 # Anthropic (Messages API, single forced tool)
 WHIPPLESCRIPT_COERCE_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-api... \
   whip run workflow.whip --provider fixture
+
+# xAI (Chat Completions API at api.x.ai, JSON-schema structured output)
+WHIPPLESCRIPT_COERCE_PROVIDER=xai XAI_API_KEY=xai-... \
+WHIPPLESCRIPT_COERCE_MODEL=grok-4 \
+  whip run workflow.whip --provider fixture
 ```
 
 The system builds the output JSON Schema from the declared output type of the
@@ -447,6 +452,11 @@ These are the credentials:
   the `whip auth set anthropic` command. The system rejects an OAuth token of
   Claude Code, which has the form `sk-ant-oat*`. The message is clear. The reuse
   of such a token for the API is not clearly permitted by the terms.
+- **xAI** needs an API key from the xAI console. Supply the key with the
+  `XAI_API_KEY` variable or with the `whip auth set xai` command. The provider
+  speaks the Chat Completions wire at `https://api.x.ai/v1`, and the model
+  names are the Grok models, such as `grok-4`. The credential surface of xAI is
+  its own: an OpenAI key or a Codex token never satisfies the `xai` provider.
 
 If you set the provider and no credential resolves, the coerce effect fails with
 a clear message. The system does not use a fixture silently.
@@ -463,7 +473,8 @@ selects the system.
 > **The `base_url` value must contain the segment for the version of the API.**
 > Usually that segment is `/v1`. The `openai` provider and the `anthropic`
 > provider are different. For those providers, the base is the host alone, and
-> whip appends `/v1/...`. The `openai-generic` provider appends only
+> whip appends `/v1/...`. The `openai-generic` provider and the `xai` provider
+> append only
 > `/chat/completions`. This behavior follows the convention of the OpenAI SDK,
 > where the version is in the `base_url` value. Thus use
 > `http://localhost:11434/v1`. Do **not** use `http://localhost:11434`.
@@ -535,6 +546,7 @@ credentials that resolve, or to store an explicit API key:
 whip auth status                           # show what resolves (redacted) + source
 whip auth set anthropic sk-ant-api03-...   # store an explicit coerce credential
 whip auth set openai     sk-proj-...
+whip auth set xai        xai-...
 ```
 
 The `whip auth set` command writes a configuration file that only the owner can

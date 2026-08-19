@@ -189,6 +189,58 @@ test("public Session DO streams directly from the signed provider endpoint", asy
   assert.equal(JSON.parse(result).status, 200);
 });
 
+test("an xai round speaks chat completions off the admitted /v1 base", async () => {
+  const deltas: string[] = [];
+  const encoder = new TextEncoder();
+  let capturedBody: Record<string, unknown> = {};
+  const xaiBinding = {
+    ...binding,
+    provider: "xai" as const,
+    credential_class: "managed-xai",
+    model: "grok-4",
+    base_url: "https://api.x.ai/v1",
+  };
+  const result = await performDirectProviderFetch(
+    {
+      // The admitted base already carries `/v1`, so the round appends only
+      // `/chat/completions` — the same shape as a generic endpoint.
+      url: `${xaiBinding.base_url}/chat/completions`,
+      headers: [
+        ["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`],
+        ["content-type", "application/json"],
+      ],
+      body: { model: "grok-4", stream: true, max_tokens: 256 },
+    },
+    xaiBinding,
+    credentialResolver({
+      provider: xaiBinding.provider,
+      credential_class: xaiBinding.credential_class,
+      api_key: "xai-session-secret",
+    }),
+    async (_url, init) => {
+      capturedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                'data: {"choices":[{"delta":{"content":"grok says"}}]}\n\n',
+              ),
+            );
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    },
+    (delta) => deltas.push(delta),
+  );
+  // Chat Completions accepts `max_tokens` as-is: no rename for this wire.
+  assert.equal(capturedBody.max_tokens, 256);
+  assert.deepEqual(deltas, ["grok says"]);
+  assert.equal(JSON.parse(result).status, 200);
+});
+
 test("OpenAI Responses egress names the output token limit for the provider API", async () => {
   let capturedBody: Record<string, unknown> | undefined;
   await performDirectProviderFetch(

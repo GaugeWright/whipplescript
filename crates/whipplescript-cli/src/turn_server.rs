@@ -431,6 +431,7 @@ pub fn run_turn_in_workspace(
         "anthropic" => CoerceProvider::Anthropic,
         "openai" | "openai-codex" => CoerceProvider::OpenAi,
         "openai-generic" => CoerceProvider::OpenAiCompat,
+        "xai" => CoerceProvider::Xai,
         other => {
             return BrokeredTurnOutcome {
                 status: TurnStatus::Failed,

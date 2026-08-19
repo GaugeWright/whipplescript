@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 /// Providers that can hold a stored coerce credential.
-pub const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic"];
+pub const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "xai"];
 
 /// Location of the stored credential config:
 /// `$WHIPPLESCRIPT_CONFIG_DIR/auth.json`, else

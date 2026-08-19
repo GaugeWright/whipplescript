@@ -21,6 +21,7 @@ export interface ModelBrokerBinding {
     | "openai-generic"
     | "anthropic"
     | "openai-codex"
+    | "xai"
     | "cloudflare-ai-gateway";
   model: string;
   base_url: string;
@@ -567,6 +568,7 @@ export async function performDirectProviderFetch(
   const expectedPath = anthropicWire
     ? `${admittedPath}/v1/messages`
     : binding.provider === "openai-generic"
+        || binding.provider === "xai"
         || binding.provider === "cloudflare-ai-gateway"
       // The gateway's `/compat` surface is OpenAI-compatible, so the admitted
       // base URL already ends at `/compat` and the request appends

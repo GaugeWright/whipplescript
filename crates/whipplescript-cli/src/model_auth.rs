@@ -63,6 +63,7 @@ pub fn credential_env_var(provider: CoerceProvider) -> &'static str {
     match provider {
         CoerceProvider::Anthropic => "ANTHROPIC_API_KEY",
         CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => "OPENAI_API_KEY",
+        CoerceProvider::Xai => "XAI_API_KEY",
     }
 }
 
@@ -82,11 +83,11 @@ pub fn resolve_credential_from(
     match provider {
         // The Codex OAuth token is an OpenAI credential; it never satisfies
         // Anthropic (which additionally rejects OAuth tokens outright — see
-        // `anthropic_oauth_rejection`).
+        // `anthropic_oauth_rejection`) or xAI.
         CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => candidates
             .codex_oauth
             .map(|key| (key, CredentialSource::CodexOAuth)),
-        CoerceProvider::Anthropic => None,
+        CoerceProvider::Anthropic | CoerceProvider::Xai => None,
     }
 }
 
@@ -99,6 +100,7 @@ pub fn resolve_credential_with_source(
     let stored_provider = match provider {
         CoerceProvider::Anthropic => "anthropic",
         CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => "openai",
+        CoerceProvider::Xai => "xai",
     };
     resolve_credential_from(
         provider,
@@ -195,7 +197,7 @@ mod tests {
     /// candidates are injected, so the table is exact and hermetic.
     #[test]
     fn credential_precedence_golden_table() {
-        use CoerceProvider::{Anthropic, OpenAi};
+        use CoerceProvider::{Anthropic, OpenAi, Xai};
         // (provider, (env, stored, codex) candidates, expected (key, source))
         type GoldenRow<'a> = (
             CoerceProvider,
@@ -233,6 +235,19 @@ mod tests {
             ),
             (Anthropic, (None, None, Some("c")), None),
             (Anthropic, (None, None, None), None),
+            // xai: env beats stored; the codex token NEVER satisfies it.
+            (
+                Xai,
+                (Some("e"), Some("s"), Some("c")),
+                Some(("e", CredentialSource::Env("XAI_API_KEY"))),
+            ),
+            (
+                Xai,
+                (None, Some("s"), Some("c")),
+                Some(("s", CredentialSource::Stored)),
+            ),
+            (Xai, (None, None, Some("c")), None),
+            (Xai, (None, None, None), None),
         ];
         for (provider, (env, stored, codex), expected) in table {
             let resolved = resolve_credential_from(*provider, candidates(*env, *stored, *codex));

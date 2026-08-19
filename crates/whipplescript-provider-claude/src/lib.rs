@@ -1042,10 +1042,15 @@ impl StdioClaudeAgentSdkTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         whipplescript_kernel::harness::strip_control_plane_secrets(&mut builder);
-        // The Claude sidecar is the Anthropic-family backend; strip OpenAI keys.
+        // The Claude sidecar is the Anthropic-family backend; strip the other
+        // families' keys (OpenAI, xAI).
         whipplescript_kernel::harness::strip_env_vars(
             &mut builder,
             whipplescript_kernel::harness::OPENAI_CREDENTIAL_ENV,
+        );
+        whipplescript_kernel::harness::strip_env_vars(
+            &mut builder,
+            whipplescript_kernel::harness::XAI_CREDENTIAL_ENV,
         );
         let mut child = builder.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {

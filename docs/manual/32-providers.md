@@ -34,6 +34,12 @@ items.
   family directly. An agent gets to this family through the **owned** harness,
   which points at the endpoint. The declaration `provider openai-generic` is
   not valid for an agent.
+- **`xai`** — the Grok API of xAI. The endpoint speaks the same Chat
+  Completions wire as `openai-generic`, at `https://api.x.ai/v1`. But the
+  backend is first-class: the credential is the `XAI_API_KEY` variable or the
+  `whip auth set xai` command, and never an OpenAI key. This family is also a
+  *model backend*, with the same reach as `openai-generic`: a coercion selects
+  it directly, and an agent gets to it through the **owned** harness.
 
 The declaration of an agent gives the family. The compact form is
 `provider <kind>`. The primary form in the reference is

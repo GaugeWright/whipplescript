@@ -586,7 +586,7 @@ fn deploy_steps(
 }
 
 /// The provider secrets `--set-secrets` forwards from the local environment.
-const DEPLOY_SECRET_KEYS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+const DEPLOY_SECRET_KEYS: [&str; 3] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"];
 
 fn deploy_command(options: &CliOptions) -> ExitCode {
     let env_worker_dir = env::var_os("WHIPPLESCRIPT_WORKER_DIR").map(PathBuf::from);
@@ -21924,6 +21924,7 @@ fn coercion(options: &CliOptions) -> ExitCode {
                     "openai-generic"
                 }
                 whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+                whipplescript_kernel::coerce_native::CoerceProvider::Xai => "xai",
             };
             if options.json {
                 return emit_json(json!({

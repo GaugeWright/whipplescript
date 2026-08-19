@@ -671,6 +671,7 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("xai") => CoerceProvider::Xai,
         Some("openai-codex") => CoerceProvider::OpenAi,
         // The metered Cloudflare AI Gateway is a distinct provider *id* rather
         // than an alias because the id carries who pays — a gateway round spends
@@ -723,6 +724,7 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
         Some("anthropic") => CoerceProvider::Anthropic,
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("xai") => CoerceProvider::Xai,
         Some("openai-codex") => CoerceProvider::OpenAi,
         // Same reasoning as the coerce parser above: distinct as an id because
         // the id is what says who pays, with the wire read from the surface.

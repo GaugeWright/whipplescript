@@ -30,6 +30,11 @@ pub enum CoerceProvider {
     /// etc. Same wire family as OpenAi but the older, near-universally-implemented API.
     OpenAiCompat,
     Anthropic,
+    /// xAI's Grok API — the Chat Completions wire at `https://api.x.ai/v1`.
+    /// Same wire family as [`CoerceProvider::OpenAiCompat`] but a first-class
+    /// backend: its own credential surface (`XAI_API_KEY` / `whip auth set
+    /// xai`), never the OpenAI one, and a known default base URL.
+    Xai,
 }
 
 impl CoerceProvider {
@@ -45,6 +50,9 @@ impl CoerceProvider {
             // in base_url), so the default MUST carry `/v1` — otherwise the
             // request 404s at `.../chat/completions`. Live-confirmed 2026-07-19.
             CoerceProvider::OpenAiCompat => "https://api.openai.com/v1",
+            // Same `/v1`-in-base convention as OpenAiCompat: the builder
+            // appends only `/chat/completions`.
+            CoerceProvider::Xai => "https://api.x.ai/v1",
         }
     }
 }
@@ -373,7 +381,7 @@ pub fn build_request(call: &CoerceCall<'_>) -> HttpRequest {
             Some(codex) => build_codex_request(call, codex),
             None => build_openai_request(call),
         },
-        CoerceProvider::OpenAiCompat => build_openai_compat_request(call),
+        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => build_openai_compat_request(call),
         CoerceProvider::Anthropic => build_anthropic_request(call),
     }
 }
@@ -615,7 +623,9 @@ pub fn parse_response(
     }
     match provider {
         CoerceProvider::OpenAi => parse_openai_response(response, wrapped),
-        CoerceProvider::OpenAiCompat => parse_openai_compat_response(response, wrapped),
+        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+            parse_openai_compat_response(response, wrapped)
+        }
         CoerceProvider::Anthropic => parse_anthropic_response(response, wrapped),
     }
 }
@@ -1281,6 +1291,52 @@ mod tests {
     }
 
     #[test]
+    fn xai_coerce_speaks_chat_completions_at_the_x_ai_default_base() {
+        // xAI shares the OpenAiCompat wire (Chat Completions + `response_format`
+        // json-schema) but is first-class: its default base URL is known, and —
+        // same `/v1`-in-base convention — the builder appends only
+        // `/chat/completions`, so the default MUST carry `/v1`.
+        assert_eq!(
+            CoerceProvider::Xai.default_base_url(),
+            "https://api.x.ai/v1"
+        );
+        let schema = json!({ "type": "object" });
+        let call = CoerceCall {
+            provider: CoerceProvider::Xai,
+            base_url: CoerceProvider::Xai.default_base_url(),
+            api_key: "xai-test",
+            model: "grok-4",
+            prompt: "Classify this",
+            output_schema: &schema,
+            schema_name: "WorkReview",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "key_xai_effect",
+        };
+        let request = build_request(&call);
+        assert_eq!(request.url, "https://api.x.ai/v1/chat/completions");
+        assert_eq!(
+            request.body["response_format"]["type"],
+            json!("json_schema")
+        );
+        assert!(request
+            .headers
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer xai-test"));
+        // And the reply parses through the same chat-completions reader.
+        let response = HttpResponse {
+            status: 200,
+            body: json!({
+                "choices": [{ "message": { "content": "{\"ok\":true}" } }],
+                "usage": { "completion_tokens": 3 }
+            }),
+        };
+        let result = parse_response(CoerceProvider::Xai, &response, false);
+        assert_eq!(result.status, CoerceStatus::Succeeded);
+        assert_eq!(result.value_json.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
     fn openai_compat_response_reads_message_content_as_structured_value() {
         let response = HttpResponse {
             status: 200,
@@ -1616,6 +1672,7 @@ mod tests {
                     CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
                         "https://api.openai.com"
                     }
+                    CoerceProvider::Xai => "https://api.x.ai/v1",
                 },
                 api_key: "key",
                 model: "m",

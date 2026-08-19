@@ -3611,11 +3611,12 @@ fn profile_config_from_value(
     let provider = match entry.get("provider").and_then(Value::as_str) {
         Some("openai") => CoerceProvider::OpenAi,
         Some("openai-generic") => CoerceProvider::OpenAiCompat,
+        Some("xai") => CoerceProvider::Xai,
         Some("anthropic") => CoerceProvider::Anthropic,
         Some(other) => {
             return Err(format!(
                 "provider profile `{name}` names unknown provider `{other}` \
-                 (expected `openai`, `openai-generic`, or `anthropic`)"
+                 (expected `openai`, `openai-generic`, `anthropic`, or `xai`)"
             ));
         }
         None => {
@@ -3677,10 +3678,11 @@ fn resolve_harness_model_config() -> Result<Option<HarnessModelConfig>, String> 
     let provider = match provider_name.as_str() {
         "openai" => CoerceProvider::OpenAi,
         "openai-generic" => CoerceProvider::OpenAiCompat,
+        "xai" => CoerceProvider::Xai,
         "anthropic" => CoerceProvider::Anthropic,
         other => {
             return Err(format!(
-            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai`, `openai-generic`, or `anthropic`)"
+            "unknown WHIPPLESCRIPT_HARNESS_PROVIDER `{other}` (expected `openai`, `openai-generic`, `anthropic`, or `xai`)"
         ))
         }
     };
@@ -4227,6 +4229,25 @@ mod tests {
             .expect("valid")
             .expect("entry");
         assert_eq!(config.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn provider_profile_accepts_xai_for_the_owned_harness() {
+        // The openai-generic lesson, applied preemptively: a backend the kernel
+        // speaks must also be reachable through both config doors, or it is
+        // code-complete and unusable. `xai` → Xai, with the x.ai default base.
+        let document = serde_json::json!({
+            "default": {
+                "provider": "xai",
+                "model": "grok-4",
+                "api_key": "k",
+            }
+        });
+        let config = profile_config_from_value(&document, None)
+            .expect("valid entry")
+            .expect("profile entry");
+        assert!(matches!(config.provider, CoerceProvider::Xai));
+        assert_eq!(config.base_url, "https://api.x.ai/v1");
     }
 
     /// A temp tree that removes itself when the binding goes out of scope —

@@ -765,6 +765,7 @@ pub fn strip_control_plane_secrets(command: &mut Command) {
 /// other family's key when spawning their sidecar (DR-0024 split).
 pub const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
 pub const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
+pub const XAI_CREDENTIAL_ENV: &[&str] = &["XAI_API_KEY"];
 
 /// Remove the named env vars from a child command's inherited environment.
 pub fn strip_env_vars(command: &mut Command, names: &[&str]) {

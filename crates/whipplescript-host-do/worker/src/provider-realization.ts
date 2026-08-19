@@ -5,6 +5,10 @@ export type HostedProvider =
   | "openai-generic"
   | "anthropic"
   | "openai-codex"
+  /** xAI's Grok API: the Chat Completions wire, same surface as
+   *  `openai-generic`, but a first-class id because the credential is an xAI
+   *  key and never an OpenAI one. */
+  | "xai"
   /** Metered upstream egress through a Cloudflare AI Gateway on unified
    *  billing. Distinct from `openai-generic` even though both speak the
    *  OpenAI-compatible surface, because *who pays* differs: a generic endpoint
@@ -51,6 +55,7 @@ const supportedProviders = new Set<HostedProvider>([
   "openai-generic",
   "anthropic",
   "openai-codex",
+  "xai",
   "cloudflare-ai-gateway",
 ]);
 

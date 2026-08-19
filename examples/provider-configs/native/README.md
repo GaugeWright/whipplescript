@@ -39,6 +39,6 @@ The rates in this example are maintained as plausible published list
 prices at the time the example was last touched — **verify against your
 provider's current price sheet before relying on the cap**, and add one
 entry per (provider, model) pair your programs actually use. Provider
-names: `anthropic`, `openai`, `openai-generic` for native coerce turns
+names: `anthropic`, `openai`, `openai-generic`, `xai` for native coerce turns
 (judges, proposers); agent-turn runs price under the provider string the
 run records.

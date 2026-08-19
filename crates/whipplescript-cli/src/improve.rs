@@ -1678,6 +1678,7 @@ fn native_coerce_turn(
         whipplescript_kernel::coerce_native::CoerceProvider::OpenAi => "openai",
         whipplescript_kernel::coerce_native::CoerceProvider::OpenAiCompat => "openai-generic",
         whipplescript_kernel::coerce_native::CoerceProvider::Anthropic => "anthropic",
+        whipplescript_kernel::coerce_native::CoerceProvider::Xai => "xai",
     };
     let usage = TurnUsage::from_usage_json(provider_name, &client.model, &usage_json);
     let value: Value = result
