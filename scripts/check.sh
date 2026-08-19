@@ -46,6 +46,12 @@ if [ -f AGENTS.md ]; then
     node scripts/check-build-coverage.mjs
 fi
 
+echo "== workflow action pins =="
+# Every third-party action must be SHA-pinned, not floating on a tag. The lane
+# this most protects is publish-crates.yml, whose job holds the crates.io token
+# and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
+scripts/check-actions-pinned.sh
+
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command.

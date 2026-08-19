@@ -32,6 +32,12 @@ on:
           - "true"
           - "false"
 
+permissions:
+  # Read-only by default, the repo convention: this lane only checks out and
+  # runs `cargo publish`, which authenticates with CARGO_REGISTRY_TOKEN rather
+  # than the workflow token, so it needs no write scope on the repository.
+  contents: read
+
 concurrency:
   # Never two publishes at once: they would race on the index and the second
   # would fail halfway with some crates up and some not.
@@ -45,6 +51,12 @@ jobs:
     # Same guard release.yml uses.
     if: github.repository == 'GaugeWright/whipplescript'
     runs-on: ubuntu-latest
+    # The publish token lives behind an environment so its protection rules —
+    # required reviewers and an environment-scoped CARGO_REGISTRY_TOKEN — gate
+    # the one release step with no undo. Those rules are configured in the
+    # repository's GitHub Settings > Environments, not here; this line alone
+    # only names the environment.
+    environment: crates-publish
     steps:
       # TWO checkouts, and the split is the point. The crates must come from the
       # tag, because crates.io has to receive exactly what was released. The
@@ -58,13 +70,13 @@ jobs:
       # tags first and publishes second, so any tooling change lands after the
       # tag it is used on.
       - name: Check out the release tag (the crates)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: v${{ inputs.version }}
           path: release
 
       - name: Check out this workflow's ref (the tooling)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: tooling
 
