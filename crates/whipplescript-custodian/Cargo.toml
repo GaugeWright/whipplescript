@@ -22,7 +22,7 @@ readme.workspace = true
 dist = false
 
 [dependencies]
-whipplescript-custody = { version = "0.5.3", path = "../whipplescript-custody" }
+whipplescript-custody = { version = "0.5.4", path = "../whipplescript-custody" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.23"

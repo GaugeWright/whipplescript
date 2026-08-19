@@ -9,7 +9,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-core = { version = "0.5.3", path = "../whipplescript-core" }
+whipplescript-core = { version = "0.5.4", path = "../whipplescript-core" }
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"

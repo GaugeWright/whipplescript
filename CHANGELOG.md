@@ -3,9 +3,13 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-## [Unreleased]
+## [0.5.4] — 2026-08-19
 
-xAI's Grok models become a first-class model backend. The endpoint already
+xAI's Grok models become a first-class model backend, and the harness loop
+exports its settled context-window reading — the number its own compaction
+trigger consumes — so an embedding product can finally show an honest
+context meter instead of a billing sum that overcounts the window by the
+number of tool rounds. The endpoint already
 worked through `openai-generic` plus a hand-set base URL, but that spelling
 made the credential an "OpenAI key" and left the operator to know the URL;
 a first-class `xai` backend owns its credential surface and its default.
@@ -27,6 +31,13 @@ a first-class `xai` backend owns its credential surface and its default.
 - **`spec/std-coercion.md` "Adding a model backend"** — the exhaustive wiring
   checklist a new backend must cover, distilled from this addition and from
   the `openai-generic` reachability lesson.
+- **Settled context-window reading** — `BrokeredTurnOutcome::last_input_tokens`
+  (the final MAIN reply's prompt size), stamped once at the terminal into the
+  usage object under `last_input_tokens` and projected by both hosts: the
+  Durable Object's `usage_observation.last_input_tokens` and the local host's
+  `TurnExecution::usage` (`TurnUsageObservation`). A gauge beside the meter:
+  billing settlement deliberately keeps carrying only the four summed
+  counters.
 
 ## [0.5.3] — 2026-08-17
 

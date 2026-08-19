@@ -9,7 +9,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-whipplescript-kernel = { version = "0.5.3", path = "../whipplescript-kernel", default-features = false }
+whipplescript-kernel = { version = "0.5.4", path = "../whipplescript-kernel", default-features = false }
 serde_json = "1"
 
 [lib]
