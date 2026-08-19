@@ -427,7 +427,7 @@ WHIPPLESCRIPT_COERCE_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-api... \
 
 # xAI (Chat Completions API at api.x.ai, JSON-schema structured output)
 WHIPPLESCRIPT_COERCE_PROVIDER=xai XAI_API_KEY=xai-... \
-WHIPPLESCRIPT_COERCE_MODEL=grok-4 \
+WHIPPLESCRIPT_COERCE_MODEL=grok-4.6 \
   whip run workflow.whip --provider fixture
 ```
 
@@ -455,7 +455,7 @@ These are the credentials:
 - **xAI** needs an API key from the xAI console. Supply the key with the
   `XAI_API_KEY` variable or with the `whip auth set xai` command. The provider
   speaks the Chat Completions wire at `https://api.x.ai/v1`, and the model
-  names are the Grok models, such as `grok-4`. The credential surface of xAI is
+  names are the Grok models, such as `grok-4.6`. The credential surface of xAI is
   its own: an OpenAI key or a Codex token never satisfies the `xai` provider.
 
 If you set the provider and no credential resolves, the coerce effect fails with
