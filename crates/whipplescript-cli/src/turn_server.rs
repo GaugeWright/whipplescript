@@ -197,7 +197,12 @@ fn start_or_attach(turn_id: &str, request: &Value) -> (Receiver<String>, Option<
                 "status": status_name(&outcome.status),
                 "summary": outcome.summary,
                 "steps": outcome.steps,
-                "usage": outcome.usage,
+                // Stamped, not raw: the container's consumer reconstructs the
+                // settled context reading from this projection.
+                "usage": whipplescript_kernel::harness_loop::usage_with_context(
+                    &outcome.usage,
+                    outcome.last_input_tokens,
+                ),
             },
         })
         .to_string();
@@ -321,6 +326,7 @@ pub fn run_turn_in_workspace(
             steps: 0,
             observations: Vec::new(),
             usage: json!({"input_tokens": 0, "output_tokens": 0}),
+            last_input_tokens: 0,
         };
     }
     let protected_write_paths = request
@@ -439,6 +445,7 @@ pub fn run_turn_in_workspace(
                 steps: 0,
                 observations: Vec::new(),
                 usage: json!({"input_tokens": 0, "output_tokens": 0}),
+                last_input_tokens: 0,
             }
         }
     };
@@ -495,6 +502,7 @@ fn failed_outcome(reason: &str) -> BrokeredTurnOutcome {
         steps: 0,
         observations: Vec::new(),
         usage: json!({"input_tokens": 0, "output_tokens": 0}),
+        last_input_tokens: 0,
     }
 }
 

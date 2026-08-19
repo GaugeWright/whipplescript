@@ -325,6 +325,10 @@ workflow Method {
                 input_tokens: 3,
                 cached_input_tokens: 0,
                 output_tokens: 0,
+                // One main reply at prompt_tokens: 3 — the settled gauge is
+                // that same reading, proving the stamp survives the full
+                // machine → settle → metadata → projection chain.
+                last_input_tokens: 3,
             })
         );
         assert!(projection.runtime_evidence_pointers.iter().any(|pointer| {

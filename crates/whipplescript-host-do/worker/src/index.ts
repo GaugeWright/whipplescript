@@ -2610,7 +2610,18 @@ export class WorkflowInstance implements DurableObject {
       turnSucceeded ? "settle" : "release",
       {
         reservation_ref: reservationRef,
-        ...(turnSucceeded && hasExactUsage ? { usage } : {}),
+        // Settlement carries exactly the billing counters it always has; the
+        // context gauge that now rides the turn projection stays out of it.
+        ...(turnSucceeded && hasExactUsage
+          ? {
+              usage: {
+                usage_ref: usage.usage_ref,
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+              },
+            }
+          : {}),
       },
     );
     if (settlement instanceof Response) return settlement;
@@ -3948,6 +3959,7 @@ export class WorkflowInstance implements DurableObject {
           input_tokens?: unknown;
           cached_input_tokens?: unknown;
           output_tokens?: unknown;
+          last_input_tokens?: unknown;
         };
         output_observation?: {
           label_ref: string;
@@ -3996,6 +4008,9 @@ export class WorkflowInstance implements DurableObject {
                   cached_input_tokens:
                     durableUsage.cached_input_tokens,
                   output_tokens: durableUsage.output_tokens,
+                  // The settled context-window reading (a gauge, not a
+                  // billing counter) rides the same projection.
+                  last_input_tokens: durableUsage.last_input_tokens,
                   // Carried only when the round ran on the metered rail, so the
                   // embedder can reconcile true cost against gateway telemetry
                   // rather than trusting an estimated rate card (ADR 0085 §3).

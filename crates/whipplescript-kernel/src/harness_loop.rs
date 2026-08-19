@@ -304,6 +304,13 @@ pub struct BrokeredTurnOutcome {
     pub steps: usize,
     pub observations: Vec<LoopObservation>,
     pub usage: Value,
+    /// The last MAIN reply's `input_tokens` — the provider's own count of the
+    /// whole prompt it just processed, the same reading the compaction trigger
+    /// consumes. A point-in-time gauge, never a sum: `usage` answers "what did
+    /// this turn cost", this answers "how full is the context window". 0 when
+    /// no main reply reported it (an error before the first reply, or a settle
+    /// straight after a compaction reset).
+    pub last_input_tokens: u64,
 }
 
 /// Project a finished [`BrokeredTurnOutcome`] onto the [`ProviderRunResult`] the
@@ -356,7 +363,7 @@ pub fn provider_result_from_brokered_turn(outcome: &BrokeredTurnOutcome) -> Prov
         transcript: serde_json::to_string(&outcome.observations)
             .unwrap_or_else(|_| "[]".to_owned()),
         exit_code: matches!(outcome.status, TurnStatus::Completed).then_some(0),
-        usage_json: outcome.usage.to_string(),
+        usage_json: usage_with_context(&outcome.usage, outcome.last_input_tokens).to_string(),
         artifacts: Vec::new(),
         failure,
     }
@@ -449,6 +456,9 @@ where
     checkpoint(&messages);
     let mut observations: Vec<LoopObservation> = Vec::new();
     let mut usage = Value::Null;
+    // Mirrors the stepped machine's field byte-for-byte: refreshed on every
+    // main reply, so the settled value is the LAST reply's prompt size.
+    let mut last_input_tokens = 0_u64;
 
     let mut provider_retries: u32 = 0;
     let mut step = 0;
@@ -489,10 +499,12 @@ where
                     steps: step + 1,
                     observations,
                     usage,
+                    last_input_tokens,
                 };
             }
         };
         usage = merge_usage(usage, reply.usage.clone());
+        last_input_tokens = input_tokens_of(&reply.usage);
 
         if reply.is_final() {
             // Mirror the stepped machine: the final assistant reply joins the
@@ -508,6 +520,7 @@ where
                 steps: step + 1,
                 observations,
                 usage,
+                last_input_tokens,
             };
         }
 
@@ -549,6 +562,7 @@ where
         steps: input.max_steps,
         observations,
         usage,
+        last_input_tokens,
     }
 }
 
@@ -849,6 +863,7 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
             });
         }
         // Pi-style steering joins the current run after the preceding
@@ -861,6 +876,7 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
             });
         }
         self.awaiting = Awaiting::Main;
@@ -882,6 +898,7 @@ where
             steps: self.input.max_steps,
             observations: std::mem::take(&mut self.observations),
             usage: std::mem::take(&mut self.usage),
+            last_input_tokens: self.last_input_tokens,
         }
     }
 }
@@ -932,6 +949,7 @@ where
                                 steps: self.step,
                                 observations: std::mem::take(&mut self.observations),
                                 usage: std::mem::take(&mut self.usage),
+                                last_input_tokens: self.last_input_tokens,
                             });
                         };
                         self.model.build_request(&compaction.request_messages, &[])
@@ -1016,6 +1034,7 @@ where
                     steps: self.step + 1,
                     observations: std::mem::take(&mut self.observations),
                     usage: std::mem::take(&mut self.usage),
+                    last_input_tokens: self.last_input_tokens,
                 });
             }
         };
@@ -1046,6 +1065,7 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
             });
         }
 
@@ -1077,6 +1097,7 @@ where
                         steps: self.step,
                         observations: std::mem::take(&mut self.observations),
                         usage: std::mem::take(&mut self.usage),
+                        last_input_tokens: self.last_input_tokens,
                     });
                 }
             };
@@ -1089,6 +1110,7 @@ where
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
             });
         }
 
@@ -1844,6 +1866,23 @@ fn model_error_summary(error: &HarnessModelError) -> String {
     }
 }
 
+/// Stamp the settled turn's context reading into its terminal usage object,
+/// under a key no provider emits. Stamped once, at the terminal — never fed
+/// back through [`merge_usage`], whose numeric summing is exactly what this
+/// gauge must not receive. A reading of 0 (no main reply reported one) is
+/// honest absence and stamps nothing.
+pub fn usage_with_context(usage: &Value, last_input_tokens: u64) -> Value {
+    if last_input_tokens == 0 {
+        return usage.clone();
+    }
+    let mut map = match usage {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    map.insert("last_input_tokens".to_owned(), json!(last_input_tokens));
+    Value::Object(map)
+}
+
 /// Accumulate usage objects across model calls by summing shared numeric keys.
 /// Non-numeric or absent keys fall back to the latest value.
 ///
@@ -2346,6 +2385,10 @@ mod tests {
         assert_eq!(out1.steps, out2.steps, "steps");
         assert_eq!(out1.observations, out2.observations, "observations");
         assert_eq!(out1.usage, out2.usage, "usage");
+        assert_eq!(
+            out1.last_input_tokens, out2.last_input_tokens,
+            "context reading"
+        );
         assert_eq!(*exec1.calls.borrow(), *exec2.calls.borrow(), "tool calls");
         assert_eq!(cp1, cp2, "checkpoint sequence");
     }
@@ -2353,6 +2396,74 @@ mod tests {
     #[test]
     fn brokered_turn_machine_matches_loop_completing_immediately() {
         assert_loops_equivalent(|| vec![Ok(final_reply("done"))], 8);
+    }
+
+    /// The settled context reading is the LAST main reply's prompt size, while
+    /// the usage meter sums every call — the two must not be conflated, in
+    /// either loop. This is the property the whole gauge rests on: a tool-loop
+    /// turn's summed input overcounts the window by the number of rounds.
+    #[test]
+    fn settled_context_reading_is_the_last_reply_not_the_sum() {
+        let replies = || {
+            vec![
+                Ok(ModelReply {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: json!({ "path": "README.md" }),
+                    }],
+                    usage: json!({ "input_tokens": 100, "output_tokens": 3 }),
+                }),
+                Ok(ModelReply {
+                    text: "done".to_owned(),
+                    tool_calls: Vec::new(),
+                    usage: json!({ "input_tokens": 130, "output_tokens": 5 }),
+                }),
+            ]
+        };
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "R".to_owned(),
+        });
+        for outcome in [
+            run_brokered_loop(
+                &ScriptedClient::new(replies()),
+                &exec,
+                &input(8),
+                &mut no_checkpoint(),
+            ),
+            run_brokered_turn_http(
+                &ScriptedHttpClient::new(replies()),
+                &exec,
+                &input(8),
+                &mut no_checkpoint(),
+                &DummyHost,
+                &NoopCompactor,
+                None,
+                None,
+            ),
+        ] {
+            assert_eq!(outcome.status, TurnStatus::Completed);
+            assert_eq!(outcome.usage["input_tokens"], json!(230), "meter sums");
+            assert_eq!(outcome.last_input_tokens, 130, "gauge reads the last");
+        }
+    }
+
+    /// The terminal stamp: rides the usage object under a key no provider
+    /// emits, and an unreported reading (0) stamps nothing rather than a lie.
+    #[test]
+    fn usage_with_context_stamps_only_a_real_reading() {
+        let usage = json!({ "input_tokens": 230, "output_tokens": 8 });
+        assert_eq!(
+            usage_with_context(&usage, 130),
+            json!({ "input_tokens": 230, "output_tokens": 8, "last_input_tokens": 130 })
+        );
+        assert_eq!(usage_with_context(&usage, 0), usage);
+        assert_eq!(
+            usage_with_context(&Value::Null, 130),
+            json!({ "last_input_tokens": 130 })
+        );
     }
 
     #[test]

@@ -534,6 +534,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         let terminal_key = idempotency_key(&[ctx.instance_id, ctx.effect_id, "terminal"]);
         let total_steps = prior_steps + outcome.steps;
         let total_usage = merge_numeric_json(prior_usage, outcome.usage.clone());
+        // The context reading is stamped after the merge: it is a point-in-time
+        // gauge (the last main reply's prompt size), and running it through the
+        // numeric merge would sum it into nonsense.
+        let total_usage =
+            crate::harness_loop::usage_with_context(&total_usage, outcome.last_input_tokens);
         let metadata_json = json!({
             "steps": total_steps,
             "usage": total_usage,

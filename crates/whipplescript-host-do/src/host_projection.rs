@@ -43,6 +43,11 @@ pub struct HostedUsageObservation {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    /// The last MAIN reply's prompt size — the settled context-window reading
+    /// the harness loop stamps at the terminal. A gauge, not a meter: the token
+    /// counts above sum the turn's calls for billing; this reports how full the
+    /// window was on the final call. 0 when the turn settled without one.
+    pub last_input_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -435,6 +440,10 @@ fn project_usage(
         input_tokens,
         cached_input_tokens,
         output_tokens: tokens("output_tokens", "completion_tokens"),
+        last_input_tokens: usage
+            .get("last_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     }))
 }
 
@@ -549,8 +558,24 @@ mod tests {
                 input_tokens: 9,
                 cached_input_tokens: 7,
                 output_tokens: 2,
+                // Absent in legacy metadata: an honest zero, never an error.
+                last_input_tokens: 0,
             }
         );
+    }
+
+    /// The context gauge rides the projection when the loop stamped one, and
+    /// stays a distinct reading from the summed billing counters.
+    #[test]
+    fn usage_projection_carries_the_stamped_context_reading() {
+        let projected = project_usage(
+            r#"{"usage":{"input_tokens":90,"output_tokens":12,"last_input_tokens":34}}"#,
+            "usage:test",
+        )
+        .expect("usage projection")
+        .expect("usage");
+        assert_eq!(projected.input_tokens, 90);
+        assert_eq!(projected.last_input_tokens, 34);
     }
 
     /// The surface in the admitted base URL is what picks the wire. Getting this
@@ -611,6 +636,7 @@ mod tests {
                 input_tokens: 3454,
                 cached_input_tokens: 3443,
                 output_tokens: 4,
+                last_input_tokens: 0,
             }
         );
         assert!(
@@ -639,6 +665,7 @@ mod tests {
                 input_tokens: 3454,
                 cached_input_tokens: 0,
                 output_tokens: 4,
+                last_input_tokens: 0,
             }
         );
     }
@@ -662,6 +689,7 @@ mod tests {
                 input_tokens: 9,
                 cached_input_tokens: 7,
                 output_tokens: 2,
+                last_input_tokens: 0,
             }
         );
     }

@@ -1325,6 +1325,24 @@ pub struct TurnExecution {
     /// has no terminal receipt by construction.
     pub receipt: Option<TurnReceipt>,
     pub output: Option<LabeledTurnOutput>,
+    /// The same deliberately narrow token projection the Durable Object host
+    /// publishes (`HostedUsageObservation`): typed counts an embedding product
+    /// may meter on, plus the settled context-window reading. The opaque
+    /// `usage_ref` on the receipt remains the authoritative evidence pointer.
+    /// `None` when the turn recorded no usage metadata.
+    pub usage: Option<TurnUsageObservation>,
+}
+
+/// The local host's projection of one turn's usage metadata. `input_tokens` and
+/// `output_tokens` sum the turn's model calls (a meter); `last_input_tokens` is
+/// the final main call's prompt size (a gauge — how full the context window
+/// was), 0 when the turn settled without one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnUsageObservation {
+    pub usage_ref: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub last_input_tokens: u64,
 }
 
 impl TurnExecution {
@@ -2667,11 +2685,56 @@ impl GovernedHostRuntime {
         };
         receipt.validate_for(command)?;
         let output = self.project_turn_output(command, receipt.output_handle.clone())?;
+        let usage = self.project_turn_usage(command, &receipt.usage_ref)?;
         Ok(TurnExecution {
             events,
             receipt: Some(receipt),
             output,
+            usage,
         })
+    }
+
+    /// Project the run's usage metadata into the typed observation. Total: a
+    /// missing run or metadata without a usage object is an honest `None`, not
+    /// an error — legacy runs recorded before the projection existed still
+    /// reconstruct.
+    fn project_turn_usage(
+        &self,
+        command: &StartTurnCommand,
+        usage_ref: &str,
+    ) -> Result<Option<TurnUsageObservation>, HostRuntimeError> {
+        let run_id = idempotency_key(&[&command.instance_ref, &command.command_id, "brokered-run"]);
+        let Some(run) = self
+            .kernel
+            .store()
+            .list_runs(&command.instance_ref)
+            .map_err(HostRuntimeError::Store)?
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+        else {
+            return Ok(None);
+        };
+        let metadata: Value =
+            serde_json::from_str(&run.metadata_json).map_err(HostRuntimeError::Json)?;
+        let Some(usage) = metadata.get("usage").filter(|usage| usage.is_object()) else {
+            return Ok(None);
+        };
+        let tokens = |primary: &str, alias: &str| {
+            usage
+                .get(primary)
+                .or_else(|| usage.get(alias))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        Ok(Some(TurnUsageObservation {
+            usage_ref: usage_ref.to_owned(),
+            input_tokens: tokens("input_tokens", "prompt_tokens"),
+            output_tokens: tokens("output_tokens", "completion_tokens"),
+            last_input_tokens: usage
+                .get("last_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        }))
     }
 
     fn ensure_evidence(
@@ -2869,10 +2932,12 @@ impl GovernedHostRuntime {
             });
         }
         let output = self.project_turn_output(command, receipt.output_handle.clone())?;
+        let usage = self.project_turn_usage(command, &receipt.usage_ref)?;
         Ok(Some(TurnExecution {
             events: projected,
             receipt: Some(receipt),
             output,
+            usage,
         }))
     }
 
@@ -5454,6 +5519,18 @@ workflow Method {
         let output = execution.output.expect("labeled output projection");
         assert_eq!(output.assistant_text, "Reading the register now.");
         assert_eq!(output.tool_calls.len(), 1);
+        // The typed usage projection: the meter sums both rounds (10 + 14),
+        // the gauge reads only the final round's prompt — a tool-loop turn
+        // must never report its summed input as the window reading.
+        assert_eq!(
+            execution.usage,
+            Some(TurnUsageObservation {
+                usage_ref: receipt.usage_ref.clone(),
+                input_tokens: 24,
+                output_tokens: 4,
+                last_input_tokens: 14,
+            })
+        );
     }
 
     #[test]

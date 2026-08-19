@@ -659,6 +659,15 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                         .get("usage")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({})),
+                                    // The container stamps the settled context
+                                    // reading into its usage projection; carry
+                                    // it so the terminal re-stamp is a no-op
+                                    // rather than an erasure.
+                                    last_input_tokens: outcome
+                                        .get("usage")
+                                        .and_then(|usage| usage.get("last_input_tokens"))
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0),
                                 }
                             }
                             Ok(response) => BrokeredTurnOutcome {
@@ -675,6 +684,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
+                                last_input_tokens: 0,
                             },
                             Err(transport) => BrokeredTurnOutcome {
                                 status: TurnStatus::Failed,
@@ -682,6 +692,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 steps: 0,
                                 observations: Vec::new(),
                                 usage: serde_json::json!({}),
+                                last_input_tokens: 0,
                             },
                         };
                         let result = provider_result_from_brokered_turn(&outcome);
