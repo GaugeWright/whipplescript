@@ -2185,7 +2185,7 @@ dependencies = [
 name = "whipplescript-custodian"
 version = "0.5.3"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ring",
  "serde",
  "serde_json",
@@ -2199,7 +2199,7 @@ dependencies = [
 name = "whipplescript-custody"
 version = "0.5.3"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "sha2",
