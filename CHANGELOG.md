@@ -3,6 +3,41 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.5] — 2026-08-20
+
+An agent turn's request dialect becomes a named, declared property of a
+provider binding rather than something recovered by reading a base URL.
+`ModelWire` — `anthropic-messages`, `openai-responses`, `openai-chat-compat`,
+`coerced-tools` — is separate from `CoerceProvider`, which answers whose
+credential pays; the two were one enum, and a metered gateway is a single
+payer identity fronting three dialects.
+
+The wire used to be recovered by testing an admitted base URL for an
+`/anthropic` suffix, with everything else taking the chat-completions wire as
+"the wire that has always worked". That default was wrong in production: an
+OpenAI model whose family carries tools only on the Responses API was sent its
+tools on chat completions and refused at the first turn that carried any,
+while this runtime's Responses builder sat unreachable behind a mapping with
+no arm that produced it. A binding may now declare its wire in the signed
+policy, and the declaration travels through the turn admission to the host.
+The surface mapping survives only as a fallback for envelopes signed before
+the field existed: it is total, and an unrecognized surface is an error rather
+than a guess.
+
+`coerced-tools` is a new dialect and the floor beneath the model catalogue:
+chat completions with `response_format` pinned to a `{reply, tool_calls[]}`
+schema and no native tool array at all, so a model that can honour a JSON
+schema can drive the loop whatever its endpoint implements. `DR-0064` records
+it and states its cost — a tool request expressed as structured output is off
+the format models are trained on — so native calling remains the default and
+this remains a fallback. Brokering is unchanged: whip still executes every
+tool the model requests, under the same lease, store policy, counter, and
+capability gate.
+
+Compatible with envelopes signed before this release. The `wire` field is
+optional and omitted when absent, so an existing policy canonicalizes to the
+bytes it was signed as and still verifies.
+
 ## [0.5.4] — 2026-08-19
 
 xAI's Grok models become a first-class model backend, and the harness loop

@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custodian"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "base64 0.23.1",
  "ring",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-host-do"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "hex",
  "p256",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "bashkit",
  "chrono",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "serde_json",
  "sha2",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-claude"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-provider-codex"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "rusqlite",
  "serde",
