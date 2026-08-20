@@ -49,6 +49,12 @@ pub struct HostTurnAdmission {
     pub provider: String,
     pub model: String,
     pub base_url: String,
+    /// The request dialect the verified policy declared for this binding, if it
+    /// declared one. Carried out with the rest of the tuple because a placement
+    /// that has to re-derive it from the base URL is guessing at exactly the
+    /// point the signature could have told it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<String>,
 }
 
 /// The common governed facade over any WhippleScript runtime store.
@@ -296,6 +302,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             provider: binding.provider.clone(),
             model: binding.model.clone(),
             base_url: binding.base_url.clone(),
+            wire: binding.wire.clone(),
         })
     }
 
@@ -593,6 +600,7 @@ workflow Method {
                     model: "gpt-test".to_owned(),
                     base_url: "https://provider.invalid".to_owned(),
                     credential_ref: "credential:model".to_owned(),
+                    wire: None,
                 },
             )]),
             placements: BTreeMap::from([(

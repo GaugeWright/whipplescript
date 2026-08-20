@@ -25,6 +25,9 @@ export interface HostTurnAdmission {
   provider: HostedProvider;
   model: string;
   base_url: string;
+  /** The request dialect the signed policy declared for this binding, when it
+   *  declared one. Absent leaves the runtime to read it from the surface. */
+  wire?: string;
 }
 
 export interface ResolvedHostProviderBinding {
@@ -34,6 +37,8 @@ export interface ResolvedHostProviderBinding {
   provider: HostedProvider;
   model: string;
   base_url: string;
+  /** Carried verbatim from the admitted policy; see HostTurnAdmission.wire. */
+  wire?: string;
   execution: "model-broker" | "direct" | "managed";
   api_key: string;
 }
@@ -111,6 +116,7 @@ export function resolveAdmittedProvider(
       provider: admission.provider,
       model: admission.model,
       base_url: admission.base_url,
+      ...(admission.wire ? { wire: admission.wire } : {}),
       execution: "managed",
       api_key: MODEL_AUTH_SENTINEL,
     };
@@ -124,6 +130,7 @@ export function resolveAdmittedProvider(
       provider: admission.provider,
       model: admission.model,
       base_url: admission.base_url,
+      ...(admission.wire ? { wire: admission.wire } : {}),
       execution: "direct",
       // WhippleScript/Wasm receives only this public sentinel. The actual
       // provider credential is read and injected inside

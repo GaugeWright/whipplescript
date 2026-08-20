@@ -10370,6 +10370,7 @@ rule settle
                     model: "gpt-5".to_owned(),
                     base_url: "https://api.openai.com/v1/responses".to_owned(),
                     credential_ref: "credential:account:openai".to_owned(),
+                    wire: None,
                 },
             )]),
             placements: BTreeMap::from([(

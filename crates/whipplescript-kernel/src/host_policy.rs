@@ -32,6 +32,20 @@ pub struct ProviderBindingPolicy {
     pub model: String,
     pub base_url: String,
     pub credential_ref: String,
+    /// The request dialect this binding speaks, as
+    /// [`crate::harness_model::ModelWire::as_str`] names it.
+    ///
+    /// Absent means the host declared none, and a runtime that must have one
+    /// derives it from the admitted surface instead. That fallback is what this
+    /// field exists to retire: a dialect recovered by inspecting a URL is a
+    /// guess, and the guess was wrong for every OpenAI model whose family
+    /// requires the Responses API to carry tools.
+    ///
+    /// Optional, and omitted when absent, so every envelope signed before this
+    /// field existed still canonicalizes — and therefore still verifies — to the
+    /// exact bytes it was signed as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<String>,
 }
 
 /// Placement constraints that sit below the WhippleScript policy envelope.
@@ -204,6 +218,7 @@ mod tests {
                     model: "gpt-5".to_owned(),
                     base_url: "https://api.openai.com/v1/responses".to_owned(),
                     credential_ref: "credential:account:openai".to_owned(),
+                    wire: Some("openai-responses".to_owned()),
                 },
             )]),
             placements: BTreeMap::from([(

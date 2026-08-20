@@ -8,8 +8,8 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{chat_messages_from_json, ChatMessage};
+use whipplescript_kernel::harness_model::ModelWire;
 use whipplescript_kernel::host_protocol::{
     EventPosition, LabeledRuntimeEvent, RuntimeEvidencePointer, StartTurnCommand, TurnReceipt,
     TurnStatus, HOST_PROTOCOL,
@@ -358,20 +358,51 @@ fn project_output(
 /// re-sent prefix. Measured 2026-08-11 against `gaugewright-panels`: same
 /// prefix, 9.25x cheaper on the native route's cached span.
 ///
-/// Anything that is not the native surface stays `OpenAiCompat`, which is both
-/// the historical behaviour and the safe default — an unrecognized surface gets
-/// the wire that has always worked rather than one that would send a body the
-/// endpoint cannot read.
-pub fn metered_gateway_wire(base_url: Option<&str>) -> CoerceProvider {
-    if base_url
-        .unwrap_or("")
-        .trim_end_matches('/')
-        .ends_with("/anthropic")
-    {
-        CoerceProvider::Anthropic
+/// Each surface the gateway fronts is named here. The mapping is total on
+/// purpose: it used to read "`/anthropic`, or else compat", and that `or else`
+/// is what sent every OpenAI model on the chat-completions wire — including the
+/// families that can only carry tools on the Responses API, which refused the
+/// first turn that carried any. A surface this function does not recognize now
+/// yields `None` so the caller can refuse, rather than being handed the wire
+/// that happened to work for something else.
+///
+/// This remains a fallback. A binding that declares its wire is believed over
+/// anything inferred here; see [`declared_or_inferred_wire`].
+pub fn metered_gateway_wire(base_url: Option<&str>) -> Option<ModelWire> {
+    let base = base_url.unwrap_or("").trim_end_matches('/');
+    if base.ends_with("/anthropic") {
+        Some(ModelWire::AnthropicMessages)
+    } else if base.ends_with("/openai") {
+        Some(ModelWire::OpenAiResponses)
+    } else if base.ends_with("/compat") {
+        Some(ModelWire::OpenAiChatCompat)
     } else {
-        CoerceProvider::OpenAiCompat
+        None
     }
+}
+
+/// The wire for one binding: what the host declared, else what the admitted
+/// surface implies.
+///
+/// A declared wire wins because it is the one fact checked before publication;
+/// an inferred one is a reading of a URL that nothing validated. Both may be
+/// absent — an old envelope through an unrecognized surface — and that is an
+/// error rather than a guess, because every remaining option would be a body
+/// some endpoint cannot read.
+pub fn declared_or_inferred_wire(
+    declared: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<ModelWire, String> {
+    if let Some(name) = declared.map(str::trim).filter(|name| !name.is_empty()) {
+        return ModelWire::parse(name)
+            .ok_or_else(|| format!("binding declares an unknown model wire: {name}"));
+    }
+    metered_gateway_wire(base_url).ok_or_else(|| {
+        format!(
+            "binding declares no model wire and its surface implies none: {}",
+            base_url.unwrap_or("<absent>")
+        )
+    })
 }
 
 fn project_usage(
@@ -578,41 +609,73 @@ mod tests {
         assert_eq!(projected.last_input_tokens, 34);
     }
 
-    /// The surface in the admitted base URL is what picks the wire. Getting this
-    /// wrong is not a crash: `/anthropic` read as compat sends a chat-completions
-    /// body to the Messages API, and `/compat` read as native sends an
-    /// Anthropic body to the shim.
+    /// The surface in the admitted base URL is what picks the wire when nothing
+    /// declares one. Getting this wrong is not a crash: `/anthropic` read as
+    /// compat sends a chat-completions body to the Messages API, and `/compat`
+    /// read as native sends an Anthropic body to the shim.
     #[test]
     fn metered_gateway_wire_follows_the_admitted_surface() {
         let base = "https://gateway.ai.cloudflare.com/v1/abc/gw";
         assert_eq!(
             metered_gateway_wire(Some(&format!("{base}/anthropic"))),
-            CoerceProvider::Anthropic
+            Some(ModelWire::AnthropicMessages)
         );
         // A trailing slash is the same admitted endpoint.
         assert_eq!(
             metered_gateway_wire(Some(&format!("{base}/anthropic/"))),
-            CoerceProvider::Anthropic
+            Some(ModelWire::AnthropicMessages)
         );
         assert_eq!(
             metered_gateway_wire(Some(&format!("{base}/compat"))),
-            CoerceProvider::OpenAiCompat
+            Some(ModelWire::OpenAiChatCompat)
         );
-        // Unknown and absent surfaces keep the long-standing wire rather than
-        // guessing into one that would send an unreadable body.
+        // The provider-native OpenAI surface is the Responses API. This arm read
+        // as compat until 2026-08-19, which is precisely the defect: a model
+        // whose family carries tools only on Responses was sent the chat
+        // completions body and refused at its first tool-bearing turn.
         assert_eq!(
             metered_gateway_wire(Some(&format!("{base}/openai"))),
-            CoerceProvider::OpenAiCompat
+            Some(ModelWire::OpenAiResponses)
         );
-        assert_eq!(metered_gateway_wire(None), CoerceProvider::OpenAiCompat);
+        // An unrecognized or absent surface names no wire. It used to name the
+        // one that had always worked, which is how a wrong answer travelled as
+        // far as a live panel.
+        assert_eq!(metered_gateway_wire(Some(&format!("{base}/llama"))), None);
+        assert_eq!(metered_gateway_wire(None), None);
         // `anthropic` must be the surface segment, not a substring of the
         // gateway's own name.
         assert_eq!(
             metered_gateway_wire(Some(
                 "https://gateway.ai.cloudflare.com/v1/abc/anthropic-panels/compat"
             )),
-            CoerceProvider::OpenAiCompat
+            Some(ModelWire::OpenAiChatCompat)
         );
+    }
+
+    /// A declared wire is believed; an undeclared one falls back to the surface;
+    /// neither available is an error rather than a guess.
+    #[test]
+    fn a_declared_wire_beats_the_surface_and_an_unknown_one_is_refused() {
+        let compat = "https://gateway.ai.cloudflare.com/v1/abc/gw/compat";
+        // Declared wins even when the surface would imply something else — this
+        // is what lets a host publish a checked pairing instead of hoping.
+        assert_eq!(
+            declared_or_inferred_wire(Some("coerced-tools"), Some(compat)),
+            Ok(ModelWire::CoercedTools)
+        );
+        // Absent and empty both mean "not declared".
+        assert_eq!(
+            declared_or_inferred_wire(None, Some(compat)),
+            Ok(ModelWire::OpenAiChatCompat)
+        );
+        assert_eq!(
+            declared_or_inferred_wire(Some("  "), Some(compat)),
+            Ok(ModelWire::OpenAiChatCompat)
+        );
+        // A name this runtime does not implement must not fall back to one it
+        // does: the host asked for something exact and did not get it.
+        assert!(declared_or_inferred_wire(Some("openai-realtime"), Some(compat)).is_err());
+        assert!(declared_or_inferred_wire(None, Some("https://example.invalid")).is_err());
     }
 
     /// Anthropic's native wire splits the prompt across three fields and leaves

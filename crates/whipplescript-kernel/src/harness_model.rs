@@ -12,6 +12,7 @@
 //! Codex OAuth SSE backend (function-call items over an event stream) is a
 //! follow-on; `coerce_native`'s `assemble_responses_sse` is the starting point.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::coerce_native::{
@@ -45,7 +46,7 @@ fn openai_request_key(cache_key: Option<&str>) -> Option<String> {
 /// the provider + model id — never an operator config knob. The numbers are the
 /// window WhippleScript's requests actually get. Unknown models fall back to a
 /// conservative family default.
-pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
+pub fn model_context_window(wire: ModelWire, model: &str) -> u64 {
     let model = model.to_ascii_lowercase();
     // Match on the bare id. A metered-gateway name carries its provider
     // (`openai/gpt-5-mini`) because unified billing routes by that form, and the
@@ -71,35 +72,39 @@ pub fn model_context_window(provider: CoerceProvider, model: &str) -> u64 {
             200_000
         };
     }
-    match provider {
-        // Claude models are 200k standard context.
-        CoerceProvider::Anthropic => 200_000,
-        // xAI publishes few, stable windows: the fast variants carry 2M, the
-        // grok-4 family and grok-code 256k, and everything earlier or
-        // unrecognized falls back to grok-3's 131k (conservative default).
-        CoerceProvider::Xai => {
-            if bare.contains("grok-4-fast") || bare.contains("grok-4.1-fast") {
-                2_000_000
-            } else if bare.contains("grok-4") || bare.contains("grok-code") {
-                256_000
-            } else {
-                131_072
-            }
-        }
-        // A generic OpenAI-compatible endpoint serves arbitrary models whose windows
-        // we can't know; fall back to the OpenAI heuristic (conservative default for
-        // an unrecognized id).
-        CoerceProvider::OpenAi | CoerceProvider::OpenAiCompat => {
-            if bare.contains("gpt-4.1") {
-                1_000_000
-            } else if bare.contains("gpt-4o") || bare.contains("gpt-4-turbo") {
-                128_000
-            } else if is_openai_reasoning_model(bare) {
-                200_000
-            } else {
-                128_000
-            }
-        }
+    // Claude models are 200k standard context.
+    if wire == ModelWire::AnthropicMessages {
+        return 200_000;
+    }
+    // xAI publishes few, stable windows: the fast variants carry 2M, the
+    // grok-4 family and grok-code 256k, and everything earlier or unrecognized
+    // falls back to grok-3's 131k (conservative default).
+    //
+    // Keyed on the model id rather than on the wire, because the wire no longer
+    // distinguishes them: xAI speaks chat completions, and so do the dozen other
+    // endpoints that can serve a grok model. A window is a property of the model
+    // wherever it is served from — the same reason the Claude test above reads
+    // the name.
+    if bare.contains("grok") {
+        return if bare.contains("grok-4-fast") || bare.contains("grok-4.1-fast") {
+            2_000_000
+        } else if bare.contains("grok-4") || bare.contains("grok-code") {
+            256_000
+        } else {
+            131_072
+        };
+    }
+    // Any remaining OpenAI-wire endpoint serves arbitrary models whose windows we
+    // can't know; fall back to the OpenAI heuristic (conservative default for an
+    // unrecognized id).
+    if bare.contains("gpt-4.1") {
+        1_000_000
+    } else if bare.contains("gpt-4o") || bare.contains("gpt-4-turbo") {
+        128_000
+    } else if is_openai_reasoning_model(bare) {
+        200_000
+    } else {
+        128_000
     }
 }
 
@@ -158,13 +163,96 @@ fn anthropic_output_limit(model: &str) -> u64 {
 /// applies its own true ceiling — which is precisely the capability the guess
 /// was reaching for, sourced from the party that actually knows it. An operator
 /// who wants a smaller budget still sets one explicitly, and that value is sent.
-pub fn model_output_limit(provider: CoerceProvider, model: &str) -> Option<u64> {
+pub fn model_output_limit(wire: ModelWire, model: &str) -> Option<u64> {
     let lowered = model.to_ascii_lowercase();
     let is_claude = lowered.contains("claude") || lowered.starts_with("anthropic/");
-    if is_claude || provider == CoerceProvider::Anthropic {
+    if is_claude || wire == ModelWire::AnthropicMessages {
         Some(anthropic_output_limit(&lowered))
     } else {
         None
+    }
+}
+
+/// The request dialect one agent turn speaks to a model endpoint.
+///
+/// Distinct from [`CoerceProvider`], which answers *whose credential pays and
+/// how it is resolved*. This answers *what bytes go on the wire*, and the two
+/// are genuinely independent: the metered Cloudflare gateway is one provider
+/// identity that fronts three dialects, and a single dialect (chat completions)
+/// is spoken by a dozen provider identities.
+///
+/// Conflating them is what made models look swappable when they were not. The
+/// dialect used to be recovered by inspecting a base URL for a suffix, so a
+/// model whose family requires the Responses API was silently sent on the chat
+/// completions wire and refused at the first turn that carried tools. A dialect
+/// that is declared can be checked before anything is published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelWire {
+    /// Anthropic's Messages API (`/v1/messages`): `tool_use` content blocks.
+    AnthropicMessages,
+    /// OpenAI's Responses API (`/v1/responses`): `function_call` output items.
+    /// The dialect OpenAI reasoning models require in order to carry tools —
+    /// and, on that surface, to carry reasoning state between tool calls.
+    OpenAiResponses,
+    /// The Chat Completions API (`/chat/completions`): `tool_calls[]` on the
+    /// assistant message. Near-universally implemented, and the older surface.
+    OpenAiChatCompat,
+    /// Chat Completions with **no native tool vocabulary**: the tool call is
+    /// requested as structured output against a JSON schema, and WhippleScript
+    /// reads it back out. The floor beneath every other dialect — a model that
+    /// can honour a JSON schema can drive the loop, whether or not its endpoint
+    /// implements function calling. See DR-0037.
+    CoercedTools,
+}
+
+impl ModelWire {
+    /// The dialect a provider identity speaks when nothing more specific is
+    /// declared. Every arm is a deliberate statement rather than a default:
+    /// an unrecognized surface has no honest fallback, so callers that cannot
+    /// name a wire should refuse rather than guess.
+    pub fn of_provider(provider: CoerceProvider) -> Self {
+        match provider {
+            CoerceProvider::Anthropic => ModelWire::AnthropicMessages,
+            CoerceProvider::OpenAi => ModelWire::OpenAiResponses,
+            CoerceProvider::OpenAiCompat | CoerceProvider::Xai => ModelWire::OpenAiChatCompat,
+        }
+    }
+
+    /// Parse a declared wire name. Returns `None` for an unknown name so the
+    /// caller can refuse rather than silently take a dialect the endpoint may
+    /// not speak.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "anthropic-messages" => Some(ModelWire::AnthropicMessages),
+            "openai-responses" => Some(ModelWire::OpenAiResponses),
+            "openai-chat-compat" => Some(ModelWire::OpenAiChatCompat),
+            "coerced-tools" => Some(ModelWire::CoercedTools),
+            _ => None,
+        }
+    }
+
+    /// The declared name, as it appears in a policy envelope or host config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelWire::AnthropicMessages => "anthropic-messages",
+            ModelWire::OpenAiResponses => "openai-responses",
+            ModelWire::OpenAiChatCompat => "openai-chat-compat",
+            ModelWire::CoercedTools => "coerced-tools",
+        }
+    }
+
+    /// Whether the dialect asks the endpoint for native function calling. The
+    /// coerced dialect does not, which is exactly why it survives endpoints
+    /// that refuse tools.
+    pub fn uses_native_tools(self) -> bool {
+        !matches!(self, ModelWire::CoercedTools)
+    }
+}
+
+impl From<CoerceProvider> for ModelWire {
+    fn from(provider: CoerceProvider) -> Self {
+        ModelWire::of_provider(provider)
     }
 }
 
@@ -172,7 +260,7 @@ pub fn model_output_limit(provider: CoerceProvider, model: &str) -> Option<u64> 
 /// `ureq`-backed transport and a resolved API key + model.
 pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
     transport: &'a T,
-    provider: CoerceProvider,
+    wire: ModelWire,
     api_key: String,
     model: String,
     base_url: String,
@@ -196,7 +284,7 @@ pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
 impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
     pub fn new(
         transport: &'a T,
-        provider: CoerceProvider,
+        wire: impl Into<ModelWire>,
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
@@ -205,7 +293,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
     ) -> Self {
         Self {
             transport,
-            provider,
+            wire: wire.into(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
@@ -231,7 +319,7 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
     ) -> Self {
         Self {
             transport,
-            provider: CoerceProvider::OpenAi,
+            wire: ModelWire::OpenAiResponses,
             api_key: access_token.into(),
             model: model.into(),
             base_url: base_url.into(),
@@ -260,7 +348,7 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
             );
         }
         build_request(
-            self.provider,
+            self.wire,
             &self.base_url,
             &self.api_key,
             &self.model,
@@ -286,11 +374,11 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
             }
             response
         });
-        map_transport_response(self.provider, response)
+        map_transport_response(self.wire, response)
     }
 
     fn context_window(&self) -> u64 {
-        model_context_window(self.provider, &self.model)
+        model_context_window(self.wire, &self.model)
     }
 }
 
@@ -318,7 +406,7 @@ impl<T: CoerceTransport + ?Sized> HarnessModelClient for RealHarnessModelClient<
 /// exact request-build / response-parse logic the native
 /// [`RealHarnessModelClient`] uses, so the wire format is identical across hosts.
 pub struct MessagesApiClient {
-    provider: CoerceProvider,
+    wire: ModelWire,
     api_key: String,
     model: String,
     base_url: String,
@@ -338,7 +426,7 @@ struct CodexBackend {
 
 impl MessagesApiClient {
     pub fn new(
-        provider: CoerceProvider,
+        wire: impl Into<ModelWire>,
         api_key: impl Into<String>,
         model: impl Into<String>,
         base_url: impl Into<String>,
@@ -346,7 +434,7 @@ impl MessagesApiClient {
         cache_key: Option<String>,
     ) -> Self {
         Self {
-            provider,
+            wire: wire.into(),
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into(),
@@ -369,7 +457,7 @@ impl MessagesApiClient {
         cache_key: Option<String>,
     ) -> Self {
         Self {
-            provider: CoerceProvider::OpenAi,
+            wire: ModelWire::OpenAiResponses,
             api_key: access_token.into(),
             model: model.into(),
             base_url: base_url.into(),
@@ -403,7 +491,7 @@ impl HttpModelClient for MessagesApiClient {
             return request;
         }
         let mut request = build_request(
-            self.provider,
+            self.wire,
             &self.base_url,
             &self.api_key,
             &self.model,
@@ -424,8 +512,8 @@ impl HttpModelClient for MessagesApiClient {
             .headers
             .push(("accept".to_owned(), "text/event-stream".to_owned()));
         if matches!(
-            self.provider,
-            CoerceProvider::OpenAiCompat | CoerceProvider::Xai
+            self.wire,
+            ModelWire::OpenAiChatCompat | ModelWire::CoercedTools
         ) {
             // A Chat Completions stream reports no usage at all unless the
             // request asks for it — the ordinary non-streamed response carries
@@ -446,21 +534,24 @@ impl HttpModelClient for MessagesApiClient {
     ) -> Result<ModelReply, HarnessModelError> {
         let response = response.map(|mut response| {
             if let Some(raw) = response.body.as_str() {
-                response.body = match self.provider {
-                    CoerceProvider::OpenAi => assemble_codex_responses_sse(raw),
-                    CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
+                response.body = match self.wire {
+                    ModelWire::OpenAiResponses => assemble_codex_responses_sse(raw),
+                    // The coerced dialect rides the chat-completions wire, so its
+                    // stream assembles the same way; only the reply *shape* differs,
+                    // and that is the parser's business rather than the stream's.
+                    ModelWire::OpenAiChatCompat | ModelWire::CoercedTools => {
                         assemble_openai_chat_sse(raw)
                     }
-                    CoerceProvider::Anthropic => assemble_anthropic_messages_sse(raw),
+                    ModelWire::AnthropicMessages => assemble_anthropic_messages_sse(raw),
                 };
             }
             response
         });
-        map_transport_response(self.provider, response)
+        map_transport_response(self.wire, response)
     }
 
     fn context_window(&self) -> u64 {
-        model_context_window(self.provider, &self.model)
+        model_context_window(self.wire, &self.model)
     }
 }
 
@@ -534,11 +625,11 @@ fn build_codex_request(
 /// transport failure to the matching [`HarnessModelError`]. Shared by every
 /// [`HttpModelClient`] so the timeout/transport mapping cannot drift between hosts.
 fn map_transport_response(
-    provider: CoerceProvider,
+    wire: ModelWire,
     response: Result<HttpResponse, CoerceTransportError>,
 ) -> Result<ModelReply, HarnessModelError> {
     match response {
-        Ok(response) => parse_response(provider, response.status, &response.body),
+        Ok(response) => parse_response(wire, response.status, &response.body),
         Err(CoerceTransportError::Timeout) => Err(HarnessModelError::Timeout),
         Err(CoerceTransportError::Transport(message)) => Err(HarnessModelError::Transport(message)),
     }
@@ -548,7 +639,7 @@ fn map_transport_response(
 
 #[allow(clippy::too_many_arguments)]
 fn build_request(
-    provider: CoerceProvider,
+    wire: ModelWire,
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -557,8 +648,8 @@ fn build_request(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> HttpRequest {
-    match provider {
-        CoerceProvider::Anthropic => {
+    match wire {
+        ModelWire::AnthropicMessages => {
             // Anthropic caches by prefix hash via `cache_control` breakpoints, so
             // the stable-key intent (Decision 7) is carried by the breakpoint, not
             // an explicit key. The `cache_key` still rides as an `Idempotency-Key`
@@ -568,10 +659,13 @@ fn build_request(
                 base_url, api_key, model, max_tokens, cache_key, messages, tools,
             )
         }
-        CoerceProvider::OpenAi => {
+        ModelWire::OpenAiResponses => {
             build_openai_request(base_url, api_key, model, cache_key, messages, tools)
         }
-        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => build_openai_compat_request(
+        ModelWire::OpenAiChatCompat => build_openai_compat_request(
+            base_url, api_key, model, max_tokens, cache_key, messages, tools,
+        ),
+        ModelWire::CoercedTools => build_coerced_tools_request(
             base_url, api_key, model, max_tokens, cache_key, messages, tools,
         ),
     }
@@ -721,6 +815,249 @@ fn openai_compat_messages(messages: &[ChatMessage]) -> Vec<Value> {
         }
     }
     out
+}
+
+/// The JSON schema one coerced step answers: free text plus zero or more tool
+/// requests.
+///
+/// `arguments` is a JSON **string** rather than an object, which looks like a
+/// wart and is not one: `strict` json-schema mode admits no free-form object,
+/// and this is the same encoding native chat-completions already uses for tool
+/// arguments — so the parse below is the ordinary one, not a second dialect of
+/// argument decoding.
+fn coerced_step_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "reply": {
+                "type": "string",
+                "description": "Text for the person. Empty while only calling tools.",
+            },
+            "tool_calls": {
+                "type": "array",
+                "description": "Tools to run before continuing. Empty when the reply is final.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "arguments": {
+                            "type": "string",
+                            "description": "A JSON object of arguments, encoded as a string.",
+                        },
+                    },
+                    "required": ["name", "arguments"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": ["reply", "tool_calls"],
+        "additionalProperties": false,
+    })
+}
+
+/// The instruction that carries the tool vocabulary a native `tools[]` array
+/// would have carried. Appended as a system message so it survives conversation
+/// compaction the way the rest of the system prompt does.
+fn coerced_tools_instruction(tools: &[ToolSpec]) -> String {
+    let mut text = String::from(
+        "You drive this turn by answering with a JSON object matching the required \
+         schema. Put text for the person in `reply`. To use a tool, add an entry to \
+         `tool_calls` whose `arguments` is a JSON object encoded as a string; the \
+         results come back and you continue. Leave `tool_calls` empty when you are \
+         done. The tools available to you are:\n",
+    );
+    for tool in tools {
+        text.push_str(&format!(
+            "\n- {}: {}\n  parameters: {}\n",
+            tool.name, tool.description, tool.input_schema
+        ));
+    }
+    text
+}
+
+/// Agent-turn request for an endpoint that will not, or cannot, take a native
+/// tool vocabulary: the Chat Completions wire with `response_format` pinned to
+/// [`coerced_step_schema`] and **no** `tools[]`.
+///
+/// This is the dialect that makes the model catalog swappable rather than a set
+/// of models that happen to share a surface. Its cost is real and stated in
+/// DR-0037: a tool request expressed as structured output is off the format the
+/// model was trained on, so tool selection is measurably weaker than native
+/// calling. It is the floor, not the preference.
+#[allow(clippy::too_many_arguments)]
+fn build_coerced_tools_request(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    max_tokens: Option<u64>,
+    cache_key: Option<&str>,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+) -> HttpRequest {
+    let request_key = openai_request_key(cache_key);
+    let mut msgs = coerced_tools_messages(messages);
+    if !tools.is_empty() {
+        msgs.push(json!({ "role": "system", "content": coerced_tools_instruction(tools) }));
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": msgs,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "agent_step",
+                "schema": coerced_step_schema(),
+                "strict": true,
+            },
+        },
+    });
+    if let Some(limit) = max_tokens {
+        body["max_tokens"] = json!(limit);
+    }
+    if let Some(key) = request_key.as_deref() {
+        body["prompt_cache_key"] = json!(key);
+    }
+    let mut headers = vec![
+        ("authorization".into(), format!("Bearer {api_key}")),
+        ("content-type".into(), "application/json".into()),
+    ];
+    if let Some(key) = request_key.as_deref() {
+        headers.push(("Idempotency-Key".into(), key.to_owned()));
+    }
+    HttpRequest {
+        url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+        headers,
+        body,
+    }
+}
+
+/// Serialize the conversation for the coerced dialect.
+///
+/// The difference from [`openai_compat_messages`] is forced by the wire: an
+/// endpoint that was never sent a `tools[]` array has no tool-call ids to
+/// correlate against, and a `role:"tool"` message referring to a `tool_call_id`
+/// it never issued is rejected. So an assistant step replays as the JSON object
+/// it was, and results return as an ordinary user message naming their call.
+fn coerced_tools_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        match message {
+            ChatMessage::System(text) => {
+                out.push(json!({ "role": "system", "content": text }));
+            }
+            ChatMessage::User { text, images } => {
+                if images.is_empty() {
+                    out.push(json!({ "role": "user", "content": text }));
+                } else {
+                    let mut content: Vec<Value> = vec![json!({ "type": "text", "text": text })];
+                    for image in images {
+                        content.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!(
+                                    "data:{};base64,{}",
+                                    image.media_type, image.data_base64
+                                ),
+                            },
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": content }));
+                }
+            }
+            ChatMessage::Assistant { text, tool_calls } => {
+                let calls: Vec<Value> = tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({ "name": call.name, "arguments": call.arguments.to_string() })
+                    })
+                    .collect();
+                let step = json!({ "reply": text, "tool_calls": calls });
+                out.push(json!({ "role": "assistant", "content": step.to_string() }));
+            }
+            ChatMessage::ToolResults(results) => {
+                for result in results {
+                    let content = if result.is_error {
+                        format!(
+                            "Result of tool call {} (error): {}",
+                            result.tool_call_id, result.content
+                        )
+                    } else {
+                        format!(
+                            "Result of tool call {}: {}",
+                            result.tool_call_id, result.content
+                        )
+                    };
+                    out.push(json!({ "role": "user", "content": content }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse a coerced step: the assistant message content is the schema-constrained
+/// JSON document, not prose.
+///
+/// A model that answers with prose anyway has not called a tool, so its text is
+/// taken as the reply. That keeps a weaker model's failure to honour the schema
+/// a degraded answer rather than a failed turn.
+fn parse_coerced_tools_response(body: &Value) -> ModelReply {
+    let usage = body.get("usage").cloned().unwrap_or(Value::Null);
+    let content = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(step) = serde_json::from_str::<Value>(content)
+        .ok()
+        .filter(Value::is_object)
+    else {
+        return ModelReply {
+            text: content.to_owned(),
+            tool_calls: Vec::new(),
+            usage,
+        };
+    };
+    let text = step
+        .get("reply")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let mut tool_calls = Vec::new();
+    for (index, call) in step
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let Some(name) = call.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let arguments = match call.get("arguments") {
+            // The schema asks for a string, and a model that sends the object
+            // directly has still said exactly what it meant.
+            Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+            Some(value) => value.clone(),
+            None => Value::Null,
+        };
+        tool_calls.push(ToolCall {
+            // No endpoint issued an id here, so the loop supplies one. It only
+            // has to correlate a result with its call within this turn.
+            id: format!("coerced-{index}"),
+            name: name.to_owned(),
+            arguments,
+        });
+    }
+    ModelReply {
+        text,
+        tool_calls,
+        usage,
+    }
 }
 
 fn build_anthropic_request(
@@ -1020,19 +1357,18 @@ fn openai_input(messages: &[ChatMessage]) -> Vec<Value> {
 // -- response parsing -----------------------------------------------------
 
 fn parse_response(
-    provider: CoerceProvider,
+    wire: ModelWire,
     status: u16,
     body: &Value,
 ) -> Result<ModelReply, HarnessModelError> {
     if !(200..300).contains(&status) {
         return Err(HarnessModelError::Provider(provider_error_excerpt(body)));
     }
-    match provider {
-        CoerceProvider::Anthropic => Ok(parse_anthropic_response(body)),
-        CoerceProvider::OpenAi => Ok(parse_openai_response(body)),
-        CoerceProvider::OpenAiCompat | CoerceProvider::Xai => {
-            Ok(parse_openai_compat_response(body))
-        }
+    match wire {
+        ModelWire::AnthropicMessages => Ok(parse_anthropic_response(body)),
+        ModelWire::OpenAiResponses => Ok(parse_openai_response(body)),
+        ModelWire::OpenAiChatCompat => Ok(parse_openai_compat_response(body)),
+        ModelWire::CoercedTools => Ok(parse_coerced_tools_response(body)),
     }
 }
 
@@ -1506,60 +1842,72 @@ mod tests {
     fn context_window_is_derived_from_the_model_not_configured() {
         // Current Claude frontier models expose their full 1M window by default.
         assert_eq!(
-            model_context_window(CoerceProvider::Anthropic, "claude-opus-4-8"),
+            model_context_window(ModelWire::AnthropicMessages, "claude-opus-4-8"),
             1_000_000
         );
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAiCompat, "anthropic/claude-opus-5"),
+            model_context_window(ModelWire::OpenAiChatCompat, "anthropic/claude-opus-5"),
             1_000_000
         );
         assert_eq!(
-            model_output_limit(CoerceProvider::OpenAiCompat, "anthropic/claude-opus-5"),
+            model_output_limit(ModelWire::OpenAiChatCompat, "anthropic/claude-opus-5"),
             Some(128_000)
         );
         // OpenAI families map to their real windows.
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAi, "gpt-4o"),
+            model_context_window(ModelWire::OpenAiResponses, "gpt-4o"),
             128_000
         );
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAi, "gpt-4.1"),
+            model_context_window(ModelWire::OpenAiResponses, "gpt-4.1"),
             1_000_000
         );
-        assert_eq!(model_context_window(CoerceProvider::OpenAi, "o3"), 200_000);
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAi, "o3-mini"),
+            model_context_window(ModelWire::OpenAiResponses, "o3"),
+            200_000
+        );
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiResponses, "o3-mini"),
             200_000
         );
         // An unrecognized OpenAI model takes the conservative family default.
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAi, "some-future-model"),
+            model_context_window(ModelWire::OpenAiResponses, "some-future-model"),
             128_000
         );
         // A generic OpenAI-compatible endpoint reuses the OpenAI heuristic.
         assert_eq!(
-            model_context_window(CoerceProvider::OpenAiCompat, "llama-3.3-70b"),
+            model_context_window(ModelWire::OpenAiChatCompat, "llama-3.3-70b"),
             128_000
         );
         // xAI: fast variants carry 2M, grok-4/grok-code 256k, and anything
         // unrecognized takes grok-3's conservative 131k. `grok-4-fast` must be
         // tested before the `grok-4` prefix claims it.
         assert_eq!(
-            model_context_window(CoerceProvider::Xai, "grok-4-fast"),
+            model_context_window(ModelWire::OpenAiChatCompat, "grok-4-fast"),
             2_000_000
         );
-        assert_eq!(model_context_window(CoerceProvider::Xai, "grok-4"), 256_000);
         assert_eq!(
-            model_context_window(CoerceProvider::Xai, "grok-code-fast-1"),
+            model_context_window(ModelWire::OpenAiChatCompat, "grok-4"),
             256_000
         );
-        assert_eq!(model_context_window(CoerceProvider::Xai, "grok-3"), 131_072);
         assert_eq!(
-            model_context_window(CoerceProvider::Xai, "some-future-grok"),
+            model_context_window(ModelWire::OpenAiChatCompat, "grok-code-fast-1"),
+            256_000
+        );
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiChatCompat, "grok-3"),
+            131_072
+        );
+        assert_eq!(
+            model_context_window(ModelWire::OpenAiChatCompat, "some-future-grok"),
             131_072
         );
         // The output limit stays provider-derived: only Anthropic names one.
-        assert_eq!(model_output_limit(CoerceProvider::Xai, "grok-4"), None);
+        assert_eq!(
+            model_output_limit(ModelWire::OpenAiChatCompat, "grok-4"),
+            None
+        );
     }
 
     /// The live 400: `openai/gpt-5-mini` satisfied a `starts_with('o')` test for
@@ -1569,22 +1917,22 @@ mod tests {
     /// the model's identity.
     #[test]
     fn a_routing_prefix_is_not_read_as_an_o_series_model() {
-        for provider in [CoerceProvider::OpenAi, CoerceProvider::OpenAiCompat] {
+        for wire in [ModelWire::OpenAiResponses, ModelWire::OpenAiChatCompat] {
             assert_eq!(
-                model_context_window(provider, "openai/gpt-5-mini"),
+                model_context_window(wire, "openai/gpt-5-mini"),
                 128_000,
                 "the `openai/` prefix must not claim the o-series window"
             );
             assert_eq!(
-                model_output_limit(provider, "openai/gpt-5-mini"),
+                model_output_limit(wire, "openai/gpt-5-mini"),
                 None,
                 "an OpenAI ceiling we do not know is not one we may invent"
             );
             // The prefix must not hide a capability either: a genuinely
             // prefixed o-series model keeps its own window.
-            assert_eq!(model_context_window(provider, "openai/o3"), 200_000);
+            assert_eq!(model_context_window(wire, "openai/o3"), 200_000);
             // And a bare name is unaffected.
-            assert_eq!(model_context_window(provider, "gpt-5-mini"), 128_000);
+            assert_eq!(model_context_window(wire, "gpt-5-mini"), 128_000);
         }
     }
 
@@ -1596,7 +1944,7 @@ mod tests {
     #[test]
     fn an_unknown_output_ceiling_is_omitted_rather_than_guessed() {
         let compat = build_request(
-            CoerceProvider::OpenAiCompat,
+            ModelWire::OpenAiChatCompat,
             "https://gateway.example/compat",
             "key",
             "openai/gpt-5-mini",
@@ -1612,7 +1960,7 @@ mod tests {
 
         // An operator who chose a budget still gets it.
         let chosen = build_request(
-            CoerceProvider::OpenAiCompat,
+            ModelWire::OpenAiChatCompat,
             "https://gateway.example/compat",
             "key",
             "openai/gpt-5-mini",
@@ -1625,7 +1973,7 @@ mod tests {
 
         // Anthropic must always name one, so the capability fills the gap.
         let anthropic = build_request(
-            CoerceProvider::Anthropic,
+            ModelWire::AnthropicMessages,
             "https://api.anthropic.com",
             "key",
             "claude-opus-5",
@@ -1687,6 +2035,156 @@ mod tests {
             description: "read a file".into(),
             input_schema: json!({ "type": "object" }),
         }]
+    }
+
+    /// The dialect a provider identity implies, and the round trip through its
+    /// declared name. A name that does not round-trip is a name a host could
+    /// write into a policy envelope and a runtime would then refuse to read.
+    #[test]
+    fn every_wire_round_trips_through_its_declared_name() {
+        for wire in [
+            ModelWire::AnthropicMessages,
+            ModelWire::OpenAiResponses,
+            ModelWire::OpenAiChatCompat,
+            ModelWire::CoercedTools,
+        ] {
+            assert_eq!(ModelWire::parse(wire.as_str()), Some(wire));
+        }
+        assert_eq!(ModelWire::parse("openai-realtime"), None);
+        assert_eq!(
+            ModelWire::of_provider(CoerceProvider::OpenAi),
+            ModelWire::OpenAiResponses
+        );
+        assert_eq!(
+            ModelWire::of_provider(CoerceProvider::Anthropic),
+            ModelWire::AnthropicMessages
+        );
+        // xAI and a generic compat endpoint are different provider identities
+        // speaking one dialect — which is the whole reason the two concepts had
+        // to stop being the same enum.
+        assert_eq!(
+            ModelWire::of_provider(CoerceProvider::Xai),
+            ModelWire::OpenAiChatCompat
+        );
+        assert_eq!(
+            ModelWire::of_provider(CoerceProvider::OpenAiCompat),
+            ModelWire::OpenAiChatCompat
+        );
+        assert!(ModelWire::OpenAiChatCompat.uses_native_tools());
+        assert!(!ModelWire::CoercedTools.uses_native_tools());
+    }
+
+    /// The live failure this dialect exists for, stated as the request that
+    /// caused it. On 2026-08-19 a `gpt-5.6-terra` panel turn went out on chat
+    /// completions carrying five function tools, and OpenAI refused it: that
+    /// family carries tools only on the Responses API unless reasoning is
+    /// switched off. The coerced dialect sends **no** `tools[]` at all, so the
+    /// refusal has nothing to refuse.
+    #[test]
+    fn the_coerced_dialect_sends_a_schema_and_never_a_tool_array() {
+        let req = build_coerced_tools_request(
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/compat",
+            "gateway-key",
+            "openai/gpt-5.6-terra",
+            None,
+            None,
+            &convo(),
+            &tool_specs(),
+        );
+        assert_eq!(
+            req.url,
+            "https://gateway.ai.cloudflare.com/v1/acct/gw/compat/chat/completions"
+        );
+        assert!(
+            req.body.get("tools").is_none(),
+            "the coerced dialect must not ask for a native tool vocabulary"
+        );
+        assert_eq!(req.body["response_format"]["type"], json!("json_schema"));
+        assert_eq!(
+            req.body["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
+        // The tool vocabulary still reaches the model — as instruction rather
+        // than as a wire feature.
+        let text = req.body["messages"].to_string();
+        assert!(
+            text.contains("read a file"),
+            "tool descriptions must survive"
+        );
+        // A prior assistant step replays as its JSON document, and a result
+        // returns as an ordinary user message: there is no tool-call id for an
+        // endpoint that was never given a tool array to correlate against.
+        let roles: Vec<&str> = req.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert!(
+            !roles.contains(&"tool"),
+            "a role:tool message would name a tool_call_id no endpoint issued"
+        );
+    }
+
+    /// A coerced step parses back into exactly the reply the loop would have
+    /// read from native tool calls, so everything downstream is unchanged.
+    #[test]
+    fn a_coerced_step_parses_into_ordinary_tool_calls() {
+        let step = json!({
+            "reply": "Reading it now.",
+            "tool_calls": [{ "name": "read", "arguments": "{\"path\":\"a.txt\"}" }],
+        });
+        let body = json!({
+            "choices": [{ "message": { "content": step.to_string() } }],
+            "usage": { "prompt_tokens": 11 },
+        });
+        let reply = parse_coerced_tools_response(&body);
+        assert_eq!(reply.text, "Reading it now.");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "read");
+        assert_eq!(reply.tool_calls[0].arguments, json!({ "path": "a.txt" }));
+        // The loop correlates results by id, so one is supplied where the
+        // endpoint issued none.
+        assert!(!reply.tool_calls[0].id.is_empty());
+        assert_eq!(reply.usage, json!({ "prompt_tokens": 11 }));
+
+        // A model that ignores the schema and answers in prose has still
+        // answered. Degrading to a plain reply keeps a weaker model usable
+        // rather than failing the turn outright.
+        let prose = json!({ "choices": [{ "message": { "content": "just talking" } }] });
+        let reply = parse_coerced_tools_response(&prose);
+        assert_eq!(reply.text, "just talking");
+        assert!(reply.tool_calls.is_empty());
+    }
+
+    /// Each dialect must reach its own builder. A wire that silently borrowed
+    /// another's request shape is the defect this whole seam exists to prevent.
+    #[test]
+    fn each_wire_builds_its_own_surface() {
+        let build = |wire| {
+            build_request(
+                wire,
+                "https://api.example.invalid/v1",
+                "key",
+                "some-model",
+                Some(1024),
+                None,
+                &convo(),
+                &tool_specs(),
+            )
+        };
+        assert!(build(ModelWire::AnthropicMessages)
+            .url
+            .ends_with("/v1/messages"));
+        assert!(build(ModelWire::OpenAiResponses)
+            .url
+            .ends_with("/v1/responses"));
+        let compat = build(ModelWire::OpenAiChatCompat);
+        assert!(compat.url.ends_with("/chat/completions"));
+        assert!(compat.body.get("tools").is_some());
+        let coerced = build(ModelWire::CoercedTools);
+        assert!(coerced.url.ends_with("/chat/completions"));
+        assert!(coerced.body.get("tools").is_none());
     }
 
     #[test]

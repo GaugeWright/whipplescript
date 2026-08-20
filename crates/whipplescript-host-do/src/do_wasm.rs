@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::do_store::{do_load_agent_snapshot, do_save_agent_snapshot, SqlValue};
 use whipplescript_kernel::coerce_native::CoerceProvider;
-use whipplescript_kernel::harness_model::MessagesApiClient;
+use whipplescript_kernel::harness_model::{MessagesApiClient, ModelWire};
 use whipplescript_kernel::sansio::{HttpResponse, TransportError};
 
 use crate::do_instance::{ExecutorSidecarConfig, ResolvedCoercionConfig, TurnContainerConfig};
@@ -665,6 +665,19 @@ fn outcome_to_json(outcome: &DurableStepOutcome) -> String {
 /// Codex brokered turns carry only sentinel authentication. The authenticated
 /// outbound local broker replaces both sentinel fields after admission; no
 /// OAuth material enters the Durable Object.
+/// The coercion transport still speaks in provider identities, so a wire read
+/// from a binding maps back onto one. The coerced-tools dialect has no coercion
+/// meaning — coercion *is* a structured-output call, so its request is already
+/// the shape that dialect would ask for — and it maps to the same chat
+/// completions transport it rides on.
+fn coerce_provider_of_wire(wire: ModelWire) -> CoerceProvider {
+    match wire {
+        ModelWire::AnthropicMessages => CoerceProvider::Anthropic,
+        ModelWire::OpenAiResponses => CoerceProvider::OpenAi,
+        ModelWire::OpenAiChatCompat | ModelWire::CoercedTools => CoerceProvider::OpenAiCompat,
+    }
+}
+
 fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let backend = match value.get("provider").and_then(serde_json::Value::as_str) {
@@ -676,11 +689,16 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
         // The metered Cloudflare AI Gateway is a distinct provider *id* rather
         // than an alias because the id carries who pays — a gateway round spends
         // GaugeWright's credits, not a customer key (ADR 0085 §1). Collapsing it
-        // would be fine on the wire and wrong in the ledger. The wire itself
-        // comes from the admitted surface; see `metered_gateway_wire`.
-        Some("cloudflare-ai-gateway") => crate::host_projection::metered_gateway_wire(
-            value.get("base_url").and_then(serde_json::Value::as_str),
-        ),
+        // would be fine on the wire and wrong in the ledger. The wire is what
+        // the binding declares, and only failing that what the admitted surface
+        // implies. Coercion is a single structured-output call rather than a
+        // tool loop, so its wire maps back onto the transport's provider enum.
+        Some("cloudflare-ai-gateway") => {
+            coerce_provider_of_wire(crate::host_projection::declared_or_inferred_wire(
+                value.get("wire").and_then(serde_json::Value::as_str),
+                value.get("base_url").and_then(serde_json::Value::as_str),
+            )?)
+        }
         other => return Err(format!("unknown coerce provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -720,17 +738,19 @@ fn parse_coerce_config(json: &str) -> Result<ResolvedCoercionConfig, String> {
 fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
     let provider_id = value.get("provider").and_then(serde_json::Value::as_str);
-    let provider = match provider_id {
-        Some("anthropic") => CoerceProvider::Anthropic,
-        Some("openai") => CoerceProvider::OpenAi,
-        Some("openai-generic") => CoerceProvider::OpenAiCompat,
-        Some("xai") => CoerceProvider::Xai,
-        Some("openai-codex") => CoerceProvider::OpenAi,
+    let wire = match provider_id {
+        Some("anthropic") => ModelWire::AnthropicMessages,
+        Some("openai") => ModelWire::OpenAiResponses,
+        Some("openai-generic") => ModelWire::OpenAiChatCompat,
+        Some("xai") => ModelWire::OpenAiChatCompat,
+        Some("openai-codex") => ModelWire::OpenAiResponses,
         // Same reasoning as the coerce parser above: distinct as an id because
-        // the id is what says who pays, with the wire read from the surface.
-        Some("cloudflare-ai-gateway") => crate::host_projection::metered_gateway_wire(
+        // the id is what says who pays. A declared wire is believed over the
+        // surface, because it is the one that was checked before publication.
+        Some("cloudflare-ai-gateway") => crate::host_projection::declared_or_inferred_wire(
+            value.get("wire").and_then(serde_json::Value::as_str),
             value.get("base_url").and_then(serde_json::Value::as_str),
-        ),
+        )?,
         other => return Err(format!("unknown agent provider: {other:?}")),
     };
     let field = |name: &str| {
@@ -759,7 +779,7 @@ fn parse_agent_config(json: &str) -> Result<MessagesApiClient, String> {
         ));
     }
     Ok(MessagesApiClient::new(
-        provider, api_key, model, base_url, max_tokens, cache_key,
+        wire, api_key, model, base_url, max_tokens, cache_key,
     ))
 }
 

@@ -3811,6 +3811,7 @@ workflow UnsafeHostChat {
                     model: "gpt-test".to_owned(),
                     base_url: "https://provider.invalid".to_owned(),
                     credential_ref: "credential:model".to_owned(),
+                    wire: None,
                 },
             )]),
             placements: BTreeMap::from([(

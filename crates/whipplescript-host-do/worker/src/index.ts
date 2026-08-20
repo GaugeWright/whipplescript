@@ -3932,6 +3932,10 @@ export class WorkflowInstance implements DurableObject {
           base_url: binding.base_url,
           api_key: binding.api_key,
           model: binding.model,
+          // Declared by the signed policy when the publisher named it. The
+          // runtime falls back to reading the surface only when it is absent,
+          // which is what every release signed before the field existed does.
+          wire: binding.wire,
           session_id: instanceId,
           cache_key: String(request.command.command_id ?? ""),
         }),
