@@ -413,6 +413,9 @@ pub enum ModelProvider {
     Codex,
     /// xAI's Grok API (Chat Completions wire, first-class credential surface).
     Xai,
+    /// A Grok/X Premium subscription OAuth bearer, admitted only at xAI's CLI
+    /// proxy on the Responses wire.
+    XaiSubscription,
 }
 
 impl ModelProvider {
@@ -423,6 +426,7 @@ impl ModelProvider {
             Self::Anthropic => "anthropic",
             Self::Codex => "openai-codex",
             Self::Xai => "xai",
+            Self::XaiSubscription => "xai-grok",
         }
     }
 }
@@ -2291,8 +2295,14 @@ impl GovernedHostRuntime {
                 binding.max_tokens,
                 Some(command.command_id.clone()),
             ),
-            ModelProvider::Xai => MessagesApiClient::new(
-                CoerceProvider::Xai,
+            ModelProvider::Xai => MessagesApiClient::new_xai(
+                binding.api_key,
+                binding.model,
+                binding.base_url,
+                binding.max_tokens,
+                Some(command.command_id.clone()),
+            ),
+            ModelProvider::XaiSubscription => MessagesApiClient::new_xai_subscription(
                 binding.api_key,
                 binding.model,
                 binding.base_url,

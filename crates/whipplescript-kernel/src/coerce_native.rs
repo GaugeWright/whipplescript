@@ -745,10 +745,23 @@ fn text_to_value(text: &str) -> Value {
 
 fn openai_usage(body: &Value) -> Value {
     let usage = body.get("usage");
-    json!({
-        "input_tokens": usage.and_then(|u| u.get("input_tokens")).and_then(Value::as_u64).unwrap_or(0),
-        "output_tokens": usage.and_then(|u| u.get("output_tokens")).and_then(Value::as_u64).unwrap_or(0),
-    })
+    let mut normalized = usage.cloned().unwrap_or_else(|| json!({}));
+    let Some(object) = normalized.as_object_mut() else {
+        return json!({ "input_tokens": 0, "output_tokens": 0 });
+    };
+    let input = object
+        .get("input_tokens")
+        .or_else(|| object.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = object
+        .get("output_tokens")
+        .or_else(|| object.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    object.insert("input_tokens".to_owned(), json!(input));
+    object.insert("output_tokens".to_owned(), json!(output));
+    normalized
 }
 
 fn anthropic_usage(body: &Value) -> Value {
@@ -1334,6 +1347,22 @@ mod tests {
         let result = parse_response(CoerceProvider::Xai, &response, false);
         assert_eq!(result.status, CoerceStatus::Succeeded);
         assert_eq!(result.value_json.as_deref(), Some("{\"ok\":true}"));
+        let usage: Value = serde_json::from_str(&result.usage_json).unwrap();
+        assert_eq!(usage["output_tokens"], json!(3));
+    }
+
+    #[test]
+    fn chat_usage_is_normalized_without_erasing_cache_detail() {
+        let usage = openai_usage(&json!({
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 4,
+                "prompt_tokens_details": { "cached_tokens": 9 }
+            }
+        }));
+        assert_eq!(usage["input_tokens"], json!(12));
+        assert_eq!(usage["output_tokens"], json!(4));
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], json!(9));
     }
 
     #[test]

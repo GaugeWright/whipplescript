@@ -279,6 +279,8 @@ pub struct RealHarnessModelClient<'a, T: CoerceTransport + ?Sized> {
     /// this the owned harness presented one to `api.openai.com` and the
     /// provider refused it for want of `api.responses.write`.
     codex: Option<CodexBackend>,
+    xai_api: bool,
+    xai_subscription: bool,
 }
 
 impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
@@ -300,6 +302,8 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
             max_tokens: max_tokens.into(),
             cache_key,
             codex: None,
+            xai_api: false,
+            xai_subscription: false,
         }
     }
 
@@ -329,7 +333,55 @@ impl<'a, T: CoerceTransport + ?Sized> RealHarnessModelClient<'a, T> {
                 account_id: account_id.into(),
                 session_id: session_id.into(),
             }),
+            xai_api: false,
+            xai_subscription: false,
         }
+    }
+
+    /// xAI public API-key backend. It speaks Chat Completions and scopes xAI's
+    /// automatic prompt cache with the `x-grok-conv-id` request header.
+    pub fn new_xai(
+        transport: &'a T,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: impl Into<Option<u64>>,
+        cache_key: Option<String>,
+    ) -> Self {
+        let mut client = Self::new(
+            transport,
+            ModelWire::OpenAiChatCompat,
+            api_key,
+            model,
+            base_url,
+            max_tokens,
+            cache_key,
+        );
+        client.xai_api = true;
+        client
+    }
+
+    /// Grok subscription backend. The host owns OAuth acquisition and refresh;
+    /// the runtime owns the fixed Responses wire and proxy request markers.
+    pub fn new_xai_subscription(
+        transport: &'a T,
+        access_token: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: impl Into<Option<u64>>,
+        cache_key: Option<String>,
+    ) -> Self {
+        let mut client = Self::new(
+            transport,
+            ModelWire::OpenAiResponses,
+            access_token,
+            model,
+            base_url,
+            max_tokens,
+            cache_key,
+        );
+        client.xai_subscription = true;
+        client
     }
 }
 
@@ -347,7 +399,7 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
                 tools,
             );
         }
-        build_request(
+        let mut request = build_request(
             self.wire,
             &self.base_url,
             &self.api_key,
@@ -356,7 +408,14 @@ impl<T: CoerceTransport + ?Sized> HttpModelClient for RealHarnessModelClient<'_,
             self.cache_key.as_deref(),
             messages,
             tools,
-        )
+        );
+        if self.xai_api {
+            apply_xai_api_cache_header(&mut request);
+        }
+        if self.xai_subscription {
+            apply_xai_subscription_headers(&mut request, &self.model);
+        }
+        request
     }
 
     fn parse_response(
@@ -417,6 +476,8 @@ pub struct MessagesApiClient {
     /// deterministic idempotency key from this scope and the exact model input.
     cache_key: Option<String>,
     codex: Option<CodexBackend>,
+    xai_api: bool,
+    xai_subscription: bool,
 }
 
 struct CodexBackend {
@@ -441,6 +502,8 @@ impl MessagesApiClient {
             max_tokens: max_tokens.into(),
             cache_key,
             codex: None,
+            xai_api: false,
+            xai_subscription: false,
         }
     }
 
@@ -467,7 +530,47 @@ impl MessagesApiClient {
                 account_id: account_id.into(),
                 session_id: session_id.into(),
             }),
+            xai_api: false,
+            xai_subscription: false,
         }
+    }
+
+    pub fn new_xai(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: impl Into<Option<u64>>,
+        cache_key: Option<String>,
+    ) -> Self {
+        let mut client = Self::new(
+            ModelWire::OpenAiChatCompat,
+            api_key,
+            model,
+            base_url,
+            max_tokens,
+            cache_key,
+        );
+        client.xai_api = true;
+        client
+    }
+
+    pub fn new_xai_subscription(
+        access_token: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        max_tokens: impl Into<Option<u64>>,
+        cache_key: Option<String>,
+    ) -> Self {
+        let mut client = Self::new(
+            ModelWire::OpenAiResponses,
+            access_token,
+            model,
+            base_url,
+            max_tokens,
+            cache_key,
+        );
+        client.xai_subscription = true;
+        client
     }
 }
 
@@ -500,6 +603,12 @@ impl HttpModelClient for MessagesApiClient {
             messages,
             tools,
         );
+        if self.xai_api {
+            apply_xai_api_cache_header(&mut request);
+        }
+        if self.xai_subscription {
+            apply_xai_subscription_headers(&mut request, &self.model);
+        }
         set_round_idempotency_key(
             &mut request,
             round_idempotency_key(self.cache_key.as_deref(), messages, tools),
@@ -553,6 +662,28 @@ impl HttpModelClient for MessagesApiClient {
     fn context_window(&self) -> u64 {
         model_context_window(self.wire, &self.model)
     }
+}
+
+fn apply_xai_api_cache_header(request: &mut HttpRequest) {
+    if let Some(key) = request
+        .body
+        .as_object_mut()
+        .and_then(|body| body.remove("prompt_cache_key"))
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        request.headers.push(("x-grok-conv-id".to_owned(), key));
+    }
+}
+
+fn apply_xai_subscription_headers(request: &mut HttpRequest, model: &str) {
+    request.headers.extend([
+        ("X-XAI-Token-Auth".to_owned(), "xai-grok-cli".to_owned()),
+        ("x-grok-model-override".to_owned(), model.to_owned()),
+        (
+            "user-agent".to_owned(),
+            format!("whipplescript/{}", env!("CARGO_PKG_VERSION")),
+        ),
+    ]);
 }
 
 fn round_idempotency_key(
@@ -2345,14 +2476,8 @@ mod tests {
         assert_eq!(reply.usage["completion_tokens"], json!(3));
 
         // xAI speaks the same Chat Completions stream, so it must ask too.
-        let xai = MessagesApiClient::new(
-            CoerceProvider::Xai,
-            "xai-key",
-            "grok-4",
-            "https://api.x.ai/v1",
-            4096,
-            None,
-        );
+        let xai =
+            MessagesApiClient::new_xai("xai-key", "grok-4", "https://api.x.ai/v1", 4096, None);
         assert_eq!(
             xai.build_request(&convo(), &tool_specs()).body["stream_options"],
             json!({ "include_usage": true }),
@@ -2372,6 +2497,54 @@ mod tests {
                 "{provider:?} reports usage without being asked"
             );
         }
+    }
+
+    #[test]
+    fn xai_backends_keep_payer_wire_cache_and_tool_authority_distinct() {
+        let api = MessagesApiClient::new_xai(
+            "xai-key",
+            "grok-4.5",
+            "https://api.x.ai/v1",
+            4096,
+            Some("turn-7".to_owned()),
+        )
+        .build_request(&convo(), &tool_specs());
+        assert_eq!(api.url, "https://api.x.ai/v1/chat/completions");
+        assert!(api.body.get("prompt_cache_key").is_none());
+        assert!(api
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-grok-conv-id" && value == "turn-7"));
+
+        let subscription = MessagesApiClient::new_xai_subscription(
+            "oauth-access",
+            "grok-4.5",
+            "https://cli-chat-proxy.grok.com",
+            4096,
+            Some("turn-7".to_owned()),
+        )
+        .build_request(&convo(), &tool_specs());
+        assert_eq!(
+            subscription.url,
+            "https://cli-chat-proxy.grok.com/v1/responses"
+        );
+        assert_eq!(subscription.body["prompt_cache_key"], json!("turn-7"));
+        assert!(subscription.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-XAI-Token-Auth") && value == "xai-grok-cli"
+        }));
+        assert!(subscription
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "x-grok-model-override" && value == "grok-4.5" }));
+        // Only the brokered function declaration is serialized. Provider-hosted
+        // search/code/MCP tools require a separately governed capability and are
+        // absent by default.
+        assert_eq!(subscription.body["tools"][0]["type"], json!("function"));
+        assert!(subscription.body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .all(|tool| tool["type"] == "function"));
     }
 
     #[test]
