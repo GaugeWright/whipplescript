@@ -848,7 +848,7 @@ test("managed fallback derivation refuses a non-Cloudflare compat base URL", asy
           return Response.json({});
         },
       ),
-    /exact Cloudflare AI Gateway compat or anthropic endpoint/,
+    /exact Cloudflare AI Gateway compat, anthropic, or openai endpoint/,
   );
   assert.equal(reached, false);
 });
@@ -880,6 +880,39 @@ test("managed funding admits the provider-native anthropic surface", async () =>
     },
   );
   assert.equal(calledUrl, `${nativeBinding.base_url}/v1/messages`);
+});
+
+// The signed `/openai` surface speaks the Responses API. Before this test, the
+// policy and harness admitted that wire while the final-fetch allowlist still
+// recognized only `/compat` and `/anthropic`, so every hosted GPT turn failed
+// locally with 502 and no request appeared in AI Gateway logs.
+test("managed funding admits the provider-native OpenAI Responses surface", async () => {
+  let calledUrl = "";
+  let sent: Record<string, unknown> = {};
+  const nativeBinding = {
+    ...gatewayBinding,
+    model: "gpt-5.6-terra",
+    base_url:
+      "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/openai",
+  };
+  await performManagedGatewayFetch(
+    {
+      url: `${nativeBinding.base_url}/v1/responses`,
+      headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
+      body: { model: nativeBinding.model, input: [], max_tokens: 1024 },
+    },
+    nativeBinding,
+    { token: () => "cf-gateway-token" },
+    async (url, init) => {
+      calledUrl = url;
+      sent = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return Response.json({ output: [] });
+    },
+  );
+  assert.equal(calledUrl, `${nativeBinding.base_url}/v1/responses`);
+  assert.equal(sent.max_output_tokens, 1024);
+  assert.ok(!("max_completion_tokens" in sent));
+  assert.ok(!("max_tokens" in sent));
 });
 
 // Live 400 on 2026-08-12: every native round failed with "max_tokens: Field
@@ -962,22 +995,22 @@ test("a compat round still renames max_tokens for the shim", async () => {
   assert.ok(!("max_tokens" in sent));
 });
 
-// A surface that is neither is still refused. Widening the regex to admit the
-// native route must not turn it into "any path under the gateway".
+// A surface that is none of the three is still refused. Widening the regex to
+// admit native routes must not turn it into "any path under the gateway".
 test("managed funding still refuses an unadmitted gateway surface", async () => {
   let reached = false;
   await assert.rejects(
     () =>
       performManagedGatewayFetch(
         {
-          url: "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/openai/chat/completions",
+          url: "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/google/chat/completions",
           headers: [["authorization", `Bearer ${MODEL_AUTH_SENTINEL}`]],
           body: {},
         },
         {
           ...gatewayBinding,
           base_url:
-            "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/openai",
+            "https://gateway.ai.cloudflare.com/v1/1689dd452ba2d2d8eb1f3c364c92b3f4/gaugewright-panels/google",
         },
         { token: () => "cf-gateway-token" },
         async () => {
@@ -985,7 +1018,7 @@ test("managed funding still refuses an unadmitted gateway surface", async () => 
           return Response.json({});
         },
       ),
-    /exact Cloudflare AI Gateway compat or anthropic endpoint/,
+    /exact Cloudflare AI Gateway compat, anthropic, or openai endpoint/,
   );
   assert.equal(reached, false);
 });

@@ -64,14 +64,12 @@ const MANAGED_GATEWAY_RETRYABLE_STATUSES = new Set([401, 403, 408, 425, 429]);
 
 /** Which upstream surface of the gateway a managed turn is admitted against.
  *
- *  `compat` is the OpenAI-compatible shim; `anthropic` is the provider-native
- *  Messages API. Both are the same gateway, the same BYOK key, and the same
- *  metered log — but the shim **silently drops `cache_control`**, so an
- *  Anthropic model routed through it can never cache. Measured 2026-08-11: on
- *  `/compat` a breakpoint changes nothing (no write premium, no read, and no
- *  `prompt_tokens_details` field to report one in), while the native route
- *  bills 1.25x on the write and 0.1x on the read of the same prefix. */
-type ManagedGatewaySurface = "compat" | "anthropic";
+ *  `compat` is the OpenAI-compatible Chat Completions shim; `anthropic` and
+ *  `openai` are the provider-native Messages and Responses APIs. All are the
+ *  same gateway, the same BYOK key, and the same metered log, but the wire is
+ *  part of the signed binding: a Responses request cannot be replayed through
+ *  Chat Completions, just as an Anthropic request cannot. */
+type ManagedGatewaySurface = "compat" | "anthropic" | "openai";
 
 interface ManagedGatewayTarget {
   accountId: string;
@@ -83,7 +81,7 @@ interface ManagedGatewayTarget {
 function managedGatewayTarget(baseUrl: string): ManagedGatewayTarget {
   const admitted = new URL(baseUrl);
   const match =
-    /^\/v1\/([0-9a-f]{32})\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/(compat|anthropic)\/?$/
+    /^\/v1\/([0-9a-f]{32})\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/(compat|anthropic|openai)\/?$/
       .exec(admitted.pathname);
   if (
     admitted.protocol !== "https:"
@@ -95,7 +93,7 @@ function managedGatewayTarget(baseUrl: string): ManagedGatewayTarget {
     || !match
   ) {
     throw new Error(
-      "managed funding requires an exact Cloudflare AI Gateway compat or anthropic endpoint",
+      "managed funding requires an exact Cloudflare AI Gateway compat, anthropic, or openai endpoint",
     );
   }
   const [, accountId, gatewayId, surface] = match;
@@ -263,12 +261,14 @@ function directProviderBody(
   body: unknown,
   provider: ModelBrokerBinding["provider"],
   /** True when this round speaks Anthropic's Messages API, whatever the
-   *  provider id. The metered gateway is one id over two surfaces, and only the
-   *  compat shim wants the OpenAI spelling. */
+   *  provider id. The metered gateway is one id over three surfaces; the
+   *  Anthropic surface alone keeps the Anthropic spelling. */
   anthropicWire = false,
+  /** True when a gateway binding speaks the provider-native Responses API. */
+  openAiResponsesWire = false,
 ): unknown {
   const providerLimit =
-    provider === "openai" || provider === "openai-codex"
+    provider === "openai" || provider === "openai-codex" || openAiResponsesWire
       ? "max_output_tokens"
       : provider === "cloudflare-ai-gateway"
         ? "max_completion_tokens"
@@ -556,17 +556,27 @@ export async function performDirectProviderFetch(
   const requested = new URL(request.url);
   const admitted = new URL(binding.base_url);
   const admittedPath = admitted.pathname.replace(/\/$/, "");
-  // The metered gateway fronts two surfaces, and which one a turn is admitted
+  // The metered gateway fronts three surfaces, and which one a turn is admitted
   // against changes the path, the auth header, and the SSE grammar. `/compat`
-  // is the OpenAI-compatible shim; `/anthropic` is the provider-native Messages
-  // API — same gateway, same BYOK key, same metered log, but the only one of
-  // the two that honours `cache_control`. Reading the surface off the admitted
-  // path keeps all three consistent with the URL actually being called.
+  // is the OpenAI-compatible shim; `/anthropic` and `/openai` are the
+  // provider-native Messages and Responses APIs. Reading the surface off the
+  // admitted path keeps all three consistent with the URL actually being called.
   const anthropicWire = binding.provider === "anthropic"
     || (binding.provider === "cloudflare-ai-gateway"
       && admittedPath.endsWith("/anthropic"));
+  const openAiResponsesWire = binding.provider === "openai"
+    || binding.provider === "openai-codex"
+    || (binding.provider === "cloudflare-ai-gateway"
+      && admittedPath.endsWith("/openai"));
+  const wireProvider = anthropicWire
+    ? "anthropic"
+    : openAiResponsesWire
+      ? "openai"
+      : binding.provider;
   const expectedPath = anthropicWire
     ? `${admittedPath}/v1/messages`
+    : openAiResponsesWire
+      ? `${admittedPath}/v1/responses`
     : binding.provider === "openai-generic"
         || binding.provider === "xai"
         || binding.provider === "cloudflare-ai-gateway"
@@ -595,7 +605,12 @@ export async function performDirectProviderFetch(
   const response = await fetcher(request.url, {
     method: "POST",
     headers,
-    body: JSON.stringify(directProviderBody(request.body, binding.provider, anthropicWire)),
+    body: JSON.stringify(directProviderBody(
+      request.body,
+      binding.provider,
+      anthropicWire,
+      openAiResponsesWire,
+    )),
   });
   mark("direct_provider_headers");
   if (!response.body) throw new Error("direct provider response had no body");
@@ -615,7 +630,7 @@ export async function performDirectProviderFetch(
     // A native gateway round streams Anthropic `content_block_delta` events, not
     // chat-completion chunks. Passing the raw provider id here would leave live
     // observation silently blank on exactly the rounds this change enables.
-  }, anthropicWire ? "anthropic" : binding.provider);
+  }, wireProvider);
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
