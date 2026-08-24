@@ -3,6 +3,28 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [0.5.6] — 2026-08-20
+
+The labeled turn projection now publishes a turn's content as ordered
+`segments` alongside the existing `assistant_text` and `tool_calls`.
+
+`LabeledTurnOutput` is the only supported way for an embedding host to obtain a
+turn's content, and it exposed only the *fold*: one final `assistant_text` plus
+a flat list of the calls that ran. That fold answers "what did the turn
+conclude", but it discards the order content was produced in, and every
+intermediate line of prose the model spoke alongside a tool call — so a turn
+that narrates its work projected as if it had said nothing until its closing
+line. A shell that replays a turn as a conversation could not, and the contract
+directs hosts not to recreate transcript-folding from the runtime store.
+
+`TurnContentSegment` is `Prose(String)` or `Tool(ProjectedToolCall)`, and
+`segments` carries them in the sequence the turn produced them — prose runs
+interleaved with the calls they introduced, results correlated into position.
+It is the same admitted content under the same turn-join label, so it carries
+no read the folded fields do not already carry and does not widen the certified
+`flow_signature`. Additive and compatible: `assistant_text` and `tool_calls`
+are unchanged, so every existing consumer keeps its folded view.
+
 ## [0.5.5] — 2026-08-20
 
 An agent turn's request dialect becomes a named, declared property of a
