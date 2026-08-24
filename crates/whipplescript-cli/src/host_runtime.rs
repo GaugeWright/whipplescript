@@ -1293,6 +1293,28 @@ pub struct ProjectedToolCall {
     pub ok: Option<bool>,
 }
 
+/// One ordered piece of a turn's host-visible content: a run of assistant prose,
+/// or a tool call (carrying its result once the matching `ToolResults` message
+/// correlates one in).
+///
+/// [`LabeledTurnOutput::assistant_text`] and [`LabeledTurnOutput::tool_calls`]
+/// are the *folded* view of a turn — the final reply, and the flat set of calls
+/// that ran. That fold answers "what did the turn conclude", but it discards the
+/// order the turn produced its content in, and every intermediate line of prose
+/// the model spoke alongside a tool call. A product shell that replays a turn as
+/// a conversation — narration interleaved with the calls it introduced — needs
+/// that order back. `segments` is the same admitted content under the same
+/// turn-join label, in the sequence the turn produced it, so the shell replays
+/// what happened rather than reconstructing it from the operational stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnContentSegment {
+    /// A contiguous run of assistant prose — one `Assistant` message's text.
+    Prose(String),
+    /// A tool call the turn made, in the position it was called; `result`/`ok`
+    /// fill in when its `ToolResults` correlate.
+    Tool(ProjectedToolCall),
+}
+
 /// WhippleScript's certified dependency set for one field of the host-visible
 /// turn projection.
 ///
@@ -1319,6 +1341,14 @@ pub struct LabeledTurnOutput {
     pub label_ref: String,
     pub assistant_text: String,
     pub tool_calls: Vec<ProjectedToolCall>,
+    /// The turn's content in the order it was produced — assistant prose runs
+    /// interleaved with the tool calls they introduced (see
+    /// [`TurnContentSegment`]). This is the same admitted content as
+    /// `assistant_text` + `tool_calls`, so it shares their certified
+    /// `flow_signature` (the conservative turn read-set); it is not a separate
+    /// output field, only an ordered re-view carrying no read the folded fields
+    /// do not already carry.
+    pub segments: Vec<TurnContentSegment>,
     pub flow_signature: Vec<CertifiedOutputFieldFlow>,
 }
 
@@ -2993,12 +3023,19 @@ impl GovernedHostRuntime {
         // wins — this is only the projection's floor, never its override.
         let mut text_with_calls = String::new();
         let mut tool_calls: Vec<ProjectedToolCall> = Vec::new();
+        // The same content, kept in the order the turn produced it. Every prose
+        // run is retained here (the folded `assistant_text` keeps only the last),
+        // each in the position it was spoken relative to the calls it introduced.
+        let mut segments: Vec<TurnContentSegment> = Vec::new();
         for message in &messages[turn_start..] {
             match message {
                 ChatMessage::Assistant {
                     text,
                     tool_calls: calls,
                 } => {
+                    if !text.is_empty() {
+                        segments.push(TurnContentSegment::Prose(text.clone()));
+                    }
                     if calls.is_empty() {
                         if !text.is_empty() {
                             assistant_text.clone_from(text);
@@ -3007,13 +3044,17 @@ impl GovernedHostRuntime {
                         if !text.is_empty() {
                             text_with_calls.clone_from(text);
                         }
-                        tool_calls.extend(calls.iter().map(|call| ProjectedToolCall {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            arguments: call.arguments.clone(),
-                            result: None,
-                            ok: None,
-                        }));
+                        for call in calls {
+                            let projected = ProjectedToolCall {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.clone(),
+                                result: None,
+                                ok: None,
+                            };
+                            tool_calls.push(projected.clone());
+                            segments.push(TurnContentSegment::Tool(projected));
+                        }
                     }
                 }
                 ChatMessage::ToolResults(results) => {
@@ -3025,6 +3066,17 @@ impl GovernedHostRuntime {
                         {
                             projected.result = Some(result.content.clone());
                             projected.ok = Some(!result.is_error);
+                        }
+                        // Correlate the same result into its ordered segment.
+                        // Most-recent-match, exactly as the folded list above.
+                        for segment in segments.iter_mut().rev() {
+                            if let TurnContentSegment::Tool(call) = segment {
+                                if call.call_id == result.tool_call_id {
+                                    call.result = Some(result.content.clone());
+                                    call.ok = Some(!result.is_error);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -3039,6 +3091,7 @@ impl GovernedHostRuntime {
             label_ref: self.label_ref(),
             assistant_text,
             tool_calls,
+            segments,
             flow_signature: certified_output_flow(command),
         }))
     }
@@ -3967,6 +4020,90 @@ workflow UnsafeHostChat {
             .err()
             .expect("testimony about a deployment this no longer is must not count");
         assert!(format!("{error:?}").contains("pinned endpoint"));
+    }
+
+    /// A turn where the model narrates *alongside* a tool call — one Assistant
+    /// message carrying both text and a `read` — then closes with a text-only
+    /// message. The folded `assistant_text` keeps only the closing line, but
+    /// `segments` preserves every prose run in the order it was produced,
+    /// interleaved with the call it introduced. Before segments existed, the
+    /// mid-turn narration ("Let me check the file.") was dropped on the floor:
+    /// a turn that narrated its work projected as if it had said nothing until
+    /// the end.
+    #[test]
+    fn segments_preserve_prose_interleaved_with_the_calls_it_introduced() {
+        let path = temp_store();
+        let policy_text = signed_policy();
+        let mut runtime = GovernedHostRuntime::open(&path, 7, &policy_text).expect("runtime");
+        let open = OpenInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "open-chat".to_owned(),
+            package_version_ref: "package:v1".to_owned(),
+            policy: runtime.policy_ref().clone(),
+        };
+        let instance = runtime.open_instance(&open, &Packages).expect("instance");
+        let secrets = Secrets {
+            calls: Cell::new(0),
+        };
+        let resources = Resources {
+            calls: Cell::new(0),
+        };
+        let driver = ScriptedDriver::new(vec![
+            // One message: narration and a tool call, spoken together.
+            json!({
+                "output": [
+                    { "type": "message", "content": [{ "text": "Let me check the file." }] },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "read",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                ],
+                "usage": { "input_tokens": 10, "output_tokens": 2 }
+            }),
+            // A closing text-only message.
+            json!({
+                "output_text": "Done — it reads clean.",
+                "usage": { "input_tokens": 14, "output_tokens": 3 }
+            }),
+        ]);
+        let execution = runtime
+            .run_turn_with_driver(
+                &turn(&instance.instance_ref, &open.policy, 1),
+                &Packages,
+                &secrets,
+                &resources,
+                &driver,
+            )
+            .expect("turn");
+        let output = execution.output.expect("labeled output projection");
+
+        // The fold still answers "what did it conclude": the closing line, and
+        // the flat set of calls that ran.
+        assert_eq!(output.assistant_text, "Done — it reads clean.");
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "read");
+
+        // The ordered view keeps the mid-turn narration the fold discards, in
+        // the position it was spoken: prose, the call it introduced, prose.
+        assert_eq!(output.segments.len(), 3);
+        assert_eq!(
+            output.segments[0],
+            TurnContentSegment::Prose("Let me check the file.".to_owned())
+        );
+        match &output.segments[1] {
+            TurnContentSegment::Tool(call) => {
+                assert_eq!(call.name, "read");
+                assert_eq!(call.result.as_deref(), Some("governed file body"));
+                assert_eq!(call.ok, Some(true));
+            }
+            other => panic!("expected the read call in position 1, got {other:?}"),
+        }
+        assert_eq!(
+            output.segments[2],
+            TurnContentSegment::Prose("Done — it reads clean.".to_owned())
+        );
     }
 
     fn temp_store() -> std::path::PathBuf {
