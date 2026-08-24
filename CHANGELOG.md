@@ -3,7 +3,7 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
-## [0.5.6] — 2026-08-20
+## [0.5.6] — 2026-08-24
 
 The labeled turn projection now publishes a turn's content as ordered
 `segments` alongside the existing `assistant_text` and `tool_calls`.
@@ -360,10 +360,115 @@ decision can cross the integrity axis for the first time.
   but vacuous today and implemented as nothing: the whip surface has no assignee
   to steer. `assigned_to` exists only in `whipplescript-store`, as a durable
   column with no language-visible field.
-- Entries for `0.2.2`, `0.2.3`, `0.3.0`, and `0.3.1` were never written. Those
-  releases are recorded in their decision records — notably
-  DR-0050 for the `ask_human`
-  removal cut as `0.3.1`. This gap is noted rather than backfilled.
+- Entries for `0.2.2`, `0.2.3`, `0.3.0`, and `0.3.1` were not written at their
+  cuts. They were **backfilled 2026-08-24** from the annotated tag messages,
+  which carry each cut's own release notes verbatim; the reasoning is unchanged,
+  only relocated to where a reader looks for it.
+
+## [0.3.1] — 2026-07-28
+
+The `0.3.0` content, published under the next free number.
+
+### Notes
+- **Version only.** crates.io holds a yanked `whipplescript-core 0.3.0` from an
+  earlier stale publish and will not let the number be reused, so the whole
+  chain skips to `0.3.1` rather than letting `core` drift a version ahead of the
+  crates that depend on it. The code is `0.3.0`'s; see that entry for what
+  changed.
+
+## [0.3.0] — 2026-07-28
+
+`ask_human` is removed (DR-0050).
+Published as `0.3.1` — see that entry.
+
+### Breaking
+- **`ask_human` is gone** — the tool and its spec, the `human_interaction` flag,
+  `TurnStatus::AwaitingHuman`, `PendingHumanRequest`, `answer_human` on the turn
+  machine and snapshot, and `HumanAnswerCommand`; on the durable-object side
+  `inbox_items`, `do_record_human_ask`, `do_mark_human_answered`, the
+  `/host/instances/*/human/answer` route, the pending projection, and the
+  `human_ask` session frame. A turn now has four terminals and no fifth parked
+  state.
+
+  It let an agent stop mid-turn and wait for a person, and it was the wrong
+  shape twice over. It never said who or where — "ask a human" assumes an
+  ambient person attached to the running turn, which is false wherever no such
+  person exists and under-specified where one does. And it conflated
+  communication with control flow: asking is communication, waiting is control
+  flow, and fusing them produced a mechanism that held a model conversation open
+  indefinitely, survived restarts only through a bespoke snapshot path built to
+  make it, and could be answered by exactly one party.
+
+  The language already has both halves, and they name their destinations:
+  `send via <channel>` with a `when message from` rule for communication, and
+  `file issue into <tracker>` with `claim` for work assignment. Neither blocks a
+  turn.
+
+  This invalidates live sessions, the same way DR-0049's bootstrap change did.
+
+### Fixed
+- **A durable-object route that was already dead.** The worker's
+  `host_answer_human_ask` and `host_validate_human_answer` called wasm exports
+  the Rust side never had, so that route would have thrown if reached.
+- The `/pending` route stays, answering `{pending: null}`, so a client from
+  before the cutover gets a well-formed answer rather than a 404.
+
+### Documented
+- Docs stopped linking to `spec/` files the public repository never publishes,
+  and the three retired page paths gained redirect stubs.
+
+## [0.2.3] — 2026-07-27
+
+The std manifests become reachable from the library, not just the binary.
+
+### Fixed
+- **`EMBEDDED_STD_MANIFESTS` moves to `whipplescript::std_manifests`**, with
+  `register_all` for the seeding loop every host would otherwise write. It was
+  declared in `main.rs`, so only the binary could seed the std package rows.
+  That was survivable until `0.2.2` made the admission gate real for
+  `std.files` / `std.coord` / `std.tracker` / `std.ingress`: an effect whose
+  capability rows were never seeded then blocks as `blocked_by_capability`, so
+  an embedding host running a *workflow* — rather than only an agent turn —
+  could not run governed effects at all.
+
+  This is the case `lib.rs` exists for: the CLI and embedding hosts cross the
+  same governance boundary, and a host that cannot reach the seeding code either
+  fails or writes its own and drifts from what `whip` does. The vendored files
+  already sat in this crate, so the `include_str!` paths are unchanged, the root
+  `std/` stays the source of truth, and `scripts/check-vendored-std.sh` still
+  passes.
+
+## [0.2.2] — 2026-07-27
+
+Tracker issues can say who should act on them.
+
+### Added
+- **Optional issue assignment** — `WorkItem.assigned_to`, a durable
+  `assigned_to` column, an `issue.assigned` event, `assign_item(id, Option<who>)`
+  on the store and the `WorkItems` trait, and `whip issue assign <id> [--to A |
+  --clear]`.
+
+  Assignment is **advisory**: it records who *should* act and never restricts
+  who *may* claim. Enforcing it would need an authority model, and this crate
+  deliberately has none — the assignee is an opaque string the embedding host
+  interprets. So assignment and claim stay distinct facts: an assignment is
+  durable and visible before anyone responds, a claim is the transient CAS that
+  decides who is acting. An unassigned issue means "whoever has access", which
+  is the ordinary case rather than an omission.
+
+  This is what `askHuman` lacked — directing work at a named party on a named
+  tracker is exactly what its deprecation asks callers to say explicitly, and
+  until now the tracker had no field to say it in.
+
+### Fixed
+- **Two migration paths, because there are two stores.** The native store
+  self-heals through the existing `tx_ensure_column`. The durable object does
+  not — its `ensureSchema` applies the schema only when `schema_migrations` is
+  absent, so every already-created object would have failed its next tracker
+  read on a missing column. It gets a lazy `ALTER TABLE` beside the additive
+  block that already does this for `host_turn_images`. The production
+  `do_schema.sql` and the in-memory test fixture are separate files; both carry
+  the column.
 
 ## [0.2.1] — 2026-07-27
 
