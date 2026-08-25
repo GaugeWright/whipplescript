@@ -583,8 +583,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let kernel = self.kernel.as_ref().expect("kernel present between steps");
         Ok(kernel
             .store()
-            .status(&self.instance_id)?
-            .map(|status| status.instance.status))
+            .get_instance(&self.instance_id)?
+            .map(|instance| instance.status))
     }
 
     #[cfg(test)]

@@ -239,6 +239,38 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Ok(rows.iter().map(|row| as_text(&row[0])).collect())
     }
 
+    /// All `files` rows as `(key, content)`, sorted and capped exactly as
+    /// [`Self::all_keys`]. A caller that needs every body — `bash` hydrates the
+    /// whole workspace before executing — pays one storage round-trip here
+    /// instead of one per file.
+    fn all_files(&self) -> Result<Vec<(String, String)>, String> {
+        let rows = if self.key_prefix.is_empty() {
+            self.sql.query(
+                "SELECT key, content FROM files ORDER BY key LIMIT ?1",
+                &[SqlValue::Int((MAX_FILES_WALKED + 1) as i64)],
+            )
+        } else {
+            self.sql.query(
+                "SELECT substr(key, length(?1) + 1), content FROM files \
+                 WHERE key LIKE ?1 || '%' ORDER BY key LIMIT ?2",
+                &[
+                    SqlValue::Text(self.key_prefix.clone()),
+                    SqlValue::Int((MAX_FILES_WALKED + 1) as i64),
+                ],
+            )
+        }
+        .map_err(|error| format!("list files failed: {error}"))?;
+        if rows.len() > MAX_FILES_WALKED {
+            return Err(format!(
+                "workspace contains more than the supported {MAX_FILES_WALKED} files"
+            ));
+        }
+        Ok(rows
+            .iter()
+            .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .collect())
+    }
+
     fn bash(&self, args: &Value) -> Result<String, String> {
         let command = str_arg(args, "command")?.trim();
         let timeout = args
@@ -246,13 +278,10 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             .and_then(Value::as_u64)
             .unwrap_or(30)
             .clamp(1, 30);
-        let keys = self.all_keys()?;
+        let workspace = self.all_files()?;
         let mut before = BTreeMap::new();
-        let mut files = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(content) = self.file_content(&key)? else {
-                continue;
-            };
+        let mut files = Vec::with_capacity(workspace.len());
+        for (key, content) in workspace {
             before.insert(key.clone(), content.clone().into_bytes());
             files.push(ShellFile {
                 path: key,

@@ -39,12 +39,13 @@ pub fn render_available_skills(skills: &[SkillCatalogueEntry]) -> String {
         "Skills provide specialized instructions for specific tasks. Before responding, inspect the available skill descriptions. If a skill clearly applies to the user's request, your first action must be to use the read tool to load its SKILL.md from the listed location; do not answer from memory or prior knowledge. Follow the loaded instructions, including any directions to read supporting resources, before producing the response. Resolve relative paths in the skill against the directory containing its SKILL.md.\n<available_skills>",
     );
     for skill in skills {
-        body.push_str(&format!(
-            "\n  <skill name=\"{}\" location=\"{}\">\n  {}\n  </skill>",
-            escape_attribute(&skill.name),
-            escape_attribute(&skill.location),
-            neutralize_reserved_tags(&skill.description)
-        ));
+        body.push_str("\n  <skill name=\"");
+        body.push_str(&escape_attribute(&skill.name));
+        body.push_str("\" location=\"");
+        body.push_str(&escape_attribute(&skill.location));
+        body.push_str("\">\n  ");
+        body.push_str(&neutralize_reserved_tags(&skill.description));
+        body.push_str("\n  </skill>");
     }
     body.push_str("\n</available_skills>");
     body
@@ -198,11 +199,13 @@ pub struct ProjectInstruction {
 pub fn render_project_context(instructions: &[ProjectInstruction]) -> String {
     let mut body = String::from("<project_context>");
     for instruction in instructions {
-        body.push_str(&format!(
-            "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>",
-            escape_attribute(&instruction.path),
-            neutralize_reserved_tags(instruction.content.trim_end())
-        ));
+        // Pushed piecewise rather than through `format!`: an instruction file is
+        // whole-document sized, and the temporary would copy it once more.
+        body.push_str("\n<project_instructions path=\"");
+        body.push_str(&escape_attribute(&instruction.path));
+        body.push_str("\">\n");
+        body.push_str(&neutralize_reserved_tags(instruction.content.trim_end()));
+        body.push_str("\n</project_instructions>");
     }
     body.push_str("\n</project_context>");
     body

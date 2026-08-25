@@ -510,6 +510,14 @@ impl RuntimeStore for NativeStores {
         self.runtime.list_runs(instance_id)
     }
 
+    fn running_run_for_effect(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<RunView>> {
+        self.runtime.running_run_for_effect(instance_id, effect_id)
+    }
+
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
         self.runtime.status(instance_id)
     }

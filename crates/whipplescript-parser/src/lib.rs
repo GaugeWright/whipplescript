@@ -7532,11 +7532,10 @@ fn validate_message_from_channels(
 }
 
 fn validate_send_channels(
-    rule: &RuleDecl,
+    body_ast: &body::BodyAst,
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let (ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
     fn walk(
         statements: &[body::BodyStmt],
         semantic: &SemanticContext,
@@ -7629,7 +7628,7 @@ fn validate_send_channels(
             }
         }
     }
-    walk(&ast.statements, semantic, diagnostics);
+    walk(&body_ast.statements, semantic, diagnostics);
 }
 
 /// In-turn agent observations — `agent.turn.streamed` (streamed progress),
@@ -8465,14 +8464,10 @@ fn max_after_depth(statements: &[body::BodyStmt]) -> usize {
 
 fn analyze_rule(
     rule: &RuleDecl,
+    body_ast: &body::BodyAst,
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> IrRuleMetadata {
-    // Statement-form gate: every body must parse into the body AST. Unknown
-    // statements, malformed modifiers, and unclosed blocks are spanned
-    // errors here rather than silent no-ops at lowering time.
-    let (body_ast, body_diagnostics) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
-    diagnostics.extend(body_diagnostics);
     let mut metadata = IrRuleMetadata {
         fact_reads: rule
             .whens
@@ -13951,15 +13946,11 @@ fn collect_prompt_payload_types(
 /// fixture can generate the anonymous shape). Mirrors the generated
 /// `<Enum>.<Variant>` class synthesis for data-carrying sum-type variants.
 fn collect_inline_decide_schemas(
-    items: &[Item],
+    rules: &[(&RuleDecl, body::BodyAst)],
     semantic: &mut SemanticContext,
     ir: &mut IrProgram,
 ) {
-    for item in items {
-        let Item::Rule(rule) = item else {
-            continue;
-        };
-        let (body_ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+    for (rule, body_ast) in rules {
         let mut decides = Vec::new();
         collect_decide_effects(&body_ast.statements, &mut decides);
         for (binding, fields, span) in decides {
@@ -14029,9 +14020,12 @@ fn collect_redact_effects<'a>(
 /// unresolved source surfaces as an empty projection + a `validate_redactions`
 /// diagnostic.) Diagnostics from the reused collector are discarded — the real
 /// pass re-emits them.
-fn rule_binding_schemas(rule: &RuleDecl, semantic: &SemanticContext) -> BTreeMap<String, String> {
+fn rule_binding_schemas(
+    rule: &RuleDecl,
+    body_ast: &body::BodyAst,
+    semantic: &SemanticContext,
+) -> BTreeMap<String, String> {
     let mut schemas = binding_types_for_rule(rule);
-    let (body_ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
     let mut payloads = collect_effect_payload_types(rule, semantic, &mut Vec::new());
     collect_exec_payload_types(&body_ast.statements, semantic, &mut payloads);
     collect_decide_payload_types(&body_ast.statements, &rule.name.name, &mut payloads);
@@ -14083,18 +14077,18 @@ fn rule_binding_schemas(rule: &RuleDecl, semantic: &SemanticContext) -> BTreeMap
 /// Mirrors [`collect_inline_decide_schemas`]; run before the rule loop so
 /// `analyze_rule` sees the class. A redact chained off an earlier redact's output
 /// resolves via the local map built as the pass proceeds.
-fn collect_redact_schemas(items: &[Item], semantic: &mut SemanticContext, ir: &mut IrProgram) {
-    for item in items {
-        let Item::Rule(rule) = item else {
-            continue;
-        };
-        let (body_ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+fn collect_redact_schemas(
+    rules: &[(&RuleDecl, body::BodyAst)],
+    semantic: &mut SemanticContext,
+    ir: &mut IrProgram,
+) {
+    for (rule, body_ast) in rules {
         let mut redacts = Vec::new();
         collect_redact_effects(&body_ast.statements, &mut redacts);
         if redacts.is_empty() {
             continue;
         }
-        let binding_schemas = rule_binding_schemas(rule, semantic);
+        let binding_schemas = rule_binding_schemas(rule, body_ast, semantic);
         let mut local: BTreeMap<String, String> = BTreeMap::new();
         for (source, keep, binding, span) in redacts {
             let name = redact_schema_name(&rule.name.name, binding);
@@ -16488,9 +16482,8 @@ fn check_field_value_roots(
 
 /// The complete set of value-position binding roots for a rule: `when` bindings
 /// plus every binding the body introduces, collected from the parsed AST.
-fn known_roots_for_rule(rule: &RuleDecl) -> BTreeSet<String> {
+fn known_roots_for_rule(rule: &RuleDecl, body_ast: &body::BodyAst) -> BTreeSet<String> {
     let mut roots: BTreeSet<String> = binding_types_for_rule(rule).into_keys().collect();
-    let (body_ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
     collect_all_binding_names(&body_ast.statements, &mut roots);
     roots
 }

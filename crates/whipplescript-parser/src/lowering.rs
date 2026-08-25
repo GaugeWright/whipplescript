@@ -131,17 +131,34 @@ pub(crate) fn lower_program(
         &mut ir,
     );
 
-    // Inline `decide -> { … } as <binding>` synthesizes a hygienic
-    // `decide.<rule>.<binding>` class so its anonymous result shape flows like a
-    // named `coerce -> Schema`. Done before the rule loop so `analyze_rule` sees
-    // the class in the semantic index when type-checking field/`case` access.
-    collect_inline_decide_schemas(&program.items, &mut semantic, &mut ir);
-
-    // `redact <source> keep [..] as <out>` synthesizes a hygienic
-    // `redact.<rule>.<out>` class holding only the kept fields of the source
-    // schema, so the projection cannot expose a dropped field. Run after the
-    // decide synthesis so a redact whose source is a decide result resolves.
-    collect_redact_schemas(&program.items, &mut semantic, &mut ir);
+    // Both synthesis passes below walk every rule body, and the body AST is a
+    // pure function of (text, span) — parse each rule ONCE here and lend the
+    // ASTs to both rather than re-lexing every body in each pass. Scoped so the
+    // borrow of `program.items` ends before the lowering loop consumes them.
+    {
+        let rules: Vec<(&RuleDecl, body::BodyAst)> = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Rule(rule) => Some((
+                    rule,
+                    body::parse_rule_body(&rule.body.text, rule.body.span.start).0,
+                )),
+                _ => None,
+            })
+            .collect();
+        // Inline `decide -> { … } as <binding>` synthesizes a hygienic
+        // `decide.<rule>.<binding>` class so its anonymous result shape flows
+        // like a named `coerce -> Schema`. Done before the rule loop so
+        // `analyze_rule` sees the class in the semantic index when type-checking
+        // field/`case` access.
+        collect_inline_decide_schemas(&rules, &mut semantic, &mut ir);
+        // `redact <source> keep [..] as <out>` synthesizes a hygienic
+        // `redact.<rule>.<out>` class holding only the kept fields of the source
+        // schema, so the projection cannot expose a dropped field. Run after the
+        // decide synthesis so a redact whose source is a decide result resolves.
+        collect_redact_schemas(&rules, &mut semantic, &mut ir);
+    }
 
     for item in program.items {
         match item {
@@ -1883,17 +1900,24 @@ fn lower_rule(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     validate_canonical_rule_body_syntax(&rule, diagnostics);
-    let metadata = analyze_rule(&rule, semantic, diagnostics);
+    // Statement-form gate: every body must parse into the body AST. Unknown
+    // statements, malformed modifiers, and unclosed blocks are spanned errors
+    // here rather than silent no-ops at lowering time. The AST is a pure
+    // function of (text, span) and three checks below read it, so it is parsed
+    // ONCE here and lent to them rather than re-lexed per check.
+    let (body_ast, body_diagnostics) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+    diagnostics.extend(body_diagnostics);
+    let metadata = analyze_rule(&rule, &body_ast, semantic, diagnostics);
     validate_workflow_terminal_actions(
         &rule,
         semantic,
         &binding_types_for_rule(&rule),
-        &known_roots_for_rule(&rule),
+        &known_roots_for_rule(&rule, &body_ast),
         workflow_contract_names,
         diagnostics,
     );
     validate_effectful_self_trigger(&rule, &metadata, diagnostics);
-    validate_send_channels(&rule, semantic, diagnostics);
+    validate_send_channels(&body_ast, semantic, diagnostics);
     validate_message_from_channels(&rule, semantic, diagnostics);
     validate_evidence_fact_not_matched(&rule, diagnostics);
     validate_turn_access_grants(&rule, &metadata, diagnostics);

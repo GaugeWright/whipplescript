@@ -504,7 +504,7 @@ impl CoerceTransport for UreqCoerceTransport {
             .headers
             .iter()
             .any(|(name, value)| name == "accept" && value.contains("event-stream"));
-        match builder.send_json(request.body.clone()) {
+        match builder.send_json(&request.body) {
             Ok(response) => Ok(read_response(response, expect_sse)),
             // A non-2xx status is still a structured (JSON) response — parse it
             // for the provider error message, never as SSE.

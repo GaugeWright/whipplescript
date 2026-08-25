@@ -401,11 +401,14 @@ impl CapabilityContract for DoCapabilityContract {
 impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
     fn advance_rules(&mut self) -> Result<bool, StoreError> {
         step_instance_generic(&mut self.kernel, self.instance_id, self.ir, None, None)?;
+        // Only the instance row's status is read, so read only that row:
+        // `status()` also counts six tables and projects revisions and
+        // invocations, and this runs once per drive-loop iteration.
         let terminal = self
             .kernel
             .store()
-            .status(self.instance_id)?
-            .map(|status| status.instance.status != "running")
+            .get_instance(self.instance_id)?
+            .map(|instance| instance.status != "running")
             .unwrap_or(true);
         Ok(terminal)
     }
@@ -856,22 +859,33 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         })?;
                     }
                 }
+                // Narrow to the transcript rows in SQL rather than folding the
+                // whole log: the rows being counted carry a full serialized
+                // chat thread, so a turn-k count over every event re-reads and
+                // re-parses all k-1 earlier transcripts.
                 let checkpoint_step = self
                     .kernel
                     .store()
-                    .list_events(self.instance_id)?
-                    .into_iter()
-                    .filter(|event| {
-                        event.event_type == "agent.turn.brokered.transcript"
-                            && serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                                .ok()
-                                .and_then(|payload| {
-                                    payload
-                                        .get("effect_id")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(|candidate| candidate == effect.effect_id)
-                                })
-                                .unwrap_or(false)
+                    .sql
+                    .query(
+                        "SELECT payload_json FROM events WHERE instance_id = ?1 \
+                         AND event_type = 'agent.turn.brokered.transcript'",
+                        &[crate::do_store::text(self.instance_id)],
+                    )
+                    .map_err(crate::do_store::sql_err)?
+                    .iter()
+                    .filter(|row| {
+                        serde_json::from_str::<serde_json::Value>(&crate::do_store::as_text(
+                            &row[0],
+                        ))
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("effect_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|candidate| candidate == effect.effect_id)
+                        })
+                        .unwrap_or(false)
                     })
                     .count();
                 let checkpoint_store = DoSqliteStore::new(self.kernel.store().sql.clone());

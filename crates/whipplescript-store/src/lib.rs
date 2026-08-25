@@ -3092,6 +3092,78 @@ impl SqliteStore {
         Ok(claimable)
     }
 
+    /// Queued, unblocked, uncancelled `exec.command` effects, in the same order
+    /// `list_effects` yields them. The worker adds these to the claimable set
+    /// even when the dependency/capacity gate above declined them, and used to
+    /// find them by scanning every effect row of the instance — which
+    /// materializes each row's `input_json` (the agent/coerce payloads are the
+    /// largest values in the store) once per worker pass. The predicate is the
+    /// same, evaluated in SQL.
+    pub fn queued_exec_command_effects(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<ClaimableEffect>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                candidate.effect_id,
+                candidate.kind,
+                candidate.target,
+                candidate.profile,
+                candidate.input_json,
+                candidate.required_capabilities,
+                COALESCE(effect_versions.declared_profiles, active_versions.declared_profiles, '[]'),
+                candidate.created_by_event_id
+            FROM effects AS candidate
+            LEFT JOIN instances ON instances.instance_id = candidate.instance_id
+            LEFT JOIN program_versions AS active_versions
+              ON active_versions.version_id = instances.version_id
+            LEFT JOIN program_versions AS effect_versions
+              ON effect_versions.version_id = candidate.program_version_id
+            WHERE candidate.instance_id = ?1
+              AND candidate.kind = 'exec.command'
+              AND candidate.status = 'queued'
+              AND candidate.policy_block_reason IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM effect_cancellation_requests AS request
+                  WHERE request.instance_id = candidate.instance_id
+                    AND request.effect_id = candidate.effect_id
+                    AND request.status = 'requested'
+              )
+            ORDER BY candidate.created_at, candidate.effect_id
+            "#,
+        )?;
+        let effects = statement
+            .query_map([instance_id], |row| {
+                Ok((
+                    ClaimableEffect {
+                        effect_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        target: row.get(2)?,
+                        profile: row.get(3)?,
+                        input_json: row.get(4)?,
+                        required_capabilities_json: row.get(5)?,
+                        declared_profiles_json: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        // RC-4b on the effects plane: the orphaned segment's effects are
+        // invisible after a restore, exactly as `list_effects` hides them.
+        let live = live_event_ids_on(&self.connection, instance_id)?;
+        let effects = effects
+            .into_iter()
+            .filter(|(_, created_by)| match (&live, created_by) {
+                (Some(live), Some(event_id)) => live.contains(event_id),
+                _ => true,
+            })
+            .map(|(effect, _)| effect)
+            .collect();
+        Ok(effects)
+    }
+
     pub fn fact_exists(&self, instance_id: &str, fact_name: &str) -> StoreResult<bool> {
         self.connection
             .query_row(
@@ -4996,6 +5068,60 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// `list_runs` narrowed to the running run of one effect. The `ORDER BY`
+    /// is kept and paired with `LIMIT 1`, so the row returned is exactly the
+    /// one a linear scan of `list_runs` would have found first.
+    pub fn running_run_for_effect(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<RunView>> {
+        let run = self
+            .connection
+            .query_row(
+                r#"
+            SELECT
+                run_id,
+                effect_id,
+                provider,
+                worker_id,
+                status,
+                started_at,
+                completed_at,
+                metadata_json,
+                EXISTS (
+                    SELECT 1
+                    FROM effect_cancellation_requests AS request
+                    WHERE request.instance_id = runs.instance_id
+                      AND request.effect_id = runs.effect_id
+                      AND request.status = 'requested'
+                ) AS cancel_requested
+            FROM runs
+            WHERE runs.instance_id = ?1
+              AND runs.effect_id = ?2
+              AND runs.status = 'running'
+            ORDER BY started_at, run_id
+            LIMIT 1
+            "#,
+                [instance_id, effect_id],
+                |row| {
+                    Ok(RunView {
+                        run_id: row.get(0)?,
+                        effect_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        worker_id: row.get(3)?,
+                        status: row.get(4)?,
+                        started_at: row.get(5)?,
+                        completed_at: row.get(6)?,
+                        metadata_json: row.get(7)?,
+                        cancel_requested: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(run)
+    }
+
     pub fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
         let Some(instance) = self.get_instance(instance_id)? else {
             return Ok(None);
@@ -5033,10 +5159,35 @@ impl SqliteStore {
             instance_id,
             Some("status = 'requested'"),
         )?;
-        let mut recent_events = self.list_events(instance_id)?;
-        if recent_events.len() > 5 {
-            recent_events = recent_events.split_off(recent_events.len() - 5);
-        }
+        // Only the tail is kept, so read only the tail. `status()` is the drive
+        // loop's per-step liveness probe, and the full log carries a payload
+        // string per recorded step; reading it whole to discard all but five
+        // rows costs the whole log again on every step.
+        let mut recent_events = {
+            let mut statement = self.connection.prepare(
+                r#"
+                SELECT event_id, sequence, event_type, payload_json, source, occurred_at
+                FROM events
+                WHERE instance_id = ?1
+                ORDER BY sequence DESC
+                LIMIT 5
+                "#,
+            )?;
+            let rows = statement
+                .query_map([instance_id], |row| {
+                    Ok(EventView {
+                        event_id: row.get(0)?,
+                        sequence: row.get(1)?,
+                        event_type: row.get(2)?,
+                        payload_json: row.get(3)?,
+                        source: row.get(4)?,
+                        occurred_at: row.get(5)?,
+                    })
+                })?
+                .collect::<result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        recent_events.reverse();
         let revisions = self.list_instance_revisions(instance_id)?;
         let parent_invocation = self.get_parent_workflow_invocation(instance_id)?;
         let child_invocations = self.list_child_workflow_invocations(instance_id)?;
@@ -6735,6 +6886,20 @@ pub trait RuntimeStore {
     fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>>;
     fn list_effects(&self, instance_id: &str) -> StoreResult<Vec<EffectView>>;
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>>;
+    /// The running run of one effect, for the callers that want that row and
+    /// not the instance's whole run history. The default body is the scan it
+    /// replaces, so an implementation that does not narrow the query still
+    /// answers with the same row.
+    fn running_run_for_effect(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<RunView>> {
+        Ok(self
+            .list_runs(instance_id)?
+            .into_iter()
+            .find(|run| run.effect_id == effect_id && run.status == "running"))
+    }
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>>;
     fn satisfy_dependencies(&self, instance_id: &str) -> StoreResult<usize>;
     fn start_run(&mut self, run: RunStart<'_>) -> StoreResult<StoredEvent>;
@@ -7165,6 +7330,13 @@ impl RuntimeStore for SqliteStore {
     fn list_runs(&self, instance_id: &str) -> StoreResult<Vec<RunView>> {
         self.list_runs(instance_id)
     }
+    fn running_run_for_effect(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<RunView>> {
+        self.running_run_for_effect(instance_id, effect_id)
+    }
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
         self.status(instance_id)
     }
@@ -7555,6 +7727,22 @@ fn live_event_ids_on(
     connection: &Connection,
     instance_id: &str,
 ) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    // An instance that was never restored has no marker, and for it the fold
+    // below reads and discards a payload string per recorded event. Probe for
+    // the marker first so the un-restored path — the common one, on a caller
+    // that runs every worker pass — never materializes the log.
+    let restored = connection
+        .query_row(
+            "SELECT 1 FROM events WHERE instance_id = ?1 AND event_type = 'context.restored' \
+             LIMIT 1",
+            [instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !restored {
+        return Ok(None);
+    }
     let mut statement = connection.prepare(
         "SELECT event_id, sequence, event_type, payload_json FROM events \
          WHERE instance_id = ?1 ORDER BY sequence",
@@ -11745,6 +11933,32 @@ fn ensure_lookup_indexes(connection: &Connection) -> StoreResult<()> {
             .optional()?
             .is_some();
         if table_exists {
+            connection.execute(statement, [])?;
+        }
+    }
+    // `runs`, `evidence` and `leases` reach a per-instance query through a full
+    // table scan otherwise — none of them carries a UNIQUE constraint that
+    // covers `instance_id`. Each is proved by COLUMN and not merely by table:
+    // an old store predates the column, and `leases` names two differently
+    // shaped tables — the runtime one keyed by instance, and the coordination
+    // one (`coordination.rs`) keyed by owner/resource, which has no
+    // `instance_id` at all. A store missing the column degrades to a no-op here
+    // rather than failing the open.
+    for (table, statement) in [
+        (
+            "runs",
+            "CREATE INDEX IF NOT EXISTS idx_runs_instance ON runs(instance_id)",
+        ),
+        (
+            "evidence",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_instance ON evidence(instance_id)",
+        ),
+        (
+            "leases",
+            "CREATE INDEX IF NOT EXISTS idx_leases_instance ON leases(instance_id)",
+        ),
+    ] {
+        if table_exists(connection, table)? && column_exists(connection, table, "instance_id")? {
             connection.execute(statement, [])?;
         }
     }
@@ -17147,6 +17361,223 @@ mod tests {
         assert_eq!(status.active_run_count, 1);
         assert_eq!(status.failure_count, 0);
         assert_eq!(status.recent_events.len(), 3);
+    }
+
+    /// The narrowed run lookup answers with the row `list_runs` + a linear
+    /// scan would have found: the effect's running run, never a sibling
+    /// effect's and never a terminal one, and `None` when there is none.
+    #[test]
+    fn running_run_for_effect_matches_the_linear_scan() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Runs", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let instance_id = instance.instance_id.clone();
+        for effect_id in ["eff-a", "eff-b", "eff-c"] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO effects (effect_id, instance_id, kind, status, \
+                     created_by_rule, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        effect_id,
+                        instance_id,
+                        "builtin.demo",
+                        "running",
+                        "r",
+                        effect_id
+                    ],
+                )
+                .expect("seed effect");
+        }
+        let seed = |run_id: &str, effect_id: &str, status: &str, started_at: &str| {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, \
+                     status, started_at, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        run_id,
+                        instance_id,
+                        effect_id,
+                        "test",
+                        "worker-1",
+                        status,
+                        started_at,
+                        "{}"
+                    ],
+                )
+                .expect("seed run");
+        };
+        seed("run-a1", "eff-a", "failed", "2030-01-01T00:00:00Z");
+        seed("run-a2", "eff-a", "running", "2030-01-01T00:00:01Z");
+        seed("run-b1", "eff-b", "running", "2030-01-01T00:00:02Z");
+        seed("run-c1", "eff-c", "completed", "2030-01-01T00:00:03Z");
+        store
+            .connection
+            .execute(
+                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+                 requested_by, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["req-1", instance_id, "eff-b", "deadline", "requested"],
+            )
+            .expect("seed cancellation request");
+
+        for effect_id in ["eff-a", "eff-b", "eff-c", "eff-missing"] {
+            let narrowed = store
+                .running_run_for_effect(&instance_id, effect_id)
+                .expect("running run");
+            let scanned = store
+                .list_runs(&instance_id)
+                .expect("runs list")
+                .into_iter()
+                .find(|run| run.effect_id == effect_id && run.status == "running");
+            assert_eq!(
+                narrowed.as_ref().map(|run| &run.run_id),
+                scanned.as_ref().map(|run| &run.run_id),
+                "narrowed lookup disagrees with the scan for {effect_id}"
+            );
+            assert_eq!(
+                narrowed.map(|run| run.cancel_requested),
+                scanned.map(|run| run.cancel_requested),
+            );
+        }
+    }
+
+    /// The narrowed `exec.command` lookup answers with exactly the rows
+    /// `list_effects` + the worker's Rust-side predicate would have kept, in
+    /// the same order: queued, unblocked, uncancelled, and `exec.command` only.
+    #[test]
+    fn queued_exec_command_effects_match_the_linear_scan() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Exec", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let instance_id = instance.instance_id.clone();
+        let seed =
+            |effect_id: &str, kind: &str, status: &str, block: Option<&str>, created_at: &str| {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO effects (effect_id, instance_id, kind, target, input_json, \
+                     status, created_by_rule, idempotency_key, policy_block_reason, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            effect_id,
+                            instance_id,
+                            kind,
+                            "echo hi",
+                            "{\"command\":\"echo hi\"}",
+                            status,
+                            "r",
+                            effect_id,
+                            block,
+                            created_at
+                        ],
+                    )
+                    .expect("seed effect");
+            };
+        // Seeded newest-first so a lookup that returned insertion order rather
+        // than `created_at` order would disagree with the scan.
+        seed(
+            "eff-late",
+            "exec.command",
+            "queued",
+            None,
+            "2030-01-01T00:00:03Z",
+        );
+        seed(
+            "eff-early",
+            "exec.command",
+            "queued",
+            None,
+            "2030-01-01T00:00:01Z",
+        );
+        seed(
+            "eff-cancelled",
+            "exec.command",
+            "queued",
+            None,
+            "2030-01-01T00:00:02Z",
+        );
+        seed(
+            "eff-blocked",
+            "exec.command",
+            "queued",
+            Some("security.script_disabled"),
+            "2030-01-01T00:00:04Z",
+        );
+        seed(
+            "eff-running",
+            "exec.command",
+            "running",
+            None,
+            "2030-01-01T00:00:05Z",
+        );
+        seed(
+            "eff-agent",
+            "agent.turn",
+            "queued",
+            None,
+            "2030-01-01T00:00:06Z",
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+                 requested_by, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "req-1",
+                    instance_id,
+                    "eff-cancelled",
+                    "deadline",
+                    "requested"
+                ],
+            )
+            .expect("seed cancellation request");
+
+        let narrowed = store
+            .queued_exec_command_effects(&instance_id)
+            .expect("narrowed lookup");
+        let scanned: Vec<String> = store
+            .list_effects(&instance_id)
+            .expect("effects list")
+            .into_iter()
+            .filter(|effect| {
+                effect.kind == "exec.command"
+                    && effect.status == "queued"
+                    && effect.policy_block_reason.is_none()
+                    && !effect.cancel_requested
+            })
+            .map(|effect| effect.effect_id)
+            .collect();
+        assert_eq!(scanned, vec!["eff-early".to_owned(), "eff-late".to_owned()]);
+        assert_eq!(
+            narrowed
+                .iter()
+                .map(|effect| effect.effect_id.clone())
+                .collect::<Vec<_>>(),
+            scanned,
+        );
+        let early = &narrowed[0];
+        assert_eq!(early.kind, "exec.command");
+        assert_eq!(early.target.as_deref(), Some("echo hi"));
+        assert_eq!(early.input_json, "{\"command\":\"echo hi\"}");
+        assert_eq!(early.required_capabilities_json, "[]");
+        assert_eq!(early.declared_profiles_json, "[]");
     }
 
     #[test]

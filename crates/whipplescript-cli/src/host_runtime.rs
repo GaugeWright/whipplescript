@@ -5,7 +5,7 @@
 //! provide only opaque-reference resolvers. Secrets and resource bodies are
 //! resolved after admission and never enter the host command or receipt.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -2004,72 +2004,89 @@ impl GovernedHostRuntime {
             .list_instances()
             .map_err(HostRuntimeError::Store)?
         {
-            let events = self
+            // The opened event is appended under a key derived from exactly this
+            // (instance, request) pair, so one indexed point lookup per instance
+            // decides the replay question that a full event-log scan used to.
+            let replay_key = idempotency_key(&[
+                &instance.instance_id,
+                &command.request_id,
+                "host-instance-opened",
+            ]);
+            let Some(stored) = self
+                .kernel
+                .store()
+                .event_by_idempotency_key(&instance.instance_id, &replay_key)
+                .map_err(HostRuntimeError::Store)?
+            else {
+                continue;
+            };
+            let Some(event) = self
                 .kernel
                 .store()
                 .list_events(&instance.instance_id)
-                .map_err(HostRuntimeError::Store)?;
-            for event in events {
-                if event.event_type != "host.instance.opened" {
-                    continue;
-                }
-                let payload: Value =
-                    serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
-                if payload.get("request_id").and_then(Value::as_str)
-                    != Some(command.request_id.as_str())
-                {
-                    continue;
-                }
-                let opened = OpenedInstance {
-                    protocol: HOST_PROTOCOL.to_owned(),
-                    request_id: command.request_id.clone(),
-                    instance_ref: instance.instance_id.clone(),
-                    package_version_ref: required_string(&payload, "package_version_ref")?,
-                    policy: serde_json::from_value(payload["policy"].clone())
-                        .map_err(HostRuntimeError::Json)?,
-                    opened_at: EventPosition {
-                        instance_ref: instance.instance_id.clone(),
-                        sequence: positive_sequence(event.sequence)?,
-                    },
-                };
-                opened.validate_for(command)?;
-                let version = self
-                    .kernel
-                    .store()
-                    .get_program_version(&instance.version_id)
-                    .map_err(HostRuntimeError::Store)?
-                    .ok_or_else(|| {
-                        HostRuntimeError::UnknownInstance(instance.instance_id.clone())
-                    })?;
-                // Different authored content under a replayed request is the
-                // integrity breach this guard exists for.
-                if version.source_hash != package.source_hash {
-                    return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
-                        "replayed package content",
-                    )));
-                }
-                // Same authored program, different IR: the toolchain compiling
-                // it has moved since the instance was opened. Refusing here
-                // would strand every instance across every compiler-evolving
-                // upgrade, which contradicts the store's durability — so the
-                // current compile is re-attested (an auditable event plus a
-                // version re-point, spec/agent-harness.md "Program identity
-                // across toolchains").
-                if version.ir_hash != package.ir_hash {
-                    self.kernel
-                        .reattest_instance_program(
-                            &instance.instance_id,
-                            ProgramVersionInput {
-                                program_name: &package.agent,
-                                source_hash: &package.source_hash,
-                                ir_hash: &package.ir_hash,
-                                compiler_version: HOST_PROTOCOL,
-                            },
-                        )
-                        .map_err(HostRuntimeError::Store)?;
-                }
-                return Ok(Some(opened));
+                .map_err(HostRuntimeError::Store)?
+                .into_iter()
+                .find(|event| event.event_id == stored.event_id)
+            else {
+                continue;
+            };
+            if event.event_type != "host.instance.opened" {
+                continue;
             }
+            let payload: Value =
+                serde_json::from_str(&event.payload_json).map_err(HostRuntimeError::Json)?;
+            if payload.get("request_id").and_then(Value::as_str)
+                != Some(command.request_id.as_str())
+            {
+                continue;
+            }
+            let opened = OpenedInstance {
+                protocol: HOST_PROTOCOL.to_owned(),
+                request_id: command.request_id.clone(),
+                instance_ref: instance.instance_id.clone(),
+                package_version_ref: required_string(&payload, "package_version_ref")?,
+                policy: serde_json::from_value(payload["policy"].clone())
+                    .map_err(HostRuntimeError::Json)?,
+                opened_at: EventPosition {
+                    instance_ref: instance.instance_id.clone(),
+                    sequence: positive_sequence(event.sequence)?,
+                },
+            };
+            opened.validate_for(command)?;
+            let version = self
+                .kernel
+                .store()
+                .get_program_version(&instance.version_id)
+                .map_err(HostRuntimeError::Store)?
+                .ok_or_else(|| HostRuntimeError::UnknownInstance(instance.instance_id.clone()))?;
+            // Different authored content under a replayed request is the
+            // integrity breach this guard exists for.
+            if version.source_hash != package.source_hash {
+                return Err(HostRuntimeError::Protocol(ProtocolError::Mismatch(
+                    "replayed package content",
+                )));
+            }
+            // Same authored program, different IR: the toolchain compiling
+            // it has moved since the instance was opened. Refusing here
+            // would strand every instance across every compiler-evolving
+            // upgrade, which contradicts the store's durability — so the
+            // current compile is re-attested (an auditable event plus a
+            // version re-point, spec/agent-harness.md "Program identity
+            // across toolchains").
+            if version.ir_hash != package.ir_hash {
+                self.kernel
+                    .reattest_instance_program(
+                        &instance.instance_id,
+                        ProgramVersionInput {
+                            program_name: &package.agent,
+                            source_hash: &package.source_hash,
+                            ir_hash: &package.ir_hash,
+                            compiler_version: HOST_PROTOCOL,
+                        },
+                    )
+                    .map_err(HostRuntimeError::Store)?;
+            }
+            return Ok(Some(opened));
         }
         Ok(None)
     }
@@ -2824,26 +2841,40 @@ impl GovernedHostRuntime {
             .store()
             .list_events(&command.instance_ref)
             .map_err(HostRuntimeError::Store)?;
+        // One parse pass over the instance log instead of re-parsing every prior
+        // `host.turn.evidence` payload once per evidence item. First writer wins,
+        // matching the `find` this replaces; an unparseable payload is skipped
+        // exactly as the old `.ok()` did.
+        let mut projected_before: HashMap<String, i64> = HashMap::new();
+        for event in &existing_events {
+            if event.event_type != "host.turn.evidence" {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                continue;
+            };
+            if payload.get("command_id").and_then(Value::as_str)
+                != Some(command.command_id.as_str())
+            {
+                continue;
+            }
+            let Some(existing_ref) = payload.get("evidence_ref").and_then(Value::as_str) else {
+                continue;
+            };
+            projected_before
+                .entry(existing_ref.to_owned())
+                .or_insert(event.sequence);
+        }
         let mut projected = Vec::with_capacity(evidence.len());
         for item in evidence {
             let evidence_ref = format!("whip:evidence:{}", item.evidence_id);
-            if let Some(existing) = existing_events.iter().find(|event| {
-                event.event_type == "host.turn.evidence"
-                    && serde_json::from_str::<Value>(&event.payload_json)
-                        .ok()
-                        .is_some_and(|payload| {
-                            payload.get("command_id").and_then(Value::as_str)
-                                == Some(command.command_id.as_str())
-                                && payload.get("evidence_ref").and_then(Value::as_str)
-                                    == Some(evidence_ref.as_str())
-                        })
-            }) {
+            if let Some(existing) = projected_before.get(evidence_ref.as_str()).copied() {
                 projected.push(LabeledRuntimeEvent {
                     protocol: HOST_PROTOCOL.to_owned(),
                     command_id: command.command_id.clone(),
                     position: EventPosition {
                         instance_ref: command.instance_ref.clone(),
-                        sequence: positive_sequence(existing.sequence)?,
+                        sequence: positive_sequence(existing)?,
                     },
                     policy: command.policy.clone(),
                     kind: item.kind,
@@ -3321,7 +3352,7 @@ impl HostDriver for NativeHttpDriver<'_> {
         for (name, value) in &request.headers {
             builder = builder.set(name, value);
         }
-        let response = match builder.send_json(request.body.clone()) {
+        let response = match builder.send_json(&request.body) {
             Ok(response) | Err(ureq::Error::Status(_, response)) => response,
             Err(ureq::Error::Transport(error)) => {
                 let message = error.to_string();

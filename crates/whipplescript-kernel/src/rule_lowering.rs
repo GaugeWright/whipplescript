@@ -323,9 +323,10 @@ pub fn ready_contexts_for(
         if let Some((schema, binding)) = pattern.split_once(" as ") {
             let schema = schema.trim();
             let binding = binding.trim();
+            let normalized = normalize_pattern_name(schema);
             let matching = facts
                 .iter()
-                .filter(|fact| fact.name == schema || fact.name == normalize_pattern_name(schema))
+                .filter(|fact| fact.name == schema || fact.name == normalized)
                 .filter(|fact| pattern_agent_matches(ir, schema, fact))
                 .filter(|fact| pattern_tracker_matches(schema, fact))
                 .filter(|fact| pattern_stream_matches(schema, fact))
@@ -5975,20 +5976,16 @@ pub fn effect_binding_value(
     upstream_effect_id: &str,
     predicate: &str,
 ) -> Option<Value> {
-    let matches: Vec<Value> = facts
-        .iter()
-        .filter_map(|fact| {
-            let payload = json_from_str(&fact.value_json);
-            if payload.get("effect_id").and_then(Value::as_str) != Some(upstream_effect_id) {
-                return None;
-            }
-            if !fact_matches_after_predicate(&fact.name, &payload, predicate) {
-                return None;
-            }
-            Some(payload)
-        })
-        .collect();
-    let payload = matches.first()?.clone();
+    let payload = facts.iter().find_map(|fact| {
+        let payload = json_from_str(&fact.value_json);
+        if payload.get("effect_id").and_then(Value::as_str) != Some(upstream_effect_id) {
+            return None;
+        }
+        if !fact_matches_after_predicate(&fact.name, &payload, predicate) {
+            return None;
+        }
+        Some(payload)
+    })?;
     if predicate == "completes" {
         return Some(terminal_union_value(&payload));
     }
@@ -6297,10 +6294,19 @@ pub fn parse_record_field_value(
                 .bindings
                 .iter()
                 .any(|(candidate, _)| candidate == binding)
-                && context_field_value(context, binding, field).is_none()
             {
-                errors.push(format!("could not resolve `{value}`"));
-                return Value::Null;
+                // A bound leading segment settles the value here: the scoped
+                // parse below would fall through every literal shape (no
+                // quotes, no `{`/`[`, no bool/null, no variant head, not an
+                // integer — every segment is an identifier) to the same
+                // `context_field_value` lookup. Resolve once and return it.
+                // An UNBOUND leading segment still falls through, where it may
+                // resolve as an expression instead.
+                let Some(resolved) = context_field_value(context, binding, field) else {
+                    errors.push(format!("could not resolve `{value}`"));
+                    return Value::Null;
+                };
+                return resolved;
             }
         }
     }
@@ -6576,18 +6582,17 @@ pub fn context_field_value(context: &RuleContext, binding: &str, field: &str) ->
 }
 
 pub fn context_path_value(context: &RuleContext, binding: &str, path: &str) -> Option<Value> {
-    let fact = context
+    let fact = &context
         .bindings
         .iter()
         .find(|(candidate, _)| candidate == binding)?
-        .1
-        .value_json
-        .clone();
-    let mut value = json_from_str(&fact);
+        .1;
+    let root = json_from_str(&fact.value_json);
+    let mut current = &root;
     for field in path.split('.') {
-        value = value.get(field)?.clone();
+        current = current.get(field)?;
     }
-    Some(value)
+    Some(current.clone())
 }
 
 pub fn context_bindings_json(context: &RuleContext) -> Value {
@@ -6619,10 +6624,11 @@ pub fn stable_hash_hex(value: &str) -> String {
     // collision could alias two distinct facts into one identity. `stable_hash`
     // (the raw u64) remains for non-adversarial uses (telemetry span ids).
     use sha2::Digest;
+    use std::fmt::Write;
     let digest = sha2::Sha256::digest(value.as_bytes());
     let mut hex = String::with_capacity(32);
     for byte in &digest[..16] {
-        hex.push_str(&format!("{byte:02x}"));
+        let _ = write!(hex, "{byte:02x}");
     }
     hex
 }

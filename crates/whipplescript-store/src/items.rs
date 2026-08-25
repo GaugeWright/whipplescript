@@ -1309,13 +1309,18 @@ impl WorkItemStore {
                     .collect::<StoreResult<Vec<_>>>()?;
                 let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
                     std::collections::HashMap::new();
+                let mut key_of: std::collections::HashMap<&str, &str> =
+                    std::collections::HashMap::new();
                 for (cid, key) in &created {
                     by_key.entry(key).or_default().push(cid);
+                    // `or_insert`, not `insert`: the linear scan this replaces
+                    // took the FIRST creation event carrying a content id.
+                    key_of.entry(cid.as_str()).or_insert(key.as_str());
                 }
                 for content_id in &unaliased {
-                    if let Some((_, key)) = created.iter().find(|(c, _)| c == content_id) {
+                    if let Some(key) = key_of.get(content_id.as_str()) {
                         // A distinct issue already carries this queue+title.
-                        if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                        if by_key[key].iter().any(|c| *c != content_id) {
                             report.duplicate_submissions.push(
                                 new_alias
                                     .get(content_id)

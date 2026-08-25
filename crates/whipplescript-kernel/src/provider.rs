@@ -1,5 +1,6 @@
 //! Native provider capability and binding validation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
@@ -528,7 +529,7 @@ pub fn redacted_provider_error_detail(message: &str) -> String {
         let truncated: String = redacted.chars().take(MAX_PROVIDER_ERROR_CHARS).collect();
         format!("{truncated}…")
     } else {
-        redacted
+        redacted.into_owned()
     }
 }
 
@@ -788,17 +789,25 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-pub fn redact_sensitive_metadata(value: &str) -> String {
-    if value.contains("sk-")
-        || value.contains("ANTHROPIC_API_KEY")
-        || value.contains("OPENAI_API_KEY")
-        || value.contains("XAI_API_KEY")
-        || value.contains("token")
-        || value.contains("secret")
+/// Every needle that makes a metadata string unfit to cross the redaction
+/// boundary. Any hit redacts the whole string; the clean case keeps its borrow.
+const SENSITIVE_METADATA_NEEDLES: [&str; 6] = [
+    "sk-",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "token",
+    "secret",
+];
+
+pub fn redact_sensitive_metadata(value: &str) -> Cow<'_, str> {
+    if SENSITIVE_METADATA_NEEDLES
+        .iter()
+        .any(|needle| value.contains(needle))
     {
-        "[REDACTED]".to_owned()
+        Cow::Borrowed("[REDACTED]")
     } else {
-        value.to_owned()
+        Cow::Borrowed(value)
     }
 }
 

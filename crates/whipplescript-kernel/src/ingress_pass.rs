@@ -84,6 +84,33 @@ pub fn admit_external_signal<S: RuntimeStore>(
     payload: &Value,
     delivery_key: &str,
 ) -> StoreResult<SignalAdmission> {
+    admit_external_signal_with_envelope(
+        kernel,
+        instance_id,
+        ir,
+        signal,
+        payload,
+        delivery_key,
+        &ifc::VerifiedEnvelope::load_from_env(),
+    )
+}
+
+/// The admission core against an envelope the CALLER already crossed the trust
+/// boundary for. A source pass admits one observation per line/element, and
+/// crossing the boundary per observation re-reads, re-verifies and re-parses the
+/// whole policy for one `internal_signals` question that cannot change within the
+/// pass. The refusal is the same one: the same envelope decides for every
+/// observation, just read once — the granularity the pass already uses for the IR
+/// and for the source contents themselves.
+pub fn admit_external_signal_with_envelope<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    ir: &IrProgram,
+    signal: &str,
+    payload: &Value,
+    delivery_key: &str,
+    envelope: &ifc::EnvelopeStatus,
+) -> StoreResult<SignalAdmission> {
     // Static refusals first (declaration, governance, payload shape): they
     // hold whether or not the target instance exists, so a driver surfaces
     // the real problem before any store lookup.
@@ -94,7 +121,7 @@ pub fn admit_external_signal<S: RuntimeStore>(
     };
     // No laundering (H8 stage b): an internal-governed signal refuses external
     // injection, whatever the driver.
-    if ifc::signal_is_internal(signal) {
+    if ifc::signal_is_internal_in(envelope, signal) {
         return Ok(SignalAdmission::Refused(SignalRefusal::InternalChannel));
     }
     // IR-typed validation (Family B conditional presence included) — the same
@@ -224,6 +251,9 @@ pub fn resolve_due_file_sources<S: RuntimeStore>(
     if kernel.store().get_instance(instance_id)?.is_none() {
         return Ok(report);
     }
+    // One trust-boundary crossing for the whole pass: the H8 gate asks the same
+    // envelope about every observation below.
+    let envelope = ifc::VerifiedEnvelope::load_from_env();
     for source in &ir.sources {
         if !source.is_file {
             continue;
@@ -265,6 +295,7 @@ pub fn resolve_due_file_sources<S: RuntimeStore>(
                     source,
                     &observation,
                     ordinal_key,
+                    &envelope,
                     &mut report,
                 )?;
             }
@@ -305,6 +336,7 @@ pub fn resolve_due_file_sources<S: RuntimeStore>(
                     source,
                     &observation,
                     occurrence_key,
+                    &envelope,
                     &mut report,
                 )?;
             }
@@ -332,6 +364,8 @@ pub fn resolve_due_http_sources<S: RuntimeStore>(
     if kernel.store().get_instance(instance_id)?.is_none() {
         return Ok(report);
     }
+    // One trust-boundary crossing for the whole pass, as in the file pass.
+    let envelope = ifc::VerifiedEnvelope::load_from_env();
     for source in &ir.sources {
         if !source.is_http {
             continue;
@@ -382,6 +416,7 @@ pub fn resolve_due_http_sources<S: RuntimeStore>(
                 source,
                 &observation,
                 ordinal_key,
+                &envelope,
                 &mut report,
             )?;
         }
@@ -393,6 +428,7 @@ pub fn resolve_due_http_sources<S: RuntimeStore>(
 /// onto the declared payload by the author's `emit` clause, derive the
 /// delivery key, admit. Duplicates are absorbed silently (idempotent pass);
 /// refusals are noted for the host to surface.
+#[allow(clippy::too_many_arguments)]
 fn admit_source_observation<S: RuntimeStore>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
@@ -400,21 +436,21 @@ fn admit_source_observation<S: RuntimeStore>(
     source: &IrSource,
     observation: &Value,
     ordinal_key: String,
+    envelope: &ifc::EnvelopeStatus,
     report: &mut IngressPassReport,
 ) -> StoreResult<()> {
-    let observation_map = observation
-        .as_object()
-        .cloned()
-        .unwrap_or_else(serde_json::Map::new);
-    let payload = clock_emit_payload(source, &observation_map);
+    let empty = serde_json::Map::new();
+    let observation_map = observation.as_object().unwrap_or(&empty);
+    let payload = clock_emit_payload(source, observation_map);
     let delivery_key = source_delivery_key(source, observation, ordinal_key);
-    match admit_external_signal(
+    match admit_external_signal_with_envelope(
         kernel,
         instance_id,
         ir,
         &source.emit_signal,
         &payload,
         &delivery_key,
+        envelope,
     )? {
         SignalAdmission::Admitted { .. } => report.admitted += 1,
         SignalAdmission::Duplicate { .. } => {}

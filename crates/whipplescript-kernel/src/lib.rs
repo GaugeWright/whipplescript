@@ -142,10 +142,10 @@ struct ProviderEvidence {
 }
 
 pub fn idempotency_key(parts: &[&str]) -> String {
-    let mut input = String::new();
+    use std::fmt::Write;
+    let mut input = String::with_capacity(parts.iter().map(|part| part.len() + 12).sum());
     for part in parts {
-        input.push_str(&part.len().to_string());
-        input.push(':');
+        let _ = write!(input, "{}:", part.len());
         input.push_str(part);
         input.push(';');
     }
@@ -162,7 +162,7 @@ pub fn idempotency_key(parts: &[&str]) -> String {
     let mut hex = String::with_capacity(36);
     hex.push_str("key_");
     for byte in &digest[..16] {
-        hex.push_str(&format!("{byte:02x}"));
+        let _ = write!(hex, "{byte:02x}");
     }
     hex
 }
@@ -1603,14 +1603,17 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         run_metadata_json: &str,
         result: &ProviderRunResult,
     ) -> StoreResult<StoredEvent> {
-        let evidence = self.record_provider_result(execution, result)?;
+        // Redacting the model's whole answer is byte-scaled work, so it happens
+        // once here and the same bytes reach the evidence row, the diagnostics,
+        // the completion, and the turn fact.
+        let safe_summary = redacted_provider_summary(&result.summary);
+        let evidence = self.record_provider_result(execution, result, &safe_summary)?;
         let (metadata_json, terminal_hash, provider_correlation_id) = provider_terminal_metadata(
             execution.instance_id,
             execution.run_id,
             result,
             run_metadata_json,
         );
-        let safe_summary = redacted_provider_summary(&result.summary);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
@@ -1658,7 +1661,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             // and cancel_run derives the effect.cancelled settling fact.
             ProviderRunStatus::Cancelled => self.cancel_run(completion)?,
         };
-        self.append_agent_turn_event_and_fact(execution, result)?;
+        self.append_agent_turn_event_and_fact(execution, result, &safe_summary)?;
         Ok(event)
     }
 
@@ -2083,7 +2086,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             // and cancel_run derives the effect.cancelled settling fact.
             ProviderRunStatus::Cancelled => self.cancel_run(completion)?,
         };
-        self.append_agent_turn_event_and_fact(execution, &result)?;
+        self.append_agent_turn_event_and_fact(execution, &result, &safe_summary)?;
         Ok(Some(event))
     }
 
@@ -2229,9 +2232,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         execution: CoerceExecution<'_>,
         result: &CoerceResult,
     ) -> StoreResult<StoredEvent> {
-        let evidence = self.record_coerce_result(execution, result)?;
-        let metadata_json = coerce_metadata(result);
+        // One redaction pass over the model's whole answer, reused by the
+        // evidence row, the diagnostics, the completion, and the coerce fact.
         let safe_summary = redacted_provider_summary(&result.summary);
+        let evidence = self.record_coerce_result(execution, result, &safe_summary)?;
+        let metadata_json = coerce_metadata(result);
         self.emit_provider_diagnostic(
             execution.run_id,
             execution.effect_id,
@@ -2277,14 +2282,17 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             CoerceStatus::Failed => self.fail_run_with_diagnostic(completion, diagnostic)?,
             CoerceStatus::TimedOut => self.timeout_run_with_diagnostic(completion, diagnostic)?,
         };
-        self.append_coerce_fact(execution, result)?;
+        self.append_coerce_fact(execution, result, &safe_summary)?;
         Ok(event)
     }
 
+    /// `safe_summary` is the caller's already-redacted `result.summary` (see
+    /// [`Self::append_coerce_fact`]).
     fn record_coerce_result(
         &self,
         execution: CoerceExecution<'_>,
         result: &CoerceResult,
+        safe_summary: &str,
     ) -> StoreResult<ProviderEvidence> {
         let metadata = json!({
             "effect_id": execution.effect_id,
@@ -2311,7 +2319,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 execution.run_id,
                 "coerce-provider",
             ])),
-            summary: Some(&redacted_provider_summary(&result.summary)),
+            summary: Some(safe_summary),
             metadata_json: &metadata,
         })?;
         Ok(ProviderEvidence {
@@ -2320,10 +2328,14 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         })
     }
 
+    /// `summary` is the caller's already-redacted `result.summary`: the
+    /// redaction walks the model's whole answer, so the settle path computes it
+    /// once and hands the same bytes to every recorder.
     fn append_coerce_fact(
         &mut self,
         execution: CoerceExecution<'_>,
         result: &CoerceResult,
+        summary: &str,
     ) -> StoreResult<()> {
         let status = coerce_status(&result.status);
         let fact_name = match result.status {
@@ -2332,7 +2344,6 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             CoerceStatus::TimedOut => "schema.coerce.timed_out",
         };
         let succeeded = matches!(result.status, CoerceStatus::Succeeded);
-        let summary = redacted_provider_summary(&result.summary);
         // DR-0032: on failure, `value` is the EffectError base (what `after f fails
         // as e` binds); on success it is the coerced output. The prior `null` on
         // failure shadowed the error blob, so the bound value was unreadable.
@@ -2348,8 +2359,8 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             Some({
                 let mut base = effect_failure_base(
                     "schema.coerce",
-                    &summary,
-                    &summary,
+                    summary,
+                    summary,
                     execution.effect_id,
                     execution.run_id,
                 );
@@ -2635,10 +2646,13 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         }
     }
 
+    /// `safe_summary` is the caller's already-redacted `result.summary` (see
+    /// [`Self::append_agent_turn_event_and_fact`]).
     fn record_provider_result(
         &self,
         execution: AgentTurnExecution<'_>,
         result: &ProviderRunResult,
+        safe_summary: &str,
     ) -> StoreResult<ProviderEvidence> {
         let artifacts = result
             .artifacts
@@ -2685,7 +2699,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 execution.run_id,
                 "provider",
             ])),
-            summary: Some(&redacted_provider_summary(&result.summary)),
+            summary: Some(safe_summary),
             metadata_json: &metadata,
         })?;
         Ok(ProviderEvidence {
@@ -2733,14 +2747,17 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(())
     }
 
+    /// `safe_summary` is the caller's already-redacted `result.summary`: the
+    /// redaction walks the model's whole answer, so the settle path computes it
+    /// once and hands the same bytes to every recorder.
     fn append_agent_turn_event_and_fact(
         &mut self,
         execution: AgentTurnExecution<'_>,
         result: &ProviderRunResult,
+        summary: &str,
     ) -> StoreResult<()> {
         let status = provider_status(&result.status);
         let fact_name = format!("agent.turn.{status}");
-        let summary = redacted_provider_summary(&result.summary);
         let mut payload_value = json!({
             "id": execution.run_id,
             "effect_id": execution.effect_id,
@@ -2765,7 +2782,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 let mut base = effect_failure_base(
                     "agent.tell",
                     &reason,
-                    &summary,
+                    summary,
                     execution.effect_id,
                     execution.run_id,
                 );
@@ -3513,10 +3530,11 @@ fn stable_hash_hex(value: &str) -> String {
     // derivation, so an offline-collidable inner hash would undermine the
     // outer one.
     use sha2::Digest;
+    use std::fmt::Write;
     let digest = sha2::Sha256::digest(value.as_bytes());
     let mut hex = String::with_capacity(32);
     for byte in &digest[..16] {
-        hex.push_str(&format!("{byte:02x}"));
+        let _ = write!(hex, "{byte:02x}");
     }
     hex
 }
@@ -3626,32 +3644,42 @@ fn is_sensitive_key(key: &str) -> bool {
 }
 
 fn redact_log_text(value: &str) -> String {
-    let mut tokens = Vec::new();
+    // Assembled into one buffer rather than a `Vec<String>` joined at the end:
+    // this walks whole provider outputs, so the per-token allocation was the
+    // cost. `split_whitespace` collapses runs, so emitting one separator before
+    // every token after the first reproduces the former `join(" ")` byte for
+    // byte.
+    let mut redacted = String::with_capacity(value.len());
     let mut redact_next = false;
+    let mut first = true;
     for token in value.split_whitespace() {
+        if !first {
+            redacted.push(' ');
+        }
+        first = false;
         if redact_next {
-            tokens.push("[REDACTED]".to_owned());
+            redacted.push_str("[REDACTED]");
             redact_next = false;
             continue;
         }
         if token.eq_ignore_ascii_case("bearer") {
-            tokens.push(token.to_owned());
+            redacted.push_str(token);
             redact_next = true;
             continue;
         }
         if let Some((key, _)) = token.split_once('=') {
             if is_sensitive_key(key) {
-                tokens.push(format!("{key}=[REDACTED]"));
+                redacted.push_str(key);
+                redacted.push_str("=[REDACTED]");
                 continue;
             }
         }
         if looks_like_secret_token(token) || contains_secret_token_pattern(token) {
-            tokens.push("[REDACTED]".to_owned());
+            redacted.push_str("[REDACTED]");
         } else {
-            tokens.push(token.to_owned());
+            redacted.push_str(token);
         }
     }
-    let redacted = tokens.join(" ");
     const MAX_MESSAGE_CHARS: usize = 512;
     if redacted.chars().count() <= MAX_MESSAGE_CHARS {
         return redacted;
@@ -3975,7 +4003,7 @@ fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {
     }
 }
 
-fn provider_metadata(result: &ProviderRunResult) -> String {
+fn provider_metadata(result: &ProviderRunResult) -> Value {
     json!({
         "stdout": redacted_text_metadata(&result.stdout),
         "stderr": redacted_text_metadata(&result.stderr),
@@ -3983,7 +4011,6 @@ fn provider_metadata(result: &ProviderRunResult) -> String {
         "usage": json_from_str(&result.usage_json),
         "failure": result.failure.as_ref().map(provider_failure_json),
     })
-    .to_string()
 }
 
 fn provider_terminal_metadata(
@@ -3994,11 +4021,7 @@ fn provider_terminal_metadata(
 ) -> (String, String, String) {
     let provider_correlation_id = provider_terminal_correlation_id(instance_id, run_id);
     let metadata = add_provider_correlation_id(
-        merge_provider_run_metadata(
-            serde_json::from_str::<Value>(&provider_metadata(result))
-                .expect("provider metadata is generated from JSON values"),
-            run_metadata_json,
-        ),
+        merge_provider_run_metadata(provider_metadata(result), run_metadata_json),
         &provider_correlation_id,
     );
     let terminal_hash = terminal_payload_hash(
@@ -4015,15 +4038,15 @@ fn provider_terminal_metadata(
 }
 
 fn merge_provider_run_metadata(mut metadata: Value, run_metadata_json: &str) -> Value {
-    let run_metadata = json_from_str(run_metadata_json);
-    let (Value::Object(metadata), Value::Object(run_metadata)) = (&mut metadata, run_metadata)
-    else {
+    let Value::Object(run_metadata) = json_from_str(run_metadata_json) else {
         return metadata;
     };
-    for (key, value) in run_metadata {
-        metadata.entry(key).or_insert(value);
+    if let Value::Object(object) = &mut metadata {
+        for (key, value) in run_metadata {
+            object.entry(key).or_insert(value);
+        }
     }
-    Value::Object(metadata.clone())
+    metadata
 }
 
 fn provider_terminal_correlation_id(instance_id: &str, run_id: &str) -> String {

@@ -32,7 +32,6 @@
 use std::collections::BTreeMap;
 
 use crate::content::ContentBlobs;
-use crate::items::sha256_hex;
 use crate::{StoreError, StoreResult};
 
 /// Encoding tag. A future layout change is a different tag rather than a silent
@@ -56,9 +55,21 @@ const MAX_ENTRIES: usize = 64;
 /// Derived from the key alone — never from position or insertion order — which
 /// is exactly what makes the tree history-independent.
 fn is_boundary(key: &str) -> bool {
-    let digest = sha256_hex(&format!("{NODE_TAG}\u{1e}boundary\u{1e}{key}"));
+    use sha2::{Digest, Sha256};
+    // Hashed and read as BYTES, not through a hex string: this runs once per
+    // entry at every level of every build, and rendering 64 hex digits to parse
+    // four of them back cost an allocation per digit. The value is the same one
+    // the hex round-trip produced — `the_boundary_predicate_matches_the_hex_
+    // round_trip` holds it there, because boundaries decide every stored node's
+    // id and a drifted predicate would stop new builds deduplicating against
+    // trees already in the store.
+    let mut hasher = Sha256::new();
+    hasher.update(NODE_TAG.as_bytes());
+    hasher.update("\u{1e}boundary\u{1e}".as_bytes());
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
     // First 16 bits of the digest, as a value in [0, 65536).
-    let window = u64::from_str_radix(&digest[..4], 16).unwrap_or(0);
+    let window = (u64::from(digest[0]) << 8) | u64::from(digest[1]);
     window.is_multiple_of(65536 / TARGET_FANOUT)
 }
 
@@ -199,18 +210,36 @@ pub fn load<B: ContentBlobs + ?Sized>(
     blobs: &B,
     root: &str,
 ) -> StoreResult<BTreeMap<String, String>> {
+    load_from(blobs, load_node(blobs, root)?)
+}
+
+/// The same materialization from a root node already in hand.
+///
+/// For a caller that had to parse the root to recognize it as one — the
+/// migration shape test — so the root blob is fetched and parsed once rather
+/// than twice.
+///
+/// # Errors
+/// Propagates store failures; refuses a node that is absent or foreign.
+pub fn load_from<B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    root: Node,
+) -> StoreResult<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
-    let mut stack = vec![root.to_owned()];
-    while let Some(id) = stack.pop() {
-        let node = load_node(blobs, &id)?;
+    let mut stack: Vec<String> = Vec::new();
+    let mut node = root;
+    loop {
         if node.level == 0 {
             out.extend(node.entries);
         } else {
             // Order does not matter: the map sorts, and every leaf is reached.
             stack.extend(node.entries.into_iter().map(|(_, child)| child));
         }
+        let Some(id) = stack.pop() else {
+            return Ok(out);
+        };
+        node = load_node(blobs, &id)?;
     }
-    Ok(out)
 }
 
 /// Look up one path without materializing the manifest — O(log n) node reads.
@@ -375,6 +404,7 @@ fn subtree_ids<B: ContentBlobs + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::items::sha256_hex;
     use std::cell::RefCell;
 
     /// A blob store that also counts distinct bodies written, so a test can
@@ -481,6 +511,52 @@ mod tests {
             "a one-entry change in a 512-entry manifest should mint a spine's \
              worth of nodes, got {novel}. If this grew, the tree stopped \
              sharing unchanged subtrees and the DR-0070 §1 win is gone."
+        );
+    }
+
+    /// The differential that lets [`is_boundary`] read digest bytes instead of
+    /// hex digits: the byte read and the hex round-trip it replaced must agree
+    /// on EVERY key, because a boundary that moved would re-identify every node
+    /// built afterwards and silently end sharing with the trees already stored.
+    #[test]
+    fn the_boundary_predicate_matches_the_hex_round_trip() {
+        fn via_hex(key: &str) -> bool {
+            let digest = sha256_hex(&format!("{NODE_TAG}\u{1e}boundary\u{1e}{key}"));
+            let window = u64::from_str_radix(&digest[..4], 16).unwrap_or(0);
+            window.is_multiple_of(65536 / TARGET_FANOUT)
+        }
+
+        let mut keys: Vec<String> = vec![
+            String::new(),
+            "a".to_owned(),
+            "\u{1e}".to_owned(),
+            "boundary".to_owned(),
+            "src/file_0000.txt".to_owned(),
+            "docs/\u{65e5}\u{672c}\u{8a9e}.md".to_owned(),
+        ];
+        // A deterministic spread, so this is a real differential rather than a
+        // handful of lucky agreements.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..4000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            keys.push(format!("dir_{state:016x}/leaf_{}.txt", state % 997));
+        }
+
+        let mut boundaries = 0usize;
+        for key in &keys {
+            assert_eq!(
+                is_boundary(key),
+                via_hex(key),
+                "boundary predicate disagrees on `{key}`"
+            );
+            boundaries += usize::from(is_boundary(key));
+        }
+        assert!(
+            boundaries > 0 && boundaries < keys.len(),
+            "the case must exercise both outcomes, saw {boundaries} of {}",
+            keys.len()
         );
     }
 

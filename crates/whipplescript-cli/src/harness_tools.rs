@@ -12,6 +12,7 @@
 //! refinement. `bash` and the budget/lease envelope are later slices.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -367,6 +368,11 @@ pub struct FileToolExecutor {
     /// Raise items already delivered mid-turn (DR-0052 Decision 7) — a
     /// notice arrives once per turn, then stays in the transcript.
     delivered_raises: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Read-only tracker connection reused across `poll_notices`, which runs once
+    /// per model round: `WorkItemStore::open` re-runs the whole self-healing
+    /// migration batch, and re-paying it every round buys nothing. Mutating
+    /// tracker tools keep opening their own store through [`Self::tracker`].
+    notice_tracker: std::cell::RefCell<Option<WorkItemStore>>,
     /// Skill activation (context-assembly Phase 2, Decision 3): map of catalogue
     /// `location` → the registered content-addressed body. A `read` of a skill
     /// location resolves here (the registry) rather than the filesystem, so the
@@ -840,6 +846,7 @@ impl FileToolExecutor {
             changes_scope: None,
             feed_subscriber: None,
             delivered_raises: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            notice_tracker: std::cell::RefCell::new(None),
             skill_bodies: std::collections::HashMap::new(),
             content_store_path: None,
         }
@@ -1264,15 +1271,15 @@ impl FileToolExecutor {
     /// overflows and a content store is configured, capture the full bytes
     /// content-addressed and append a `recall` footer so the model can read the rest
     /// losslessly (Phase 5). Without a content store, this is just the truncation.
-    fn cap_and_capture(&self, tool: &str, full: &str) -> String {
+    fn cap_and_capture(&self, tool: &str, full: String) -> String {
         if full.len() <= self.max_bytes {
-            return full.to_string();
+            return full;
         }
-        let truncated = middle_truncate(full, self.max_bytes);
+        let truncated = middle_truncate(&full, self.max_bytes);
         let Some(path) = &self.content_store_path else {
             return truncated;
         };
-        match ContentStore::open(path).and_then(|store| store.put(full)) {
+        match ContentStore::open(path).and_then(|store| store.put(&full)) {
             // The footer format is owned by the kernel so the `ToolResultCompactor`
             // can parse the recall id back (context-assembly Phase 5).
             Ok(id) => format!(
@@ -1461,6 +1468,7 @@ impl FileToolExecutor {
             if crate::glob_match(pattern, rel) {
                 hits.push(rel.to_string());
             }
+            ControlFlow::Continue(())
         });
         hits.sort();
         hits.truncate(limit);
@@ -1490,11 +1498,28 @@ impl FileToolExecutor {
         let mut walked = 0usize;
         walk(&root, &root.join(base), &mut walked, &mut |rel| {
             if matches_found >= limit {
-                return;
+                // Nothing further can be emitted, so stop the walk rather than
+                // stat the rest of the tree for results that are discarded.
+                return ControlFlow::Break(());
             }
             let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
-                return;
+                return ControlFlow::Continue(());
             };
+            if context == 0 {
+                // No window to merge, so matches stream straight out: no
+                // per-file line vector, match vector, or ordered set.
+                for (index, line) in content.lines().enumerate() {
+                    if matches_found >= limit {
+                        break;
+                    }
+                    if !matcher.is_match(line) {
+                        continue;
+                    }
+                    matches_found += 1;
+                    hits.push(format!("{rel}:{}:{}", index + 1, cap_grep_line(line)));
+                }
+                return ControlFlow::Continue(());
+            }
             let lines: Vec<&str> = content.lines().collect();
             // Match pass first so a context line that is itself a match keeps
             // the match (`:`) format even past the match limit.
@@ -1522,6 +1547,7 @@ impl FileToolExecutor {
                     hits.push(format!("{rel}-{}-{line}", index + 1));
                 }
             }
+            ControlFlow::Continue(())
         });
         if hits.is_empty() {
             Ok("No matches".to_string())
@@ -2114,7 +2140,26 @@ impl FileToolExecutor {
         let Some(scope) = self.changes_scope.as_ref() else {
             return Vec::new();
         };
-        let Ok((store, queue)) = self.tracker() else {
+        let Some(queue) = self.tracker_queue.clone() else {
+            return Vec::new();
+        };
+        // Read-only, so it reuses the cached connection rather than paying
+        // `tracker()`'s migration batch again every round. The connection stays
+        // in autocommit between polls, so each `list_items` opens a fresh read
+        // transaction and a raise another process commits mid-turn is still
+        // seen by the next round.
+        let mut cached = self.notice_tracker.borrow_mut();
+        if cached.is_none() {
+            let Ok(store) = WorkItemStore::open(
+                self.tracker_store
+                    .clone()
+                    .unwrap_or_else(crate::items_store_path),
+            ) else {
+                return Vec::new();
+            };
+            *cached = Some(store);
+        }
+        let Some(store) = cached.as_ref() else {
             return Vec::new();
         };
         let Ok(items) = store.list_items(Some(&queue), Some("open")) else {
@@ -2423,7 +2468,7 @@ impl ToolExecutor for FileToolExecutor {
             // `recall` them — truncation is lossless, not lossy.
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
-                content: self.cap_and_capture(&call.name, &content),
+                content: self.cap_and_capture(&call.name, content),
             },
             // Errors are operational (small); cap without capture.
             Err(reason) => ToolOutcome {
@@ -2645,43 +2690,63 @@ fn middle_truncate(text: &str, max_bytes: usize) -> String {
 }
 
 /// Recursively walk `dir` (under `root`), invoking `visit` with each file's
-/// root-relative slash path. Bounded by [`MAX_FILES_WALKED`].
-fn walk(root: &Path, dir: &Path, walked: &mut usize, visit: &mut dyn FnMut(&str)) {
-    let canonical_root = match root.canonicalize() {
-        Ok(path) => path,
-        Err(_) => return,
+/// root-relative slash path. Bounded by [`MAX_FILES_WALKED`]; a `visit` that
+/// returns [`ControlFlow::Break`] ends the traversal there.
+fn walk(
+    root: &Path,
+    dir: &Path,
+    walked: &mut usize,
+    visit: &mut dyn FnMut(&str) -> ControlFlow<()>,
+) {
+    // `root` is invariant across the recursion, so it resolves once for the whole
+    // traversal and every containment check below is made against that one root.
+    let Ok(canonical_root) = root.canonicalize() else {
+        return;
     };
+    let _ = walk_under(root, &canonical_root, dir, walked, visit);
+}
+
+fn walk_under(
+    root: &Path,
+    canonical_root: &Path,
+    dir: &Path,
+    walked: &mut usize,
+    visit: &mut dyn FnMut(&str) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     let Ok(canonical_dir) = dir.canonicalize() else {
-        return;
+        return ControlFlow::Continue(());
     };
-    if !canonical_dir.starts_with(&canonical_root) {
-        return;
+    if !canonical_dir.starts_with(canonical_root) {
+        return ControlFlow::Continue(());
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return ControlFlow::Continue(());
     };
     let mut children: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     children.sort();
     for path in children {
         if *walked >= MAX_FILES_WALKED {
-            return;
+            return ControlFlow::Break(());
         }
         let Ok(canonical_path) = path.canonicalize() else {
             continue;
         };
-        if !canonical_path.starts_with(&canonical_root) {
+        if !canonical_path.starts_with(canonical_root) {
             continue;
         }
-        if path.is_dir() {
-            walk(root, &path, walked, visit);
+        // Asked of the already-resolved path: same answer as `path.is_dir()`
+        // (both follow links), without re-walking the link chain.
+        if canonical_path.is_dir() {
+            walk_under(root, canonical_root, &path, walked, visit)?;
         } else {
             *walked += 1;
             if let Ok(rel) = path.strip_prefix(root) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                visit(&rel);
+                visit(&rel)?;
             }
         }
     }
+    ControlFlow::Continue(())
 }
 
 /// Persona bundle for the owned harness. Mirrors pi's persona shape, adapted to

@@ -9,6 +9,8 @@
 //! result cache is workspace-wide, and a native-recorded result should serve
 //! a DO request for the same content key once the stores converge.
 
+use std::fmt::Write;
+
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -31,7 +33,11 @@ pub const SCRIPT_ARGV_PLACEHOLDER: &str = "{script}";
 /// sha256 as lowercase hex — the script-pin digest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Delta-kernel content key for a hermetic exec (compute plane P8-1):
@@ -525,6 +531,21 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_matches_the_known_vector() {
+        // This digest feeds persisted script pins, exec content keys, and
+        // package identity, so the rendering is pinned against a fixed vector
+        // rather than against whatever the helper currently emits.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn content_key_is_stable_and_component_sensitive() {

@@ -601,7 +601,7 @@ impl HttpConn {
         if let Some(session) = &self.session {
             builder = builder.set("mcp-session-id", session);
         }
-        let response = match builder.send_json(message.clone()) {
+        let response = match builder.send_json(message) {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
                 let body = response.into_string().unwrap_or_default();

@@ -100,9 +100,7 @@ pub fn resolve_due_time_effects<S: RuntimeStore>(
         // a cancellation request; never-run effects expire directly.
         let running_run = kernel
             .store()
-            .list_runs(instance_id)?
-            .into_iter()
-            .find(|run| run.effect_id == effect.effect_id && run.status == "running");
+            .running_run_for_effect(instance_id, &effect.effect_id)?;
         let expired_run_id = running_run.as_ref().map(|run| run.run_id.clone());
         let terminal_event_id = match running_run {
             Some(run) => {

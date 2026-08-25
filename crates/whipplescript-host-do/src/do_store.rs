@@ -205,6 +205,25 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         do_chain_head(&self.sql, instance_id)
     }
 
+    /// The last event's sequence, or `None` for an instance with no events —
+    /// `list_events` narrowed to the one column its position readers want.
+    ///
+    /// Deliberately not [`DoSqliteStore::chain_head`], which answers the same
+    /// number: that one backfills and then *refuses* a log it cannot chain, and
+    /// a position read has no reason to refuse one. This asks only where the
+    /// log ends.
+    pub fn latest_event_sequence(&self, instance_id: &str) -> StoreResult<Option<i64>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT sequence FROM events WHERE instance_id = ?1 \
+                 ORDER BY sequence DESC LIMIT 1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_i64(&row[0])))
+    }
+
     /// The stored prefix as owned rows, for folding independently of the
     /// recorded head. Native parity: `SqliteStore`'s `LogAppend::chain_prefix`.
     pub fn chain_prefix(
@@ -4307,14 +4326,15 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .iter()
             .map(|r| (as_text(&r[0]), as_text(&r[1])))
             .collect();
-        for (artifact_id, _) in &artifact_run_links {
-            self.sql
-                .execute(
-                    "UPDATE artifacts SET run_id = NULL WHERE artifact_id = ?1",
-                    &[text(artifact_id)],
-                )
-                .map_err(sql_err)?;
-        }
+        // Exactly the rows the query above described, so detach them set-wise
+        // rather than one statement per artifact.
+        self.sql
+            .execute(
+                "UPDATE artifacts SET run_id = NULL \
+                 WHERE run_id IN (SELECT run_id FROM runs WHERE instance_id = ?1)",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
         for table in [
             "effect_cancellation_requests",
             "leases",
@@ -4449,19 +4469,15 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         }
 
         for (artifact_id, run_id) in artifact_run_links {
-            let run_exists = !self
-                .sql
-                .query("SELECT 1 FROM runs WHERE run_id = ?1", &[text(&run_id)])
-                .map_err(sql_err)?
-                .is_empty();
-            if run_exists {
-                self.sql
-                    .execute(
-                        "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2",
-                        &[text(&run_id), text(&artifact_id)],
-                    )
-                    .map_err(sql_err)?;
-            }
+            // The EXISTS clause carries the same "only if replay recreated the
+            // run" condition the separate probe enforced, in one round-trip.
+            self.sql
+                .execute(
+                    "UPDATE artifacts SET run_id = ?1 WHERE artifact_id = ?2 \
+                     AND EXISTS (SELECT 1 FROM runs WHERE run_id = ?1)",
+                    &[text(&run_id), text(&artifact_id)],
+                )
+                .map_err(sql_err)?;
         }
         Ok(())
     }
@@ -4495,6 +4511,30 @@ impl<Sql: DoSql> whipplescript_store::log_append::LogAppend for DoSqliteStore<Sq
     fn chain_prefix(&self, instance_id: &str) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
         Self::chain_prefix(self, instance_id)
     }
+}
+
+/// The package-registration upsert alone, without the manifest
+/// well-formedness parse. `register_package` keeps that parse for every caller
+/// that arrives with unvalidated bytes; `register_package_manifest` has already
+/// parsed the identical `&str` and comes here directly.
+fn do_insert_package_row<Sql: DoSql>(
+    sql: &Sql,
+    package: PackageRegistration<'_>,
+) -> StoreResult<()> {
+    sql.execute(
+        "INSERT INTO package_registrations (package_id, name, version, manifest_json) \
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(package_id) DO UPDATE SET \
+         name = excluded.name, version = excluded.version, \
+         manifest_json = excluded.manifest_json",
+        &[
+            text(package.package_id),
+            text(package.name),
+            text(package.version),
+            text(package.manifest_json),
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
 }
 
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
@@ -5619,18 +5659,25 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 required_capabilities_json: as_text(&row[5]),
                 declared_profiles_json: as_text(&row[6]),
             };
-            if let Some(block) = do_policy_block(&self.sql, instance_id, &effect.effect_id)? {
-                // Persist the block where it is observed (parity with native
-                // `persist_policy_block_on`): a silent skip left the effect
-                // reading `queued` with no reason forever.
-                do_persist_policy_block(&self.sql, instance_id, &effect.effect_id, &block)?;
-                continue;
-            }
+            // Both probes re-join effects/instances/program_versions to derive
+            // a column this row already carries, and both then decline on it:
+            // `do_policy_block` yields `None` for any status outside the
+            // queued/blocked set, `do_capacity_block` for any kind but
+            // `agent.tell`. Decide from the row in hand and skip the join.
             let already_running = as_text(&row[8]) == "running";
-            if !already_running
-                && do_capacity_block(&self.sql, instance_id, &effect.effect_id)?.is_some()
-            {
-                continue;
+            if !already_running {
+                if let Some(block) = do_policy_block(&self.sql, instance_id, &effect.effect_id)? {
+                    // Persist the block where it is observed (parity with native
+                    // `persist_policy_block_on`): a silent skip left the effect
+                    // reading `queued` with no reason forever.
+                    do_persist_policy_block(&self.sql, instance_id, &effect.effect_id, &block)?;
+                    continue;
+                }
+                if effect.kind == "agent.tell"
+                    && do_capacity_block(&self.sql, instance_id, &effect.effect_id)?.is_some()
+                {
+                    continue;
+                }
             }
             claimable.push(effect);
         }
@@ -5650,21 +5697,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
 
     fn register_package(&self, package: PackageRegistration<'_>) -> StoreResult<()> {
         serde_json::from_str::<Value>(package.manifest_json)?;
-        self.sql
-            .execute(
-                "INSERT INTO package_registrations (package_id, name, version, manifest_json) \
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(package_id) DO UPDATE SET \
-                 name = excluded.name, version = excluded.version, \
-                 manifest_json = excluded.manifest_json",
-                &[
-                    text(package.package_id),
-                    text(package.name),
-                    text(package.version),
-                    text(package.manifest_json),
-                ],
-            )
-            .map_err(sql_err)?;
-        Ok(())
+        do_insert_package_row(&self.sql, package)
     }
 
     fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
@@ -5673,12 +5706,17 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let name = required_manifest_string(&manifest, &["name"])?;
         let version = required_manifest_string(&manifest, &["version"])?;
 
-        self.register_package(PackageRegistration {
-            package_id: &package_id,
-            name: &name,
-            version: &version,
-            manifest_json,
-        })?;
+        // The manifest is already parsed above, so go straight to the upsert
+        // rather than re-parsing the same bytes inside `register_package`.
+        do_insert_package_row(
+            &self.sql,
+            PackageRegistration {
+                package_id: &package_id,
+                name: &name,
+                version: &version,
+                manifest_json,
+            },
+        )?;
 
         for capability in manifest
             .get("capabilities")
@@ -6945,6 +6983,30 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         Ok(rows.iter().map(|r| run_view_from_row(r)).collect())
     }
 
+    /// Parity with the native `running_run_for_effect`: `list_runs` narrowed
+    /// to one effect's running run, `ORDER BY` kept so `LIMIT 1` picks the row
+    /// a scan of `list_runs` would have found first.
+    fn running_run_for_effect(
+        &self,
+        instance_id: &str,
+        effect_id: &str,
+    ) -> StoreResult<Option<RunView>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT run_id, effect_id, provider, worker_id, status, started_at, \
+                 completed_at, metadata_json, \
+                 EXISTS (SELECT 1 FROM effect_cancellation_requests AS request \
+                 WHERE request.instance_id = runs.instance_id \
+                 AND request.effect_id = runs.effect_id AND request.status = 'requested') \
+                 FROM runs WHERE runs.instance_id = ?1 AND runs.effect_id = ?2 \
+                 AND runs.status = 'running' ORDER BY started_at, run_id LIMIT 1",
+                &[text(instance_id), text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|r| run_view_from_row(r)))
+    }
+
     fn status(&self, instance_id: &str) -> StoreResult<Option<StatusView>> {
         let Some(instance) = self.get_instance(instance_id)? else {
             return Ok(None);
@@ -6979,10 +7041,21 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         let failure_count = count_where("effects", Some("status IN ('failed', 'timed_out')"))?;
         let cancellation_request_count =
             count_where("effect_cancellation_requests", Some("status = 'requested'"))?;
-        let mut recent_events = self.list_events(instance_id)?;
-        if recent_events.len() > 5 {
-            recent_events = recent_events.split_off(recent_events.len() - 5);
-        }
+        // Only the tail is kept, so read only the tail (parity with native):
+        // the full log carries a payload string per recorded step, and the
+        // drive loop's callers discard all but the last five rows.
+        let mut recent_events = self
+            .sql
+            .query(
+                "SELECT event_id, sequence, event_type, payload_json, source, occurred_at \
+                 FROM events WHERE instance_id = ?1 ORDER BY sequence DESC LIMIT 5",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?
+            .iter()
+            .map(|r| event_view_from_row(r))
+            .collect::<Vec<_>>();
+        recent_events.reverse();
         let revisions = self.list_instance_revisions(instance_id)?;
         let parent_invocation = self.get_parent_workflow_invocation(instance_id)?;
         let child_invocations = self.list_child_workflow_invocations(instance_id)?;
@@ -8038,6 +8111,21 @@ fn do_live_event_ids<S: DoSql>(
     sql: &S,
     instance_id: &str,
 ) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    // An instance that was never restored has no marker, and for it the fold
+    // below reads and discards a payload string per recorded event. Probe for
+    // the marker first so the un-restored path — the common one, on a caller
+    // that runs every worker pass — never materializes the log.
+    let restored = !sql
+        .query(
+            "SELECT 1 FROM events WHERE instance_id = ?1 AND event_type = 'context.restored' \
+             LIMIT 1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?
+        .is_empty();
+    if !restored {
+        return Ok(None);
+    }
     let rows = sql
         .query(
             "SELECT event_id, sequence, event_type, payload_json FROM events \
@@ -8876,12 +8964,17 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 .collect();
             let mut by_key: std::collections::HashMap<&str, Vec<&str>> =
                 std::collections::HashMap::new();
+            let mut key_of: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::new();
             for (cid, key) in &keyed {
                 by_key.entry(key).or_default().push(cid);
+                // `or_insert`, not `insert`: the linear scan this replaces took
+                // the FIRST creation event carrying a content id.
+                key_of.entry(cid).or_insert(key);
             }
             for (content_id, alias) in &new_alias {
-                if let Some((_, key)) = keyed.iter().find(|(c, _)| c == content_id) {
-                    if by_key[key.as_str()].iter().any(|c| *c != content_id) {
+                if let Some(key) = key_of.get(content_id.as_str()) {
+                    if by_key[*key].iter().any(|c| *c != content_id) {
                         report.duplicate_submissions.push(alias.clone());
                     }
                 }
@@ -10422,6 +10515,40 @@ mod tests {
 
         assert_eq!(head.sequence, Some(2));
         assert_eq!(head, event_chain::fold_prefix("i1", &entries));
+    }
+
+    /// The bounded head read answers exactly what folding the whole log and
+    /// taking its last row answers — including the absent case, which must read
+    /// as no events rather than as a missing row error.
+    #[test]
+    fn latest_event_sequence_matches_the_last_listed_event() {
+        let store = store();
+        assert_eq!(
+            store.latest_event_sequence("i1").expect("empty log reads"),
+            None
+        );
+
+        store
+            .append_event(chain_event("i1"))
+            .expect("first appends");
+        store
+            .append_event(chain_event("i1"))
+            .expect("second appends");
+        // A second instance's log must not be mistaken for this one's.
+        store
+            .append_event(chain_event("i2"))
+            .expect("other appends");
+
+        let listed = store
+            .list_events("i1")
+            .expect("events list")
+            .last()
+            .map(|event| event.sequence);
+        assert_eq!(
+            store.latest_event_sequence("i1").expect("head reads"),
+            listed
+        );
+        assert_eq!(listed, Some(2));
     }
 
     #[test]
@@ -13463,6 +13590,74 @@ mod tests {
         let runs = store.list_runs("i1").expect("runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "completed");
+    }
+
+    /// The narrowed run lookup answers with the row `list_runs` + a linear
+    /// scan would have found: the effect's running run, never a sibling
+    /// effect's and never a terminal one, and `None` when there is none.
+    #[test]
+    fn do_store_running_run_for_effect_matches_the_linear_scan() {
+        let store = store();
+        let seed = |run_id: &str, effect_id: &str, status: &str, started_at: &str| {
+            store
+                .sql
+                .execute(
+                    "INSERT INTO runs (run_id, instance_id, effect_id, provider, worker_id, \
+                     status, started_at, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    &[
+                        text(run_id),
+                        text("i1"),
+                        text(effect_id),
+                        text("builtin"),
+                        text("w1"),
+                        text(status),
+                        text(started_at),
+                        text("{}"),
+                    ],
+                )
+                .expect("seed run");
+        };
+        seed("run_a1", "eff_a", "failed", "2026-01-01T00:00:00Z");
+        seed("run_a2", "eff_a", "running", "2026-01-01T00:00:01Z");
+        seed("run_b1", "eff_b", "running", "2026-01-01T00:00:02Z");
+        seed("run_c1", "eff_c", "completed", "2026-01-01T00:00:03Z");
+        store
+            .sql
+            .execute(
+                "INSERT INTO effect_cancellation_requests (request_id, instance_id, effect_id, \
+                 requested_by, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    text("req_1"),
+                    text("i1"),
+                    text("eff_b"),
+                    text("deadline"),
+                    text("requested"),
+                ],
+            )
+            .expect("seed cancellation request");
+
+        let scan = |effect_id: &str| {
+            store
+                .list_runs("i1")
+                .expect("runs")
+                .into_iter()
+                .find(|run| run.effect_id == effect_id && run.status == "running")
+        };
+        for effect_id in ["eff_a", "eff_b", "eff_c", "eff_missing"] {
+            let narrowed = store
+                .running_run_for_effect("i1", effect_id)
+                .expect("running run");
+            let scanned = scan(effect_id);
+            assert_eq!(
+                narrowed.as_ref().map(|run| &run.run_id),
+                scanned.as_ref().map(|run| &run.run_id),
+                "narrowed lookup disagrees with the scan for {effect_id}"
+            );
+            assert_eq!(
+                narrowed.map(|run| run.cancel_requested),
+                scanned.map(|run| run.cancel_requested),
+            );
+        }
     }
 
     /// RC-2 Delta A (DO mirror): rebuild_projections_to reflects instance state

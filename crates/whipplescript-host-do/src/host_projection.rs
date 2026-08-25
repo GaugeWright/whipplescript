@@ -17,6 +17,8 @@ use whipplescript_kernel::host_protocol::{
 use whipplescript_kernel::idempotency_key;
 use whipplescript_store::{EventView, EvidenceRecord, NewEvent, RuntimeStore, StoreError};
 
+use crate::do_store::{DoSql, DoSqliteStore};
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HostedOutputFieldFlow {
     pub field: String,
@@ -66,14 +68,19 @@ pub struct HostedToolCallObservation {
     pub ok: Option<bool>,
 }
 
-pub fn current_position<S: RuntimeStore>(
-    store: &S,
+/// The instance's current durable coordinate.
+///
+/// Bound to the DO store rather than to `RuntimeStore` because the bounded head
+/// read it needs is not a `RuntimeStore` method. The generic form folded the
+/// whole log — every row, payload included — to read one integer off its last
+/// element, and this runs on metered edge CPU against a log that only grows.
+pub fn current_position<Sql: DoSql>(
+    store: &DoSqliteStore<Sql>,
     instance_id: &str,
 ) -> Result<EventPosition, StoreError> {
-    let sequence = store
-        .list_events(instance_id)?
-        .last()
-        .map_or(0, |event| event.sequence);
+    // An instance with no events sits at 0, which is what the downstream
+    // `sequence > 0` refusals read as "no position yet".
+    let sequence = store.latest_event_sequence(instance_id)?.unwrap_or(0);
     Ok(EventPosition {
         instance_ref: instance_id.to_owned(),
         sequence: u64::try_from(sequence).map_err(|_| {
@@ -102,21 +109,25 @@ pub fn project_host_turn<S: RuntimeStore>(
 
     let label_ref = format!("whip:label:{}", command.policy.envelope_hash);
     let mut events = store.list_events(instance_id).map_err(store_error)?;
-    let first_turn_event = events
+    // `event_mentions_command` builds a whole `Value` tree per payload, and the
+    // two passes below ask it the same question of the same events. Decide it
+    // once so each payload is deserialized once.
+    let mentions: Vec<bool> = events
         .iter()
-        .find(|event| event_mentions_command(&event.payload_json, command_id))
-        .map_or_else(
-            || events.last().map_or(0, |event| event.sequence),
-            |event| event.sequence,
-        );
+        .map(|event| event_mentions_command(&event.payload_json, command_id))
+        .collect();
+    let first_turn_event = mentions.iter().position(|mentions| *mentions).map_or_else(
+        || events.last().map_or(0, |event| event.sequence),
+        |index| events[index].sequence,
+    );
     let mut pointers = events
         .iter()
-        .filter(|event| {
+        .zip(&mentions)
+        .filter(|(event, mentions)| {
             event.sequence >= first_turn_event
-                && (event_mentions_command(&event.payload_json, command_id)
-                    || event.event_type == "host.turn.receipt")
+                && (**mentions || event.event_type == "host.turn.receipt")
         })
-        .map(|event| {
+        .map(|(event, _)| {
             Ok(RuntimeEvidencePointer::Event(LabeledRuntimeEvent {
                 protocol: HOST_PROTOCOL.to_owned(),
                 command_id: command_id.to_owned(),

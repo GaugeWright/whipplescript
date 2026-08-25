@@ -19397,21 +19397,30 @@ fn drive_pass_idle(step_report: &StepReport, worker_report: &WorkerReport) -> bo
 }
 
 fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerReport, StoreError> {
-    guard_no_stale_effect_kinds(store_path)?;
+    // One connection for the whole pass: every `SqliteStore::open` re-runs the
+    // WAL setup, the migration sweep and the permission hardening, so the pass
+    // opens once and lends `&store` to the guard and the passes below. The
+    // stale-kind guard still runs first, before anything else touches the store.
+    let store = SqliteStore::open(store_path)?;
+    guard_no_stale_effect_kinds(&store, store_path)?;
     let mut report = WorkerReport {
         instance_id: options.instance_id.clone(),
         provider: options.provider.clone(),
         ..WorkerReport::default()
     };
     let cancellation_report =
-        process_running_cancellations(store_path, &options.instance_id, &options.provider)?;
+        process_running_cancellations(&store, store_path, &options.instance_id, &options.provider)?;
     report.cancellation_acknowledgements = cancellation_report.acknowledgements;
     report.cancellation_diagnostics = cancellation_report.diagnostics;
+    // The time pass runs through the kernel, which owns its store, so the handle
+    // is lent to a kernel for the call and taken back afterwards.
+    let mut kernel = RuntimeKernel::new(store);
     let time_report = resolve_due_time_effects(
-        store_path,
+        &mut kernel,
         &options.instance_id,
         options.virtual_now.as_deref().unwrap_or("now"),
     )?;
+    let store = kernel.into_store();
     report.timers_fired = time_report.timers_fired;
     report.deadlines_expired = time_report.deadlines_expired;
     report.terminal_events.extend(time_report.terminal_events);
@@ -19484,7 +19493,6 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
     if program_imports_std_script {
         let raw_exec_authority = !options.exec_profile.is_hosted() && exec_allowlist_present();
         if script_manifest.is_some() || raw_exec_authority {
-            let store = SqliteStore::open(store_path)?;
             let instance = store
                 .get_instance(&options.instance_id)?
                 .ok_or_else(|| StoreError::Conflict("instance not found".to_owned()))?;
@@ -19496,32 +19504,15 @@ fn run_worker_once(store_path: &Path, options: &WorkerOptions) -> Result<WorkerR
             }
         }
     }
-    {
-        let store = SqliteStore::open(store_path)?;
-        register_locked_packages(&store, package_lock.as_ref())?;
-    }
-    let store = SqliteStore::open(store_path)?;
+    register_locked_packages(&store, package_lock.as_ref())?;
     let mut claimable = store.claimable_effects(&options.instance_id)?;
     let mut seen_claimable = claimable
         .iter()
         .map(|effect| effect.effect_id.clone())
         .collect::<BTreeSet<_>>();
-    for effect in store.list_effects(&options.instance_id)? {
-        if effect.kind == "exec.command"
-            && effect.status == "queued"
-            && effect.policy_block_reason.is_none()
-            && !effect.cancel_requested
-            && seen_claimable.insert(effect.effect_id.clone())
-        {
-            claimable.push(ClaimableEffect {
-                effect_id: effect.effect_id,
-                kind: effect.kind,
-                target: effect.target,
-                profile: effect.profile,
-                input_json: effect.input_json,
-                required_capabilities_json: effect.required_capabilities_json,
-                declared_profiles_json: effect.declared_profiles_json,
-            });
+    for effect in store.queued_exec_command_effects(&options.instance_id)? {
+        if seen_claimable.insert(effect.effect_id.clone()) {
+            claimable.push(effect);
         }
     }
     // The ready set is mutually independent (a dependent effect is not claimable
@@ -19572,8 +19563,7 @@ fn is_retired_effect_kind(kind: &str) -> bool {
 
 /// Fail loudly if the store holds a pending effect whose kind was retired by a
 /// rename (see [`RETIRED_EFFECT_KINDS`]). Cheap: one indexed DISTINCT query.
-fn guard_no_stale_effect_kinds(store_path: &Path) -> Result<(), StoreError> {
-    let store = SqliteStore::open(store_path)?;
+fn guard_no_stale_effect_kinds(store: &SqliteStore, store_path: &Path) -> Result<(), StoreError> {
     let stale: Vec<String> = store
         .pending_effect_kinds()?
         .into_iter()
@@ -20314,15 +20304,13 @@ fn resolve_due_inbound_messages(
 /// expires effects whose `timeout` deadline passed. Wall-clock reads live
 /// here, on worker passes — never in rule evaluation.
 fn resolve_due_time_effects(
-    store_path: &Path,
+    kernel: &mut RuntimeKernel,
     instance_id: &str,
     now: &str,
 ) -> Result<TimePassReport, StoreError> {
     // Lifted into the kernel (DR-0033 Phase 6) so the DO host runs the same
     // pass over its threaded store; the CLI opens the store once and delegates.
-    let store = SqliteStore::open(store_path)?;
-    let mut kernel = RuntimeKernel::new(store);
-    whipplescript_kernel::time_pass::resolve_due_time_effects(&mut kernel, instance_id, now)
+    whipplescript_kernel::time_pass::resolve_due_time_effects(kernel, instance_id, now)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20353,11 +20341,11 @@ impl CancellationAcknowledgementOrder {
 }
 
 fn process_running_cancellations(
+    store: &SqliteStore,
     store_path: &Path,
     instance_id: &str,
     provider: &str,
 ) -> Result<RunningCancellationReport, StoreError> {
-    let store = SqliteStore::open(store_path)?;
     let requests = store.list_effect_cancellation_requests(instance_id)?;
     let open_requests = requests
         .iter()
@@ -20392,8 +20380,10 @@ fn process_running_cancellations(
                 "run_id": run.run_id,
             })
             .to_string();
-            let store = SqliteStore::open(store_path)?;
-            let mut kernel = RuntimeKernel::new(store);
+            // The kernel owns its store, so this branch takes its own
+            // connection rather than the borrowed pass handle. Only reached
+            // when an acknowledgeable cancellation is actually pending.
+            let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
             kernel.cancel_run(EffectCompletion {
                 instance_id,
                 effect_id: &run.effect_id,
@@ -25887,9 +25877,20 @@ fn run(options: &CliOptions) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut dev_stream_cursors = DevStreamCursors::default();
+    // One connection for every delta pass: the pass runs twice an iteration and
+    // `SqliteStore::open` re-runs the WAL setup and the migration sweep each
+    // time. Opened only when streaming, so the default path still opens nothing.
+    let dev_stream_store = if stream.enabled() {
+        match SqliteStore::open(&options.store_path) {
+            Ok(store) => Some(store),
+            Err(error) => return report_store_error("failed to open store", error),
+        }
+    } else {
+        None
+    };
     if let Err(code) = stream_dev_event_deltas(
         &mut stream,
-        &options.store_path,
+        dev_stream_store.as_ref(),
         &started.instance_id,
         &mut dev_stream_cursors,
     ) {
@@ -25919,7 +25920,7 @@ fn run(options: &CliOptions) -> ExitCode {
         }
         if let Err(code) = stream_dev_event_deltas(
             &mut stream,
-            &options.store_path,
+            dev_stream_store.as_ref(),
             &started.instance_id,
             &mut dev_stream_cursors,
         ) {
@@ -25957,7 +25958,7 @@ fn run(options: &CliOptions) -> ExitCode {
         }
         if let Err(code) = stream_dev_event_deltas(
             &mut stream,
-            &options.store_path,
+            dev_stream_store.as_ref(),
             &started.instance_id,
             &mut dev_stream_cursors,
         ) {
@@ -26088,7 +26089,7 @@ fn run(options: &CliOptions) -> ExitCode {
     }
     if let Err(code) = stream_dev_event_deltas(
         &mut stream,
-        &options.store_path,
+        dev_stream_store.as_ref(),
         &started.instance_id,
         &mut dev_stream_cursors,
     ) {
@@ -26302,16 +26303,17 @@ struct DevStreamCursors {
 
 fn stream_dev_event_deltas(
     stream: &mut DevStream,
-    store_path: &Path,
+    store: Option<&SqliteStore>,
     instance_id: &str,
     cursors: &mut DevStreamCursors,
 ) -> Result<(), ExitCode> {
     if !stream.enabled() {
         return Ok(());
     }
-    let store = match SqliteStore::open(store_path) {
-        Ok(store) => store,
-        Err(error) => return Err(report_store_error("failed to open store", error)),
+    // Present exactly when the stream is enabled — the caller opens it beside
+    // `DevStream::new`, so the delta pass no longer reopens the store per call.
+    let Some(store) = store else {
+        return Ok(());
     };
     // Evidence deltas (`dev.evidence`): tool dispatch/settle, context bundles,
     // turn observations — the shape-only rows an external UI renders as turn
@@ -26354,29 +26356,29 @@ fn stream_dev_event_deltas(
         Ok(events) => events,
         Err(error) => return Err(report_store_error("failed to stream dev events", error)),
     };
-    let new_events = events
+    // One pass over the new rows for both the delta payload and the high-water
+    // mark: this runs twice an iteration over a log that only grows.
+    let mut latest_sequence = cursors.after_sequence;
+    let mut new_events = Vec::new();
+    for event in events
         .iter()
         .filter(|event| event.sequence > cursors.after_sequence)
-        .collect::<Vec<_>>();
+    {
+        latest_sequence = latest_sequence.max(event.sequence);
+        new_events.push(event_to_json(event));
+    }
     if new_events.is_empty() {
         return Ok(());
     }
-    let latest_sequence = new_events
-        .iter()
-        .map(|event| event.sequence)
-        .max()
-        .unwrap_or(cursors.after_sequence);
+    let new_event_count = new_events.len();
     if stream
         .emit(
             "dev.events",
             json!({
                 "instance_id": instance_id,
                 "after_sequence": cursors.after_sequence,
-                "count": new_events.len(),
-                "events": new_events
-                    .iter()
-                    .map(|event| event_to_json(event))
-                    .collect::<Vec<_>>(),
+                "count": new_event_count,
+                "events": new_events,
             }),
         )
         .is_err()

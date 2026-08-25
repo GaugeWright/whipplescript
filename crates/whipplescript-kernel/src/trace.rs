@@ -124,7 +124,10 @@ struct TraceState {
     stale_runs: BTreeSet<String>,
     terminal_effects: BTreeSet<String>,
     cancel_requested_effects: BTreeSet<String>,
-    dependencies: Vec<DependencyEdge>,
+    /// Dependency edges keyed by DOWNSTREAM effect id: every reader wants the
+    /// edges of one downstream, and a flat list makes that a scan of the whole
+    /// instance's edges on each claim and each block.
+    dependencies: BTreeMap<String, Vec<DependencyEdge>>,
     revision_epoch: i64,
     cancelled: bool,
     paused: bool,
@@ -176,7 +179,11 @@ fn check_record(state: &mut TraceState, record: &TraceRecord) -> Result<(), Trac
                     ),
                 );
             }
-            state.dependencies.push(edge.clone());
+            state
+                .dependencies
+                .entry(edge.downstream_effect_id.clone())
+                .or_default()
+                .push(edge.clone());
         }
         TraceEvent::EffectClaimed { effect_id } => {
             if state.cancelled {
@@ -531,10 +538,13 @@ fn first_unsatisfied_dependency<'a>(
     state: &'a TraceState,
     effect_id: &str,
 ) -> Option<&'a DependencyEdge> {
+    // Insertion order within a downstream is preserved by the per-key vector,
+    // so this reports the same edge the flat scan did; a downstream with no
+    // edges recorded is the empty case.
     state
         .dependencies
+        .get(effect_id)?
         .iter()
-        .filter(|edge| edge.downstream_effect_id == effect_id)
         .find(|edge| !dependency_satisfied(state, edge))
 }
 

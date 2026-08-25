@@ -22,6 +22,8 @@
 //! Transports (HTTP native+DO, stdio native-only) live host-side; this module
 //! only says what bytes go on the wire and what comes back.
 
+use std::collections::{BTreeSet, HashSet};
+
 use serde_json::{json, Map, Value};
 
 /// The MCP protocol revision whip speaks. Pinned rather than negotiated
@@ -521,32 +523,37 @@ pub fn admit_tools(
     // Role expansion admits only CLASSIFIED tools: a role can never reach a
     // tool nobody classified, so a server that grows a tool cannot grow the
     // meaning of an existing role.
+    let classified: HashSet<&str> = input.classified.iter().map(String::as_str).collect();
     let mut requested: Vec<String> = input.granted_names.clone();
     for (_, tools) in &input.granted_roles {
         for tool in tools {
-            if input.classified.iter().any(|known| known == tool) {
+            if classified.contains(tool.as_str()) {
                 requested.push(tool.clone());
             }
         }
     }
 
-    // The intersection proper: grant INTERSECT offered INTERSECT profile.
-    let mut exposed = Vec::new();
+    // The intersection proper: grant INTERSECT offered INTERSECT profile. The
+    // sets are membership-only; `exposed` is a BTreeSet because the result is
+    // sorted and deduplicated either way.
+    let offered: HashSet<&str> = input.offered.iter().map(String::as_str).collect();
+    let permitted: Option<HashSet<&str>> = input
+        .profile_permitted
+        .as_ref()
+        .map(|tools| tools.iter().map(String::as_str).collect());
+    let mut exposed = BTreeSet::new();
     for tool in requested {
-        if !input.offered.contains(&tool) {
+        if !offered.contains(tool.as_str()) {
             continue;
         }
-        if let Some(permitted) = &input.profile_permitted {
-            if !permitted.contains(&tool) {
+        if let Some(permitted) = &permitted {
+            if !permitted.contains(tool.as_str()) {
                 continue;
             }
         }
-        if !exposed.contains(&tool) {
-            exposed.push(tool);
-        }
+        exposed.insert(tool);
     }
-    exposed.sort();
-    Ok(exposed)
+    Ok(exposed.into_iter().collect())
 }
 
 /// Compare a live manifest against pinned digests, returning the drifted tool
@@ -562,8 +569,9 @@ pub fn manifest_drift(pinned: &Map<String, Value>, live: &[McpToolDescriptor]) -
             None => drifted.push(format!("{} (added)", tool.name)),
         }
     }
+    let live_names: HashSet<&str> = live.iter().map(|tool| tool.name.as_str()).collect();
     for name in pinned.keys() {
-        if !live.iter().any(|tool| &tool.name == name) {
+        if !live_names.contains(name.as_str()) {
             drifted.push(format!("{name} (removed)"));
         }
     }

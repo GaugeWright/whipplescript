@@ -1739,12 +1739,13 @@ pub fn assemble_openai_chat_sse(raw: &str) -> Value {
                 tools[index]["function"]["name"] = json!(name);
             }
             if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
-                let joined = format!(
-                    "{}{}",
-                    tools[index]["function"]["arguments"].as_str().unwrap_or(""),
-                    args
-                );
-                tools[index]["function"]["arguments"] = json!(joined);
+                // Append in place: rebuilding the whole accumulation per
+                // fragment is quadratic in the argument blob's size.
+                let slot = &mut tools[index]["function"]["arguments"];
+                match slot {
+                    Value::String(accumulated) => accumulated.push_str(args),
+                    _ => *slot = json!(args),
+                }
             }
         }
     }
@@ -1787,36 +1788,39 @@ pub fn assemble_anthropic_messages_sse(raw: &str) -> Value {
                     content.push(Value::Null);
                 }
                 match event.pointer("/delta/type").and_then(Value::as_str) {
+                    // Both arms append in place: rebuilding the whole
+                    // accumulation per delta is quadratic in the block's size,
+                    // and a streamed answer arrives as thousands of deltas.
                     Some("text_delta") => {
-                        let joined = format!(
-                            "{}{}",
-                            content[index]
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            event
-                                .pointer("/delta/text")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                        );
+                        let delta = event
+                            .pointer("/delta/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        // Seeded without a "type" so a delta arriving before its
+                        // content_block_start still assembles exactly the block
+                        // the rebuilding form produced — an untyped one, which
+                        // parse_anthropic_response drops. Adding "type" here
+                        // would surface text that has always been discarded;
+                        // that is a separate change, not this one.
                         if content[index].is_null() {
-                            content[index] = json!({"type":"text"});
+                            content[index] = json!({"text":""});
                         }
-                        content[index]["text"] = json!(joined);
+                        let slot = &mut content[index]["text"];
+                        match slot {
+                            Value::String(accumulated) => accumulated.push_str(delta),
+                            _ => *slot = json!(delta),
+                        }
                     }
                     Some("input_json_delta") => {
-                        let joined = format!(
-                            "{}{}",
-                            content[index]
-                                .get("input_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            event
-                                .pointer("/delta/partial_json")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                        );
-                        content[index]["input_json"] = json!(joined);
+                        let delta = event
+                            .pointer("/delta/partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let slot = &mut content[index]["input_json"];
+                        match slot {
+                            Value::String(accumulated) => accumulated.push_str(delta),
+                            _ => *slot = json!(delta),
+                        }
                     }
                     _ => {}
                 }

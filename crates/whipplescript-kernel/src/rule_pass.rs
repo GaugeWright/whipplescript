@@ -58,6 +58,20 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         instance_id: instance_id.to_owned(),
         ..StepReport::default()
     };
+    // Each round of the fixpoint below commits at most one rule and then
+    // re-reads the whole event log, so the per-event payload derivations were
+    // re-parsed once per commit. Event payloads are immutable — the store only
+    // appends, or truncates a whole suffix, and neither can change what an
+    // event id derives to — so each event is parsed once per pass and the
+    // rounds reuse the derivation. The retention fold, the cancelled set and
+    // the `seen` dedup still run per round: they depend on ordering and on the
+    // restore markers, not only on the payload bytes.
+    let mut restored_targets: std::collections::HashMap<String, Option<i64>> =
+        std::collections::HashMap::new();
+    let mut cancelled_keys: std::collections::HashMap<String, Option<(String, Option<String>)>> =
+        std::collections::HashMap::new();
+    let mut committed_firings: std::collections::HashMap<String, Option<RecordedFiring>> =
+        std::collections::HashMap::new();
     let mut made_progress = true;
     while made_progress {
         made_progress = false;
@@ -112,8 +126,8 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             restore_generation,
         );
         let facts = kernel.store().list_facts(instance_id)?;
-        let active_fact_ids: std::collections::BTreeSet<String> =
-            facts.iter().map(|fact| fact.fact_id.clone()).collect();
+        let active_fact_ids: std::collections::BTreeSet<&str> =
+            facts.iter().map(|fact| fact.fact_id.as_str()).collect();
         let all_facts = kernel.store().list_facts_including_consumed(instance_id)?;
         let effects = kernel.store().list_effects(instance_id)?;
         let started_event_id = events
@@ -137,12 +151,13 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             let mut live: Vec<&EventView> = Vec::new();
             for event in &events {
                 if event.event_type == "context.restored" {
-                    if let Some(target) = serde_json::from_str::<Value>(&event.payload_json)
-                        .ok()
-                        .and_then(|payload| {
-                            payload.get("restored_to_sequence").and_then(Value::as_i64)
-                        })
-                    {
+                    if !restored_targets.contains_key(&event.event_id) {
+                        restored_targets.insert(
+                            event.event_id.clone(),
+                            restored_target_from_payload(&event.payload_json),
+                        );
+                    }
+                    if let Some(target) = restored_targets[&event.event_id] {
                         live.retain(|kept| kept.sequence <= target);
                     }
                 } else {
@@ -159,14 +174,13 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 .iter()
                 .filter(|event| event.event_type == "progression.cancelled")
                 .filter_map(|event| {
-                    let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
-                    let rule = payload.get("rule").and_then(Value::as_str)?.to_owned();
-                    let identity = payload
-                        .get("identity")
-                        .and_then(Value::as_str)
-                        .filter(|identity| *identity != "started")
-                        .map(str::to_owned);
-                    Some((rule, identity))
+                    if !cancelled_keys.contains_key(&event.event_id) {
+                        cancelled_keys.insert(
+                            event.event_id.clone(),
+                            cancelled_key_from_payload(&event.payload_json),
+                        );
+                    }
+                    cancelled_keys[&event.event_id].clone()
                 })
                 .collect();
             let mut recorded = Vec::new();
@@ -174,50 +188,50 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 if event.event_type != "rule.committed" {
                     continue;
                 }
-                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                if !committed_firings.contains_key(&event.event_id) {
+                    committed_firings.insert(
+                        event.event_id.clone(),
+                        recorded_firing_from_payload(&event.payload_json),
+                    );
+                }
+                let Some(firing) = committed_firings[&event.event_id].as_ref() else {
                     continue;
                 };
-                let Some(rule_name) = payload.get("rule").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(context) = payload.get("context").and_then(context_from_record) else {
-                    continue;
-                };
-                let version_id = payload
-                    .get("program_version_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let epoch = payload
-                    .get("revision_epoch")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                let key = (rule_name.to_owned(), context.identity.clone());
+                let key = (firing.rule.clone(), firing.context.identity.clone());
                 if cancelled.contains(&key) {
                     continue;
                 }
                 if seen.insert(key) {
-                    let fact_ids = payload
-                        .get("facts")
-                        .and_then(Value::as_array)
-                        .map(|facts| {
-                            facts
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    recorded.push(RecordedFiring {
-                        rule: rule_name.to_owned(),
-                        context,
-                        version_id,
-                        epoch,
-                        fact_ids,
-                    });
+                    recorded.push(firing.clone());
                 }
             }
             (recorded, cancelled)
         };
+        // The `seen` dedup above admits at most one recorded firing per
+        // (rule, identity), so keying by the (rule, identity, admission)
+        // triple resolves exactly what a scan of `recorded_firings` would --
+        // including the miss when the admitting event differs.
+        let recorded_by_context: std::collections::HashMap<
+            (&str, Option<&str>, Option<&str>),
+            &RecordedFiring,
+        > = recorded_firings
+            .iter()
+            .map(|firing| {
+                (
+                    (
+                        firing.rule.as_str(),
+                        firing.context.identity.as_deref(),
+                        firing.context.trigger_event_id.as_deref(),
+                    ),
+                    firing,
+                )
+            })
+            .collect();
+        let cancelled_identities: std::collections::BTreeSet<(&str, Option<&str>)> =
+            cancelled_firings
+                .iter()
+                .map(|(rule, identity)| (rule.as_str(), identity.as_deref()))
+                .collect();
 
         // DR-0043 slice 3 (old-body completion): a firing admitted under an
         // earlier program version completes under THAT version's rule body,
@@ -284,7 +298,8 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 // admission identity (Decision 4), so the same (rule,
                 // identity) IS the cancelled firing, live match or not.
                 .filter(|context| {
-                    !cancelled_firings.contains(&(rule.name.clone(), context.identity.clone()))
+                    !cancelled_identities
+                        .contains(&(rule.name.as_str(), context.identity.as_deref()))
                 })
                 .collect();
             // Pinned firings (DR-0043 Decision 1): recorded contexts not
@@ -388,7 +403,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     .collect();
                 let admissions = context.trigger_event_id.as_deref();
                 lowering.consumed_fact_ids.retain(|fact_id| {
-                    if !active_fact_ids.contains(fact_id) {
+                    if !active_fact_ids.contains(fact_id.as_str()) {
                         return false;
                     }
                     if !bound_ids.contains(fact_id.as_str()) {
@@ -412,11 +427,11 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 // (content-keyed, byte-identical ids). Suppress them so an
                 // untouched replay lowers to EMPTY and commits nothing — a
                 // since-consumed fact's revival belongs to a new firing.
-                if let Some(recorded) = recorded_firings.iter().find(|firing| {
-                    firing.rule == rule.name
-                        && firing.context.identity == context.identity
-                        && firing.context.trigger_event_id == context.trigger_event_id
-                }) {
+                if let Some(recorded) = recorded_by_context.get(&(
+                    rule.name.as_str(),
+                    context.identity.as_deref(),
+                    context.trigger_event_id.as_deref(),
+                )) {
                     lowering
                         .facts
                         .retain(|fact| !recorded.fact_ids.contains(&fact.fact_id));
@@ -703,7 +718,7 @@ fn lower_rule_with_region(
     all_facts: &[whipplescript_store::FactView],
     effects: &[whipplescript_store::EffectView],
     source_path: Option<&std::path::Path>,
-    active_fact_ids: &std::collections::BTreeSet<String>,
+    active_fact_ids: &std::collections::BTreeSet<&str>,
 ) -> crate::lowering::OwnedLowering {
     use crate::rule_lowering::{
         effect_binding_value, eval_expr_value, guard_result, push_effect_binding, EvalScope,
@@ -774,7 +789,7 @@ fn lower_rule_with_region(
     let normalize = |mut lowering: crate::lowering::OwnedLowering| {
         lowering
             .consumed_fact_ids
-            .retain(|fact_id| active_fact_ids.contains(fact_id));
+            .retain(|fact_id| active_fact_ids.contains(fact_id.as_str()));
         (
             {
                 let mut ids: Vec<String> = lowering
@@ -968,6 +983,7 @@ fn region_effect_id(
 /// A committed firing reconstructed from its `rule.committed` record
 /// (DR-0043): the rule it fired, its pinned context, and the program
 /// version + revision epoch it was ADMITTED under.
+#[derive(Clone)]
 struct RecordedFiring {
     rule: String,
     context: RuleContext,
@@ -978,6 +994,59 @@ struct RecordedFiring {
     /// suppressed — re-recording a since-consumed fact is a NEW firing's
     /// act (DR-0044 re-admission), never a replay's.
     fact_ids: Vec<String>,
+}
+
+/// The three per-event payload derivations `step_instance_generic` memoizes
+/// across its fixpoint rounds. Each takes only the immutable payload bytes, so
+/// an event id derives the same value for the whole pass.
+fn restored_target_from_payload(payload_json: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()?
+        .get("restored_to_sequence")
+        .and_then(Value::as_i64)
+}
+
+fn cancelled_key_from_payload(payload_json: &str) -> Option<(String, Option<String>)> {
+    let payload = serde_json::from_str::<Value>(payload_json).ok()?;
+    let rule = payload.get("rule").and_then(Value::as_str)?.to_owned();
+    let identity = payload
+        .get("identity")
+        .and_then(Value::as_str)
+        .filter(|identity| *identity != "started")
+        .map(str::to_owned);
+    Some((rule, identity))
+}
+
+fn recorded_firing_from_payload(payload_json: &str) -> Option<RecordedFiring> {
+    let payload = serde_json::from_str::<Value>(payload_json).ok()?;
+    let rule = payload.get("rule").and_then(Value::as_str)?.to_owned();
+    let context = payload.get("context").and_then(context_from_record)?;
+    let version_id = payload
+        .get("program_version_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let epoch = payload
+        .get("revision_epoch")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let fact_ids = payload
+        .get("facts")
+        .and_then(Value::as_array)
+        .map(|facts| {
+            facts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(RecordedFiring {
+        rule,
+        context,
+        version_id,
+        epoch,
+        fact_ids,
+    })
 }
 
 /// Loads and compiles the rule bodies of an OLD program version for old-body

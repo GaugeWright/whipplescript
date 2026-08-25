@@ -309,13 +309,17 @@ impl ContentStore {
 
 #[cfg(feature = "native")]
 impl ContentBlobs for ContentStore {
+    /// The per-blob statements here are `prepare_cached`: the manifest tree
+    /// stores and reads one blob per NODE, so re-parsing the same one-line SQL
+    /// per node was a real share of the cost of a cut. The SQL, the rows, and
+    /// the error paths are unchanged — only where the compiled statement lives.
     fn put(&self, body: &str) -> StoreResult<String> {
         let id = crate::stable_hash_hex(body);
-        self.connection.execute(
+        let mut insert = self.connection.prepare_cached(
             "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
              VALUES (?1, ?2, ?3, datetime('now'))",
-            params![id, body, body.len() as i64],
         )?;
+        insert.execute(params![id, body, body.len() as i64])?;
         Ok(id)
     }
 
@@ -324,16 +328,18 @@ impl ContentBlobs for ContentStore {
     /// answer to their id — callers (working sets, bundles, diff) never
     /// see the tiering.
     fn get(&self, id: &str) -> StoreResult<Option<String>> {
-        if let Some(body) = self
-            .connection
-            .query_row(
-                "SELECT body FROM content_blobs WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
+        // Each cached statement is scoped so it returns to the cache before the
+        // next step — `get` recurses through `reassemble_root`.
         {
-            return Ok(Some(body));
+            let mut loose = self
+                .connection
+                .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?;
+            if let Some(body) = loose
+                .query_row(params![id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                return Ok(Some(body));
+            }
         }
         if let Some(body) = self.read_packed(id)? {
             return Ok(Some(body));
@@ -342,14 +348,12 @@ impl ContentBlobs for ContentStore {
         // by decision. `status` short-circuits on this table, so `get`
         // must too — otherwise a (forged) chunk root sharing the id would
         // resurrect erased bytes here while `status` still reports Erased.
-        let tombstoned: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT byte_len FROM content_erasures WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let tombstoned: Option<i64> = {
+            let mut erased = self
+                .connection
+                .prepare_cached("SELECT byte_len FROM content_erasures WHERE id = ?1")?;
+            erased.query_row(params![id], |row| row.get(0)).optional()?
+        };
         if tombstoned.is_some() {
             return Ok(None);
         }
@@ -367,11 +371,8 @@ impl ContentBlobs for ContentStore {
     fn status(&self, id: &str) -> StoreResult<BlobStatus> {
         let live: Option<i64> = self
             .connection
-            .query_row(
-                "SELECT byte_len FROM content_blobs WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT byte_len FROM content_blobs WHERE id = ?1")?
+            .query_row(params![id], |row| row.get(0))
             .optional()?;
         if let Some(byte_len) = live {
             return Ok(BlobStatus::Live {
@@ -380,11 +381,8 @@ impl ContentBlobs for ContentStore {
         }
         let packed: Option<i64> = self
             .connection
-            .query_row(
-                "SELECT len FROM content_pack_entries WHERE chunk_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT len FROM content_pack_entries WHERE chunk_id = ?1")?
+            .query_row(params![id], |row| row.get(0))
             .optional()?;
         if let Some(byte_len) = packed {
             return Ok(BlobStatus::Live {
@@ -393,11 +391,8 @@ impl ContentBlobs for ContentStore {
         }
         let erased: Option<i64> = self
             .connection
-            .query_row(
-                "SELECT byte_len FROM content_erasures WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT byte_len FROM content_erasures WHERE id = ?1")?
+            .query_row(params![id], |row| row.get(0))
             .optional()?;
         if let Some(byte_len) = erased {
             return Ok(BlobStatus::Erased {
@@ -635,18 +630,17 @@ impl ContentStore {
     pub fn chunk_root_info(&self, root_id: &str) -> StoreResult<Option<ChunkRootInfo>> {
         let root: Option<(i64, Option<String>)> = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT byte_len, erased_at FROM content_chunk_roots WHERE root_id = ?1",
-                params![root_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            )?
+            .query_row(params![root_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         let Some((byte_len, erased_at)) = root else {
             return Ok(None);
         };
-        let mut stmt = self
-            .connection
-            .prepare("SELECT chunk_id FROM content_chunk_refs WHERE root_id = ?1 ORDER BY seq")?;
+        let mut stmt = self.connection.prepare_cached(
+            "SELECT chunk_id FROM content_chunk_refs WHERE root_id = ?1 ORDER BY seq",
+        )?;
         let mapped = stmt.query_map(params![root_id], |row| row.get::<_, String>(0))?;
         let mut chunk_ids = Vec::new();
         for row in mapped {
@@ -717,22 +711,20 @@ impl ContentStore {
     fn read_packed(&self, chunk_id: &str) -> StoreResult<Option<String>> {
         let entry: Option<(String, i64, i64)> = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT pack_id, offset, len FROM content_pack_entries WHERE chunk_id = ?1",
-                params![chunk_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+            )?
+            .query_row(params![chunk_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .optional()?;
         let Some((pack_id, offset, len)) = entry else {
             return Ok(None);
         };
         let pack: Option<String> = self
             .connection
-            .query_row(
-                "SELECT body FROM content_blobs WHERE id = ?1",
-                params![pack_id],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT body FROM content_blobs WHERE id = ?1")?
+            .query_row(params![pack_id], |row| row.get(0))
             .optional()?;
         let Some(pack) = pack else {
             return Ok(None);

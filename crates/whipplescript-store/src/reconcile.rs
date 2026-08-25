@@ -48,7 +48,15 @@ pub enum RebaseDownPlan {
     /// At quiescence, the intersecting delta arrives as an ask: the
     /// structured conflicts are the notification payload. Nothing is
     /// auto-resolved.
-    AskAtQuiescence { conflicts: Vec<PathConflict> },
+    ///
+    /// `merged_remainder` is the clean part of the SAME three-way, carried
+    /// rather than dropped: the caller needs it to build the refined manifest
+    /// once the contested paths resolve, and recovering it meant re-walking the
+    /// union of three manifests for an answer already computed here.
+    AskAtQuiescence {
+        conflicts: Vec<PathConflict>,
+        merged_remainder: BTreeMap<String, String>,
+    },
 }
 
 /// One merge-up decision.
@@ -97,9 +105,15 @@ pub fn plan_rebase_down(
         MergeOutcome::Clean { manifest } => RebaseDownPlan::Silent {
             new_head_manifest: manifest,
         },
-        MergeOutcome::Conflicted { conflicts, .. } => {
+        MergeOutcome::Conflicted {
+            conflicts,
+            merged_remainder,
+        } => {
             if quiescent {
-                RebaseDownPlan::AskAtQuiescence { conflicts }
+                RebaseDownPlan::AskAtQuiescence {
+                    conflicts,
+                    merged_remainder,
+                }
             } else {
                 RebaseDownPlan::DeferredMidRun
             }
@@ -190,13 +204,18 @@ mod tests {
             plan_rebase_down(&base, &branch_head, &target_head, &ours, &theirs, false),
             RebaseDownPlan::DeferredMidRun
         );
-        let RebaseDownPlan::AskAtQuiescence { conflicts } =
-            plan_rebase_down(&base, &branch_head, &target_head, &ours, &theirs, true)
+        let RebaseDownPlan::AskAtQuiescence {
+            conflicts,
+            merged_remainder,
+        } = plan_rebase_down(&base, &branch_head, &target_head, &ours, &theirs, true)
         else {
             panic!("expected the ask");
         };
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].path, "a.md");
+        // The ask carries the clean half of the same three-way, so the caller
+        // never has to recompute the merge to build the refined manifest.
+        assert!(!merged_remainder.contains_key("a.md"));
     }
 
     #[test]

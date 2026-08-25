@@ -20,7 +20,7 @@
 //! head guards make a racing writer a refused normal outcome rather
 //! than a lost update.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 #[cfg(feature = "native")]
@@ -721,15 +721,30 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let Some(hash) = hash else {
             return Ok(BTreeMap::new());
         };
-        let Some(body) = self.content.get(hash)? else {
-            return Err(StoreError::Conflict(format!(
+        self.load_manifest_opt(hash)?.ok_or_else(|| {
+            StoreError::Conflict(format!(
                 "manifest blob {hash} is absent from the content store"
-            )));
+            ))
+        })
+    }
+
+    /// The same read, answering an absent root blob with `Ok(None)` instead of
+    /// a conflict — for callers that treat an unreadable manifest as a cut to
+    /// skip, and would otherwise fetch the root once to test whether it is
+    /// there and again to read it.
+    ///
+    /// The shape test IS the parse: recognizing the root as a tree node yields
+    /// the node the walk continues from, and a body that is not one falls
+    /// through to the flat path exactly as before — including a malformed body,
+    /// which still surfaces as the flat parse's error.
+    fn load_manifest_opt(&self, hash: &str) -> StoreResult<Option<BTreeMap<String, String>>> {
+        let Some(body) = self.content.get(hash)? else {
+            return Ok(None);
         };
-        if crate::manifest_tree::is_node(&body) {
-            return crate::manifest_tree::load(&self.content, hash);
+        if let Some(root) = crate::manifest_tree::parse_node(&body) {
+            return Ok(Some(crate::manifest_tree::load_from(&self.content, root)?));
         }
-        serde_json::from_str(&body).map_err(StoreError::from)
+        Ok(Some(serde_json::from_str(&body).map_err(StoreError::from)?))
     }
 
     /// DR-0070 §1: manifests are written as prolly trees, so a cut writes new
@@ -1456,26 +1471,15 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             }
             RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
             RebaseDownPlan::DeferredMidRun => return Ok(ReconcileOutcome::DeferredMidRun),
-            RebaseDownPlan::AskAtQuiescence { conflicts } => {
+            RebaseDownPlan::AskAtQuiescence {
+                conflicts,
+                merged_remainder,
+            } => {
                 // At quiescence, certified source merges refine the
                 // contested paths; any residue is the honest ask. The
                 // refined manifest = clean remainder + certified content,
-                // recomputed here from the same three-way.
-                let crate::merge::MergeOutcome::Conflicted {
-                    merged_remainder,
-                    conflicts: raw,
-                } = crate::merge::merge_manifests(
-                    &point,
-                    &head,
-                    &target,
-                    &branch_side,
-                    &parent_side,
-                )
-                else {
-                    unreachable!("plan reported conflicts");
-                };
-                debug_assert_eq!(raw.len(), conflicts.len());
-                let (resolved, remaining) = self.refine_source_conflicts(raw)?;
+                // both halves carried out of the plan's three-way.
+                let (resolved, remaining) = self.refine_source_conflicts(conflicts)?;
                 if !remaining.is_empty() {
                     // The residue is the ask AND the tag: record each as
                     // an open conflict object on the branch (conflict-
@@ -1805,21 +1809,11 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     RebaseDownPlan::UpToDate => head,
                     RebaseDownPlan::Silent { new_head_manifest } => new_head_manifest,
                     RebaseDownPlan::DeferredMidRun => unreachable!("probe plans quiescent"),
-                    RebaseDownPlan::AskAtQuiescence { .. } => {
-                        let crate::merge::MergeOutcome::Conflicted {
-                            merged_remainder,
-                            conflicts: raw,
-                        } = crate::merge::merge_manifests(
-                            &point,
-                            &head,
-                            &target,
-                            &branch_side,
-                            &parent_side,
-                        )
-                        else {
-                            unreachable!("plan reported conflicts");
-                        };
-                        let (resolved, remaining) = self.refine_source_conflicts(raw)?;
+                    RebaseDownPlan::AskAtQuiescence {
+                        conflicts,
+                        merged_remainder,
+                    } => {
+                        let (resolved, remaining) = self.refine_source_conflicts(conflicts)?;
                         if !remaining.is_empty() {
                             return Ok(MergeProbeOutcome::Conflicted {
                                 conflicts: remaining,
@@ -2178,11 +2172,20 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 || cuts.get(indexed - 1).map(|cut| cut.cut_id.as_str())
                     == cursor.last_indexed_cut_id.as_deref());
         let prefix = if consistent { indexed } else { 0 };
+        // The window is known here, so the work is confined to it rather than
+        // done for the whole branch and thrown away by the `retain` below:
+        // rows and recomputed cuts before `window_start` are exactly the ones
+        // that retain drops. When the branch is shorter than the window this is
+        // 0 and nothing changes.
+        let window_start = cuts.len().saturating_sub(limit);
         let by_cut: BTreeMap<&str, &crate::branches::CutRow> =
             cuts.iter().map(|cut| (cut.cut_id.as_str(), cut)).collect();
         let mut units: Vec<crate::selection::ChangeUnit> = Vec::new();
-        if prefix > 0 {
-            for row in self.branches.list_change_unit_rows(branch_id, 0)? {
+        if prefix > 0 && window_start < prefix {
+            for row in self
+                .branches
+                .list_change_unit_rows(branch_id, window_start as i64)?
+            {
                 if row.cut_seq as usize >= prefix {
                     continue; // beyond the verified prefix: recompute below
                 }
@@ -2209,7 +2212,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 });
             }
         }
-        for cut in &cuts[prefix..] {
+        for cut in &cuts[prefix.max(window_start)..] {
             self.push_units_for_cut(cut, &mut units)?;
         }
         // Window semantics are unchanged: callers get the units of the
@@ -2234,16 +2237,15 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         cut: &crate::branches::CutRow,
         units: &mut Vec<crate::selection::ChangeUnit>,
     ) -> StoreResult<()> {
-        let after = match self.content.get(&cut.manifest_hash)? {
-            Some(_) => self.load_manifest(Some(&cut.manifest_hash))?,
-            None => return Ok(()),
+        let Some(after) = self.load_manifest_opt(&cut.manifest_hash)? else {
+            return Ok(());
         };
         let before = match cut.parent_cut_id.as_deref() {
             None => BTreeMap::new(),
             Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
                 None => BTreeMap::new(),
-                Some(parent) => match self.content.get(&parent.manifest_hash)? {
-                    Some(_) => self.load_manifest(Some(&parent.manifest_hash))?,
+                Some(parent) => match self.load_manifest_opt(&parent.manifest_hash)? {
+                    Some(manifest) => manifest,
                     None => return Ok(()),
                 },
             },
@@ -2780,9 +2782,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             return Ok(None);
         };
         let units = self.change_units(branch_id, 500)?;
+        // Indexed once instead of scanned per path: units are oldest first, so
+        // a forward pass leaves the newest unit for each path — the one a
+        // reverse scan found — and the cost stops being paths × units.
+        let mut newest: HashMap<&str, &crate::selection::ChangeUnit> = HashMap::new();
+        for unit in &units {
+            newest.insert(unit.path.as_str(), unit);
+        }
         let mut attributions = Vec::new();
         for path in manifest.keys() {
-            let last = units.iter().rev().find(|unit| unit.path == *path);
+            let last = newest.get(path.as_str()).copied();
             attributions.push(PathAttribution {
                 path: path.clone(),
                 cut_id: last.map(|unit| unit.cut_id.clone()),

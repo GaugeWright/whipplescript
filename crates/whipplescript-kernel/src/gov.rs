@@ -494,7 +494,7 @@ struct ParsedAttestation {
 }
 
 fn parse_attestation(signed_json: &str) -> Result<ParsedAttestation, String> {
-    let value: serde_json::Value = serde_json::from_str(signed_json)
+    let mut value: serde_json::Value = serde_json::from_str(signed_json)
         .map_err(|err| format!("invalid signed envelope: {err}"))?;
     let attestation = value
         .get("attestation")
@@ -552,15 +552,17 @@ fn parse_attestation(signed_json: &str) -> Result<ParsedAttestation, String> {
     };
     // recompute the canonical content hash from the FULL content (everything
     // except the attestation), re-canonicalized through the envelope so ordering
-    // matches signing. A tamper to any covered field breaks the hash.
-    let mut content = value.clone();
-    if let Some(obj) = content.as_object_mut() {
+    // matches signing. A tamper to any covered field breaks the hash. The
+    // attested hash is owned off first so the parsed document itself can shed
+    // its attestation in place — nothing below reads it again.
+    let attested_hash = attested_hash.to_owned();
+    if let Some(obj) = value.as_object_mut() {
         obj.remove("attestation");
     }
-    let recanonical = canonicalize(&content.to_string())?;
+    let recanonical = canonicalize(&value.to_string())?;
     if hash_hex(&recanonical) == attested_hash {
         Ok(ParsedAttestation {
-            envelope_hash: attested_hash.to_owned(),
+            envelope_hash: attested_hash,
             signer,
             external,
         })

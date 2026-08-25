@@ -195,10 +195,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         packages: &P,
         provider: ProviderRealization<'_>,
     ) -> Result<bool, HostFacadeError> {
-        self.validate_turn(command, packages)?;
-        let package = packages
-            .resolve_package(&command.package_version_ref)
-            .map_err(HostFacadeError::Resolver)?;
+        let (_admission, package) = self.admit_turn_with_binding(command, packages)?;
         if !self.envelope.permits_provider_binding(
             &command.provider_binding.binding_id,
             &command.provider_binding.credential.credential_id,
@@ -281,7 +278,19 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
         command: &StartTurnCommand,
         packages: &P,
     ) -> Result<HostTurnAdmission, HostFacadeError> {
-        self.admit_turn(command, packages)?;
+        Ok(self.admit_turn_with_binding(command, packages)?.0)
+    }
+
+    /// The admission an admitted turn produces, together with the package it
+    /// already resolved. `begin_turn` needs both, and resolving a package
+    /// compiles it, so handing the resolved value forward keeps one host turn to
+    /// one compile. Every check below runs in the order it always did.
+    fn admit_turn_with_binding<P: PackageResolver + ?Sized>(
+        &self,
+        command: &StartTurnCommand,
+        packages: &P,
+    ) -> Result<(HostTurnAdmission, ResolvedPackage), HostFacadeError> {
+        let package = self.admit_turn(command, packages)?;
         let binding = self
             .envelope
             .resolve_provider_binding(
@@ -295,15 +304,18 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                         .to_owned(),
                 )
             })?;
-        Ok(HostTurnAdmission {
-            provider_binding_id: command.provider_binding.binding_id.clone(),
-            credential_id: command.provider_binding.credential.credential_id.clone(),
-            placement_ceiling_ref: command.placement_ceiling_ref.clone(),
-            provider: binding.provider.clone(),
-            model: binding.model.clone(),
-            base_url: binding.base_url.clone(),
-            wire: binding.wire.clone(),
-        })
+        Ok((
+            HostTurnAdmission {
+                provider_binding_id: command.provider_binding.binding_id.clone(),
+                credential_id: command.provider_binding.credential.credential_id.clone(),
+                placement_ceiling_ref: command.placement_ceiling_ref.clone(),
+                provider: binding.provider.clone(),
+                model: binding.model.clone(),
+                base_url: binding.base_url.clone(),
+                wire: binding.wire.clone(),
+            },
+            package,
+        ))
     }
 
     fn admit_turn<P: PackageResolver + ?Sized>(
@@ -419,74 +431,89 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
             .list_instances()
             .map_err(HostFacadeError::Store)?
         {
-            for event in self
+            // The opened event is appended under a key derived from exactly this
+            // (instance, request) pair, so one indexed point lookup per instance
+            // decides the replay question that a full event-log scan used to.
+            let replay_key = idempotency_key(&[
+                &instance.instance_id,
+                &command.request_id,
+                "host-instance-opened",
+            ]);
+            let Some(stored) = self
+                .kernel
+                .store()
+                .event_by_idempotency_key(&instance.instance_id, &replay_key)
+                .map_err(HostFacadeError::Store)?
+            else {
+                continue;
+            };
+            let Some(event) = self
                 .kernel
                 .store()
                 .list_events(&instance.instance_id)
                 .map_err(HostFacadeError::Store)?
-            {
-                if event.event_type != "host.instance.opened" {
-                    continue;
-                }
-                let payload: Value =
-                    serde_json::from_str(&event.payload_json).map_err(HostFacadeError::Json)?;
-                if payload.get("request_id").and_then(Value::as_str)
-                    != Some(command.request_id.as_str())
-                {
-                    continue;
-                }
-                let opened = OpenedInstance {
-                    protocol: HOST_PROTOCOL.to_owned(),
-                    request_id: command.request_id.clone(),
-                    instance_ref: instance.instance_id.clone(),
-                    package_version_ref: payload
-                        .get("package_version_ref")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            HostFacadeError::Incomplete("opened package ref".to_owned())
-                        })?
-                        .to_owned(),
-                    policy: serde_json::from_value(payload["policy"].clone())
-                        .map_err(HostFacadeError::Json)?,
-                    opened_at: EventPosition {
-                        instance_ref: instance.instance_id.clone(),
-                        sequence: positive_sequence(event.sequence)?,
-                    },
-                };
-                opened.validate_for(command)?;
-                let version = self
-                    .kernel
-                    .store()
-                    .get_program_version(&instance.version_id)
-                    .map_err(HostFacadeError::Store)?
-                    .ok_or_else(|| {
-                        HostFacadeError::UnknownInstance(instance.instance_id.clone())
-                    })?;
-                // Different authored content under a replayed request is the
-                // integrity breach this guard exists for.
-                if version.source_hash != package.source_hash {
-                    return Err(HostFacadeError::Protocol(ProtocolError::Mismatch(
-                        "replayed package content",
-                    )));
-                }
-                // Same authored program, different IR: re-attest under the
-                // current compiler rather than strand the instance
-                // (spec/agent-harness.md "Program identity across toolchains").
-                if version.ir_hash != package.ir_hash {
-                    self.kernel
-                        .reattest_instance_program(
-                            &instance.instance_id,
-                            ProgramVersionInput {
-                                program_name: &package.agent,
-                                source_hash: &package.source_hash,
-                                ir_hash: &package.ir_hash,
-                                compiler_version: HOST_PROTOCOL,
-                            },
-                        )
-                        .map_err(HostFacadeError::Store)?;
-                }
-                return Ok(Some(opened));
+                .into_iter()
+                .find(|event| event.event_id == stored.event_id)
+            else {
+                continue;
+            };
+            if event.event_type != "host.instance.opened" {
+                continue;
             }
+            let payload: Value =
+                serde_json::from_str(&event.payload_json).map_err(HostFacadeError::Json)?;
+            if payload.get("request_id").and_then(Value::as_str)
+                != Some(command.request_id.as_str())
+            {
+                continue;
+            }
+            let opened = OpenedInstance {
+                protocol: HOST_PROTOCOL.to_owned(),
+                request_id: command.request_id.clone(),
+                instance_ref: instance.instance_id.clone(),
+                package_version_ref: payload
+                    .get("package_version_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| HostFacadeError::Incomplete("opened package ref".to_owned()))?
+                    .to_owned(),
+                policy: serde_json::from_value(payload["policy"].clone())
+                    .map_err(HostFacadeError::Json)?,
+                opened_at: EventPosition {
+                    instance_ref: instance.instance_id.clone(),
+                    sequence: positive_sequence(event.sequence)?,
+                },
+            };
+            opened.validate_for(command)?;
+            let version = self
+                .kernel
+                .store()
+                .get_program_version(&instance.version_id)
+                .map_err(HostFacadeError::Store)?
+                .ok_or_else(|| HostFacadeError::UnknownInstance(instance.instance_id.clone()))?;
+            // Different authored content under a replayed request is the
+            // integrity breach this guard exists for.
+            if version.source_hash != package.source_hash {
+                return Err(HostFacadeError::Protocol(ProtocolError::Mismatch(
+                    "replayed package content",
+                )));
+            }
+            // Same authored program, different IR: re-attest under the
+            // current compiler rather than strand the instance
+            // (spec/agent-harness.md "Program identity across toolchains").
+            if version.ir_hash != package.ir_hash {
+                self.kernel
+                    .reattest_instance_program(
+                        &instance.instance_id,
+                        ProgramVersionInput {
+                            program_name: &package.agent,
+                            source_hash: &package.source_hash,
+                            ir_hash: &package.ir_hash,
+                            compiler_version: HOST_PROTOCOL,
+                        },
+                    )
+                    .map_err(HostFacadeError::Store)?;
+            }
+            return Ok(Some(opened));
         }
         Ok(None)
     }

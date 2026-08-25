@@ -169,6 +169,12 @@ enum Edit<'a> {
 /// keeps a per-round snapshot of the furthest-x frontier (`trace`), and
 /// the backtrack walks rounds in reverse — `trace[d]` holds round d-1's
 /// frontier, exactly what round d's endpoints extended from.
+///
+/// Each snapshot is only the LIVE BAND, `k` in `[-d, d]`, not the whole
+/// `2(N+M)+1` frontier: round d can have reached no further diagonal, and the
+/// backtrack reads no further than one diagonal either side of its own. Storing
+/// the whole vector made the trace O(D·(N+M)) — for two wholly different large
+/// files, tens of gigabytes copied — where the band is O(D²).
 fn myers_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Edit<'a>> {
     let n = a.len() as isize;
     let m = b.len() as isize;
@@ -176,12 +182,24 @@ fn myers_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Edit<'a>> {
     if max == 0 {
         return Vec::new();
     }
+    // An empty side admits exactly one edit script — every line of the other
+    // side, in order — so the general search has nothing to decide. Taking it
+    // anyway costs O(m²): the frontier walks d out to m, banding a fresh
+    // `2d+1` snapshot every round. This is the common case rather than a
+    // corner one — an added or removed file diffs against an empty side, and a
+    // whole-branch diff reports every path that way.
+    if a.is_empty() {
+        return b.iter().map(|line| Edit::Add(line)).collect();
+    }
+    if b.is_empty() {
+        return a.iter().map(|line| Edit::Remove(line)).collect();
+    }
     let offset = max;
     let width = (2 * max + 1) as usize;
     let mut v = vec![0isize; width];
     let mut trace: Vec<Vec<isize>> = Vec::new();
     'outer: for d in 0..=max {
-        trace.push(v.clone());
+        trace.push(v[(offset - d) as usize..=(offset + d) as usize].to_vec());
         let mut k = -d;
         while k <= d {
             let idx = (k + offset) as usize;
@@ -208,16 +226,18 @@ fn myers_diff<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<Edit<'a>> {
     let mut y = m;
     for d in (1..trace.len()).rev() {
         let d_i = d as isize;
-        let v = &trace[d];
+        // The band is centred on k = 0 with radius d, so a diagonal's slot is
+        // `k + d` rather than `k + offset`.
+        let band = &trace[d];
         let k = x - y;
-        let idx = (k + offset) as usize;
-        let prev_k = if k == -d_i || (k != d_i && v[idx - 1] < v[idx + 1]) {
+        let idx = (k + d_i) as usize;
+        let prev_k = if k == -d_i || (k != d_i && band[idx - 1] < band[idx + 1]) {
             k + 1
         } else {
             k - 1
         };
-        let prev_idx = (prev_k + offset) as usize;
-        let prev_x = v[prev_idx];
+        let prev_idx = (prev_k + d_i) as usize;
+        let prev_x = band[prev_idx];
         let prev_y = prev_x - prev_k;
         // The snake (shared lines) this round rode after its edit step.
         while x > prev_x && y > prev_y {
@@ -409,6 +429,50 @@ mod tests {
                 rebuilt_target, target_lines,
                 "target for {base:?} -> {target:?}"
             );
+        }
+    }
+
+    /// The same correctness property over generated pairs, which is what keeps
+    /// the banded trace honest: a mis-indexed backtrack yields a script that is
+    /// plausible line by line and still rebuilds the wrong sides, and the fixed
+    /// cases above are too shallow to reach the deeper rounds.
+    #[test]
+    fn generated_pairs_also_reconstruct_both_sides() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..200 {
+            let alphabet = 2 + (case % 5);
+            let base_len = (next() % 40) as usize;
+            let target_len = (next() % 40) as usize;
+            let base: Vec<String> = (0..base_len)
+                .map(|_| format!("line_{}", next() % alphabet))
+                .collect();
+            let target: Vec<String> = (0..target_len)
+                .map(|_| format!("line_{}", next() % alphabet))
+                .collect();
+            let base_lines: Vec<&str> = base.iter().map(String::as_str).collect();
+            let target_lines: Vec<&str> = target.iter().map(String::as_str).collect();
+            let script = myers_diff(&base_lines, &target_lines);
+
+            let mut rebuilt_base = Vec::new();
+            let mut rebuilt_target = Vec::new();
+            for edit in &script {
+                match edit {
+                    Edit::Keep(text) => {
+                        rebuilt_base.push(*text);
+                        rebuilt_target.push(*text);
+                    }
+                    Edit::Remove(text) => rebuilt_base.push(*text),
+                    Edit::Add(text) => rebuilt_target.push(*text),
+                }
+            }
+            assert_eq!(rebuilt_base, base_lines, "base for case {case}");
+            assert_eq!(rebuilt_target, target_lines, "target for case {case}");
         }
     }
 

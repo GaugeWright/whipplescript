@@ -2551,7 +2551,16 @@ pub fn check_ifc_program_with_imports(ir: &IrProgram, imports: &[IrProgram]) -> 
 /// not be sourced from outside (the W6 no-laundering principle). Ungoverned/absent or
 /// a rejected envelope → `false` (the gradual model imposes nothing in dev mode).
 pub fn signal_is_internal(signal_name: &str) -> bool {
-    match VerifiedEnvelope::load_from_env() {
+    signal_is_internal_in(&VerifiedEnvelope::load_from_env(), signal_name)
+}
+
+/// The same H8 question against an ALREADY-crossed trust boundary. A pass that
+/// admits many candidates loads the status once and asks here, so it crosses the
+/// boundary (file read, attestation check, envelope parse) once per pass rather
+/// than once per candidate; the mapping is identical, so the same envelope
+/// refuses the same signals either way.
+pub fn signal_is_internal_in(status: &EnvelopeStatus, signal_name: &str) -> bool {
+    match status {
         EnvelopeStatus::Verified(verified) => verified
             .envelope()
             .is_internal_signal(&format!("signal:{signal_name}")),
