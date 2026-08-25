@@ -30,6 +30,13 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
   title, and **never** the event payload or issue body, so nothing accumulated
   there can reach a subscriber through this channel.
 
+  The `subscribe` grant does not widen which queues a turn can read: an agent
+  may name only its own configured queue and the queues the host declared, and
+  any other queue is refused. `list_todos` is scoped to the configured queue, so
+  without that confinement the grant would have let an agent watch another
+  agent's queue and read its titles, aliases, and actors — a strictly wider read
+  than it could perform directly.
+
   The cursor is a durable per-`(subscriber, queue)` watermark over the local
   event sequence. Subscribing starts at the current head rather than replaying
   a queue's history; re-subscribing never rewinds; a stale advance is a no-op.

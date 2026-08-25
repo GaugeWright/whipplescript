@@ -365,6 +365,10 @@ pub struct FileToolExecutor {
     changes_scope: Option<ChangesScope>,
     /// Identity this turn's tracker subscriptions are keyed by (gap (a)).
     feed_subscriber: Option<String>,
+    /// Queues the HOST declared this turn may watch. The agent-callable tool is
+    /// confined to these plus the turn's own tracker queue; see
+    /// `permitted_feed_queue`.
+    feed_queues: Vec<String>,
     /// Raise items already delivered mid-turn (DR-0052 Decision 7) — a
     /// notice arrives once per turn, then stays in the transcript.
     delivered_raises: std::cell::RefCell<std::collections::BTreeSet<String>>,
@@ -845,6 +849,7 @@ impl FileToolExecutor {
             provider_ctx: None,
             changes_scope: None,
             feed_subscriber: None,
+            feed_queues: Vec::new(),
             delivered_raises: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             notice_tracker: std::cell::RefCell::new(None),
             skill_bodies: std::collections::HashMap::new(),
@@ -895,6 +900,7 @@ impl FileToolExecutor {
                 let _ = store.subscribe_events(&subscriber, queue);
             }
         }
+        self.feed_queues = queues.to_vec();
         self.feed_subscriber = Some(subscriber);
         self
     }
@@ -2201,10 +2207,31 @@ impl FileToolExecutor {
         notices
     }
 
+    /// The queues the agent-callable tool may name: the turn's own tracker
+    /// queue, plus whatever the HOST declared with `with_tracker_feed`.
+    ///
+    /// The turn's own queue is free because `list_todos` already reads it — a
+    /// feed over it discloses nothing new. Every OTHER queue must come from the
+    /// host, because `list_todos` is scoped to the configured queue and cannot
+    /// reach them: without this check, the `subscribe` grant would let an agent
+    /// name any queue in the store and read another agent's item titles,
+    /// aliases, and actors through the feed. That is a wider read than the
+    /// grant is meant to convey, and it is the reason this function exists.
+    fn permitted_feed_queue(&self, queue: &str, own: &str) -> Result<(), String> {
+        if queue == own || self.feed_queues.iter().any(|allowed| allowed == queue) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{queue}` is not a queue this turn may watch: subscribe to `{own}`, \
+             or ask the host to declare the queue for this turn"
+        ))
+    }
+
     /// Declare or drop an interest in a queue's events (gap (a), agent-facing
     /// half). The host-configured half is `with_tracker_feed`; both write the
     /// same durable subscription, so an agent can narrow or widen what its
-    /// embedder set up without a second mechanism existing.
+    /// embedder set up without a second mechanism existing — but only WITHIN
+    /// what the host allowed (`permitted_feed_queue`).
     fn subscribe_todos(&self, args: &Value) -> Result<String, String> {
         let Some(subscriber) = self.feed_subscriber.as_deref() else {
             return Err("this turn has no tracker feed identity".to_owned());
@@ -2215,6 +2242,7 @@ impl FileToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or(&default_queue)
             .to_owned();
+        self.permitted_feed_queue(&queue, &default_queue)?;
         let action = args
             .get("action")
             .and_then(Value::as_str)
@@ -5806,6 +5834,80 @@ mod tests {
         // The title IS carried — it names the work, and anyone who may read the
         // queue can already see it via `list_todos`.
         assert!(notices[0].contains("harmless title"), "{}", notices[0]);
+    }
+
+    /// The `subscribe` grant does not widen which QUEUES a turn can read.
+    ///
+    /// `list_todos` is scoped to the turn's configured queue, so without this
+    /// check an agent holding `subscribe` could name any queue in the store and
+    /// read another agent's titles, aliases, and actors through the feed — a
+    /// strictly wider read than it could perform directly.
+    #[test]
+    fn subscribing_cannot_reach_a_queue_the_turn_could_not_already_read() {
+        let root = temp_root();
+        let store_path = root.join("items.sqlite");
+        let grants = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [{
+                    "resource": "tracker",
+                    "operations": [{ "operation": "subscribe" }]
+                }]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+
+        // Bob's private queue, with a title Alice must not be able to watch.
+        let mut store = WorkItemStore::open(&store_path).expect("store");
+        store
+            .file_item("bob-queue", "bob's private work", "", &[], &json!({}), None)
+            .expect("files");
+
+        let alice = FileToolExecutor::new(&root)
+            .with_tracker("alice-queue", "alice")
+            .with_tracker_store(store_path.clone())
+            .with_turn_tool_access(grants)
+            .with_profile_policy(Some("repo-writer"))
+            .with_tracker_feed("agent:alice", &["alice-queue".to_string()]);
+
+        // Naming someone else's queue is refused, and says what to do instead.
+        let refused = alice.execute(&call(TOOL_SUBSCRIBE_TODOS, json!({ "queue": "bob-queue" })));
+        assert_eq!(refused.status, ToolStatus::Error, "{}", refused.content);
+        assert!(
+            refused.content.contains("not a queue this turn may watch"),
+            "{}",
+            refused.content
+        );
+
+        // Refused means NOT SUBSCRIBED, not merely reported: activity on bob's
+        // queue must not reach Alice afterwards.
+        let filed = store
+            .file_item(
+                "bob-queue",
+                "second private item",
+                "",
+                &[],
+                &json!({}),
+                None,
+            )
+            .expect("files");
+        store
+            .claim_item(&filed.id, "agent:bob", None)
+            .expect("claim");
+        let notices = alice.poll_notices();
+        assert!(
+            !notices.iter().any(|n| n.contains("private")),
+            "{notices:?}"
+        );
+
+        // Her own queue still works, and so does a queue the HOST declared.
+        let own = alice.execute(&call(TOOL_SUBSCRIBE_TODOS, json!({})));
+        assert_eq!(own.status, ToolStatus::Ok, "{}", own.content);
+        let declared = alice.execute(&call(
+            TOOL_SUBSCRIBE_TODOS,
+            json!({ "queue": "alice-queue" }),
+        ));
+        assert_eq!(declared.status, ToolStatus::Ok, "{}", declared.content);
     }
 
     #[test]

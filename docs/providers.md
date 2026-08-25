@@ -157,6 +157,11 @@ The current scope is **experimental**:
   also subscribe itself. A subscription begins at the queue's current position,
   so it reports what happens next rather than replaying history.
 
+  The grant does not widen which queues a turn can read. An agent may subscribe
+  only to its own configured queue and to the queues you name in
+  `WHIPPLESCRIPT_HARNESS_TRACKER_FEED`; any other queue is refused. Watching a
+  queue therefore discloses nothing the turn could not already read directly.
+
   A notice names the item, the change, and the actor — never the item's body or
   an event payload. It is delivered as information, not as an instruction, and
   nothing about the receiving turn's own work changes. Delivery happens on the
