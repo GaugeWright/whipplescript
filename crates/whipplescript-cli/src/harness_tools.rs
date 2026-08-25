@@ -2046,7 +2046,8 @@ impl FileToolExecutor {
             // A release with no active lease stays a no-op success: the requested
             // end state — this agent holding nothing — already holds. Releasing
             // a lease held by *another* agent is the open gap, recorded as gap
-            // (e) of the tracker-feed item on `spec/vnext-tracker.md`.
+            // (e) of `spec/tracker-event-subscriptions-tracker.md`, which owns
+            // closing it: `release_item` takes no holder at all.
             "pending" => {
                 store
                     .release_item(id)

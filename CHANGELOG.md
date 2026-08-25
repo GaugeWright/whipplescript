@@ -3,6 +3,21 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## Maintenance releases
+
+Fixes cut on a support branch for a consumer pinned to an older line, while
+`main` had moved past it. These are **not** steps in the version ladder — `main`
+never passed through them — so they are listed here rather than as ladder
+entries. They are published to crates.io only: no GitHub Release, no Homebrew
+formula, no platform archives. Policy: `spec/release-checklist.md`
+§"Maintenance releases off a support branch".
+
+- **`0.4.2`** — 2026-08-17, branch `v0.4.x`, tag `v0.4.2` (`-src` only). Partial
+  by design: `whipplescript` and `whipplescript-store` only; `whipplescript-core`,
+  `-parser`, and `-kernel` remain at `0.4.1`, and the branch's workspace version
+  still reads `0.4.1`. Carries the contended-store-write wait and the native
+  answer-delta seam backport (#196). Recorded retroactively 2026-08-25.
+
 ## [0.5.6] — 2026-08-24
 
 The labeled turn projection now publishes a turn's content as ordered
