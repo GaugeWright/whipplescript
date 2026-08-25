@@ -4944,7 +4944,10 @@ rule work
     ///   classification by accident.
     ///
     /// Closing this needs the checker to know a resource's KIND, which it
-    /// cannot see from the IR today. Tracked in `spec/vnext-tracker.md`.
+    /// cannot see from the IR today. Tracked in
+    /// `spec/flow-checker-resource-kind-tracker.md`. When the gap closes, this
+    /// test must become a negative fixture that proves the denial bites — not
+    /// merely lose its assertion.
     #[test]
     fn mcp_tool_name_grants_carry_no_static_flow_classification() {
         let secret_to_public = || {
