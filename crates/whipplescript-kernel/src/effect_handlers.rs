@@ -1746,7 +1746,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
     now: &str,
     _config: &EffectConfig,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
-    use whipplescript_store::items::{ClaimOutcome, RenewOutcome};
+    use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome};
     let input = json_from_str(&effect.input_json);
     let run_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-run"]);
     let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "queue-lease"]);
@@ -1835,9 +1835,14 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         }
         "tracker.release" => {
             let id = input.get("id").and_then(Value::as_str).unwrap_or_default();
-            match kernel.store_mut().release_item(id) {
-                Ok(true) => Ok(json!({"id": id, "status": "open"})),
-                Ok(false) => Err(format!("item `{id}` was not in progress")),
+            // `None`: the in-program `release` effect is the program acting on
+            // its own tracker, not one agent reaching across another's claim.
+            match kernel.store_mut().release_item(id, None) {
+                Ok(ReleaseOutcome::Released) => Ok(json!({"id": id, "status": "open"})),
+                Ok(ReleaseOutcome::NotHeld) => Err(format!("item `{id}` was not in progress")),
+                Ok(ReleaseOutcome::HeldByOther { holder }) => {
+                    Err(format!("item `{id}` is held by {holder}"))
+                }
                 Err(error) => Err(format!("release failed: {error:?}")),
             }
         }
@@ -1847,9 +1852,16 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                 .pointer("/payload/summary")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            match kernel.store_mut().finish_item(id, summary.as_deref()) {
-                Ok(true) => Ok(json!({"id": id, "status": "done", "summary": summary})),
-                Ok(false) => Err(format!("item `{id}` cannot finish from its current status")),
+            match kernel.store_mut().finish_item(id, summary.as_deref(), None) {
+                Ok(FinishOutcome::Finished) => {
+                    Ok(json!({"id": id, "status": "done", "summary": summary}))
+                }
+                Ok(FinishOutcome::NotOpen) => {
+                    Err(format!("item `{id}` cannot finish from its current status"))
+                }
+                Ok(FinishOutcome::HeldByOther { holder }) => {
+                    Err(format!("item `{id}` is held by {holder}"))
+                }
                 Err(error) => Err(format!("finish failed: {error:?}")),
             }
         }

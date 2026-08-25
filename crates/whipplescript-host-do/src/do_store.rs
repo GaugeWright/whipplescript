@@ -32,7 +32,9 @@ use whipplescript_store::coordination::{
     AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
 };
 use whipplescript_store::event_chain;
-use whipplescript_store::items::{apply_overlay, ClaimOutcome, RenewOutcome, WorkItem, WorkItems};
+use whipplescript_store::items::{
+    apply_overlay, ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, WorkItem, WorkItems,
+};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
 #[allow(unused_imports)]
@@ -7954,6 +7956,40 @@ fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreRe
 }
 
 /// Release the (single) active lease on an issue, if present.
+/// Holder precondition, the durable-object half of `tx_holder_conflict`
+/// (`tracker-lease.maude` I4). `None` for `expect_holder` is the operator and
+/// in-program path; `Some(actor)` refuses when a *different* actor holds the
+/// active lease. A lease that does not exist is not a conflict.
+///
+/// Column parity with the native side is the point: a refusal that only one
+/// host enforces is a refusal an agent can evade by running on the other.
+fn do_holder_conflict(
+    sql: &impl DoSql,
+    item_id: &str,
+    _now: &str,
+    expect_holder: Option<&str>,
+) -> StoreResult<Option<String>> {
+    let Some(expected) = expect_holder else {
+        return Ok(None);
+    };
+    let rows = sql
+        .query(
+            &format!(
+                "SELECT actor FROM tracker_leases WHERE issue_id = ?1 AND {DO_ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            &[text(item_id)],
+        )
+        .map_err(sql_err)?;
+    match rows.first() {
+        Some(row) => {
+            let actor = as_text(&row[0]);
+            Ok((actor != expected).then_some(actor))
+        }
+        None => Ok(None),
+    }
+}
+
 fn do_release_active_lease(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<bool> {
     let rows = sql
         .query(
@@ -8321,9 +8357,20 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         })
     }
 
-    fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
+    fn release_item(
+        &mut self,
+        item_id: &str,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<ReleaseOutcome> {
         let now = do_now(&self.sql)?;
-        do_release_active_lease(&self.sql, item_id, &now)
+        if let Some(holder) = do_holder_conflict(&self.sql, item_id, &now, expect_holder)? {
+            return Ok(ReleaseOutcome::HeldByOther { holder });
+        }
+        Ok(if do_release_active_lease(&self.sql, item_id, &now)? {
+            ReleaseOutcome::Released
+        } else {
+            ReleaseOutcome::NotHeld
+        })
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
@@ -8356,8 +8403,16 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         Ok(leases.len())
     }
 
-    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
+    fn finish_item(
+        &mut self,
+        item_id: &str,
+        summary: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
         let now = do_now(&self.sql)?;
+        if let Some(holder) = do_holder_conflict(&self.sql, item_id, &now, expect_holder)? {
+            return Ok(FinishOutcome::HeldByOther { holder });
+        }
         let status = self
             .sql
             .query(
@@ -8368,7 +8423,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             .first()
             .map(|row| as_text(&row[0]));
         if status.as_deref() != Some("open") {
-            return Ok(false);
+            return Ok(FinishOutcome::NotOpen);
         }
         let payload = serde_json::json!({"status": "closed", "summary": summary});
         do_tracker_append(
@@ -8387,7 +8442,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             )
             .map_err(sql_err)?;
         do_release_active_lease(&self.sql, item_id, &now)?;
-        Ok(true)
+        Ok(FinishOutcome::Finished)
     }
 
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
@@ -9846,6 +9901,54 @@ mod tests {
         files.remove(path).expect("remove absent is idempotent");
     }
 
+    /// DO parity for `tracker-lease.maude` I4. The native store enforces the
+    /// holder precondition; if this host did not, the refusal would be one an
+    /// agent evades simply by running on the durable object instead.
+    #[test]
+    fn do_a_non_holder_cannot_release_or_finish_a_held_item() {
+        let mut store = store();
+        WorkItems::file_item(
+            &mut store,
+            "triage",
+            "first",
+            "",
+            &[],
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("file");
+        assert_eq!(
+            WorkItems::claim_item(&mut store, "WS-1", "agent:a", None).expect("claim"),
+            ClaimOutcome::Claimed
+        );
+
+        assert_eq!(
+            WorkItems::release_item(&mut store, "WS-1", Some("agent:b")).expect("release"),
+            ReleaseOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+        assert_eq!(
+            WorkItems::finish_item(&mut store, "WS-1", None, Some("agent:b")).expect("finish"),
+            FinishOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+
+        // Refused means unchanged on this host too.
+        let after = WorkItems::get_item(&store, "WS-1")
+            .expect("get")
+            .expect("row");
+        assert_eq!(after.status, "in_progress");
+        assert_eq!(after.claimed_by.as_deref(), Some("agent:a"));
+
+        // The holder is unaffected, and the operator path still clears.
+        assert_eq!(
+            WorkItems::release_item(&mut store, "WS-1", Some("agent:a")).expect("holder release"),
+            ReleaseOutcome::Released
+        );
+    }
+
     #[test]
     fn do_work_items_file_claim_release_finish_over_dosql() {
         let mut store = store();
@@ -9922,7 +10025,10 @@ mod tests {
                 .status,
             "open"
         );
-        assert!(WorkItems::finish_item(&mut store, "WS-1", Some("done by hand")).expect("finish"));
+        assert_eq!(
+            WorkItems::finish_item(&mut store, "WS-1", Some("done by hand"), None).expect("finish"),
+            FinishOutcome::Finished
+        );
         assert_eq!(
             WorkItems::get_item(&store, "WS-1")
                 .expect("get2")

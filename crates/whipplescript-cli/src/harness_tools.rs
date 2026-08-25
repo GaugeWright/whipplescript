@@ -31,7 +31,7 @@ use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
 use whipplescript_store::coordination::{AcquireOutcome, CoordinationStore};
 use whipplescript_store::files::{FileStore, NativeFileStore};
-use whipplescript_store::items::{ClaimOutcome, WorkItemStore};
+use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, WorkItemStore};
 use whipplescript_store::{
     RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
 };
@@ -2033,26 +2033,40 @@ impl FileToolExecutor {
                 }
                 ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
             },
-            // `finish_item` is false when the item is not durably open — missing,
-            // or already closed by whoever got there first.
-            "completed" => {
-                if !store
-                    .finish_item(id, None)
-                    .map_err(|error| format!("finish: {error:?}"))?
-                {
+            // Holder-scoped (`tracker-lease.maude` I4): closing an item releases
+            // its lease, so an unguarded close ends work another agent is still
+            // doing. `NotOpen` stays the ordinary miss — missing, or already
+            // closed by whoever got there first.
+            "completed" => match store
+                .finish_item(id, None, Some(&holder))
+                .map_err(|error| format!("finish: {error:?}"))?
+            {
+                FinishOutcome::Finished => {}
+                FinishOutcome::NotOpen => {
                     return Err(format!("`{id}` is not open (missing, or already closed)"));
                 }
-            }
+                FinishOutcome::HeldByOther { holder: current } => {
+                    return Err(format!(
+                        "`{id}` is claimed by {current}, so this turn cannot close it"
+                    ));
+                }
+            },
             // A release with no active lease stays a no-op success: the requested
-            // end state — this agent holding nothing — already holds. Releasing
-            // a lease held by *another* agent is the open gap, recorded as gap
-            // (e) of `spec/tracker-event-subscriptions-tracker.md`, which owns
-            // closing it: `release_item` takes no holder at all.
-            "pending" => {
-                store
-                    .release_item(id)
-                    .map_err(|error| format!("release: {error:?}"))?;
-            }
+            // end state — this agent holding nothing — already holds. A lease
+            // held by ANOTHER agent is refused rather than silently taken: the
+            // refusal has to reach the model, or a stale agent quietly unclaims
+            // live work and both agents proceed as if they own it.
+            "pending" => match store
+                .release_item(id, Some(&holder))
+                .map_err(|error| format!("release: {error:?}"))?
+            {
+                ReleaseOutcome::Released | ReleaseOutcome::NotHeld => {}
+                ReleaseOutcome::HeldByOther { holder: current } => {
+                    return Err(format!(
+                        "`{id}` is claimed by {current}, so this turn cannot release it"
+                    ));
+                }
+            },
             other => return Err(format!("unknown status `{other}`")),
         }
         Ok(json!({ "id": id, "status": status }).to_string())

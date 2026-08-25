@@ -30657,7 +30657,9 @@ fn emit_issue_row(
 }
 
 fn issue(options: &CliOptions) -> ExitCode {
-    use whipplescript_store::items::{ClaimOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore};
+    use whipplescript_store::items::{
+        ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SetFieldOutcome, WorkItemStore,
+    };
     let usage = ISSUE_USAGE;
     let args = &options.args;
     let command = args.first().map(String::as_str).unwrap_or("list");
@@ -30944,10 +30946,18 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.release_item(id) {
-                Ok(true) => emit_issue_row(&store, id, "released", options.json),
-                Ok(false) => {
+            // `None`: an operator clearing a stuck lease is the deliberate
+            // escape hatch the holder precondition must not close.
+            match store.release_item(id, None) {
+                Ok(ReleaseOutcome::Released) => {
+                    emit_issue_row(&store, id, "released", options.json)
+                }
+                Ok(ReleaseOutcome::NotHeld) => {
                     eprintln!("issue `{id}` had no active claim to release");
+                    ExitCode::FAILURE
+                }
+                Ok(ReleaseOutcome::HeldByOther { holder }) => {
+                    eprintln!("issue `{id}` is held by {holder}");
                     ExitCode::FAILURE
                 }
                 Err(error) => report_store_error("failed to release claim", error),
@@ -30986,10 +30996,14 @@ fn issue(options: &CliOptions) -> ExitCode {
                 return ExitCode::from(2);
             };
             let summary = flag_value(args, "--summary");
-            match store.finish_item(id, summary.as_deref()) {
-                Ok(true) => emit_issue_row(&store, id, "finished", options.json),
-                Ok(false) => {
+            match store.finish_item(id, summary.as_deref(), None) {
+                Ok(FinishOutcome::Finished) => emit_issue_row(&store, id, "finished", options.json),
+                Ok(FinishOutcome::NotOpen) => {
                     eprintln!("issue `{id}` is not open (cannot finish)");
+                    ExitCode::FAILURE
+                }
+                Ok(FinishOutcome::HeldByOther { holder }) => {
+                    eprintln!("issue `{id}` is held by {holder}");
                     ExitCode::FAILURE
                 }
                 Err(error) => report_store_error("failed to finish issue", error),
@@ -31003,10 +31017,16 @@ fn issue(options: &CliOptions) -> ExitCode {
                 eprintln!("{usage}");
                 return ExitCode::from(2);
             };
-            match store.release_item(id) {
-                Ok(true) => emit_issue_row(&store, id, "failed (claim released)", options.json),
-                Ok(false) => {
+            match store.release_item(id, None) {
+                Ok(ReleaseOutcome::Released) => {
+                    emit_issue_row(&store, id, "failed (claim released)", options.json)
+                }
+                Ok(ReleaseOutcome::NotHeld) => {
                     eprintln!("issue `{id}` had no active claim to fail");
+                    ExitCode::FAILURE
+                }
+                Ok(ReleaseOutcome::HeldByOther { holder }) => {
+                    eprintln!("issue `{id}` is held by {holder}");
                     ExitCode::FAILURE
                 }
                 Err(error) => report_store_error("failed to fail issue", error),

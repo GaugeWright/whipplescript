@@ -3,6 +3,39 @@
 All notable changes to WhippleScript are recorded here. This project aims to
 follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
+## [Unreleased]
+
+### Fixed
+
+- **A non-holder can no longer release or close a claimed tracker item**
+  (`tracker-lease.maude` I4). `update_todo` called `finish_item` and
+  `release_item` with no holder, and `WorkItems::release_item` took no holder at
+  all — it stripped whichever active lease it found. With several agents on one
+  tracker, a stale agent could unclaim or close work another agent was still
+  doing, and both would then proceed believing they owned the item.
+
+  `release_item` and `finish_item` now take `expect_holder: Option<&str>` and
+  return `ReleaseOutcome` / `FinishOutcome` instead of `bool`. `Some(actor)`
+  refuses with `HeldByOther { holder }` when a different actor holds the lease,
+  and both agent paths pass it — native and durable object alike, because a
+  refusal enforced on one host is one an agent evades by running on the other.
+  `None` preserves the unconditional behaviour for the operator escape hatch
+  (`whip issue release`, `whip issue fail`) and the in-program `release` effect,
+  so a stuck lease stays clearable.
+
+  The check runs inside the mutation's own transaction; a caller-side
+  read-then-act would be a TOCTOU race against the CAS the lease exists to be.
+  It guards against clobbering *another* actor, not against acting on an
+  unclaimed item, so closing an unclaimed item still works.
+
+  The lease model had no rule for explicit release at all before this — only
+  terminal-release (I3) — so the implementation was less holder-aware than its
+  own model. I4 generalizes I2's holder-only renew to any holder-scoped lease
+  mutation.
+
+  **Breaking for embedders** implementing `WorkItems` or calling either method:
+  both signatures gained a parameter and both return types changed.
+
 ## Maintenance releases
 
 Fixes cut on a support branch for a consumer pinned to an older line, while

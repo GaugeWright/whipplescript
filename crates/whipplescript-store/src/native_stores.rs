@@ -798,16 +798,25 @@ impl WorkItems for NativeStores {
         self.items.renew_claim(item_id, actor, expires)
     }
 
-    fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
-        self.items.release_item(item_id)
+    fn release_item(
+        &mut self,
+        item_id: &str,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<ReleaseOutcome> {
+        self.items.release_item(item_id, expect_holder)
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
         self.items.release_claims_for_holder(holder)
     }
 
-    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
-        self.items.finish_item(item_id, summary)
+    fn finish_item(
+        &mut self,
+        item_id: &str,
+        summary: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
+        self.items.finish_item(item_id, summary, expect_holder)
     }
 
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {

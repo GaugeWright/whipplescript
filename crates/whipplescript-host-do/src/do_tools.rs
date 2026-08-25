@@ -34,7 +34,7 @@ use whipplescript_kernel::harness_loop::{
 };
 use whipplescript_kernel::host_package::workspace_tool_specs_from_registry;
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
-use whipplescript_store::items::{ClaimOutcome, WorkItems};
+use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, WorkItems};
 use whipplescript_store::RuntimeStore;
 
 use crate::do_store::{DoSql, DoSqliteStore, SqlValue};
@@ -587,23 +587,39 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 }
                 ClaimOutcome::NotFound => return Err(format!("`{id}` was not found")),
             },
-            // `finish_item` is false when the item is not durably open — missing,
-            // or already closed by whoever got there first.
-            "completed" => {
-                if !store
-                    .finish_item(id, None)
-                    .map_err(|error| format!("finish: {error:?}"))?
-                {
+            // Holder-scoped, at parity with the native path
+            // (`tracker-lease.maude` I4): closing releases the lease, so an
+            // unguarded close ends work another holder is still doing.
+            "completed" => match store
+                .finish_item(id, None, Some(&holder))
+                .map_err(|error| format!("finish: {error:?}"))?
+            {
+                FinishOutcome::Finished => {}
+                FinishOutcome::NotOpen => {
                     return Err(format!("`{id}` is not open (missing, or already closed)"));
                 }
-            }
+                FinishOutcome::HeldByOther { holder: current } => {
+                    return Err(format!(
+                        "`{id}` is claimed by {current}, so this turn cannot close it"
+                    ));
+                }
+            },
             // A release with no active lease stays a no-op success, as natively:
-            // the requested end state — this holder holding nothing — holds.
-            "pending" => {
-                store
-                    .release_item(id)
-                    .map_err(|error| format!("release: {error:?}"))?;
-            }
+            // the requested end state — this holder holding nothing — holds. A
+            // lease held by another holder is refused, also as natively: a
+            // refusal enforced on only one host is one an agent evades by
+            // running on the other.
+            "pending" => match store
+                .release_item(id, Some(&holder))
+                .map_err(|error| format!("release: {error:?}"))?
+            {
+                ReleaseOutcome::Released | ReleaseOutcome::NotHeld => {}
+                ReleaseOutcome::HeldByOther { holder: current } => {
+                    return Err(format!(
+                        "`{id}` is claimed by {current}, so this turn cannot release it"
+                    ));
+                }
+            },
             other => return Err(format!("unknown status `{other}`")),
         }
         Ok(json!({ "id": id, "status": status }).to_string())
@@ -1356,7 +1372,46 @@ mod tests {
             missing.content
         );
 
-        // Nor is closing what someone already closed.
+        // Nor is CLOSING an item whose lease someone else holds
+        // (`tracker-lease.maude` I4). Closing releases the lease, so an
+        // unguarded close would end work `instance:wf-1` is still doing —
+        // which is exactly what this path did before the holder precondition.
+        let stolen = exec.execute(&call(
+            "update_todo",
+            json!({ "id": id, "status": "completed" }),
+        ));
+        assert_eq!(stolen.status, ToolStatus::Error, "{}", stolen.content);
+        assert!(
+            stolen.content.contains("claimed by instance:wf-1"),
+            "{}",
+            stolen.content
+        );
+        // And the refusal left it alone rather than half-closing it.
+        assert_eq!(
+            WorkItems::get_item(&other, &id)
+                .expect("get")
+                .expect("row")
+                .status,
+            "in_progress"
+        );
+        // Releasing another actor's lease is refused for the same reason.
+        let unclaim = exec.execute(&call(
+            "update_todo",
+            json!({ "id": id, "status": "pending" }),
+        ));
+        assert_eq!(unclaim.status, ToolStatus::Error, "{}", unclaim.content);
+        assert!(
+            unclaim.content.contains("claimed by instance:wf-1"),
+            "{}",
+            unclaim.content
+        );
+
+        // With the lease cleared through the operator path, the close lands —
+        // and closing what is already closed is still the ordinary miss.
+        assert_eq!(
+            WorkItems::release_item(&mut other, &id, None).expect("operator release"),
+            ReleaseOutcome::Released
+        );
         let done = exec.execute(&call(
             "update_todo",
             json!({ "id": id, "status": "completed" }),

@@ -521,14 +521,33 @@ impl WorkItemStore {
         })
     }
 
-    pub fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
+    /// Release the active lease on an issue, optionally only if `expect_holder`
+    /// holds it (`tracker-lease.maude` I4, holder-only release).
+    ///
+    /// `None` releases whatever is there — the operator escape hatch for a stuck
+    /// lease, and the in-program `release` effect. `Some(actor)` refuses when a
+    /// *different* actor holds it, which is what keeps a stale agent from
+    /// releasing live work.
+    pub fn release_item(
+        &mut self,
+        item_id: &str,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<ReleaseOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
+        if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
+            tx.commit()?;
+            return Ok(ReleaseOutcome::HeldByOther { holder });
+        }
         let released = tx_release_active_lease(&tx, item_id, &now)?;
         tx.commit()?;
-        Ok(released)
+        Ok(if released {
+            ReleaseOutcome::Released
+        } else {
+            ReleaseOutcome::NotHeld
+        })
     }
 
     /// Terminal-releases-all (`tracker-lease.maude` I3, E7 non-opt-out): every
@@ -554,11 +573,25 @@ impl WorkItemStore {
 
     /// Marks the item done (`issue.closed`), records the optional summary, and
     /// releases any active lease. Finishable only from durable `open`.
-    pub fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
+    ///
+    /// Holder-scoped when `expect_holder` is `Some` (`tracker-lease.maude` I4).
+    /// Closing releases the lease, so an unguarded close is the same clobber as
+    /// an unguarded release, one step removed — it ends work another actor is
+    /// still doing.
+    pub fn finish_item(
+        &mut self,
+        item_id: &str,
+        summary: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = tx_now(&tx)?;
+        if let Some(holder) = tx_holder_conflict(&tx, item_id, &now, expect_holder)? {
+            tx.commit()?;
+            return Ok(FinishOutcome::HeldByOther { holder });
+        }
         let status: Option<String> = tx
             .query_row(
                 "SELECT status FROM tracker_issues WHERE issue_id = ?1",
@@ -568,7 +601,7 @@ impl WorkItemStore {
             .optional()?;
         if status.as_deref() != Some("open") {
             tx.commit()?;
-            return Ok(false);
+            return Ok(FinishOutcome::NotOpen);
         }
         let payload = json!({"status": "closed", "summary": summary});
         tx_append_event(&tx, Some(item_id), "issue.closed", &payload, None, &now)?;
@@ -579,7 +612,7 @@ impl WorkItemStore {
         )?;
         tx_release_active_lease(&tx, item_id, &now)?;
         tx.commit()?;
-        Ok(true)
+        Ok(FinishOutcome::Finished)
     }
 
     /// Direct an open issue at `assignee`, or clear it with `None` (0.2.2).
@@ -1580,8 +1613,55 @@ fn tx_expire_stale_leases(tx: &Transaction<'_>, item_id: &str, now: &str) -> Sto
     Ok(())
 }
 
+/// The active lease on `item_id`, if any, as `(lease_id, actor)`.
+#[cfg(feature = "native")]
+fn tx_active_lease_holder(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    now: &str,
+) -> StoreResult<Option<(String, String)>> {
+    Ok(tx
+        .query_row(
+            &format!(
+                "SELECT lease_id, actor FROM tracker_leases WHERE issue_id = ?1 AND {ACTIVE_LEASE} \
+                 ORDER BY acquired_at DESC LIMIT 1"
+            ),
+            params![item_id, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Holder precondition, evaluated INSIDE the caller's transaction.
+///
+/// `expect_holder` is `None` for the operator and in-program paths, which may
+/// release a stuck lease deliberately. It is `Some(actor)` for an agent, where
+/// the whole point is that a stale one must not act on a lease someone else
+/// now holds. Checking outside the transaction would be a TOCTOU race against
+/// the very CAS the lease exists to be, so this is not a caller-side check.
+///
+/// A lease that does not exist is not a conflict: the precondition guards
+/// against clobbering *another* actor, not against acting on an unclaimed item.
+#[cfg(feature = "native")]
+fn tx_holder_conflict(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    now: &str,
+    expect_holder: Option<&str>,
+) -> StoreResult<Option<String>> {
+    let Some(expected) = expect_holder else {
+        return Ok(None);
+    };
+    match tx_active_lease_holder(tx, item_id, now)? {
+        Some((_, actor)) if actor != expected => Ok(Some(actor)),
+        _ => Ok(None),
+    }
+}
+
 /// Release the (single) active lease on an issue, if present. Returns whether a
-/// lease was released.
+/// lease was released. Unconditional: the holder precondition is the caller's,
+/// via `tx_holder_conflict`, so the terminal and expiry paths that legitimately
+/// strip another actor's lease keep working.
 #[cfg(feature = "native")]
 fn tx_release_active_lease(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResult<bool> {
     let lease: Option<(String, String)> = tx
@@ -2145,11 +2225,22 @@ pub trait WorkItems {
         expires: Option<&str>,
     ) -> StoreResult<RenewOutcome>;
 
-    fn release_item(&mut self, item_id: &str) -> StoreResult<bool>;
+    /// Holder-scoped when `expect_holder` is `Some` (`tracker-lease.maude` I4);
+    /// `None` is the operator/in-program path that may clear a stuck lease.
+    fn release_item(
+        &mut self,
+        item_id: &str,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<ReleaseOutcome>;
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize>;
 
-    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool>;
+    fn finish_item(
+        &mut self,
+        item_id: &str,
+        summary: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome>;
 
     /// Records a `blocks(from -> to)` edge (`to` is gated until `from` closes).
     /// The relation source-verbs' A+blockers seam; `from` blocks `to`.
@@ -2215,16 +2306,25 @@ impl WorkItems for WorkItemStore {
         self.renew_claim(item_id, actor, expires)
     }
 
-    fn release_item(&mut self, item_id: &str) -> StoreResult<bool> {
-        self.release_item(item_id)
+    fn release_item(
+        &mut self,
+        item_id: &str,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<ReleaseOutcome> {
+        self.release_item(item_id, expect_holder)
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
         self.release_claims_for_holder(holder)
     }
 
-    fn finish_item(&mut self, item_id: &str, summary: Option<&str>) -> StoreResult<bool> {
-        self.finish_item(item_id, summary)
+    fn finish_item(
+        &mut self,
+        item_id: &str,
+        summary: Option<&str>,
+        expect_holder: Option<&str>,
+    ) -> StoreResult<FinishOutcome> {
+        self.finish_item(item_id, summary, expect_holder)
     }
 
     fn add_blocks(&mut self, from: &str, to: &str) -> StoreResult<()> {
@@ -2247,6 +2347,29 @@ pub enum RenewOutcome {
     Renewed { expires_at: Option<String> },
     NotHeld,
     NotMonotonic,
+}
+
+/// Outcome of `release_item` (`tracker-lease.maude` I4, holder-only release).
+///
+/// `NotHeld` is a SUCCESS, not a refusal: releasing an issue carrying no active
+/// lease already satisfies the requested end state — this actor holding nothing.
+/// `HeldByOther` is the refusal, and it names the holder because a caller that
+/// cannot say who has the item hands the model nothing it can act on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReleaseOutcome {
+    Released,
+    NotHeld,
+    HeldByOther { holder: String },
+}
+
+/// Outcome of `finish_item` (`tracker-lease.maude` I4). `NotOpen` folds the two
+/// non-conflict misses the old `false` carried — missing, or already closed by
+/// whoever got there first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FinishOutcome {
+    Finished,
+    NotOpen,
+    HeldByOther { holder: String },
 }
 
 #[cfg(feature = "native")]
@@ -2752,7 +2875,8 @@ mod tests {
 
         // A finishes (issue.closed → status "closed"); B sets status "open" —
         // both chaining off the shared created event.
-        a.finish_item(&issue.id, Some("done")).expect("finish");
+        a.finish_item(&issue.id, Some("done"), None)
+            .expect("finish");
         b.set_field(b_alias, "status", "open").expect("set");
 
         b.import_events(&a.export_events().unwrap()).unwrap();
@@ -3273,7 +3397,12 @@ mod tests {
                 .expect("release"),
             1
         );
-        assert!(items.finish_item(&filed.id, Some("done")).expect("finish"));
+        assert_eq!(
+            items
+                .finish_item(&filed.id, Some("done"), None)
+                .expect("finish"),
+            FinishOutcome::Finished
+        );
         assert_eq!(
             items
                 .list_items(Some("backlog"), Some("closed"))
@@ -3401,7 +3530,9 @@ mod tests {
         let item = store
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
-        store.finish_item(&item.id, Some("done")).expect("finishes");
+        store
+            .finish_item(&item.id, Some("done"), None)
+            .expect("finishes");
         assert!(
             !store.assign_item(&item.id, Some("alice")).expect("no-op"),
             "reassigning a closed issue must be a no-op, not a silent rewrite",
@@ -3474,7 +3605,10 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         store.claim_item(&item.id, "w", None).expect("claims");
-        assert!(store.release_item(&item.id).expect("releases"));
+        assert_eq!(
+            store.release_item(&item.id, None).expect("releases"),
+            ReleaseOutcome::Released
+        );
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
     }
 
@@ -3530,7 +3664,10 @@ mod tests {
             store.claim_item(&item.id, "w1", None).expect("claims"),
             ClaimOutcome::Claimed
         );
-        assert!(store.release_item(&item.id).expect("releases"));
+        assert_eq!(
+            store.release_item(&item.id, None).expect("releases"),
+            ReleaseOutcome::Released
+        );
         let mut claimed = 0;
         for worker in 0..3 {
             if let ClaimOutcome::Claimed = store
@@ -3589,9 +3726,12 @@ mod tests {
             .file_item("backlog", "a", "", &[], &json!({}), None)
             .expect("files");
         store.claim_item(&item.id, "w", None).expect("claims");
-        assert!(store
-            .finish_item(&item.id, Some("done by agent"))
-            .expect("finishes"));
+        assert_eq!(
+            store
+                .finish_item(&item.id, Some("done by agent"), None)
+                .expect("finishes"),
+            FinishOutcome::Finished
+        );
         let item = store.get_item(&item.id).expect("gets").expect("exists");
         assert_eq!(item.status, "closed");
         assert!(store.ready_items("backlog").expect("ready").is_empty());
@@ -3637,6 +3777,98 @@ mod tests {
 
     /// Claim TTL (T3): a finite absolute `expires` records a timed lease that
     /// blocks readiness while in the future and stops blocking once past-due —
+    /// `tracker-lease.maude` I4 (holder-only release). Before the precondition
+    /// existed, both of these silently succeeded: `release_item` took no holder
+    /// at all and `finish_item` released whatever lease it found, so a stale
+    /// agent could unclaim or close live work and both agents would proceed
+    /// believing they owned the item.
+    #[test]
+    fn a_non_holder_cannot_release_or_finish_a_held_item() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(
+            store.claim_item(&item.id, "agent:a", None).expect("claims"),
+            ClaimOutcome::Claimed
+        );
+
+        // The refusal names the holder: a caller that cannot say who has the
+        // item hands the model nothing it can act on.
+        assert_eq!(
+            store
+                .release_item(&item.id, Some("agent:b"))
+                .expect("release refused"),
+            ReleaseOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .finish_item(&item.id, None, Some("agent:b"))
+                .expect("finish refused"),
+            FinishOutcome::HeldByOther {
+                holder: "agent:a".to_string()
+            }
+        );
+
+        // Refused means UNCHANGED, not merely reported: the lease still stands
+        // and the issue is still open. A refusal that already did the damage is
+        // not a refusal.
+        let after = store.get_item(&item.id).expect("gets").expect("exists");
+        assert_eq!(after.status, "in_progress");
+        assert_eq!(after.claimed_by.as_deref(), Some("agent:a"));
+
+        // The holder itself is unaffected by the precondition.
+        assert_eq!(
+            store
+                .release_item(&item.id, Some("agent:a"))
+                .expect("holder releases"),
+            ReleaseOutcome::Released
+        );
+    }
+
+    /// The precondition guards against clobbering ANOTHER actor, not against
+    /// acting on an unclaimed item — so an item with no lease stays workable,
+    /// and releasing nothing stays an idempotent success rather than an error.
+    #[test]
+    fn an_unheld_item_is_not_a_holder_conflict() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(
+            store
+                .release_item(&item.id, Some("agent:b"))
+                .expect("release of an unheld item"),
+            ReleaseOutcome::NotHeld
+        );
+        assert_eq!(
+            store
+                .finish_item(&item.id, None, Some("agent:b"))
+                .expect("finish of an unheld item"),
+            FinishOutcome::Finished
+        );
+    }
+
+    /// `None` is the operator escape hatch (`whip issue release`, `fail`) and
+    /// the in-program `release` effect. It must keep clearing a lease the
+    /// caller does not hold, or a stuck lease becomes unrecoverable.
+    #[test]
+    fn an_unscoped_release_still_clears_another_actors_lease() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        store.claim_item(&item.id, "agent:a", None).expect("claims");
+        assert_eq!(
+            store
+                .release_item(&item.id, None)
+                .expect("operator release"),
+            ReleaseOutcome::Released
+        );
+    }
+
     /// so a claim in the past is expired-on-arrival and never blocks.
     #[test]
     fn claim_with_ttl_records_a_finite_expiry() {
@@ -3738,7 +3970,10 @@ mod tests {
             .collect();
         assert_eq!(ready, vec![blocker.id.clone()], "blocked issue is gated");
         // Closing the blocker frees the blocked issue.
-        assert!(store.finish_item(&blocker.id, None).expect("finish"));
+        assert_eq!(
+            store.finish_item(&blocker.id, None, None).expect("finish"),
+            FinishOutcome::Finished
+        );
         let ready: Vec<String> = store
             .ready_items("backlog")
             .expect("ready")
@@ -3775,8 +4010,10 @@ mod tests {
             .renew_claim(&c.id, "w1", Some("2099-01-01 00:00:00"))
             .expect("renew");
         store.claim_item(&a.id, "w2", None).expect("claims a");
-        store.release_item(&a.id).expect("release a");
-        store.finish_item(&b.id, Some("done")).expect("finish b");
+        store.release_item(&a.id, None).expect("release a");
+        store
+            .finish_item(&b.id, Some("done"), None)
+            .expect("finish b");
 
         let before = store.dump_projection().expect("dump before");
         store.rebuild_projection().expect("rebuild");

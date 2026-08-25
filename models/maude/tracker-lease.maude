@@ -10,6 +10,11 @@
 --- extend its expiresAt.
 --- Invariant I3 (terminal-release, E7): reaching a terminal for an actor
 --- releases EVERY lease that actor holds across ALL issues at once.
+--- Invariant I4 (holder-only release): only the actor that holds a lease can
+--- release it explicitly. I2 generalized from renew to any holder-scoped
+--- lease mutation -- an explicit release is a lease mutation like any other,
+--- and the implementation had NO model counterpart for it at all: release
+--- was issue-scoped, so a non-holder could strip a live lease.
 ---
 --- CRITICAL: the grant guard "no active lease on this issue anywhere" is a
 --- global predicate. A guard over a bare associative-commutative soup is
@@ -40,6 +45,13 @@ mod TRACKER-LEASE is
   op terminal : Nat -> Fact [ctor] .
   --- released(actor): a terminal has been processed for the actor.
   op released : Nat -> Fact [ctor] .
+  --- releaseReq(issue, actor): a pending EXPLICIT release request, distinct
+  --- from the terminal-release of I3.
+  op releaseReq : Nat Nat -> Fact [ctor] .
+  --- releasedLease(issue, actor): an explicit release was honoured. The rule
+  --- needs an observable product, or "the lease is gone" cannot be searched
+  --- for -- a residual variable absorbs an absence.
+  op releasedLease : Nat Nat -> Fact [ctor] .
 
   vars I A E E2 T : Nat .
   var C : Cfg .
@@ -69,4 +81,12 @@ mod TRACKER-LEASE is
 
   --- Terminal-release: strip every lease held by the terminated actor at once.
   rl [release] : { terminal(A) C } => { released(A) stripLeases(A, C) } .
+
+  --- Explicit release: honoured only for the actor that holds the lease --
+  --- the request and the lease must share issue AND actor, exactly as renew
+  --- does. A non-holder request matches nothing, so the lease survives.
+  --- Fragment matching is sound here for the same reason it is for renew:
+  --- this is a positive local match, not the global negative predicate that
+  --- forced [grant] to wrap the whole state.
+  rl [releaseHeld] : releaseReq(I, A) lease(I, A, E) => releasedLease(I, A) .
 endm

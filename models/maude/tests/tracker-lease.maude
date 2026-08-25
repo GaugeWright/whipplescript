@@ -22,6 +22,11 @@ search in TRACKER-LEASE :
   { terminal(1) lease(1, 1, 100) lease(2, 1, 100) now(50) }
   =>! { released(1) now(50) } .
 
+--- Coverage 5 (holder-only release, I4): the holder releases its own lease.
+search in TRACKER-LEASE :
+  { releaseReq(1, 1) lease(1, 1, 100) now(50) }
+  =>! { releasedLease(1, 1) now(50) } .
+
 --- Bite 1 (exclusivity): two claims on the SAME issue never both become
 --- active leases. This is the wrapped-state check -- with a bare soup the
 --- second grant would match a fragment and this would find a solution.
@@ -40,5 +45,13 @@ search in TRACKER-LEASE :
 search in TRACKER-LEASE :
   { terminal(1) lease(1, 1, 100) lease(2, 1, 100) lease(3, 2, 100) now(50) }
   =>* { released(1) lease(II:Nat, 1, EE:Nat) RESIDUAL:Cfg } .
+
+--- Bite 4 (holder-only release, I4): a NON-holder release -- actor 9 against
+--- a lease held by actor 1 -- never strips the lease. Searched through the
+--- releasedLease product rather than the lease's absence, because RESIDUAL
+--- would absorb an absence and the search would pass vacuously.
+search in TRACKER-LEASE :
+  { releaseReq(1, 9) lease(1, 1, 100) now(50) }
+  =>* { releasedLease(1, AA:Nat) RESIDUAL:Cfg } .
 
 quit .

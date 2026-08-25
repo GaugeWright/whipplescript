@@ -109,7 +109,7 @@ text-merge-compose.maude	SSSSSNNNSSN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
 tracker-claim-turn.maude	NSNS
 tracker-lease-merge.maude	SSSNNS
-tracker-lease.maude	SSSSNNN
+tracker-lease.maude	SSSSSNNNN
 tracker-merge.maude	SSSSSNNNS
 tracker-projection.maude	SSNNN
 tracker-readiness.maude	SSSNNNN
