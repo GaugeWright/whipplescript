@@ -513,24 +513,35 @@ mod tests {
     /// land, and each is told the count *its own* bump produced: across every
     /// worker the reported counts are exactly 1..=N, no value twice.
     ///
-    /// The landing half of that is what this test actually catches. The
-    /// distinctness half is the property `RETURNING` on the upsert buys — the
-    /// increment and its answer are one statement, so no other bump can land
-    /// between them — and it is asserted here as the executable statement of
-    /// the contract, not as evidence the contract is enforced. Reading the
-    /// count back with a separate SELECT violates it, and this test does not
-    /// reliably catch that: measured against the read-back version it failed 0
-    /// of 5 runs here, and only about 2 in 3 runs at 4,800 contended bumps
-    /// (~5s), which is too slow and too much of a coin flip to keep.
+    /// Both halves bite. The distinctness half is the property `RETURNING` on
+    /// the upsert buys — the increment and its answer are one statement, so no
+    /// other bump can land between them — and it takes the two pragmas below
+    /// to catch its absence. Against a read-back version this fails 5 runs in
+    /// 5, in about 0.03s.
     ///
-    /// Worth knowing why the window is so hard to hit, because it also bounds
-    /// how bad the defect is: SQLite's busy handler *sleeps* before retrying,
-    /// so a writer that lost the lock wakes milliseconds later, long after the
-    /// winner's microsecond-wide gap between its upsert and its read-back has
-    /// closed. A stale read-back needs two bumps that were never in contention
-    /// to interleave anyway. That is rare, not impossible — and the count feeds
-    /// the `recurring` threshold, where a value reported twice makes a check
-    /// written at equality fire twice or slip past unseen.
+    /// Those pragmas are worth explaining, because without them this test
+    /// passes against the read-back version and proves nothing. The window is
+    /// the microsecond-wide gap between a worker's upsert committing and its
+    /// read-back taking a snapshot, and two things hide it — both timing,
+    /// neither isolation:
+    ///
+    /// 1. SQLite's busy handler *sleeps* before retrying, a millisecond on the
+    ///    first attempt, so a writer that lost the lock wakes three orders of
+    ///    magnitude later than the window it would have to land in. A handler
+    ///    that retries at once polls at the window's own scale.
+    /// 2. `synchronous = FULL` fsyncs the WAL on every commit, and that fsync
+    ///    is itself wider than the window — so the interposing writer, spinning
+    ///    or not, cannot *finish* inside it. This is the dominant shield: with
+    ///    the spin handler alone the read-back version still passed 3 runs in
+    ///    5; dropping the fsync took it to 5 failures in 5.
+    ///
+    /// Neither pragma invents a race. Real processes do back off and do fsync;
+    /// what these remove is the machine-dependent shield that keeps a real
+    /// interleaving from being observed here — the same shield a faster disk
+    /// or a busier box removes on its own. And the defect they expose is not
+    /// cosmetic: the count feeds the `recurring` threshold, where a value
+    /// reported twice makes a check written at equality fire twice or slip
+    /// past unseen.
     ///
     /// The barrier before `open` is doing separate work: the opens contend too,
     /// and that is the fresh-file WAL conversion race `establish_wal` exists
@@ -553,6 +564,20 @@ mod tests {
                 std::thread::spawn(move || {
                     open_together.wait();
                     let mut store = IncidentStore::open(&path).expect("open store");
+                    // Retry at once rather than sleeping, and give up long
+                    // after any contention here could still be live, so a lock
+                    // that never frees surfaces as an error instead of hanging.
+                    store
+                        .connection
+                        .busy_handler(Some(|attempts| attempts < 1_000_000))
+                        .expect("install the spinning busy handler");
+                    // See the doc comment: the commit fsync is wider than the
+                    // window this test has to observe, so it is the shield that
+                    // has to go.
+                    store
+                        .connection
+                        .execute_batch("PRAGMA synchronous = OFF")
+                        .expect("drop the commit fsync");
                     (0..ROUNDS)
                         .map(|bump| {
                             // A barrier per round, not just one at the start:
@@ -561,7 +586,9 @@ mod tests {
                             // gap between them is almost never occupied.
                             // Re-aligning every round puts all the upserts in
                             // flight at once, which is what makes a separate
-                            // read-back observably stale.
+                            // read-back observably stale — given the two
+                            // pragmas above, without which no alignment is
+                            // fine enough to matter.
                             bump_together.wait();
                             // Argument order alternates: the pair key is
                             // symmetric, so every worker contends for one row.
