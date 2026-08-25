@@ -95,6 +95,21 @@ while IFS= read -r lock; do
     npm --prefix "${dir:-.}" audit --omit=dev
 done < <(git ls-files '*package-lock.json')
 
+echo "== supply-chain policy =="
+# What `cargo audit` does not answer: the LICENSES the dependency tree carries,
+# whether a crate arrives from an unexpected registry or git remote, and how far
+# the tree has duplicated. deny.toml holds the policy; this reads Cargo.lock and
+# crate metadata rather than compiling, so it is cheap enough for every change.
+# Advisories are left out of the invocation on purpose — `cargo audit` above is
+# already the hard advisory gate over the same RustSec database, and a second
+# one only adds nondeterministic breakage when a new advisory lands. deny.toml
+# says the same at more length.
+command -v cargo-deny >/dev/null || {
+    echo "cargo-deny is not installed; run: cargo install cargo-deny --locked" >&2
+    exit 1
+}
+cargo deny check bans licenses sources
+
 echo "== formatting =="
 cargo fmt --all -- --check
 

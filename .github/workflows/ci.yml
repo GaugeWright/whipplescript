@@ -115,11 +115,14 @@ jobs:
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The green bar audits the dependency tree, so the tool it needs is
-      # installed here rather than in a workflow that runs the audit separately.
+      # The green bar audits the dependency tree and checks its supply-chain
+      # policy, so the tools it needs are installed here rather than in workflows
+      # that run those checks separately. cargo-deny is version-pinned because it
+      # gates license and source policy; a floating build could change a verdict
+      # under an unchanged tree.
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
-          tool: cargo-audit
+          tool: cargo-audit, cargo-deny@0.20.2
       # The green bar now audits the npm trees too, so this job needs the pinned
       # Node even though it skips the hosted-runtime contracts below.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7

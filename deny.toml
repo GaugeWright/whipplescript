@@ -1,0 +1,72 @@
+# cargo-deny supply-chain policy for whipplescript-src (SOC 2 4.1).
+#
+# scripts/check.sh already runs `cargo audit` (the RustSec advisory DB) and
+# `cargo clippy -D warnings`. What neither answers is the rest of the supply
+# chain: what LICENSES the dependency tree carries, whether crates arrive from
+# an unexpected REGISTRY or git remote, and how badly the tree has DUPLICATED.
+# That is what this file adds. The green bar runs `cargo deny check bans
+# licenses sources` next to the audit; see scripts/check.sh.
+#
+# Advisories are deliberately NOT a hard gate here. `cargo audit` in check.sh is
+# already the hard advisory gate and reads the same RustSec database, so making
+# cargo-deny also fail on a vulnerability would be a redundant second gate whose
+# only distinct effect is nondeterministic breakage when a new advisory lands
+# between one green run and the next. The advisories check is therefore left out
+# of the invocation rather than downgraded crate-by-crate. This section stays so
+# that a manual `cargo deny check advisories` still denies yanked releases —
+# something `cargo audit` does not check, because it needs the registry index.
+
+[advisories]
+# A yanked release is a supply-chain signal cargo audit does not surface. Denied
+# for the manual `cargo deny check advisories` path; the gate does not run it.
+yanked = "deny"
+
+[licenses]
+# The standard permissive set, plus every additional license actually present in
+# this tree (each justified where it is added). A copyleft license appearing on
+# a statically linked dependency would fail here rather than be waved through.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "OpenSSL",
+    # Present in this tree. libbz2-rs-sys (the bzip2 codec, pulled in through the
+    # store's compression path) carries the permissive BSD-style bzip2 license.
+    "bzip2-1.0.6",
+    # Present in this tree. webpki-roots ships Mozilla's trusted CA root bundle,
+    # which is distributed under the permissive Community Data License Agreement.
+    # The 2.0 revision carries no share-alike obligation.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# The allow list above is the set of licenses this project will accept, kept
+# broader than the current tree on purpose so a routine dependency bump onto a
+# standard permissive license does not fail the gate. cargo-deny would otherwise
+# warn on each allowed-but-absent entry; silence that, since the breadth is
+# deliberate. A newly appearing license still outside the list still fails.
+unused-allowed-license = "allow"
+
+[bans]
+# A real tree already carries a few duplicate versions; failing on them on day
+# one would gate the policy on unrelated dependency hygiene. Warn so the
+# duplication is visible without blocking, and tighten to deny later if wanted.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# A crate must come from crates.io or an explicitly allowed git remote; anything
+# else is an unrecognised supply-chain origin and fails.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
