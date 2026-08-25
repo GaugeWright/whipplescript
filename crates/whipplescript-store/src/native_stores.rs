@@ -806,6 +806,35 @@ impl WorkItems for NativeStores {
         self.items.release_item(item_id, expect_holder)
     }
 
+    fn subscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
+        self.items.subscribe_events(subscriber, queue)
+    }
+
+    fn unsubscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
+        self.items.unsubscribe_events(subscriber, queue)
+    }
+
+    fn list_subscriptions(&self, subscriber: &str) -> StoreResult<Vec<TrackerSubscription>> {
+        self.items.list_subscriptions(subscriber)
+    }
+
+    fn poll_subscribed_events(
+        &self,
+        subscriber: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<SubscribedEvent>> {
+        self.items.poll_subscribed_events(subscriber, limit)
+    }
+
+    fn advance_subscription(
+        &mut self,
+        subscriber: &str,
+        queue: &str,
+        position: i64,
+    ) -> StoreResult<()> {
+        self.items.advance_subscription(subscriber, queue, position)
+    }
+
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
         self.items.release_claims_for_holder(holder)
     }

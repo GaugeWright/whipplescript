@@ -336,6 +336,16 @@ function ensureSchema(sql: SqlStorage): void {
     comment_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, author TEXT,
     body TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
+  // Tracker-event subscriptions are additive the same way: an object created
+  // before the feed has no `tracker_subscriptions`, and the first-touch branch
+  // never revisits it. Without this, every subscribed poll on an existing
+  // object fails its read.
+  sql.exec(`CREATE TABLE IF NOT EXISTS tracker_subscriptions (
+    subscriber TEXT NOT NULL, queue TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (subscriber, queue)
+  )`);
   sql.exec(`CREATE TABLE IF NOT EXISTS tracker_evidence (
     evidence_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, kind TEXT, reference TEXT,
     note TEXT, added_by TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

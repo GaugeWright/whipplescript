@@ -5,6 +5,40 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **Tracker-event subscriptions, delivered mid-turn.** An agent can watch a
+  tracker queue and learn that another actor claimed or closed an item while it
+  is still deciding, instead of discovering the collision when their changes
+  meet. Claim is the load-bearing event: an open/closed pair only tells you
+  after the wasted work is done.
+
+  Two ways to subscribe, and they write the same durable subscription. An
+  embedder names the queues a turn watches with
+  `WHIPPLESCRIPT_HARNESS_TRACKER_FEED` (comma-separated); the agent can narrow
+  or widen that with the `subscribe_todos` tool, which is governed by its own
+  grant — `with access to tracker { subscribe }` (or `watch`). That grant is
+  deliberately not implied by `write` or `update`: subscribing is a read, and
+  folding it into a write grant would hand every writer a feed it never asked
+  for.
+
+  Notices arrive as prose (`WS-12 (title) was claimed by agent:bob`) framed as
+  information rather than instruction, matching the existing raise notice —
+  mid-turn delivery is another principal's content entering a model's context,
+  and a line that read like a directive would be one an attacker could author
+  by filing an issue. The rendered event carries the alias, kind, actor, and
+  title, and **never** the event payload or issue body, so nothing accumulated
+  there can reach a subscriber through this channel.
+
+  The cursor is a durable per-`(subscriber, queue)` watermark over the local
+  event sequence. Subscribing starts at the current head rather than replaying
+  a queue's history; re-subscribing never rewinds; a stale advance is a no-op.
+
+  Delivery is owned-harness-only, as DR-0052 has it — coordination granularity
+  is a property of the harness, and on the durable object the turn boundary
+  remains the atom. The durable-object *store* implements subscriptions at full
+  parity regardless, since both hosts share one schema.
+
 ### Fixed
 
 - **A non-holder can no longer release or close a claimed tracker item**

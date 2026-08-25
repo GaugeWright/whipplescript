@@ -124,7 +124,8 @@ The current scope is **experimental**:
   also govern the `command` resource. The interpreter has no reach to the OS.
   Thus there is no allow-list of commands to configure. The sandbox and the
   policy of the workspace ARE the boundary that the system applies.
-- The tracker tools are `list_todos`, `add_todo`, and `update_todo`. The harness
+- The tracker tools are `list_todos`, `add_todo`, `update_todo`, and
+  `subscribe_todos`. The harness
   offers these tools only when you set
   `WHIPPLESCRIPT_HARNESS_TRACKER=<tracker>`. The agent then participates in the
   durable work tracker. The agent files items and updates items that the rules
@@ -137,11 +138,30 @@ The current scope is **experimental**:
   `claim`, `finish`, or `release` grant for the applicable change of status. An
   `update` grant is an alternative.
 
+  The `subscribe_todos` tool needs a `with access to tracker { subscribe }`
+  grant (`watch` is an alternative spelling). A `write` or `update` grant does
+  **not** carry it. Subscribing is a read, so it is granted on its own; a turn
+  that writes to a tracker does not thereby start receiving a feed about it.
+
   A registered profile can make this authority more narrow with
   `tracker.file`, `tracker.claim`, `tracker.finish`, `tracker.release`,
   `tracker.update`, or `tracker.write`. When an IFC governance envelope is
   active, an authority that changes a tracker also needs the envelope to govern
   the `tracker` resource.
+
+  **Watching a queue.** A subscribed turn receives a notice mid-turn when
+  another actor claims, releases, or closes an item on a queue it watches, so
+  it can stop before duplicating work rather than discover the collision at
+  merge. Set `WHIPPLESCRIPT_HARNESS_TRACKER_FEED=<queue>[,<queue>...]` to
+  subscribe a turn before it starts; an agent holding the `subscribe` grant can
+  also subscribe itself. A subscription begins at the queue's current position,
+  so it reports what happens next rather than replaying history.
+
+  A notice names the item, the change, and the actor — never the item's body or
+  an event payload. It is delivered as information, not as an instruction, and
+  nothing about the receiving turn's own work changes. Delivery happens on the
+  built-in harness; a delegated provider and the hosted durable object keep the
+  turn boundary as the atom and deliver nothing mid-turn.
 
   Under the refined I3 rule, these tools write shared *state* of a tracker. They
   never write a fact that a rule can match. The system attributes an `add_todo`

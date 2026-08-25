@@ -33,7 +33,8 @@ use whipplescript_store::coordination::{
 };
 use whipplescript_store::event_chain;
 use whipplescript_store::items::{
-    apply_overlay, ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, WorkItem, WorkItems,
+    apply_overlay, ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SubscribedEvent,
+    TrackerSubscription, WorkItem, WorkItems,
 };
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
@@ -8068,6 +8069,102 @@ fn do_live_event_ids<S: DoSql>(
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn subscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
+        let head = self.event_position()?;
+        // INSERT OR IGNORE, as natively: re-subscribing keeps the cursor.
+        let changed = self
+            .sql
+            .execute(
+                "INSERT OR IGNORE INTO tracker_subscriptions (subscriber, queue, position) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(subscriber), text(queue), int(head)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed > 0)
+    }
+
+    fn unsubscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
+        let changed = self
+            .sql
+            .execute(
+                "DELETE FROM tracker_subscriptions WHERE subscriber = ?1 AND queue = ?2",
+                &[text(subscriber), text(queue)],
+            )
+            .map_err(sql_err)?;
+        Ok(changed > 0)
+    }
+
+    fn list_subscriptions(&self, subscriber: &str) -> StoreResult<Vec<TrackerSubscription>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT subscriber, queue, position FROM tracker_subscriptions \
+                 WHERE subscriber = ?1 ORDER BY queue",
+                &[text(subscriber)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| TrackerSubscription {
+                subscriber: as_text(&row[0]),
+                queue: as_text(&row[1]),
+                position: as_i64(&row[2]),
+            })
+            .collect())
+    }
+
+    fn poll_subscribed_events(
+        &self,
+        subscriber: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<SubscribedEvent>> {
+        // Column parity with the native query, including the alias bridge:
+        // `tracker_events.issue_id` is the content id and
+        // `tracker_issues.issue_id` is the `WS-N` alias, so joining them
+        // directly matches nothing.
+        let rows = self
+            .sql
+            .query(
+                "SELECT e.event_seq, i.queue, a.alias, e.kind, e.actor, i.title \
+                 FROM tracker_events e \
+                 JOIN tracker_aliases a ON a.content_id = e.issue_id \
+                 JOIN tracker_issues i ON i.issue_id = a.alias \
+                 JOIN tracker_subscriptions s \
+                   ON s.subscriber = ?1 AND s.queue = i.queue AND e.event_seq > s.position \
+                 ORDER BY e.event_seq LIMIT ?2",
+                &[text(subscriber), int(limit as i64)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| SubscribedEvent {
+                position: as_i64(&row[0]),
+                queue: as_text(&row[1]),
+                issue: as_text(&row[2]),
+                kind: as_text(&row[3]),
+                actor: as_opt_text(&row[4]),
+                title: as_opt_text(&row[5]),
+            })
+            .collect())
+    }
+
+    fn advance_subscription(
+        &mut self,
+        subscriber: &str,
+        queue: &str,
+        position: i64,
+    ) -> StoreResult<()> {
+        // MAX(...) so a stale advance never rewinds, as natively.
+        self.sql
+            .execute(
+                "UPDATE tracker_subscriptions SET position = MAX(position, ?3) \
+                 WHERE subscriber = ?1 AND queue = ?2",
+                &[text(subscriber), text(queue), int(position)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
     fn event_position(&self) -> StoreResult<i64> {
         let rows = self
             .sql
@@ -9721,6 +9818,12 @@ pub(crate) mod test_support {
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE tracker_subscriptions (
+                subscriber TEXT NOT NULL, queue TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (subscriber, queue)
+            );
             CREATE TABLE tracker_issues (
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
@@ -9877,6 +9980,66 @@ mod tests {
     /// P1: the production `DoSqlStorage` drives the file plane over REAL DO
     /// SQLite (the `files` table) through the `FileStore` seam — write, read,
     /// append, overwrite-replaces, exists, and missing-errors.
+    /// Data-layer parity for tracker-event subscriptions.
+    ///
+    /// The DO deliberately does NOT deliver notices mid-turn — `poll_notices`
+    /// returns nothing on the stepped machine, where the turn boundary is the
+    /// atom (DR-0052: coordination granularity is a property of the harness),
+    /// so there is no `subscribe_todos` tool here. The STORE half still has to
+    /// agree with native: both hosts implement one `WorkItems` trait over one
+    /// schema, and a subscription must not be corrupted by the host that is not
+    /// delivering it.
+    #[test]
+    fn do_subscriptions_track_a_cursor_at_parity_with_native() {
+        let mut store = store();
+        WorkItems::file_item(
+            &mut store,
+            "triage",
+            "before",
+            "",
+            &[],
+            &serde_json::json!({}),
+            None,
+        )
+        .expect("file");
+        assert!(WorkItems::subscribe_events(&mut store, "agent:a", "triage").expect("subscribe"));
+        // Subscribing starts at the head: the earlier filing is not replayed.
+        assert!(WorkItems::poll_subscribed_events(&store, "agent:a", 50)
+            .expect("poll")
+            .is_empty());
+
+        assert_eq!(
+            WorkItems::claim_item(&mut store, "WS-1", "agent:b", None).expect("claim"),
+            ClaimOutcome::Claimed
+        );
+        let events = WorkItems::poll_subscribed_events(&store, "agent:a", 50).expect("poll");
+        let claim = events
+            .iter()
+            .find(|e| e.kind == "claim.acquired")
+            .expect("claim event delivered");
+        assert_eq!(claim.actor.as_deref(), Some("agent:b"));
+        assert_eq!(claim.issue, "WS-1", "resolved through the alias bridge");
+
+        // Advancing consumes; a stale advance does not rewind.
+        let last = events.iter().map(|e| e.position).max().expect("position");
+        WorkItems::advance_subscription(&mut store, "agent:a", "triage", last).expect("advance");
+        assert!(WorkItems::poll_subscribed_events(&store, "agent:a", 50)
+            .expect("poll")
+            .is_empty());
+        WorkItems::advance_subscription(&mut store, "agent:a", "triage", 0).expect("stale");
+        assert!(WorkItems::poll_subscribed_events(&store, "agent:a", 50)
+            .expect("poll")
+            .is_empty());
+
+        assert_eq!(
+            WorkItems::list_subscriptions(&store, "agent:a")
+                .expect("list")
+                .len(),
+            1
+        );
+        assert!(WorkItems::unsubscribe_events(&mut store, "agent:a", "triage").expect("unsub"));
+    }
+
     #[test]
     fn do_sql_storage_round_trips_the_file_plane_over_real_sqlite() {
         use whipplescript_store::files::FileStore;

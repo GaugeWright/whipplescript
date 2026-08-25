@@ -249,6 +249,12 @@
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE tracker_subscriptions (
+                subscriber TEXT NOT NULL, queue TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (subscriber, queue)
+            );
             CREATE TABLE tracker_issues (
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
