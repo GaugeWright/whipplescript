@@ -5,11 +5,20 @@
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT,
-                format_version INTEGER
+                format_version INTEGER,
+                -- DR-0066: the hash chain. `entry_digest` = H(prev_digest || canonical(entry)),
+                -- so the instance's high-water mark is (sequence, entry_digest) and a gap or a
+                -- substitution cannot hide. Digests are computed in Rust
+                -- (whipplescript-store::event_chain) so both hosts agree byte for byte.
+                prev_digest TEXT, entry_digest TEXT
             );
             CREATE UNIQUE INDEX events_instance_idempotency_key_idx
                 ON events(instance_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL;
+            -- Native has carried UNIQUE(instance_id, sequence) since migration 0001; this side
+            -- did not, so two rows could share a position. DR-0066 needs one entry per sequence
+            -- for the chain to mean anything.
+            CREATE UNIQUE INDEX events_instance_sequence_idx ON events(instance_id, sequence);
             CREATE TABLE facts (
                 fact_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, program_version_id TEXT,
                 revision_epoch INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL,
@@ -25,7 +34,11 @@
                 effective_authority TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL,
                 started_at TEXT, last_event_id TEXT, last_error TEXT, completed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                -- DR-0066 §3: the writer fence. Counts ownership transfers of this
+                -- instance's log, and is NOT `revision_epoch` above, which is program
+                -- lineage — two clocks, two names.
+                owner_epoch INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE programs (
                 program_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE

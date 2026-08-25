@@ -369,6 +369,35 @@ function ensureSchema(sql: SqlStorage): void {
   if (hasFormatVersion.length === 0) {
     sql.exec(`ALTER TABLE events ADD COLUMN format_version INTEGER`);
   }
+  // DR-0067: the event log's hash chain. DDL ONLY here — the digests are
+  // computed in Rust (`whipplescript-store::event_chain`, which compiles to
+  // wasm) and backfilled lazily by `do_chain_head` at first touch. A second
+  // implementation in TypeScript would be two things that must agree byte for
+  // byte forever, which is the drift this deliberately refuses.
+  for (const column of ["prev_digest", "entry_digest"] as const) {
+    const present = sql
+      .exec(`SELECT name FROM pragma_table_info('events') WHERE name = ?`, column)
+      .toArray();
+    if (present.length === 0) {
+      sql.exec(`ALTER TABLE events ADD COLUMN ${column} TEXT`);
+    }
+  }
+  // DR-0067 §3: the writer fence. Distinct from `revision_epoch`, which is
+  // program lineage — two clocks, two names.
+  const hasOwnerEpoch = sql
+    .exec(`SELECT name FROM pragma_table_info('instances') WHERE name = 'owner_epoch'`)
+    .toArray();
+  if (hasOwnerEpoch.length === 0) {
+    sql.exec(`ALTER TABLE instances ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0`);
+  }
+  // Native has enforced one event per (instance, sequence) since migration
+  // 0001; this side never did, so two rows could share a position and the chain
+  // would be meaningless. Adding it can only fail on an object that already
+  // holds such a pair, which is a real defect and must surface rather than be
+  // swallowed — a log with two events at one sequence cannot be chained.
+  sql.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS events_instance_sequence_idx ON events(instance_id, sequence)`,
+  );
   // Message-scoped image bodies are a broker cache, not part of the admitted
   // command. Existing objects acquire this additive table lazily.
   sql.exec(`CREATE TABLE IF NOT EXISTS host_turn_images (

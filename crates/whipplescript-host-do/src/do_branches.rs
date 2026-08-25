@@ -22,6 +22,7 @@ use whipplescript_store::branches::{
     MAINLINE_BRANCH_ID,
 };
 use whipplescript_store::content::ContentBlobs;
+use whipplescript_store::event_chain;
 use whipplescript_store::{StoreError, StoreResult};
 
 use crate::do_store::{
@@ -124,6 +125,16 @@ impl<S: DoSql> DoBranches<S> {
                 indexed_cuts INTEGER NOT NULL,
                 last_indexed_cut_id TEXT
             )",
+            // DR-0068 §5: run-scoped closure pins, keyed by (cut, holder) so a
+            // re-dispatch renews rather than accumulating.
+            "CREATE TABLE IF NOT EXISTS closure_pins (
+                cut_id     TEXT NOT NULL,
+                holder     TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (cut_id, holder)
+            )",
+            "CREATE INDEX IF NOT EXISTS closure_pins_holder_idx
+                ON closure_pins(holder)",
         ] {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
@@ -135,6 +146,10 @@ impl<S: DoSql> DoBranches<S> {
             ("cuts", "origin"),
             ("cuts", "actor"),
             ("cuts", "intent"),
+            // DR-0068 §2: the cut's log half — the pinned
+            // `(sequence, head_digest)` per in-scope instance. NULL reads as
+            // "not captured", never as "no instances".
+            ("cuts", "log_heads"),
             ("change_units", "decl_units"),
         ] {
             let info = self
@@ -592,6 +607,114 @@ impl<S: DoSql> Branches for DoBranches<S> {
             )
             .map_err(sql_err)?;
         Ok(())
+    }
+
+    fn pin_closure(&mut self, cut_id: &str, holder: &str, expires_at: &str) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO closure_pins (cut_id, holder, expires_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(cut_id, holder) DO UPDATE SET expires_at = excluded.expires_at",
+                &[text(cut_id), text(holder), text(expires_at)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn release_closure_pins(&mut self, holder: &str) -> StoreResult<usize> {
+        let released = self
+            .sql
+            .execute(
+                "DELETE FROM closure_pins WHERE holder = ?1",
+                &[text(holder)],
+            )
+            .map_err(sql_err)?;
+        Ok(usize::try_from(released).unwrap_or(0))
+    }
+
+    fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT cut_id FROM closure_pins WHERE expires_at > ?1",
+                &[text(now)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    fn attach_cut_log_heads(
+        &mut self,
+        cut_id: &str,
+        heads: &event_chain::LogHeads,
+    ) -> StoreResult<()> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT log_heads FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Err(StoreError::Conflict(format!(
+                "cut `{cut_id}` does not exist, so its log heads cannot be attached"
+            )));
+        };
+        if as_opt_text(&row[0]).is_some() {
+            return Err(StoreError::Conflict(format!(
+                "cut `{cut_id}` already pinned its log heads; a cut is immutable and a \
+                 second pin would be a second answer to what world it names"
+            )));
+        }
+        let encoded = event_chain::encode_log_heads(heads)?;
+        let updated = self
+            .sql
+            .execute(
+                // `AND log_heads IS NULL` for the same reason as native: the
+                // refusal has to be part of the write, or two callers both see
+                // it unpinned and the second silently overwrites a pin the
+                // record calls immutable.
+                //
+                // This host is single-writer by platform guarantee, so the race
+                // should not arise — but the guard is here anyway, because
+                // "the two hosts behave the same" is the property DR-0066
+                // exists to hold, and a difference justified by a guarantee
+                // made elsewhere is still a difference.
+                "UPDATE cuts SET log_heads = ?1 WHERE cut_id = ?2 AND log_heads IS NULL",
+                &[text(&encoded), text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        if updated == 0 {
+            return Err(StoreError::Conflict(format!(
+                "cut `{cut_id}` was pinned concurrently; a cut is immutable and a second \
+                 pin would be a second answer to what world it names"
+            )));
+        }
+        Ok(())
+    }
+
+    fn cut_log_heads(&self, cut_id: &str) -> StoreResult<Option<event_chain::LogHeads>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT log_heads FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        match rows.first().and_then(|row| as_opt_text(&row[0])) {
+            None => Ok(None),
+            Some(encoded) => Ok(Some(event_chain::decode_log_heads(&encoded)?)),
+        }
+    }
+
+    fn cut_manifest_hash(&self, cut_id: &str) -> StoreResult<Option<String>> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT manifest_hash FROM cuts WHERE cut_id = ?1",
+                &[text(cut_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows.first().map(|row| as_text(&row[0])))
     }
 
     fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>> {

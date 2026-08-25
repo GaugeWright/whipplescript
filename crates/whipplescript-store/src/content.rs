@@ -129,6 +129,111 @@ pub trait ContentBlobs {
     }
 }
 
+/// The content plane's executable conformance driver, shipped with the trait so
+/// every implementation runs the same one — the third such suite, after
+/// `ref_authority::conformance` and `log_append::conformance`.
+///
+/// Not `#[cfg(test)]`, for the reason the others are not: a driver that only
+/// exists in the defining crate's tests cannot be run by an implementation in
+/// another crate, which is exactly the case it exists for.
+pub mod conformance {
+    use super::{BlobStatus, ContentBlobs, EraseOutcome};
+    use crate::StoreResult;
+
+    /// Check the obligations DR-0066 places on any content store.
+    ///
+    /// Takes a factory rather than a store so each check starts clean, and so a
+    /// caller cannot accidentally have one check depend on another's leftovers.
+    ///
+    /// # Errors
+    /// Propagates store failures. A contract violation panics with what was
+    /// expected, because a conformance failure is not a value the caller
+    /// handles — it means the implementation is not one.
+    pub fn run_suite<B: ContentBlobs>(make: impl Fn() -> B) -> StoreResult<()> {
+        // Identical bytes dedupe to one id — the property every other
+        // conclusion about content addressing rests on.
+        let blobs = make();
+        let first = blobs.put("the same bytes")?;
+        let second = blobs.put("the same bytes")?;
+        assert_eq!(first, second, "identical bytes must dedupe to one id");
+        assert_ne!(
+            first,
+            blobs.put("different bytes")?,
+            "different bytes must not share an id"
+        );
+
+        // What was stored is what comes back.
+        let blobs = make();
+        let id = blobs.put("round trip")?;
+        assert_eq!(
+            blobs.get(&id)?.as_deref(),
+            Some("round trip"),
+            "a stored blob must read back byte-identical"
+        );
+
+        // status and get must agree. Two functions disagreeing about whether a
+        // blob exists reads as a successful erasure to everything downstream —
+        // the divergence that was live in `erase` before DR-0070's pack fix.
+        assert!(
+            matches!(blobs.status(&id)?, BlobStatus::Live { .. }),
+            "status must report Live for a blob get returns"
+        );
+        assert!(
+            matches!(blobs.status("never-stored")?, BlobStatus::Unknown),
+            "status must report Unknown for an id the store has never seen"
+        );
+        assert_eq!(
+            blobs.get("never-stored")?,
+            None,
+            "get must report nothing for an id the store has never seen"
+        );
+
+        // C1: erased is not absent. A store without an erasure path says so
+        // rather than pretending, and the suite honours that instead of
+        // failing it — fail-honest is the contract, not erasure itself.
+        let blobs = make();
+        let doomed = blobs.put("doomed")?;
+        match blobs.erase(&doomed, "2026-08-24T00:00:00Z")? {
+            EraseOutcome::Unsupported => {}
+            EraseOutcome::Erased { .. } | EraseOutcome::AlreadyErased => {
+                assert!(
+                    matches!(blobs.status(&doomed)?, BlobStatus::Erased { .. }),
+                    "an erased blob must read as Erased, never as Unknown — a caller \
+                     told 'absent' retries forever for bytes that are gone"
+                );
+                assert_eq!(
+                    blobs.get(&doomed)?,
+                    None,
+                    "erasure must remove the bytes, not merely the tombstone's absence"
+                );
+                // Idempotent retry.
+                assert!(
+                    matches!(
+                        blobs.erase(&doomed, "2026-08-24T00:00:01Z")?,
+                        EraseOutcome::AlreadyErased | EraseOutcome::Erased { .. }
+                    ),
+                    "re-erasing must be idempotent, not an error"
+                );
+            }
+            EraseOutcome::Unknown => panic!(
+                "erase reported Unknown for a blob the store just accepted — status \
+                 and erase disagree about whether it exists"
+            ),
+        }
+
+        // Erasing something never stored is Unknown, not a silent success.
+        let blobs = make();
+        assert!(
+            matches!(
+                blobs.erase("never-stored", "2026-08-24T00:00:00Z")?,
+                EraseOutcome::Unknown | EraseOutcome::Unsupported
+            ),
+            "erasing an unknown id must say so"
+        );
+        Ok(())
+    }
+}
+
 use crate::StoreResult;
 
 #[cfg(feature = "native")]
@@ -331,6 +436,16 @@ impl ContentBlobs for ContentStore {
                 byte_len: info.byte_len,
             });
         }
+        // A packed id has no `content_blobs` row, so without this the lookup
+        // below finds nothing and erasure reports `Unknown` — while `status`
+        // still answers `Live` from the pack and the bytes stay put. Erasure
+        // must remove the BYTES, and a pack is one blob, so the pack is
+        // dissolved first and its survivors return to loose rows.
+        //
+        // Reachable today only by erasing a packed chunk id directly (erasing a
+        // chunk ROOT goes through `unpack_for_erasure`). It becomes the ordinary
+        // path the moment DR-0070 §5's co-access packing packs plain blobs.
+        self.dissolve_pack_containing(id)?;
         let live: Option<i64> = self
             .connection
             .query_row(
@@ -543,6 +658,58 @@ impl ContentStore {
             chunk_ids,
             erased: erased_at.is_some(),
         }))
+    }
+
+    /// Dissolve the pack holding `id`, returning its members to loose rows.
+    ///
+    /// A no-op when `id` is not packed. Idempotent, and safe to call before any
+    /// operation that needs `id` to have a `content_blobs` row of its own — the
+    /// pack is an internal storage optimization (DR-0070 §5) and must never
+    /// change what an operation on a content id means.
+    fn dissolve_pack_containing(&self, id: &str) -> StoreResult<bool> {
+        let pack_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT pack_id FROM content_pack_entries WHERE chunk_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(pack_id) = pack_id else {
+            return Ok(false);
+        };
+        let mut statement = self
+            .connection
+            .prepare("SELECT chunk_id FROM content_pack_entries WHERE pack_id = ?1")?;
+        let members = statement
+            .query_map(params![pack_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        // Read every member THROUGH the pack before dismantling it; afterwards
+        // the bytes are only in the loose rows this writes.
+        let mut bodies = Vec::with_capacity(members.len());
+        for member in &members {
+            if let Some(body) = self.read_packed(member)? {
+                bodies.push((member.clone(), body));
+            }
+        }
+        for (member, body) in &bodies {
+            self.connection.execute(
+                // `created_at` is NOT NULL, and `INSERT OR IGNORE` swallows a
+                // constraint violation — omitting it silently re-inlined
+                // nothing while reporting success. Every column the schema
+                // requires is named here for that reason.
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len, created_at) \
+                 VALUES (?1, ?2, ?3, datetime('now'))",
+                params![member, body, body.len() as i64],
+            )?;
+        }
+        self.connection.execute(
+            "DELETE FROM content_pack_entries WHERE pack_id = ?1",
+            params![pack_id],
+        )?;
+        self.connection
+            .execute("DELETE FROM content_blobs WHERE id = ?1", params![pack_id])?;
+        Ok(true)
     }
 
     /// Read a chunk that lives inside a pack object. Offsets are byte
@@ -774,6 +941,111 @@ mod tests {
         let other = store.put("different").expect("put other");
         assert_ne!(id1, other);
         assert_eq!(store.get("nonexistent").expect("get missing"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The native content store runs the trait's own conformance suite.
+    #[test]
+    fn the_native_content_store_passes_the_conformance_suite() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-content-conf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let counter = std::cell::Cell::new(0usize);
+        conformance::run_suite(|| {
+            counter.set(counter.get() + 1);
+            ContentStore::open(root.join(format!("{}.db", counter.get()))).expect("open")
+        })
+        .expect("suite runs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Erasing a **packed** blob must remove the bytes, not silently no-op.
+    ///
+    /// A packed id has no `content_blobs` row, and `erase` looked only there —
+    /// so it reported `Unknown` while `status` kept answering `Live` from the
+    /// pack and the bytes stayed put. `status` and `erase` disagreeing about
+    /// whether a blob exists is the kind of divergence that reads as a
+    /// successful erasure to everything downstream.
+    ///
+    /// Reachable today only by erasing a packed chunk id directly (erasing a
+    /// chunk ROOT goes through `unpack_for_erasure`), so nothing was relying on
+    /// it. It becomes the ordinary path the moment DR-0070 §5's co-access
+    /// packing packs plain blobs — which is why it is fixed before that lands
+    /// rather than after.
+    #[test]
+    fn erasing_a_packed_blob_removes_the_bytes() {
+        use crate::chunking::ChunkingConfig;
+        let dir = std::env::temp_dir().join(format!(
+            "whip-pack-erase-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        let store = ContentStore::open(dir.join("content.db")).expect("open");
+        let config = ChunkingConfig {
+            whole_blob_threshold: 64,
+            min_size: 16,
+            avg_size: 64,
+            max_size: 256,
+        };
+        let body: String = "packed-body-".repeat(200);
+        let root = store.put_chunked(&body, &config).expect("put chunked");
+        let packed = store.pack_root(&root).expect("pack");
+        assert!(packed > 0, "the fixture must actually pack something");
+
+        let chunk_ids = store
+            .chunk_root_info(&root)
+            .expect("root info")
+            .expect("root exists")
+            .chunk_ids;
+        let one_chunk = chunk_ids.first().expect("at least one chunk").clone();
+
+        assert!(
+            matches!(
+                store.status(&one_chunk).expect("status"),
+                BlobStatus::Live { .. }
+            ),
+            "a packed chunk still reads as Live, because status consults the pack"
+        );
+        assert!(
+            matches!(
+                store
+                    .erase(&one_chunk, "2026-08-24T00:00:00Z")
+                    .expect("erase"),
+                EraseOutcome::Erased { .. }
+            ),
+            "a packed blob must actually erase, not report Unknown"
+        );
+        assert!(
+            matches!(
+                store.status(&one_chunk).expect("status"),
+                BlobStatus::Erased { .. }
+            ),
+            "and status must agree with erase afterwards"
+        );
+
+        // The pack dissolved rather than being left holding erased bytes: its
+        // surviving members are still readable, through loose rows now.
+        let survivors: Vec<&String> = chunk_ids.iter().filter(|id| **id != one_chunk).collect();
+        for survivor in survivors {
+            assert!(
+                store.get(survivor).expect("get").is_some(),
+                "dissolving the pack must not lose the chunks that were not erased"
+            );
+        }
+        assert_eq!(
+            store.get_chunked(&root).expect("reassemble"),
+            None,
+            "the root reads as erased once one of its chunks is gone"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -31,6 +31,7 @@ use serde_json::Value;
 use whipplescript_store::coordination::{
     AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
 };
+use whipplescript_store::event_chain;
 use whipplescript_store::items::{apply_overlay, ClaimOutcome, RenewOutcome, WorkItem, WorkItems};
 use whipplescript_store::{NewEvent, RuntimeStore, StoreError, StoreResult, StoredEvent};
 // The remaining ported methods reference the full set of store data types.
@@ -193,6 +194,131 @@ pub struct DoSqliteStore<Sql: DoSql> {
 impl<Sql: DoSql> DoSqliteStore<Sql> {
     pub fn new(sql: Sql) -> Self {
         Self { sql }
+    }
+
+    /// DR-0067 §2: this instance's high-water mark, `(sequence, head_digest)`.
+    /// Native parity: `SqliteStore::chain_head`.
+    pub fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
+        do_chain_head(&self.sql, instance_id)
+    }
+
+    /// The stored prefix as owned rows, for folding independently of the
+    /// recorded head. Native parity: `SqliteStore`'s `LogAppend::chain_prefix`.
+    pub fn chain_prefix(
+        &self,
+        instance_id: &str,
+    ) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
+        Ok(do_chain_prefix(&self.sql, instance_id)?
+            .into_iter()
+            .map(|row| event_chain::OwnedChainEntry {
+                event_id: row.event_id,
+                sequence: row.sequence,
+                event_type: row.event_type,
+                payload_json: row.payload_json,
+                occurred_at: row.occurred_at,
+                source: row.source,
+                causation_id: row.causation_id,
+                correlation_id: row.correlation_id,
+                idempotency_key: row.idempotency_key,
+                format_version: row.format_version,
+            })
+            .collect())
+    }
+
+    /// DR-0067 §2: append only if the head is still `expected_head`.
+    /// Native parity: `SqliteStore::append_event_cas`.
+    pub fn append_event_cas(
+        &self,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        do_append_event_cas(&self.sql, expected_head, event)
+    }
+
+    /// DR-0067 §3: this instance's current owner epoch.
+    /// Native parity: `SqliteStore::instance_owner_epoch`.
+    pub fn instance_owner_epoch(&self, instance_id: &str) -> StoreResult<i64> {
+        do_instance_owner_epoch(&self.sql, instance_id)
+    }
+
+    /// DR-0067 §3: take ownership of an instance's log, evicting the previous
+    /// owner. Native parity: `SqliteStore::claim_instance_ownership`.
+    pub fn claim_instance_ownership(&self, instance_id: &str) -> StoreResult<i64> {
+        do_claim_instance_ownership(&self.sql, instance_id)
+    }
+
+    /// DR-0068 §3: read an instance's log against a pin, verifying as it goes.
+    /// Native parity: `SqliteStore::list_events_pinned`.
+    ///
+    /// `list_events` answers "everything you have right now", which is safe for
+    /// a caller reading its own store and meaningless across machines. This
+    /// form returns exactly the pinned prefix and refuses unless the rows fold
+    /// to the pinned digest.
+    pub fn list_events_pinned(
+        &self,
+        instance_id: &str,
+        pinned: &event_chain::ChainHead,
+    ) -> StoreResult<Vec<EventView>> {
+        let upto = pinned.sequence.unwrap_or(0);
+        let rows = self
+            .sql
+            .query(
+                "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+                 causation_id, correlation_id, idempotency_key, format_version \
+                 FROM events WHERE instance_id = ?1 AND sequence <= ?2 ORDER BY sequence ASC",
+                &[text(instance_id), int(upto)],
+            )
+            .map_err(sql_err)?;
+        let stored = rows
+            .iter()
+            .map(|row| DoChainRow {
+                event_id: as_text(&row[0]),
+                sequence: as_i64(&row[1]),
+                event_type: as_text(&row[2]),
+                payload_json: as_text(&row[3]),
+                occurred_at: as_text(&row[4]),
+                source: as_opt_text(&row[5]),
+                causation_id: as_opt_text(&row[6]),
+                correlation_id: as_opt_text(&row[7]),
+                idempotency_key: as_opt_text(&row[8]),
+                format_version: as_opt_i64(&row[9]),
+            })
+            .collect::<Vec<_>>();
+        let entries = stored
+            .iter()
+            .map(|row| row.as_entry(instance_id))
+            .collect::<Vec<_>>();
+        let folded = event_chain::fold_prefix(instance_id, &entries);
+        if folded != *pinned {
+            return Err(StoreError::Conflict(format!(
+                "pinned prefix does not verify for instance `{instance_id}`: pin names \
+                 sequence {:?} at {}, the stored rows fold to sequence {:?} at {}. The log is \
+                 not the one this pin names.",
+                pinned.sequence, pinned.digest, folded.sequence, folded.digest
+            )));
+        }
+        Ok(stored
+            .into_iter()
+            .map(|row| EventView {
+                event_id: row.event_id,
+                sequence: row.sequence,
+                event_type: row.event_type,
+                payload_json: row.payload_json,
+                source: row.source.unwrap_or_default(),
+                occurred_at: row.occurred_at,
+            })
+            .collect())
+    }
+
+    /// DR-0067 §2 + §3: head compare-and-set plus the ownership fence.
+    /// Native parity: `SqliteStore::append_event_fenced`.
+    pub fn append_event_fenced(
+        &self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        do_append_event_fenced(&self.sql, owner_epoch, expected_head, event)
     }
 
     /// The `capability_bindings.provider` name bound for `capability` visible to
@@ -814,7 +940,7 @@ fn as_opt_i64(value: &SqlValue) -> Option<i64> {
     }
 }
 
-fn int(n: i64) -> SqlValue {
+pub(crate) fn int(n: i64) -> SqlValue {
     SqlValue::Int(n)
 }
 
@@ -1340,37 +1466,271 @@ fn do_append_event_idempotent<Sql: DoSql>(
     do_append_event(sql, event)
 }
 
+/// One `events` row in the shape [`event_chain`] reads it.
+struct DoChainRow {
+    event_id: String,
+    sequence: i64,
+    event_type: String,
+    payload_json: String,
+    occurred_at: String,
+    source: Option<String>,
+    causation_id: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+    format_version: Option<i64>,
+}
+
+impl DoChainRow {
+    fn as_entry<'a>(&'a self, instance_id: &'a str) -> event_chain::ChainEntry<'a> {
+        event_chain::ChainEntry {
+            event_id: &self.event_id,
+            instance_id,
+            sequence: self.sequence,
+            event_type: &self.event_type,
+            payload_json: &self.payload_json,
+            occurred_at: &self.occurred_at,
+            source: self.source.as_deref().unwrap_or(""),
+            causation_id: self.causation_id.as_deref(),
+            correlation_id: self.correlation_id.as_deref(),
+            idempotency_key: self.idempotency_key.as_deref(),
+            format_version: self.format_version,
+        }
+    }
+}
+
+const DO_CHAIN_PREFIX_QUERY: &str =
+    "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+     causation_id, correlation_id, idempotency_key, format_version \
+     FROM events WHERE instance_id = ?1 ORDER BY sequence ASC";
+
+fn do_chain_prefix<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<Vec<DoChainRow>> {
+    let rows = sql
+        .query(DO_CHAIN_PREFIX_QUERY, &[text(instance_id)])
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| DoChainRow {
+            event_id: as_text(&row[0]),
+            sequence: as_i64(&row[1]),
+            event_type: as_text(&row[2]),
+            payload_json: as_text(&row[3]),
+            occurred_at: as_text(&row[4]),
+            source: as_opt_text(&row[5]),
+            causation_id: as_opt_text(&row[6]),
+            correlation_id: as_opt_text(&row[7]),
+            idempotency_key: as_opt_text(&row[8]),
+            format_version: as_opt_i64(&row[9]),
+        })
+        .collect())
+}
+
+/// DR-0067 §5 on the DO host: fill in the chain for one instance.
+///
+/// Deliberately in Rust rather than in the Worker's `ensureSchema`: the digest
+/// has exactly one implementation (`whipplescript-store::event_chain`, which
+/// compiles to wasm), so the two hosts cannot drift. The TypeScript side does
+/// DDL only — it adds the columns and never computes a hash.
+fn do_backfill_event_chain<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<()> {
+    let stored = do_chain_prefix(sql, instance_id)?;
+    let mut prev = event_chain::genesis_digest(instance_id);
+    for row in &stored {
+        let digest = event_chain::entry_digest(&prev, &row.as_entry(instance_id));
+        sql.execute(
+            "UPDATE events SET prev_digest = ?1, entry_digest = ?2 WHERE event_id = ?3",
+            &[text(&prev), text(&digest), text(&row.event_id)],
+        )
+        .map_err(sql_err)?;
+        prev = digest;
+    }
+    Ok(())
+}
+
+/// DR-0067 §2 on the DO host: the instance's `(sequence, head_digest)`.
+///
+/// An object created before the chain existed has rows with NULL digests; the
+/// lazy backfill runs once for that instance and the head is re-read. Native
+/// refuses in the same situation because its backfill runs at open; here there
+/// is no open, so the repair happens at first touch instead.
+fn do_chain_head<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
+    let read = |sql: &Sql| -> StoreResult<Option<(i64, Option<String>)>> {
+        let rows = sql
+            .query(
+                "SELECT sequence, entry_digest FROM events WHERE instance_id = ?1 \
+                 ORDER BY sequence DESC LIMIT 1",
+                &[text(instance_id)],
+            )
+            .map_err(sql_err)?;
+        Ok(rows
+            .first()
+            .map(|row| (as_i64(&row[0]), as_opt_text(&row[1]))))
+    };
+    let head = match read(sql)? {
+        None => return Ok(event_chain::ChainHead::empty(instance_id)),
+        Some((sequence, Some(digest))) => Some((sequence, digest)),
+        Some(_) => {
+            do_backfill_event_chain(sql, instance_id)?;
+            read(sql)?.and_then(|(sequence, digest)| digest.map(|digest| (sequence, digest)))
+        }
+    };
+    match head {
+        Some((sequence, digest)) => Ok(event_chain::ChainHead {
+            sequence: Some(sequence),
+            digest,
+        }),
+        None => Err(StoreError::Conflict(format!(
+            "instance `{instance_id}` has an unchained event log that the backfill did not \
+             repair; it cannot be extended"
+        ))),
+    }
+}
+
 fn do_append_event<Sql: DoSql>(sql: &Sql, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
+    do_append_event_chained(sql, None, event)
+}
+
+/// DR-0067 §2 on the DO host: append only if the head is still `expected_head`.
+fn do_append_event_cas<Sql: DoSql>(
+    sql: &Sql,
+    expected_head: &str,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    do_append_event_chained(sql, Some(expected_head), event)
+}
+
+/// DR-0067 §3 on the DO host: the instance's current owner epoch.
+fn do_instance_owner_epoch<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<i64> {
+    let rows = sql
+        .query(
+            "SELECT owner_epoch FROM instances WHERE instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows.first().map(|row| as_i64(&row[0])).unwrap_or(0))
+}
+
+/// DR-0067 §3 on the DO host: take ownership, evicting the previous owner.
+fn do_claim_instance_ownership<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<i64> {
+    let updated = sql
+        .execute(
+            "UPDATE instances SET owner_epoch = owner_epoch + 1 WHERE instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    if updated == 0 {
+        return Err(StoreError::Conflict(format!(
+            "instance `{instance_id}` does not exist, so its log ownership cannot be claimed"
+        )));
+    }
+    do_instance_owner_epoch(sql, instance_id)
+}
+
+/// DR-0067 §2 + §3 on the DO host: head compare-and-set plus the fence.
+fn do_append_event_fenced<Sql: DoSql>(
+    sql: &Sql,
+    owner_epoch: i64,
+    expected_head: &str,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    let current = do_instance_owner_epoch(sql, event.instance_id)?;
+    if owner_epoch != current {
+        return Err(StoreError::Conflict(format!(
+            "event-log ownership fence failed for instance `{}`: caller holds epoch \
+             {owner_epoch}, the log is at epoch {current}. Ownership moved; this writer must \
+             stop rather than append.",
+            event.instance_id
+        )));
+    }
+    do_append_event_cas(sql, expected_head, event)
+}
+
+fn do_append_event_chained<Sql: DoSql>(
+    sql: &Sql,
+    expected_head: Option<&str>,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    let head = do_chain_head(sql, event.instance_id)?;
+    if let Some(expected) = expected_head {
+        if expected != head.digest {
+            return Err(StoreError::Conflict(format!(
+                "event-log compare-and-set failed for instance `{}`: expected head {expected}, \
+                 found {}. Another writer extended this log; re-read before appending.",
+                event.instance_id, head.digest
+            )));
+        }
+    }
+    // Drawn before the insert for the same reason as native: the digest commits
+    // to the id and the timestamp, so the statement cannot be the thing that
+    // invents them. Same formats, so nothing downstream can tell.
+    let minted = sql
+        .query(
+            "SELECT 'evt_' || lower(hex(randomblob(16))), CURRENT_TIMESTAMP",
+            &[],
+        )
+        .map_err(sql_err)?;
+    let minted = minted
+        .first()
+        .ok_or_else(|| sql_err("event id/timestamp query returned no row".to_string()))?;
+    let event_id = as_text(&minted[0]);
+    let occurred_at = as_text(&minted[1]);
+    let sequence = head.sequence.unwrap_or(0) + 1;
+    let format_version = whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION;
+    let entry = event_chain::ChainEntry {
+        event_id: &event_id,
+        instance_id: event.instance_id,
+        sequence,
+        event_type: event.event_type,
+        payload_json: event.payload_json,
+        occurred_at: &occurred_at,
+        source: event.source,
+        causation_id: event.causation_id,
+        correlation_id: event.correlation_id,
+        idempotency_key: event.idempotency_key,
+        format_version: Some(format_version),
+    };
+    let entry_digest = event_chain::entry_digest(&head.digest, &entry);
     let rows = sql
         .query(
             "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
-             occurred_at, source, causation_id, correlation_id, idempotency_key, format_version) VALUES \
-             ('evt_' || lower(hex(randomblob(16))), ?1, \
-             (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE instance_id = ?1), \
-             ?2, ?3, CURRENT_TIMESTAMP, ?4, ?5, ?6, ?7, ?8) RETURNING event_id, sequence",
+             occurred_at, source, causation_id, correlation_id, idempotency_key, format_version, \
+             prev_digest, entry_digest) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             RETURNING event_id, sequence",
             &[
+                text(&event_id),
                 text(event.instance_id),
+                int(sequence),
                 text(event.event_type),
                 text(event.payload_json),
+                text(&occurred_at),
                 text(event.source),
                 opt_text(event.causation_id),
                 opt_text(event.correlation_id),
                 opt_text(event.idempotency_key),
                 // DR-0054 Phase B: stamp the writer's event format (native
                 // `append_event_on` parity); legacy NULL rows read as v1.
-                int(whipplescript_store::SUPPORTED_EVENT_FORMAT_VERSION),
+                int(format_version),
+                text(&head.digest),
+                text(&entry_digest),
             ],
         )
         .map_err(|error| {
-            // Name the colliding event (native `append_event_on` parity): a
-            // UNIQUE hit on the idempotency key is undebuggable from a generic
-            // store error.
+            // Name the colliding event (native `append_event_on` parity). Two
+            // distinct collisions live here since DR-0067 moved sequence
+            // assignment out of the INSERT, and they mean opposite things.
             if error.contains("UNIQUE") {
-                StoreError::Conflict(format!(
-                    "duplicate event idempotency key for `{}` (key {:?}): a second \
-                     distinct commit produced an already-used key",
-                    event.event_type, event.idempotency_key
-                ))
+                if error.contains("events.sequence") {
+                    StoreError::Conflict(format!(
+                        "event-log sequence {sequence} is already taken for instance `{}`: \
+                         another writer appended concurrently. Re-read the head and retry.",
+                        event.instance_id
+                    ))
+                } else {
+                    StoreError::Conflict(format!(
+                        "duplicate event idempotency key for `{}` (key {:?}): a second \
+                         distinct commit produced an already-used key",
+                        event.event_type, event.idempotency_key
+                    ))
+                }
             } else {
                 sql_err(error)
             }
@@ -4105,6 +4465,35 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
 }
 
 #[allow(unused_variables, clippy::todo, clippy::too_many_arguments)]
+/// DR-0067's append surface, so this host runs the same conformance driver the
+/// native store does rather than a mirrored copy of its assertions.
+impl<Sql: DoSql> whipplescript_store::log_append::LogAppend for DoSqliteStore<Sql> {
+    fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
+        Self::chain_head(self, instance_id)
+    }
+
+    fn instance_owner_epoch(&self, instance_id: &str) -> StoreResult<i64> {
+        Self::instance_owner_epoch(self, instance_id)
+    }
+
+    fn claim_instance_ownership(&mut self, instance_id: &str) -> StoreResult<i64> {
+        Self::claim_instance_ownership(self, instance_id)
+    }
+
+    fn append_event_fenced(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        Self::append_event_fenced(self, owner_epoch, expected_head, event)
+    }
+
+    fn chain_prefix(&self, instance_id: &str) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
+        Self::chain_prefix(self, instance_id)
+    }
+}
+
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn schema_version(&self) -> StoreResult<i64> {
         let rows = self
@@ -9002,6 +9391,17 @@ pub(crate) mod test_support {
         conn: std::rc::Rc<Connection>,
     }
 
+    impl RusqliteDoSql {
+        /// A bare in-memory handle with no schema applied — for a module that
+        /// creates its own tables (`do_refs`), where `store()`'s full runtime
+        /// schema would be noise.
+        pub(crate) fn in_memory() -> Self {
+            Self {
+                conn: std::rc::Rc::new(Connection::open_in_memory().expect("sqlite")),
+            }
+        }
+    }
+
     fn to_value(v: &SqlValue) -> Value {
         match v {
             SqlValue::Null => Value::Null,
@@ -9060,8 +9460,10 @@ pub(crate) mod test_support {
                 event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                 event_type TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
                 source TEXT NOT NULL, causation_id TEXT, correlation_id TEXT, idempotency_key TEXT,
-                format_version INTEGER
+                format_version INTEGER,
+                prev_digest TEXT, entry_digest TEXT
             );
+            CREATE UNIQUE INDEX events_instance_sequence_idx ON events(instance_id, sequence);
             CREATE UNIQUE INDEX events_instance_idempotency_key_idx
                 ON events(instance_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL;
@@ -9080,7 +9482,8 @@ pub(crate) mod test_support {
                 effective_authority TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL,
                 started_at TEXT, last_event_id TEXT, last_error TEXT, completed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                owner_epoch INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE programs (
                 program_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE
@@ -9714,6 +10117,336 @@ mod tests {
                 .provider_trust_evidence("agent_turn", "other")
                 .expect("read"),
             None
+        );
+    }
+
+    fn chain_event(instance_id: &str) -> NewEvent<'_> {
+        NewEvent {
+            instance_id,
+            event_type: "rule.fired",
+            payload_json: "{}",
+            source: "test",
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: None,
+        }
+    }
+
+    /// DR-0067 §2 on this host: the head advances and equals an independent
+    /// fold of the stored prefix, exactly as native's does.
+    #[test]
+    fn do_chain_head_is_the_fold_of_the_stored_prefix() {
+        let store = store();
+        store
+            .append_event(chain_event("i1"))
+            .expect("first appends");
+        store
+            .append_event(chain_event("i1"))
+            .expect("second appends");
+
+        let head = store.chain_head("i1").expect("head reads");
+        let stored = do_chain_prefix(&store.sql, "i1").expect("prefix reads");
+        let entries = stored
+            .iter()
+            .map(|row| row.as_entry("i1"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(head.sequence, Some(2));
+        assert_eq!(head, event_chain::fold_prefix("i1", &entries));
+    }
+
+    #[test]
+    fn do_compare_and_set_append_refuses_a_stale_head() {
+        let store = store();
+        let stale = store.chain_head("i1").expect("head reads");
+        store
+            .append_event(chain_event("i1"))
+            .expect("the new owner appends");
+
+        let zombie = store.append_event_cas(&stale.digest, chain_event("i1"));
+        assert!(
+            matches!(zombie, Err(StoreError::Conflict(_))),
+            "a stale head must be refused, got {zombie:?}"
+        );
+    }
+
+    /// The DO's own version of the zombie bite: a writer that re-read the head
+    /// passes compare-and-set, and only the ownership fence stops it.
+    #[test]
+    fn do_owner_epoch_refuses_a_zombie_that_re_read_the_head() {
+        let store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, workflow_principal, \
+                 effective_authority, status, input_json) \
+                 VALUES ('i1', 'prog_1', 'ver_1', 'root', '{}', 'running', '{}')",
+                &[],
+            )
+            .expect("instance seeds");
+
+        let old_epoch = store.instance_owner_epoch("i1").expect("epoch reads");
+        let new_epoch = store
+            .claim_instance_ownership("i1")
+            .expect("ownership claims");
+        assert_eq!(new_epoch, old_epoch + 1);
+
+        let head = store.chain_head("i1").expect("head reads");
+        let stale = store.append_event_fenced(old_epoch, &head.digest, chain_event("i1"));
+        assert!(
+            matches!(stale, Err(StoreError::Conflict(_))),
+            "the stale owner must be fenced out, got {stale:?}"
+        );
+        store
+            .append_event_fenced(new_epoch, &head.digest, chain_event("i1"))
+            .expect("the current owner appends");
+    }
+
+    /// The path that exists only on this host: an object provisioned before
+    /// DR-0067 has rows with NULL digests and no `open` to repair them at, so
+    /// the backfill runs lazily at first touch — and must land on exactly the
+    /// digests a live append would have written.
+    #[test]
+    fn do_legacy_rows_are_backfilled_at_first_touch() {
+        let store = store();
+        store
+            .append_event(chain_event("i1"))
+            .expect("first appends");
+        store
+            .append_event(chain_event("i1"))
+            .expect("second appends");
+        let live = store.chain_head("i1").expect("head reads");
+
+        store
+            .sql
+            .execute(
+                "UPDATE events SET prev_digest = NULL, entry_digest = NULL",
+                &[],
+            )
+            .expect("digests clear");
+
+        assert_eq!(
+            store.chain_head("i1").expect("head re-reads"),
+            live,
+            "the lazy backfill must reproduce the live digests"
+        );
+    }
+
+    /// A `DoSql` that fails the Nth statement, deterministically.
+    ///
+    /// The `DoSql` trait is already the fault-injection seam this host needs —
+    /// `execute` and `query` both return `Result`, so a decorator can fail one
+    /// statement without the store above it knowing the difference. Nothing had
+    /// used it that way.
+    pub(crate) struct FaultySql<S: DoSql> {
+        inner: S,
+        fail_at: std::cell::Cell<usize>,
+        seen: std::cell::Cell<usize>,
+    }
+
+    impl<S: DoSql> FaultySql<S> {
+        fn new(inner: S, fail_at: usize) -> Self {
+            Self {
+                inner,
+                fail_at: std::cell::Cell::new(fail_at),
+                seen: std::cell::Cell::new(0),
+            }
+        }
+        /// Stop injecting, so a checker can read the wreckage.
+        fn disarm(&self) {
+            self.fail_at.set(usize::MAX);
+        }
+    }
+
+    impl<S: DoSql> DoSql for FaultySql<S> {
+        fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64, String> {
+            self.seen.set(self.seen.get() + 1);
+            if self.seen.get() == self.fail_at.get() {
+                return Err("injected fault".to_owned());
+            }
+            self.inner.execute(sql, params)
+        }
+        fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+            self.seen.set(self.seen.get() + 1);
+            if self.seen.get() == self.fail_at.get() {
+                return Err("injected fault".to_owned());
+            }
+            self.inner.query(sql, params)
+        }
+    }
+
+    /// **A statement failing mid-append must never leave the recorded head
+    /// disagreeing with the stored prefix.**
+    ///
+    /// This is the first fault injection below the SQL boundary in either host.
+    /// It walks the failure point across every statement an append issues and,
+    /// after each, disarms the fault and checks the chain invariant — so the
+    /// question is not "did the append fail gracefully" but "is the log still a
+    /// log afterwards".
+    #[test]
+    fn a_statement_failing_mid_append_leaves_the_chain_consistent() {
+        // Counted, because a loop that took the fail-closed `continue` every
+        // time would pass while checking nothing.
+        let mut checked = 0usize;
+        let mut refused = 0usize;
+        for fail_at in 1..24usize {
+            let conn = test_support::RusqliteDoSql::in_memory();
+            let store = DoSqliteStore::new(conn);
+            store
+                .sql
+                .execute(
+                    "CREATE TABLE events (event_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, \
+                     sequence INTEGER NOT NULL, event_type TEXT NOT NULL, payload_json TEXT \
+                     NOT NULL, occurred_at TEXT NOT NULL, source TEXT NOT NULL, causation_id \
+                     TEXT, correlation_id TEXT, idempotency_key TEXT, format_version INTEGER, \
+                     prev_digest TEXT, entry_digest TEXT)",
+                    &[],
+                )
+                .expect("events table");
+            store
+                .sql
+                .execute(
+                    "CREATE UNIQUE INDEX events_instance_sequence_idx \
+                     ON events(instance_id, sequence)",
+                    &[],
+                )
+                .expect("sequence index");
+            store
+                .sql
+                .execute(
+                    "CREATE TABLE instances (instance_id TEXT PRIMARY KEY, \
+                     owner_epoch INTEGER NOT NULL DEFAULT 0)",
+                    &[],
+                )
+                .expect("instances table");
+            store
+                .sql
+                .execute(
+                    "INSERT INTO instances (instance_id, owner_epoch) VALUES ('i1', 0)",
+                    &[],
+                )
+                .expect("instance seeds");
+
+            // A clean append first, so the failure lands on a non-empty log.
+            store
+                .append_event(chain_event("i1"))
+                .expect("first appends");
+
+            let faulty = DoSqliteStore::new(FaultySql::new(store.sql, fail_at));
+            // The append may succeed or fail; either is fine. What must hold is
+            // the state afterwards.
+            let _ = faulty.append_event(chain_event("i1"));
+            faulty.sql.disarm();
+
+            let recorded = match faulty.chain_head("i1") {
+                Ok(head) => head,
+                // Refusing to report a head over a log it cannot verify is the
+                // correct fail-closed outcome, not a violation.
+                Err(_) => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            checked += 1;
+            let prefix = do_chain_prefix(&faulty.sql, "i1").expect("prefix reads");
+            let entries: Vec<_> = prefix.iter().map(|row| row.as_entry("i1")).collect();
+            let folded = whipplescript_store::event_chain::fold_prefix("i1", &entries);
+            assert_eq!(
+                recorded, folded,
+                "fail_at={fail_at}: a statement failing mid-append left the recorded \
+                 head disagreeing with the stored prefix"
+            );
+        }
+        assert!(
+            checked > 0,
+            "every injected failure took the fail-closed path, so the invariant \
+             was never actually checked against a readable log"
+        );
+        // Recorded rather than asserted on: how the failures split between
+        // "log still readable and consistent" and "refuses to report a head" is
+        // a fact about where the statements fall, not a contract.
+        assert!(checked + refused == 23, "every failure point was exercised");
+    }
+
+    /// The durable-object host runs the **same** append conformance driver the
+    /// native store does (`log_append::conformance`), which the shared
+    /// `LogAppend` trait is what made possible — before it, the append surface
+    /// was inherent to each store type and this host got mirrored assertions
+    /// instead of the driver.
+    #[test]
+    fn do_store_passes_the_same_append_contention_suite_as_native() {
+        whipplescript_store::log_append::conformance::run_suite(
+            || {
+                let store = store();
+                store
+                    .sql
+                    .execute(
+                        "INSERT INTO instances (instance_id, program_id, version_id, \
+                         workflow_principal, effective_authority, status, input_json) \
+                         VALUES ('sim-1', 'prog_1', 'ver_1', 'root', '{}', 'running', '{}')",
+                        &[],
+                    )
+                    .expect("instance seeds");
+                (store, "sim-1".to_owned())
+            },
+            0..32,
+        )
+        .expect("suite runs");
+    }
+
+    /// DR-0068 §3 on this host: the pinned read returns exactly the pinned
+    /// prefix and refuses a substituted one.
+    #[test]
+    fn do_pinned_read_returns_the_prefix_and_refuses_substitution() {
+        let store = store();
+        store
+            .append_event(chain_event("i1"))
+            .expect("first appends");
+        let pin = store.chain_head("i1").expect("head reads");
+        store
+            .append_event(chain_event("i1"))
+            .expect("a later event appends");
+
+        let pinned = store
+            .list_events_pinned("i1", &pin)
+            .expect("pinned read verifies");
+        assert_eq!(
+            pinned.len(),
+            1,
+            "the later event must not leak into the pin"
+        );
+
+        store
+            .sql
+            .execute(
+                "UPDATE events SET payload_json = '{\"tampered\":true}' WHERE sequence = 1",
+                &[],
+            )
+            .expect("row is tampered with");
+        let read = store.list_events_pinned("i1", &pin);
+        assert!(
+            matches!(read, Err(StoreError::Conflict(_))),
+            "a substituted row must refuse, got {read:?}"
+        );
+    }
+
+    /// Native has enforced one event per (instance, sequence) since migration
+    /// 0001; this host did not, and the chain is meaningless without it.
+    #[test]
+    fn do_events_reject_a_duplicate_sequence() {
+        let store = store();
+        store
+            .append_event(chain_event("i1"))
+            .expect("first appends");
+        let duplicate = store.sql.execute(
+            "INSERT INTO events (event_id, instance_id, sequence, event_type, payload_json, \
+             occurred_at, source) VALUES ('evt_dup', 'i1', 1, 'rule.fired', '{}', \
+             CURRENT_TIMESTAMP, 'test')",
+            &[],
+        );
+        assert!(
+            duplicate.is_err(),
+            "a second row at sequence 1 must be refused"
         );
     }
 

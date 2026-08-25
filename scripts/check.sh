@@ -30,7 +30,7 @@ if [ -f AGENTS.md ]; then
     # Same guard, opposite reason: this one needs the FULL tree, because it
     # answers what the projection withheld. Only `-src` can run it — the mirror
     # is the thing being checked, and it cannot see what it is missing
-    # (DR-0069 OPS-8).
+    # (GaugeWright DR-0069 OPS-8 — that repository runs its own DR sequence).
     echo "== mirror projection =="
     node scripts/check-mirror-projection.mjs
 
@@ -62,6 +62,13 @@ echo "== workflow action pins =="
 # this most protects is publish-crates.yml, whose job holds the crates.io token
 # and cannot be undone. Cheap, needs no toolchain, so it runs on every change.
 scripts/check-actions-pinned.sh
+
+# DR-0066: the shared digest/verification cores must stay free of ambient time,
+# randomness, and IO, or deterministic simulation stops being available and the
+# two hosts become able to disagree. Cheap enough for the green bar; the script
+# is explicit about what it does and does not claim.
+echo "== sans-IO purity =="
+scripts/check-sansio-purity.sh
 
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented

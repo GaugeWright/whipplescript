@@ -15,7 +15,7 @@ else
   fi
 fi
 
-for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla" "$ROOT/models/tla/CredentialCustody.tla"; do
+for MODEL in "$ROOT/models/tla/ControlPlaneLifecycle.tla" "$ROOT/models/tla/NativeProviderLifecycle.tla" "$ROOT/models/tla/ResumableEffectLifecycle.tla" "$ROOT/models/tla/InstanceSchedulerLifecycle.tla" "$ROOT/models/tla/ClockSourceLifecycle.tla" "$ROOT/models/tla/InfoflowReleaseBudget.tla" "$ROOT/models/tla/InfoflowLabelCarriage.tla" "$ROOT/models/tla/ReconciliationDaemonLifecycle.tla" "$ROOT/models/tla/CoordLease.tla" "$ROOT/models/tla/CoordCounter.tla" "$ROOT/models/tla/CoordLedger.tla" "$ROOT/models/tla/CredentialCustody.tla" "$ROOT/models/tla/LogChainIntegrity.tla" "$ROOT/models/tla/PinnedResolution.tla" "$ROOT/models/tla/SubstratePublishOrder.tla"; do
   "${APALACHE[@]}" typecheck "$MODEL"
   "${APALACHE[@]}" check \
     --cinit=ConstInit \
@@ -96,6 +96,104 @@ coord_bite() {
 coord_bite CoordLease   'Cardinality(held[k]) < Slots' MutualExclusion
 coord_bite CoordCounter 'consumed + a <= Cap'           CapInvariant
 coord_bite CoordLedger  'notin appended'                   NoLostEntry
+
+# --- DR-0067 log-chain bites (models/tla/LogChainIntegrity.tla) ------------------
+# The append carries TWO guards, and the claim in DR-0067 section 3 is that
+# neither subsumes the other: compare-and-set defeats a blind zombie, the owner
+# epoch defeats one that re-read the head first. So each guard gets its own
+# bite, and they must violate DIFFERENT invariants -- a shared violation would
+# mean one guard is riding on the other's teeth and the pair is really one.
+#
+# Both guards are structural conjuncts of WriteEntry, so a violating step simply
+# cannot be taken and no state invariant would notice. The model carries a
+# history variable per guard (`staleWrite`, `blindWrite`) for exactly that
+# reason, as EffectRequeueNecessity does for the requeue guard.
+# Generic marker bite: delete the line carrying MARKER from MODEL and require an
+# invariant violation. The mutant is compared against the original first, so a
+# marker that has been renamed away cannot let a bite silently test nothing —
+# the failure mode the custody bites below paid for.
+marker_bite() {
+  local model="$1" marker="$2" expect_inv="$3"
+  local dir
+  dir="$(mktemp -d)"
+  grep -v "$marker" "$ROOT/models/tla/$model.tla" > "$dir/$model.tla"
+  if cmp -s "$dir/$model.tla" "$ROOT/models/tla/$model.tla"; then
+    echo "$model bite FAILED: marker '$marker' matched nothing, so it tested nothing" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  echo "== $model bite: mutant without '$marker' must violate $expect_inv"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv=SafetyInvariants --length=6 "$dir/$model.tla" \
+        > "$dir/out.log" 2>&1; then
+    echo "$model bite FAILED: dropping '$marker' did not violate $expect_inv" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$dir/out.log"; then
+    echo "$model bite FAILED: mutant erred for the wrong reason (not an invariant violation)" >&2
+    cat "$dir/out.log" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  rm -rf "$dir"
+  echo "$model bite OK ($expect_inv guard is load-bearing)"
+}
+marker_bite LogChainIntegrity 'THE FENCE'           NoStaleWrite
+marker_bite LogChainIntegrity 'THE COMPARE-AND-SET' NoBlindWrite
+
+# --- DR-0066 §4 publish-order bites (models/tla/SubstratePublishOrder.tla) -------
+# One bite per ordering edge, and they must violate different invariants: the
+# claim is that publishing bottom-up is three separate obligations, not one
+# restated three ways.
+marker_bite SubstratePublishOrder 'CONTENT BEFORE HISTORY'          NoHistoryWithoutContent
+marker_bite SubstratePublishOrder 'HISTORY BEFORE REF'              NoRefWithoutItsHistory
+marker_bite SubstratePublishOrder 'NO REF STRONGER THAN ITS CLOSURE' NoRefStrongerThanItsClosure
+
+# --- DR-0068 pinned-resolution bites (models/tla/PinnedResolution.tla) -----------
+# Three guards, three invariants, and they must be independent for the same
+# reason the log-chain pair must be. Two of these are SUBSTITUTIONS rather than
+# deletions, because removing the line would leave a variable unassigned and
+# Apalache would fail to parse — a parse failure is not the invariant doing its
+# job (the lesson the custody bites paid for below).
+#
+# Every mutant is compared against the original before it is checked. A sed
+# expression that silently matches nothing would otherwise produce an unmutated
+# model that passes, and the bite would report success having tested nothing.
+pinned_bite() {
+  local label="$1" expr="$2" expect_inv="$3"
+  local dir
+  dir="$(mktemp -d)"
+  sed "$expr" "$ROOT/models/tla/PinnedResolution.tla" > "$dir/PinnedResolution.tla"
+  if cmp -s "$dir/PinnedResolution.tla" "$ROOT/models/tla/PinnedResolution.tla"; then
+    echo "pinned-resolution bite FAILED: '$label' changed nothing, so it tested nothing" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  echo "== pinned-resolution bite: $label must violate $expect_inv"
+  if "${APALACHE[@]}" check --cinit=ConstInit --init=Init --next=Next \
+        --inv=SafetyInvariants --length=6 "$dir/PinnedResolution.tla" \
+        > "$dir/out.log" 2>&1; then
+    echo "pinned-resolution bite FAILED: '$label' did not violate $expect_inv" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  if ! grep -qiE 'invariant .* violated|outcome is: Error' "$dir/out.log"; then
+    echo "pinned-resolution bite FAILED: '$label' erred for the wrong reason" >&2
+    cat "$dir/out.log" >&2
+    rm -rf "$dir"
+    exit 1
+  fi
+  rm -rf "$dir"
+  echo "pinned-resolution bite OK ($expect_inv guard is load-bearing)"
+}
+# A runner that resolves the ref itself instead of taking the trigger's cut.
+pinned_bite 'resolve from the ref' 's/= triggerCut\]/= ref]/' RunnersFiredTogetherAgree
+# The pin taken later than dispatch, leaving a window between a cut being named
+# and being held. This is the gap the model found in the first place.
+pinned_bite 'no pin at dispatch' 's/pinned \\cup {ref}/pinned/' NamedCutIsPinned
+# A collector that ignores run pins.
+pinned_bite 'collector ignores pins' '/COLLECT ONLY UNPINNED/d' NoPinnedCutCollected
 
 # --- DR-0053 credential custody bites (models/tla/CredentialCustody.tla) ---------
 # Every safety invariant in the custody model must have its OWN bite: the seven

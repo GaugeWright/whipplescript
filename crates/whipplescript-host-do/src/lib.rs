@@ -40,6 +40,7 @@ pub mod do_instance;
 pub mod do_memory;
 pub mod do_packages;
 /// `RuntimeStore` over the DO's synchronous SQLite (`DoSql`).
+pub mod do_refs;
 pub mod do_store;
 /// The in-isolate agent-turn tool executor over the DO file plane (P4).
 pub mod do_tools;

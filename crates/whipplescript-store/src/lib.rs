@@ -6,16 +6,23 @@ pub mod chunking;
 pub mod content;
 pub mod coordination;
 pub mod diff;
+pub mod event_chain;
 pub mod files;
 pub mod improve;
 pub mod incidents;
 pub mod items;
+pub mod log_append;
+pub mod log_simulation;
+pub mod manifest_tree;
 pub mod materialize;
 pub mod memory;
 pub mod merge;
 #[cfg(feature = "native")]
 pub mod native_stores;
+pub mod preflight;
+pub mod read_through;
 pub mod reconcile;
+pub mod ref_authority;
 /// Relocated to `whipplescript-core` (DR-0052 R4.2: one selection
 /// grammar validates statically in the parser and dynamically at the
 /// seams — no mirror to drift). Re-exported here so every existing
@@ -24,6 +31,7 @@ pub use whipplescript_core::selection;
 pub mod skill_frontmatter;
 pub mod stat_cache;
 pub mod text_merge;
+pub mod transfer;
 pub mod vcs;
 pub mod working_set;
 pub mod workspace_api;
@@ -1169,6 +1177,74 @@ impl SqliteStore {
 
     pub fn append_event(&self, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
         append_event_on(&self.connection, event)
+    }
+
+    /// DR-0067 §5: rebuild the chain from the stored rows.
+    ///
+    /// The repair path for a backfill that did not finish — from a failed
+    /// statement or a process that died partway. The state either leaves is the
+    /// same (a NULL-digest suffix, since the backfill walks ascending), and
+    /// `chain_head` refuses over it, which is right but not self-healing:
+    /// `ensure_*` re-runs the backfill only when it *adds* the columns, so a
+    /// reopen does not repair.
+    ///
+    /// Deliberately **explicit rather than automatic**. The durable-object host
+    /// repairs lazily because it has no open hook to repair at; native has one,
+    /// and running it on every open would mean silently rebuilding a chain
+    /// whose failure to build is itself information. An operator invoking this
+    /// has seen the refusal and decided.
+    ///
+    /// Safe to call when nothing is wrong: it recomputes what is already there.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn repair_event_chain(&self) -> StoreResult<()> {
+        backfill_event_chain(&self.connection)
+    }
+
+    /// DR-0067 §2: this instance's high-water mark, `(sequence, head_digest)`.
+    ///
+    /// The digest covers the whole committed prefix, so a reader that holds it
+    /// can verify the entries it was served are the recorded ones, complete and
+    /// in order — the property a bare sequence number cannot give across
+    /// machines.
+    pub fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
+        chain_head_on(&self.connection, instance_id)
+    }
+
+    /// DR-0067 §2: append only if the log's head is still `expected_head`.
+    ///
+    /// Returns [`StoreError::Conflict`] when another writer has extended the
+    /// log, which is what makes a stale owner's append fail instead of
+    /// interleaving into a history that describes no real execution.
+    pub fn append_event_cas(
+        &self,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        append_event_cas_on(&self.connection, expected_head, event)
+    }
+
+    /// DR-0067 §3: this instance's current owner epoch.
+    pub fn instance_owner_epoch(&self, instance_id: &str) -> StoreResult<i64> {
+        instance_owner_epoch_on(&self.connection, instance_id)
+    }
+
+    /// DR-0067 §3: take ownership of an instance's log, evicting the previous
+    /// owner. Returns the epoch every subsequent append must present.
+    pub fn claim_instance_ownership(&self, instance_id: &str) -> StoreResult<i64> {
+        claim_instance_ownership_on(&self.connection, instance_id)
+    }
+
+    /// DR-0067 §2 + §3: the append a durable worker should use — head
+    /// compare-and-set *and* the ownership fence.
+    pub fn append_event_fenced(
+        &self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        append_event_fenced_on(&self.connection, owner_epoch, expected_head, event)
     }
 
     pub fn create_program_version(
@@ -4657,6 +4733,71 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// DR-0068 §3: read an instance's log **against a pin**, verifying as it
+    /// goes.
+    ///
+    /// [`SqliteStore::list_events`] answers "everything you have right now",
+    /// which is safe for a caller reading its own store and meaningless across
+    /// machines — a reader cannot tell a complete prefix from a truncated one,
+    /// nor a served prefix from a substituted one. This form takes the
+    /// `(sequence, head_digest)` the caller pinned, returns exactly that prefix,
+    /// and refuses unless the rows actually fold to the pinned digest.
+    ///
+    /// Refusal, not repair: a mismatch means the log is not the one the pin
+    /// names, and the caller must stop rather than proceed on a different world.
+    pub fn list_events_pinned(
+        &self,
+        instance_id: &str,
+        pinned: &event_chain::ChainHead,
+    ) -> StoreResult<Vec<EventView>> {
+        let upto = pinned.sequence.unwrap_or(0);
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+             causation_id, correlation_id, idempotency_key, format_version \
+             FROM events WHERE instance_id = ?1 AND sequence <= ?2 ORDER BY sequence ASC",
+        )?;
+        let stored = statement
+            .query_map(params![instance_id, upto], |row| {
+                Ok(StoredChainRow {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    occurred_at: row.get(4)?,
+                    source: row.get(5)?,
+                    causation_id: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    idempotency_key: row.get(8)?,
+                    format_version: row.get(9)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        let entries = stored
+            .iter()
+            .map(|row| row.as_entry(instance_id))
+            .collect::<Vec<_>>();
+        let folded = event_chain::fold_prefix(instance_id, &entries);
+        if folded != *pinned {
+            return Err(StoreError::Conflict(format!(
+                "pinned prefix does not verify for instance `{instance_id}`: pin names \
+                 sequence {:?} at {}, the stored rows fold to sequence {:?} at {}. The log is \
+                 not the one this pin names.",
+                pinned.sequence, pinned.digest, folded.sequence, folded.digest
+            )));
+        }
+        Ok(stored
+            .into_iter()
+            .map(|row| EventView {
+                event_id: row.event_id,
+                sequence: row.sequence,
+                event_type: row.event_type,
+                payload_json: row.payload_json,
+                source: row.source.unwrap_or_default(),
+                occurred_at: row.occurred_at,
+            })
+            .collect())
+    }
+
     /// The already-recorded event carrying this `(instance_id, idempotency_key)`
     /// pair, if any — the read side of the events unique index, so admission
     /// drivers can absorb a re-delivered key instead of tripping the index.
@@ -7456,7 +7597,143 @@ fn restore_marker_target(payload_json: &str) -> Option<i64> {
 }
 
 #[cfg(feature = "native")]
+/// The unguarded append: no expected head, no epoch — and therefore it must
+/// still behave the way it did before the chain existed, which means a
+/// concurrent writer is something to retry past rather than report.
+///
+/// **This retry is a regression fix, and the regression was mine.** Before
+/// DR-0067 the sequence was computed *inside* the INSERT
+/// (`SELECT COALESCE(MAX(sequence), 0) + 1 ...` as a subquery), so SQLite
+/// evaluated it under the write lock and concurrent appends to one instance
+/// serialized with no possible collision. Chaining moved the head read into a
+/// separate statement, because the digest has to commit to a sequence the
+/// INSERT has not chosen yet — and that opened a window where two threads read
+/// the same head, computed the same sequence, and the loser's append was simply
+/// lost. `dev_native_fixture_stress_records_one_terminal_per_effect` caught it
+/// intermittently, which is exactly how this class of bug shows up.
+///
+/// The guarded paths do NOT retry: a caller that passed an expected head or an
+/// epoch asked to be told about contention, and swallowing it there would
+/// defeat the point of asking.
+#[cfg(feature = "native")]
 fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<StoredEvent> {
+    // Bounded: a livelock under extreme contention should surface as an error,
+    // not spin. Each attempt re-reads the head, so a retry races afresh rather
+    // than replaying a stale sequence.
+    const ATTEMPTS: usize = 16;
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        match append_event_chained_on(connection, None, None, event) {
+            Ok(stored) => return Ok(stored),
+            Err(StoreError::Conflict(message)) if message.contains("is already taken") => {
+                last = Some(StoreError::Conflict(message));
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        StoreError::Conflict(format!(
+            "event-log sequence contention for instance `{}` did not clear in \
+             {ATTEMPTS} attempts",
+            event.instance_id
+        ))
+    }))
+}
+
+/// DR-0067 §2 and §3 together: append only if the head is still `expected_head`
+/// *and* the caller still owns the log at `owner_epoch`.
+///
+/// This is the append a durable worker should use once it has claimed
+/// ownership. The two checks close different holes and neither subsumes the
+/// other — see [`ensure_instance_owner_epoch`].
+#[cfg(feature = "native")]
+fn append_event_fenced_on(
+    connection: &Connection,
+    owner_epoch: i64,
+    expected_head: &str,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    append_event_chained_on(connection, Some(expected_head), Some(owner_epoch), event)
+}
+
+/// DR-0067 §2: append as **compare-and-set on the head**.
+///
+/// Rejected when the instance's current head digest is not `expected_head`. The
+/// log's high-water mark is a ref and this is its CAS, which is why DR-0066 §2
+/// needs no second mechanism for the history plane.
+///
+/// This defeats a *blind* zombie — an old owner resuming from stale in-memory
+/// state, the ordinary failover case — because its expected digest is stale. It
+/// does not defeat a zombie that re-reads the head first; that gap is closed by
+/// the owner epoch (DR-0067 §3), not here.
+#[cfg(feature = "native")]
+fn append_event_cas_on(
+    connection: &Connection,
+    expected_head: &str,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    append_event_chained_on(connection, Some(expected_head), None, event)
+}
+
+/// The one append path. `expected_head` present means compare-and-set.
+///
+/// `event_id` and `occurred_at` are drawn from SQLite *before* the insert
+/// rather than generated inside it, because the entry digest commits to both
+/// and cannot be computed from values the statement has not produced yet. The
+/// formats are unchanged — the same `randomblob` id shape and the same
+/// `CURRENT_TIMESTAMP` — so nothing downstream can tell the difference.
+#[cfg(feature = "native")]
+fn append_event_chained_on(
+    connection: &Connection,
+    expected_head: Option<&str>,
+    owner_epoch: Option<i64>,
+    event: NewEvent<'_>,
+) -> StoreResult<StoredEvent> {
+    if let Some(claimed) = owner_epoch {
+        let current = instance_owner_epoch_on(connection, event.instance_id)?;
+        if claimed != current {
+            return Err(StoreError::Conflict(format!(
+                "event-log ownership fence failed for instance `{}`: caller holds epoch \
+                 {claimed}, the log is at epoch {current}. Ownership moved; this writer must \
+                 stop rather than append.",
+                event.instance_id
+            )));
+        }
+    }
+    let head = chain_head_on(connection, event.instance_id)?;
+    if let Some(expected) = expected_head {
+        if expected != head.digest {
+            return Err(StoreError::Conflict(format!(
+                "event-log compare-and-set failed for instance `{}`: expected head {expected}, \
+                 found {}. Another writer extended this log; re-read before appending.",
+                event.instance_id, head.digest
+            )));
+        }
+    }
+    let (event_id, occurred_at) = connection.query_row(
+        "SELECT 'evt_' || lower(hex(randomblob(16))), CURRENT_TIMESTAMP",
+        [],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    let sequence = head.sequence.unwrap_or(0) + 1;
+    // DR-0054 Phase B: stamp the writer's event format so a future reader can
+    // tell a row it must not misparse. Constant within a build, so replay
+    // re-derivation stays byte-identical.
+    let format_version = SUPPORTED_EVENT_FORMAT_VERSION;
+    let entry = event_chain::ChainEntry {
+        event_id: &event_id,
+        instance_id: event.instance_id,
+        sequence,
+        event_type: event.event_type,
+        payload_json: event.payload_json,
+        occurred_at: &occurred_at,
+        source: event.source,
+        causation_id: event.causation_id,
+        correlation_id: event.correlation_id,
+        idempotency_key: event.idempotency_key,
+        format_version: Some(format_version),
+    };
+    let entry_digest = event_chain::entry_digest(&head.digest, &entry);
     connection
         .query_row(
             r#"
@@ -7471,35 +7748,27 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
                 causation_id,
                 correlation_id,
                 idempotency_key,
-                format_version
+                format_version,
+                prev_digest,
+                entry_digest
             )
-            VALUES (
-                'evt_' || lower(hex(randomblob(16))),
-                ?1,
-                (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE instance_id = ?1),
-                ?2,
-                ?3,
-                CURRENT_TIMESTAMP,
-                ?4,
-                ?5,
-                ?6,
-                ?7,
-                ?8
-            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             RETURNING event_id, sequence
             "#,
             params![
+                event_id,
                 event.instance_id,
+                sequence,
                 event.event_type,
                 event.payload_json,
+                occurred_at,
                 event.source,
                 event.causation_id,
                 event.correlation_id,
                 event.idempotency_key,
-                // DR-0054 Phase B: stamp the writer's event format so a future
-                // reader can tell a row it must not misparse. Constant within a
-                // build, so replay re-derivation stays byte-identical.
-                SUPPORTED_EVENT_FORMAT_VERSION,
+                format_version,
+                head.digest,
+                entry_digest,
             ],
             |row| {
                 Ok(StoredEvent {
@@ -7509,11 +7778,24 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
             },
         )
         .map_err(|error| {
-            // Name the colliding event in the error: a UNIQUE hit on the
-            // idempotency key is otherwise undebuggable from the generic
-            // "internal store error" the CLI wraps around it.
-            if let rusqlite::Error::SqliteFailure(f, _) = &error {
+            // Name the colliding event in the error: a UNIQUE hit is otherwise
+            // undebuggable from the generic "internal store error" the CLI wraps
+            // around it. Since DR-0067 moved sequence assignment out of the
+            // INSERT, there are now two distinct collisions here and they mean
+            // opposite things — tell them apart rather than reporting every one
+            // as a duplicate key.
+            if let rusqlite::Error::SqliteFailure(f, detail) = &error {
                 if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
+                    let on_sequence = detail
+                        .as_deref()
+                        .is_some_and(|text| text.contains("events.sequence"));
+                    if on_sequence {
+                        return StoreError::Conflict(format!(
+                            "event-log sequence {sequence} is already taken for instance `{}`: \
+                             another writer appended concurrently. Re-read the head and retry.",
+                            event.instance_id
+                        ));
+                    }
                     return StoreError::Conflict(format!(
                         "duplicate event idempotency key for `{}` (key {:?}): a second \
                          distinct commit produced an already-used key",
@@ -11067,8 +11349,284 @@ fn apply_migrations(connection: &mut Connection) -> StoreResult<()> {
     ensure_skill_body_column(connection)?;
     ensure_lookup_indexes(connection)?;
     ensure_event_format_column(connection)?;
+    ensure_event_chain_columns(connection)?;
+    ensure_instance_owner_epoch(connection)?;
     ensure_store_meta(connection)?;
     Ok(())
+}
+
+/// DR-0067 §3: the writer fence.
+///
+/// Distinct from `instances.revision_epoch`, which is program lineage — these
+/// are two different clocks and giving them one name would be exactly the
+/// two-meanings-for-one-identifier defect the guide refuses. `owner_epoch`
+/// counts *ownership transfers* of the instance's log.
+///
+/// Why this exists when [`append_event_cas_on`] already refuses a stale head:
+/// compare-and-set defeats a blind zombie, one resuming from stale in-memory
+/// state. It does not defeat a zombie that re-reads the head first and then
+/// appends — that append targets the true head and succeeds. The epoch closes
+/// it, because ownership moved and the old owner's epoch is now behind, whether
+/// or not it re-read anything.
+#[cfg(feature = "native")]
+fn ensure_instance_owner_epoch(connection: &Connection) -> StoreResult<()> {
+    let instances_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'instances'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !instances_table_exists {
+        return Ok(());
+    }
+    if !column_exists(connection, "instances", "owner_epoch")? {
+        connection.execute(
+            "ALTER TABLE instances ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// The instance's current owner epoch. An instance with no row has never
+/// changed hands, so it reads as epoch 0 rather than as an error — the fence is
+/// opt-in and must not turn an unfenced append path into a failure.
+#[cfg(feature = "native")]
+fn instance_owner_epoch_on(connection: &Connection, instance_id: &str) -> StoreResult<i64> {
+    Ok(connection
+        .query_row(
+            "SELECT owner_epoch FROM instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Take ownership of an instance's log, returning the epoch the new owner must
+/// present on every append.
+///
+/// The bump alone evicts the previous owner: from the moment it lands, the old
+/// epoch no longer matches and every append under it is refused. There is
+/// therefore no window between "ownership moved" and "the new owner's first
+/// append" for the old owner to interleave into — which is the property the
+/// tracker asked for and the one the model's transfer-window bite checks.
+#[cfg(feature = "native")]
+fn claim_instance_ownership_on(connection: &Connection, instance_id: &str) -> StoreResult<i64> {
+    let updated = connection.execute(
+        "UPDATE instances SET owner_epoch = owner_epoch + 1 WHERE instance_id = ?1",
+        params![instance_id],
+    )?;
+    if updated == 0 {
+        return Err(StoreError::Conflict(format!(
+            "instance `{instance_id}` does not exist, so its log ownership cannot be claimed"
+        )));
+    }
+    instance_owner_epoch_on(connection, instance_id)
+}
+
+/// DR-0067 §1: give `events` its hash chain, and §5's **backfill** resolution.
+///
+/// The two columns are added by the ensure-* additive pattern; the backfill
+/// then walks each instance's prefix in sequence order and fills them in. The
+/// alternative (anchor: start a fresh chain and leave older entries
+/// unverifiable) was rejected because backfill is available here — every
+/// column [`event_chain::canonical_entry`] reads is *recorded* rather than
+/// recomputed, so folding stored rows is deterministic and reproduces exactly
+/// what a live append would have written. This is not a rewrite of the log:
+/// no recorded value changes, and the derived columns are the only ones set.
+///
+/// One-time, and guarded by the column check, so an already-chained store pays
+/// a `PRAGMA table_info` and nothing else on open.
+#[cfg(feature = "native")]
+fn ensure_event_chain_columns(connection: &Connection) -> StoreResult<()> {
+    let events_table_exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !events_table_exists {
+        return Ok(());
+    }
+    if column_exists(connection, "events", "entry_digest")? {
+        return Ok(());
+    }
+    connection.execute("ALTER TABLE events ADD COLUMN prev_digest TEXT", [])?;
+    connection.execute("ALTER TABLE events ADD COLUMN entry_digest TEXT", [])?;
+    backfill_event_chain(connection)
+}
+
+/// Fold every existing instance's prefix and record the digests it implies.
+#[cfg(feature = "native")]
+fn backfill_event_chain(connection: &Connection) -> StoreResult<()> {
+    let mut instances = connection.prepare("SELECT DISTINCT instance_id FROM events")?;
+    let instance_ids = instances
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<result::Result<Vec<_>, _>>()?;
+    for instance_id in instance_ids {
+        let mut rows = connection.prepare(
+            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+             causation_id, correlation_id, idempotency_key, format_version \
+             FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let stored = rows
+            .query_map(params![instance_id], |row| {
+                Ok(StoredChainRow {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    occurred_at: row.get(4)?,
+                    source: row.get(5)?,
+                    causation_id: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    idempotency_key: row.get(8)?,
+                    format_version: row.get(9)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        let mut prev = event_chain::genesis_digest(&instance_id);
+        for row in &stored {
+            let digest = event_chain::entry_digest(&prev, &row.as_entry(&instance_id));
+            connection.execute(
+                "UPDATE events SET prev_digest = ?1, entry_digest = ?2 WHERE event_id = ?3",
+                params![prev, digest, row.event_id],
+            )?;
+            prev = digest;
+        }
+    }
+    Ok(())
+}
+
+/// An `events` row in the shape the chain reads it.
+#[cfg(feature = "native")]
+impl crate::log_append::LogAppend for SqliteStore {
+    fn chain_head(&self, instance_id: &str) -> StoreResult<event_chain::ChainHead> {
+        Self::chain_head(self, instance_id)
+    }
+
+    fn instance_owner_epoch(&self, instance_id: &str) -> StoreResult<i64> {
+        Self::instance_owner_epoch(self, instance_id)
+    }
+
+    fn claim_instance_ownership(&mut self, instance_id: &str) -> StoreResult<i64> {
+        Self::claim_instance_ownership(self, instance_id)
+    }
+
+    fn append_event_fenced(
+        &mut self,
+        owner_epoch: i64,
+        expected_head: &str,
+        event: NewEvent<'_>,
+    ) -> StoreResult<StoredEvent> {
+        Self::append_event_fenced(self, owner_epoch, expected_head, event)
+    }
+
+    fn chain_prefix(&self, instance_id: &str) -> StoreResult<Vec<event_chain::OwnedChainEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+             causation_id, correlation_id, idempotency_key, format_version \
+             FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
+        )?;
+        let rows = statement
+            .query_map(params![instance_id], |row| {
+                Ok(event_chain::OwnedChainEntry {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    occurred_at: row.get(4)?,
+                    source: row.get(5)?,
+                    causation_id: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    idempotency_key: row.get(8)?,
+                    format_version: row.get(9)?,
+                })
+            })?
+            .collect::<result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+#[cfg(feature = "native")]
+struct StoredChainRow {
+    event_id: String,
+    sequence: i64,
+    event_type: String,
+    payload_json: String,
+    occurred_at: String,
+    source: Option<String>,
+    causation_id: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+    format_version: Option<i64>,
+}
+
+#[cfg(feature = "native")]
+impl StoredChainRow {
+    fn as_entry<'a>(&'a self, instance_id: &'a str) -> event_chain::ChainEntry<'a> {
+        event_chain::ChainEntry {
+            event_id: &self.event_id,
+            instance_id,
+            sequence: self.sequence,
+            event_type: &self.event_type,
+            payload_json: &self.payload_json,
+            occurred_at: &self.occurred_at,
+            // `source` is NOT NULL in the schema; the Option is defensive for a
+            // store written before that was true, and an absent source must not
+            // be silently equal to an empty one.
+            source: self.source.as_deref().unwrap_or(""),
+            causation_id: self.causation_id.as_deref(),
+            correlation_id: self.correlation_id.as_deref(),
+            idempotency_key: self.idempotency_key.as_deref(),
+            format_version: self.format_version,
+        }
+    }
+}
+
+/// DR-0067 §2: an instance's high-water mark — how far its log goes and what
+/// the whole committed prefix hashes to.
+///
+/// This is the value [`append_event_cas_on`] compare-and-sets against and the
+/// value a reader pins (DR-0068).
+#[cfg(feature = "native")]
+fn chain_head_on(
+    connection: &Connection,
+    instance_id: &str,
+) -> StoreResult<event_chain::ChainHead> {
+    let head = connection
+        .query_row(
+            "SELECT sequence, entry_digest FROM events WHERE instance_id = ?1 \
+             ORDER BY sequence DESC LIMIT 1",
+            params![instance_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    match head {
+        Some((sequence, Some(digest))) => Ok(event_chain::ChainHead {
+            sequence: Some(sequence),
+            digest,
+        }),
+        // A row with no digest means the backfill did not reach it, which would
+        // make every later digest a lie. Refuse rather than silently restart the
+        // chain from genesis.
+        // The message names an entry point the caller can actually invoke.
+        // It previously said only "until the chain is backfilled", naming a
+        // repair with no way to reach it — and since `ensure_*` re-runs the
+        // backfill only when it ADDS the columns, a reopen does not repair
+        // this. An error that names an unreachable remedy is a dead end.
+        Some((sequence, None)) => Err(StoreError::Conflict(format!(
+            "instance `{instance_id}` has an unchained event at sequence {sequence}: \
+             the log cannot be extended until the chain is backfilled — call \
+             `SqliteStore::repair_event_chain` to rebuild it from the stored rows"
+        ))),
+        None => Ok(event_chain::ChainHead::empty(instance_id)),
+    }
 }
 
 /// DR-0054 Phase B: give `events` a nullable `format_version` column via the
@@ -11978,6 +12536,592 @@ mod tests {
         assert_eq!(second.sequence, 2);
         assert_eq!(other.sequence, 1);
         assert_ne!(first.event_id, second.event_id);
+    }
+
+    /// Read an instance's stored prefix back as chain entries, so a test can
+    /// fold it independently of whatever the writer recorded.
+    fn stored_prefix(store: &SqliteStore, instance_id: &str) -> Vec<StoredChainRow> {
+        let mut rows = store
+            .connection
+            .prepare(
+                "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
+                 causation_id, correlation_id, idempotency_key, format_version \
+                 FROM events WHERE instance_id = ?1 ORDER BY sequence ASC",
+            )
+            .expect("prefix query prepares");
+        let stored = rows
+            .query_map(params![instance_id], |row| {
+                Ok(StoredChainRow {
+                    event_id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    occurred_at: row.get(4)?,
+                    source: row.get(5)?,
+                    causation_id: row.get(6)?,
+                    correlation_id: row.get(7)?,
+                    idempotency_key: row.get(8)?,
+                    format_version: row.get(9)?,
+                })
+            })
+            .expect("prefix rows map")
+            .collect::<result::Result<Vec<_>, _>>()
+            .expect("prefix rows collect");
+        stored
+    }
+
+    #[test]
+    fn the_head_digest_is_the_fold_of_the_stored_prefix() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("second appends");
+
+        let head = store.chain_head("instance-a").expect("head reads");
+        let stored = stored_prefix(&store, "instance-a");
+        let entries = stored
+            .iter()
+            .map(|row| row.as_entry("instance-a"))
+            .collect::<Vec<_>>();
+        let folded = event_chain::fold_prefix("instance-a", &entries);
+
+        assert_eq!(head.sequence, Some(2));
+        assert_eq!(
+            head, folded,
+            "the recorded head must equal an independent fold of the prefix"
+        );
+    }
+
+    #[test]
+    fn an_empty_instance_heads_at_its_own_genesis() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let head = store.chain_head("instance-fresh").expect("head reads");
+        assert_eq!(head, event_chain::ChainHead::empty("instance-fresh"));
+        assert_ne!(
+            head.digest,
+            event_chain::genesis_digest("instance-other"),
+            "genesis must not be shared across instances"
+        );
+    }
+
+    #[test]
+    fn compare_and_set_append_accepts_the_current_head() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let head = store.chain_head("instance-a").expect("head reads");
+        let appended = store
+            .append_event_cas(&head.digest, new_event("instance-a", "rule.fired", None))
+            .expect("CAS against the live head appends");
+        assert_eq!(appended.sequence, 1);
+
+        let next = store.chain_head("instance-a").expect("head re-reads");
+        assert_ne!(next.digest, head.digest, "the head must advance");
+    }
+
+    /// The zombie-writer bite. A stale owner holds the head it saw before
+    /// failover; the new owner has since extended the log. The stale append must
+    /// be refused — without this it lands at a fresh sequence, satisfies every
+    /// schema constraint, and yields a history that describes no execution.
+    #[test]
+    fn compare_and_set_append_refuses_a_stale_head() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let stale = store.chain_head("instance-a").expect("head reads");
+
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("the new owner appends");
+
+        let zombie =
+            store.append_event_cas(&stale.digest, new_event("instance-a", "rule.fired", None));
+
+        assert!(
+            matches!(zombie, Err(StoreError::Conflict(_))),
+            "a stale head must be refused, got {zombie:?}"
+        );
+        assert_eq!(
+            store.chain_head("instance-a").expect("head reads").sequence,
+            Some(1),
+            "the refused append must not have landed"
+        );
+    }
+
+    /// DR-0068 §3: a pinned read returns exactly the pinned prefix, and a
+    /// later append does not leak into it.
+    #[test]
+    fn a_pinned_read_returns_exactly_the_pinned_prefix() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("second appends");
+        let pin = store.chain_head("instance-a").expect("head reads");
+
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("a later event appends");
+
+        let pinned = store
+            .list_events_pinned("instance-a", &pin)
+            .expect("pinned read verifies");
+        assert_eq!(
+            pinned.len(),
+            2,
+            "the later event must not leak into the pin"
+        );
+        assert_eq!(
+            store.list_events("instance-a").expect("live read").len(),
+            3,
+            "the unbounded read still sees everything, which is why it is not the \
+             cross-machine form"
+        );
+    }
+
+    /// The substitution bite: rows that no longer fold to the pinned digest
+    /// must refuse, not be served as though they were the pinned world.
+    #[test]
+    fn a_pinned_read_refuses_a_prefix_that_does_not_fold_to_its_pin() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        let pin = store.chain_head("instance-a").expect("head reads");
+
+        store
+            .connection
+            .execute(
+                "UPDATE events SET payload_json = '{\"tampered\":true}' WHERE sequence = 1",
+                [],
+            )
+            .expect("row is tampered with");
+
+        let read = store.list_events_pinned("instance-a", &pin);
+        assert!(
+            matches!(read, Err(StoreError::Conflict(_))),
+            "a substituted row must refuse, got {read:?}"
+        );
+    }
+
+    /// A pin naming a prefix longer than the store holds is equally a refusal:
+    /// a truncated log is not the world the pin names.
+    #[test]
+    fn a_pinned_read_refuses_a_truncated_log() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("second appends");
+        let pin = store.chain_head("instance-a").expect("head reads");
+
+        store
+            .connection
+            .execute("DELETE FROM events WHERE sequence = 2", [])
+            .expect("row is dropped");
+
+        assert!(matches!(
+            store.list_events_pinned("instance-a", &pin),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    /// DR-0067 §5: backfill must reproduce exactly what a live append writes,
+    /// or a pre-migration prefix means something different from a post-migration
+    /// one.
+    #[test]
+    fn backfilling_an_unchained_log_reproduces_the_live_digests() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "external.started", None))
+            .expect("first appends");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("second appends");
+        let live = store.chain_head("instance-a").expect("head reads");
+
+        // Return the store to its pre-DR-0067 shape, then re-run the backfill.
+        store
+            .connection
+            .execute(
+                "UPDATE events SET prev_digest = NULL, entry_digest = NULL",
+                [],
+            )
+            .expect("digests clear");
+        backfill_event_chain(&store.connection).expect("backfill runs");
+
+        assert_eq!(
+            store.chain_head("instance-a").expect("head re-reads"),
+            live,
+            "backfilled digests must match the ones the live appends wrote"
+        );
+    }
+
+    /// An **interrupted backfill** leaves a NULL-digest suffix, never a hole,
+    /// because it walks ascending — so reading the last row catches it.
+    ///
+    /// This is the native answer to "what about partial writes". The append
+    /// path has exactly one mutating statement (the INSERT; everything before
+    /// it is a SELECT), so it has no partial state to be in. The multi-statement
+    /// mutation is the backfill, and this is the state an interruption of it
+    /// actually produces.
+    #[test]
+    fn an_interrupted_backfill_leaves_a_suffix_that_refuses() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        for _ in 0..3 {
+            store
+                .append_event(new_event("instance-a", "rule.fired", None))
+                .expect("appends");
+        }
+        // Backfill walks ascending, so interruption clears a SUFFIX.
+        store
+            .connection
+            .execute(
+                "UPDATE events SET prev_digest = NULL, entry_digest = NULL WHERE sequence >= 3",
+                [],
+            )
+            .expect("suffix clears");
+
+        assert!(
+            matches!(store.chain_head("instance-a"), Err(StoreError::Conflict(_))),
+            "an interrupted backfill must refuse, not report the last chained row"
+        );
+    }
+
+    /// **The stored digests are a derived cache, and only the last one is ever
+    /// read.** Written after a test asserting the opposite failed and taught me
+    /// what the columns actually are.
+    ///
+    /// Nothing folds them: `list_events_pinned` folds row *content*. So a
+    /// corrupted digest on a middle row changes no answer — nothing consults
+    /// it — and a "hole" there is not a hazard, which is why no check catches
+    /// one. What *is* a hazard is a corrupted **last** digest, because
+    /// `chain_head` returns it; and a reader that pins from it and then
+    /// verifies catches exactly that, because the content it folds no longer
+    /// agrees with the digest it was handed.
+    #[test]
+    fn only_the_last_digest_is_read_and_corrupting_it_is_caught_on_verify() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        for _ in 0..3 {
+            store
+                .append_event(new_event("instance-a", "rule.fired", None))
+                .expect("appends");
+        }
+        let good = store.chain_head("instance-a").expect("head reads");
+
+        // A middle digest is not consulted by anything, so wrecking it changes
+        // no answer — including the pinned read, which folds content.
+        store
+            .connection
+            .execute(
+                "UPDATE events SET entry_digest = 'wrecked' WHERE sequence = 2",
+                [],
+            )
+            .expect("middle digest wrecked");
+        assert_eq!(
+            store.chain_head("instance-a").expect("head still reads"),
+            good
+        );
+        assert!(
+            store.list_events_pinned("instance-a", &good).is_ok(),
+            "a middle digest is a derived cache nothing reads; wrecking it \
+             cannot change what the prefix folds to"
+        );
+
+        // The LAST digest is read, so wrecking it yields a head that the
+        // content does not support — and verifying against that head refuses.
+        store
+            .connection
+            .execute(
+                "UPDATE events SET entry_digest = 'wrecked-head' WHERE sequence = 3",
+                [],
+            )
+            .expect("last digest wrecked");
+        let bad = store.chain_head("instance-a").expect("head reads");
+        assert_ne!(
+            bad, good,
+            "the corrupted last digest is what chain_head returns"
+        );
+        assert!(
+            matches!(
+                store.list_events_pinned("instance-a", &bad),
+                Err(StoreError::Conflict(_))
+            ),
+            "verifying against a head the content does not support must refuse"
+        );
+    }
+
+    /// **Process death is not a separate hazard from statement failure here,
+    /// and reopening does not repair.**
+    ///
+    /// Checked rather than argued. The append is one statement, so SQLite's own
+    /// atomicity decides it — there is no torn append to survive. The only
+    /// multi-statement mutation is the backfill, and dying partway through it
+    /// leaves exactly the state a failed statement leaves: a NULL-digest
+    /// suffix. So a restarted process finds the same thing this test builds.
+    ///
+    /// What it finds is a refusal, and **it stays refused**: `ensure_*` only
+    /// backfills when it adds the columns, so a reopen does not re-run it. That
+    /// is fail-closed, which is right, but it is not self-healing — and the
+    /// durable-object host *is* (`do_chain_head` backfills lazily at first
+    /// touch). The asymmetry is recorded on the tracker rather than papered
+    /// over here.
+    #[test]
+    fn reopening_after_an_interrupted_backfill_stays_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("store.sqlite");
+
+        {
+            let store = SqliteStore::open(&path).expect("store opens");
+            for _ in 0..3 {
+                store
+                    .append_event(new_event("instance-a", "rule.fired", None))
+                    .expect("appends");
+            }
+            // The state an interruption leaves, however it was interrupted.
+            store
+                .connection
+                .execute(
+                    "UPDATE events SET prev_digest = NULL, entry_digest = NULL \
+                     WHERE sequence >= 3",
+                    [],
+                )
+                .expect("suffix clears");
+        } // handle dropped without ceremony — the restart boundary.
+
+        let reopened = SqliteStore::open(&path).expect("store reopens");
+        assert!(
+            matches!(
+                reopened.chain_head("instance-a"),
+                Err(StoreError::Conflict(_))
+            ),
+            "a restarted process must refuse a log it cannot verify"
+        );
+        assert!(
+            reopened
+                .append_event(new_event("instance-a", "rule.fired", None))
+                .is_err(),
+            "and must not extend it"
+        );
+
+        // The refusal names a repair, so the repair must exist and work.
+        reopened.repair_event_chain().expect("repair runs");
+        let head = reopened
+            .chain_head("instance-a")
+            .expect("the repaired log verifies");
+        assert_eq!(head.sequence, Some(3));
+        reopened
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("and can be extended again");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Concurrent unguarded appends to one instance must all land.**
+    ///
+    /// The regression this guards was mine: chaining moved the sequence
+    /// computation out of the INSERT (where SQLite's write lock made collisions
+    /// impossible) into a preceding read, so two threads could pick the same
+    /// sequence and one append vanished. It surfaced only as an intermittent
+    /// failure in a CLI stress test, which is a bad place to learn about it.
+    ///
+    /// This reproduces the race directly against a shared file-backed store, so
+    /// the property is checked where it lives rather than inferred from a
+    /// downstream symptom.
+    #[test]
+    fn concurrent_unguarded_appends_all_land() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-append-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("store.sqlite");
+        SqliteStore::open(&path).expect("store initialises");
+
+        const WRITERS: usize = 4;
+        const EACH: usize = 12;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for _ in 0..WRITERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let store = SqliteStore::open(&path).expect("writer opens");
+                barrier.wait();
+                for _ in 0..EACH {
+                    store
+                        .append_event(new_event("instance-a", "rule.fired", None))
+                        .expect("an unguarded append must not be lost to contention");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer finishes");
+        }
+
+        let store = SqliteStore::open(&path).expect("store reopens");
+        let head = store.chain_head("instance-a").expect("head reads");
+        assert_eq!(
+            head.sequence,
+            Some((WRITERS * EACH) as i64),
+            "every concurrent append must have landed, with no gaps in the chain"
+        );
+        // And the chain is still coherent, not merely long.
+        assert_eq!(
+            store
+                .list_events_pinned("instance-a", &head)
+                .expect("verifies")
+                .len(),
+            WRITERS * EACH
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unchained row would make every later digest a lie, so extending the
+    /// log must refuse rather than quietly restarting from genesis.
+    #[test]
+    fn an_unchained_row_refuses_further_appends() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .expect("first appends");
+        store
+            .connection
+            .execute("UPDATE events SET entry_digest = NULL", [])
+            .expect("digest clears");
+
+        let head = store.chain_head("instance-a");
+        assert!(
+            matches!(head, Err(StoreError::Conflict(_))),
+            "an unchained head must refuse, got {head:?}"
+        );
+        assert!(store
+            .append_event(new_event("instance-a", "rule.fired", None))
+            .is_err());
+    }
+
+    /// The hole compare-and-set leaves open, and the one the epoch closes.
+    ///
+    /// A zombie that re-reads the head before appending presents the *true*
+    /// head, so CAS admits it. Only the ownership fence refuses it.
+    #[test]
+    fn the_owner_epoch_refuses_a_zombie_that_re_read_the_head() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Fence", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = instance.instance_id.as_str();
+
+        let old_owner_epoch = store.instance_owner_epoch(id).expect("epoch reads");
+        let new_owner_epoch = store
+            .claim_instance_ownership(id)
+            .expect("ownership claims");
+        assert_eq!(new_owner_epoch, old_owner_epoch + 1);
+
+        // The zombie does everything right except still exist: it re-reads the
+        // live head, so its compare-and-set would succeed.
+        let live_head = store.chain_head(id).expect("head reads");
+        assert!(
+            store
+                .append_event_cas(&live_head.digest, new_event(id, "rule.fired", None))
+                .is_ok(),
+            "CAS alone admits a zombie that re-read — this is why the fence exists"
+        );
+
+        let head_again = store.chain_head(id).expect("head re-reads");
+        let fenced = store.append_event_fenced(
+            old_owner_epoch,
+            &head_again.digest,
+            new_event(id, "rule.fired", None),
+        );
+        assert!(
+            matches!(fenced, Err(StoreError::Conflict(_))),
+            "the stale owner must be fenced out, got {fenced:?}"
+        );
+
+        // And the true owner still works.
+        store
+            .append_event_fenced(
+                new_owner_epoch,
+                &head_again.digest,
+                new_event(id, "rule.fired", None),
+            )
+            .expect("the current owner appends");
+    }
+
+    /// Ownership transfer must leave no window: the moment the epoch bumps, the
+    /// previous owner is refused, without waiting for the new owner to append.
+    #[test]
+    fn ownership_transfer_evicts_the_previous_owner_immediately() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Transfer", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = instance.instance_id.as_str();
+
+        let first = store.claim_instance_ownership(id).expect("first claims");
+        let head = store.chain_head(id).expect("head reads");
+        store
+            .append_event_fenced(first, &head.digest, new_event(id, "rule.fired", None))
+            .expect("first owner appends");
+
+        store.claim_instance_ownership(id).expect("second claims");
+
+        // No append by the second owner yet — the first is already out.
+        let head = store.chain_head(id).expect("head re-reads");
+        let stale =
+            store.append_event_fenced(first, &head.digest, new_event(id, "rule.fired", None));
+        assert!(
+            matches!(stale, Err(StoreError::Conflict(_))),
+            "the bump alone must evict, got {stale:?}"
+        );
+    }
+
+    /// Assert the reason rather than the variant. `Conflict` is the store's
+    /// catch-all for "someone else got there first", so matching it alone
+    /// cannot tell an absent instance from a contended one — and those two want
+    /// opposite things from the caller.
+    #[test]
+    fn claiming_ownership_of_an_unknown_instance_refuses() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let refusal = store.claim_instance_ownership("instance-nope");
+        let Err(StoreError::Conflict(message)) = refusal else {
+            panic!("claiming an unknown instance must be refused, got {refusal:?}");
+        };
+        assert!(
+            message.contains("instance-nope") && message.contains("does not exist"),
+            "the refusal must name the instance and say it does not exist: {message}"
+        );
     }
 
     #[test]

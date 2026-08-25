@@ -449,14 +449,34 @@ impl NativeWorkspaceVcs {
     /// the sweep is conservative by construction (chunk tier and erasure
     /// tombstones untouched), so archaeology keeps everything a recorded
     /// cut can reach and a wrong root set can only retain too much.
-    pub fn purge_unreachable(&mut self) -> StoreResult<crate::content::PurgeOutcome> {
+    ///
+    /// DR-0068 §5: run-held cuts are added to the root set explicitly. Today
+    /// that changes nothing — every recorded cut is already a root, so no
+    /// cut's closure is collectable and the pin is not yet load-bearing. It is
+    /// wired now precisely because that stops being true the moment retention
+    /// (research note §15) begins pruning recorded cuts: the guard exists
+    /// before the thing that needs it, rather than being remembered afterwards.
+    pub fn purge_unreachable(&mut self, now: &str) -> StoreResult<crate::content::PurgeOutcome> {
         let mut roots = self.branches.reachability_roots()?;
-        // A root that is a MANIFEST names content ids: expand one level.
-        // (Non-manifest roots that happen to parse as a string map add
-        // only phantom ids — retention noise, never a wrong delete.)
+        for cut_id in self.branches.pinned_cuts(now)? {
+            if let Some(manifest_hash) = self.branches.cut_manifest_hash(&cut_id)? {
+                roots.insert(manifest_hash);
+            }
+        }
+        // A root that is a MANIFEST names content ids: expand it.
+        //
+        // A TREE manifest (DR-0070 §1) must be walked WHOLE, not one level:
+        // interior nodes and the leaves under them would otherwise look
+        // unreachable, and the sweep would delete content a recorded cut still
+        // names. A flat manifest keeps the old one-level expansion.
+        // (Non-manifest roots that happen to parse as a string map add only
+        // phantom ids — retention noise, never a wrong delete.)
         for hash in roots.clone() {
             if let Some(body) = self.content.get(&hash)? {
-                if let Ok(manifest) = serde_json::from_str::<BTreeMap<String, String>>(&body) {
+                if crate::manifest_tree::is_node(&body) {
+                    roots.extend(crate::manifest_tree::reachable_ids(&self.content, &hash)?);
+                } else if let Ok(manifest) = serde_json::from_str::<BTreeMap<String, String>>(&body)
+                {
                     roots.extend(manifest.into_values());
                 }
             }
@@ -686,6 +706,17 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         self.branches.list_cuts(branch_id, limit)
     }
 
+    /// DR-0070 §1 migration: **a compatibility read path keyed by shape**, and
+    /// no rewrite of existing cuts.
+    ///
+    /// A manifest root written after the tree landed is a `manifest_tree` node;
+    /// one written before is a flat JSON map. The two are told apart by reading
+    /// the blob and trying the node shape first — a cut is immutable, so
+    /// rewriting old manifests would mean minting new cut identities for cuts
+    /// that already exist and are already referenced.
+    ///
+    /// The flat path therefore stays forever, not as a deprecation window but
+    /// as the honest way to read history written before the tree.
     fn load_manifest(&self, hash: Option<&str>) -> StoreResult<BTreeMap<String, String>> {
         let Some(hash) = hash else {
             return Ok(BTreeMap::new());
@@ -695,12 +726,16 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 "manifest blob {hash} is absent from the content store"
             )));
         };
+        if crate::manifest_tree::is_node(&body) {
+            return crate::manifest_tree::load(&self.content, hash);
+        }
         serde_json::from_str(&body).map_err(StoreError::from)
     }
 
+    /// DR-0070 §1: manifests are written as prolly trees, so a cut writes new
+    /// bytes proportional to the change rather than to the workspace.
     fn store_manifest(&self, manifest: &BTreeMap<String, String>) -> StoreResult<String> {
-        let body = serde_json::to_string(manifest)?;
-        self.content.put(&body)
+        crate::manifest_tree::build(&self.content, manifest)
     }
 
     /// The branch's current file listing (path → content id).
@@ -2200,9 +2235,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         units: &mut Vec<crate::selection::ChangeUnit>,
     ) -> StoreResult<()> {
         let after = match self.content.get(&cut.manifest_hash)? {
-            Some(body) => {
-                serde_json::from_str::<BTreeMap<String, String>>(&body).map_err(StoreError::from)?
-            }
+            Some(_) => self.load_manifest(Some(&cut.manifest_hash))?,
             None => return Ok(()),
         };
         let before = match cut.parent_cut_id.as_deref() {
@@ -2210,7 +2243,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
             Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
                 None => BTreeMap::new(),
                 Some(parent) => match self.content.get(&parent.manifest_hash)? {
-                    Some(body) => serde_json::from_str(&body).map_err(StoreError::from)?,
+                    Some(_) => self.load_manifest(Some(&parent.manifest_hash))?,
                     None => return Ok(()),
                 },
             },
@@ -3959,7 +3992,7 @@ mod tests {
         .expect("record");
         // A stray blob nothing names — the one thing the sweep may take.
         let orphan = vcs.content_store().put("orphaned residue").expect("put");
-        let outcome = vcs.purge_unreachable().expect("purge");
+        let outcome = vcs.purge_unreachable("t9").expect("purge");
         assert!(outcome.purged >= 1, "the orphan was reclaimed: {outcome:?}");
         assert_eq!(
             vcs.content_store().get(&orphan).expect("get"),
@@ -4333,6 +4366,101 @@ mod tests {
         assert!(
             paths.contains(&"prog.whip"),
             ".whip never text-merges: {paths:?}"
+        );
+    }
+
+    /// DR-0070 §1, the measurement the tracker gated the content tier on —
+    /// now **inverted**, because the tree landed.
+    ///
+    /// Its first version measured the wrong thing, and the flaw is worth
+    /// recording: it serialized the materialized map and compared sizes, which
+    /// says how big a manifest *is*, not how many bytes a cut *writes*. That
+    /// number barely moves when the storage layout changes, so the test would
+    /// have kept passing whether or not the tree delivered anything.
+    ///
+    /// What actually matters is the count of NEW nodes a one-entry change
+    /// mints. Under the old flat layout it was one whole-workspace blob every
+    /// time, deduplicating with nothing. Under the tree it is a spine: the leaf
+    /// that changed and its ancestors, with every other subtree keeping its id
+    /// and costing nothing.
+    #[test]
+    fn a_one_file_edit_mints_only_a_spine() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+
+        const FILES: usize = 256;
+        let mut last_manifest = String::new();
+        for index in 0..FILES {
+            let outcome = vcs
+                .write(
+                    MAINLINE_BRANCH_ID,
+                    &format!("src/file_{index:04}.txt"),
+                    Some("original body"),
+                    &format!("cut_seed_{index}"),
+                    "t1",
+                )
+                .expect("seed write");
+            if let VcsWriteOutcome::Written { manifest_hash, .. } = outcome {
+                last_manifest = manifest_hash;
+            }
+        }
+
+        let before_ids = crate::manifest_tree::reachable_ids(&vcs.content, &last_manifest)
+            .expect("the manifest is a tree and walks whole");
+
+        // Change exactly one file out of FILES.
+        let outcome = vcs
+            .write(
+                MAINLINE_BRANCH_ID,
+                "src/file_0000.txt",
+                Some("edited body"),
+                "cut_edit",
+                "t2",
+            )
+            .expect("edit write");
+        let VcsWriteOutcome::Written { manifest_hash, .. } = outcome else {
+            panic!("the edit should have written");
+        };
+        let after_ids =
+            crate::manifest_tree::reachable_ids(&vcs.content, &manifest_hash).expect("walks whole");
+
+        let minted = after_ids.difference(&before_ids).count();
+        assert!(
+            minted > 0 && minted <= 12,
+            "a one-entry change in a {FILES}-entry manifest should mint a spine \
+             (its leaf, its ancestors, and the new blob), got {minted} new ids. \
+             If this grew, the tree stopped sharing unchanged subtrees and the \
+             DR-0070 §1 win is gone."
+        );
+
+        // And the content still reads back whole through the compatibility seam.
+        let materialized = vcs
+            .manifest(MAINLINE_BRANCH_ID)
+            .expect("manifest reads")
+            .expect("branch exists");
+        assert_eq!(materialized.len(), FILES);
+    }
+
+    /// DR-0070 §1's migration decision: a compatibility read path keyed by
+    /// shape, and no rewrite of existing cuts. A manifest written flat before
+    /// the tree must still read, because cuts are immutable and rewriting them
+    /// would mint new identities for cuts that already exist.
+    #[test]
+    fn a_flat_manifest_written_before_the_tree_still_reads() {
+        let vcs = vcs();
+        let flat: BTreeMap<String, String> =
+            BTreeMap::from([("legacy/a.txt".to_owned(), "hash-a".to_owned())]);
+        let body = serde_json::to_string(&flat).expect("encodes");
+        let hash = vcs.content.put(&body).expect("legacy manifest stores");
+
+        assert!(
+            !crate::manifest_tree::is_node(&body),
+            "a flat manifest must not be mistaken for a tree node"
+        );
+        assert_eq!(
+            vcs.load_manifest(Some(&hash))
+                .expect("legacy manifest reads"),
+            flat
         );
     }
 

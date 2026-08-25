@@ -21,7 +21,10 @@ use std::path::Path;
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::event_chain;
+use crate::StoreError;
 use crate::StoreResult;
+use std::collections::BTreeSet;
 
 /// The distinguished mainline branch id.
 pub const MAINLINE_BRANCH_ID: &str = "main";
@@ -406,6 +409,68 @@ pub trait Branches {
     /// cut id.
     fn record_cut(&mut self, cut: CutRecord<'_>) -> StoreResult<()>;
 
+    /// DR-0068 §5: hold a cut's closure against collection for a run.
+    ///
+    /// Taken at **dispatch**, in the same step that stamps the cut into the
+    /// trigger — `models/tla/PinnedResolution.tla` found the window that opens
+    /// if the runner pins when it starts instead (collect a cut, fire a trigger
+    /// naming it, resolve; every runner agrees on a world already reclaimed).
+    ///
+    /// Idempotent per `(cut_id, holder)`: a re-dispatch of the same run renews
+    /// rather than accumulating. Deliberately a FIFTH lease-shaped mechanism
+    /// rather than a merge into one of the existing four — `std-coord.md`'s
+    /// four-mechanisms resolution is a standing decision that they stay
+    /// separate, sharing the *contract shape* and not an implementation. The
+    /// shape is honoured here: atomic attempt, holder-lifetime bound, TTL
+    /// expiry, and release-on-terminal through [`Branches::release_closure_pins`].
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn pin_closure(&mut self, cut_id: &str, holder: &str, expires_at: &str) -> StoreResult<()>;
+
+    /// DR-0068 §5: release every pin a holder owns — the terminal hook.
+    ///
+    /// Every terminal path must reach this. A pin that outlives its run blocks
+    /// collection forever, which is the cancel-leak lesson the runtime already
+    /// paid for once (`release_holder_resources_on_terminal`): a held resource
+    /// that only *usually* gets released is a leak with extra steps.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn release_closure_pins(&mut self, holder: &str) -> StoreResult<usize>;
+
+    /// DR-0068 §5: cut ids currently held, expiry applied at `now`.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>>;
+
+    /// DR-0068 §2: record the log half of a cut — every in-scope instance's
+    /// `(sequence, head_digest)` at the moment it was taken.
+    ///
+    /// Separate from [`Branches::record_cut`] because the two halves live in
+    /// different stores: manifests and cuts are the branch store's, event logs
+    /// are the runtime store's. Only a caller holding both can capture this, so
+    /// asking `record_cut` for it would put a field on every VCS-internal cut
+    /// that no VCS-internal caller could ever fill.
+    ///
+    /// Attaching what a cut already carries is refused rather than silently
+    /// overwritten: a cut is immutable, and a second, different pin would mean
+    /// two answers to "what world is this".
+    fn attach_cut_log_heads(
+        &mut self,
+        cut_id: &str,
+        heads: &event_chain::LogHeads,
+    ) -> StoreResult<()>;
+
+    /// DR-0068 §2: the log heads this cut pinned.
+    ///
+    /// `Ok(None)` means the cut predates the capture — distinct from
+    /// `Ok(Some(empty))`, which means the cut genuinely had no in-scope
+    /// instances. A runner must treat the first as "cannot verify" rather than
+    /// as "nothing to verify".
+    fn cut_log_heads(&self, cut_id: &str) -> StoreResult<Option<event_chain::LogHeads>>;
+
     /// DR-0052 L4 — the change-unit index. `change_unit_cursor` reports
     /// how far the branch's oldest-first cut list is indexed;
     /// `append_change_unit_rows` extends the index (advancing the
@@ -429,6 +494,12 @@ pub trait Branches {
     fn reset_change_unit_index(&mut self, branch_id: &str) -> StoreResult<()>;
     /// The change id a cut carries; `None` for pre-identity cuts.
     fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>>;
+
+    /// The manifest root a cut names, if the cut is recorded.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn cut_manifest_hash(&self, cut_id: &str) -> StoreResult<Option<String>>;
     /// The full recorded cut; `None` for unrecorded ids.
     fn get_cut(&self, cut_id: &str) -> StoreResult<Option<CutRow>>;
     /// The branch's recorded cuts, newest first, up to `limit`.
@@ -720,13 +791,26 @@ fn ensure_branch_schema(connection: &Connection) -> StoreResult<()> {
             indexed_cuts INTEGER NOT NULL,
             last_indexed_cut_id TEXT
         );
+        -- DR-0068 §5: run-scoped closure pins. Keyed by (cut, holder) so a
+        -- re-dispatch of the same run renews rather than accumulating.
+        CREATE TABLE IF NOT EXISTS closure_pins (
+            cut_id     TEXT NOT NULL,
+            holder     TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (cut_id, holder)
+        );
+        CREATE INDEX IF NOT EXISTS closure_pins_holder_idx
+            ON closure_pins(holder);
         "#,
     )?;
     // Provenance columns arrived with Phase 2, the actor tier with
     // DR-0052; stores minted before either gain the columns in place
     // (pre-migration rows read as NULL — honest "recorded before this
     // provenance existed").
-    for column in ["parent_cut_id", "origin", "actor", "intent"] {
+    // DR-0068 §2: `log_heads` carries the cut's log half — the pinned
+    // `(sequence, head_digest)` per in-scope instance. NULL on a cut recorded
+    // before it, which reads as "not captured", never as "no instances".
+    for column in ["parent_cut_id", "origin", "actor", "intent", "log_heads"] {
         ensure_column(connection, "cuts", column)?;
     }
     // DR-0054: declaration-level sub-rows on the change-unit index.
@@ -1089,6 +1173,109 @@ impl Branches for BranchStore {
             ],
         )?;
         Ok(())
+    }
+
+    fn pin_closure(&mut self, cut_id: &str, holder: &str, expires_at: &str) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO closure_pins (cut_id, holder, expires_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(cut_id, holder) DO UPDATE SET expires_at = excluded.expires_at",
+            params![cut_id, holder, expires_at],
+        )?;
+        Ok(())
+    }
+
+    fn release_closure_pins(&mut self, holder: &str) -> StoreResult<usize> {
+        let released = self.connection.execute(
+            "DELETE FROM closure_pins WHERE holder = ?1",
+            params![holder],
+        )?;
+        Ok(released)
+    }
+
+    fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT cut_id FROM closure_pins WHERE expires_at > ?1")?;
+        let cuts = statement
+            .query_map(params![now], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(cuts)
+    }
+
+    fn attach_cut_log_heads(
+        &mut self,
+        cut_id: &str,
+        heads: &event_chain::LogHeads,
+    ) -> StoreResult<()> {
+        let existing: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT log_heads FROM cuts WHERE cut_id = ?1",
+                params![cut_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                return Err(StoreError::Conflict(format!(
+                    "cut `{cut_id}` does not exist, so its log heads cannot be attached"
+                )))
+            }
+            Some(Some(_)) => {
+                return Err(StoreError::Conflict(format!(
+                    "cut `{cut_id}` already pinned its log heads; a cut is immutable and a \
+                     second pin would be a second answer to what world it names"
+                )))
+            }
+            Some(None) => {}
+        }
+        let encoded = event_chain::encode_log_heads(heads)?;
+        // `AND log_heads IS NULL` is the guard, not the check above.
+        //
+        // The read-then-write shape leaves a window in which two callers both
+        // see NULL and both write, and the second silently overwrites a pin the
+        // record says is immutable — the same class of defect as the lost-append
+        // race, found by auditing for the pattern rather than by waiting for a
+        // stress test to notice. Making the condition part of the statement
+        // closes it; the read above survives only to distinguish "no such cut"
+        // from "already pinned" in the error.
+        let updated = self.connection.execute(
+            "UPDATE cuts SET log_heads = ?1 WHERE cut_id = ?2 AND log_heads IS NULL",
+            params![encoded, cut_id],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::Conflict(format!(
+                "cut `{cut_id}` was pinned concurrently; a cut is immutable and a second \
+                 pin would be a second answer to what world it names"
+            )));
+        }
+        Ok(())
+    }
+
+    fn cut_log_heads(&self, cut_id: &str) -> StoreResult<Option<event_chain::LogHeads>> {
+        let encoded: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT log_heads FROM cuts WHERE cut_id = ?1",
+                params![cut_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match encoded.flatten() {
+            None => Ok(None),
+            Some(text) => Ok(Some(event_chain::decode_log_heads(&text)?)),
+        }
+    }
+
+    fn cut_manifest_hash(&self, cut_id: &str) -> StoreResult<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT manifest_hash FROM cuts WHERE cut_id = ?1",
+                params![cut_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn cut_change_id(&self, cut_id: &str) -> StoreResult<Option<String>> {
@@ -1471,6 +1658,351 @@ mod tests {
             created_at: "2026-07-10T00:00:00Z",
             idempotency_key: None,
         }
+    }
+
+    fn seed_cut(store: &mut BranchStore, cut_id: &str) {
+        store.ensure_mainline("t0").expect("mainline");
+        store
+            .record_cut(CutRecord {
+                cut_id,
+                change_id: cut_id,
+                branch_id: MAINLINE_BRANCH_ID,
+                manifest_hash: "manifest_a",
+                parent_cut_id: None,
+                origin: None,
+                actor: None,
+                intent: None,
+                recorded_at: "t1",
+            })
+            .expect("cut records");
+    }
+
+    fn one_head(instance: &str, sequence: i64, digest: &str) -> event_chain::LogHeads {
+        let mut heads = event_chain::LogHeads::new();
+        heads.insert(
+            instance.to_owned(),
+            event_chain::ChainHead {
+                sequence: Some(sequence),
+                digest: digest.to_owned(),
+            },
+        );
+        heads
+    }
+
+    /// DR-0068 §2: a cut carries the log half, so pinning the cut pins the
+    /// runtime history too.
+    #[test]
+    fn a_cut_pins_and_returns_its_log_heads() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        let heads = one_head("inst_a", 3, "digest_a");
+
+        store
+            .attach_cut_log_heads("cut_1", &heads)
+            .expect("heads attach");
+
+        assert_eq!(
+            store.cut_log_heads("cut_1").expect("heads read"),
+            Some(heads)
+        );
+    }
+
+    /// "Not captured" and "no instances" must not be the same answer: the first
+    /// means a runner cannot verify, the second means there is nothing to.
+    #[test]
+    fn an_uncaptured_cut_is_distinct_from_an_empty_one() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        assert_eq!(store.cut_log_heads("cut_1").expect("heads read"), None);
+
+        seed_cut(&mut store, "cut_2");
+        store
+            .attach_cut_log_heads("cut_2", &event_chain::LogHeads::new())
+            .expect("empty heads attach");
+        assert_eq!(
+            store.cut_log_heads("cut_2").expect("heads read"),
+            Some(event_chain::LogHeads::new())
+        );
+    }
+
+    /// A cut is immutable, so a second, different pin would be a second answer
+    /// to what world it names.
+    #[test]
+    fn re_pinning_a_cut_is_refused() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        store
+            .attach_cut_log_heads("cut_1", &one_head("inst_a", 3, "digest_a"))
+            .expect("first attach");
+
+        let second = store.attach_cut_log_heads("cut_1", &one_head("inst_a", 4, "digest_b"));
+        assert!(
+            matches!(&second, Err(StoreError::Conflict(message)) if message.contains("already pinned")),
+            "a re-pin must be refused *as a re-pin*, got {second:?}"
+        );
+        assert_eq!(
+            store.cut_log_heads("cut_1").expect("heads read"),
+            Some(one_head("inst_a", 3, "digest_a")),
+            "the original pin must survive the refusal"
+        );
+    }
+
+    /// **Concurrent pins of one cut: exactly one wins.**
+    ///
+    /// The read-then-write shape let both callers see NULL and both write, so
+    /// the immutability the record promises held only when nobody raced. Found
+    /// by auditing for the pattern after the lost-append race, not by a failing
+    /// test — which is the only reason it is fixed before it mattered.
+    #[test]
+    fn a_concurrently_pinned_cut_keeps_exactly_one_pin() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-pin-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("branches.sqlite");
+        {
+            let mut store = BranchStore::open(&path).expect("store opens");
+            seed_cut(&mut store, "cut_1");
+        }
+
+        const WRITERS: usize = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for index in 0..WRITERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut store = BranchStore::open(&path).expect("writer opens");
+                let heads = one_head("inst_a", index as i64, &format!("digest_{index}"));
+                barrier.wait();
+                store.attach_cut_log_heads("cut_1", &heads).is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .filter(|_| true)
+            .map(|handle| handle.join().expect("writer finishes"))
+            .filter(|won| *won)
+            .count();
+
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent pin may win; the rest must be refused"
+        );
+        let store = BranchStore::open(&path).expect("store reopens");
+        assert!(
+            store.cut_log_heads("cut_1").expect("heads read").is_some(),
+            "and the winner's pin must be what survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `attach_cut_log_heads` has THREE Conflict refusals — unknown cut,
+    /// already pinned, pinned concurrently — so `Err(Conflict(_))` does not say
+    /// which one fired. It passes just as well when the refusal is right for
+    /// the wrong reason, and a mutation sweep reads it as testing nothing.
+    /// Assert the reason, not the variant.
+    #[test]
+    fn pinning_an_unknown_cut_is_refused() {
+        let mut store = store();
+        store.ensure_mainline("t0").expect("mainline");
+        let refusal = store.attach_cut_log_heads("cut_nope", &one_head("inst_a", 1, "d"));
+        let Err(StoreError::Conflict(message)) = refusal else {
+            panic!("pinning an unknown cut must be refused, got {refusal:?}");
+        };
+        assert!(
+            message.contains("cut_nope") && message.contains("does not exist"),
+            "the refusal must name the cut and say it does not exist, \
+             not merely be some conflict: {message}"
+        );
+    }
+
+    /// DR-0068 §5: a pin holds until it expires, and expiry is applied at read
+    /// time rather than by a sweeper — a pin nobody swept must not read as
+    /// still held.
+    #[test]
+    fn a_pin_holds_until_it_expires() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        store
+            .pin_closure("cut_1", "run-a", "2026-08-24T12:00:00Z")
+            .expect("pin taken");
+
+        assert!(store
+            .pinned_cuts("2026-08-24T11:59:59Z")
+            .expect("read")
+            .contains("cut_1"));
+        assert!(
+            !store
+                .pinned_cuts("2026-08-24T12:00:01Z")
+                .expect("read")
+                .contains("cut_1"),
+            "an expired pin must not read as held"
+        );
+    }
+
+    /// Idempotent per (cut, holder): a re-dispatch renews rather than
+    /// accumulating rows that each have to be released separately.
+    #[test]
+    fn re_pinning_the_same_run_renews_rather_than_accumulating() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        store
+            .pin_closure("cut_1", "run-a", "2026-08-24T12:00:00Z")
+            .expect("pin taken");
+        store
+            .pin_closure("cut_1", "run-a", "2026-08-24T18:00:00Z")
+            .expect("pin renewed");
+
+        assert!(
+            store
+                .pinned_cuts("2026-08-24T13:00:00Z")
+                .expect("read")
+                .contains("cut_1"),
+            "the renewal must have extended the hold"
+        );
+        assert_eq!(
+            store.release_closure_pins("run-a").expect("release"),
+            1,
+            "a renewal must not have left a second row behind"
+        );
+    }
+
+    /// The terminal hook, and the lesson this runtime already paid for once: a
+    /// held resource released on only *some* terminal paths is a leak with
+    /// extra steps. Releasing by holder is what lets every terminal path reach
+    /// it without knowing which cuts the run touched.
+    #[test]
+    fn releasing_a_holder_frees_every_cut_it_held() {
+        let mut store = store();
+        seed_cut(&mut store, "cut_1");
+        seed_cut(&mut store, "cut_2");
+        store
+            .pin_closure("cut_1", "run-a", "2126-01-01T00:00:00Z")
+            .expect("pin one");
+        store
+            .pin_closure("cut_2", "run-a", "2126-01-01T00:00:00Z")
+            .expect("pin two");
+        store
+            .pin_closure("cut_1", "run-b", "2126-01-01T00:00:00Z")
+            .expect("another run pins the same cut");
+
+        assert_eq!(store.release_closure_pins("run-a").expect("release"), 2);
+
+        let held = store.pinned_cuts("2026-08-24T00:00:00Z").expect("read");
+        assert!(
+            held.contains("cut_1"),
+            "another holder's pin on the same cut must survive"
+        );
+        assert!(!held.contains("cut_2"));
+    }
+
+    /// **Concurrent pins and releases of one cut, under real threads.**
+    ///
+    /// `pin_closure` is `INSERT ... ON CONFLICT DO UPDATE` and
+    /// `release_closure_pins` is a single `DELETE`, so both are one atomic
+    /// statement and neither has the read-then-write shape that produced three
+    /// defects in this work. That is an argument, though, not a check — and
+    /// after this session I would rather not leave a concurrency claim resting
+    /// on one.
+    ///
+    /// The property: a holder that pinned and did not release still holds, and
+    /// a holder that released holds nothing. No interleaving may leave a pin
+    /// belonging to a released holder, which is the leak that blocks collection
+    /// forever.
+    #[test]
+    fn concurrent_pins_and_releases_leave_no_orphaned_hold() {
+        let dir = std::env::temp_dir().join(format!(
+            "whip-pinrace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("branches.sqlite");
+        {
+            let mut store = BranchStore::open(&path).expect("store opens");
+            seed_cut(&mut store, "cut_1");
+        }
+
+        const HOLDERS: usize = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(HOLDERS));
+        let mut handles = Vec::new();
+        for index in 0..HOLDERS {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut store = BranchStore::open(&path).expect("holder opens");
+                let holder = format!("run-{index}");
+                barrier.wait();
+                for _ in 0..8 {
+                    store
+                        .pin_closure("cut_1", &holder, "2126-01-01T00:00:00Z")
+                        .expect("pin takes");
+                }
+                // Odd holders release; even holders keep holding.
+                if index % 2 == 1 {
+                    store
+                        .release_closure_pins(&holder)
+                        .expect("release succeeds");
+                }
+                index % 2 == 0
+            }));
+        }
+        let still_holding: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("holder finishes"))
+            .filter(|kept| *kept)
+            .count();
+
+        let store = BranchStore::open(&path).expect("store reopens");
+        let held = store
+            .pinned_cuts("2026-08-24T00:00:00Z")
+            .expect("pins read");
+        assert!(
+            held.contains("cut_1"),
+            "holders that did not release must still hold the cut"
+        );
+        assert!(still_holding > 0, "the fixture must leave someone holding");
+
+        // Every remaining pin belongs to a holder that did not release: no
+        // interleaving may strand one, and none may vanish either.
+        let rows: Vec<(String, String)> = store
+            .connection
+            .prepare("SELECT cut_id, holder FROM closure_pins")
+            .and_then(|mut s| {
+                s.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect()
+            })
+            .expect("pins enumerate");
+        assert_eq!(
+            rows.len(),
+            still_holding,
+            "one row per non-releasing holder — no orphan, no duplicate"
+        );
+        for (_, holder) in &rows {
+            let index: usize = holder
+                .trim_start_matches("run-")
+                .parse()
+                .expect("holder id parses");
+            assert_eq!(index % 2, 0, "a released holder must hold nothing");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn releasing_a_holder_with_no_pins_is_not_an_error() {
+        let mut store = store();
+        assert_eq!(store.release_closure_pins("run-never").expect("release"), 0);
     }
 
     #[test]
