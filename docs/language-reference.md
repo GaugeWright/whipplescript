@@ -2155,6 +2155,38 @@ The angle brackets are a built-in constructor, as in `map<string>`, not a
 type parameter: the argument ranges over a closed, protocol-owned set of
 values rather than over types.
 
+### `obtain credential`
+
+An agent or a rule that discovers it needs authority it was not granted raises
+a **governance escalation**. The statement is deliberately non-blocking: it
+files a tracker item and derives a `credential.requested` fact, and the run
+continues.
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+rule deploy
+  when deploy.blocked as blocked
+=> {
+  obtain credential deploy_key into ops {
+    title "deploy_key is not granted"
+    body "Deploy blocked: {{ blocked.reason }}"
+  } as escalation
+}
+```
+
+The fact is what makes the escalation *reactable*: a rule matching
+`when fact credential.requested as asked` acts on the program's own missing
+authority. The item names the tracker, as every tracker write in the language
+does; there is no ambient escalation queue.
+
+Nothing waits. A run proceeds, or fails on the authority it still does not
+have, and a later run — after a human edited governance — succeeds. A blocking
+request would be the shape the language removed when it removed `ask_human`.
+
+The credential must be declared. An escalation naming an undeclared handle is a
+check error: it would ask a human for a credential no rule can ever use, and
+the escalation would look answered while changing nothing.
+
 ### The sealing rung and the governance floor
 
 The custodian seals material at a rung that it derives from evidence:

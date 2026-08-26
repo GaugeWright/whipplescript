@@ -354,6 +354,27 @@ pub enum BodyEffectKind {
         /// stdout at the effect-result boundary (spec/json-ingestion.md).
         parse_target: Option<ExecParse>,
     },
+    /// `obtain credential <name> into <tracker> { … } [as <b>]` — DR-0053 §11.
+    ///
+    /// An agent discovering it needs authority it was not granted is a
+    /// governance escalation, and the tempting spelling is a blocking request:
+    /// exactly the shape DR-0050 removed. So this is NON-BLOCKING. It files a
+    /// tracker item and emits a `credential.requested` fact; the run proceeds,
+    /// or fails on the authority it still does not have, and a later run —
+    /// after a human edited governance — succeeds. Escalation is resumable
+    /// rather than suspended.
+    ///
+    /// The tracker is named because every tracker write in this language names
+    /// its tracker; there is no ambient escalation queue, and inventing one
+    /// would put a governance destination outside the program's declarations.
+    ///
+    /// Spelled `request credential` in the record until the 2026-08-25
+    /// amendment took `request` for the outbound construct.
+    ObtainCredential {
+        credential: String,
+        queue: String,
+        fields: Vec<FieldAssign>,
+    },
     /// Work-queue verbs (`file issue into q { ... }`, `claim x`, `release x`,
     /// `finish x [{ ... }]`).
     TrackerFile {
@@ -1446,6 +1467,7 @@ impl<'a> BodyParser<'a> {
             "timer" => self.parse_timer(),
             "cancel" => self.parse_cancel(),
             "exec" => self.parse_exec(),
+            "obtain" => self.parse_obtain_credential(),
             "file" => self.parse_tracker_file(),
             "claim" => self.parse_tracker_claim(),
             "release" => self.parse_tracker_release(),
@@ -3719,6 +3741,59 @@ impl<'a> BodyParser<'a> {
     }
 
     // -- tracker verbs ---------------------------------------------------------
+
+    /// `obtain credential <name> into <tracker> { … } [as <binding>]`
+    /// (DR-0053 §11). Shaped after `file issue into <tracker> { … }`, whose
+    /// field block it reuses verbatim — the item this files IS a tracker item,
+    /// and giving it a second field vocabulary would make the same escalation
+    /// read two ways depending on which verb wrote it.
+    fn parse_obtain_credential(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // obtain
+        if !self.consume_ident("credential") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `credential` after `obtain`",
+                Some("write `obtain credential <name> into <tracker> { … }`".to_owned()),
+            );
+            return None;
+        }
+        let credential = self.ident_text("credential name")?;
+        if !self.consume_ident("into") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `into <tracker>` after the credential name",
+                Some(
+                    "name the tracker the escalation is filed into, as in \
+                     `obtain credential deploy_key into ops { … }`"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        }
+        let queue = self.ident_text("tracker name")?;
+        let fields = self.parse_field_block(false)?;
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::ObtainCredential {
+                credential,
+                queue,
+                fields,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
+            span: self.span_from(start),
+        }))
+    }
 
     fn parse_tracker_file(&mut self) -> Option<BodyStmt> {
         let start = self.pos;

@@ -1905,6 +1905,37 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
                     "queue-fact",
                 ])),
             )?;
+            // DR-0053 §11: an `obtain credential` is a governance escalation,
+            // and the tracker item alone is only half of it. The fact is what
+            // makes the escalation RULE-MATCHABLE, so a program can react to
+            // its own missing authority — react, not wait, which is the whole
+            // difference from the blocking shape DR-0050 removed.
+            //
+            // Derived after the item is filed, never before: a fact claiming an
+            // escalation was raised when the filing failed would be the one
+            // wrong thing this could record.
+            if let Some(credential) = input.get("credential").and_then(Value::as_str) {
+                let requested = json!({
+                    "credential": credential,
+                    "queue": input.get("queue").cloned().unwrap_or(Value::Null),
+                    "item": value.get("id").cloned().unwrap_or(Value::Null),
+                    "effect_id": effect.effect_id,
+                    "run_id": run_id,
+                })
+                .to_string();
+                kernel.derive_fact(
+                    instance_id,
+                    "credential.requested",
+                    credential,
+                    &requested,
+                    Some(&terminal.event_id),
+                    Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "credential-requested-fact",
+                    ])),
+                )?;
+            }
             Ok(terminal)
         }
         Err(reason) => {

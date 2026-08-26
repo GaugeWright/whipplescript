@@ -323,6 +323,20 @@ pub(crate) fn print_effect(
             push_stmt_line(out, indent, &format!("{head}{parse}{binding}{timeout}"));
             return;
         }
+        BodyEffectKind::ObtainCredential {
+            credential,
+            queue,
+            fields,
+        } => {
+            push_stmt_line(
+                out,
+                indent,
+                &format!("obtain credential {credential} into {queue} {{"),
+            );
+            print_fields(fields, indent + 1, &rn, out);
+            push_stmt_line(out, indent, &format!("}}{binding}"));
+            return;
+        }
         BodyEffectKind::TrackerFile { queue, fields } => {
             push_stmt_line(out, indent, &format!("file issue into {queue} {{"));
             print_fields(fields, indent + 1, &rn, out);

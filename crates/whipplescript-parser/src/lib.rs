@@ -10985,6 +10985,10 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
         body::BodyEffectKind::HttpRequest { .. } => IrEffectKind::HttpRequest,
+        // DR-0053 §11 files a tracker item; it is not a custody OPERATION, so
+        // it lowers onto the tracker-file effect kind rather than minting a
+        // kind whose only difference is which fields the handler adds.
+        body::BodyEffectKind::ObtainCredential { .. } => IrEffectKind::TrackerFile,
         body::BodyEffectKind::TrackerFile { .. } => IrEffectKind::TrackerFile,
         body::BodyEffectKind::TrackerClaim { .. } => IrEffectKind::TrackerClaim,
         body::BodyEffectKind::TrackerRelease { .. } => IrEffectKind::TrackerRelease,
@@ -11078,7 +11082,8 @@ fn validate_http_requests(
     for statement in statements {
         match statement {
             body::BodyStmt::Effect(effect) => {
-                validate_http_request(rule, effect, declared_credentials, diagnostics)
+                validate_http_request(rule, effect, declared_credentials, diagnostics);
+                validate_obtain_credential(rule, effect, declared_credentials, diagnostics);
             }
             body::BodyStmt::After(after) => {
                 validate_http_requests(rule, &after.body, declared_credentials, diagnostics)
@@ -11086,6 +11091,40 @@ fn validate_http_requests(
             _ => {}
         }
     }
+}
+
+/// An `obtain credential` must name a credential the program declares
+/// (DR-0053 §11).
+///
+/// The escalation is *for* a specific authority, and a typo'd handle would file
+/// a governance item asking a human for a credential no rule can ever use —
+/// the escalation would look answered and change nothing. This is the one
+/// static check the verb needs: it presents no material and calls no custody
+/// operation, so there is nothing else about it to get wrong at runtime.
+fn validate_obtain_credential(
+    rule: &RuleDecl,
+    effect: &body::EffectStmt,
+    declared_credentials: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let body::BodyEffectKind::ObtainCredential { credential, .. } = &effect.kind else {
+        return;
+    };
+    if declared_credentials.contains(credential.as_str()) {
+        return;
+    }
+    diagnostics.push(Diagnostic {
+        related: Vec::new(),
+        span: effect.span,
+        message: format!(
+            "rule `{}` escalates for undeclared credential `{credential}`",
+            rule.name.name
+        ),
+        suggestion: Some(format!(
+            "declare it with `credential {credential} {{ kind bearer }}`; governance supplies \
+             the address"
+        )),
+    });
 }
 
 /// A `request` must name a credential it actually presents (DR-0053 §5; the
@@ -11330,6 +11369,7 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             | body::BodyEffectKind::HttpRequest { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::TrackerFile { .. }
+            | body::BodyEffectKind::ObtainCredential { .. }
             | body::BodyEffectKind::TrackerClaim { .. }
             | body::BodyEffectKind::TrackerRelease { .. }
             | body::BodyEffectKind::TrackerFinish { .. }
@@ -15248,6 +15288,10 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
             }
         },
         body::BodyEffectKind::TrackerFile { fields: f, .. } => fields(f, out),
+        // An escalation's title and body reach the same durable tracker row a
+        // `file issue` does. The credential is a declared HANDLE, not a
+        // binding, and carries nothing of the run into the record.
+        body::BodyEffectKind::ObtainCredential { fields: f, .. } => fields(f, out),
         body::BodyEffectKind::TrackerClaim { item, .. }
         | body::BodyEffectKind::TrackerRelease { item } => source(item, out),
         body::BodyEffectKind::TrackerFinish { item, fields: f } => {
@@ -16550,6 +16594,7 @@ fn check_conditioned_effect_reads(
             body::ExecTarget::Capability { .. } => {}
         },
         body::BodyEffectKind::TrackerFile { fields, .. }
+        | body::BodyEffectKind::ObtainCredential { fields, .. }
         | body::BodyEffectKind::TrackerFinish { fields, .. }
         | body::BodyEffectKind::LedgerAppend { fields, .. } => check_conditioned_reads_in_fields(
             rule,
@@ -17893,6 +17938,17 @@ fn validate_effect_field_roots(
                     check_field_value_roots(
                         rule,
                         &format!("file into `{queue}`"),
+                        fields,
+                        known_roots,
+                        diagnostics,
+                    );
+                }
+                body::BodyEffectKind::ObtainCredential {
+                    credential, fields, ..
+                } => {
+                    check_field_value_roots(
+                        rule,
+                        &format!("obtain credential `{credential}`"),
                         fields,
                         known_roots,
                         diagnostics,

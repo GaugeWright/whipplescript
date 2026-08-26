@@ -3347,6 +3347,39 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+        } else if let Some(rest) = trimmed.strip_prefix("obtain credential ") {
+            // DR-0053 §11. Lowers onto `tracker.file` — the item it files IS a
+            // tracker item — with the credential carried in `name` so the
+            // handler can add the escalation's own fields and derive the
+            // `credential.requested` fact. `name` rather than a second target
+            // because `target` is the tracker, exactly as it is for `file`.
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            let head = rest.split('{').next().unwrap_or(rest);
+            let mut words = head.split_whitespace();
+            let credential = words.next().unwrap_or_default().to_owned();
+            // `into <tracker>`; the word after `into`.
+            let queue = head
+                .split_once(" into ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .unwrap_or_default()
+                .trim_end_matches('{')
+                .to_owned();
+            let body = invoke_body(&statement).unwrap_or_default();
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(trimmed),
+                kind: "tracker.file".to_owned(),
+                target: Some(queue),
+                name: Some(credential),
+                binding: binding_after_as(&statement),
+                args: vec![body],
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: Vec::new(),
+                after: current_after,
+            });
+            index = next_index;
         } else if let Some(rest) = trimmed.strip_prefix("file ") {
             let (statement, next_index) =
                 parse_statement_until_balanced_braces(&lines, index, trimmed);
@@ -4491,11 +4524,19 @@ pub fn parsed_effect_input_json(
                 None,
                 errors,
             );
-            json!({
+            let mut input = json!({
                 "queue": effect.target,
                 "item": Value::Object(fields),
                 "rule": rule.name,
-            })
+            });
+            // DR-0053 §11: an `obtain credential` carries the credential it is
+            // escalating for. Its presence is what tells the handler to derive
+            // `credential.requested` beside the item — a `file issue` never
+            // sets it, so the two cannot be confused at the boundary.
+            if let Some(credential) = effect.name.as_deref() {
+                insert_json_field(&mut input, "credential", json!(credential));
+            }
+            input
         }
         "tracker.claim" | "tracker.renew" | "tracker.release" | "tracker.finish" => {
             let binding = effect.args.first().map(String::as_str).unwrap_or_default();

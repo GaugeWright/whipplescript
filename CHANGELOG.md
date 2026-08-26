@@ -91,6 +91,31 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Added
 
+- **`obtain credential` — non-blocking governance escalation** (DR-0053 §11).
+
+  ```whip
+  obtain credential deploy_key into ops {
+    title "deploy_key is not granted"
+    body "Deploy blocked: {{ blocked.reason }}"
+  } as escalation
+  ```
+
+  A rule that discovers it needs authority it was not granted files a tracker
+  item and derives a `credential.requested` fact. Nothing waits: the run
+  proceeds, or fails on the authority it still does not have, and a later run —
+  after a human edited governance — succeeds. A blocking request would be the
+  shape the language removed with `ask_human`.
+
+  The fact is what makes it an escalation rather than a notification. It
+  carries the credential, the tracker, and the item id, so a rule matching
+  `when fact credential.requested as asked` acts on the program's own missing
+  authority without re-reading the tracker.
+
+  The tracker is named in the statement, as every tracker write in the language
+  is; there is no ambient escalation queue. A credential the program does not
+  declare is a check error — the escalation would ask a human for authority no
+  rule could use, and would look answered while changing nothing.
+
 - **`secret` carries its credential kind** (DR-0053 §15).
 
   ```whip

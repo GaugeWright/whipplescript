@@ -6986,6 +6986,253 @@ fn dev_fixture_failure_reaches_event_stream() {
     let _ = fs::remove_file(store_path);
 }
 
+/// DR-0053 §11 end to end. An agent discovering it needs authority it was not
+/// granted is a governance escalation, and the tempting spelling is a blocking
+/// request — exactly the shape DR-0050 removed. So `obtain credential` files a
+/// tracker item AND derives a `credential.requested` fact, and the fact is what
+/// makes the escalation rule-matchable: the program REACTS to its own missing
+/// authority instead of waiting on a human.
+///
+/// The second rule here is the load-bearing part. Without the fact the item is
+/// filed and nothing in the program can ever know, which is a notification, not
+/// an escalation.
+#[test]
+fn obtain_credential_files_an_item_and_lets_a_rule_react_to_it() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("obtain-credential");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow Escalate
+
+use std.custody
+
+tracker ops {
+  provider builtin
+}
+
+credential deploy_key {
+  kind ed25519
+}
+
+output result R
+class R { v string }
+
+rule seed
+  when started
+=> {
+  obtain credential deploy_key into ops {
+    title "deploy_key is not granted"
+    body "The deploy rule needs it."
+  } as escalation
+}
+
+rule react
+  when fact credential.requested as asked
+=> {
+  complete result { v asked.credential }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = whip(bin, &store_path)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+
+    // The item was filed.
+    assert!(facts
+        .iter()
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.file.completed")));
+
+    // And the escalation is a fact carrying which credential, which tracker,
+    // and which item — enough for a rule to act on without re-reading the
+    // tracker.
+    let requested = facts
+        .iter()
+        .find(|fact| fact.get("name").and_then(Value::as_str) == Some("credential.requested"))
+        .unwrap_or_else(|| panic!("no credential.requested fact: {facts:#?}"));
+    let value = requested.get("value").expect("fact value");
+    assert_eq!(
+        value.get("credential").and_then(Value::as_str),
+        Some("deploy_key")
+    );
+    assert_eq!(value.get("queue").and_then(Value::as_str), Some("ops"));
+    assert!(
+        value.get("item").and_then(Value::as_str).is_some(),
+        "the fact names the item it filed: {value}"
+    );
+
+    // The reacting rule ran, which is the property that makes this an
+    // escalation rather than a notification.
+    let status = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "status",
+            instance_id,
+        ],
+    );
+    let terminal = status
+        .get("workflow_terminal")
+        .unwrap_or_else(|| panic!("no workflow terminal: {status}"));
+    assert_eq!(
+        terminal.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    // The reacting rule read the credential out of the fact, so the escalation
+    // carried its subject rather than merely announcing that one happened.
+    assert_eq!(
+        terminal
+            .get("payload")
+            .and_then(|payload| payload.get("v"))
+            .and_then(Value::as_str),
+        Some("deploy_key"),
+        "{terminal}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
+/// The discriminator: a plain `file issue` must NOT derive
+/// `credential.requested`. Both verbs lower to the same `tracker.file` effect
+/// kind, so without this the fact could be attached to every tracker write and
+/// these tests would still pass.
+#[test]
+fn a_plain_file_issue_derives_no_credential_request() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let items_path = temp_store_path();
+    let workflow_path = temp_workflow_path("plain-file-issue");
+    fs::write(
+        &workflow_path,
+        r#"
+@service
+workflow PlainFile
+
+tracker ops {
+  provider builtin
+}
+
+output result R
+class R { v string }
+
+rule seed
+  when started
+=> {
+  file issue into ops {
+    title "Ordinary work"
+    body "Nothing to do with credentials."
+  } as filed
+
+  after filed succeeds {
+    complete result { v "ok" }
+  }
+}
+"#,
+    )
+    .expect("workflow writes");
+
+    let output = whip(bin, &store_path)
+        .env("WHIPPLESCRIPT_ITEMS_STORE", &items_path)
+        .args([
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "run",
+            workflow_path.to_str().expect("utf-8 workflow path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ])
+        .output()
+        .expect("command runs");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dev: Value =
+        serde_json::from_str(&stdout[stdout.find('{').expect("json")..]).expect("run json");
+    let instance_id = dev
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id");
+
+    let facts = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store_path.to_str().expect("utf-8 temp path"),
+            "--json",
+            "facts",
+            instance_id,
+        ],
+    );
+    let facts = facts.as_array().expect("facts array");
+    assert!(facts
+        .iter()
+        .any(|fact| fact.get("name").and_then(Value::as_str) == Some("tracker.file.completed")));
+    assert!(
+        !facts
+            .iter()
+            .any(|fact| fact.get("name").and_then(Value::as_str) == Some("credential.requested")),
+        "a plain `file issue` must not raise a credential escalation: {facts:#?}"
+    );
+
+    let _ = fs::remove_file(store_path);
+    let _ = fs::remove_file(items_path);
+    let _ = fs::remove_file(workflow_path);
+}
+
 #[test]
 fn dev_queue_claim_success_releases_agent_turn_dependency() {
     let bin = env!("CARGO_BIN_EXE_whip");

@@ -12723,6 +12723,67 @@ rule j
 }
 
 #[test]
+fn obtain_credential_escalates_for_a_declared_credential_only() {
+    // DR-0053 §11. The escalation is FOR a specific authority, so a typo'd
+    // handle would file a governance item asking a human for a credential no
+    // rule can ever use — the escalation would look answered and change
+    // nothing.
+    let good = compile_program(
+        r#"
+@service
+workflow Escalate
+
+use std.custody
+
+tracker ops { provider builtin }
+credential deploy_key { kind ed25519 }
+
+output result R
+class R { v string }
+rule seed
+  when started
+=> {
+  obtain credential deploy_key into ops {
+    title "not granted"
+    body "please grant"
+  } as escalation
+}
+"#,
+    );
+    assert!(good.diagnostics.is_empty(), "{:?}", good.diagnostics);
+
+    let bad = compile_program(
+        r#"
+@service
+workflow Escalate
+
+use std.custody
+
+tracker ops { provider builtin }
+credential deploy_key { kind ed25519 }
+
+output result R
+class R { v string }
+rule seed
+  when started
+=> {
+  obtain credential deply_key into ops {
+    title "not granted"
+    body "please grant"
+  } as escalation
+}
+"#,
+    );
+    assert!(
+        bad.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("undeclared credential `deply_key`")),
+        "{:?}",
+        bad.diagnostics
+    );
+}
+
+#[test]
 fn duplicate_channel_is_rejected() {
     let source = r#"
 @service
