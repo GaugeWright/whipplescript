@@ -1754,6 +1754,56 @@ fn is_egress_op(operation: &str) -> bool {
     )
 }
 
+/// Every resource the PROGRAM declares, across the families that carry the
+/// language's own operation vocabulary.
+///
+/// This is the resource-KIND signal the checker was missing. It is derived, not
+/// declared: a resource this program brought into being is one whose operations
+/// are the language's verbs, and any other resource named in a grant is foreign
+/// — an MCP server, `web`, `command` — whose operation names belong to someone
+/// else and mean nothing here.
+fn declared_resources(ir: &IrProgram) -> BTreeSet<&str> {
+    let mut names = BTreeSet::new();
+    names.extend(ir.file_stores.iter().map(|r| r.name.as_str()));
+    names.extend(ir.trackers.iter().map(|r| r.name.as_str()));
+    names.extend(ir.ledgers.iter().map(|r| r.name.as_str()));
+    names.extend(ir.channels.iter().map(|r| r.name.as_str()));
+    names.extend(ir.memory_pools.iter().map(|r| r.name.as_str()));
+    names.extend(ir.counters.iter().map(|r| r.name.as_str()));
+    names.extend(ir.leases.iter().map(|r| r.name.as_str()));
+    names.extend(ir.streams.iter().map(|r| r.name.as_str()));
+    names
+}
+
+/// How one grant operation flows, given whether the program declares its
+/// resource (DR-0072).
+///
+/// FAIL CLOSED, and for a reason stronger than caution: a remote tool call
+/// genuinely moves data BOTH ways. Its arguments leave the process and its
+/// results come back, so `github { get_issue }` is an egress of whatever is
+/// passed to it AND a read of whatever it returns. Treating an unclassifiable
+/// operation as both is therefore the accurate reading, not merely the
+/// conservative one.
+///
+/// A foreign resource ignores the verb vocabulary entirely. That is what closes
+/// classification-by-coincidence: a server whose tool happens to be named `get`
+/// was previously read-only by accident of naming, and the name is chosen by
+/// the server, not by this program.
+fn classify_op(operation: &str, resource_is_declared: bool) -> (bool, bool) {
+    if !resource_is_declared {
+        return (true, true);
+    }
+    let read = is_read_op(operation);
+    let egress = is_egress_op(operation);
+    if read || egress {
+        (read, egress)
+    } else {
+        // A declared resource with an operation outside the vocabulary: still
+        // unclassifiable, so still both.
+        (true, true)
+    }
+}
+
 fn is_coordination_effect(kind: &IrEffectKind) -> bool {
     matches!(
         kind,
@@ -3362,6 +3412,8 @@ pub fn check_with_envelope_imports(
     imports: &[IrProgram],
 ) -> Vec<Diagnostic> {
     let envelope = verified.envelope();
+    // The resource-kind signal (DR-0072): which resources this program declares.
+    let declared = declared_resources(ir);
     let schema_names: BTreeSet<&str> = ir
         .schemas
         .iter()
@@ -3613,12 +3665,14 @@ pub fn check_with_envelope_imports(
             }
             for grant in &effect.access_grants {
                 let resource = grant.resource.as_str();
+                let declared = declared.contains(resource);
                 for op in &grant.operations {
-                    if is_read_op(&op.operation) {
+                    let (reads_it, writes_it) = classify_op(&op.operation, declared);
+                    if reads_it {
                         reads.push(resource);
                         span.get_or_insert(effect.span);
                     }
-                    if is_egress_op(&op.operation) {
+                    if writes_it {
                         writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
@@ -4931,34 +4985,20 @@ rule work
     const READ_LEDGER: &str = "    with access to ledger {\n      read [\"**\"]\n    }\n";
     const WRITE_OUTBOX: &str = "    with access to outbox {\n      write [\"**\"]\n    }\n";
 
-    /// The static flow checker classifies a turn grant by its OPERATION VERB
-    /// (`is_read_op` / `is_egress_op`), not by what kind of resource the grant
-    /// names. A grant whose operations are MCP tool names therefore carries no
-    /// read/egress classification at all, and the flow checker stays silent on
-    /// it.
+    /// DR-0072: a grant on a resource the program does not declare is classified
+    /// as BOTH a read and an egress, whatever its operations are named.
     ///
-    /// This test pins that limit deliberately rather than hiding it. What it
-    /// means in practice: for MCP servers the enforced boundary is the ENVELOPE
-    /// (the `mcp:<server>` resource must be governed) plus per-tool admission,
-    /// NOT static flow analysis of values into and out of tool calls. The same
-    /// is true of the shipped `web { search fetch }` grant, so this is a
-    /// property of the checker's verb vocabulary and not something MCP
-    /// introduced.
+    /// This test was the inverse until 2026-08-25: it pinned the gap, asserting
+    /// that a tool-name grant drew no diagnostic at all. It now proves the
+    /// refusal BITES, which is what the gap's own tracker required of it.
     ///
-    /// Two consequences worth keeping visible:
-    /// - a secret-labelled value passed as a tool ARGUMENT is not statically
-    ///   denied the way `read`->`write` between two file stores is;
-    /// - a server whose tool happens to be NAMED `get`/`list`/`read` (or
-    ///   `write`/`send`/`export`) is classified by that coincidence, which is
-    ///   classification by accident.
-    ///
-    /// Closing this needs the checker to know a resource's KIND, which it
-    /// cannot see from the IR today. Tracked in
-    /// `spec/flow-checker-resource-kind-tracker.md`. When the gap closes, this
-    /// test must become a negative fixture that proves the denial bites — not
-    /// merely lose its assertion.
+    /// Two things are checked, and the second is the one that was classification
+    /// by accident: an operation named nothing the language knows
+    /// (`get_issue`), and an operation whose name COLLIDES with a read verb
+    /// (`get`). Both are foreign — the server chooses those names, not this
+    /// program — so both are denied.
     #[test]
-    fn mcp_tool_name_grants_carry_no_static_flow_classification() {
+    fn tool_name_grants_on_a_foreign_resource_are_denied_both_ways() {
         let secret_to_public = || {
             Envelope::from_json(
                 r#"{ "resources": {
@@ -4971,24 +5011,43 @@ rule work
             .expect("valid envelope")
         };
 
-        // A tool-name grant reading from a Secret-labelled server and writing to
-        // a public store draws NO diagnostic, because `get_issue` is not a
-        // read verb.
+        // A tool-name grant reading a Secret-labelled server and writing to a
+        // public store is now DENIED. Before DR-0072 this was silent, because
+        // `get_issue` is in neither verb list.
         let tool_named = ir_with_grants(
             "    with access to github {\n      get_issue\n    }\n\
                  with access to outbox {\n      write [\"**\"]\n    }\n",
         );
-        let quiet =
+        let denied =
             check_with_envelope(&tool_named, &VerifiedEnvelope::for_test(secret_to_public()));
         assert!(
-            quiet.is_empty(),
-            "expected the documented gap (no static classification), got {:?}",
-            quiet.iter().map(|d| &d.message).collect::<Vec<_>>()
+            denied.iter().any(|d| d.message.contains("denied flow")),
+            "a foreign tool-name grant must be classified, got {:?}",
+            denied.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 
-        // Spell the SAME grant with the verb `read` and the checker does flag
-        // it — proving the harness is wired correctly and the silence above is
-        // about the verb vocabulary, not about a broken fixture.
+        // Classification by coincidence is closed: `get` IS a read verb, but
+        // `github` is not a resource this program declares, so the name buys
+        // nothing and the grant is still both directions.
+        let coincidental = ir_with_grants(
+            "    with access to github {\n      get\n    }\n\
+                 with access to outbox {\n      write [\"**\"]\n    }\n",
+        );
+        let also_denied = check_with_envelope(
+            &coincidental,
+            &VerifiedEnvelope::for_test(secret_to_public()),
+        );
+        assert!(
+            also_denied
+                .iter()
+                .any(|d| d.message.contains("denied flow")),
+            "a verb-shaped tool name on a foreign resource must not buy silence, got {:?}",
+            also_denied.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // The verb form on a DECLARED resource is unchanged — the vocabulary
+        // still means what it meant, so this is a narrowing of where the
+        // vocabulary applies rather than a rewrite of it.
         let verb_named = ir_with_grants(
             "    with access to github {\n      read\n    }\n\
                  with access to outbox {\n      write [\"**\"]\n    }\n",
@@ -5000,6 +5059,38 @@ rule work
             "the verb form must still be denied; got {:?}",
             flagged.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    /// The DR-0072 rule itself, stated as a table.
+    ///
+    /// The narrowing is about WHERE the verb vocabulary applies, not what the
+    /// verbs mean: on a resource this program declares they mean exactly what
+    /// they meant before, and the 150-odd other tests in this module are the
+    /// regression guard for that.
+    #[test]
+    fn classify_op_reads_the_vocabulary_only_where_the_program_owns_the_resource() {
+        // Declared resource: the language's own verbs, unchanged.
+        assert_eq!(classify_op("read", true), (true, false));
+        assert_eq!(classify_op("list", true), (true, false));
+        assert_eq!(classify_op("write", true), (false, true));
+        assert_eq!(classify_op("send", true), (false, true));
+
+        // Declared resource, operation outside the vocabulary: unclassifiable,
+        // so both. The checker does not get to guess.
+        assert_eq!(classify_op("frobnicate", true), (true, true));
+
+        // Foreign resource: both, always. A remote call ships its arguments and
+        // returns a result, so this is the accurate reading and not merely the
+        // safe one.
+        assert_eq!(classify_op("get_issue", false), (true, true));
+        assert_eq!(classify_op("search", false), (true, true));
+
+        // Foreign resource whose operation NAME collides with a read verb. The
+        // name is the server's to choose, so it buys nothing — this is the
+        // classification-by-coincidence that DR-0072 closes.
+        assert_eq!(classify_op("get", false), (true, true));
+        assert_eq!(classify_op("read", false), (true, true));
+        assert_eq!(classify_op("write", false), (true, true));
     }
 
     #[test]

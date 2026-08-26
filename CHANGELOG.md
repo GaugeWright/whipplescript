@@ -5,6 +5,40 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Breaking
+
+- **A grant on a resource your program does not declare is now classified as
+  both a read and an egress** (DR-0072).
+
+  The static flow checker classified a grant by its operation verb against two
+  closed lists. An operation in neither list contributed nothing, so
+  `with access to github { get_issue }` on a `Secret`-labelled server, writing to
+  a public store, drew **no diagnostic** — while the same grant spelled
+  `github { read }` was denied. Worse than the silence: a server whose tool
+  happened to be *named* `get` was classified read-only, a confident answer
+  derived from a naming accident in a name the server chooses.
+
+  The verb vocabulary now applies exactly to resources the program declares — a
+  `file store`, `tracker`, `ledger`, `channel`, memory pool, counter, lease, or
+  stream. Every other resource is foreign, and every grant on one is both
+  directions regardless of naming. An unknown operation on a declared resource
+  is also both: the checker does not guess.
+
+  **This is accurate, not merely conservative.** A remote tool call ships its
+  arguments and returns a result, so it genuinely moves data both ways. The old
+  behaviour was not cautious-but-imprecise; it was wrong in the permissive
+  direction.
+
+  A program whose foreign-resource grant carries a real unchecked flow now fails
+  to build. It was always leaking. Across the workspace suite, 2446 tests pass
+  and 0 fail under the rule, and the shipped examples are unaffected because
+  they grant on declared file stores. MCP and the `web { search fetch }` grant
+  closed together, as they had to — the hole predated MCP.
+
+  What is unchanged: the checker classifies a *grant*, not the journey of a
+  value into a particular tool argument.
+
+
 ### Added
 
 - **Tracker-event subscriptions, delivered mid-turn.** An agent can watch a

@@ -629,16 +629,27 @@ records each call as evidence, and it records the trust level of each server
 once per turn. It also marks the description of an unattested server as
 untrusted content.
 
-**One limit to know.** The static flow checker classifies a grant by the name of
-the operation. The names it knows are `read`, `recall`, `get`, `list`, and
-`import` for a read, and `write`, `learn`, `send`, `notify`, `emit`, `export`,
-`append`, and `queue` for an egress. The operations in an MCP grant are the names
-of tools, so the checker does not classify them. The checker therefore does not
-report a flow from a confidential value into a tool argument. The same limit
-applies to the `web { search fetch }` grant. For an MCP server the boundary that
-the system does enforce is the governance envelope, which must govern the
-`mcp:<server>` resource, together with the admission of each tool. Do not treat
-the absence of a diagnostic as proof that no confidential value reached a server.
+**How a grant on a server is classified.** The static flow checker reads the
+operation vocabulary — `read`, `recall`, `get`, `list`, `import` for a read, and
+`write`, `learn`, `send`, `notify`, `emit`, `export`, `append`, `queue` for an
+egress — only for resources your program declares, such as a `file store` or a
+`tracker`. An MCP server is not one of those. Every grant on a server is
+therefore classified as **both a read and an egress**, whatever its tools are
+named.
+
+That is the accurate reading rather than a cautious one: a tool call sends its
+arguments to the server and receives a result back, so it moves data both ways.
+It also means a tool *named* `get` gets no special treatment — the server picks
+that name, so it earns nothing here.
+
+In practice, a turn that reads a confidential resource and holds a grant on a
+server whose readers do not cover it is refused when you check the program. The
+same applies to the `web { search fetch }` grant.
+
+**One limit that remains.** The checker classifies the grant, not the journey of
+a single value into a particular tool argument. It reports that a confidential
+resource and a server grant meet in one turn; it does not trace which argument
+carried what.
 
 ### The trust ladder
 

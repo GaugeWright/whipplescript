@@ -1,0 +1,43 @@
+load ../flow-classification.maude
+
+--- Coverage 1 (C1): a declared resource with a read verb classifies as a read.
+search in FLOW-CLASSIFICATION :
+  { grant(declared, readVerb) } =>! { classified(true, false) } .
+
+--- Coverage 2 (C1): a declared resource with an egress verb classifies as an
+--- egress.
+search in FLOW-CLASSIFICATION :
+  { grant(declared, egressVerb) } =>! { classified(false, true) } .
+
+--- Coverage 3 (C2): a foreign resource with a foreign operation name is both.
+search in FLOW-CLASSIFICATION :
+  { grant(foreign, foreignName) } =>! { classified(true, true) } .
+
+--- Coverage 4 (C3): a foreign resource whose operation is NAMED like a read
+--- verb is still both -- the collision buys nothing.
+search in FLOW-CLASSIFICATION :
+  { grant(foreign, readVerb) } =>! { classified(true, true) } .
+
+--- Coverage 5: an unknown operation on a DECLARED resource is also both; the
+--- checker does not guess a classification it cannot derive.
+search in FLOW-CLASSIFICATION :
+  { grant(declared, foreignName) } =>! { classified(true, true) } .
+
+--- Bite 1 (C3, the defect DR-0072 closes): a foreign resource whose operation
+--- is named `get` must NEVER classify read-only. This is the state the old
+--- verb-list checker reached, and the whole point of the rule is that it is now
+--- unreachable.
+search in FLOW-CLASSIFICATION :
+  { grant(foreign, readVerb) } =>* { classified(true, false) } .
+
+--- Bite 2 (C2): a foreign grant never classifies as egress-only either -- the
+--- read half is not droppable, so an ingress of untrusted content is not lost.
+search in FLOW-CLASSIFICATION :
+  { grant(foreign, egressVerb) } =>* { classified(false, true) } .
+
+--- Bite 3 (C1 is a narrowing, not a rewrite): a DECLARED read verb must not
+--- become both, or every existing program would start failing.
+search in FLOW-CLASSIFICATION :
+  { grant(declared, readVerb) } =>* { classified(true, true) } .
+
+quit .

@@ -1,0 +1,52 @@
+--- DR-0072: the verb vocabulary applies exactly to resources the PROGRAM
+--- declares. A grant on any other resource is classified as BOTH a read and an
+--- egress, whatever its operations are named.
+---
+--- Invariant C1 (declared resources keep the vocabulary): on a declared
+--- resource, a read verb classifies as a read and an egress verb as an egress,
+--- exactly as before. The change narrows WHERE the vocabulary applies, not
+--- what it means.
+--- Invariant C2 (foreign resources are both): on a resource the program does
+--- not declare, every operation classifies as read AND egress. A remote call
+--- ships its arguments and returns a result, so this is the accurate reading
+--- rather than a conservative one.
+--- Invariant C3 (no classification by coincidence): C2 holds even when the
+--- operation NAME collides with a verb. The server chooses that name, so it
+--- must buy nothing. This is the property the old checker violated -- a tool
+--- named `get` was read-only by accident.
+---
+--- The bite is C3: search for a foreign `get` classified read-only. Before
+--- DR-0072 that state was reachable; it must now have NO solution.
+mod FLOW-CLASSIFICATION is
+  protecting BOOL .
+
+  sorts Op Res Class Fact Cfg State .
+  subsort Fact < Cfg .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  --- Operation names the model distinguishes: a read verb, an egress verb, and
+  --- a name outside the vocabulary.
+  ops readVerb egressVerb foreignName : -> Op [ctor] .
+  --- A resource is either declared by this program or foreign to it.
+  ops declared foreign : -> Res [ctor] .
+  --- grant(resource, operation): a pending classification.
+  op grant : Res Op -> Fact [ctor] .
+  --- classified(reads, egresses): the answer.
+  op classified : Bool Bool -> Fact [ctor] .
+
+  var O : Op .
+
+  --- C1: a declared resource reads the vocabulary.
+  rl [declaredRead]   : grant(declared, readVerb)   => classified(true, false) .
+  rl [declaredEgress] : grant(declared, egressVerb) => classified(false, true) .
+  --- A declared resource with an operation outside the vocabulary is still
+  --- unclassifiable, so still both -- the checker does not guess.
+  rl [declaredUnknown] : grant(declared, foreignName) => classified(true, true) .
+
+  --- C2 and C3: a foreign resource is both, for EVERY operation. The rule does
+  --- not inspect O, which is exactly why a verb-shaped name buys nothing.
+  rl [foreignAlways] : grant(foreign, O) => classified(true, true) .
+endm

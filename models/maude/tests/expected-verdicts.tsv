@@ -40,6 +40,7 @@ envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
 envelope-minting.maude	SSNNSNSNSNNSSS
 expression-kernel.maude	NNSSNNSNSSNSSSSSNNSNSNSSNNSSNSNSNS
 external-event-loop.maude	NSS
+flow-classification.maude	SSSSSNNN
 guard-commit-bite.maude	NNSS
 harness-class.maude	SSNN
 harness-evidence-fork.maude	SSNN
