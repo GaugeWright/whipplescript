@@ -1867,6 +1867,8 @@ pub struct IrEffectNode {
     /// from the AST instead of re-scanning rule-body text. `None` for
     /// non-`exec` effects. Not part of the `.ir` snapshot.
     pub exec_target: Option<IrExecTarget>,
+    /// Present exactly on `IrEffectKind::HttpRequest`.
+    pub http_request: Option<IrHttpRequest>,
 }
 
 /// The two `exec` source forms (spec/std-script.md): a raw command string
@@ -1876,6 +1878,65 @@ pub struct IrEffectNode {
 pub enum IrExecTarget {
     Raw,
     Capability { name: String },
+}
+
+/// The payload of a `request` effect (DR-0053 §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrHttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<IrRequestHeader>,
+    /// Expression source for the body, if any.
+    pub body: Option<String>,
+    /// `signed with <handle>` — canonicalized and signed custodian-side.
+    pub signed_with: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRequestHeader {
+    pub name: String,
+    pub value: IrRequestHeaderValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IrRequestHeaderValue {
+    /// Expression source.
+    Expr(String),
+    /// A MARKED SLOT: the position the custodian substitutes material into.
+    /// The count of these is what the custodian is told out of band, so a
+    /// sentinel arriving inside interpolated data cannot silently become a
+    /// slot the author never wrote.
+    Credential {
+        presentation: String,
+        handle: String,
+    },
+}
+
+impl IrHttpRequest {
+    /// How many marked slots the author placed. Declared to the custodian out
+    /// of band from the request text (`CustodyOp::Request::slots`).
+    pub fn slot_count(&self) -> usize {
+        self.headers
+            .iter()
+            .filter(|header| matches!(header.value, IrRequestHeaderValue::Credential { .. }))
+            .count()
+    }
+
+    /// Every credential handle this request names, in order.
+    pub fn credential_handles(&self) -> Vec<&str> {
+        let mut handles: Vec<&str> = self
+            .headers
+            .iter()
+            .filter_map(|header| match &header.value {
+                IrRequestHeaderValue::Credential { handle, .. } => Some(handle.as_str()),
+                IrRequestHeaderValue::Expr(_) => None,
+            })
+            .collect();
+        if let Some(signed) = &self.signed_with {
+            handles.push(signed.as_str());
+        }
+        handles
+    }
 }
 
 /// A lowered turn-access grant: the granted operations narrow the turn's effective
@@ -1911,6 +1972,9 @@ pub enum IrEffectKind {
     WorkflowInvoke,
     TimerWait,
     ExecCommand,
+    /// Authenticated outbound HTTP (DR-0053 §5). Distinct from `web`, which is
+    /// a GET-only unauthenticated harness tool rather than language surface.
+    HttpRequest,
     TrackerFile,
     TrackerClaim,
     TrackerRenew,
@@ -2024,9 +2088,7 @@ struct SemanticContext {
     /// kind-conditioned static checks (`sign … with` needs a signing kind,
     /// presentation forms need a presentable kind) resolve through this map.
     /// Kinds are stored kebab-case, matching the custody protocol.
-    /// Consumed once `call`/`verify` land; the declaration ships first
-    /// (custody-first sequencing).
-    #[allow(dead_code)]
+    /// Consumed by the `request` presentation check below; `verify` follows.
     credentials: BTreeMap<String, String>,
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
@@ -3947,6 +4009,18 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
+        // DR-0053 §5. `std.custody` is already the library a `credential`
+        // declaration registers; this is its first effect kind.
+        IrEffectKind::HttpRequest => (
+            "std.custody",
+            strings(&["request"]),
+            Some("custody.request.input"),
+            Some("custody.request.output"),
+            strings(&["custody.request"]),
+            strings(&["custodian"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
         IrEffectKind::TrackerFile => (
             "std.tracker",
             strings(&["file"]),
@@ -4126,6 +4200,7 @@ impl IrEffectKind {
             Self::WorkflowInvoke => "workflow.invoke",
             Self::TimerWait => "timer.wait",
             Self::ExecCommand => "exec.command",
+            Self::HttpRequest => "custody.request",
             Self::TrackerFile => "tracker.file",
             Self::TrackerClaim => "tracker.claim",
             Self::TrackerRenew => "tracker.renew",
@@ -8839,6 +8914,12 @@ fn analyze_rule(
         &semantic.schemas.events,
         diagnostics,
     );
+    validate_http_requests(
+        rule,
+        &body_ast.statements,
+        &semantic.credentials.keys().map(String::as_str).collect(),
+        diagnostics,
+    );
     validate_workflow_invocations(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_milestone_statements(rule, semantic, diagnostics);
     let mut block_stack: Vec<BlockFrame> = Vec::new();
@@ -9073,6 +9154,7 @@ fn analyze_rule(
                 declassified: false,
                 selected_by: None,
                 exec_target: None,
+                http_request: None,
             });
         }
     }
@@ -9985,6 +10067,7 @@ fn terminal_completed_payload_type(
             .unwrap_or_else(terminal_unknown_payload_type),
         IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
         IrEffectKind::CapabilityCall
+        | IrEffectKind::HttpRequest
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -10485,6 +10568,7 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Invoke { .. } => IrEffectKind::WorkflowInvoke,
         body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
+        body::BodyEffectKind::HttpRequest { .. } => IrEffectKind::HttpRequest,
         body::BodyEffectKind::TrackerFile { .. } => IrEffectKind::TrackerFile,
         body::BodyEffectKind::TrackerClaim { .. } => IrEffectKind::TrackerClaim,
         body::BodyEffectKind::TrackerRelease { .. } => IrEffectKind::TrackerRelease,
@@ -10567,6 +10651,142 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 
 /// The `exec` surface form (raw command vs manifest capability), surfaced so
 /// check-time gates classify exec effects without re-scanning rule-body text.
+/// Walk every `request` in a rule body, including inside `after` blocks and
+/// `case` arms — an unauthenticated request nested in a branch is still one.
+fn validate_http_requests(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    declared_credentials: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                validate_http_request(rule, effect, declared_credentials, diagnostics)
+            }
+            body::BodyStmt::After(after) => {
+                validate_http_requests(rule, &after.body, declared_credentials, diagnostics)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A `request` must name a credential it actually presents (DR-0053 §5; the
+/// `unmarked` violation in `models/maude/credential-no-eliminator.maude`).
+///
+/// The custodian refuses at runtime when the slot count it was told disagrees
+/// with what it finds; this is the same property decided statically, so a
+/// program that could never authenticate fails to build rather than failing on
+/// the wire. DR-0042 checks the runtime half at the Worker.
+fn validate_http_request(
+    rule: &RuleDecl,
+    effect: &body::EffectStmt,
+    declared_credentials: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(request) = http_request_for_body(&effect.kind) else {
+        return;
+    };
+    // Every handle named must be declared. A typo'd handle would otherwise
+    // reach the custodian as an unknown credential at egress time.
+    for handle in request.credential_handles() {
+        if !declared_credentials.contains(handle) {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: effect.span,
+                message: format!(
+                    "rule `{}` presents undeclared credential `{handle}` in a `request`",
+                    rule.name.name
+                ),
+                suggestion: Some(format!(
+                    "declare it with `credential {handle} {{ kind bearer }}`"
+                )),
+            });
+        }
+    }
+    // One `CustodyOp::Request` carries ONE credential's material, so a request
+    // naming two is not expressible at the custodian. v1 refuses it here rather
+    // than at egress: the sentinel format allows several handles, the operation
+    // does not, and the author should learn that from the compiler.
+    let distinct: BTreeSet<&str> = request.credential_handles().into_iter().collect();
+    if distinct.len() > 1 {
+        let mut names: Vec<&str> = distinct.into_iter().collect();
+        names.sort_unstable();
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: effect.span,
+            message: format!(
+                "rule `{}` presents {} credentials in one `request` ({})",
+                rule.name.name,
+                names.len(),
+                names.join(", ")
+            ),
+            suggestion: Some(
+                "a request carries one credential: split it, or present the same handle in \
+                 every slot"
+                    .to_owned(),
+            ),
+        });
+    }
+    // `signed with` canonicalizes the request; it does not put material in a
+    // slot. A request that ONLY signs is complete. A request that presents
+    // nothing and signs nothing authenticates nothing, and saying so at compile
+    // time is cheaper than discovering it against a live endpoint.
+    if request.slot_count() == 0 && request.signed_with.is_none() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: effect.span,
+            message: format!(
+                "rule `{}` has a `request` that authenticates nothing",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "present a credential — `header \"Authorization\" bearer <handle>` — or sign the \
+                 request with `signed with <handle>`"
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
+    let body::BodyEffectKind::HttpRequest {
+        method,
+        url,
+        headers,
+        body,
+        signed_with,
+    } = kind
+    else {
+        return None;
+    };
+    Some(IrHttpRequest {
+        method: method.clone(),
+        url: url.clone(),
+        headers: headers
+            .iter()
+            .map(|header| IrRequestHeader {
+                name: header.name.clone(),
+                value: match &header.value {
+                    body::RequestHeaderValue::Expr { source, .. } => {
+                        IrRequestHeaderValue::Expr(source.clone())
+                    }
+                    body::RequestHeaderValue::Credential {
+                        presentation,
+                        handle,
+                    } => IrRequestHeaderValue::Credential {
+                        presentation: presentation.as_str().to_owned(),
+                        handle: handle.clone(),
+                    },
+                },
+            })
+            .collect(),
+        body: body.as_ref().map(|(source, _)| source.clone()),
+        signed_with: signed_with.clone(),
+    })
+}
+
 fn exec_target_for_body(kind: &body::BodyEffectKind) -> Option<IrExecTarget> {
     match kind {
         body::BodyEffectKind::Exec { target, .. } => Some(match target {
@@ -10655,6 +10875,9 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
         body::BodyEffectKind::Prompt { .. }
             | body::BodyEffectKind::Timer { .. }
             | body::BodyEffectKind::Exec { .. }
+            // `request … { … } as x` closes its `as` on the block line, the
+            // same shape as `send via`, so the line scanner cannot see it.
+            | body::BodyEffectKind::HttpRequest { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::TrackerFile { .. }
             | body::BodyEffectKind::TrackerClaim { .. }
@@ -10837,6 +11060,7 @@ fn walk_effects(
                 let endorsed = endorsed_for_body(&effect.kind);
                 let declassified = declassified_for_body(&effect.kind);
                 let exec_target = exec_target_for_body(&effect.kind);
+                let http_request = http_request_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -10859,6 +11083,7 @@ fn walk_effects(
                     declassified,
                     selected_by: case_stack.last().cloned(),
                     exec_target,
+                    http_request,
                 });
             }
             body::BodyStmt::After(after) => {
@@ -13623,6 +13848,7 @@ fn effect_binding_schema(
         }),
         IrEffectKind::AgentTell
         | IrEffectKind::CapabilityCall
+        | IrEffectKind::HttpRequest
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -14961,6 +15187,19 @@ fn check_conditioned_effect_reads(
         body::BodyEffectKind::ConstructCapabilityCall { fields, .. } => {
             for field in fields {
                 expression(&field.source, diagnostics);
+            }
+        }
+        body::BodyEffectKind::HttpRequest { headers, body, .. } => {
+            // A credential slot is a handle, not an expression — it never
+            // reaches the expression checker, which is the point: there is no
+            // expression that yields material.
+            for header in headers {
+                if let body::RequestHeaderValue::Expr { source, .. } = &header.value {
+                    expression(source, diagnostics);
+                }
+            }
+            if let Some((source, _)) = body {
+                expression(source, diagnostics);
             }
         }
         body::BodyEffectKind::Invoke { payload, .. } => check_conditioned_reads_in_fields(

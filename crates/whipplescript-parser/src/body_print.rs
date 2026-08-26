@@ -97,6 +97,38 @@ pub(crate) fn print_effect(
         .map(|seconds| format!(" timeout {seconds}s"))
         .unwrap_or_default();
     let header = match &effect.kind {
+        BodyEffectKind::HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+            signed_with,
+        } => {
+            let mut lines = Vec::new();
+            for header in headers {
+                let value = match &header.value {
+                    body::RequestHeaderValue::Credential {
+                        presentation,
+                        handle,
+                    } => format!("{} {}", presentation.as_str(), rn(handle)),
+                    body::RequestHeaderValue::Expr { source, .. } => rn(source),
+                };
+                lines.push(format!("    header {:?} {value}", header.name));
+            }
+            if let Some((source, _)) = body {
+                lines.push(format!("    body {}", rn(source)));
+            }
+            let block = if lines.is_empty() {
+                " {}".to_owned()
+            } else {
+                format!(" {{\n{}\n  }}", lines.join("\n"))
+            };
+            let signed = signed_with
+                .as_ref()
+                .map(|handle| format!(" signed with {}", rn(handle)))
+                .unwrap_or_default();
+            format!("request {method} {url:?}{block}{signed}")
+        }
         BodyEffectKind::Tell {
             target,
             access_grants,

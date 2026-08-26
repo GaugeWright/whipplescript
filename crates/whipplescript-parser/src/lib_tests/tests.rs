@@ -13392,3 +13392,142 @@ workflow Child {
         "cold references only b: {per_field:?}"
     );
 }
+
+const REQUEST_PROGRAM: &str = r#"@service
+workflow RequestTest
+
+output result R
+class R { ok bool }
+class Ticket { id string  status "open" }
+
+credential stripe_api { kind bearer }
+
+table seed as Ticket [ { id "T1"  status "open" } ]
+
+rule pay
+  when Ticket as ticket where ticket.status == "open"
+=> {
+  request POST "https://api.stripe.com/v1/refunds" {
+    header "Authorization" bearer stripe_api
+    header "Idempotency-Key" ticket.id
+    body ticket.id
+  } as refund
+
+  after refund succeeds as reply {
+    complete result { ok true }
+  }
+}
+"#;
+
+/// The construct lowers, and its binding is seeded from the AST — `as refund`
+/// closes on the block line, where the line scanner cannot see it (the same
+/// shape as `send via`).
+#[test]
+fn a_request_lowers_with_its_credential_slot_and_binding() {
+    let compiled = compile_program(REQUEST_PROGRAM);
+    let ir = compiled.ir.expect("request program compiles");
+    let rule = ir.rules.iter().find(|r| r.name == "pay").expect("rule pay");
+    let effect = rule
+        .metadata
+        .effects
+        .iter()
+        .find(|e| e.kind == IrEffectKind::HttpRequest)
+        .expect("the request lowered to an effect");
+    assert_eq!(effect.binding.as_deref(), Some("refund"));
+
+    let request = effect.http_request.as_ref().expect("request payload");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.url, "https://api.stripe.com/v1/refunds");
+    // One MARKED slot, not two: the idempotency header is an ordinary
+    // expression. The count is what the custodian is told out of band, so it
+    // has to mean the author's slots and nothing else.
+    assert_eq!(request.slot_count(), 1);
+    assert_eq!(request.credential_handles(), vec!["stripe_api"]);
+}
+
+/// A handle that was never declared reaches the custodian as an unknown
+/// credential at egress; the checker refuses it at build time instead.
+#[test]
+fn a_request_naming_an_undeclared_credential_is_refused() {
+    let compiled =
+        compile_program(&REQUEST_PROGRAM.replace("bearer stripe_api", "bearer typo_api"));
+    assert!(
+        compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("presents undeclared credential `typo_api`")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A request that presents nothing and signs nothing authenticates nothing.
+/// Saying so at build time is cheaper than discovering it against a live
+/// endpoint, and `signed with` alone still satisfies it.
+#[test]
+fn a_request_that_authenticates_nothing_is_refused_but_signing_alone_suffices() {
+    let unauthenticated =
+        REQUEST_PROGRAM.replace("    header \"Authorization\" bearer stripe_api\n", "");
+    let compiled = compile_program(&unauthenticated);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("authenticates nothing")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    // Signing is authentication too, so the same body with `signed with` is
+    // accepted -- the check must not demand a header slot specifically.
+    let signed = unauthenticated.replace("  } as refund", "  } signed with stripe_api as refund");
+    let compiled = compile_program(&signed);
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("authenticates nothing")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// One `CustodyOp::Request` carries one credential's material, so a request
+/// naming two is not expressible at the custodian. The sentinel format supports
+/// several handles; the operation does not, and the author should learn that
+/// from the compiler rather than at egress.
+#[test]
+fn a_request_presenting_two_credentials_is_refused() {
+    let two = REQUEST_PROGRAM
+        .replace(
+            "credential stripe_api { kind bearer }",
+            "credential stripe_api { kind bearer }\ncredential other_api { kind bearer }",
+        )
+        .replace(
+            "    header \"Idempotency-Key\" ticket.id",
+            "    header \"X-Other\" bearer other_api",
+        );
+    let compiled = compile_program(&two);
+    assert!(
+        compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("presents 2 credentials in one `request`")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+}

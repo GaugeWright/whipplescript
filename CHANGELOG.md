@@ -5,6 +5,45 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **`request` — authenticated outbound HTTP** (DR-0053 §5).
+
+  ```whip
+  credential stripe_api { kind bearer }
+
+  request POST "https://api.stripe.com/v1/refunds" {
+    header "Authorization" bearer stripe_api
+    header "Idempotency-Key" ticket.id
+    body ticket.id
+  } as refund
+  ```
+
+  whip builds the request with **sentinels** at the marked slots and never with
+  material; the custodian substitutes and signs at egress. The request whip
+  constructs and records carries a handle, not bytes. Presentation forms are
+  `bearer`, `basic`, and `raw`; a handle in a slot is not an expression and
+  never reaches the expression checker, because no expression yields material.
+
+  Three compile-time refusals: an undeclared handle, a request that presents
+  nothing and signs nothing (`signed with` alone satisfies it — signing *is*
+  authentication), and more than one distinct credential in one request, since
+  one custody operation carries one credential's material.
+
+  An HTTP error status settles as a **completed** effect carrying the status —
+  the endpoint was reached. `after … fails` means whip could not make the call,
+  which includes having no custodian configured: that fails loudly rather than
+  egressing unauthenticated.
+
+  Spelled `call` in DR-0053 until the 2026-08-25 amendment; `call` was already
+  package capability invocation.
+
+  **Known exposure, not solved here.** An endpoint that echoes the credential
+  back returns material that lands in the run record. whip cannot redact it —
+  it is designed never to know it — so only the custodian can, and it does not
+  yet. Recorded on the credential-custody tracker.
+
+
 ### Breaking
 
 - **A grant on a resource your program does not declare is now classified as

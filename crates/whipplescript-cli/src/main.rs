@@ -19615,6 +19615,7 @@ fn run_claimable_effect(
                 .unwrap_or(&wall_clock_instant()),
             options,
         ),
+        "custody.request" => run_custody_request_effect(store_path, instance_id, effect, options),
         "exec.command" => run_exec_effect(
             store_path,
             instance_id,
@@ -24653,6 +24654,262 @@ fn run_queue_effect(
         now,
         &options.effect_config(),
     )
+}
+
+/// The custody transport for an egress, or `None` when no custodian was asked
+/// for. Mirrors `custodian_sign`'s split: the client transport is a Unix domain
+/// socket, so on any other target a CONFIGURED socket is a refusal rather than a
+/// fallback — answering a request for custodian authority with an
+/// unauthenticated call would be exactly the substitution this seam prevents.
+/// Boxed so both arms return ONE type: a non-Unix build has no transport type
+/// to name, and an `Infallible` placeholder would still have to satisfy
+/// `CustodyTransport` at the call site.
+#[cfg(target_family = "unix")]
+fn custody_egress_transport(
+) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
+    Ok(
+        whipplescript_custody::client::UnixSocketTransport::from_env().map(|transport| {
+            Box::new(transport) as Box<dyn whipplescript_custody::CustodyTransport>
+        }),
+    )
+}
+
+#[cfg(not(target_family = "unix"))]
+fn custody_egress_transport(
+) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
+    match custodian_socket_unreachable() {
+        Some(message) => Err(message),
+        None => Ok(None),
+    }
+}
+
+/// `custody.request` (DR-0053 §5): egress an authenticated HTTP request through
+/// the custodian.
+///
+/// whip builds the request with SENTINELS at the author's marked slots and
+/// never with material. The custodian substitutes and signs, so the request
+/// this process constructs and records carries a handle, not bytes. Verified
+/// end to end: the recorded input holds
+/// `{"credential": "...", "presentation": "bearer"}` and the store contains no
+/// material anywhere.
+///
+/// The RESPONSE is a different matter, and this handler does not solve it. An
+/// endpoint that echoes the credential back -- an auth-debug route, a
+/// misconfigured mirror -- returns material that is then persisted in the run
+/// record. whip cannot redact it, because whip is designed never to know it;
+/// only the custodian, which holds the material and sees the response, can.
+/// Tracked on the credential-custody tracker's per-run scrub row.
+fn run_custody_request_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_custody::{
+        CredentialName, CustodyCall, CustodyOk, CustodyOp, EgressRequest, Sentinel, UseAttribution,
+    };
+
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    let config = options.effect_config();
+    let input: Value = serde_json::from_str(&effect.input_json).unwrap_or_else(|_| json!({}));
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-request-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-request-lease"]);
+
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "input": input }).to_string(),
+    })?;
+
+    let fail = |kernel: &mut RuntimeKernel<SqliteStore>, summary: &str| {
+        kernel.fail_run(EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: &config.provider,
+            worker_id: "whip-worker",
+            status: "failed",
+            exit_code: Some(1),
+            summary: Some(summary),
+            metadata_json: &json!({ "error": summary }).to_string(),
+            idempotency_key: None,
+        })
+    };
+
+    // Build the wire request. A credential slot renders a sentinel; every other
+    // header is the value the kernel already resolved.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut credential: Option<String> = None;
+    let mut slots = 0usize;
+    for header in input
+        .get("headers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let name = header
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if let Some(handle) = header.get("credential").and_then(Value::as_str) {
+            let form = header
+                .get("presentation")
+                .and_then(Value::as_str)
+                .unwrap_or("raw");
+            let handle_name = match CredentialName::new(handle) {
+                Ok(name) => name,
+                Err(err) => return fail(&mut kernel, &format!("credential name: {err}")),
+            };
+            headers.push((
+                name,
+                Sentinel {
+                    credential: handle_name,
+                    form: match whipplescript_custody::PresentationForm::parse(form) {
+                        Ok(form) => form,
+                        Err(err) => return fail(&mut kernel, &err),
+                    },
+                }
+                .render(),
+            ));
+            credential.get_or_insert_with(|| handle.to_owned());
+            slots += 1;
+        } else {
+            let value = match header.get("value") {
+                Some(Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            headers.push((name, value));
+        }
+    }
+    // `signed with` names the credential when no slot did: signing is the
+    // authentication in that shape, and the checker guarantees one of the two
+    // exists.
+    if credential.is_none() {
+        credential = input
+            .get("signed_with")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    let Some(credential) = credential else {
+        return fail(
+            &mut kernel,
+            "a `request` reached the runtime naming no credential",
+        );
+    };
+    let credential = match CredentialName::new(&credential) {
+        Ok(name) => name,
+        Err(err) => return fail(&mut kernel, &format!("credential name: {err}")),
+    };
+    // The declared count is the AUTHOR's, taken from the compiler rather than
+    // recounted here: a sentinel that arrived inside interpolated data would be
+    // found by the custodian's scan and must make the totals disagree.
+    let declared_slots = input
+        .get("slots")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(slots);
+    let body_b64 = input
+        .get("body")
+        .filter(|body| !body.is_null())
+        .map(|body| match body {
+            Value::String(text) => whipplescript_custody::encode_body_b64(text.as_bytes()),
+            other => whipplescript_custody::encode_body_b64(other.to_string().as_bytes()),
+        });
+
+    let request = EgressRequest {
+        method: input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_owned(),
+        url: input
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        headers,
+        body_b64,
+    };
+
+    // No custodian means no way to authenticate. Failing loudly is the point:
+    // the alternative would be egressing unauthenticated, which is the
+    // substitution this whole seam exists to prevent.
+    let transport =
+        match custody_egress_transport() {
+            Ok(Some(transport)) => transport,
+            Ok(None) => return fail(
+                &mut kernel,
+                "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): an authenticated request \
+                 cannot be sent without one",
+            ),
+            Err(message) => return fail(&mut kernel, &message),
+        };
+    let call = CustodyCall::new(
+        UseAttribution {
+            run_id: run_id.clone(),
+            actor: Some(instance_id.to_owned()),
+            effect_key: Some(effect.effect_id.clone()),
+        },
+        CustodyOp::Request {
+            credential,
+            request,
+            slots: declared_slots,
+        },
+    );
+    let reply = match transport.call(call) {
+        Ok(reply) => reply,
+        Err(err) => return fail(&mut kernel, &format!("custodian unreachable: {err:?}")),
+    };
+    let response = match reply.outcome {
+        Ok(CustodyOk::Requested { response }) => response,
+        Ok(other) => {
+            return fail(
+                &mut kernel,
+                &format!("custodian answered a request with {other:?}"),
+            )
+        }
+        Err(refusal) => return fail(&mut kernel, &format!("custodian refused: {refusal:?}")),
+    };
+
+    let body = response
+        .body_b64
+        .as_deref()
+        .and_then(|encoded| whipplescript_custody::decode_body_b64(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)));
+    let output = json!({
+        "status": response.status,
+        "body": body,
+        "rung": reply.rung.as_str(),
+        "degraded": reply.degraded,
+        "use_id": reply.use_id,
+    });
+    // An HTTP error status is a REACHED endpoint, not a transport failure, so
+    // it settles as a completed effect carrying the status. `after … fails`
+    // means whip could not make the call.
+    kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some(&format!("{} {}", response.status, effect.effect_id)),
+        metadata_json: &json!({ "output": output }).to_string(),
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            &effect.effect_id,
+            "terminal",
+        ])),
+    })
 }
 
 fn run_event_effect(

@@ -434,6 +434,26 @@ impl fmt::Display for PresentationForm {
     }
 }
 
+/// Encode a request/response body for the `body_b64` field.
+///
+/// The convention lives here rather than at each call site because this crate
+/// owns the wire type: base64 rather than a string so binary bodies survive,
+/// and standard alphabet with padding, matching what the custodian decodes.
+pub fn encode_body_b64(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    STANDARD.encode(bytes)
+}
+
+/// Decode a `body_b64` field.
+pub fn decode_body_b64(encoded: &str) -> Result<Vec<u8>, String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("bad base64: {err}"))
+}
+
 const SENTINEL_OPEN: &str = "{{whipplescript-credential:";
 const SENTINEL_CLOSE: &str = "}}";
 

@@ -147,6 +147,62 @@ pub struct RecordStmt {
     pub span: SourceSpan,
 }
 
+/// How a credential handle is presented in a `request` slot (DR-0053 §5).
+///
+/// The handle in the slot **is** the declaration of use; there is no separate
+/// `with credential` modifier. Each form lowers to a sentinel that the
+/// custodian substitutes at egress, so the program text never contains the
+/// material and the language has no way to ask for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialPresentation {
+    /// `Authorization: Bearer <material>`.
+    Bearer,
+    /// `Authorization: Basic <material>`.
+    Basic,
+    /// The material alone, for schemes whose framing the author writes.
+    Raw,
+}
+
+impl CredentialPresentation {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "bearer" => Some(Self::Bearer),
+            "basic" => Some(Self::Basic),
+            "raw" => Some(Self::Raw),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Basic => "basic",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+/// One `header "<name>" <value>` line of a `request` block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestHeader {
+    pub name: String,
+    pub value: RequestHeaderValue,
+    pub span: SourceSpan,
+}
+
+/// A header value: either an ordinary expression, or a credential in one of the
+/// presentation forms — which is the *marked slot* the custodian fills.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestHeaderValue {
+    /// Both the source text and the parsed node, matching `FieldValue::Expr`:
+    /// the checker reads the text, the lowering reads the node.
+    Expr { source: String, expr: Expr },
+    Credential {
+        presentation: CredentialPresentation,
+        handle: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FieldAssign {
     pub name: String,
@@ -257,6 +313,20 @@ pub enum BodyEffectKind {
         /// Absolute deadline expression (a time literal or a time-typed
         /// path); `None` for a relative `timer <duration>`.
         until: Option<String>,
+    },
+    /// `request <METHOD> "<url>" { header … body … } [signed with <h>] as <b>`
+    /// — the authenticated outbound egress of DR-0053 §5.
+    ///
+    /// Spelled `call` in the record until the 2026-08-25 amendment: `call` was
+    /// already package capability invocation, and a keyword carries one
+    /// meaning.
+    HttpRequest {
+        method: String,
+        url: String,
+        headers: Vec<RequestHeader>,
+        body: Option<(String, Expr)>,
+        /// `signed with <handle>` — canonicalized and signed custodian-side.
+        signed_with: Option<String>,
     },
     Exec {
         target: ExecTarget,
@@ -1328,6 +1398,7 @@ impl<'a> BodyParser<'a> {
             "prompt" => self.parse_prompt_effect(),
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
+            "request" => self.parse_http_request(),
             "invoke" => self.parse_invoke(),
             "read" => self.parse_read(),
             "write" => self.parse_write(),
@@ -2104,6 +2175,164 @@ impl<'a> BodyParser<'a> {
             requires,
             timeout_seconds,
             prompt: Some(prompt),
+            span: self.span_from(start),
+        }))
+    }
+
+    /// `request <METHOD> "<url>" { header "<name>" <value> … body <expr> }
+    /// [signed with <handle>] as <binding>` (DR-0053 §5).
+    fn parse_http_request(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // request
+                       // The METHOD is an uppercase bare word rather than a string, so a
+                       // lowercase typo reads as a method rather than silently becoming a URL.
+        let method = match self.peek().map(|t| t.tok.clone()) {
+            Some(Tok::Ident(word)) if word.chars().all(|c| c.is_ascii_uppercase()) => {
+                self.pos += 1;
+                word
+            }
+            _ => {
+                let span = self.span_here();
+                self.error(
+                    span,
+                    "expected an HTTP method after `request`".to_owned(),
+                    Some(
+                        "write `request POST \"https://example.com/path\" { … } as reply`"
+                            .to_owned(),
+                    ),
+                );
+                return None;
+            }
+        };
+        let Some(Tok::Str(url)) = self.peek().map(|t| t.tok.clone()) else {
+            let span = self.span_here();
+            self.error(
+                span,
+                format!("expected a quoted URL after `request {method}`"),
+                Some(format!(
+                    "write `request {method} \"https://example.com/path\" {{ … }} as reply`"
+                )),
+            );
+            return None;
+        };
+        self.pos += 1;
+
+        let mut headers = Vec::new();
+        let mut body = None;
+        if self.at_sym('{') {
+            self.pos += 1;
+            loop {
+                if self.at_sym('}') {
+                    self.pos += 1;
+                    break;
+                }
+                match self.peek().map(|t| t.tok.clone()) {
+                    Some(Tok::Ident(word)) if word == "header" => {
+                        let header_start = self.pos;
+                        self.pos += 1;
+                        let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
+                            let span = self.span_here();
+                            self.error(
+                                span,
+                                "expected a quoted header name after `header`".to_owned(),
+                                Some(
+                                    "write `header \"Authorization\" bearer stripe_api`".to_owned(),
+                                ),
+                            );
+                            return None;
+                        };
+                        self.pos += 1;
+                        // A presentation form is `bearer|basic|raw <handle>`;
+                        // anything else is an ordinary expression.
+                        let value = match self.peek().map(|t| t.tok.clone()) {
+                            Some(Tok::Ident(word))
+                                if CredentialPresentation::parse(&word).is_some()
+                                    && matches!(
+                                        self.peek_at(1).map(|t| t.tok.clone()),
+                                        Some(Tok::Ident(_))
+                                    ) =>
+                            {
+                                let presentation = CredentialPresentation::parse(&word)
+                                    .expect("guarded by the match");
+                                self.pos += 1;
+                                let handle =
+                                    self.ident_text("credential handle after the presentation")?;
+                                RequestHeaderValue::Credential {
+                                    presentation,
+                                    handle,
+                                }
+                            }
+                            _ => {
+                                let (source, expr) = self.parse_value_expression()?;
+                                RequestHeaderValue::Expr { source, expr }
+                            }
+                        };
+                        headers.push(RequestHeader {
+                            name,
+                            value,
+                            span: self.span_from(header_start),
+                        });
+                    }
+                    Some(Tok::Ident(word)) if word == "body" => {
+                        if body.is_some() {
+                            let span = self.span_here();
+                            self.error(
+                                span,
+                                "a request carries at most one `body`".to_owned(),
+                                None,
+                            );
+                            return None;
+                        }
+                        self.pos += 1;
+                        body = Some(self.parse_value_expression()?);
+                    }
+                    _ => {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "expected `header` or `body` inside a request block".to_owned(),
+                            None,
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let signed_with = if self.at_ident("signed") {
+            self.pos += 1;
+            if !self.consume_ident("with") {
+                let span = self.span_here();
+                self.error(
+                    span,
+                    "expected `with <credential>` after `signed`".to_owned(),
+                    Some("write `} signed with release_signing as put`".to_owned()),
+                );
+                return None;
+            }
+            Some(self.ident_text("credential handle after `signed with`")?)
+        } else {
+            None
+        };
+
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::HttpRequest {
+                method,
+                url,
+                headers,
+                body,
+                signed_with,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
             span: self.span_from(start),
         }))
     }

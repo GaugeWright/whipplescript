@@ -42,6 +42,14 @@ pub mod std_manifests {
             "std.agent",
             include_str!("../vendored-std/manifests/agent.json"),
         ),
+        // Credential custody (DR-0053). Registers the `custody.request` effect
+        // contract and the custodian provider that serves it — the effect
+        // egresses carrying sentinels, so the provider is the only party that
+        // ever holds material.
+        (
+            "std.custody",
+            include_str!("../vendored-std/manifests/custody.json"),
+        ),
         // Thin provider package (spec/std-agent.md "Providers"): contributes
         // provider kind `codex` iff the `codex` cargo feature compiles the adapter
         // in — manifest presence and adapter presence agree by construction. A

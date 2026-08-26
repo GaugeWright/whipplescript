@@ -1,0 +1,60 @@
+{
+  "schema": "whipplescript.package_manifest.v0",
+  "package_id": "std.custody",
+  "name": "std.custody",
+  "version": "0.1.0",
+  "libraries": [
+    {
+      "id": "std.custody",
+      "version": "0.1.0",
+      "standard": true,
+      "effect_contracts": [
+        {
+          "id": "custody.request",
+          "effect_kind": "custody.request",
+          "source_forms": [
+            "request"
+          ],
+          "input_schema": "custody.request.input",
+          "output_schema": "custody.request.output",
+          "required_capabilities": [
+            "custody.request"
+          ],
+          "provider_kinds": [
+            "custodian"
+          ],
+          "projected_facts": [
+            "effect.output"
+          ],
+          "validation": "runtime_boundary"
+        }
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "custody.request",
+      "description": "Egress an authenticated HTTP request through the custodian (DR-0053 \u00a75). The request leaves whip carrying SENTINELS at the author's marked slots; the custodian substitutes material and signs, so the material never enters this process and no capability grants a way to read it."
+    }
+  ],
+  "providers": [
+    {
+      "id": "custodian",
+      "provider_kind": "custodian",
+      "capability": "custody.request",
+      "config": {}
+    }
+  ],
+  "profiles": [],
+  "bindings": [
+    {
+      "id": "binding-custody-request-default",
+      "program_id": null,
+      "capability": "custody.request",
+      "provider": "custodian",
+      "config": {
+        "provider_id": "custodian"
+      }
+    }
+  ]
+}

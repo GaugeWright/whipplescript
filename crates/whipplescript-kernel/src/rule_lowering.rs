@@ -3063,6 +3063,28 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+        } else if trimmed.strip_prefix("request ").is_some() {
+            // request <METHOD> "<url>" { header … body … } [signed with <h>]
+            // as <binding> (DR-0053 §5). The block spans lines; everything the
+            // input builder needs is on the IR node, so nothing is carried in
+            // `args` — the text scan exists only to find the statement and its
+            // binding, which is why this branch is short where `send` is long.
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(&statement),
+                kind: "custody.request".to_owned(),
+                target: None,
+                name: Some("request".to_owned()),
+                binding: binding_after_as(&statement),
+                args: Vec::new(),
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec!["custody.request".to_owned()],
+                after: current_after,
+            });
+            index = next_index;
         } else if trimmed.strip_prefix("send ").is_some() {
             // send via <channel> { text <expr> [markdown <expr>] [thread_id <expr>] }
             // as <binding> (std.messaging). The block spans lines; the channel and
@@ -4829,6 +4851,76 @@ pub fn parsed_effect_input_json(
                 "message": Value::Object(message),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
+            })
+        }
+        // DR-0053 §5. The text scan found the statement; the SHAPE comes off
+        // the IR node, so header names, presentations and the author's slot
+        // count are the compiler's values rather than a second parse of the
+        // same text.
+        "custody.request" => {
+            let node = rule.metadata.effects.iter().find(|node| {
+                node.kind == IrEffectKind::HttpRequest
+                    && node.binding.as_ref() == effect.binding.as_ref()
+            });
+            let request = match node.and_then(|node| node.http_request.as_ref()) {
+                Some(request) => request,
+                None => {
+                    // The compiler produced the effect, so losing the payload
+                    // here means the two lowerings disagree. Say so rather than
+                    // emitting an empty request that would egress to nowhere.
+                    errors.push(format!(
+                        "rule `{}`: a `request` effect lost its lowered shape",
+                        rule.name
+                    ));
+                    return json!({}).to_string();
+                }
+            };
+            let headers: Vec<Value> = request
+                .headers
+                .iter()
+                .map(|header| match &header.value {
+                    // A marked slot carries the HANDLE, never material: the
+                    // custodian substitutes at egress. Nothing in this input
+                    // could yield a secret even if the run record were read.
+                    IrRequestHeaderValue::Credential {
+                        presentation,
+                        handle,
+                    } => json!({
+                        "name": header.name,
+                        "credential": handle,
+                        "presentation": presentation,
+                    }),
+                    IrRequestHeaderValue::Expr(source) => json!({
+                        "name": header.name,
+                        "value": parse_field_value_scoped(
+                            source,
+                            context,
+                            live_facts,
+                            live_effects,
+                            live_ir,
+                        ),
+                    }),
+                })
+                .collect();
+            json!({
+                "method": request.method,
+                "url": request.url,
+                "headers": headers,
+                "body": request.body.as_ref().map(|source| parse_field_value_scoped(
+                    source,
+                    context,
+                    live_facts,
+                    live_effects,
+                    live_ir,
+                )),
+                "signed_with": request.signed_with,
+                // Declared out of band from the request text: the custodian
+                // scans finished text for sentinels and cannot tell a slot the
+                // author wrote from one that arrived inside interpolated data.
+                // Disagreement is a refusal rather than a substitution.
+                "slots": request.slot_count(),
+                "rule": rule.name,
+                "bindings": context_bindings_json(context),
             })
         }
         "capability.call" if effect.name.as_deref() == Some("undo") => json!({
