@@ -395,12 +395,18 @@ impl Custodian {
         request: &EgressRequest,
         declared_slots: usize,
     ) -> Result<CustodyOk, CustodyError> {
-        let substituted = substitute_request(name, kind, material, request, declared_slots)?;
+        let (substituted, secrets) =
+            substitute_request(name, kind, material, request, declared_slots)?;
         let response = self
             .egress
             .perform(&substituted)
             .map_err(|detail| CustodyError::EgressFailed { detail })?;
-        Ok(CustodyOk::Requested { response })
+        // Redact on the way back. The caller cannot: whip is designed never to
+        // know the material, so it cannot recognise it, and this is the only
+        // place that holds both the material and the response.
+        Ok(CustodyOk::Requested {
+            response: secrets.scrub_response(response, name),
+        })
     }
 
     // -- derive -------------------------------------------------------------
@@ -493,7 +499,10 @@ impl Custodian {
         // never appears in whip's address space (DR-0053 *Open*: OAuth
         // response capture).
         let parent_kind = CredentialKind::Bearer;
-        let substituted =
+        // Deliberately unscrubbed: this response is parsed for the minted
+        // token and never handed back to whip, and scrubbing could corrupt a
+        // token that happens to contain the parent's text.
+        let (substituted, _secrets) =
             substitute_request(name, parent_kind, material, exchange, exchange_slots)?;
         let response = self
             .egress
@@ -645,14 +654,88 @@ fn present(form: PresentationForm, material: &[u8]) -> Result<String, CustodyErr
 /// the authority on how many slots are legitimate, not the text. It detects
 /// rather than prevents: data can add an occurrence but cannot remove the
 /// author's, so any injection makes the totals disagree and the call refuses.
+/// The strings a substitution put on the wire, so they can be taken back out of
+/// the response.
+///
+/// This exists because whip cannot do it. whip is designed never to know the
+/// material, so it cannot recognise it in order to redact it — the custodian is
+/// the only party that holds the material AND sees the response. Found
+/// 2026-08-26 by pointing a `request` at an endpoint that echoes the
+/// `Authorization` header: the request whip built was clean, and the material
+/// came back from OUTSIDE and landed in whip's run record.
+#[derive(Debug, Default)]
+struct WireSecrets {
+    /// Longest first, so `Bearer <material>` is replaced before `<material>`
+    /// and a redaction cannot leave a dangling fragment of a longer match.
+    fragments: Vec<String>,
+}
+
+impl WireSecrets {
+    fn add(&mut self, fragment: String) {
+        if fragment.is_empty() || self.fragments.contains(&fragment) {
+            return;
+        }
+        self.fragments.push(fragment);
+        self.fragments.sort_by_key(|value| usize::MAX - value.len());
+    }
+
+    /// Redact every known fragment from `text`.
+    fn scrub(&self, text: &str, name: &CredentialName) -> String {
+        let mut out = text.to_owned();
+        for fragment in &self.fragments {
+            if out.contains(fragment.as_str()) {
+                out = out.replace(fragment.as_str(), &format!("[redacted {}]", name.as_str()));
+            }
+        }
+        out
+    }
+
+    /// Redact from a whole response: header values and a textual body.
+    ///
+    /// Header NAMES are not scrubbed — a name is not material, and rewriting
+    /// one would corrupt the response shape for no gain. A binary body passes
+    /// through: it cannot carry the textual form that was substituted in, and
+    /// re-encoding it would be a lie about what arrived.
+    fn scrub_response(&self, response: EgressResponse, name: &CredentialName) -> EgressResponse {
+        if self.fragments.is_empty() {
+            return response;
+        }
+        EgressResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(key, value)| (key, self.scrub(&value, name)))
+                .collect(),
+            body_b64: response.body_b64.map(|encoded| {
+                match decode_b64(&encoded)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                {
+                    Some(text) => B64.encode(self.scrub(&text, name)),
+                    None => encoded,
+                }
+            }),
+        }
+    }
+}
+
 fn substitute_request(
     name: &CredentialName,
     _kind: CredentialKind,
     material: &[u8],
     request: &EgressRequest,
     declared_slots: usize,
-) -> Result<EgressRequest, CustodyError> {
+) -> Result<(EgressRequest, WireSecrets), CustodyError> {
     let mut marked = 0usize;
+    let mut secrets = WireSecrets::default();
+    // The material itself, in the encodings a presentation can put it in. An
+    // endpoint may echo the whole header (`Bearer sk_…`) or just the token, so
+    // both are recorded and the longest is replaced first.
+    if let Ok(text) = std::str::from_utf8(material) {
+        secrets.add(text.to_owned());
+    }
+    secrets.add(B64.encode(material));
     let mut substitute_text = |text: &str| -> Result<String, CustodyError> {
         let found = Sentinel::find_all(text).map_err(|detail| CustodyError::ScopeRefused {
             credential: name.clone(),
@@ -671,7 +754,9 @@ fn substitute_request(
                 });
             }
             out.push_str(&text[at..range.start]);
-            out.push_str(&present(sentinel.form, material)?);
+            let presented = present(sentinel.form, material)?;
+            secrets.add(presented.clone());
+            out.push_str(&presented);
             at = range.end;
             marked += 1;
         }
@@ -711,12 +796,15 @@ fn substitute_request(
             ),
         });
     }
-    Ok(EgressRequest {
-        method: request.method.clone(),
-        url,
-        headers,
-        body_b64,
-    })
+    Ok((
+        EgressRequest {
+            method: request.method.clone(),
+            url,
+            headers,
+            body_b64,
+        },
+        secrets,
+    ))
 }
 
 /// AWS SigV4's initial key is `"AWS4" || secret` (§7). That prefix is keyed

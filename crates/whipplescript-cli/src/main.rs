@@ -24693,12 +24693,17 @@ fn custody_egress_transport(
 /// `{"credential": "...", "presentation": "bearer"}` and the store contains no
 /// material anywhere.
 ///
-/// The RESPONSE is a different matter, and this handler does not solve it. An
-/// endpoint that echoes the credential back -- an auth-debug route, a
-/// misconfigured mirror -- returns material that is then persisted in the run
-/// record. whip cannot redact it, because whip is designed never to know it;
-/// only the custodian, which holds the material and sees the response, can.
-/// Tracked on the credential-custody tracker's per-run scrub row.
+/// The RESPONSE is scrubbed by the custodian, not here. An endpoint that echoes
+/// the credential back -- an auth-debug route, a misconfigured mirror --
+/// returns material that would otherwise be persisted in the run record, and
+/// whip cannot redact it because whip is designed never to know it. The
+/// custodian holds both the material and the response, so it redacts on the way
+/// back (`WireSecrets`).
+///
+/// That is substring redaction, and its limits are real: a response that
+/// TRANSFORMS the credential -- hashing it, returning a prefix -- is not
+/// caught, and a binary body passes through. It is defence in depth behind the
+/// type system, not a second guarantee.
 fn run_custody_request_effect(
     store_path: &Path,
     instance_id: &str,

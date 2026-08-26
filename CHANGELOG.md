@@ -5,6 +5,29 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The custodian redacts its own material out of an egress response.** An
+  endpoint that echoes the credential back — an auth-debug route, a
+  misconfigured mirror — returned material that then landed in whip's run
+  record, having arrived from *outside*.
+
+  whip cannot fix that: it is designed never to know the material, so it cannot
+  recognise it to redact it. The custodian holds both the material and the
+  response, so it now redacts on the way back. It records exactly what it put on
+  the wire — the presented string, the material as text, and its base64, so a
+  `basic` credential and a bare-token echo are both caught — and replaces those
+  in the response headers and textual body, longest fragment first.
+
+  `mint`'s exchange deliberately does not scrub: that response is parsed for the
+  minted token and never handed back, and scrubbing could corrupt a token
+  containing the parent's text.
+
+  Substring redaction only. A response that *transforms* the credential —
+  hashing it, returning a prefix — is not caught, and a binary body passes
+  through. This is defence in depth behind the type system, not a second
+  guarantee.
+
 ### Added
 
 - **`request` — authenticated outbound HTTP** (DR-0053 §5).

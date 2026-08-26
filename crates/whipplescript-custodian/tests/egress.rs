@@ -118,8 +118,13 @@ fn one_shot_server(response_body: &'static str) -> (u16, std::thread::JoinHandle
     (port, handle)
 }
 
+/// Substitution on the way OUT. Renamed 2026-08-26: this was called
+/// `..._but_material_never_returns`, which claimed a property it never
+/// exercised — its server replies with a fixed body, so nothing about the
+/// return path was under test. The echo test below is the one that checks it,
+/// and the leak it found survived partly because this name said otherwise.
 #[test]
-fn request_substitutes_and_egresses_but_material_never_returns() {
+fn request_substitutes_material_into_the_marked_slot_on_the_way_out() {
     let (port, server) = one_shot_server(r#"{"ok":true}"#);
 
     let mut store = SealedStore::create(None, "pw").expect("store");
@@ -214,4 +219,112 @@ fn a_denied_host_never_reaches_the_network_and_is_recorded() {
         custodian.uses().last().expect("record").outcome,
         "egress-failed"
     );
+}
+
+/// A deliberately hostile endpoint: it reflects the request's `Authorization`
+/// header and body back in its response, the way an auth-debug route or a
+/// misconfigured mirror does.
+fn echoing_server() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let seen = String::from_utf8_lossy(&raw).into_owned();
+        let auth = seen
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_default();
+        // Echo it in a header AND the body, since either surface persists.
+        let body = format!("{{\"saw\":\"{auth}\"}}");
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-echoed-auth: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(reply.as_bytes());
+    });
+    (port, handle)
+}
+
+/// The custodian redacts its own material out of the response.
+///
+/// whip cannot do this: it is designed never to know the material, so it cannot
+/// recognise it. The custodian is the only party holding both the material and
+/// the response, which is why the scrub lives here. Found 2026-08-26 by running
+/// a real `request` against an endpoint like the one above and watching the
+/// credential land in whip's run record.
+#[test]
+fn an_echoed_credential_is_redacted_out_of_the_response() {
+    let (port, server) = echoing_server();
+
+    let mut store = SealedStore::create(None, "pw").expect("store");
+    store
+        .register(
+            name("echo_api"),
+            CredentialKind::Bearer,
+            Zeroizing::new(b"tok-must-not-return".to_vec()),
+            None,
+        )
+        .expect("register");
+    let custodian = Custodian::new(store, Box::new(UreqEgress::new(vec!["127.0.0.1".into()])));
+
+    let sentinel = Sentinel::new(name("echo_api"), PresentationForm::Bearer).render();
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "echo-test".into(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Request {
+            credential: name("echo_api"),
+            slots: 1,
+            request: EgressRequest {
+                method: "GET".into(),
+                url: format!("http://127.0.0.1:{port}/whoami"),
+                headers: vec![("Authorization".into(), sentinel)],
+                body_b64: None,
+            },
+        },
+    ));
+    server.join().expect("server");
+
+    let CustodyOk::Requested { response } = reply.outcome.expect("request succeeds") else {
+        panic!("wrong variant");
+    };
+    let body = String::from_utf8(
+        B64.decode(response.body_b64.expect("body"))
+            .expect("base64"),
+    )
+    .expect("utf8");
+    let headers = format!("{:?}", response.headers);
+
+    // Neither the token nor the presented header survives, in either surface.
+    assert!(!body.contains("tok-must-not-return"), "body leaked: {body}");
+    assert!(
+        !headers.contains("tok-must-not-return"),
+        "header leaked: {headers}"
+    );
+    assert!(!body.contains("Bearer tok-"), "body leaked: {body}");
+    // And the redaction names the credential, so a reader is not left guessing
+    // why the field changed. The marker carries the name exactly as the handle
+    // spells it — some names already carry a `credential:` prefix, so the
+    // marker does not add one.
+    assert!(body.contains("[redacted echo_api]"), "{body}");
+    assert!(headers.contains("[redacted echo_api]"), "{headers}");
 }
