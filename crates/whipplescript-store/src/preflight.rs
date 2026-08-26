@@ -197,6 +197,17 @@ mod tests {
         }
     }
 
+    /// The double stands in for a real content store, so it has to satisfy the
+    /// contract it stands in for. Added 2026-08-25 by
+    /// `scripts/check-conformance-coverage.sh`, which found this implementation
+    /// running no suite — and it was minting `blob_{len}` ids at the time, so
+    /// two distinct bodies of equal length shared one. Every test in this module
+    /// was checking preflight against a store that was not content-addressed.
+    #[test]
+    fn the_preflight_double_satisfies_the_content_contract() {
+        crate::content::conformance::run_suite(FakeBlobs::default).expect("suite runs");
+    }
+
     fn manifest_of(pairs: &[(&str, &str)]) -> String {
         let map: BTreeMap<String, String> = pairs
             .iter()

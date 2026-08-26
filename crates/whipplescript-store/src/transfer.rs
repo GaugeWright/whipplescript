@@ -248,6 +248,13 @@ mod tests {
         }
     }
 
+    /// Same reason as `preflight`'s double: a transfer test is only as good as
+    /// the store it transfers between.
+    #[test]
+    fn the_transfer_double_satisfies_the_content_contract() {
+        crate::content::conformance::run_suite(FakeBlobs::default).expect("suite runs");
+    }
+
     impl FakeBlobs {
         fn erase(&self, id: &str) {
             let len = self.live.borrow_mut().remove(id).map_or(0, |b| b.len());

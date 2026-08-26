@@ -41,6 +41,12 @@ if [ -f AGENTS.md ]; then
     echo "== decision records =="
     scripts/check-decision-records.sh
 
+    # A conformance suite is worth what it is pointed at. `ContentBlobs` had
+    # seven implementations and three ran its suite, and two of the four that
+    # did not were minting ids no real backend produces.
+    echo "== conformance coverage =="
+    scripts/check-conformance-coverage.sh
+
     # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
     # repository, which owns it. It fails when a cargo workspace or a lockfile is
     # watched by nothing. Edit it there and re-render; a local edit fails here.

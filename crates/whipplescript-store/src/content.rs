@@ -186,6 +186,22 @@ pub mod conformance {
             blobs.put("different bytes")?,
             "different bytes must not share an id"
         );
+        // ...and distinctness must not come from LENGTH. Added 2026-08-25,
+        // because the pair above happens to differ in length (14 bytes against
+        // 15), so a store keying on `body.len()` satisfied it — and one did.
+        // `preflight::FakeBlobs` minted `blob_{len}` for months and passed this
+        // suite by that coincidence, which made every preflight test a check
+        // against a store where two equal-length bodies are the same content.
+        //
+        // This is the case that costs nothing and closes the coincidence: two
+        // distinct bodies of EQUAL length must still differ.
+        let same_length_a = blobs.put("aaaa")?;
+        let same_length_b = blobs.put("bbbb")?;
+        assert_ne!(
+            same_length_a, same_length_b,
+            "two distinct bodies of the same length must not share an id — an \
+             id derived from length is not a content address"
+        );
 
         // What was stored is what comes back.
         let blobs = make();

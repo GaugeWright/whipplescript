@@ -429,6 +429,14 @@ mod tests {
         }
     }
 
+    /// The tree's write-counting double runs the contract too — it was minting
+    /// `sha256_hex` ids where the real store mints `stable_hash_hex`, so the
+    /// node ids these tests count were ids no backend produces.
+    #[test]
+    fn the_manifest_double_satisfies_the_content_contract() {
+        crate::content::conformance::run_suite(CountingBlobs::default).expect("suite runs");
+    }
+
     impl CountingBlobs {
         fn reset_writes(&self) {
             self.writes.borrow_mut().clear();
