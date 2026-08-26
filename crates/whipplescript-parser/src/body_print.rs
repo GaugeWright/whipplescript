@@ -683,6 +683,23 @@ pub(crate) fn print_statement_rn(
                 ),
             );
         }
+        BodyStmt::Declassify {
+            source,
+            target_type,
+            binding,
+            ..
+        } => {
+            push_stmt_line(
+                out,
+                indent,
+                &format!(
+                    "declassify {} into {} as {}",
+                    rn(source),
+                    target_type,
+                    rn(binding)
+                ),
+            );
+        }
     }
 }
 

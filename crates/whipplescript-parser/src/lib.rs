@@ -1735,7 +1735,7 @@ pub struct IrRuleMetadata {
     /// through unmarked coerces (a model call is a total mixing point: its
     /// output carries the join of all its inputs). IFC-only (NOT in the `.ir`
     /// snapshot).
-    pub coerce_input_roots: BTreeMap<String, BTreeSet<String>>,
+    pub carried_input_roots: BTreeMap<String, BTreeSet<String>>,
     /// `after <effect-binding> succeeds|completes as <alias>` → the effect
     /// binding, so the IFC engine can resolve payload and argument roots
     /// through the aliases bodies actually reference. IFC-only (NOT in the
@@ -6068,7 +6068,8 @@ fn collect_coordination_resources_from_statements(
             | body::BodyStmt::Terminal(_)
             | body::BodyStmt::Cancel { .. }
             | body::BodyStmt::Milestone { .. }
-            | body::BodyStmt::Redact { .. } => {}
+            | body::BodyStmt::Redact { .. }
+            | body::BodyStmt::Declassify { .. } => {}
         }
     }
 }
@@ -8410,7 +8411,7 @@ fn collect_statement_roots(statements: &[body::BodyStmt], out: &mut BTreeSet<Str
                 collect_statement_roots(&region.body, out);
                 collect_statement_roots(&region.lapse_body, out);
             }
-            body::BodyStmt::Redact { source, .. } => {
+            body::BodyStmt::Redact { source, .. } | body::BodyStmt::Declassify { source, .. } => {
                 out.insert(source.clone());
             }
         }
@@ -8868,6 +8869,8 @@ fn analyze_rule(
     // can itself contain `->`/` as `, so a text scan is unsafe), giving its
     // result the same after-binding type flow a named `coerce -> Schema` gets.
     collect_exec_payload_types(&body_ast.statements, semantic, &mut effect_payload_types);
+    collect_open_payload_types(&body_ast.statements, semantic, &mut effect_payload_types);
+    collect_declassify_payload_types(&body_ast.statements, semantic, &mut effect_payload_types);
     // Inline `decide … as <binding>` carries the synthesized
     // `decide.<rule>.<binding>` class (see `collect_inline_decide_schemas`), so
     // its result is `case`able / field-accessible like a named coerce result.
@@ -9189,6 +9192,61 @@ fn analyze_rule(
         &binding_types,
         diagnostics,
     );
+    // DR-0074 §4: no value derived from opened plaintext crosses into a durable
+    // record. Runs whether or not an envelope is configured — plaintext in
+    // `facts.value_json` is not a policy question.
+    {
+        let mut open_bindings = BTreeSet::new();
+        collect_open_bindings(&body_ast.statements, &mut open_bindings);
+        if !open_bindings.is_empty() {
+            validate_confinement(
+                rule,
+                &body_ast.statements,
+                &open_bindings,
+                &BTreeSet::new(),
+                diagnostics,
+            );
+        }
+    }
+    // DR-0074 §3 obligation 3: the envelope's `sealed<T>` and the `into <Type>`
+    // must agree. Sited here rather than in the collector above because it
+    // needs `binding_types` complete — an `open` inside an `after` block reads
+    // an envelope off a binding the collector had not yet produced.
+    validate_open_type_agreement(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
+    validate_declassify_projection(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
+    // DR-0074 §10: a sealed value's payload type must match the field it is
+    // stored in, or `open`'s three-way agreement rests on a declaration the
+    // bytes never satisfied.
+    {
+        let mut sealed_bindings = BTreeMap::new();
+        collect_seal_payload_types(
+            &body_ast.statements,
+            semantic,
+            &binding_types,
+            &mut sealed_bindings,
+        );
+        if !sealed_bindings.is_empty() {
+            validate_seal_storage(
+                rule,
+                &body_ast.statements,
+                semantic,
+                &sealed_bindings,
+                diagnostics,
+            );
+        }
+    }
     // Family B read-narrowing: a presence-conditioned field is readable only inside a
     // matching `case <root>.<disc>` arm (starts with nothing allowed at the rule top).
     validate_conditioned_field_reads(
@@ -9493,7 +9551,7 @@ fn analyze_rule(
     );
     collect_provenance_metadata(
         &body_ast.statements,
-        &mut metadata.coerce_input_roots,
+        &mut metadata.carried_input_roots,
         &mut metadata.after_aliases,
     );
     collect_egress_case_influence(
@@ -9606,17 +9664,72 @@ fn collect_egress_case_influence(
 }
 
 /// Collect the raw structure input-side provenance narrowing resolves over:
-/// each coerce's argument-expression binding roots (template-scan fallback for
-/// unparseable sources, same discipline as `send_payload_reads`), and the
-/// `after … succeeds|completes as` alias map.
+/// for each operation whose OUTPUT carries its INPUT's provenance, the binding
+/// roots of that input (template-scan fallback for unparseable sources, same
+/// discipline as `send_payload_reads`), plus the `after … succeeds|completes
+/// as` alias map.
+///
+/// Named `coerce_input_roots` until DR-0074, when it stopped being about
+/// coerces: `open`'s plaintext carries the provenance of the envelope it opened,
+/// and `declassify`'s output carries its source's. All three are the same
+/// relation, and a checker that knew only the coerce case could not see that an
+/// opened value came from a governed resource at all — so the `grant declassify`
+/// consultation at the egress would never fire on it.
 fn collect_provenance_metadata(
     statements: &[body::BodyStmt],
-    coerce_input_roots: &mut BTreeMap<String, BTreeSet<String>>,
+    carried_input_roots: &mut BTreeMap<String, BTreeSet<String>>,
     after_aliases: &mut BTreeMap<String, String>,
 ) {
     for statement in statements {
         match statement {
+            // `declassify <source> into <T> as <b>`: the release carries where
+            // the value came from. Its AUTHORITY is a separate question, asked
+            // by the `grant declassify` consultation this provenance feeds.
+            body::BodyStmt::Declassify {
+                source, binding, ..
+            } => {
+                let mut roots = BTreeSet::new();
+                if let Ok(expr) = parse_expression(source) {
+                    collect_expr_binding_roots(&expr, &mut roots);
+                } else {
+                    collect_template_binding_roots(source, &mut roots);
+                }
+                carried_input_roots
+                    .entry(binding.clone())
+                    .or_default()
+                    .extend(roots);
+            }
             body::BodyStmt::Effect(effect) => {
+                // DR-0074 §3: an `open`'s output is the plaintext of the
+                // envelope it was given, so it carries that envelope's
+                // provenance exactly.
+                if let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability,
+                    fields,
+                    ..
+                } = &effect.kind
+                {
+                    if target_capability == CUSTODY_UNWRAP_CAPABILITY {
+                        if let (Some(binding), Some(envelope)) = (
+                            effect.binding.as_ref(),
+                            fields
+                                .iter()
+                                .find(|field| field.name == OPEN_ENVELOPE_SLOT)
+                                .map(|field| field.source.as_str()),
+                        ) {
+                            let mut roots = BTreeSet::new();
+                            if let Ok(expr) = parse_expression(envelope) {
+                                collect_expr_binding_roots(&expr, &mut roots);
+                            } else {
+                                collect_template_binding_roots(envelope, &mut roots);
+                            }
+                            carried_input_roots
+                                .entry(binding.clone())
+                                .or_default()
+                                .extend(roots);
+                        }
+                    }
+                }
                 if let body::BodyEffectKind::Coerce { args, .. } = &effect.kind {
                     if let Some(binding) = &effect.binding {
                         let mut roots = BTreeSet::new();
@@ -9627,7 +9740,7 @@ fn collect_provenance_metadata(
                                 collect_template_binding_roots(arg, &mut roots);
                             }
                         }
-                        coerce_input_roots
+                        carried_input_roots
                             .entry(binding.clone())
                             .or_default()
                             .extend(roots);
@@ -9643,11 +9756,11 @@ fn collect_provenance_metadata(
                         after_aliases.insert(alias.clone(), after.binding.clone());
                     }
                 }
-                collect_provenance_metadata(&after.body, coerce_input_roots, after_aliases);
+                collect_provenance_metadata(&after.body, carried_input_roots, after_aliases);
             }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_provenance_metadata(&branch.body, coerce_input_roots, after_aliases);
+                    collect_provenance_metadata(&branch.body, carried_input_roots, after_aliases);
                 }
             }
             _ => {}
@@ -9675,6 +9788,18 @@ fn collect_crossing_roots(
     ) {
         for statement in statements {
             match statement {
+                // DR-0074 §5: `declassify … into <Type> as <b>` is a marked
+                // confidentiality crossing of exactly the kind `coerce …
+                // declassified` already is, so its output joins
+                // `declassified_roots` and inherits the WHOLE existing
+                // discipline — `grant declassify` consultation at the egress,
+                // the guarantee report's trusted-surface listing, and
+                // NMIF-on-the-selector. Wiring it here rather than adding a
+                // second mechanism is what keeps the region's exit audited
+                // instead of merely explicit.
+                body::BodyStmt::Declassify { binding, .. } => {
+                    declassified.insert(binding.clone());
+                }
                 body::BodyStmt::Effect(effect) => {
                     if let body::BodyEffectKind::Coerce {
                         declassified: is_declassified,
@@ -10288,6 +10413,19 @@ struct RuleCaseBranchSource {
     body: String,
     pattern_span: SourceSpan,
 }
+
+/// The custody capability an `open` targets (DR-0074 §3). Named once here
+/// because three separate checks key on it — the plaintext binding's type, the
+/// three-way type agreement, and the confinement analysis.
+pub(crate) const CUSTODY_UNWRAP_CAPABILITY: &str = "custody.unwrap";
+/// The custody capability a `seal` targets (DR-0074 §12).
+pub(crate) const CUSTODY_WRAP_CAPABILITY: &str = "custody.wrap";
+/// The value slot of the `seal` construct, as the manifest names it.
+pub(crate) const SEAL_VALUE_SLOT: &str = "value";
+/// The `into <Type>` slot of the `open` construct, as the manifest names it.
+pub(crate) const OPEN_PAYLOAD_TYPE_SLOT: &str = "payload_type";
+/// The sealed-envelope slot of the `open` construct.
+pub(crate) const OPEN_ENVELOPE_SLOT: &str = "envelope";
 
 fn collect_effect_payload_types(
     rule: &RuleDecl,
@@ -14806,6 +14944,850 @@ fn collect_exec_payload_types(
     }
 }
 
+/// DR-0074 §4, the load-bearing rule: **any value crossing from interpreter
+/// memory into a durable record must be sealed or declassified first.**
+///
+/// Inside an `open`'s `after` block — the confinement region of §3 — the
+/// plaintext binding and everything derived from it (§6) may be compared,
+/// projected, iterated and interpolated freely, because none of that writes
+/// anything down. What is refused is the crossing.
+///
+/// **Why this lives in the parser and not the IFC checker.** §4 says the rule
+/// "mostly falls out of the existing lattice", and under a governed envelope it
+/// does. But an envelope is optional under the gradual model, so a check that
+/// lived only in the kernel would not run at all in ungoverned dev mode — and
+/// plaintext reaching `facts.value_json` is not a policy question. Same
+/// boundary Slice 1 settled for the grant classes: zero-setup floor here,
+/// governed ceiling there.
+///
+/// **The crossings are derived from durability, not from a construct list.**
+/// Three statement shapes write durably: a `record`, a terminal payload, and
+/// ANY effect (§4: "Reaching anything outside whip means creating an effect,
+/// and every effect records its input durably"). Enumerating effect *kinds*
+/// would reopen the split-route hole; instead every effect is a crossing and
+/// `collect_effect_binding_roots` is exhaustive over the kinds.
+fn validate_confinement(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    open_bindings: &BTreeSet<String>,
+    confined: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // Confinement ACCUMULATES down a block: a `redact` of plaintext produces a
+    // further confined binding that later statements must not cross with, so
+    // the set grows as the block is walked rather than being fixed on entry.
+    let mut confined = confined.clone();
+    let confined = &mut confined;
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => {
+                let mut roots = BTreeSet::new();
+                collect_payload_field_roots(&record.fields, record.from.as_deref(), &mut roots);
+                refuse_confined_crossing(
+                    rule,
+                    &roots,
+                    confined,
+                    record.span,
+                    &format!("records `{}`", record.schema),
+                    diagnostics,
+                );
+            }
+            body::BodyStmt::Terminal(terminal) => {
+                let mut roots = BTreeSet::new();
+                collect_payload_field_roots(&terminal.fields, terminal.from.as_deref(), &mut roots);
+                refuse_confined_crossing(
+                    rule,
+                    &roots,
+                    confined,
+                    terminal.span,
+                    &format!("completes `{}`", terminal.name),
+                    diagnostics,
+                );
+            }
+            body::BodyStmt::Milestone {
+                name, fields, span, ..
+            } => {
+                let mut roots = BTreeSet::new();
+                collect_payload_field_roots(fields, None, &mut roots);
+                refuse_confined_crossing(
+                    rule,
+                    &roots,
+                    confined,
+                    *span,
+                    &format!("emits milestone `{name}`"),
+                    diagnostics,
+                );
+            }
+            body::BodyStmt::Effect(effect) => {
+                let mut roots = BTreeSet::new();
+                collect_effect_binding_roots(&effect.kind, &mut roots);
+                if let Some(prompt) = &effect.prompt {
+                    collect_template_binding_roots(&prompt.text, &mut roots);
+                }
+                refuse_confined_crossing(
+                    rule,
+                    &roots,
+                    confined,
+                    effect.span,
+                    "creates an effect, whose input is durable,",
+                    diagnostics,
+                );
+            }
+            // A `redact` is a synchronous pure projection that never becomes an
+            // effect, so it writes nothing down — but its RESULT still derives
+            // from confined plaintext, so the confinement travels with it (§6).
+            // It narrows a value; it does not release one.
+            body::BodyStmt::Redact {
+                source, binding, ..
+            } => {
+                if confined.contains(source.split('.').next().unwrap_or(source)) {
+                    confined.insert(binding.clone());
+                }
+            }
+            // `declassify` is §5's EXIT. Its result is deliberately NOT
+            // confined: that is the whole point of a granted, audited crossing,
+            // and a region with no exit satisfies §4 trivially. The bound on
+            // what escapes is the target type, and the authority to do it at all
+            // is governance's `grant declassify`, checked in the kernel.
+            body::BodyStmt::Declassify { .. } => {}
+            body::BodyStmt::After(after) => {
+                let mut inner = confined.clone();
+                // Entering the `after` block of an `open` is what opens a
+                // region: its success alias IS the plaintext.
+                if open_bindings.contains(&after.binding)
+                    && matches!(
+                        after.predicate,
+                        body::AfterPredicate::Succeeds | body::AfterPredicate::Completes
+                    )
+                {
+                    if let Some(alias) = &after.alias {
+                        inner.insert(alias.clone());
+                    }
+                }
+                validate_confinement(rule, &after.body, open_bindings, &inner, diagnostics);
+            }
+            body::BodyStmt::Case(case) => {
+                // The scrutinee is a READ, not a crossing: §4 says in-region
+                // plaintext may be compared freely. A branch alias binds part
+                // of it, so the confinement follows into the arm.
+                let mut roots = BTreeSet::new();
+                if let Ok(expr) = parse_expression(&case.scrutinee) {
+                    collect_expr_binding_roots(&expr, &mut roots);
+                } else {
+                    collect_template_binding_roots(&case.scrutinee, &mut roots);
+                }
+                let scrutinee_confined = roots.iter().any(|root| confined.contains(root));
+                for branch in &case.branches {
+                    let mut inner = confined.clone();
+                    if scrutinee_confined {
+                        if let Some(alias) = &branch.binding {
+                            inner.insert(alias.clone());
+                        }
+                    }
+                    validate_confinement(rule, &branch.body, open_bindings, &inner, diagnostics);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_confinement(rule, &region.body, open_bindings, confined, diagnostics);
+                validate_confinement(
+                    rule,
+                    &region.lapse_body,
+                    open_bindings,
+                    confined,
+                    diagnostics,
+                );
+            }
+            body::BodyStmt::Done { .. } | body::BodyStmt::Cancel { .. } => {}
+        }
+    }
+}
+
+/// The §4 refusal. Names the crossing, and offers the exits — including
+/// `confine`, which the record's *Consequences* adds as a fourth resolution
+/// beside `separate`, `cleared`, and `downgrade`: keep the work inside the
+/// region and let only a sealed or declassified value out of it.
+fn refuse_confined_crossing(
+    rule: &RuleDecl,
+    roots: &BTreeSet<String>,
+    confined: &BTreeSet<String>,
+    span: SourceSpan,
+    what: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let leaked: Vec<&String> = roots
+        .iter()
+        .filter(|root| confined.contains(*root))
+        .collect();
+    let Some(first) = leaked.first() else {
+        return;
+    };
+    diagnostics.push(Diagnostic {
+        related: Vec::new(),
+        span,
+        message: format!(
+            "rule `{}` {what} using `{first}`, which holds plaintext opened inside a \
+             confinement region (DR-0074 §4: a value crossing into a durable record must be \
+             sealed or declassified first)",
+            rule.name.name
+        ),
+        suggestion: Some(
+            "confine the work to the region and let only a converted value out: `seal` it \
+             back to a `sealed<T>` and record that, or `declassify` it into a bounded type. \
+             A value derived from opened plaintext is itself confined (§6)"
+                .to_owned(),
+        ),
+    });
+}
+
+/// The bindings of every `open` in a rule body, at any depth — the effects
+/// whose `after` block is a confinement region.
+fn collect_open_bindings(statements: &[body::BodyStmt], out: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability, ..
+                } = &effect.kind
+                {
+                    if target_capability == CUSTODY_UNWRAP_CAPABILITY {
+                        if let Some(binding) = &effect.binding {
+                            out.insert(binding.clone());
+                        }
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => collect_open_bindings(&after.body, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_open_bindings(&branch.body, out);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                collect_open_bindings(&region.body, out);
+                collect_open_bindings(&region.lapse_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every binding root an EFFECT references, whatever its kind.
+///
+/// §4's rule is about the RECORD, not the construct: "Reaching anything outside
+/// whip means creating an effect, and every effect records its input durably."
+/// So the confinement check needs one question answered uniformly for all
+/// twenty-three effect kinds — which bindings does this effect carry into its
+/// durable outbox row?
+///
+/// The match is deliberately EXHAUSTIVE with no `_` arm. A new effect kind is
+/// a new durable crossing, and the split-route hole §4 describes is exactly
+/// what a wildcard arm would reopen: one route checked, another reaching the
+/// same table unchecked. Adding a variant must fail to compile here.
+fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<String>) {
+    let source = |text: &str, out: &mut BTreeSet<String>| {
+        if let Ok(expr) = parse_expression(text) {
+            collect_expr_binding_roots(&expr, out);
+        } else {
+            collect_template_binding_roots(text, out);
+        }
+    };
+    let fields = |fields: &[body::FieldAssign], out: &mut BTreeSet<String>| {
+        collect_payload_field_roots(fields, None, out);
+    };
+    match kind {
+        // A turn carries its prompt (collected by the caller from
+        // `EffectStmt::prompt`) and its target; the target is an agent name,
+        // not a binding.
+        body::BodyEffectKind::Tell { on_stream, .. } => {
+            if let Some(stream) = on_stream {
+                source(stream, out);
+            }
+        }
+        body::BodyEffectKind::Coerce { args, .. } => {
+            for arg in args {
+                source(arg, out);
+            }
+        }
+        // The prompt text is the input; the caller adds it for every effect.
+        body::BodyEffectKind::Prompt { .. } | body::BodyEffectKind::Decide { .. } => {}
+        body::BodyEffectKind::Call { argument, .. } => {
+            if let Some(argument) = argument {
+                source(argument, out);
+            }
+        }
+        body::BodyEffectKind::ConstructCapabilityCall { fields, .. } => {
+            for field in fields {
+                source(&field.source, out);
+            }
+        }
+        body::BodyEffectKind::Invoke { payload, .. } => fields(payload, out),
+        body::BodyEffectKind::Timer { until, .. } => {
+            if let Some(until) = until {
+                source(until, out);
+            }
+        }
+        body::BodyEffectKind::HttpRequest {
+            url, headers, body, ..
+        } => {
+            source(url, out);
+            for header in headers {
+                // A credential header is a MARKED SLOT the custodian fills
+                // (DR-0053 §5); it carries a handle, never a binding.
+                if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
+                    collect_expr_binding_roots(expr, out);
+                }
+            }
+            if let Some((_, expr)) = body {
+                collect_expr_binding_roots(expr, out);
+            }
+        }
+        body::BodyEffectKind::Exec { target, .. } => match target {
+            body::ExecTarget::RawCommand(command) => source(command, out),
+            body::ExecTarget::Capability { stdin_binding, .. } => {
+                out.insert(stdin_binding.clone());
+            }
+        },
+        body::BodyEffectKind::TrackerFile { fields: f, .. } => fields(f, out),
+        body::BodyEffectKind::TrackerClaim { item, .. }
+        | body::BodyEffectKind::TrackerRelease { item } => source(item, out),
+        body::BodyEffectKind::TrackerFinish { item, fields: f } => {
+            source(item, out);
+            fields(f, out);
+        }
+        body::BodyEffectKind::LeaseAcquire { key_expr, .. } => source(key_expr, out),
+        body::BodyEffectKind::LeaseRenew {
+            acquire_binding, ..
+        } => {
+            out.insert(acquire_binding.clone());
+        }
+        body::BodyEffectKind::LedgerAppend { fields: f, .. } => fields(f, out),
+        body::BodyEffectKind::CounterConsume {
+            key_expr,
+            amount_expr,
+            ..
+        } => {
+            source(key_expr, out);
+            source(amount_expr, out);
+        }
+        body::BodyEffectKind::Notify {
+            target_expr,
+            from,
+            fields: f,
+            ..
+        } => {
+            source(target_expr, out);
+            if let Some(from) = from {
+                out.insert(from.clone());
+            }
+            fields(f, out);
+        }
+        body::BodyEffectKind::FileRead { path, .. } => source(path, out),
+        body::BodyEffectKind::FileWrite { path, body, .. } => {
+            source(path, out);
+            source(body, out);
+        }
+        body::BodyEffectKind::FileImport { path, .. } => source(path, out),
+        body::BodyEffectKind::FileExport {
+            path, predicate, ..
+        } => {
+            source(path, out);
+            if let Some(predicate) = predicate {
+                source(predicate, out);
+            }
+        }
+    }
+}
+
+/// DR-0074 §10: a `seal` produces a `sealed<T>` value, where `T` is the
+/// declared type of what was sealed. Without this the envelope has nowhere to
+/// go — a `sealed<PatientRecord>` field refuses the binding — so `seal` could
+/// be written but its result could never be stored, which is the whole point
+/// of sealing.
+///
+/// The payload type is read from the sealed EXPRESSION rather than from an
+/// ascription, because the surface has no type slot: Slice 1 dropped it so the
+/// binding could be spelled `as`. An expression whose type does not resolve
+/// leaves the binding untyped rather than guessing.
+fn collect_seal_payload_types(
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    payloads: &mut BTreeMap<String, String>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability,
+                    fields,
+                    ..
+                } = &effect.kind
+                else {
+                    continue;
+                };
+                if target_capability != CUSTODY_WRAP_CAPABILITY {
+                    continue;
+                }
+                let (Some(binding), Some(value)) = (
+                    effect.binding.as_ref(),
+                    fields
+                        .iter()
+                        .find(|field| field.name == SEAL_VALUE_SLOT)
+                        .map(|field| field.source.trim()),
+                ) else {
+                    continue;
+                };
+                let root = value.split('.').next().unwrap_or(value);
+                let Some(root_schema) = binding_types.get(root) else {
+                    continue;
+                };
+                let path: Vec<String> = value.split('.').skip(1).map(str::to_owned).collect();
+                // Compared as SOURCE TEXT so a sealed primitive is tracked
+                // too: `sealed<string>` is as legal as `sealed<PatientRecord>`,
+                // and a collector that only understood class references would
+                // silently skip exactly the cases with no other check.
+                let Ok(resolved) = semantic.schemas.resolve_field_path(root_schema, &path) else {
+                    continue;
+                };
+                payloads.insert(binding.clone(), resolved.to_source());
+            }
+            body::BodyStmt::After(after) => {
+                // The success alias IS the envelope, so it carries the same
+                // payload type as the `seal` binding it came from.
+                if let (Some(alias), Some(sealed_as)) =
+                    (after.alias.as_ref(), payloads.get(&after.binding).cloned())
+                {
+                    payloads.insert(alias.clone(), sealed_as);
+                }
+                collect_seal_payload_types(&after.body, semantic, binding_types, payloads)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_seal_payload_types(&branch.body, semantic, binding_types, payloads);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                collect_seal_payload_types(&region.body, semantic, binding_types, payloads);
+                collect_seal_payload_types(&region.lapse_body, semantic, binding_types, payloads);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A `seal`'s envelope may only be stored in a `sealed<T>` field whose `T` is
+/// the type that was actually sealed.
+///
+/// Without this a `seal claim.id` (a string) lands happily in a
+/// `sealed<PatientRecord>` field, and the mismatch surfaces only at `open` —
+/// where DR-0074 §3's obligation-3 check trusts the FIELD's declared type and
+/// therefore asks the custodian for a grant on a type the bytes were never
+/// sealed as. The three-way agreement §2 depends on is only as good as the
+/// weakest of the three.
+fn validate_seal_storage(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    sealed_bindings: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => {
+                for field in &record.fields {
+                    let body::FieldValue::Expr { source, .. } = &field.value else {
+                        continue;
+                    };
+                    let Some(sealed_as) = sealed_bindings.get(source.trim()) else {
+                        continue;
+                    };
+                    let Ok(TypeSyntax::Sealed { inner, .. }) = semantic
+                        .schemas
+                        .resolve_field_path(&record.schema, std::slice::from_ref(&field.name))
+                    else {
+                        continue;
+                    };
+                    let expected = inner.to_source();
+                    if expected == *sealed_as {
+                        continue;
+                    }
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: field.span,
+                        message: format!(
+                            "rule `{}` stores `{}` in `{}.{}`, which expects \
+                             `sealed<{}>` — it was sealed as `sealed<{sealed_as}>`",
+                            rule.name.name,
+                            source.trim(),
+                            record.schema,
+                            field.name,
+                            expected
+                        ),
+                        suggestion: Some(
+                            "seal the value the field's payload type names; `open` later trusts \
+                             that declaration to choose the unwrap grant (DR-0074 §2)"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+            body::BodyStmt::After(after) => {
+                validate_seal_storage(rule, &after.body, semantic, sealed_bindings, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_seal_storage(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        sealed_bindings,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_seal_storage(rule, &region.body, semantic, sealed_bindings, diagnostics);
+                validate_seal_storage(
+                    rule,
+                    &region.lapse_body,
+                    semantic,
+                    sealed_bindings,
+                    diagnostics,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `declassify <source> into <Type> as <binding>` types `binding` at `<Type>`.
+/// Unlike `redact`, which synthesizes a projected class from a kept-field list,
+/// the target here is a class the program already declares — so there is
+/// nothing to synthesize and the release's shape is reviewable in the source.
+fn collect_declassify_payload_types(
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    payloads: &mut BTreeMap<String, IrType>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Declassify {
+                target_type,
+                binding,
+                ..
+            } if semantic.schemas.class_exists(target_type) => {
+                payloads.insert(binding.clone(), IrType::Ref(target_type.clone()));
+            }
+            body::BodyStmt::After(after) => {
+                collect_declassify_payload_types(&after.body, semantic, payloads)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_declassify_payload_types(&branch.body, semantic, payloads);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                collect_declassify_payload_types(&region.body, semantic, payloads);
+                collect_declassify_payload_types(&region.lapse_body, semantic, payloads);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The target type of a `declassify` is the BOUND on the release, so it has to
+/// be a real projection of the source rather than an assertion about it.
+///
+/// DR-0074 §5 and `docs/providers.md` both make this the whole control: a
+/// `Receipt` of `{approved bool, amount Money}` is a genuine bound, while one
+/// carrying a free-text field the model wrote "is an open channel with extra
+/// steps". A target naming a field the source does not have is neither — it is
+/// a release whose shape nothing checks, which is the decorative-mechanism
+/// failure DR-0053 §14's grant classes exist to avoid.
+fn validate_declassify_projection(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Declassify {
+                source,
+                target_type,
+                span,
+                ..
+            } => {
+                if !semantic.schemas.class_exists(target_type) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: *span,
+                        message: format!(
+                            "rule `{}` declassifies into `{target_type}`, which is not a \
+                             declared class",
+                            rule.name.name
+                        ),
+                        suggestion: Some(
+                            "declare the bounded type the release is narrowed to".to_owned(),
+                        ),
+                    });
+                    continue;
+                }
+                let root = source.split('.').next().unwrap_or(source);
+                let Some(source_schema) = binding_types.get(root) else {
+                    continue;
+                };
+                let mut rest = source.split('.').skip(1).map(str::to_owned).peekable();
+                let path: Vec<String> = rest.by_ref().collect();
+                let Ok(resolved) = semantic.schemas.resolve_field_path(source_schema, &path) else {
+                    continue;
+                };
+                let TypeSyntax::Ref { name: from } = resolved else {
+                    continue;
+                };
+                let Some(target_fields) = semantic.schemas.classes.get(target_type) else {
+                    continue;
+                };
+                for field in target_fields.keys() {
+                    if semantic
+                        .schemas
+                        .resolve_field_path(&from.name, std::slice::from_ref(field))
+                        .is_err()
+                    {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: *span,
+                            message: format!(
+                                "rule `{}` declassifies `{source}` into `{target_type}`, which \
+                                 declares `{field}` — a field `{}` does not have",
+                                rule.name.name, from.name
+                            ),
+                            suggestion: Some(format!(
+                                "`declassify` projects onto the target type's fields, so every \
+                                 field of `{target_type}` must exist on `{}`; the target type is \
+                                 the bound on what is released",
+                                from.name
+                            )),
+                        });
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => validate_declassify_projection(
+                rule,
+                &after.body,
+                semantic,
+                binding_types,
+                diagnostics,
+            ),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_declassify_projection(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_declassify_projection(
+                    rule,
+                    &region.body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+                validate_declassify_projection(
+                    rule,
+                    &region.lapse_body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// DR-0074 §3, obligation 3: the `into <Type>` must match the envelope's own
+/// `sealed<T>`. **All three agreeing is what makes the grant meaningful** — the
+/// envelope's type, the `into` type, and the grant's type. This validator owns
+/// the first pair, which is the only one answerable without a policy: the grant
+/// side is checked against the turn's own scoping here too, and against the
+/// signed envelope in the kernel, where governance lives.
+///
+/// A mismatch is not a cast. `open <sealed<A>> into B` asks the custodian for a
+/// grant on B while handing it an A, so it would either fail at runtime or —
+/// worse, if a grant on B existed — open bytes under an authorisation that was
+/// never about them.
+fn validate_open_type_agreement(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability,
+                    fields,
+                    ..
+                } = &effect.kind
+                else {
+                    continue;
+                };
+                if target_capability != CUSTODY_UNWRAP_CAPABILITY {
+                    continue;
+                }
+                let slot = |name: &str| {
+                    fields
+                        .iter()
+                        .find(|field| field.name == name)
+                        .map(|field| field.source.trim())
+                };
+                let (Some(envelope), Some(declared)) =
+                    (slot(OPEN_ENVELOPE_SLOT), slot(OPEN_PAYLOAD_TYPE_SLOT))
+                else {
+                    continue;
+                };
+                // Only a resolvable dotted read carries a declared type. A
+                // literal or a computed expression has no `sealed<T>` to
+                // compare against, and inventing an answer for it would report
+                // a mismatch the source does not contain.
+                let mut parts = envelope.split('.');
+                let (Some(root), rest) =
+                    (parts.next(), parts.map(str::to_owned).collect::<Vec<_>>())
+                else {
+                    continue;
+                };
+                let Some(root_schema) = binding_types.get(root) else {
+                    continue;
+                };
+                let Ok(resolved) = semantic.schemas.resolve_field_path(root_schema, &rest) else {
+                    continue;
+                };
+                let TypeSyntax::Sealed { inner, .. } = resolved else {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` opens `{envelope}`, which is not a sealed value",
+                            rule.name.name
+                        ),
+                        suggestion: Some(
+                            "`open` takes a `sealed<T>`; seal the value first, or read the field \
+                             that holds the envelope"
+                                .to_owned(),
+                        ),
+                    });
+                    continue;
+                };
+                let TypeSyntax::Ref { name: sealed_type } = *inner else {
+                    continue;
+                };
+                if sealed_type.name == declared {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: effect.span,
+                    message: format!(
+                        "rule `{}` opens `{envelope}` into `{declared}`, but it is sealed as \
+                         `sealed<{}>`",
+                        rule.name.name, sealed_type.name
+                    ),
+                    suggestion: Some(format!(
+                        "open it into `{}`; `into` names the type the envelope already holds, \
+                         and it is what the unwrap grant is narrowed by (DR-0074 §2)",
+                        sealed_type.name
+                    )),
+                });
+            }
+            body::BodyStmt::After(after) => validate_open_type_agreement(
+                rule,
+                &after.body,
+                semantic,
+                binding_types,
+                diagnostics,
+            ),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_open_type_agreement(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// DR-0074 §3: an `open` binds its plaintext at the type named by `into
+/// <Type>`, so `after <opening> succeeds as patient` types `patient` as that
+/// class and `patient.<field>` resolves like any other typed binding.
+///
+/// Keyed on the construct's TARGET CAPABILITY rather than on the `open`
+/// keyword. The keyword belongs to a package manifest and could be spelled
+/// differently by another one; `custody.unwrap` is the operation this typing
+/// rule is actually about, and the generated grammar table carries it, so the
+/// manifest stays the single source of both the parse and this.
+fn collect_open_payload_types(
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    payloads: &mut BTreeMap<String, IrType>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability,
+                    fields,
+                    ..
+                } = &effect.kind
+                {
+                    if target_capability != CUSTODY_UNWRAP_CAPABILITY {
+                        continue;
+                    }
+                    let (Some(binding), Some(payload_type)) = (
+                        effect.binding.as_ref(),
+                        fields
+                            .iter()
+                            .find(|field| field.name == OPEN_PAYLOAD_TYPE_SLOT)
+                            .map(|field| field.source.trim()),
+                    ) else {
+                        continue;
+                    };
+                    // An unknown class is the type-reference check's diagnostic,
+                    // not this collector's; leaving the binding untyped here
+                    // would turn one error into a second, confusing one about a
+                    // field on a schema that does not exist.
+                    if semantic.schemas.class_exists(payload_type) {
+                        payloads.insert(binding.clone(), IrType::Ref(payload_type.to_owned()));
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => {
+                collect_open_payload_types(&after.body, semantic, payloads)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    collect_open_payload_types(&branch.body, semantic, payloads);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Collects the schemas an `exec ... -> each` stream records as facts.
 fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<String>) {
     for statement in statements {
@@ -15759,7 +16741,8 @@ fn validate_conditioned_field_reads(
             ),
             body::BodyStmt::Done { .. }
             | body::BodyStmt::Cancel { .. }
-            | body::BodyStmt::Redact { .. } => {}
+            | body::BodyStmt::Redact { .. }
+            | body::BodyStmt::Declassify { .. } => {}
             body::BodyStmt::After(after) => validate_conditioned_field_reads(
                 rule,
                 &after.body,
@@ -16671,8 +17654,9 @@ fn collect_all_binding_names(statements: &[body::BodyStmt], out: &mut BTreeSet<S
                     collect_all_binding_names(&branch.body, out);
                 }
             }
-            // `redact … as <out>` introduces the projected binding `out`.
-            body::BodyStmt::Redact { binding, .. } => {
+            // `redact … as <out>` and `declassify … as <out>` both introduce
+            // the projected binding `out`.
+            body::BodyStmt::Redact { binding, .. } | body::BodyStmt::Declassify { binding, .. } => {
                 out.insert(binding.clone());
             }
             body::BodyStmt::Record(_)
@@ -17303,19 +18287,29 @@ fn validate_literal_assignment(
         // DR-0074 §1: a sealed value has no literal form. It arises only from
         // `seal`, so a literal in this position is always wrong, and saying so
         // is more useful than the mismatch it would otherwise surface later.
+        //
+        // A bare IDENTIFIER is exempt, and the exemption is load-bearing rather
+        // than a loosening: `LiteralExpr::Ident` is how a binding reference
+        // parses in a field position, so refusing it here made the only value
+        // that CAN legally land in a sealed field — a `seal`'s own output —
+        // unstorable. The binding's type is checked by the ordinary assignment
+        // path; this arm is about literals.
         TypeSyntax::Sealed { .. } => {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: rule.body.span,
-                message: format!(
-                    "field `{record_schema}.{field}` expects `{}`, which has no literal form",
-                    field_ty.to_source()
-                ),
-                suggestion: Some(format!(
-                    "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
-                    field_ty.to_source()
-                )),
-            });
+            if !matches!(literal, LiteralExpr::Ident(_)) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "field `{record_schema}.{field}` expects `{}`, which has no literal form",
+                        field_ty.to_source()
+                    ),
+                    suggestion: Some(format!(
+                        "seal a value first: `seal <value> with <credential> as v`, then use \
+                         `v` — a `{}` arises only from `seal`",
+                        field_ty.to_source()
+                    )),
+                });
+            }
         }
         // DR-0053 §5: a secret has no literal form either — a credential is
         // never a value in source. Reached directly now that `secret` is its

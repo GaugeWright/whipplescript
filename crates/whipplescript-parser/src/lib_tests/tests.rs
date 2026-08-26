@@ -13932,6 +13932,582 @@ fn non_narrowable_wrap_grant_refuses_narrowing() {
         .any(|diagnostic| diagnostic.message.contains("carries a narrowing clause")));
 }
 
+// --- DR-0074 §3: `open` and the confinement region ---------------------------
+
+fn open_source(body: &str) -> String {
+    format!(
+        r#"
+use std.custody
+@service
+workflow OpenRegion
+
+class PatientRecord {{
+  notes string
+  severity int
+}}
+
+class BillingRecord {{
+  amount int
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Triaged {{
+  id string
+  note string
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule triage
+  when Claim as claim
+=> {{
+{body}
+}}
+"#
+    )
+}
+
+#[test]
+fn open_is_an_effect_whose_after_block_binds_the_plaintext() {
+    // DR-0074 §3: `open` is an effect because a rule commit does no I/O and
+    // AEAD is nondeterministic, so the plaintext binds where every effect
+    // output binds — inside `after`. That block IS the confinement region; no
+    // new region construct exists, and `Region` is taken by DR-0043 anyway.
+    let compiled = compile_program(&open_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20 }",
+    ));
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("ir");
+    let rule = ir.rules.first().expect("rule");
+    assert!(
+        rule.metadata
+            .effects
+            .iter()
+            .any(|effect| effect.kind == IrEffectKind::CapabilityCall),
+        "open lowers to a capability call"
+    );
+}
+
+#[test]
+fn the_plaintext_binding_carries_the_type_it_was_opened_into() {
+    // The binding is typed by `into <Type>`, so a field on it resolves like any
+    // other typed binding — and a field that does not exist is caught.
+    // The assertion is about the TYPE, so it checks for the absence of a
+    // field-path error rather than of every diagnostic: §4 independently
+    // refuses the crossing, and that refusal is another test's subject.
+    let good = compile_program(&open_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  note patient.notes }\n\
+         \x20 }",
+    ));
+    assert!(
+        !good
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("invalid field path")),
+        "`notes` is a real field of PatientRecord: {:?}",
+        good.diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+
+    let bad = compile_program(&open_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  note patient.nosuchfield }\n\
+         \x20 }",
+    ));
+    assert!(
+        bad.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("schema `PatientRecord` has no field `nosuchfield`")
+        }),
+        "diagnostics were: {:?}",
+        bad.diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn opening_into_the_wrong_type_is_refused() {
+    // DR-0074 §3, obligation 3. A mismatch is not a cast: it asks the custodian
+    // for a grant on one type while handing it another, so if a grant on the
+    // named type existed it would open bytes under an authorisation that was
+    // never about them.
+    let compiled = compile_program(&open_source(
+        "  open claim.body into BillingRecord with phi_key as opening\n\
+         \x20 after opening succeeds as billing {\n\
+         \x20 }",
+    ));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("but it is sealed as `sealed<PatientRecord>`")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn opening_something_that_is_not_sealed_is_refused() {
+    // `open claim.id` names a plain string. Left unchecked it would reach the
+    // custodian as an envelope and fail there, at run time, in production.
+    let compiled = compile_program(&open_source(
+        "  open claim.id into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20 }",
+    ));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("which is not a sealed value")),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- DR-0074 §4: the crossing rule -------------------------------------------
+
+fn confinement_source(body: &str) -> String {
+    format!(
+        r#"
+use std.custody
+use std.agent
+@service
+workflow Confinement
+
+class PatientRecord {{
+  notes string
+  kind "urgent" | "normal"
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Triaged {{
+  id string
+  note string
+}}
+
+agent worker {{ provider fixture  profile "repo-writer"  capacity 1 }}
+credential phi_key {{ kind raw }}
+
+@external
+rule triage
+  when Claim as claim
+=> {{
+{body}
+}}
+"#
+    )
+}
+
+fn confinement_errors(body: &str) -> Vec<String> {
+    compile_program(&confinement_source(body))
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn opened_plaintext_may_not_reach_a_fact() {
+    // §4, the load-bearing rule. `facts.value_json` is durable, so this is the
+    // crossing the whole record exists to refuse.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  note patient.notes }\n\
+         \x20 }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("holds plaintext opened inside a")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn the_confinement_travels_through_derivation() {
+    // §6: a value computed from in-region plaintext is itself in-region.
+    // Without this the discipline is defeated by one interpolation, and §4
+    // would protect only the value that entered the block.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  note \"seen: {{ patient.notes }}\" }\n\
+         \x20 }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("holds plaintext opened inside a")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn opened_plaintext_may_not_reach_any_effect_input() {
+    // §4: "Reaching anything outside whip means creating an effect, and every
+    // effect records its input durably." There is no non-durable sink, so a
+    // turn is a crossing exactly as a fact is.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   tell worker \"Summarize {{ patient.notes }}\"\n\
+         \x20 }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("creates an effect, whose input is durable")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn in_region_plaintext_may_be_compared_freely() {
+    // §4: within the interpreter it may be computed over freely — compared,
+    // projected, iterated, interpolated. None of that writes anything down, so
+    // a `case` over plaintext is not a crossing and a fact built from
+    // non-confined values inside the arm is fine.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   case patient.kind {\n\
+         \x20     \"urgent\" => {\n\
+         \x20       record Triaged { id claim.id  note \"high\" }\n\
+         \x20     }\n\
+         \x20     _ => {}\n\
+         \x20   }\n\
+         \x20 }",
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+#[test]
+fn a_case_binding_over_plaintext_stays_confined() {
+    // The arm's `as` binding is part of the plaintext, so recording IT is the
+    // same crossing wearing a different name.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   case patient.kind {\n\
+         \x20     \"urgent\" as k => {\n\
+         \x20       record Triaged { id claim.id  note k }\n\
+         \x20     }\n\
+         \x20     _ => {}\n\
+         \x20   }\n\
+         \x20 }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("holds plaintext opened inside a")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn outside_the_region_nothing_is_confined() {
+    // Zero false positives: the rule applies to the region, not to the rule.
+    let errors = confinement_errors(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20 }\n\
+         \x20 record Triaged { id claim.id  note claim.id }",
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+#[test]
+fn the_refusal_offers_confine_as_a_resolution() {
+    // The DR's *Consequences*: `confine` is a FOURTH resolution beside
+    // `separate`, `cleared`, and `downgrade`, and the diagnostic is where an
+    // author meets it.
+    let compiled = compile_program(&confinement_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  note patient.notes }\n\
+         \x20 }",
+    ));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .suggestion
+                .as_deref()
+                .is_some_and(|text| text.contains("confine the work to the region"))
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.suggestion)
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- DR-0074 §5: `declassify`, the region's pure exit ------------------------
+
+fn declassify_source(body: &str) -> String {
+    format!(
+        r#"
+use std.custody
+@service
+workflow Declassifying
+
+class PatientRecord {{
+  notes string
+  severity int
+}}
+
+class Receipt {{
+  severity int
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Triaged {{
+  id string
+  severity int
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule triage
+  when Claim as claim
+=> {{
+{body}
+}}
+"#
+    )
+}
+
+const OPEN_AND_DECLASSIFY: &str = "  open claim.body into PatientRecord with phi_key as opening\n\
+     \x20 after opening succeeds as patient {\n\
+     \x20   declassify patient into Receipt as receipt\n\
+     \x20   record Triaged { id claim.id  severity receipt.severity }\n\
+     \x20 }";
+
+#[test]
+fn declassify_is_the_exit_that_lets_a_value_out_of_a_region() {
+    // §5. Without a working exit a region satisfies §4 trivially and the whole
+    // construct is vacuous, so this is the test that says the feature does
+    // something. `declassify` is pure — no effect, no durable input row —
+    // which is exactly why it can be the exit while `seal` (an effect) cannot
+    // yet be.
+    let compiled = compile_program(&declassify_source(OPEN_AND_DECLASSIFY));
+    assert_eq!(compiled.diagnostics, Vec::new());
+}
+
+#[test]
+fn a_declassified_value_is_no_longer_confined() {
+    // The point of the crossing: `receipt` may be recorded, while `patient`
+    // may not.
+    let refused = compile_program(&declassify_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   record Triaged { id claim.id  severity patient.severity }\n\
+         \x20 }",
+    ));
+    assert!(
+        refused.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("holds plaintext opened inside a")),
+        "{:?}",
+        refused
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_declassify_target_type_must_really_project_the_source() {
+    // The target type is the BOUND on the release, so it has to be a real
+    // projection rather than an assertion. A target naming a field the source
+    // does not have is a release whose shape nothing checks — the decorative
+    // mechanism the grant classes exist to avoid.
+    let compiled = compile_program(&declassify_source(OPEN_AND_DECLASSIFY).replace(
+        "severity int\n}\n\nclass Claim",
+        "nosuchfield string\n}\n\nclass Claim",
+    ));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("a field `PatientRecord` does not have")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_declassified_binding_carries_the_target_type() {
+    let compiled = compile_program(&declassify_source(
+        "  open claim.body into PatientRecord with phi_key as opening\n\
+         \x20 after opening succeeds as patient {\n\
+         \x20   declassify patient into Receipt as receipt\n\
+         \x20   record Triaged { id claim.id  severity receipt.bogus }\n\
+         \x20 }",
+    ));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("schema `Receipt` has no field `bogus`")
+        }),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn declassify_joins_the_audited_crossing_set() {
+    // §5 calls this the GRANTED, audited crossing. Wiring the binding into
+    // `declassified_roots` is what makes it audited rather than merely
+    // explicit: the existing DR-0027 machinery — `grant declassify`
+    // consultation at the egress, the guarantee report's trusted surface,
+    // NMIF-on-the-selector — all key on that set, so the exit inherits the
+    // whole discipline instead of introducing a second one.
+    let compiled = compile_program(&declassify_source(OPEN_AND_DECLASSIFY));
+    let ir = compiled.ir.expect("ir");
+    let rule = ir.rules.first().expect("rule");
+    assert!(
+        rule.metadata.declassified_roots.contains("receipt"),
+        "declassified roots were: {:?}",
+        rule.metadata.declassified_roots
+    );
+}
+
+// --- DR-0074 §10: a sealed value is storable, at its own payload type -------
+
+fn seal_storage_source(sealed: &str, field_type: &str) -> String {
+    format!(
+        r#"
+use std.custody
+@service
+workflow SealStorage
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  rec PatientRecord
+}}
+
+class Stored {{
+  id string
+  body {field_type}
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule keep
+  when Claim as claim
+=> {{
+  seal {sealed} with phi_key as sealing
+  after sealing succeeds as envelope {{
+    record Stored {{ id claim.id  body envelope }}
+  }}
+}}
+"#
+    )
+}
+
+#[test]
+fn a_sealed_value_can_be_stored_in_a_sealed_field() {
+    // Slice 1 shipped `seal` without ever storing its result, so this path was
+    // never exercised: a bare binding in a field position parses as
+    // `LiteralExpr::Ident`, and the no-literal-form refusal caught it. The
+    // envelope had nowhere to go, which is the whole point of sealing.
+    let compiled = compile_program(&seal_storage_source("claim.rec", "sealed<PatientRecord>"));
+    assert_eq!(compiled.diagnostics, Vec::new());
+}
+
+#[test]
+fn a_literal_in_a_sealed_field_is_still_refused() {
+    // The exemption above is for BINDINGS. A literal still has no sealed form,
+    // and that refusal is the one DR-0074 §1 asks for.
+    let compiled = compile_program(
+        &seal_storage_source("claim.rec", "sealed<PatientRecord>")
+            .replace("body envelope }", "body \"ciphertext\" }"),
+    );
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("which has no literal form")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_sealed_value_may_not_be_stored_at_the_wrong_payload_type() {
+    // The three-way agreement §2 depends on is only as good as its weakest
+    // leg. `open` trusts the FIELD's declared type to choose the unwrap grant,
+    // so a string stored in a `sealed<PatientRecord>` field would make it ask
+    // for a grant on a type the bytes were never sealed as.
+    let compiled = compile_program(&seal_storage_source("claim.id", "sealed<PatientRecord>"));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("it was sealed as `sealed<string>`")),
+        "{:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 // --- DR-0074 §12: `seal` as a std.custody construct instance -----------------
 
 #[test]

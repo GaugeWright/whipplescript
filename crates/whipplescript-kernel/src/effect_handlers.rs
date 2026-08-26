@@ -2581,6 +2581,33 @@ pub fn run_custody_capability(
                 },
             }
         }
+        // DR-0074 §3 says `open`'s output is TRANSIENT — "available to its
+        // `after` block, never written to the event". That cannot be built on
+        // the current execution model, and the reason is checkable rather than
+        // a matter of effort: `rule_lowering::effect_binding_value` resolves
+        // EVERY `after` binding out of `facts.value_json`, so a durable fact is
+        // the only channel an effect output has to its own `after` block.
+        //
+        // The two things this handler could return are both wrong. Producing
+        // the plaintext writes it into that fact, which is precisely the §4
+        // violation the record exists to prevent. Producing envelope identity
+        // instead satisfies §4 but LIES: the checker types the binding at the
+        // `into <Type>` class, so `patient.notes` would read null at run time
+        // with nothing reporting it.
+        //
+        // So it refuses, for the same reason the hosted path refuses in Slice 1
+        // — a security operation must not appear to have happened. The
+        // custodian's own `unwrap` is exercised by `whipplescript-custodian`'s
+        // tests; what is missing is a non-durable channel from an effect's
+        // result to its `after` block, and that is a decision DR-0074 does not
+        // contain rather than code nobody has written.
+        Some("custody.unwrap") => fail(
+            "custody unwrap: opening is compiled and checked, but not executable — an `after` \
+             binding resolves from a durable fact, so an open's plaintext has no non-durable \
+             channel to its region (DR-0074 §3's transient output). Refusing rather than \
+             recording plaintext or binding an envelope the checker types as its payload."
+                .to_owned(),
+        ),
         other => fail(format!(
             "custody-provider does not handle capability `{}`",
             other.unwrap_or_default()
@@ -3052,10 +3079,17 @@ mod custody_capability_tests {
     }
 
     #[test]
-    fn the_custody_provider_does_not_unwrap() {
-        // Opening is DR-0074 §3's `open` region, governed by a type-narrowed
-        // grant and not yet built. A provider that could unwrap before the
-        // region existed would be exactly the over-grant this record removes.
+    fn the_custody_provider_refuses_to_unwrap_rather_than_leak_or_lie() {
+        // The `open` region is now compiled and checked, but opening is still
+        // not EXECUTABLE, and the refusal says so instead of guessing.
+        //
+        // `rule_lowering::effect_binding_value` resolves every `after` binding
+        // out of `facts.value_json`, so a durable fact is the only channel an
+        // effect result has to its own `after` block. Producing the plaintext
+        // would write it there — the §4 violation the record exists to prevent.
+        // Producing envelope identity instead would satisfy §4 and LIE, because
+        // the checker types that binding at the `into <Type>` class, so
+        // `patient.notes` would read null with nothing reporting it.
         let transport = custodian_with_wrapping_key();
         let outcome = run_custody_capability(
             &transport,
@@ -3063,9 +3097,9 @@ mod custody_capability_tests {
             "run-1",
         );
         let CapabilityOutcome::Failed { message, .. } = outcome else {
-            panic!("custody.unwrap must not be handled here");
+            panic!("custody.unwrap must refuse until the transient channel exists");
         };
-        assert!(message.contains("does not handle capability `custody.unwrap`"));
+        assert!(message.contains("no non-durable channel"), "{message}");
     }
 
     #[test]

@@ -858,17 +858,38 @@ through, and WhippleScript does not offer a way to try. Bind one agent to the
 cleared endpoint, let it read the secret, and pass a narrow result to a second
 agent bound to the cheaper one:
 
-<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
-agent Auditor      -- governance binds this to the on-prem endpoint
-agent Summarizer   -- and this to the cloud one
+use std.agent
+@service
+workflow ProviderSeparation
 
-when message m on Intake {
-  ask Auditor to review m against Ledger -> finding
-  declassify finding into Receipt -> release
-  ask Summarizer to draft a reply about release -> draft
+class Message { id string  text string }
+class Finding { approved bool  amount int  rationale string }
+class Receipt { approved bool  amount int }
+
+agent Auditor { provider fixture  profile "repo-writer"  capacity 1 }
+agent Summarizer { provider fixture  profile "repo-writer"  capacity 1 }
+
+@external
+rule review
+  when Message as m
+=> {
+  coerce audit(m.text) as finding
+  after finding succeeds as f {
+    declassify f into Receipt as release
+    tell Summarizer "Draft a reply: approved {{ release.approved }}, amount {{ release.amount }}" as draft
+  }
+}
+
+coerce audit(text string) -> Finding {
+  prompt """markdown
+  Review {{ text }} against policy.
+  """
 }
 ```
+
+Governance binds `Auditor` to the on-prem endpoint and `Summarizer` to the
+cheaper one.
 
 The `declassify` is where the whole separation rests, so its target schema is
 the real control: `Receipt` as `{ approved: bool, amount: Money }` is a genuine

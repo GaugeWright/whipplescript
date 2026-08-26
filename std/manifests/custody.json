@@ -52,6 +52,31 @@
             "custody-provider"
           ],
           "validation": "runtime_boundary"
+        },
+        {
+          "id": "custody.unwrap",
+          "effect_kind": "capability.call",
+          "source_forms": [
+            "call custody.unwrap",
+            "open <sealed> into <Type> with <credential> as <binding>"
+          ],
+          "input_schema": {
+            "credential": "string",
+            "envelope": "json",
+            "payload_type": "string"
+          },
+          "output_schema": {
+            "credential": "string",
+            "context": "string",
+            "payload_type": "string"
+          },
+          "required_capabilities": [
+            "custody.unwrap"
+          ],
+          "provider_kinds": [
+            "custody-provider"
+          ],
+          "validation": "runtime_boundary"
         }
       ],
       "constructs": [
@@ -92,6 +117,49 @@
           ],
           "lowering_target": "capability_call",
           "target_capability": "custody.wrap"
+        },
+        {
+          "id": "custody.open",
+          "construct_family": "effect_operation",
+          "keyword": "open",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "open",
+            "slots": [
+              {
+                "name": "envelope",
+                "kind": "expression"
+              },
+              {
+                "name": "payload_type",
+                "kind": "identifier",
+                "connective": "into"
+              },
+              {
+                "name": "credential",
+                "kind": "identifier",
+                "connective": "with"
+              }
+            ],
+            "payload": null,
+            "binding": "required",
+            "target_capability": "custody.unwrap"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "custody.unwrap"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "custody.unwrap.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "custody.unwrap"
         }
       ]
     }
@@ -104,6 +172,15 @@
     {
       "id": "custody.wrap",
       "description": "Seal a value into a custodian-held envelope. The wrapping key never reaches whip; the envelope carries the label and its AEAD context binding.",
+      "schema": {
+        "input": {
+          "credential": "string"
+        }
+      }
+    },
+    {
+      "id": "custody.unwrap",
+      "description": "Open a custodian-held envelope back to its payload (DR-0074 §3). The plaintext lives in the opening effect's `after` block and is never written to a durable record; the grant is narrowed by the payload's declared type.",
       "schema": {
         "input": {
           "credential": "string"
@@ -122,6 +199,12 @@
       "id": "provider-custody-wrap",
       "provider_kind": "custody-provider",
       "capability": "custody.wrap",
+      "config": {}
+    },
+    {
+      "id": "provider-custody-unwrap",
+      "provider_kind": "custody-provider",
+      "capability": "custody.unwrap",
       "config": {}
     }
   ],
@@ -150,6 +233,13 @@
       "id": "binding-custody-wrap-global",
       "program_id": null,
       "capability": "custody.wrap",
+      "provider": "custody-provider",
+      "config": {}
+    },
+    {
+      "id": "binding-custody-unwrap-global",
+      "program_id": null,
+      "capability": "custody.unwrap",
       "provider": "custody-provider",
       "config": {}
     }

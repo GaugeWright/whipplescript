@@ -2631,4 +2631,32 @@ mod custody_routing_tests {
             "says what is missing: {message}"
         );
     }
+
+    #[test]
+    fn the_hosted_path_refuses_to_open_too() {
+        // DR-0074 §3 parity. `custody.unwrap` is a SECOND capability on the
+        // same provider, and the fail-open this module exists to prevent is
+        // per-capability: a new one added to the manifest without a routing
+        // branch falls through to the fixture provider exactly as `wrap` would
+        // have. Opening is the more dangerous direction, so it gets its own
+        // assertion rather than riding on the wrap test.
+        let effect = whipplescript_store::ClaimableEffect {
+            effect_id: "e2".to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some("custody.unwrap".to_owned()),
+            profile: None,
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let CapabilityOutcome::Failed { message, .. } =
+            UnroutableCustodyProvider.produce(&effect, &EffectConfig::default())
+        else {
+            panic!("the hosted path must refuse to open, not produce a value");
+        };
+        assert!(
+            message.contains("custody.unwrap"),
+            "names the capability: {message}"
+        );
+    }
 }

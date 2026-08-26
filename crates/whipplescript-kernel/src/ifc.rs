@@ -3456,7 +3456,7 @@ fn resolve_root_sources(
             visited,
         );
     }
-    if let Some(arg_roots) = metadata.coerce_input_roots.get(base) {
+    if let Some(arg_roots) = metadata.carried_input_roots.get(base) {
         let mut carried = BTreeSet::new();
         for arg_root in arg_roots {
             carried.extend(resolve_root_sources(
@@ -3541,7 +3541,7 @@ fn output_tokens_for_root(
             if effect.endorsed {
                 // The judgment: recurse into the coercion's inputs, crossing
                 // armed — the grant targets the executor being endorsed.
-                if let Some(arg_roots) = metadata.coerce_input_roots.get(base) {
+                if let Some(arg_roots) = metadata.carried_input_roots.get(base) {
                     for arg_root in arg_roots {
                         output_tokens_for_root(
                             arg_root,
@@ -11900,5 +11900,83 @@ rule refund
             .map(|d| d.message)
             .collect();
         assert!(messages.is_empty(), "{messages:?}");
+    }
+}
+
+/// DR-0074 §3/§5 at the governance layer: provenance flows THROUGH an `open`,
+/// so a value released by `declassify` still answers for where it came from.
+#[cfg(test)]
+mod open_provenance_tests {
+    use super::{check_with_envelope, Envelope, VerifiedEnvelope};
+    use whipplescript_parser::compile_program;
+
+    const PROGRAM: &str = r#"use std.custody
+use std.messaging
+@service
+workflow Gov
+
+class PatientRecord { notes string  severity int }
+class Receipt { severity int }
+class Claim { id string  body sealed<PatientRecord> }
+
+channel Out
+credential phi_key { kind raw }
+
+@external
+rule r
+  when Claim as claim
+=> {
+  open claim.body into PatientRecord with phi_key as opening
+  after opening succeeds as patient {
+    declassify patient into Receipt as receipt
+    send via Out { text "sev {{ receipt.severity }}" } as sent
+  }
+}
+"#;
+
+    fn messages(policy: &str) -> Vec<String> {
+        let compiled = compile_program(PROGRAM);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(policy).expect("valid policy");
+        check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    const POLICY: &str = "grant schema Claim -> fact:Claim readable by Clinician\n\
+         grant channel Out -> smtp:out public\n";
+
+    #[test]
+    fn an_opened_value_still_answers_for_where_it_came_from() {
+        // Before this, provenance stopped at the `open`: the checker knew only
+        // the coerce case, so an opened value had no traceable source and the
+        // `grant declassify` consultation never fired on it. The release was
+        // shape-gated but not grant-gated.
+        let messages = messages(POLICY);
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("fact:Claim") && message.contains("requires its grant")
+            }),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_declassify_grant_clears_it() {
+        // The other half: `declassify` really is DR-0074 §5's GRANTED crossing,
+        // not merely an explicit one. It inherits DR-0027's machinery whole
+        // rather than introducing a second mechanism.
+        let granted = format!("{POLICY}grant declassify fact:Claim to public\n");
+        assert_eq!(messages(&granted), Vec::<String>::new());
     }
 }

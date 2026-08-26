@@ -137,6 +137,26 @@ pub enum BodyStmt {
         binding: String,
         span: SourceSpan,
     },
+    /// `declassify <source> into <Type> as <binding>` (DR-0074 §5): the
+    /// granted, audited crossing out of a confinement region.
+    ///
+    /// Synchronous and pure, exactly like `redact`, and that is what makes it
+    /// usable as an exit: it relabels rather than doing I/O, so it creates no
+    /// effect and therefore no durable input row. `seal`, the other exit §5
+    /// names, IS an effect — which is why the two are not symmetric.
+    ///
+    /// The target type is the bound on the release: the result carries exactly
+    /// the fields `<Type>` declares, so a narrow class is a narrow crossing and
+    /// a class with a free-text field is an open channel with extra steps.
+    /// Authorization lives in governance (`grant declassify … to <role>`,
+    /// DR-0027 I-IFC3); this construct is the explicit, auditable point where
+    /// it is claimed.
+    Declassify {
+        source: String,
+        target_type: String,
+        binding: String,
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1435,6 +1455,7 @@ impl<'a> BodyParser<'a> {
             "append" => self.parse_ledger_append(),
             "emit" => self.parse_emit_signal(),
             "redact" => self.parse_redact(),
+            "declassify" => self.parse_declassify(),
             "when" | "on" => {
                 let span = self.span_here();
                 self.error(
@@ -3149,6 +3170,48 @@ impl<'a> BodyParser<'a> {
         })
     }
 
+    /// `declassify <source> into <Type> as <binding>` — DR-0074 §5's pure exit.
+    ///
+    /// Spelled with `as`, matching `redact`, the pure projection it is a
+    /// sibling of. `docs/providers.md` and DR-0074 §5 both write `-> <binding>`;
+    /// that form was never built, and `->` in this language means an ingestion
+    /// contract (`exec … -> Schema`), not a binding.
+    fn parse_declassify(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // declassify
+        let source = self.ident_text("binding to declassify after `declassify`")?;
+        if !self.consume_ident("into") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `into <Type>` after the binding".to_owned(),
+                Some(
+                    "write `declassify patient into Receipt as receipt`; the target type is \
+                     what bounds the release"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        }
+        let target_type = self.ident_text("target type after `into`")?;
+        if !self.consume_ident("as") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "`declassify` requires an `as <binding>`".to_owned(),
+                Some("write `declassify patient into Receipt as receipt`".to_owned()),
+            );
+            return None;
+        }
+        let binding = self.ident_text("output binding after `as`")?;
+        Some(BodyStmt::Declassify {
+            source,
+            target_type,
+            binding,
+            span: self.span_from(start),
+        })
+    }
+
     /// `acquire <lease> for <key-expr> [until ttl] as <slot>`: one atomic
     /// attempt with branchable `held`/`contended` outcomes
     /// (spec/coordination.md).
@@ -4143,10 +4206,39 @@ impl<'a> BodyParser<'a> {
 }
 
 const STATEMENT_KEYWORDS: &[&str] = &[
-    "record", "done", "consume", "tell", "coerce", "prompt", "claim", "release", "renew", "finish",
-    "file", "call", "recall", "send", "invoke", "read", "write", "import", "export", "after",
-    "case", "complete", "fail", "timer", "cancel", "decide", "exec", "when", "on", "else", "then",
+    "record",
+    "done",
+    "consume",
+    "tell",
+    "coerce",
+    "prompt",
+    "claim",
+    "release",
+    "renew",
+    "finish",
+    "file",
+    "call",
+    "recall",
+    "send",
+    "invoke",
+    "read",
+    "write",
+    "import",
+    "export",
+    "after",
+    "case",
+    "complete",
+    "fail",
+    "timer",
+    "cancel",
+    "decide",
+    "exec",
+    "when",
+    "on",
+    "else",
+    "then",
     "redact",
+    "declassify",
 ];
 
 #[cfg(test)]
@@ -4206,6 +4298,7 @@ mod tests {
             table,
             vec![
                 ("seal", "custody.wrap"),
+                ("open", "custody.unwrap"),
                 ("recall", "memory.query"),
                 ("learn", "memory.write"),
                 ("curate", "memory.curate"),

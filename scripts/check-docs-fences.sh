@@ -111,7 +111,7 @@ EXPECTED = {
     "docs/manual/26-gauges.md": 2,
     "docs/manual/32-providers.md": 1,
     "docs/manual/35-memory.md": 1,
-    "docs/providers.md": 2,
+    "docs/providers.md": 3,
     "docs/tutorials/root-agent.md": 1,
 }
 
