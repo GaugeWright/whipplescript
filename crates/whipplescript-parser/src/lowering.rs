@@ -690,10 +690,10 @@ fn lower_credential(
                 "credential `{}` names unknown kind `{}`",
                 credential.name.name, credential.kind.name
             ),
-            suggestion: Some(
-                "declare one of: bearer, basic, raw, hmac_sha256, ed25519, aws_sigv4, jwt_rs256"
-                    .to_owned(),
-            ),
+            suggestion: Some(format!(
+                "declare one of: {}",
+                crate::credential_kind_spellings().join(", ")
+            )),
         });
         // Fall through: the credential still lowers so reference sites do
         // not cascade an unknown-credential error on top.
@@ -2007,6 +2007,14 @@ pub(crate) fn lower_type(ty: TypeSyntax) -> IrType {
         TypeSyntax::Array { inner, .. } => IrType::Array(Box::new(lower_type(*inner))),
         TypeSyntax::Map { inner, .. } => IrType::Map(Box::new(lower_type(*inner))),
         TypeSyntax::Sealed { inner, .. } => IrType::Sealed(Box::new(lower_type(*inner))),
+        // DR-0053 §15. An unparseable kind lowers to the bare form; the
+        // diagnostic is raised once, where the type is written, rather than at
+        // every use of a binding that carries it.
+        TypeSyntax::Secret { kind, .. } => {
+            IrType::Primitive(IrPrimitiveType::Secret(kind.as_ref().and_then(|kind| {
+                whipplescript_custody::CredentialKind::parse(&kind.name.replace('_', "-")).ok()
+            })))
+        }
         TypeSyntax::Union { variants, .. } => {
             IrType::Union(variants.into_iter().map(lower_type).collect())
         }
@@ -2029,7 +2037,6 @@ fn lower_primitive_type(name: &str) -> IrPrimitiveType {
         // `secret` must never fall into the String default below: that would
         // silently downgrade the one type whose point is having no
         // eliminator.
-        "secret" => IrPrimitiveType::Secret,
         _ => IrPrimitiveType::String,
     }
 }

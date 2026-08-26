@@ -3497,20 +3497,7 @@ fn dependency_predicate_name(predicate: &DependencyPredicate) -> &'static str {
 }
 
 fn primitive_type_name(primitive: &IrPrimitiveType) -> &'static str {
-    match primitive {
-        IrPrimitiveType::String => "string",
-        IrPrimitiveType::Int => "int",
-        IrPrimitiveType::Float => "float",
-        IrPrimitiveType::Bool => "bool",
-        IrPrimitiveType::Null => "null",
-        IrPrimitiveType::Duration => "duration",
-        IrPrimitiveType::Time => "time",
-        IrPrimitiveType::Image => "image",
-        IrPrimitiveType::Audio => "audio",
-        IrPrimitiveType::Pdf => "pdf",
-        IrPrimitiveType::Video => "video",
-        IrPrimitiveType::Secret => "secret",
-    }
+    primitive.as_str()
 }
 
 fn dependency_edge(dependency: &NewEffectDependency<'_>) -> DependencyEdge {

@@ -2092,7 +2092,7 @@ fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
         // ride in it, because it has no literal form and no eliminator
         // (DR-0053 §5). Stated explicitly so the default below is a decision,
         // not an accident.
-        IrType::Primitive(IrPrimitiveType::Secret) => false,
+        IrType::Primitive(IrPrimitiveType::Secret(_)) => false,
         IrType::Primitive(_) => false,
         IrType::LiteralString(_) => false,
         // A union is closed exactly when every arm is a declared literal. One

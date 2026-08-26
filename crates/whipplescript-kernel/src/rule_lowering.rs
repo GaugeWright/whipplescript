@@ -5382,21 +5382,7 @@ pub fn completed_turn_agent(pattern: &str) -> Option<&str> {
 
 pub fn ir_type_name(ty: &IrType) -> String {
     match ty {
-        IrType::Primitive(primitive) => match primitive {
-            IrPrimitiveType::String => "string",
-            IrPrimitiveType::Int => "int",
-            IrPrimitiveType::Float => "float",
-            IrPrimitiveType::Bool => "bool",
-            IrPrimitiveType::Null => "null",
-            IrPrimitiveType::Duration => "duration",
-            IrPrimitiveType::Time => "time",
-            IrPrimitiveType::Image => "image",
-            IrPrimitiveType::Audio => "audio",
-            IrPrimitiveType::Pdf => "pdf",
-            IrPrimitiveType::Video => "video",
-            IrPrimitiveType::Secret => "secret",
-        }
-        .to_owned(),
+        IrType::Primitive(primitive) => primitive.as_str().to_owned(),
         IrType::LiteralString(value) | IrType::Ref(value) => value.clone(),
         IrType::AgentRef(agents) => format!("AgentRef<{}>", agents.join(" | ")),
         IrType::Optional(inner) => ir_type_name(inner),
@@ -5517,7 +5503,11 @@ fn validate_json_for_primitive(
         // A secret at runtime is only ever a sentinel the lowering produced —
         // plaintext material can never validate into a secret slot
         // (DR-0053 §5: no expression evaluates to secret bytes).
-        IrPrimitiveType::Secret => value
+        // The KIND is not re-checked here: the sentinel names a credential
+        // handle, and the handle's kind is a compile-time fact resolved
+        // through the declaration map. Re-deriving it at runtime from a
+        // string would be a second source of truth for the same thing.
+        IrPrimitiveType::Secret(_) => value
             .as_str()
             .is_some_and(|s| whipplescript_custody::Sentinel::parse(s).is_ok()),
     };

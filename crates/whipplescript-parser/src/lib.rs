@@ -995,6 +995,21 @@ pub enum TypeSyntax {
         inner: Box<TypeSyntax>,
         span: SourceSpan,
     },
+    /// DR-0053 §15: `secret` or `secret<ed25519>`.
+    ///
+    /// A DISCRIMINANT rather than a type parameter — the argument ranges over
+    /// the protocol's closed `CredentialKind` set, which is `Finite`'s shape
+    /// rather than `Map`'s. `None` is the bare spelling and means "any kind";
+    /// it stays valid, so there is no source break.
+    ///
+    /// Kinds are spelled with underscores in source (`hmac_sha256`) because
+    /// the lexer reads one identifier, and normalize to the protocol's
+    /// kebab-case — the same convention `credential … { kind … }` already
+    /// uses.
+    Secret {
+        kind: Option<Ident>,
+        span: SourceSpan,
+    },
     Union {
         variants: Vec<TypeSyntax>,
         span: SourceSpan,
@@ -1010,6 +1025,7 @@ impl TypeSyntax {
             | Self::Array { span, .. }
             | Self::Map { span, .. }
             | Self::Sealed { span, .. }
+            | Self::Secret { span, .. }
             | Self::Union { span, .. }
             | Self::AgentRef { span, .. } => *span,
             Self::Ref { name } => name.span,
@@ -1505,7 +1521,14 @@ pub enum IrPrimitiveType {
     /// bound, passed, stored in a field, and placed in an effect position —
     /// and no operation anywhere in the language or runtime yields its
     /// material (`models/maude/credential-no-eliminator.maude`).
-    Secret,
+    ///
+    /// DR-0053 §15 parameterises it by the credential's kind. The kind-
+    /// conditioned checks are name-keyed — they resolve a handle through a
+    /// `name -> kind` map — and every one of the four things §5 permits a
+    /// secret to do leaves no name to resolve. The discriminant is what a
+    /// bound, passed, or stored secret still carries. `None` is the bare
+    /// spelling and means "any kind".
+    Secret(Option<whipplescript_custody::CredentialKind>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2177,7 +2200,12 @@ enum ExprType {
     /// interpolation accepts a secret where prose is expected — the
     /// expression-level face of the no-eliminator property. Deliberately NOT
     /// `Unknown`, which type-checks everywhere.
-    Secret,
+    ///
+    /// §15 carries the credential kind. `None` is the bare spelling and means
+    /// "any kind": it accepts every parameterised secret, and a parameterised
+    /// position accepts only its own kind. Narrowing in one direction only is
+    /// what makes the bare form a widening rather than an escape.
+    Secret(Option<whipplescript_custody::CredentialKind>),
     Null,
     Object,
     Optional(Box<ExprType>),
@@ -4293,7 +4321,11 @@ impl IrType {
 }
 
 impl IrPrimitiveType {
-    fn as_str(&self) -> &'static str {
+    /// The primitive's name as source spells it, including the `secret<kind>`
+    /// discriminant. Public because the kernel prints primitive names in two
+    /// places and a copied table is exactly how a new kind would silently
+    /// print as bare `secret` on one path and not the other.
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::String => "string",
             Self::Int => "int",
@@ -4306,7 +4338,21 @@ impl IrPrimitiveType {
             Self::Audio => "audio",
             Self::Pdf => "pdf",
             Self::Video => "video",
-            Self::Secret => "secret",
+            // Static rather than formatted so `as_str` keeps its
+            // `&'static str` contract. The table is the closed
+            // `CredentialKind` set spelled in source form, and the compiler
+            // makes it exhaustive: a kind added to the protocol fails to
+            // build here rather than silently printing as bare `secret`.
+            Self::Secret(None) => "secret",
+            Self::Secret(Some(kind)) => match kind {
+                whipplescript_custody::CredentialKind::Bearer => "secret<bearer>",
+                whipplescript_custody::CredentialKind::Basic => "secret<basic>",
+                whipplescript_custody::CredentialKind::Raw => "secret<raw>",
+                whipplescript_custody::CredentialKind::HmacSha256 => "secret<hmac_sha256>",
+                whipplescript_custody::CredentialKind::Ed25519 => "secret<ed25519>",
+                whipplescript_custody::CredentialKind::AwsSigv4 => "secret<aws_sigv4>",
+                whipplescript_custody::CredentialKind::JwtRs256 => "secret<jwt_rs256>",
+            },
         }
     }
 }
@@ -7489,6 +7535,18 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
     }
 }
 
+/// Every credential kind as SOURCE spells it — underscored, because the lexer
+/// reads one identifier there. Derived from the protocol's closed set rather
+/// than typed out, so a kind added to `CredentialKind` appears in every
+/// suggestion that lists them instead of in whichever one someone remembered.
+pub(crate) fn credential_kind_spellings() -> Vec<String> {
+    use whipplescript_custody::CredentialKind::*;
+    [Bearer, Basic, Raw, HmacSha256, Ed25519, AwsSigv4, JwtRs256]
+        .iter()
+        .map(|kind| kind.as_str().replace('-', "_"))
+        .collect()
+}
+
 fn validate_type_refs(
     ty: &TypeSyntax,
     schema_names: &BTreeSet<String>,
@@ -7497,6 +7555,29 @@ fn validate_type_refs(
 ) {
     match ty {
         TypeSyntax::Primitive { .. } | TypeSyntax::LiteralString { .. } => {}
+        // The discriminant ranges over a protocol-owned set rather than over
+        // this program's schemas, so what there is to resolve is the kind
+        // itself. Refused here rather than widened silently to the bare form:
+        // `secret<ed25519>` misspelled is a narrowing the author asked for
+        // and did not get, which is the over-promise DR-0053 §14 rejects one
+        // construct over.
+        TypeSyntax::Secret {
+            kind: Some(kind), ..
+        } => {
+            let normalized = kind.name.replace('_', "-");
+            if whipplescript_custody::CredentialKind::parse(&normalized).is_err() {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: kind.span,
+                    message: format!("`secret` names unknown credential kind `{}`", kind.name),
+                    suggestion: Some(format!(
+                        "name one of: {}",
+                        credential_kind_spellings().join(", ")
+                    )),
+                });
+            }
+        }
+        TypeSyntax::Secret { kind: None, .. } => {}
         TypeSyntax::Ref { name } => {
             if !schema_names.contains(&name.name) && !is_builtin_schema_ref(&name.name) {
                 diagnostics.push(Diagnostic {
@@ -12689,9 +12770,14 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax, semantic: &SemanticContext) -> Ex
             "string" => ExprType::String,
             "duration" => ExprType::Duration,
             "time" => ExprType::Time,
-            "secret" => ExprType::Secret,
             _ => ExprType::Unknown,
         },
+        TypeSyntax::Secret { kind, .. } => ExprType::Secret(kind.as_ref().and_then(|kind| {
+            // An unknown kind is reported by `validate_secret_kinds`; here it
+            // widens to the bare form rather than cascading a second error on
+            // every use of the binding.
+            whipplescript_custody::CredentialKind::parse(&kind.name.replace('_', "-")).ok()
+        })),
         TypeSyntax::LiteralString { value, .. } => ExprType::Finite {
             label: "literal".to_owned(),
             values: vec![value.clone()],
@@ -12844,7 +12930,8 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Finite { label, values } => format!("{label}<{}>", values.join(" | ")),
         ExprType::Duration => "duration".to_owned(),
         ExprType::Time => "time".to_owned(),
-        ExprType::Secret => "secret".to_owned(),
+        ExprType::Secret(None) => "secret".to_owned(),
+        ExprType::Secret(Some(kind)) => format!("secret<{}>", kind.as_str().replace('-', "_")),
         ExprType::Null => "null".to_owned(),
         ExprType::Object => "object".to_owned(),
         ExprType::Array(inner) => format!("{}[]", expr_type_label(inner)),
@@ -14249,6 +14336,15 @@ pub fn inline_decide_schema_name(rule: &str, binding: &str) -> String {
 /// (`bool`, `string`, …) or a reference to a declared class/enum. The `decide`
 /// grammar only admits single identifiers, so no compound parsing is needed.
 fn decide_field_type_syntax(ty: &str, span: SourceSpan) -> TypeSyntax {
+    // `secret` stopped being a primitive name when it gained its discriminant
+    // (DR-0053 §15). The `decide` grammar admits only single identifiers, so
+    // the parameterised form is unspellable here and the bare one is what it
+    // always was — without this arm it would fall through to `Ref` and report
+    // an unknown schema instead of the unsatisfiable coerce schema that says
+    // a model cannot produce a secret.
+    if ty == "secret" {
+        return TypeSyntax::Secret { kind: None, span };
+    }
     if is_primitive_type(ty) {
         TypeSyntax::Primitive {
             name: ty.to_owned(),
@@ -17156,6 +17252,24 @@ fn validate_literal_assignment(
                 )),
             });
         }
+        // DR-0053 §5: a secret has no literal form either — a credential is
+        // never a value in source. Reached directly now that `secret` is its
+        // own type-syntax variant rather than a primitive name.
+        TypeSyntax::Secret { .. } => {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
+                    field_ty.to_source()
+                ),
+                suggestion: Some(
+                    "reference a declared credential; material lives with the custodian, never \
+                     in source"
+                        .to_owned(),
+                ),
+            });
+        }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
     }
 }
@@ -17611,6 +17725,24 @@ fn validate_literal_against_type(
                     "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
                     field_ty.to_source()
                 )),
+            });
+        }
+        // DR-0053 §5: a secret has no literal form either — a credential is
+        // never a value in source. Reached directly now that `secret` is its
+        // own type-syntax variant rather than a primitive name.
+        TypeSyntax::Secret { .. } => {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
+                    field_ty.to_source()
+                ),
+                suggestion: Some(
+                    "reference a declared credential; material lives with the custodian, never \
+                     in source"
+                        .to_owned(),
+                ),
             });
         }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
@@ -18228,24 +18360,6 @@ fn validate_primitive_literal(
     literal: &LiteralExpr<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // A `secret` admits no literal at all: a credential is never a value in
-    // source (DR-0053 §5). The generic "record a compatible value" suggestion
-    // below would be exactly the wrong advice here.
-    if primitive == "secret" {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: rule.body.span,
-            message: format!(
-                "field `{record_schema}.{field}` is `secret`: secrets have no literal form"
-            ),
-            suggestion: Some(
-                "reference a declared credential; material lives with the custodian, never in \
-                 source"
-                    .to_owned(),
-            ),
-        });
-        return;
-    }
     let valid = matches!(
         (primitive, literal),
         ("string", LiteralExpr::String(_))
@@ -18832,6 +18946,10 @@ impl TypeSyntax {
             Self::Array { inner, .. } => format!("{}[]", inner.to_source()),
             Self::Map { inner, .. } => format!("map<{}>", inner.to_source()),
             Self::Sealed { inner, .. } => format!("sealed<{}>", inner.to_source()),
+            Self::Secret { kind: None, .. } => "secret".to_owned(),
+            Self::Secret {
+                kind: Some(kind), ..
+            } => format!("secret<{}>", kind.name),
             Self::Union { variants, .. } => variants
                 .iter()
                 .map(Self::to_source)

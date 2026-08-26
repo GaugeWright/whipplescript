@@ -12610,6 +12610,119 @@ rule j
 }
 
 #[test]
+fn a_secret_carries_its_credential_kind() {
+    // DR-0053 §15. The kind-conditioned checks are name-keyed, and every one
+    // of the four things a secret is allowed to do — bind, pass, store in a
+    // field, sit in an effect position — leaves no name to resolve. The
+    // discriminant is what a stored secret still carries.
+    let compiled = compile_program(
+        r#"
+@service
+workflow SecretKind
+
+class Config {
+  signing secret<ed25519>
+  webhook secret<hmac_sha256>
+  anything secret
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> {
+  complete result { v "ok" }
+}
+"#,
+    );
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("program compiles");
+    let snapshot = ir.to_snapshot();
+    // The discriminant survives lowering into the IR, which is the point: a
+    // bare `secret` in the snapshot would mean the type carried nothing.
+    assert!(snapshot.contains("secret<ed25519>"), "{snapshot}");
+    assert!(snapshot.contains("secret<hmac_sha256>"), "{snapshot}");
+}
+
+#[test]
+fn an_unknown_secret_kind_is_refused_rather_than_widened() {
+    // Silently widening `secret<ed2551>` to bare `secret` would give the
+    // author a narrowing they asked for and did not get — the over-promise
+    // DR-0053 §14 keeps two grant classes apart to avoid.
+    let compiled = compile_program(
+        r#"
+@service
+workflow BadSecretKind
+
+class Config {
+  signing secret<ed2551>
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> {
+  complete result { v "ok" }
+}
+"#,
+    );
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unknown credential kind"))
+        .unwrap_or_else(|| panic!("{:?}", compiled.diagnostics));
+    // The suggestion is derived from the protocol's closed set, so a kind
+    // added there appears here without anyone remembering to add it.
+    let suggestion = diagnostic.suggestion.as_deref().unwrap_or_default();
+    for spelling in ["bearer", "hmac_sha256", "jwt_rs256"] {
+        assert!(suggestion.contains(spelling), "{suggestion}");
+    }
+}
+
+#[test]
+fn a_parameterised_secret_field_still_admits_no_literal() {
+    // The no-eliminator property does not weaken when the type narrows, and
+    // the diagnostic names the type as written rather than bare `secret`.
+    let compiled = compile_program(
+        r#"
+@service
+workflow ParameterisedSecretLiteral
+
+class Config {
+  signing secret<ed25519>
+}
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule j
+  when go.now as g
+=> {
+  record Config { signing "sk_live_oops" }
+  complete result { v "ok" }
+}
+"#,
+    );
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("secrets have no literal form"))
+        .unwrap_or_else(|| panic!("{:?}", compiled.diagnostics));
+    assert!(
+        diagnostic.message.contains("secret<ed25519>"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
 fn duplicate_channel_is_rejected() {
     let source = r#"
 @service

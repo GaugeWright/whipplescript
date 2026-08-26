@@ -2124,12 +2124,36 @@ declaration registers the `std.custody` library automatically.
 
 ### The `secret` type
 
-The type `secret` is a primitive type beside `string` and `bool`. A value of
+The type `secret` is a built-in type beside `string` and `bool`. A value of
 type `secret` can be bound, passed, stored in a field of a class, and placed
 in an effect position. No operation in the language or the runtime yields the
 material of a secret. A `secret` field admits no literal: a credential is a
 reference, never a value. A model cannot produce a secret either — the
 coercion schema of a `secret` field matches nothing.
+
+The type carries the credential kind: `secret<ed25519>`, `secret<bearer>`,
+`secret<hmac_sha256>`, and so on across the same closed set that
+`credential … { kind … }` declares. A kind outside that set is a check error
+rather than a silent widening.
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+class ReleaseKeys {
+  signing secret<ed25519>
+  webhook secret<hmac_sha256>
+  anything secret
+}
+```
+
+Bare `secret` remains valid and means "any kind". The discriminant exists
+because the checks that depend on a credential's kind are keyed by its *name*,
+and each of the four things a secret is allowed to do — bind, pass, store,
+place in an effect position — leaves no name to resolve. What a stored secret
+still carries is its type.
+
+The angle brackets are a built-in constructor, as in `map<string>`, not a
+type parameter: the argument ranges over a closed, protocol-owned set of
+values rather than over types.
 
 ### The sealing rung and the governance floor
 

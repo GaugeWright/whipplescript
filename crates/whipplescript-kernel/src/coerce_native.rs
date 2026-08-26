@@ -225,7 +225,7 @@ fn primitive_schema(primitive: &IrPrimitiveType) -> Value {
         | IrPrimitiveType::Video => json!({ "type": "string" }),
         // The `false` schema matches nothing: a model can never produce a
         // secret (DR-0053 §5 — material enters only via the custodian).
-        IrPrimitiveType::Secret => json!(false),
+        IrPrimitiveType::Secret(_) => json!(false),
     }
 }
 

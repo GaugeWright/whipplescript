@@ -1224,11 +1224,10 @@ impl Parser<'_> {
                         related: Vec::new(),
                         span,
                         message: format!("credential `{}` must declare its kind", name.name),
-                        suggestion: Some(
-                            "add `kind <kind>` inside the credential block (bearer | basic | \
-                             raw | hmac_sha256 | ed25519 | aws_sigv4 | jwt_rs256)"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(format!(
+                            "add `kind <kind>` inside the credential block ({})",
+                            crate::credential_kind_spellings().join(" | ")
+                        )),
                     });
                     return None;
                 };
@@ -3796,6 +3795,25 @@ impl Parser<'_> {
                 span: map.span.join(close.span),
                 inner: Box::new(inner),
             }
+        } else if self.at_ident("secret") {
+            // DR-0053 §15. Intercepted before the primitive branch below so
+            // there is ONE representation of `secret`: bare and parameterised
+            // are the same variant with and without a discriminant, rather
+            // than a primitive and a constructor that must be kept agreeing.
+            let secret = self.advance().clone();
+            if !self.at_symbol('<') {
+                return Some(TypeSyntax::Secret {
+                    kind: None,
+                    span: secret.span,
+                });
+            }
+            self.expect_symbol('<')?;
+            let kind = self.expect_ident("credential kind")?;
+            let close = self.expect_symbol('>')?;
+            TypeSyntax::Secret {
+                span: secret.span.join(close.span),
+                kind: Some(kind),
+            }
         } else if self.at_ident("sealed") {
             // DR-0074 §10. Spelled after `map<...>` above, deliberately: a
             // built-in constructor over one type, not a generic.
@@ -4215,7 +4233,6 @@ pub(crate) fn is_primitive_type(name: &str) -> bool {
             | "audio"
             | "pdf"
             | "video"
-            | "secret"
     )
 }
 

@@ -65,6 +65,33 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Added
 
+- **`secret` carries its credential kind** (DR-0053 §15).
+
+  ```whip
+  class ReleaseKeys {
+    signing secret<ed25519>
+    webhook secret<hmac_sha256>
+    anything secret
+  }
+  ```
+
+  The checks that depend on a credential's kind are keyed by its *name*, and
+  each of the four things §5 designs a secret to do — bind, pass, store in a
+  record field, sit in an effect position — leaves no name to resolve. The
+  discriminant is what a stored secret still carries.
+
+  Bare `secret` stays valid and means "any kind", so there is no source break.
+  A kind outside the protocol's closed set is a check error rather than a
+  silent widening: widening would hand the author a narrowing they asked for
+  and did not get.
+
+  The angle brackets are a built-in constructor, as in `map<string>`, not a
+  type parameter — the argument ranges over a closed set of values, not over
+  types. Built now because §15 said now: `request` has landed but sentinel
+  lowering into value slots has not, so nothing yet produces a secret value in
+  an expression. The use-site check that rejects `secret<bearer>` where
+  `secret<ed25519>` is required arrives with those values.
+
 - **`request` — authenticated outbound HTTP** (DR-0053 §5).
 
   ```whip
