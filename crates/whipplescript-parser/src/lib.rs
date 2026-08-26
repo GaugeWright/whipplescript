@@ -10281,6 +10281,15 @@ fn collect_egress_payload_reads(
                     }
                     out.push((credential.to_owned(), roots));
                 }
+                // What a filed issue carries into the tracker: every field
+                // value. `finish item { summary … }` is NOT here — it names an
+                // item binding rather than a tracker, so its queue is not known
+                // statically. That residual is recorded on the tracker.
+                body::BodyEffectKind::TrackerFile { queue, fields } => {
+                    let mut roots = BTreeSet::new();
+                    collect_payload_field_roots(fields, None, &mut roots);
+                    out.push((queue.clone(), roots));
+                }
                 body::BodyEffectKind::FileWrite {
                     store, path, body, ..
                 } => {
@@ -11295,6 +11304,13 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         // checker decides whether this declaration is partitioned or `shared`.
         body::BodyEffectKind::LeaseAcquire { resource, .. } => Some(format!("resource:{resource}")),
         body::BodyEffectKind::LedgerAppend { ledger, .. } => Some(format!("resource:{ledger}")),
+        // DR-0051 §1 gave trackers a READ side — a `when <tracker> has ready
+        // issue` trigger keys the bare handle — and never a write side. So an
+        // item filed from a rule body reached a durable surface that humans and
+        // other agents read, with no sink for the flow checker to weigh it
+        // against. Keyed by the bare handle, exactly as the read side and a
+        // file store are, so both directions name the same resource.
+        body::BodyEffectKind::TrackerFile { queue, .. } => Some(queue.clone()),
         body::BodyEffectKind::CounterConsume { counter, .. } => Some(format!("resource:{counter}")),
         // DR-0053 §5: a `request` leaves the process for an external endpoint
         // under exactly one credential — the checker guarantees the "exactly

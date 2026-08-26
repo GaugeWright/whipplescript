@@ -2141,6 +2141,7 @@ fn selected_effect_integrity_sinks(
                 | IrEffectKind::FileExport
                 | IrEffectKind::CapabilityCall
                 | IrEffectKind::HttpRequest
+                | IrEffectKind::TrackerFile
                 | IrEffectKind::LeaseAcquire
                 | IrEffectKind::LedgerAppend
                 | IrEffectKind::CounterConsume
@@ -3931,6 +3932,14 @@ pub fn check_with_envelope_imports(
                     | IrEffectKind::LedgerAppend
                     | IrEffectKind::CounterConsume => {
                         reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Filing an issue writes a durable, shared surface. It is
+                    // NOT a read: a rule reads a tracker through its trigger,
+                    // which DR-0051 §1 keys separately, and the filed id it
+                    // returns is data whip already had.
+                    IrEffectKind::TrackerFile => {
                         writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
@@ -11724,6 +11733,141 @@ rule seed
             messages.iter().all(|m| !m.contains("for that type")),
             "{messages:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tracker_egress_tests {
+    //! DR-0051 §1 gave trackers a READ side and never a write side. A rule
+    //! could file an issue carrying a confidential value into a durable
+    //! surface that humans and other agents read, and the flow checker had no
+    //! sink to weigh it against — it reported nothing at all.
+    //!
+    //! Found the same day as the `request` hole and by the same method:
+    //! enumerating which effect kinds the reader-set classification actually
+    //! names, rather than trusting that a wildcard arm was fail-closed.
+
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    fn program(body_field: &str) -> IrProgram {
+        let source = format!(
+            r#"
+@service
+workflow TrackerLeak
+
+use std.ingress
+
+tracker ops {{ provider builtin }}
+
+signal charge.disputed {{ note string }}
+
+output result R
+class R {{ v string }}
+
+rule leak
+  when charge.disputed as charge
+=> {{
+  file issue into ops {{
+    title "dispute"
+    body {body_field}
+  }} as filed
+
+  after filed succeeds {{
+    complete result {{ v "ok" }}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    #[test]
+    fn a_filed_issue_is_an_egress_sink_the_checker_can_see() {
+        let ir = program("charge.note");
+        let filed = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::TrackerFile)
+            .expect("the file lowers to an effect node");
+        assert_eq!(filed.resource.as_deref(), Some("ops"));
+
+        let reads = ir
+            .rules
+            .iter()
+            .find_map(|rule| rule.metadata.egress_payload_reads.get("ops"))
+            .expect("the filed item records what its payload reads");
+        assert!(reads.contains("charge"), "{reads:?}");
+    }
+
+    #[test]
+    fn filing_a_confidential_value_into_an_uncleared_tracker_is_denied() {
+        let ir = program("charge.note");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        let denial = messages
+            .iter()
+            .find(|m| m.contains("denied flow"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a confidential value reaching a shared tracker must be denied: {messages:#?}"
+                )
+            });
+        assert!(denial.contains("ops"), "{denial}");
+    }
+
+    #[test]
+    fn a_cleared_tracker_still_compiles() {
+        // The refusal must be about the LABEL. Without this the fix could be
+        // "deny every filed issue" and the test above would still pass.
+        let ir = program("charge.note");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "ops": { "reader": "confidential" },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(messages.is_empty(), "{messages:#?}");
+    }
+
+    #[test]
+    fn a_non_confidential_payload_files_freely() {
+        // The common case must stay silent: an ungoverned tracker and a
+        // literal payload are not a flow anybody labelled.
+        let ir = program(r#""a dispute was raised""#);
+        let envelope = Envelope::from_json(r#"{ "resources": {} }"#).expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(messages.is_empty(), "{messages:#?}");
     }
 }
 

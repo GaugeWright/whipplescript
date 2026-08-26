@@ -7,6 +7,29 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Fixed
 
+- **A filed tracker issue was invisible to the information-flow checker.**
+  DR-0051 §1 gave trackers a *read* side — a `when <tracker> has ready issue`
+  trigger keys the bare handle — and never a write side. So a rule could
+  `file issue into ops { body charge.note }` with a confidential `charge`, and
+  the checker reported nothing at all: a tracker item is a durable surface that
+  humans and other agents read.
+
+  A `file issue` is now a write sink keyed by the bare tracker handle, so both
+  directions name the same resource, and its field values are recorded as what
+  the payload reads. Mutation-verified, with a cleared tracker still compiling
+  so the fix cannot degenerate into "deny every filed issue".
+
+  Found by the same method as the `request` hole below, and on the same day:
+  enumerating which effect kinds the reader-set classification actually names,
+  rather than trusting that its `_ => {}` arm was fail-closed. It is not — an
+  unnamed kind is neither a read nor a write. Thirteen of twenty-two kinds are
+  still unnamed there; `spec/flow-checker-resource-kind-tracker.md` is reopened
+  to carry that, along with `finish item { summary … }`, which names an item
+  binding rather than a tracker and so has no statically-known sink.
+
+  A confidential value filed into an unlabelled tracker is newly refused. The
+  exits are the usual two: clear the sink, or declassify.
+
 - **`request` was invisible to the information-flow checker.**
   `IrEffectKind::HttpRequest` appeared nowhere in `ifc.rs`, and the parser
   returned no IFC resource for it. The construct that egresses a URL, headers,
