@@ -22418,14 +22418,26 @@ fn coerce_provider_by_name(
 }
 
 fn auth_status(options: &CliOptions) -> ExitCode {
+    // Each row carries the resolved credential's REFERENCE beside its source
+    // label (DR-0053 *Migration*): every path whip resolves for itself is a
+    // legacy spelling, degraded at r0, and a status surface that prints only
+    // "from env:OPENAI_API_KEY" reads exactly like one naming a custodian
+    // entry at the same rung. It is not the same thing, and the operator
+    // deciding whether their setup meets `require credential <rung>` is the
+    // person who needs to know.
     let mut rows = Vec::new();
     for provider in auth::KNOWN_PROVIDERS {
         let coerce_provider = coerce_provider_by_name(provider).expect("known provider");
-        let (source, redacted) = match model_auth::resolve_credential_with_source(coerce_provider) {
-            Some((key, source)) => (source.label(), Some(auth::redact(&key))),
-            None => ("none".to_owned(), None),
-        };
-        rows.push((provider.to_owned(), source, redacted));
+        let (source, reference, redacted) =
+            match model_auth::resolve_credential_with_source(coerce_provider) {
+                Some((key, source)) => (
+                    source.label(),
+                    Some(source.credential_ref()),
+                    Some(auth::redact(&key)),
+                ),
+                None => ("none".to_owned(), None, None),
+            };
+        rows.push((provider.to_owned(), source, reference, redacted));
     }
     // Phase 4 auth relocation: when the policy channel hands whip resolved
     // credentials inside provider profiles, the host owns auth and the rows
@@ -22436,12 +22448,22 @@ fn auth_status(options: &CliOptions) -> ExitCode {
     if options.json {
         let providers: Vec<Value> = rows
             .iter()
-            .map(|(provider, source, redacted)| {
+            .map(|(provider, source, reference, redacted)| {
                 json!({
                     "provider": provider,
                     "source": source,
                     "credential": redacted,
                     "configured": redacted.is_some(),
+                    "credential_ref": reference.as_ref().map(
+                        whipplescript_custody::CredentialRef::label,
+                    ),
+                    "rung": reference
+                        .as_ref()
+                        .and_then(whipplescript_custody::CredentialRef::static_rung)
+                        .map(|rung| rung.ladder_label()),
+                    "degraded": reference
+                        .as_ref()
+                        .map(whipplescript_custody::CredentialRef::is_legacy),
                 })
             })
             .collect();
@@ -22457,9 +22479,16 @@ fn auth_status(options: &CliOptions) -> ExitCode {
                 "host-resolved provider profiles: {path} (whip's own credentials below are the fallback path)"
             );
         }
-        for (provider, source, redacted) in &rows {
+        for (provider, source, reference, redacted) in &rows {
             match redacted {
-                Some(redacted) => println!("{provider}: {redacted} (from {source})"),
+                Some(redacted) => {
+                    println!("{provider}: {redacted} (from {source})");
+                    if let Some(reference) = reference {
+                        if reference.is_legacy() {
+                            println!("  {}", reference.status_line());
+                        }
+                    }
+                }
                 None => println!("{provider}: not configured"),
             }
         }

@@ -1689,6 +1689,14 @@ that the command redacts. With the `--json` flag, the output has the
 subcommand stores a key for `openai` or for `anthropic`. There is no `login`
 subcommand. Whip runs no OAuth procedure.
 
+Every credential this resolver finds is one whip holds itself, so `status` also
+reports it as **degraded at r0** — `credential_ref`, `rung`, and `degraded` in
+the JSON, and a second line in the text output. This layer predates the
+custodian of DR-0053, and a report that named only the source read exactly like
+one naming a custodian entry at the same rung. The rung a `require credential
+<rung>` clause compares against is the one the custodian *derives*; nothing in
+configuration can claim it.
+
 A host that embeds whip can own the authentication fully. Such a host gives
 resolved credentials to whip in the profiles of the providers. The
 `WHIPPLESCRIPT_PROVIDER_PROFILES` variable names a JSON file that the host

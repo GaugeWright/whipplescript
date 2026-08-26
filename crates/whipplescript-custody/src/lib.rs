@@ -148,26 +148,79 @@ impl CredentialRef {
                 tag: raw.to_string(),
             });
         }
-        Err(format!(
-            "unrecognized credential reference {raw:?}: use `credential:<name>` (custodian \
-             entry) or the legacy `env:<VAR>` shim"
-        ))
+        // Deliberately no echo of `raw`. The value that reaches this arm is
+        // precisely the one that named no scheme, and the likeliest reason a
+        // field holding a reference names no scheme is that it holds the
+        // material instead. An error string is copied into diagnostics,
+        // reports, and recorded validation evidence, so echoing here would put
+        // the secret in all three on the way to complaining about it. The
+        // operator has the value in front of them; what they lack is the
+        // vocabulary, which is what this says.
+        Err(
+            "unrecognized credential reference: use `credential:<name>` (a custodian entry) \
+             or the legacy `env:<VAR>` shim"
+                .to_string(),
+        )
     }
 
-    /// The honest rung/degraded pair this reference can claim WITHOUT asking
-    /// a custodian: legacy shims are r0 degraded by construction. For
-    /// `Custodian` references the truth is whatever the custodian's reply
-    /// derives — this method reports the r0 floor and the caller must prefer
-    /// the reply's values (`credential-rung-evidence.maude`: configuration
-    /// is not evidence).
-    pub fn shim_rung(&self) -> (Rung, bool) {
-        (Rung::Process, true)
+    /// The rung this reference can claim WITHOUT asking a custodian.
+    ///
+    /// `None` for `Custodian`, and that is the load-bearing case:
+    /// configuration is not evidence
+    /// (`models/maude/credential-rung-evidence.maude`), so nothing on this
+    /// side of the wire may claim a rung on the custodian's behalf — the
+    /// caller must take the reply's derived value. The legacy spellings
+    /// answer `Some(Rung::Process)` because whip itself holds the plaintext,
+    /// which is r0 by construction.
+    ///
+    /// The predecessor of this method answered `(Rung::Process, true)` for
+    /// every variant including `Custodian`, which read as a floor and was
+    /// really a claim. It had no callers, so nothing believed it.
+    pub fn static_rung(&self) -> Option<Rung> {
+        match self {
+            CredentialRef::Custodian(_) => None,
+            CredentialRef::LegacyEnv { .. } | CredentialRef::LegacyTag { .. } => {
+                Some(Rung::Process)
+            }
+        }
     }
 
     /// Whether this reference is a legacy spelling that the unification will
     /// retire once a rung is required.
+    ///
+    /// This is the DEGRADED tag of DR-0053 *Migration*. A legacy reference
+    /// resolves at r0 like an in-process custodian entry does, but it is not
+    /// the same thing and the two must not print the same: r0 custody seals
+    /// at rest under a passphrase-derived key, while `env:OPENAI_API_KEY` is
+    /// an environment variable in whip's own process. Degraded is what
+    /// carries that difference to an operator.
     pub fn is_legacy(&self) -> bool {
         !matches!(self, CredentialRef::Custodian(_))
+    }
+
+    /// The canonical spelling. Legacy references round-trip to what the
+    /// operator wrote, so a status surface names the config it can go edit.
+    pub fn label(&self) -> String {
+        match self {
+            CredentialRef::Custodian(name) => format!("credential:{}", name.as_str()),
+            CredentialRef::LegacyEnv { var } => format!("env:{var}"),
+            CredentialRef::LegacyTag { tag } => tag.clone(),
+        }
+    }
+
+    /// One line an operator can act on: the spelling, its rung, and — when the
+    /// spelling is legacy — what to do about it. A `Custodian` reference gets
+    /// no rung here on purpose; only the custodian's reply may state one.
+    pub fn status_line(&self) -> String {
+        match self.static_rung() {
+            Some(rung) => format!(
+                "{} ({} degraded: whip holds this material itself; \
+                 migrate to `credential:<name>`)",
+                self.label(),
+                rung.ladder_label()
+            ),
+            None => format!("{} (rung derived by the custodian)", self.label()),
+        }
     }
 }
 
@@ -1043,15 +1096,34 @@ mod tests {
         ] {
             let parsed = CredentialRef::parse(legacy).expect("legacy parses");
             assert!(parsed.is_legacy(), "{legacy} must be legacy");
-            assert_eq!(parsed.shim_rung(), (Rung::Process, true));
+            assert_eq!(parsed.static_rung(), Some(Rung::Process));
+            assert_eq!(parsed.label(), legacy);
+            // The status line an operator reads must not be mistakable for
+            // custody at the same rung.
+            assert!(
+                parsed.status_line().contains("degraded"),
+                "{legacy}: {}",
+                parsed.status_line()
+            );
         }
-        assert!(!CredentialRef::parse("credential:model")
-            .expect("parse")
-            .is_legacy());
+        let custodian = CredentialRef::parse("credential:model").expect("parse");
+        assert!(!custodian.is_legacy());
+        // Configuration is not evidence: nothing here may state a rung for a
+        // custodian entry, and the status line must not print one.
+        assert_eq!(custodian.static_rung(), None);
+        assert!(!custodian.status_line().contains("r0"));
         // Unknown schemes are errors, not silent passthrough — the resolver
         // that "silently passes plaintext through otherwise" is the exact
         // complaint DR-0053 records.
-        assert!(CredentialRef::parse("sk_live_plaintext").is_err());
+        // The refusal must not echo what it refused. A field holding a
+        // reference that names no scheme most likely holds the material
+        // instead, and this error string travels into diagnostics, provider
+        // reports, and recorded validation evidence.
+        let refused = CredentialRef::parse("sk_live_plaintext").expect_err("no scheme");
+        assert!(!refused.contains("sk_live_plaintext"), "{refused}");
+        let colon = CredentialRef::parse("admin:hunter2").expect_err("unknown scheme");
+        assert!(!colon.contains("admin"), "{colon}");
+        assert!(!colon.contains("hunter2"), "{colon}");
         assert!(CredentialRef::parse("env:").is_err());
     }
 

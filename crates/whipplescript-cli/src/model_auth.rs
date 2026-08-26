@@ -43,6 +43,34 @@ impl CredentialSource {
             CredentialSource::CodexOAuth => "~/.codex/auth.json".to_owned(),
         }
     }
+
+    /// This source as a reference in the unified namespace (DR-0053
+    /// *Migration*).
+    ///
+    /// Every variant here predates custody: whip reads the material into its
+    /// own process, so every one is a legacy spelling and every one is
+    /// degraded at r0. That is worth stating in a type rather than leaving to
+    /// each surface to infer, because the inference the surfaces were making
+    /// was that there was nothing to say — a key from `OPENAI_API_KEY` printed
+    /// exactly like a credential a custodian holds, and an operator could not
+    /// tell which one they were running.
+    ///
+    /// The custodian-backed source that will join this enum answers for itself
+    /// here rather than being special-cased at each call site.
+    pub fn credential_ref(self) -> whipplescript_custody::CredentialRef {
+        use whipplescript_custody::CredentialRef;
+        match self {
+            CredentialSource::Env(name) => CredentialRef::LegacyEnv {
+                var: name.to_owned(),
+            },
+            CredentialSource::Stored => CredentialRef::LegacyTag {
+                tag: "secret:whip-auth".to_owned(),
+            },
+            CredentialSource::CodexOAuth => CredentialRef::LegacyTag {
+                tag: "secret:codex-oauth".to_owned(),
+            },
+        }
+    }
 }
 
 /// The credential candidates a resolution consults, snapshot as plain values so
@@ -284,5 +312,37 @@ mod tests {
             credential_env_var(CoerceProvider::OpenAiCompat),
             "OPENAI_API_KEY"
         );
+    }
+
+    #[test]
+    fn every_source_whip_resolves_for_itself_is_degraded_at_r0() {
+        // DR-0053 *Migration*. This layer predates custody: whatever it
+        // resolves, whip is holding the plaintext. That makes every source
+        // here a legacy spelling at r0 degraded, and the point of saying so in
+        // a type is that `whip auth status` used to print a key from
+        // `OPENAI_API_KEY` exactly as it would print one a custodian holds at
+        // the same rung.
+        for (source, expected_label) in [
+            (
+                CredentialSource::Env("OPENAI_API_KEY"),
+                "env:OPENAI_API_KEY",
+            ),
+            (CredentialSource::Stored, "secret:whip-auth"),
+            (CredentialSource::CodexOAuth, "secret:codex-oauth"),
+        ] {
+            let reference = source.credential_ref();
+            assert_eq!(reference.label(), expected_label);
+            assert!(reference.is_legacy(), "{expected_label}");
+            assert_eq!(
+                reference.static_rung(),
+                Some(whipplescript_custody::Rung::Process),
+                "{expected_label}"
+            );
+            assert!(
+                reference.status_line().contains("degraded"),
+                "{}",
+                reference.status_line()
+            );
+        }
     }
 }

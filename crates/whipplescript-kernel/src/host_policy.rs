@@ -115,6 +115,16 @@ impl HostGovernancePolicy {
             nonempty("provider model", &binding.model)?;
             nonempty("provider base URL", &binding.base_url)?;
             nonempty("credential reference", &binding.credential_ref)?;
+            // Reference, not value (DR-0053 §2). A `credential_ref` naming no
+            // scheme is either a typo or the material itself pasted into the
+            // field, and the second is the failure this whole seam exists to
+            // prevent — an admitted envelope would then carry a secret in a
+            // record that is canonicalized, signed, and kept. Every spelling
+            // the migration recognizes parses, including the legacy ones, so
+            // this rejects nothing that was ever a reference.
+            whipplescript_custody::CredentialRef::parse(&binding.credential_ref).map_err(
+                |message| format!("provider binding `{handle}` credential reference: {message}"),
+            )?;
             require_principal_binding(self, handle, "provider")?;
         }
         for (handle, placement) in &self.placements {
@@ -253,6 +263,44 @@ mod tests {
             .validate()
             .expect_err("unknown provider must fail")
             .contains("undeclared provider"));
+    }
+
+    #[test]
+    fn rejects_a_provider_binding_whose_credential_reference_is_a_value() {
+        // DR-0053 §2 is reference-not-value, and an admitted envelope is
+        // canonicalized, signed, and kept. A key pasted where a reference
+        // belongs used to validate clean and be stored in all three.
+        let mut policy = complete_policy();
+        policy
+            .provider_bindings
+            .get_mut("model")
+            .expect("fixture has a model binding")
+            .credential_ref = "sk-proj-pasted-key".to_owned();
+        let error = policy
+            .validate()
+            .expect_err("a reference naming no scheme must fail");
+        assert!(error.contains("credential reference"), "{error}");
+        // The refusal names the field, never the value it refused.
+        assert!(!error.contains("sk-proj-pasted-key"), "{error}");
+
+        // Every spelling the migration recognizes still validates, so this
+        // tightening rejects nothing that was ever a reference.
+        for accepted in [
+            "credential:acme/openai-live",
+            "credential:account:openai",
+            "env:OPENAI_API_KEY",
+            "secret:claude",
+        ] {
+            let mut policy = complete_policy();
+            policy
+                .provider_bindings
+                .get_mut("model")
+                .expect("fixture has a model binding")
+                .credential_ref = accepted.to_owned();
+            policy.validate().unwrap_or_else(|error| {
+                panic!("{accepted} must stay valid: {error}");
+            });
+        }
     }
 
     #[test]

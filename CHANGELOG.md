@@ -7,6 +7,41 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Fixed
 
+- **A credential reference now has to be one.** `credentials_ref` (provider
+  binding config) and `credential_ref` (signed host policy) were free strings
+  that nothing parsed. A key pasted into either field validated clean and was
+  then written into recorded validation evidence and a canonicalized, signed
+  policy envelope — reference-not-value (DR-0053 §2) held by convention only.
+
+  Both now parse. Every spelling the migration recognizes still validates, so
+  nothing that was ever a reference is rejected; what is rejected is a value
+  that names no scheme.
+
+  The refusal does not echo what it refused, for the same reason: the input
+  that reaches that arm is the one most likely to *be* the material, and an
+  error string travels into diagnostics, provider reports, and evidence. A test
+  in `whipplescript-custody` pins the no-echo property and both call sites
+  assert it again.
+
+- **The legacy credential path reports itself as degraded** (DR-0053
+  *Migration*). Every credential `whip auth`/`coerce` resolves for itself —
+  `OPENAI_API_KEY`, a stored key, the Codex OAuth token — is material whip
+  holds in its own process. That is r0, and it is not the same as an r0
+  custodian entry, which seals at rest under a passphrase-derived key. Until
+  now the two printed identically, so an operator deciding whether their setup
+  meets `require credential <rung>` could not tell which one they were running.
+
+  `whip auth status` now carries `credential_ref`, `rung`, and `degraded` in
+  its JSON and a second line in its text output, and provider validation
+  reports a legacy reference as `credentials_ref_degraded` rather than plain
+  `credentials_ref_available`. Legacy still passes — the shim exists so
+  existing setups keep working — it just says so.
+
+  A rung is still never claimed from configuration: a `credential:<name>`
+  reference reports no rung at all, because only the custodian's derived
+  evidence may state one
+  (`models/maude/credential-rung-evidence.maude`).
+
 - **The custodian redacts its own material out of an egress response.** An
   endpoint that echoes the credential back — an auth-debug route, a
   misconfigured mirror — returned material that then landed in whip's run

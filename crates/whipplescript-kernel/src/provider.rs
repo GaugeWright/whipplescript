@@ -744,26 +744,63 @@ pub fn validate_provider_binding(
         ));
     }
 
-    if capability.auth_requirements.is_empty() || config.credentials_ref.is_some() {
-        results.push(ProviderValidationResult::pass(
+    // DR-0053 *Migration*: a credential reference has a SHAPE, not merely a
+    // presence. Parsing it here is what makes the legacy path distinguishable
+    // from custody — before this, `env:OPENAI_API_KEY` and
+    // `credential:acme/stripe-live` both reported "a credential reference is
+    // available" and an operator reading the report could not tell which one
+    // they were running. The degradation is meant to be visible rather than
+    // silent, and a report that cannot name it is where it goes silent.
+    results.push(match config.credentials_ref.as_deref() {
+        Some(raw) => match whipplescript_custody::CredentialRef::parse(raw) {
+            // Legacy still PASSES: the shim exists so existing setups keep
+            // working. It carries its own code so the degradation travels into
+            // `whip doctor` output and the recorded validation evidence.
+            Ok(reference) if reference.is_legacy() => ProviderValidationResult::pass(
+                provider,
+                surface,
+                "provider.config.valid",
+                "credentials_ref_degraded",
+                format!(
+                    "provider credential reference is {}",
+                    reference.status_line()
+                ),
+            ),
+            Ok(reference) => ProviderValidationResult::pass(
+                provider,
+                surface,
+                "provider.config.valid",
+                "credentials_ref_available",
+                format!(
+                    "provider credential reference is {}",
+                    reference.status_line()
+                ),
+            ),
+            Err(message) => ProviderValidationResult::fail(
+                provider,
+                surface,
+                "provider.config.invalid",
+                "unparsable_credentials_ref",
+                format!("provider credential reference is unusable: {message}"),
+            )
+            .missing_ref("credentials_ref"),
+        },
+        None if capability.auth_requirements.is_empty() => ProviderValidationResult::pass(
             provider,
             surface,
             "provider.config.valid",
-            "credentials_ref_available",
-            "provider credential reference is available or not required",
-        ));
-    } else {
-        results.push(
-            ProviderValidationResult::fail(
-                provider,
-                surface,
-                "provider.config.missing",
-                "missing_credentials_ref",
-                "provider credential reference is required for this native surface",
-            )
-            .missing_ref("credentials_ref"),
-        );
-    }
+            "credentials_ref_not_required",
+            "this native surface declares no auth requirement",
+        ),
+        None => ProviderValidationResult::fail(
+            provider,
+            surface,
+            "provider.config.missing",
+            "missing_credentials_ref",
+            "provider credential reference is required for this native surface",
+        )
+        .missing_ref("credentials_ref"),
+    });
 
     results
 }
@@ -1075,6 +1112,72 @@ mod tests {
             .expect("missing credentials reported");
         assert_eq!(missing.missing_config_refs, vec!["credentials_ref"]);
         assert!(!missing.to_json().to_string().contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn a_credential_reference_reports_its_shape_not_just_its_presence() {
+        // DR-0053 *Migration*. Before this, all three of these configs
+        // reported the same "credential reference is available" pass, so a
+        // report could not distinguish material whip holds itself from
+        // material a custodian holds — which is the whole distinction the
+        // rung ladder is built on.
+        fn code_for(credentials_ref: &str) -> String {
+            let config = ProviderBindingConfig::from_json_str(&format!(
+                r#"{{
+                  "provider_id": "fixture-main",
+                  "provider_kind": "fixture",
+                  "surface": "fixture",
+                  "credentials_ref": "{credentials_ref}"
+                }}"#
+            ))
+            .expect("config parses");
+            let results = validate_provider_binding(&config, &builtin_provider_capabilities());
+            results
+                .iter()
+                .find(|result| result.code.contains("credentials_ref"))
+                .map(|result| result.code.clone())
+                .expect("a credentials_ref result is always emitted")
+        }
+
+        // The canonical namespace: no rung claimed here, because
+        // configuration is not evidence.
+        assert_eq!(
+            code_for("credential:acme/openai-live"),
+            "credentials_ref_available"
+        );
+        // Every legacy spelling passes — the shim keeps existing setups
+        // working — but says so.
+        for legacy in [
+            "env:OPENAI_API_KEY",
+            "secret:codex",
+            "credential:account:openai",
+        ] {
+            assert_eq!(code_for(legacy), "credentials_ref_degraded", "{legacy}");
+        }
+
+        // A value where a reference belongs. This is the shape that matters:
+        // an API key pasted into `credentials_ref` used to validate clean and
+        // then be written into recorded validation evidence.
+        let config = ProviderBindingConfig::from_json_str(
+            r#"{
+              "provider_id": "fixture-main",
+              "provider_kind": "fixture",
+              "surface": "fixture",
+              "credentials_ref": "sk-proj-not-a-reference"
+            }"#,
+        )
+        .expect("config parses");
+        let results = validate_provider_binding(&config, &builtin_provider_capabilities());
+        let refused = results
+            .iter()
+            .find(|result| result.code == "unparsable_credentials_ref")
+            .expect("an unparsable reference is refused");
+        assert_eq!(refused.status, ProviderValidationStatus::Fail);
+        // And the refusal must not echo it back into the report.
+        assert!(!refused
+            .to_json()
+            .to_string()
+            .contains("sk-proj-not-a-reference"));
     }
 
     #[test]
