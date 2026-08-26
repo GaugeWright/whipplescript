@@ -3197,6 +3197,40 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Register a whole manifest set as one durable step, returning each
+    /// package id in the order given.
+    ///
+    /// [`Self::register_package_manifest`] writes the package row plus a row
+    /// per capability, provider and binding, and outside a transaction every
+    /// one of those is its own commit. Re-seeding the embedded std manifests
+    /// into a store that already holds the identical set therefore cost ~32
+    /// fsyncs per process start to write nothing that changed — the rows are
+    /// upserts, so the content is the same afterwards either way.
+    ///
+    /// The set is one logical claim ("the store holds these packages"), so it
+    /// commits as one. Every write and its self-healing upsert are unchanged;
+    /// what goes away is the per-row commit boundary, which was never meaning-
+    /// ful here. A crash mid-set now leaves the store with the old set rather
+    /// than half of the new one.
+    pub fn register_package_manifests<'a, I>(&self, manifests: I) -> StoreResult<Vec<String>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        // `Immediate` matches every other write batch in this store: a deferred
+        // transaction that upgrades on its first write can fail with
+        // SQLITE_BUSY_SNAPSHOT, which `busy_timeout` does not retry.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut package_ids = Vec::new();
+        for manifest_json in manifests {
+            package_ids.push(self.register_package_manifest(manifest_json)?);
+        }
+        transaction.commit()?;
+        Ok(package_ids)
+    }
+
     pub fn register_package_manifest(&self, manifest_json: &str) -> StoreResult<String> {
         let manifest: Value = serde_json::from_str(manifest_json)?;
         let package_id = required_manifest_string(&manifest, &["package_id", "plugin_id"])?;
@@ -12279,6 +12313,80 @@ mod tests {
 
     /// DR-0062 §6: the registry records what was FILED. Derivation of rung and
     /// class from it lives in the kernel, so this only has to be faithful.
+    /// The batch must land exactly what the one-at-a-time calls landed; it
+    /// exists to remove commit boundaries, not to change what is registered.
+    #[test]
+    fn register_package_manifests_lands_what_individual_calls_land() {
+        const MANIFESTS: [&str; 3] = [
+            include_str!("../../../std/manifests/memory.json"),
+            include_str!("../../../std/manifests/coord.json"),
+            include_str!("../../../std/manifests/files.json"),
+        ];
+        fn registry(store: &SqliteStore) -> Vec<String> {
+            let mut rows = Vec::new();
+            for table in [
+                "SELECT package_id, name, version FROM package_registrations",
+                "SELECT capability, description FROM capability_schemas",
+                "SELECT provider_id, effect_kind, provider FROM effect_providers",
+            ] {
+                let mut statement = store.connection.prepare(table).expect("query prepares");
+                let mut found: Vec<String> = statement
+                    .query_map([], |row| {
+                        let mut parts = Vec::new();
+                        for index in 0..row.as_ref().column_count() {
+                            parts.push(row.get::<_, Option<String>>(index)?.unwrap_or_default());
+                        }
+                        Ok(parts.join("|"))
+                    })
+                    .expect("query runs")
+                    .map(|row| row.expect("row reads"))
+                    .collect();
+                found.sort();
+                rows.extend(found);
+            }
+            rows
+        }
+
+        let one_at_a_time = SqliteStore::open_in_memory().expect("store opens");
+        for manifest in MANIFESTS {
+            one_at_a_time
+                .register_package_manifest(manifest)
+                .expect("manifest registers");
+        }
+
+        let batched = SqliteStore::open_in_memory().expect("store opens");
+        let ids = batched
+            .register_package_manifests(MANIFESTS)
+            .expect("manifest set registers");
+
+        assert_eq!(ids, ["std.memory", "std.coord", "std.files"]);
+        assert_eq!(registry(&batched), registry(&one_at_a_time));
+    }
+
+    /// One commit for the set means a rejected manifest takes the whole set
+    /// with it. Registering half a set was never meaningful, and this is the
+    /// fail-closed direction: nothing enters rather than some of it.
+    #[test]
+    fn a_rejected_manifest_registers_none_of_the_set() {
+        let store = SqliteStore::open_in_memory().expect("store opens");
+        let outcome = store.register_package_manifests([
+            include_str!("../../../std/manifests/memory.json"),
+            "{ not valid json",
+        ]);
+        assert!(outcome.is_err(), "a malformed manifest must refuse the set");
+
+        let remaining: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM package_registrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count reads");
+        assert_eq!(
+            remaining, 0,
+            "the good manifest must not survive the bad one"
+        );
+    }
+
     #[test]
     fn provider_trust_evidence_records_pin_claim_and_operator_run() {
         let store = SqliteStore::open_in_memory().expect("store opens");

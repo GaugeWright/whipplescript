@@ -17950,9 +17950,10 @@ fn register_locked_packages(
     // `ON CONFLICT DO UPDATE`), but skipping keeps the lock authoritative for any
     // name it shares with an embedded manifest — the lock wins.
     let mut registered = BTreeSet::new();
+    let mut manifests: Vec<String> = Vec::new();
     if let Some(package_lock) = package_lock {
         for manifest in &package_lock.manifests {
-            store.register_package_manifest(&manifest.manifest_json)?;
+            manifests.push(manifest.manifest_json.clone());
             registered.insert(manifest.name.clone());
         }
     }
@@ -17962,8 +17963,12 @@ fn register_locked_packages(
         if registered.contains(&manifest.name) {
             continue;
         }
-        store.register_package_manifest(&manifest.manifest_json)?;
+        manifests.push(manifest.manifest_json.clone());
     }
+    // One commit for the whole set. This runs on every start and every worker
+    // pass, and per-manifest commits made a no-op re-seed pay a durable write
+    // per package, capability, provider and binding.
+    store.register_package_manifests(manifests.iter().map(String::as_str))?;
     Ok(())
 }
 
