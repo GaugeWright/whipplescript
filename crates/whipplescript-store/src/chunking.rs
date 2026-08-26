@@ -263,6 +263,39 @@ mod tests {
         bytes
     }
 
+    /// **The default chunking parameters are frozen identity.**
+    ///
+    /// `root_hash` is `content_hash_hex` over the concatenated chunk ids, so a
+    /// chunk root's identity IS its chunking decision. Change `avg_size`, or the
+    /// boundary function, or the order chunks are hashed in, and the same bytes
+    /// acquire a different root id — every stored large blob silently
+    /// re-identifies, and content addressing's one promise (same bytes, same id)
+    /// stops holding for exactly the objects big enough to matter.
+    ///
+    /// Nothing pinned that until 2026-08-25. The test config above says in its
+    /// own comment that "the DEFAULTS are identity-bearing and exercised for
+    /// shape only" — the hazard was known and left unguarded, which is how a
+    /// parameter tweak would have shipped as a silent re-key.
+    ///
+    /// If this test fails, the question is not "what is the new hash". It is
+    /// whether every existing store is being migrated, because this value is a
+    /// promise already made to bytes on disk.
+    #[test]
+    fn the_default_chunker_is_a_frozen_identity() {
+        let blob = data(700_000, 0xC0FFEE);
+        let tree = chunk_blob(&blob, &ChunkingConfig::default());
+        assert!(
+            !tree.is_whole_blob(),
+            "the fixture must exceed the whole-blob threshold, or this pins nothing"
+        );
+        assert_eq!(
+            tree.root_hash,
+            "bdf8500c29664e914cbb6f20fd4518dc",
+            "the default chunker's identity changed: {} chunks",
+            tree.chunks.len()
+        );
+    }
+
     /// Below the threshold a blob keeps its plain content hash — nothing
     /// upstream re-keys when chunking ships.
     #[test]

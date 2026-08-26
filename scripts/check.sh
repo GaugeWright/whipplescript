@@ -47,6 +47,13 @@ if [ -f AGENTS.md ]; then
     echo "== conformance coverage =="
     scripts/check-conformance-coverage.sh
 
+    # DR-0066 §8 opens "a change that weakens one of these is a defect even when
+    # it makes something faster", and not one of its seven refusals had a check.
+    # Two are mechanically checkable; the other five are recorded as unchecked
+    # rather than left implied.
+    echo "== substrate refusals =="
+    scripts/check-substrate-refusals.sh
+
     # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
     # repository, which owns it. It fails when a cargo workspace or a lockfile is
     # watched by nothing. Edit it there and re-render; a local edit fails here.
