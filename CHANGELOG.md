@@ -7,6 +7,32 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Fixed
 
+- **`request` was invisible to the information-flow checker.**
+  `IrEffectKind::HttpRequest` appeared nowhere in `ifc.rs`, and the parser
+  returned no IFC resource for it. The construct that egresses a URL, headers,
+  and a body to an arbitrary external host got no reader-set check, no
+  `denied flow`, and no entry in the flow graph — a confidential value could be
+  sent to an uncleared endpoint and nothing said so. It shipped that way in the
+  same release that introduced it.
+
+  A `request` now names its credential as its IFC resource and is classified as
+  **both** a read and a write. That is the accurate reading rather than merely
+  the conservative one: the payload leaves the process and the response comes
+  back. Both directions refuse, and both refusals are mutation-verified.
+
+  The sink identity is the credential handle, not the URL: it is the resource
+  the program declares and the one governance grants by identity, so it is what
+  an envelope can actually grant. Two requests under one credential to
+  different hosts therefore share a sink.
+
+  **A governed program may newly be refused, and that is the fix working.**
+  Because a `request` is also a read, what comes back carries the credential's
+  reader set: a rule that requests under a `readable by Ops` credential and
+  completes a public `result` is now a `denied flow`. The join is per rule, as
+  it is for a `file store` read, so the refusal does not ask whether the
+  completed value derives from the response. The exits are the same as
+  everywhere else — clear the sink, or declassify.
+
 - **A credential reference now has to be one.** `credentials_ref` (provider
   binding config) and `credential_ref` (signed host policy) were free strings
   that nothing parsed. A key pasted into either field validated clean and was

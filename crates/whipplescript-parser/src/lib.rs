@@ -10125,6 +10125,37 @@ fn collect_egress_payload_reads(
                         out.push(reads);
                     }
                 }
+                // A `request` egresses its URL, its non-credential header
+                // values, and its body. The URL counts: a path or query can
+                // carry data as surely as a body can, which is the same
+                // reasoning `write … to <store>` applies to its path.
+                body::BodyEffectKind::HttpRequest {
+                    url,
+                    headers,
+                    body,
+                    signed_with,
+                    ..
+                } => {
+                    let Some(credential) =
+                        request_credential_handle(headers, signed_with.as_deref())
+                    else {
+                        continue;
+                    };
+                    let mut roots = BTreeSet::new();
+                    collect_template_binding_roots(url, &mut roots);
+                    for header in headers {
+                        // A credential slot carries a HANDLE, never an
+                        // expression, so there is nothing to read from it.
+                        if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
+                            collect_expr_binding_roots(expr, &mut roots);
+                        }
+                    }
+                    if let Some((source, expr)) = body {
+                        collect_expr_binding_roots(expr, &mut roots);
+                        collect_template_binding_roots(source, &mut roots);
+                    }
+                    out.push((credential.to_owned(), roots));
+                }
                 body::BodyEffectKind::FileWrite {
                     store, path, body, ..
                 } => {
@@ -11088,8 +11119,42 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         body::BodyEffectKind::LeaseAcquire { resource, .. } => Some(format!("resource:{resource}")),
         body::BodyEffectKind::LedgerAppend { ledger, .. } => Some(format!("resource:{ledger}")),
         body::BodyEffectKind::CounterConsume { counter, .. } => Some(format!("resource:{counter}")),
+        // DR-0053 §5: a `request` leaves the process for an external endpoint
+        // under exactly one credential — the checker guarantees the "exactly
+        // one". Before this it had no IFC resource at all, so the construct
+        // that egresses a URL, headers, and a body to an arbitrary host was
+        // invisible to the egress checker.
+        //
+        // The credential is the sink identity because it is the resource the
+        // program DECLARES and the one governance grants by identity
+        // (`grant credential … -> credential:<addr>`). It is coarser than the
+        // URL — two requests under one credential to different hosts share a
+        // sink — and coarse-but-declared is what an envelope can actually
+        // grant.
+        body::BodyEffectKind::HttpRequest {
+            headers,
+            signed_with,
+            ..
+        } => request_credential_handle(headers, signed_with.as_deref()).map(str::to_owned),
         _ => None,
     }
+}
+
+/// The one credential a `request` authenticates with: the first marked header
+/// slot, else `signed with`. `validate_http_request` refuses a request that
+/// names none and one that names two, so "first" is "the only one" in any
+/// program that compiles.
+fn request_credential_handle<'a>(
+    headers: &'a [body::RequestHeader],
+    signed_with: Option<&'a str>,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|header| match &header.value {
+            body::RequestHeaderValue::Credential { handle, .. } => Some(handle.as_str()),
+            body::RequestHeaderValue::Expr { .. } => None,
+        })
+        .or(signed_with)
 }
 
 fn construct_use_for_body(kind: &body::BodyEffectKind) -> Option<IrConstructUse> {

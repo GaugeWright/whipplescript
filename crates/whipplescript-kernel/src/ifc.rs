@@ -1825,6 +1825,8 @@ fn rule_read_resources(
                 effect.kind,
                 IrEffectKind::FileRead
                     | IrEffectKind::FileImport
+                    // A response is inbound external data.
+                    | IrEffectKind::HttpRequest
                     | IrEffectKind::LeaseAcquire
                     | IrEffectKind::LedgerAppend
                     | IrEffectKind::CounterConsume
@@ -1991,6 +1993,10 @@ fn declared_resources(ir: &IrProgram) -> BTreeSet<&str> {
     names.extend(ir.counters.iter().map(|r| r.name.as_str()));
     names.extend(ir.leases.iter().map(|r| r.name.as_str()));
     names.extend(ir.streams.iter().map(|r| r.name.as_str()));
+    // A credential is a declared resource too: `request` names one as its
+    // egress sink, so the grant vocabulary that classifies operations on
+    // declared resources has to see it as declared.
+    names.extend(ir.credentials.iter().map(|r| r.name.as_str()));
     names
 }
 
@@ -2134,6 +2140,7 @@ fn selected_effect_integrity_sinks(
             IrEffectKind::FileWrite
                 | IrEffectKind::FileExport
                 | IrEffectKind::CapabilityCall
+                | IrEffectKind::HttpRequest
                 | IrEffectKind::LeaseAcquire
                 | IrEffectKind::LedgerAppend
                 | IrEffectKind::CounterConsume
@@ -3923,6 +3930,17 @@ pub fn check_with_envelope_imports(
                     IrEffectKind::LeaseAcquire
                     | IrEffectKind::LedgerAppend
                     | IrEffectKind::CounterConsume => {
+                        reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // A `request` is BOTH, and the accurate reading rather
+                    // than merely the conservative one: its URL, headers, and
+                    // body leave the process for an external endpoint, and its
+                    // response comes back in. It was neither until now, so an
+                    // authenticated call to an arbitrary host was the one
+                    // egress this checker could not see.
+                    IrEffectKind::HttpRequest => {
                         reads.push(resource);
                         writes.push(resource);
                         span.get_or_insert(effect.span);
@@ -11706,5 +11724,181 @@ rule seed
             messages.iter().all(|m| !m.contains("for that type")),
             "{messages:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod request_egress_tests {
+    //! DR-0053 §5: `request` reaches an external endpoint. Until these tests
+    //! existed it reached one INVISIBLY — `IrEffectKind::HttpRequest` appeared
+    //! nowhere in this file, so a confidential value could be sent to an
+    //! arbitrary host with no reader-set check, no `denied egress`, and no
+    //! entry in the flow graph. The construct shipped that way.
+
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    fn program(body_expr: &str) -> IrProgram {
+        let source = format!(
+            r#"
+@service
+workflow RequestEgress
+
+use std.custody
+use std.ingress
+
+credential stripe_api {{ kind bearer }}
+
+signal charge.disputed {{ note string }}
+
+output result R
+class R {{ v string }}
+
+rule refund
+  when charge.disputed as charge
+=> {{
+  request POST "https://api.stripe.com/v1/refunds" {{
+    header "Authorization" bearer stripe_api
+    body {body_expr}
+  }} as refund
+
+  after refund succeeds {{
+    complete result {{ v "ok" }}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    #[test]
+    fn a_request_is_an_egress_sink_the_checker_can_see() {
+        // The credential is the sink identity: it is the resource the program
+        // declares and the one governance grants by identity.
+        let ir = program("charge.note");
+        let request = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::HttpRequest)
+            .expect("the request lowers to an effect node");
+        assert_eq!(request.resource.as_deref(), Some("stripe_api"));
+
+        // And the body's binding roots are recorded against that sink, so the
+        // label of what is being sent is knowable.
+        let reads = ir
+            .rules
+            .iter()
+            .find_map(|rule| rule.metadata.egress_payload_reads.get("stripe_api"))
+            .expect("the request records what its payload reads");
+        assert!(reads.contains("charge"), "{reads:?}");
+    }
+
+    #[test]
+    fn sending_a_confidential_value_to_an_uncleared_endpoint_is_denied() {
+        // The whole point. `charge` is confidential; the credential naming the
+        // endpoint is not cleared for it.
+        let ir = program("charge.note");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        let denial = messages
+            .iter()
+            .find(|m| m.contains("denied flow"))
+            .unwrap_or_else(|| {
+                panic!("a confidential value reaching an external endpoint must be denied: {messages:#?}")
+            });
+        // The endpoint is named by the credential, so the diagnostic points at
+        // the thing the operator can grant.
+        assert!(denial.contains("stripe_api"), "{denial}");
+    }
+
+    #[test]
+    fn an_external_response_cannot_shape_a_sink_that_demands_a_voucher() {
+        // The other direction, and the reason a `request` is classified as
+        // BOTH: whatever the endpoint returns is external content, untrusted
+        // by default. A sink that demands a voucher must not be shaped by it.
+        let ir = program("charge.note");
+        let envelope =
+            Envelope::from_json(r#"{ "resources": { "result": { "writer": ["Operator"] } } }"#)
+                .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("stripe_api")),
+            "an external response must not silently vouch for a guarded sink: {messages:#?}"
+        );
+    }
+
+    #[test]
+    fn a_restricted_credentials_response_does_not_leak_into_a_public_result() {
+        // The consequence worth naming, because governed programs will meet
+        // it: classifying `request` as a READ means what comes back is
+        // reachable only with that credential, so it carries the credential's
+        // reader set. A rule that requests under an `Ops`-only credential and
+        // completes a public `result` is now a denied flow.
+        //
+        // Coarse, in the way the rest of this checker is coarse — the join is
+        // per rule, so the refusal does not ask whether the completed value
+        // derives from the response. A `file store` read behaves the same way,
+        // and the sanctioned exit is the same one: declassify, or clear the
+        // sink.
+        let ir = program("charge.note");
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live readable by Ops\n",
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("denied flow") && m.contains("stripe_api")),
+            "{messages:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cleared_endpoint_still_compiles() {
+        // The refusal has to be about the LABEL, not about `request` existing.
+        // Without this the fix above could be "deny every request" and pass.
+        let ir = program("charge.note");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "stripe_api": { "reader": "confidential" },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(messages.is_empty(), "{messages:?}");
     }
 }
