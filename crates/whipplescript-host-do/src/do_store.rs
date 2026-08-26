@@ -1654,12 +1654,14 @@ fn do_append_event_fenced<Sql: DoSql>(
 ) -> StoreResult<StoredEvent> {
     let current = do_instance_owner_epoch(sql, event.instance_id)?;
     if owner_epoch != current {
-        return Err(StoreError::Conflict(format!(
-            "event-log ownership fence failed for instance `{}`: caller holds epoch \
-             {owner_epoch}, the log is at epoch {current}. Ownership moved; this writer must \
-             stop rather than append.",
-            event.instance_id
-        )));
+        return Err(StoreError::GuardRefused {
+            guard: whipplescript_store::GuardKind::OwnershipFence,
+            instance_id: event.instance_id.to_owned(),
+            detail: format!(
+                "caller holds epoch {owner_epoch}, the log is at epoch {current}. Ownership \
+                 moved; this writer must stop rather than append."
+            ),
+        });
     }
     do_append_event_cas(sql, expected_head, event)
 }
@@ -1672,11 +1674,15 @@ fn do_append_event_chained<Sql: DoSql>(
     let head = do_chain_head(sql, event.instance_id)?;
     if let Some(expected) = expected_head {
         if expected != head.digest {
-            return Err(StoreError::Conflict(format!(
-                "event-log compare-and-set failed for instance `{}`: expected head {expected}, \
-                 found {}. Another writer extended this log; re-read before appending.",
-                event.instance_id, head.digest
-            )));
+            return Err(StoreError::GuardRefused {
+                guard: whipplescript_store::GuardKind::CompareAndSet,
+                instance_id: event.instance_id.to_owned(),
+                detail: format!(
+                    "expected head {expected}, found {}. Another writer extended this log; \
+                     re-read before appending.",
+                    head.digest
+                ),
+            });
         }
     }
     // Drawn before the insert for the same reason as native: the digest commits
@@ -10570,8 +10576,14 @@ mod tests {
 
         let zombie = store.append_event_cas(&stale.digest, chain_event("i1"));
         assert!(
-            matches!(zombie, Err(StoreError::Conflict(_))),
-            "a stale head must be refused, got {zombie:?}"
+            matches!(
+                zombie,
+                Err(StoreError::GuardRefused {
+                    guard: whipplescript_store::GuardKind::CompareAndSet,
+                    ..
+                })
+            ),
+            "a stale head must be refused by the compare-and-set: {zombie:?}"
         );
     }
 
@@ -10599,7 +10611,13 @@ mod tests {
         let head = store.chain_head("i1").expect("head reads");
         let stale = store.append_event_fenced(old_epoch, &head.digest, chain_event("i1"));
         assert!(
-            matches!(stale, Err(StoreError::Conflict(_))),
+            matches!(
+                stale,
+                Err(StoreError::GuardRefused {
+                    guard: whipplescript_store::GuardKind::OwnershipFence,
+                    ..
+                })
+            ),
             "the stale owner must be fenced out, got {stale:?}"
         );
         store

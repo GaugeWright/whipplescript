@@ -19702,6 +19702,20 @@ where
     // handler failure is reported and skipped so sibling effects still run —
     // aborting on the first error re-poisoned EVERY subsequent worker pass
     // before any effect ran. Store-level errors still abort.
+    //
+    // **A guard refusal is NOT absorbable, and used to be** (fixed 2026-08-25,
+    // DR-0073 §2). `Conflict` means "someone got there first at the level of
+    // this operation" — `run is not running`, `run already has a terminal
+    // completion` — and skipping the effect is the right answer. A
+    // `GuardRefused` means something else entirely: the writer's view of the log
+    // is stale, or its append never landed. Absorbing it dropped a write on the
+    // floor and printed one line of stderr, so a fenced *terminal* would have
+    // degraded a completed external effect to `uncertain` via
+    // `recover_running_provider_runs` — quietly.
+    //
+    // That is why this had to be fixed BEFORE any guard gets a production
+    // caller: wiring a guard into a path whose conflicts are swallowed makes the
+    // system quieter, not safer.
     fn absorb_conflict(
         effect: &ClaimableEffect,
         result: Result<Option<whipplescript_store::StoredEvent>, StoreError>,
@@ -40495,6 +40509,17 @@ fn store_error(error: StoreError) -> String {
         StoreError::Conflict(message) => message,
         StoreError::PolicyBlocked { reason, .. } => reason,
         StoreError::CapacityBlocked { reason, .. } => reason,
+        // DR-0067 §2/§3: a guard refused the write. Never say "try again" — a
+        // stale view is not fixed by repeating the same write, and a caller that
+        // retries a fenced append is a superseded writer insisting.
+        StoreError::GuardRefused {
+            guard,
+            instance_id,
+            detail,
+        } => format!(
+            "the log's {} refused a write to instance `{instance_id}`: {detail}",
+            guard.as_str()
+        ),
         // DR-0066 §3: a store answered with bytes that are not the bytes asked
         // for. Say which store, because the remedy differs — a bad cache entry
         // is discardable, a bad authority object is data loss — and never

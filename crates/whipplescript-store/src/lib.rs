@@ -72,6 +72,36 @@ pub const SUPPORTED_EVENT_FORMAT_VERSION: i64 = 1;
 /// last wrote this?") without guessing from its contents.
 pub const WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Which of the log's guards refused a write (DR-0067 §2/§3, DR-0073 §2).
+///
+/// A kind rather than a message, because the caller's *response* differs and a
+/// substring match is not a classification. `absorb_conflict` in the CLI
+/// swallowed every `Conflict` alike, so a guard refusal — the substrate saying
+/// "your view of the log is stale" — degraded to one line of stderr and a
+/// skipped effect, indistinguishable from an ordinary semantic refusal like
+/// "run is not running".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardKind {
+    /// The head moved: this writer read a head that is no longer current.
+    CompareAndSet,
+    /// The writer's epoch is not the instance's: it has been superseded.
+    OwnershipFence,
+    /// Sequence contention did not clear within the bounded retry. Not a stale
+    /// view — a write that never landed, which is no more absorbable.
+    SequenceContention,
+}
+
+impl GuardKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompareAndSet => "compare-and-set",
+            Self::OwnershipFence => "ownership fence",
+            Self::SequenceContention => "sequence contention",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),
@@ -95,6 +125,18 @@ pub enum StoreError {
     /// looking again at the same store is not a remedy. Collapsing the two
     /// would let a `Conflict(_)` assertion pass on silent corruption, which is
     /// the failure this variant exists to make loud.
+    /// DR-0067 §2/§3: one of the log's guards refused this write.
+    ///
+    /// Distinct from [`StoreError::Conflict`], which means "someone got there
+    /// first at the level of this operation, look again and you may proceed".
+    /// A guard refusal means the writer's view of the log is stale or its write
+    /// never landed, and a caller that absorbs it drops an append on the floor.
+    GuardRefused {
+        guard: GuardKind,
+        instance_id: String,
+        /// What was expected versus what is there, for an operator.
+        detail: String,
+    },
     ContentMismatch {
         /// The id the bytes were fetched by.
         id: String,
@@ -7904,12 +7946,10 @@ fn append_event_on(connection: &Connection, event: NewEvent<'_>) -> StoreResult<
             Err(other) => return Err(other),
         }
     }
-    Err(last.unwrap_or_else(|| {
-        StoreError::Conflict(format!(
-            "event-log sequence contention for instance `{}` did not clear in \
-             {ATTEMPTS} attempts",
-            event.instance_id
-        ))
+    Err(last.unwrap_or_else(|| StoreError::GuardRefused {
+        guard: GuardKind::SequenceContention,
+        instance_id: event.instance_id.to_owned(),
+        detail: format!("did not clear in {ATTEMPTS} attempts"),
     }))
 }
 
@@ -7965,22 +8005,28 @@ fn append_event_chained_on(
     if let Some(claimed) = owner_epoch {
         let current = instance_owner_epoch_on(connection, event.instance_id)?;
         if claimed != current {
-            return Err(StoreError::Conflict(format!(
-                "event-log ownership fence failed for instance `{}`: caller holds epoch \
-                 {claimed}, the log is at epoch {current}. Ownership moved; this writer must \
-                 stop rather than append.",
-                event.instance_id
-            )));
+            return Err(StoreError::GuardRefused {
+                guard: GuardKind::OwnershipFence,
+                instance_id: event.instance_id.to_owned(),
+                detail: format!(
+                    "caller holds epoch {claimed}, the log is at epoch {current}. Ownership \
+                     moved; this writer must stop rather than append."
+                ),
+            });
         }
     }
     let head = chain_head_on(connection, event.instance_id)?;
     if let Some(expected) = expected_head {
         if expected != head.digest {
-            return Err(StoreError::Conflict(format!(
-                "event-log compare-and-set failed for instance `{}`: expected head {expected}, \
-                 found {}. Another writer extended this log; re-read before appending.",
-                event.instance_id, head.digest
-            )));
+            return Err(StoreError::GuardRefused {
+                guard: GuardKind::CompareAndSet,
+                instance_id: event.instance_id.to_owned(),
+                detail: format!(
+                    "expected head {expected}, found {}. Another writer extended this log; \
+                     re-read before appending.",
+                    head.digest
+                ),
+            });
         }
     }
     let (event_id, occurred_at) = connection.query_row(
@@ -13029,8 +13075,15 @@ mod tests {
             store.append_event_cas(&stale.digest, new_event("instance-a", "rule.fired", None));
 
         assert!(
-            matches!(zombie, Err(StoreError::Conflict(_))),
-            "a stale head must be refused, got {zombie:?}"
+            matches!(
+                zombie,
+                Err(StoreError::GuardRefused {
+                    guard: GuardKind::CompareAndSet,
+                    ..
+                })
+            ),
+            "a stale head must be refused BY THE COMPARE-AND-SET — the fence \
+             would also refuse it, for a different reason: {zombie:?}"
         );
         assert_eq!(
             store.chain_head("instance-a").expect("head reads").sequence,
@@ -13400,6 +13453,11 @@ mod tests {
 
         let head = store.chain_head("instance-a");
         assert!(
+            // Deliberately a `Conflict`, not a `GuardRefused`. An unchained row
+            // is not a stale view or a lost write — it is a store that needs
+            // `repair_event_chain` before it can be extended at all, and the
+            // caller's response is neither "look again" nor "stop, you were
+            // superseded".
             matches!(head, Err(StoreError::Conflict(_))),
             "an unchained head must refuse, got {head:?}"
         );
@@ -13450,8 +13508,16 @@ mod tests {
             new_event(id, "rule.fired", None),
         );
         assert!(
-            matches!(fenced, Err(StoreError::Conflict(_))),
-            "the stale owner must be fenced out, got {fenced:?}"
+            matches!(
+                fenced,
+                Err(StoreError::GuardRefused {
+                    guard: GuardKind::OwnershipFence,
+                    ..
+                })
+            ),
+            "the stale owner must be fenced out BY THE FENCE — this zombie \
+             re-read the head, so the compare-and-set would have admitted it, \
+             which is the whole reason the fence exists: {fenced:?}"
         );
 
         // And the true owner still works.
@@ -13494,8 +13560,14 @@ mod tests {
         let stale =
             store.append_event_fenced(first, &head.digest, new_event(id, "rule.fired", None));
         assert!(
-            matches!(stale, Err(StoreError::Conflict(_))),
-            "the bump alone must evict, got {stale:?}"
+            matches!(
+                stale,
+                Err(StoreError::GuardRefused {
+                    guard: GuardKind::OwnershipFence,
+                    ..
+                })
+            ),
+            "the bump alone must evict, and by the fence: {stale:?}"
         );
     }
 
@@ -16863,6 +16935,185 @@ mod tests {
             .expect("file.write.completed fact derives");
     }
 
+    /// **A superseded writer, racing a live one, on real threads.**
+    ///
+    /// The gap this closes, named in `spec/substrate-wiring-tracker.md`: the
+    /// fence and the compare-and-set were only ever exercised *serially*.
+    /// `log_append.rs`'s conformance driver is a sequential schedule and
+    /// `log_simulation.rs` is a seeded single-threaded scheduler, so both check
+    /// the LOGIC of exclusion and neither checks it under contention. Every
+    /// concurrency defect found in this repository during 2026-08-25 was in a
+    /// guarantee that had been specified and then verified single-threaded, so
+    /// "the logic is right" is exactly the evidence that has repeatedly not been
+    /// enough.
+    ///
+    /// Two real writers over two SQLite connections to one file. B claims the
+    /// instance, which bumps the epoch; A holds the epoch it was given before
+    /// the claim and keeps appending under it. Every one of A's appends must be
+    /// refused BY THE FENCE — not by the compare-and-set, which A would defeat
+    /// simply by re-reading the head, and not by sequence contention, which is
+    /// a retryable condition and not an exclusion.
+    #[test]
+    fn a_superseded_writer_is_refused_under_real_contention() {
+        // Generous, because the point is overlap rather than volume: A must
+        // still be appending when B's claim lands. A stops shortly after its
+        // first refusal, so the loop rarely runs to the bound.
+        const APPENDS: usize = 2000;
+
+        let dir = std::env::temp_dir().join(format!(
+            "whip-superseded-{}-{}",
+            std::process::id(),
+            APPENDS
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("store.sqlite");
+
+        let instance_id = {
+            let mut store = SqliteStore::open(&path).expect("store opens");
+            let version = store
+                .create_program_version(test_program_version("Superseded", "source-1", "ir-1"))
+                .expect("program version creates");
+            let instance = store
+                .create_instance(NewInstance {
+                    program_id: &version.program_id,
+                    version_id: &version.version_id,
+                    input_json: "{}",
+                })
+                .expect("instance creates");
+            instance.instance_id
+        };
+
+        // A is the owner, and takes its epoch honestly — from a claim, never
+        // from a read. Reading it back would satisfy the fence while proving
+        // nothing (DR-0073's third refusal).
+        let store_a = SqliteStore::open(&path).expect("A opens");
+        let epoch_a = store_a
+            .claim_instance_ownership(&instance_id)
+            .expect("A claims");
+
+        let refusals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let landed_after_eviction = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrong_reason = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let evicted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Both writers start together; without this B's thread spin-up alone
+        // outlasted A's whole loop and the test proved nothing — which its own
+        // final assertion caught rather than passing quietly.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let instance_id = &instance_id;
+            let refusals = std::sync::Arc::clone(&refusals);
+            let landed_after_eviction = std::sync::Arc::clone(&landed_after_eviction);
+            let wrong_reason = std::sync::Arc::clone(&wrong_reason);
+            let path_b = path.clone();
+            let evicted_b = std::sync::Arc::clone(&evicted);
+            let start_a = std::sync::Arc::clone(&start);
+            let start_b = std::sync::Arc::clone(&start);
+
+            scope.spawn(move || {
+                let mut seen_refusal = false;
+                let mut after_refusal = 0;
+                start_a.wait();
+                for _ in 0..APPENDS {
+                    if seen_refusal {
+                        after_refusal += 1;
+                        if after_refusal > 3 {
+                            break;
+                        }
+                    }
+                    // A re-reads the head every pass, so the compare-and-set
+                    // alone would admit it. Only the epoch can refuse it.
+                    let head = match store_a.chain_head(instance_id) {
+                        Ok(head) => head,
+                        Err(_) => continue,
+                    };
+                    let result = store_a.append_event_fenced(
+                        epoch_a,
+                        &head.digest,
+                        new_event(instance_id, "rule.fired", None),
+                    );
+                    // The invariant has to be race-free from A's own side. "Did
+                    // B claim yet?" is not: A's append can legitimately succeed
+                    // an instant BEFORE the claim lands and read the flag as set
+                    // an instant after, which is a time-of-check bug in the test
+                    // rather than a lost write in the store — it failed here
+                    // first, exactly that way.
+                    //
+                    // What IS race-free: eviction is monotonic, because the
+                    // epoch only ever increases. So once A has seen one fence
+                    // refusal it is superseded for good, and any LATER success
+                    // is a real violation no interleaving can excuse.
+                    match result {
+                        Ok(_) if seen_refusal => {
+                            landed_after_eviction.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(_) => {}
+                        Err(StoreError::GuardRefused {
+                            guard: GuardKind::OwnershipFence,
+                            ..
+                        }) => {
+                            seen_refusal = true;
+                            refusals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(other) => {
+                            wrong_reason
+                                .lock()
+                                .expect("lock")
+                                .push(format!("{other:?}"));
+                        }
+                    }
+                }
+            });
+
+            scope.spawn(move || {
+                let store_b = SqliteStore::open(&path_b).expect("B opens");
+                start_b.wait();
+                let _epoch_b = store_b
+                    .claim_instance_ownership(instance_id)
+                    .expect("B claims, evicting A");
+                evicted_b.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+
+        assert!(
+            evicted.load(std::sync::atomic::Ordering::SeqCst),
+            "B must have claimed at all"
+        );
+        let wrong = wrong_reason.lock().expect("lock").clone();
+        assert!(
+            wrong.is_empty(),
+            "every refusal of a superseded writer must be the FENCE. A \
+             compare-and-set refusal would mean the test never exercised the \
+             hazard (A re-reads the head each pass), and sequence contention is \
+             retryable rather than an exclusion: {wrong:?}"
+        );
+        assert_eq!(
+            landed_after_eviction.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an append under a superseded epoch must never land"
+        );
+        assert!(
+            refusals.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the race must actually happen — zero refusals means B's claim \
+             landed after A had finished, and the test proved nothing"
+        );
+
+        // The log still folds to its recorded head: a refused append left no trace.
+        let store = SqliteStore::open(&path).expect("reader opens");
+        let recorded =
+            crate::log_append::LogAppend::chain_head(&store, &instance_id).expect("head");
+        let independent = crate::event_chain::fold_owned(
+            &instance_id,
+            &crate::log_append::LogAppend::chain_prefix(&store, &instance_id).expect("prefix"),
+        );
+        assert_eq!(
+            recorded, independent,
+            "a refused append must leave the chain exactly as it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// DR-0073 §5: a restore whose log moved underneath it is REFUSED, not
     /// silently applied.
     ///
@@ -16935,12 +17186,13 @@ mod tests {
             &expected_head,
             Some("restore-1"),
         );
-        let Err(StoreError::Conflict(message)) = refused else {
+        let Err(StoreError::GuardRefused { guard, detail, .. }) = refused else {
             panic!("a restore must not truncate a log that moved under it, got {refused:?}");
         };
-        assert!(
-            message.contains("compare-and-set"),
-            "the refusal must say the head moved, not merely conflict: {message}"
+        assert_eq!(
+            guard,
+            GuardKind::CompareAndSet,
+            "the head moved, so it is the compare-and-set that must refuse: {detail}"
         );
 
         // And the admission is still there — the refusal cost nothing.

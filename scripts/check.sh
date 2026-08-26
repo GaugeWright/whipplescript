@@ -34,6 +34,13 @@ if [ -f AGENTS.md ]; then
     echo "== mirror projection =="
     node scripts/check-mirror-projection.mjs
 
+    # `-src` only, because `spec/decision-records/` is not projected — the mirror
+    # has no records to check the numbering of. A DR number is claimed by writing
+    # a file on a branch, so two branches in flight always collide and nothing
+    # notices until a person reads the merge; that happened twice on 2026-08-25.
+    echo "== decision records =="
+    scripts/check-decision-records.sh
+
     # Rendered from tools/shared-checks/build-coverage.mjs in the GaugeWright
     # repository, which owns it. It fails when a cargo workspace or a lockfile is
     # watched by nothing. Edit it there and re-render; a local edit fails here.

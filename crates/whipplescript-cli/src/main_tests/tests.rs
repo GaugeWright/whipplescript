@@ -1474,3 +1474,64 @@ fn event_view(sequence: i64, event_type: &str, payload: Value) -> EventView {
         occurred_at: "2026-01-01T00:00:00Z".to_owned(),
     }
 }
+
+/// DR-0073 §2: a guard refusal must ABORT the pass, not be absorbed into stderr.
+///
+/// `absorb_conflict` swallowed every `StoreError::Conflict` alike so one poisoned
+/// effect could not wedge a whole worker pass — correct for a semantic refusal
+/// like "run is not running". It was wrong for the log's guards: those mean the
+/// writer's view is stale or its append never landed, and absorbing one drops a
+/// write on the floor behind a single line of stderr. A fenced *terminal* would
+/// have degraded a completed external effect to `uncertain` that way.
+///
+/// This is why the classification had to land BEFORE any guard gets a production
+/// caller: wiring a guard into a path whose conflicts are swallowed makes the
+/// system quieter rather than safer.
+#[test]
+fn a_guard_refusal_aborts_the_pass_while_a_semantic_conflict_is_absorbed() {
+    use whipplescript_store::{ClaimableEffect, GuardKind, StoreError};
+
+    fn effect(id: &str) -> ClaimableEffect {
+        ClaimableEffect {
+            effect_id: id.to_owned(),
+            kind: "notify".to_owned(),
+            target: None,
+            profile: None,
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        }
+    }
+    let effects = vec![effect("e1"), effect("e2")];
+
+    // A semantic conflict is still absorbed: both effects are attempted, the
+    // pass succeeds, and a sibling is not punished for its neighbour.
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let absorbed = super::run_claimable_effects_bounded(&effects, 1, |_effect| {
+        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(StoreError::Conflict("run is not running".to_owned()))
+    });
+    assert!(
+        absorbed.is_ok(),
+        "a semantic refusal must not wedge the pass: {absorbed:?}"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both effects must be attempted when the refusal is semantic"
+    );
+
+    // A guard refusal is not absorbed: it comes back to the caller, naming the
+    // guard, so the pass can stop instead of continuing on a stale view.
+    let refused = super::run_claimable_effects_bounded(&effects, 1, |_effect| {
+        Err(StoreError::GuardRefused {
+            guard: GuardKind::OwnershipFence,
+            instance_id: "i1".to_owned(),
+            detail: "caller holds epoch 1, the log is at epoch 2".to_owned(),
+        })
+    });
+    let Err(StoreError::GuardRefused { guard, .. }) = refused else {
+        panic!("a guard refusal must abort the pass, got {refused:?}");
+    };
+    assert_eq!(guard, GuardKind::OwnershipFence);
+}

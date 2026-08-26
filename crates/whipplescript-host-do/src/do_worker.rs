@@ -158,6 +158,29 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         if !exists {
             return Err(format!("no governed host instance `{instance_id}`"));
         }
+        // DR-0067 §3 / DR-0073 §3: claim the instance's log.
+        //
+        // This is the ONE place in the tree where a claim is a real transfer
+        // rather than self-election. The platform gives one live object per id,
+        // so an attach is either the first one or a resumption after eviction or
+        // hibernation — and in the second case the epoch bump is exactly the
+        // statement that wants making: whatever isolate held this log before is
+        // superseded, now, and its writes must stop rather than interleave.
+        //
+        // Natively the same call would prove nothing, because any process may
+        // claim any instance at any time and a "claim" there is a writer
+        // electing itself. That is why DR-0073 §3 scopes the fence to this host
+        // and leaves the native path to its per-write guards.
+        //
+        // The epoch is deliberately not stored: no append on this host presents
+        // one yet. Claiming still does the load-bearing half — it EVICTS — so a
+        // previous isolate's fenced append is refused from this moment. Wiring
+        // the presenting half is tracked in `spec/substrate-wiring-tracker.md`.
+        let _epoch = kernel
+            .store()
+            .claim_instance_ownership(instance_id)
+            .map_err(|error| format!("claim instance log ownership: {error:?}"))?;
+
         // DO-plane package bootstrap (see `create`): the governed host facade
         // opens the instance without seeding std packages, so seed them here
         // too. Idempotent (`ON CONFLICT DO UPDATE`), so a re-attach after an
@@ -437,6 +460,19 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 _ => Box::new(DoFileStore::new(DoSqlStorage::new(Rc::clone(&sql)))),
             }
         };
+        // DR-0067 §3 / DR-0073 §3, the same claim `attach` takes. `create` is
+        // also a resumption path — it matches an existing instance rather than
+        // always minting one — so the isolate arriving here may well be
+        // superseding a previous holder, and says so.
+        // DR-0067 §3 / DR-0073 §3, the same claim `attach` takes. `create` is
+        // also a resumption path — it matches an existing instance rather than
+        // always minting one — so the isolate arriving here may well be
+        // superseding a previous holder, and says so.
+        kernel
+            .store()
+            .claim_instance_ownership(&instance_id)
+            .map_err(|error| format!("claim instance log ownership: {error:?}"))?;
+
         Ok(Self {
             kernel: Some(kernel),
             ir,
@@ -853,6 +889,113 @@ mod tests {
     /// old `"do"` literals), and a reattach under a different source records a
     /// diagnosable `do.revision_drift` row instead of silently reattaching
     /// under an indistinguishable identity. The reattach itself proceeds.
+    // DR-0067 §3's fence gets its first production caller here (2026-08-25).
+    //
+    // The mechanism was built, tested, and reached by NOTHING — that is what
+    // the review of DR-0066..DR-0071 found, and what
+    // `spec/substrate-wiring-tracker.md` exists to close. This test is the
+    // evidence that a claim is now actually taken: bringing a second isolate
+    // up on the same instance evicts the first, so the first's fenced append
+    // stops being accepted.
+    //
+    // Only this host. Natively the same call would be a writer electing
+    // itself, since any process may claim any instance at any time; DR-0073
+    // §3 scopes the fence here and leaves native to its per-write guards.
+    #[test]
+    fn attaching_a_second_isolate_evicts_the_first() {
+        use whipplescript_store::{GuardKind, StoreError};
+
+        let sql = store().sql;
+        // A minimal program: what matters is that an instance exists for two
+        // isolates to contend over, not what it does.
+        let source = r#"workflow MinimalNoop
+
+output result StartupSeen
+
+class StartupSeen {
+  source string
+  state "observed"
+}
+
+rule observe_start
+  when started
+=> {
+  record StartupSeen {
+    source "evict"
+    state "observed"
+  }
+
+  complete result {
+    source "evict"
+    state "observed"
+  }
+}
+"#
+        .to_owned();
+        let first = DurableInstance::create(
+            sql.clone(),
+            &source,
+            "{}",
+            "local/MinimalNoop",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("first isolate creates");
+        let instance_id = first.instance_id.clone();
+        let epoch_first = first
+            .kernel
+            .as_ref()
+            .expect("kernel")
+            .store()
+            .instance_owner_epoch(&instance_id)
+            .expect("epoch reads");
+
+        // A second isolate comes up on the same instance — an eviction or a
+        // hibernation wake, which on this platform is the only way two of
+        // them exist for one id.
+        let second = DurableInstance::create(
+            sql.clone(),
+            &source,
+            "{}",
+            "local/MinimalNoop",
+            DurableEffectPorts::default(),
+            &[],
+            &[],
+        )
+        .expect("second isolate creates");
+        let store_second = second.kernel.as_ref().expect("kernel").store();
+        let epoch_second = store_second
+            .instance_owner_epoch(&instance_id)
+            .expect("epoch reads");
+        assert!(
+            epoch_second > epoch_first,
+            "bringing up a second isolate must claim, or the fence protects \
+             nothing: {epoch_first} -> {epoch_second}"
+        );
+
+        // The first isolate, resuming mid-flight, re-reads the head — so the
+        // compare-and-set has nothing to object to. Only the fence refuses.
+        let head = store_second.chain_head(&instance_id).expect("head");
+        let zombie = store_second.append_event_fenced(
+            epoch_first,
+            &head.digest,
+            whipplescript_store::NewEvent {
+                instance_id: &instance_id,
+                event_type: "rule.fired",
+                payload_json: "{}",
+                source: "test",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: None,
+            },
+        );
+        let Err(StoreError::GuardRefused { guard, .. }) = zombie else {
+            panic!("the superseded isolate must not append, got {zombie:?}");
+        };
+        assert_eq!(guard, GuardKind::OwnershipFence);
+    }
+
     #[test]
     fn create_stamps_real_revision_identity_and_records_drift_on_reattach() {
         fn minimal_source(marker: &str) -> String {

@@ -143,7 +143,11 @@ pub mod conformance {
                             );
                             heads[who] = store.chain_head(instance_id)?;
                         }
-                        Err(StoreError::Conflict(_)) => {}
+                        // A guard did its job. Which guard is asserted by the
+                        // dedicated tests; here the point is only that the
+                        // refused append left no trace, checked by the fold
+                        // below.
+                        Err(StoreError::GuardRefused { .. }) => {}
                         Err(other) => return Err(other),
                     }
                 }
