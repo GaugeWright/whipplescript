@@ -1796,14 +1796,16 @@ pub fn assemble_anthropic_messages_sse(raw: &str) -> Value {
                             .pointer("/delta/text")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        // Seeded without a "type" so a delta arriving before its
-                        // content_block_start still assembles exactly the block
-                        // the rebuilding form produced — an untyped one, which
-                        // parse_anthropic_response drops. Adding "type" here
-                        // would surface text that has always been discarded;
-                        // that is a separate change, not this one.
+                        // A delta can arrive before its content_block_start —
+                        // a truncated or malformed stream, or a start event
+                        // carrying no content_block. Seed the block as text so
+                        // it is still recognised downstream: parse_anthropic_response
+                        // dispatches on "type" and drops what it cannot name, so
+                        // an untyped block silently discards answer text the
+                        // model did send. Nothing else can it be — only a
+                        // text_delta reaches here.
                         if content[index].is_null() {
-                            content[index] = json!({"text":""});
+                            content[index] = json!({"type":"text","text":""});
                         }
                         let slot = &mut content[index]["text"];
                         match slot {
@@ -1907,6 +1909,22 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 4);
         assert_eq!(body["usage"]["output_tokens"], 2);
         assert!(!body.to_string().contains("secret"));
+    }
+
+    /// A stream can deliver a text delta with no content_block_start ahead of
+    /// it. The block still has to reach the reply: parse_anthropic_response
+    /// dispatches on "type", so an untyped block would drop answer text the
+    /// model actually sent.
+    #[test]
+    fn anthropic_sse_assembly_keeps_text_whose_block_never_started() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"orph\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"aned\"}}\n\n",
+        );
+        let body = assemble_anthropic_messages_sse(raw);
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "orphaned");
+        assert_eq!(parse_anthropic_response(&body).text, "orphaned");
     }
 
     #[test]
