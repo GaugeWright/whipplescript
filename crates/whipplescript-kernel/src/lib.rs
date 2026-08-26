@@ -3474,6 +3474,7 @@ fn ir_type_signature(ty: &IrType) -> String {
         IrType::Optional(inner) => format!("optional<{}>", ir_type_signature(inner)),
         IrType::Array(inner) => format!("array<{}>", ir_type_signature(inner)),
         IrType::Map(inner) => format!("map<{}>", ir_type_signature(inner)),
+        IrType::Sealed(inner) => format!("sealed<{}>", ir_type_signature(inner)),
         IrType::Union(variants) => {
             let variants = variants
                 .iter()

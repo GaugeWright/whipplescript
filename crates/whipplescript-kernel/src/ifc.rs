@@ -81,6 +81,24 @@ impl DualLabel {
     }
 }
 
+/// `grant unwrap <Credential> for <Type> to <Role>` (DR-0074 §2): which role may
+/// open a sealed payload of one declared type under one credential. The type is
+/// the narrowing axis, so all three parts are required and none may be a glob.
+///
+/// The credential is stored as WRITTEN rather than resolved, exactly as
+/// `declassify` and `endorse` store their resource: a DSL file may bind a handle
+/// on a line after the grant that references it, so resolution happens at the
+/// query, not at the parse.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UnwrapGrant {
+    /// The credential handle (or address) this grant opens under.
+    credential: String,
+    /// The declared payload type it narrows to — `sealed<T>`'s `T`.
+    payload_type: String,
+    /// The qualified role that may open it.
+    role: String,
+}
+
 #[derive(PartialEq, Eq)]
 pub struct Envelope {
     /// resource handle -> reader-authority SET (a set of compartments; absent or
@@ -135,6 +153,18 @@ pub struct Envelope {
     /// endorse grants `(resource, role)`: `resource`'s data may be raised to `role`
     /// integrity — the audited integrity-axis crossing.
     endorse: Vec<(String, String)>,
+    /// `grant unwrap <Credential> for <Type> to <Role>` (DR-0074 §2, §11). An
+    /// unwrap grant is OWNED, not composed: only the envelope that binds the
+    /// credential may issue one over it, and unwrap grants are never
+    /// intersected across a composed set.
+    ///
+    /// It is not a downgrade grant, though it sits beside two. Opening releases
+    /// nothing by itself — DR-0053 §13's carriage means the envelope records the
+    /// label and `unwrap` restores it, so opened plaintext is still labelled and
+    /// every sink it reaches is checked against the composed meet. This grant
+    /// answers *may this program decrypt*; the labels answer *where may the
+    /// plaintext go*, and only the second is a composition question.
+    unwrap_grants: Vec<UnwrapGrant>,
     /// signal resources (`signal:<name>`) governance marks INTERNAL (H8 stage b): an
     /// internal signal is an internal channel, NOT an external entry point, so its
     /// integrity at a receiver is DERIVED from its emitters (carriage) rather than
@@ -310,6 +340,7 @@ impl Envelope {
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
+        let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -541,6 +572,32 @@ impl Envelope {
                 }
             }
         }
+        // DR-0074 §2's third grant class. Objects rather than the positional
+        // arrays its neighbours use: a two-element `[resource, role]` reads at a
+        // glance, a three-element one does not, and this key carries no
+        // back-compat obligation to a shape already in the wild.
+        if let Some(entries) = value.get("unwrap_grants").and_then(|d| d.as_array()) {
+            for entry in entries {
+                let (Some(credential), Some(payload_type), Some(role)) = (
+                    entry.get("credential").and_then(serde_json::Value::as_str),
+                    entry.get("type").and_then(serde_json::Value::as_str),
+                    entry.get("role").and_then(serde_json::Value::as_str),
+                ) else {
+                    return Err("invalid IFC envelope: an unwrap grant needs \
+                                `credential`, `type` and `role`"
+                        .to_owned());
+                };
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
+                reject_pattern_resource(payload_type)
+                    .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
+                unwrap_grants.push(UnwrapGrant {
+                    credential: credential.to_owned(),
+                    payload_type: payload_type.to_owned(),
+                    role: qualify_role(role, authority_ref),
+                });
+            }
+        }
         if let Some(pairs) = value.get("declassifications").and_then(|d| d.as_array()) {
             for pair in pairs {
                 if let Some(items) = pair.as_array() {
@@ -565,6 +622,8 @@ impl Envelope {
         declassify.dedup();
         endorse.sort();
         endorse.dedup();
+        unwrap_grants.sort();
+        unwrap_grants.dedup();
         guarantees.sort();
         attachments.sort_by(|left, right| {
             (&left.authority, &left.exposure, &left.digest).cmp(&(
@@ -573,13 +632,14 @@ impl Envelope {
                 &right.digest,
             ))
         });
-        Ok(Self {
+        let envelope = Self {
             readers,
             governed,
             deleg,
             declassify,
             integrity,
             endorse,
+            unwrap_grants,
             principals,
             internal_signals,
             internal_workflows,
@@ -597,7 +657,9 @@ impl Envelope {
             capabilities,
             provider_bindings,
             placements,
-        })
+        };
+        envelope.check_unwrap_grants_are_owned()?;
+        Ok(envelope)
     }
 
     /// Parse the readable governance DSL (DR-0028), one statement per line:
@@ -610,6 +672,7 @@ impl Envelope {
         let mut governed = BTreeSet::new();
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
+        let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -677,6 +740,51 @@ impl Envelope {
                 } else {
                     endorse.push(pair);
                 }
+                continue;
+            }
+            // `grant unwrap <Credential> for <Type> to <Role>` (DR-0074 §2) —
+            // the type-narrowed grant class. All three parts are required: a
+            // bare `grant unwrap PHIKey` read as "every type" would preserve
+            // exactly the over-grant this class exists to remove, so it fails
+            // closed rather than defaulting.
+            //
+            // Matched before the generic `grant <kind> <handle> -> <address>`
+            // form for the same reason `declassify`/`endorse` are: there is no
+            // `->` on this line, so the generic arm would reject it with a
+            // message about a resource id it does not want.
+            if tokens.first().copied() == Some("grant") && tokens.get(1).copied() == Some("unwrap")
+            {
+                let (Some(credential), Some("for"), Some(payload_type), Some("to"), Some(role)) = (
+                    tokens.get(2).copied(),
+                    tokens.get(3).copied(),
+                    tokens.get(4).copied(),
+                    tokens.get(5).copied(),
+                    tokens.get(6).copied(),
+                ) else {
+                    return Err(format!(
+                        "line {}: unwrap grant needs \
+                         `grant unwrap <Credential> for <Type> to <Role>` \
+                         (DR-0074 §2: the type is required, not a default)",
+                        index + 1
+                    ));
+                };
+                if tokens.len() > 7 {
+                    return Err(format!(
+                        "line {}: unwrap grant narrows to exactly one type",
+                        index + 1
+                    ));
+                }
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                // A glob in the type slot would be the whole-operation grant
+                // wearing a narrower spelling.
+                reject_pattern_resource(payload_type)
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                unwrap_grants.push(UnwrapGrant {
+                    credential: credential.to_owned(),
+                    payload_type: payload_type.to_owned(),
+                    role: qualify_role(role, authority_ref),
+                });
                 continue;
             }
             // `require mcp <rung>` sets the minimum MCP trust rung (design note
@@ -946,6 +1054,8 @@ impl Envelope {
         declassify.dedup();
         endorse.sort();
         endorse.dedup();
+        unwrap_grants.sort();
+        unwrap_grants.dedup();
         guarantees.sort();
         attachments.sort_by(|left, right| {
             (&left.authority, &left.exposure, &left.digest).cmp(&(
@@ -954,13 +1064,14 @@ impl Envelope {
                 &right.digest,
             ))
         });
-        Ok(Self {
+        let envelope = Self {
             readers,
             governed,
             deleg,
             declassify,
             integrity,
             endorse,
+            unwrap_grants,
             principals,
             internal_signals,
             internal_workflows,
@@ -978,7 +1089,9 @@ impl Envelope {
             capabilities: BTreeSet::new(),
             provider_bindings: BTreeMap::new(),
             placements: BTreeMap::new(),
-        })
+        };
+        envelope.check_unwrap_grants_are_owned()?;
+        Ok(envelope)
     }
 
     /// The canonical signed-artifact JSON: every governed resource with its reader
@@ -1105,6 +1218,27 @@ impl Envelope {
         // so an envelope that names no authority keeps its existing hash.
         if let Some(authority) = &self.authority {
             canonical["authority"] = serde_json::Value::String(authority.clone());
+        }
+        // DR-0074 §2's unwrap grants. Emitted only when present, on the same
+        // rule as §8's arms below: an envelope granting no unwrap keeps the hash
+        // it already has, so this record does not invalidate signed artifacts.
+        // Present, it MUST be covered — an unwrap grant outside the signature is
+        // an authorization anyone holding the file could add.
+        if !self.unwrap_grants.is_empty() {
+            let mut grants = self.unwrap_grants.clone();
+            grants.sort();
+            canonical["unwrap_grants"] = serde_json::Value::Array(
+                grants
+                    .iter()
+                    .map(|grant| {
+                        serde_json::json!({
+                            "credential": grant.credential,
+                            "type": grant.payload_type,
+                            "role": grant.role,
+                        })
+                    })
+                    .collect(),
+            );
         }
         // §8's arms. Emitted only when present, so an envelope that exposes and
         // attaches nothing keeps its existing hash. They MUST be here: the
@@ -1291,6 +1425,91 @@ impl Envelope {
     /// that can read `sink` can also read `source` — i.e. `sink`'s reader authority
     /// acts-for `source`'s. Otherwise some reader of `sink` is not cleared for
     /// `source`, and it leaks (the fail-closed sticky boundary, DR-0027 I-IFC6).
+    /// DR-0074 §11: an unwrap grant is **owned**. Only the envelope that binds
+    /// the credential may issue one over it, and a grant over a credential this
+    /// envelope does not bind is a hard error rather than a dropped arm —
+    /// DR-0063 §3's reason applies unchanged: silence would let a party
+    /// discover, long after signing, that a grant it believed it issued never
+    /// applied.
+    ///
+    /// The ownership predicate deliberately differs from §3's, which asks
+    /// whether the envelope *labels* the resource (`readers` or `integrity`). A
+    /// downgrade grant only means something against a label, so that is the
+    /// right evidence there. An unwrap grant is over a CREDENTIAL, whose
+    /// ownership evidence is the binding itself: DR-0074 §2's own example binds
+    /// `grant credential PHIKey -> credential:acme/phi-key sealed at hardware`
+    /// with no reader clause, and under §3's predicate that example would be
+    /// rejected by the record specifying it.
+    fn check_unwrap_grants_are_owned(&self) -> Result<(), String> {
+        for grant in &self.unwrap_grants {
+            let address = self.resolve(&grant.credential);
+            if !self.governed.contains(address) {
+                let who = self.authority.as_deref().unwrap_or("an envelope");
+                return Err(format!(
+                    "{who} grants unwrap over credential `{}`, which it does not bind \
+                     (DR-0074 §11: an unwrap grant is owned, not composed)",
+                    grant.credential
+                ));
+            }
+            // A credential is the only thing an unwrap grant can be over. Left
+            // unchecked, `grant unwrap Ledger for PatientRecord to R` would
+            // parse, sign, and mean nothing.
+            if !address.starts_with("credential:") {
+                let who = self.authority.as_deref().unwrap_or("an envelope");
+                return Err(format!(
+                    "{who} grants unwrap over `{}`, which binds `{address}` — an unwrap \
+                     grant names a credential",
+                    grant.credential
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether ANY role holds an unwrap grant for `payload_type` under
+    /// `credential`. The turn-scoping surface asks this rather than
+    /// [`may_unwrap`](Self::may_unwrap): a turn declares what the program may
+    /// ask for, and which principal is running is not known until the turn runs.
+    /// The per-principal question is `may_unwrap`, asked at the `open` site.
+    fn grants_any_unwrap(&self, credential: &str, payload_type: &str) -> bool {
+        let target = self.resolve(credential);
+        self.unwrap_grants.iter().any(|grant| {
+            self.resolve(&grant.credential) == target && grant.payload_type == payload_type
+        })
+    }
+
+    /// The payload types any role may open under `credential`, sorted. Used to
+    /// make a refusal name what IS available rather than only what is not.
+    fn unwrap_types_for(&self, credential: &str) -> Vec<String> {
+        let target = self.resolve(credential);
+        let types: BTreeSet<&str> = self
+            .unwrap_grants
+            .iter()
+            .filter(|grant| self.resolve(&grant.credential) == target)
+            .map(|grant| grant.payload_type.as_str())
+            .collect();
+        types.into_iter().map(str::to_owned).collect()
+    }
+
+    /// Whether an unwrap grant lets a party acting-for `role` open a
+    /// `sealed<payload_type>` under `credential` (DR-0074 §2). Narrowing is by
+    /// TYPE and by nothing else: a grant for one type never opens another under
+    /// the same credential, which is the confinement model's T1.
+    ///
+    /// The role side closes over acts-for, as every other role question here
+    /// does — a grant to `Clinician` is held by anything that acts-for
+    /// `Clinician`. The type side closes over nothing: there is no subtyping
+    /// among payload types, and inventing one here would widen a grant by a rule
+    /// nobody wrote down.
+    pub fn may_unwrap(&self, credential: &str, payload_type: &str, role: &str) -> bool {
+        let target = self.resolve(credential);
+        self.unwrap_grants.iter().any(|grant| {
+            self.resolve(&grant.credential) == target
+                && grant.payload_type == payload_type
+                && self.can_act(role, &grant.role)
+        })
+    }
+
     /// A declassify grant does NOT arm a raw flow: grants authorize the
     /// source-marked `declassified` coerce only (I-IFC3 — "the only operations
     /// that lower confidentiality are explicit in the source"). The rule walk
@@ -1881,6 +2100,11 @@ fn carries_prose(ty: &whipplescript_parser::IrType) -> bool {
         IrType::Union(variants) => variants.iter().any(carries_prose),
         IrType::Optional(inner) | IrType::Array(inner) => carries_prose(inner),
         IrType::Map(_) => true,
+        // Ciphertext cannot instruct a downstream reader: what whip holds is an
+        // envelope with no literal form, and the payload is unreachable until
+        // an `open` region (DR-0074 §3) which is granted and scoped. The
+        // payload's own prose-bearing is checked there, at type `T`, not here.
+        IrType::Sealed(_) => false,
         IrType::Object(fields) => fields.iter().any(|field| carries_prose(&field.ty)),
         // A reference to another class, or an agent handle, is not something the
         // narrowing can see through; treat it as prose-bearing (fail closed).
@@ -2056,6 +2280,7 @@ impl Composition {
             record,
         };
         composed.check_grants_are_owned()?;
+        composed.check_unwrap_ownership_is_unambiguous()?;
         composed.check_required_authorities(&authorities)?;
         composed.check_attachments_resolve()?;
         Ok(composed)
@@ -2063,6 +2288,7 @@ impl Composition {
 
     /// §3: only the envelope that labels a resource may carry a downgrade grant
     /// over it, and a foreign grant is a hard error rather than a dropped arm.
+    ///
     fn check_grants_are_owned(&self) -> Result<(), String> {
         for envelope in &self.constituents {
             for (resource, _) in envelope.declassify.iter().chain(envelope.endorse.iter()) {
@@ -2073,6 +2299,41 @@ impl Composition {
                     return Err(format!(
                         "{who} grants a downgrade over {resource}, which it does not label"
                     ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// DR-0074 §11: only the authority that OWNS a credential may grant unwrap
+    /// over it. Each constituent already proved at parse that it binds the
+    /// credential it grants over, so the naive re-check here would be dead —
+    /// which is the finding that shaped this one. What a parse cannot see is
+    /// whether ANOTHER constituent binds the same credential address, and once
+    /// two do, "binds it" has stopped identifying a unique owner.
+    ///
+    /// A contested binding is refused rather than resolved. There is no
+    /// evidence in the composed set that says which authority is the real
+    /// owner: addresses carry no required authority prefix, and under §8 a
+    /// counterparty references an opaque exposure precisely so that it never
+    /// learns an address it could re-bind. Picking a winner here would be
+    /// inventing that evidence.
+    fn check_unwrap_ownership_is_unambiguous(&self) -> Result<(), String> {
+        for envelope in &self.constituents {
+            for grant in &envelope.unwrap_grants {
+                let address = envelope.resolve(&grant.credential);
+                let who = envelope.authority.as_deref().unwrap_or("an envelope");
+                for other in &self.constituents {
+                    let them = other.authority.as_deref().unwrap_or("an envelope");
+                    if them == who {
+                        continue;
+                    }
+                    if other.governed.contains(address) {
+                        return Err(format!(
+                            "{who} grants unwrap over {address}, which {them} also binds — \
+                             ownership of a credential is not shared (DR-0074 §11)"
+                        ));
+                    }
                 }
             }
         }
@@ -2441,6 +2702,12 @@ impl VerifiedEnvelope {
     /// (`spec/mcp-support-design-note.md` section 6).
     pub fn mcp_min_rung(&self) -> Option<crate::mcp::McpRung> {
         self.envelope.mcp_min_rung()
+    }
+
+    /// Whether an unwrap grant lets a party acting-for `role` open a
+    /// `sealed<payload_type>` under `credential` (DR-0074 §2, §11).
+    pub fn may_unwrap(&self, credential: &str, payload_type: &str, role: &str) -> bool {
+        self.envelope.may_unwrap(credential, payload_type, role)
     }
 
     /// The minimum credential sealing rung this verified policy requires, if
@@ -4404,7 +4671,83 @@ pub fn check_with_envelope_imports(
             }
         }
     }
+    check_turn_unwrap_scoping(ir, envelope, &mut diagnostics);
     diagnostics
+}
+
+/// DR-0074 §2's two surfaces meeting. A turn scopes itself with `with access to
+/// credential <c> { unwrap for <T> }`; the envelope says which role may open
+/// which type under which credential. A turn asking to open a type the policy
+/// granted nobody is refused here.
+///
+/// **Why this is in the kernel and the syntactic check stays in the parser.**
+/// The parser already refuses a BARE `unwrap`, and that refusal must not move:
+/// under the gradual model an envelope is optional, so a check living here does
+/// not run at all in ungoverned dev mode, and the over-grant §2 exists to remove
+/// would be back whenever nobody set `WHIPPLESCRIPT_IFC_ENVELOPE`. A bare grant
+/// is malformed with or without a policy; whether a well-formed grant is
+/// AUTHORIZED is a question only a policy can answer. So the two checks are not
+/// duplicates of each other — they are the zero-setup floor and the
+/// governed-deployment ceiling, which is the progressive-rigor shape the rest of
+/// this file already has.
+fn check_turn_unwrap_scoping(
+    ir: &IrProgram,
+    envelope: &Envelope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                let Some(credential) = grant.resource.strip_prefix("credential ") else {
+                    continue;
+                };
+                for op in &grant.operations {
+                    if op.operation != "unwrap" {
+                        continue;
+                    }
+                    // A bare `unwrap` is the parser's diagnostic, already
+                    // emitted. Reporting it twice would say nothing new.
+                    let Some(payload_type) = op.target.as_deref() else {
+                        continue;
+                    };
+                    // An ungoverned credential is not an ungranted one: under
+                    // the gradual model a handle the envelope never mentions is
+                    // outside the policy's scope, and refusing here would make
+                    // governance a precondition for naming a credential at all.
+                    if !envelope.governs(envelope.resolve(credential)) {
+                        continue;
+                    }
+                    if envelope.grants_any_unwrap(credential, payload_type) {
+                        continue;
+                    }
+                    let available = envelope.unwrap_types_for(credential);
+                    diagnostics.push(Diagnostic {
+                        span: effect.span,
+                        related: Vec::new(),
+                        message: format!(
+                            "rule `{rule}` scopes `unwrap for {payload_type}` on credential \
+                             `{credential}`, which governance grants to nobody for that type",
+                            rule = rule.name,
+                        ),
+                        suggestion: Some(if available.is_empty() {
+                            format!(
+                                "governance grants no unwrap at all on `{credential}`; add \
+                                 `grant unwrap {credential} for {payload_type} to <Role>` to the \
+                                 envelope, or drop the operation from the turn"
+                            )
+                        } else {
+                            format!(
+                                "governance grants unwrap on `{credential}` for {}; scope the \
+                                 turn to one of those, or add `grant unwrap {credential} for \
+                                 {payload_type} to <Role>` to the envelope",
+                                available.join(", ")
+                            )
+                        }),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// The principal-ceiling check (DR-0031 / DR-0028 D3): an agent acts-for the
@@ -10582,6 +10925,191 @@ rule settle
     }
 
     #[test]
+    fn an_unwrap_grant_narrows_by_type_and_by_nothing_else() {
+        // DR-0074 §2: the type-narrowed grant class. This is the confinement
+        // model's T1 at the governance surface — a grant for one type never
+        // opens another type under the SAME credential.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord to acme::Clinician\n",
+        )
+        .expect("parsed");
+        assert!(envelope.may_unwrap("PHIKey", "PatientRecord", "acme::Clinician"));
+        // The narrowing bites: another type under the same credential, and the
+        // same type under another credential, are both refused.
+        assert!(!envelope.may_unwrap("PHIKey", "BillingRecord", "acme::Clinician"));
+        assert!(!envelope.may_unwrap("OtherKey", "PatientRecord", "acme::Clinician"));
+        // ...and so does the role.
+        assert!(!envelope.may_unwrap("PHIKey", "PatientRecord", "acme::Billing"));
+        // The credential resolves through its binding, so the address the label
+        // is keyed by answers the same question the handle does (E5).
+        assert!(envelope.may_unwrap(
+            "credential:acme/phi-key",
+            "PatientRecord",
+            "acme::Clinician"
+        ));
+    }
+
+    #[test]
+    fn an_unwrap_grant_reaches_through_acts_for() {
+        // The role side closes over delegation, as every other role question
+        // here does. A Consultant that acts-for Clinician holds the grant.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord to acme::Clinician\n\
+             delegate acme::Consultant acts-for acme::Clinician\n",
+        )
+        .expect("parsed");
+        assert!(envelope.may_unwrap("PHIKey", "PatientRecord", "acme::Consultant"));
+        // Not the other way: Clinician does not inherit Consultant's reach.
+        let reverse = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord to acme::Consultant\n\
+             delegate acme::Consultant acts-for acme::Clinician\n",
+        )
+        .expect("parsed");
+        assert!(!reverse.may_unwrap("PHIKey", "PatientRecord", "acme::Clinician"));
+    }
+
+    #[test]
+    fn an_unwrap_grant_needs_its_type_and_its_role() {
+        // DR-0074's Migration: a bare `grant unwrap <Credential>` is a check
+        // error, NOT a silent whole-operation grant. Reading it as "every type"
+        // would preserve exactly the over-grant §2 exists to remove.
+        let bare = match Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey to acme::Clinician\n",
+        ) {
+            Ok(_) => panic!("a bare unwrap grant names no type"),
+            Err(error) => error,
+        };
+        assert!(bare.contains("the type is required"), "{bare}");
+        // A type with no audience is equally incomplete.
+        assert!(Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord\n",
+        )
+        .is_err());
+        // A glob in the type slot is the whole-operation grant wearing a
+        // narrower spelling, so it is refused like a glob anywhere else.
+        assert!(Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for * to acme::Clinician\n",
+        )
+        .is_err());
+        // Two types on one line would be two grants; say so rather than
+        // silently keeping the first.
+        assert!(Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord to acme::Clinician extra\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_unwrap_grant_over_an_unbound_credential_is_a_hard_error() {
+        // DR-0074 §11: an unwrap grant is OWNED. An envelope granting unwrap
+        // over a credential it never bound is refused rather than having the
+        // arm dropped — DR-0063 §3's reason carries over unchanged, that
+        // silence lets a party discover after signing that a grant it believed
+        // it issued never applied.
+        let error = match Envelope::from_dsl(
+            "authority beta\n\
+             grant unwrap PHIKey for PatientRecord to beta::Requester\n",
+        ) {
+            Ok(_) => panic!("beta binds no such credential"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not bind"), "{error}");
+        assert!(
+            error.contains("beta"),
+            "the refusal names the issuer: {error}"
+        );
+    }
+
+    #[test]
+    fn an_unwrap_grant_names_a_credential_and_not_some_other_resource() {
+        // Left unchecked this parses, signs, and means nothing: there is no
+        // unwrapping under a file store.
+        let error = match Envelope::from_dsl(
+            "authority acme\n\
+             grant file_store Ledger -> file:/srv/ledger.db readable by Operator\n\
+             grant unwrap Ledger for PatientRecord to acme::Clinician\n",
+        ) {
+            Ok(_) => panic!("a file store is not a credential"),
+            Err(error) => error,
+        };
+        assert!(error.contains("names a credential"), "{error}");
+    }
+
+    #[test]
+    fn unwrap_grants_survive_the_canonical_round_trip() {
+        // The signature covers the canonical JSON, so a grant that does not
+        // round-trip is an authorization outside the signature — something
+        // anyone holding the file could add.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap PHIKey for PatientRecord to acme::Clinician\n",
+        )
+        .expect("parsed");
+        let canonical = envelope.to_canonical_json();
+        let reparsed = Envelope::from_json(&canonical).expect("round trip");
+        assert!(reparsed.may_unwrap("PHIKey", "PatientRecord", "acme::Clinician"));
+        assert!(!reparsed.may_unwrap("PHIKey", "BillingRecord", "acme::Clinician"));
+        // Lossless in the strong sense the emitter's own comment claims: a
+        // reparse canonicalizes to the identical document, so the hash is
+        // stable across a parse.
+        assert_eq!(reparsed.to_canonical_json(), canonical);
+        // An envelope granting no unwrap emits no key, so every already-signed
+        // artifact keeps the hash it has.
+        let quiet = Envelope::from_dsl("authority acme\n").expect("parsed");
+        assert!(!quiet.to_canonical_json().contains("unwrap_grants"));
+    }
+
+    #[test]
+    fn a_contested_credential_binding_refuses_its_unwrap_grant() {
+        // §11 at the composition. Writing this test is what showed the naive
+        // composition arm was dead: a constituent granting unwrap over a
+        // credential it never bound cannot be BUILT, because `from_dsl` already
+        // refuses it. The hazard a parse genuinely cannot see is this one —
+        // both authorities bind the same credential address, so "binds it" no
+        // longer names one owner, and beta's grant reaches acme's key.
+        let (acme, acme_hash) = composed_member(
+            "acme",
+            1,
+            "authority acme\n\
+             grant credential PHIKey -> credential:acme/phi-key sealed at hardware\n",
+        );
+        let (beta, beta_hash) = composed_member(
+            "beta",
+            1,
+            "authority beta\n\
+             grant credential Mirror -> credential:acme/phi-key sealed at hardware\n\
+             grant unwrap Mirror for PatientRecord to beta::Requester\n",
+        );
+        let error = match Composition::compose(
+            vec![acme, beta],
+            vec![entry("acme", 1, &acme_hash), entry("beta", 1, &beta_hash)],
+        ) {
+            Ok(_) => panic!("two authorities bind one credential"),
+            Err(error) => error,
+        };
+        assert!(error.contains("also binds"), "{error}");
+        assert!(
+            error.contains("not shared"),
+            "the refusal names the rule: {error}"
+        );
+    }
+
+    #[test]
     fn envelope_dsl_declares_a_minimum_credential_rung() {
         // DR-0053 §4: `require credential <rung>` beside `require mcp <rung>`,
         // for the same reason — provisioning a credential must not also lower
@@ -11028,6 +11556,155 @@ grant endorse crm to Operator\n";
         assert!(
             !vouched.iter().any(|m| m.contains("NMIF-on-the-selector")),
             "a governance-vouched signal may steer a crossing, got {vouched:?}"
+        );
+    }
+}
+
+/// DR-0074 §2's two surfaces meeting: the turn scopes, the envelope authorizes.
+///
+/// Kept in its own module because the question it asks is not the one the
+/// grant-class tests in the parser ask. Those cover whether a grant is
+/// WELL-FORMED, which holds with no envelope at all; these cover whether a
+/// well-formed grant is AUTHORIZED, which only a policy can answer.
+#[cfg(test)]
+mod turn_unwrap_scoping_tests {
+    use super::{check_with_envelope, Envelope, VerifiedEnvelope};
+    use whipplescript_parser::compile_program;
+
+    fn source(grant_ops: &str) -> String {
+        format!(
+            r#"
+use std.agent
+workflow SealedGrant
+
+class PatientRecord {{
+  notes string
+}}
+
+class BillingRecord {{
+  amount int
+}}
+
+agent triage {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+credential phi_key {{ kind raw }}
+
+rule seed
+  when started
+=> {{
+  tell triage
+    with access to credential phi_key {{
+      {grant_ops}
+    }}
+  "Triage the claim."
+}}
+"#
+        )
+    }
+
+    fn messages(grant_ops: &str, policy: &str) -> Vec<String> {
+        let text = source(grant_ops);
+        let compiled = compile_program(&text);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(policy).expect("valid policy");
+        check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    }
+
+    const GOVERNED: &str = "authority acme\n\
+         grant credential phi_key -> credential:acme/phi-key sealed at hardware\n\
+         grant unwrap phi_key for PatientRecord to acme::Clinician\n";
+
+    #[test]
+    fn a_turn_may_scope_to_a_granted_type() {
+        assert!(messages("unwrap for PatientRecord", GOVERNED)
+            .iter()
+            .all(|m| !m.contains("unwrap")));
+    }
+
+    #[test]
+    fn a_turn_may_not_scope_to_a_type_governance_granted_nobody() {
+        // The turn is well-formed — it names a type, so the parser passes it.
+        // Whether the policy authorizes that type is a question only the
+        // envelope can answer, and the answer here is no.
+        let messages = messages("unwrap for BillingRecord", GOVERNED);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("grants to nobody for that type")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_types_that_are_available() {
+        // The Migration clause: an author is told what IS grantable under this
+        // credential, not only that their choice was not.
+        let text = source("unwrap for BillingRecord");
+        let compiled = compile_program(&text);
+        let ir = compiled.ir.expect("ir");
+        let envelope = Envelope::from_dsl(GOVERNED).expect("valid policy");
+        let suggestions: Vec<String> =
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .filter_map(|d| d.suggestion)
+                .collect();
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains("grants unwrap on `phi_key` for PatientRecord")),
+            "{suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_with_no_unwrap_grant_says_so_plainly() {
+        // "Governance grants none" and "governance grants others" are different
+        // situations for an author, so they get different sentences rather than
+        // one with an empty list in it.
+        let bare = "authority acme\n\
+             grant credential phi_key -> credential:acme/phi-key sealed at hardware\n";
+        let suggestions: Vec<String> = {
+            let text = source("unwrap for PatientRecord");
+            let compiled = compile_program(&text);
+            let ir = compiled.ir.expect("ir");
+            let envelope = Envelope::from_dsl(bare).expect("valid policy");
+            check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .filter_map(|d| d.suggestion)
+                .collect()
+        };
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains("grants no unwrap at all")),
+            "{suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn an_ungoverned_credential_is_not_an_ungranted_one() {
+        // Progressive rigor: a credential the envelope never mentions is
+        // outside the policy's scope, not refused by it. Refusing here would
+        // make governance a precondition for naming a credential at all, which
+        // is the entry rigor this language does not have.
+        let elsewhere = "authority acme\n\
+             grant credential other -> credential:acme/other sealed at hardware\n";
+        let messages = messages("unwrap for PatientRecord", elsewhere);
+        assert!(
+            messages.iter().all(|m| !m.contains("for that type")),
+            "{messages:?}"
         );
     }
 }

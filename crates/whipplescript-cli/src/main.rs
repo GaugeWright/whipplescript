@@ -22782,6 +22782,19 @@ fn run_capability_effect(
             ),
         };
     }
+    if bound_provider.as_deref() == Some("custody-provider") {
+        let custody = CustodyCapabilityProvider {
+            run_id: effect.effect_id.clone(),
+        };
+        return run_capability_effect_generic(
+            &mut kernel,
+            instance_id,
+            effect,
+            &options.effect_config(),
+            &contract,
+            &custody,
+        );
+    }
     if bound_provider.as_deref() == Some("memory-provider") {
         let memory = MemoryCapabilityProvider {
             store_path: store_path.with_extension("memory.sqlite"),
@@ -23606,6 +23619,65 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for DesktopCapabi
 /// stable. Memory pools are provider-*less* by design — selection is owned by
 /// the binding, not the pool declaration — so all three memory capabilities
 /// route here.
+/// The `std.custody` capability provider (DR-0074 §12). The wrap logic is
+/// host-agnostic (`run_custody_capability`); this native provider only supplies
+/// the transport, which is the unix socket a running `whip-custodian serve`
+/// listens on.
+///
+/// A missing custodian is a *failure*, never a fallback. There is no
+/// whip-side wrap: the whole design rests on the wrapping key living in a
+/// second principal, so degrading to something whip could do itself would
+/// dissolve the property the record exists to provide.
+struct CustodyCapabilityProvider {
+    run_id: String,
+}
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for CustodyCapabilityProvider {
+    fn label(&self) -> &'static str {
+        "custody-provider"
+    }
+
+    fn produce(
+        &self,
+        effect: &ClaimableEffect,
+        _config: &EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        use whipplescript_kernel::effect_handlers::CapabilityOutcome;
+        // The transport is a unix socket, so it does not exist on Windows. That
+        // is a REFUSAL there, not a degradation: there is no whip-side wrap to
+        // fall back to, and a host that cannot reach a custodian must say so
+        // rather than report a sealing that never happened.
+        #[cfg(target_family = "unix")]
+        {
+            let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env()
+            else {
+                return CapabilityOutcome::Failed {
+                    error_kind: "custody".to_owned(),
+                    message: format!(
+                        "no custodian: set {} to the socket of a running `whip-custodian serve`",
+                        whipplescript_custody::CUSTODIAN_SOCKET_ENV
+                    ),
+                };
+            };
+            whipplescript_kernel::effect_handlers::run_custody_capability(
+                &transport,
+                effect,
+                &self.run_id,
+            )
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            let _ = (effect, &self.run_id);
+            CapabilityOutcome::Failed {
+                error_kind: "custody".to_owned(),
+                message: "no custodian transport on this platform: the custodian is reached \
+                          over a unix socket, and there is no whip-side wrap to fall back to"
+                    .to_owned(),
+            }
+        }
+    }
+}
+
 struct MemoryCapabilityProvider {
     store_path: PathBuf,
 }

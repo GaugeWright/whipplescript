@@ -26,8 +26,11 @@ construct-interop-examples.maude	SNSNSNSNSNSNSN
 construct-lowering.maude	SSSSSNNNNNNNNNNNNNNNNNSNSSSSSS
 contradiction-reopener.maude	NSSNS
 credential-no-eliminator.maude	SSSSSSSSNNNNNNNNN
+credential-region-escape.maude	SSSSSNNNN
+credential-region-materialization.maude	SSSSSNNNNNN
 credential-rung-evidence.maude	SSSSSNNNNNN
 credential-scope-narrowing.maude	SSSSSNNNN
+credential-unwrap-confinement.maude	SSSSSSNNNNNNN
 credential-verify-endorse.maude	SSSSNNNNNN
 credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
@@ -59,8 +62,8 @@ infoflow-integrity.maude	SSSSNNNN
 infoflow-output-integrity.maude	SSSNNN
 infoflow-package.maude	SSSNN
 infoflow-reader-sets.maude	SSSSNNNN
-infoflow-redact-provenance.maude	SSNN
 infoflow-redaction.maude	SSNNN
+infoflow-redact-provenance.maude	SSNN
 infoflow-signal-carriage.maude	SSSSNNNNN
 infoflow-signature.maude	SSNNNSNNN
 infoflow-staging.maude	SSNN

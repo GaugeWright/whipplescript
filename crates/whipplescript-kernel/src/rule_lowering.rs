@@ -55,6 +55,9 @@ pub fn ingest_shape_json(ir: &IrProgram, ty: &IrType, depth: usize) -> Value {
             json!(ir_type_name(&IrType::Primitive(primitive.clone())))
         }
         IrType::LiteralString(value) => json!({ "literal": value }),
+        // An envelope is opaque at the ingest boundary: its shape is "sealed",
+        // never the payload's, which nothing outside a region may see.
+        IrType::Sealed(_) => json!("sealed"),
         IrType::AgentRef(_) => json!("string"),
         IrType::Ref(name) => {
             for schema in &ir.schemas {
@@ -5399,6 +5402,7 @@ pub fn ir_type_name(ty: &IrType) -> String {
         IrType::Optional(inner) => ir_type_name(inner),
         IrType::Array(inner) => format!("{}[]", ir_type_name(inner)),
         IrType::Map(inner) => format!("map<{}>", ir_type_name(inner)),
+        IrType::Sealed(inner) => format!("sealed<{}>", ir_type_name(inner)),
         IrType::Object(fields) => format!(
             "{{{}}}",
             fields
@@ -5448,6 +5452,14 @@ pub fn validate_json_for_ir_type(
         IrType::Optional(inner) => {
             if !value.is_null() {
                 validate_json_for_ir_type(ir, value, inner, path, errors);
+            }
+        }
+        // DR-0074 §10: the wire form of an envelope is an opaque string. Its
+        // payload is not validated here and must not be — reading it would
+        // require opening it, which is a granted, scoped operation (§3).
+        IrType::Sealed(_) => {
+            if value.as_str().is_none() {
+                errors.push(format!("{path} must be a sealed envelope string"));
             }
         }
         IrType::Array(inner) => match value.as_array() {

@@ -137,6 +137,15 @@ pub mod std_manifests {
             "std.ingress",
             include_str!("../vendored-std/manifests/ingress.json"),
         ),
+        // DR-0074 §12: custody as the fifteenth std package, so `seal` is a
+        // construct instance rather than a core effect kind. The `credential`
+        // DECLARATION stays core and rides `vendored-std/grammars/`; this
+        // manifest carries the `custody.wrap` capability and the `seal`
+        // effect_operation.
+        (
+            "std.custody",
+            include_str!("../vendored-std/manifests/custody.json"),
+        ),
         (
             "std.memory",
             include_str!("../vendored-std/manifests/memory.json"),

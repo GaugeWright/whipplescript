@@ -13531,3 +13531,364 @@ fn a_request_presenting_two_credentials_is_refused() {
             .collect::<Vec<_>>()
     );
 }
+
+// --- DR-0074 §10: `sealed<T>` -------------------------------------------------
+
+#[test]
+fn sealed_type_parses_and_carries_its_payload_type() {
+    // A sealed field is declarable and its payload type is a schema reference
+    // like any other, so `validate_type_refs` must see through the constructor.
+    let source = r#"
+workflow SealedFields
+
+class PatientRecord {
+  notes string
+}
+
+class Claim {
+  id string
+  body sealed<PatientRecord>
+}
+
+rule seed
+  when started
+=> {
+}
+"#;
+
+    let compiled = compile_program(source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("sealed field compiles");
+    let claim = ir
+        .schemas
+        .iter()
+        .find_map(|schema| match schema {
+            IrSchema::Class(class) if class.name == "Claim" => Some(class),
+            _ => None,
+        })
+        .expect("Claim schema");
+    let body = claim
+        .fields
+        .iter()
+        .find(|field| field.name == "body")
+        .expect("body field");
+    // The payload type survives into the IR: this is the whole reason §10 puts
+    // it in the type rather than leaving it to provenance.
+    assert_eq!(
+        format!("{:?}", body.ty),
+        "Sealed(Ref(\"PatientRecord\"))",
+        "sealed<T> must carry T into the IR"
+    );
+}
+
+#[test]
+fn sealed_payload_type_must_resolve() {
+    // The constructor is transparent to schema-reference checking, so an
+    // unknown payload type is caught rather than hidden by the wrapper.
+    let source = r#"
+workflow SealedUnknownPayload
+
+class Claim {
+  body sealed<NoSuchClass>
+}
+
+rule seed
+  when started
+=> {
+}
+"#;
+
+    let compiled = compile_program(source);
+    assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+        .message
+        .contains("unknown schema reference `NoSuchClass`")));
+}
+
+#[test]
+fn sealed_field_rejects_a_literal_because_there_is_no_literal_form() {
+    // DR-0074 §1: a sealed value arises only from `seal`. A literal in the slot
+    // is refused with the route to fix rather than a downstream type mismatch.
+    let source = r#"
+workflow SealedLiteral
+
+class PatientRecord {
+  notes string
+}
+
+class Claim {
+  body sealed<PatientRecord>
+}
+
+rule seed
+  when started
+=> {
+  record Claim {
+    body "not ciphertext"
+  }
+}
+"#;
+
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expects `sealed<PatientRecord>`, which has no literal form")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+// --- DR-0074 §2: the type-narrowed grant class -------------------------------
+
+fn sealed_grant_source(grant_ops: &str) -> String {
+    format!(
+        r#"
+use std.agent
+workflow SealedGrant
+
+class PatientRecord {{
+  notes string
+}}
+
+agent triage {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+credential phi_key {{ kind raw }}
+
+rule seed
+  when started
+=> {{
+  tell triage
+    with access to credential phi_key {{
+      {grant_ops}
+    }}
+  "Triage the claim."
+}}
+"#
+    )
+}
+
+fn kinded_grant_source(kind: &str, grant_ops: &str) -> String {
+    format!(
+        r#"
+use std.agent
+workflow KindedGrant
+
+class PatientRecord {{
+  notes string
+}}
+
+agent triage {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+credential key {{ kind {kind} }}
+
+rule seed
+  when started
+=> {{
+  tell triage
+    with access to credential key {{
+      {grant_ops}
+    }}
+  "Triage the claim."
+}}
+"#
+    )
+}
+
+#[test]
+fn a_credential_kind_that_cannot_unwrap_is_refused_at_compile_time() {
+    // `CredentialKind::supports` was enforced only by the custodian, so an
+    // ed25519 key granted `unwrap` compiled clean and failed in production. An
+    // ed25519 key cannot decrypt, and nothing about that depends on runtime
+    // state, so the compiler is where it belongs — S4's argument, applied to
+    // custody.
+    let compiled = compile_program(&kinded_grant_source("ed25519", "unwrap for PatientRecord"));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("whose kind `ed25519` cannot perform it")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    // The refusal names the kinds that CAN, which is what makes `kind raw`
+    // discoverable rather than folklore held in the custodian's source.
+    assert!(compiled.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("raw or hmac-sha256"))
+    }));
+}
+
+#[test]
+fn the_kinds_that_can_unwrap_still_compile() {
+    // Both arms of `supports`, so the check is not simply refusing `unwrap`.
+    for kind in ["raw", "hmac-sha256"] {
+        let compiled = compile_program(&kinded_grant_source(kind, "unwrap for PatientRecord"));
+        assert_eq!(compiled.diagnostics, Vec::new(), "kind {kind} must unwrap");
+    }
+}
+
+#[test]
+fn the_credential_kind_check_covers_every_operation_not_just_unwrap() {
+    // Written because a check that happened to be right about `unwrap` and
+    // wrong about everything else would pass the tests above.
+    let signing = compile_program(&kinded_grant_source("bearer", "sign"));
+    assert!(
+        signing
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot perform it")),
+        "a bearer token does not sign: {:?}",
+        signing
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+    let requesting = compile_program(&kinded_grant_source("ed25519", "request [\"api/*\"]"));
+    assert!(requesting
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("cannot perform it")));
+    // ...and a kind that does support its operation is left alone.
+    assert_eq!(
+        compile_program(&kinded_grant_source("ed25519", "sign")).diagnostics,
+        Vec::new()
+    );
+}
+
+#[test]
+fn type_narrowed_unwrap_grant_names_its_type() {
+    let compiled = compile_program(&sealed_grant_source("unwrap for PatientRecord"));
+    assert_eq!(compiled.diagnostics, Vec::new());
+    assert!(compiled.ir.is_some());
+}
+
+#[test]
+fn bare_unwrap_grant_fails_closed() {
+    // Reading a bare `unwrap` as "every type" would preserve exactly the
+    // over-grant DR-0074 exists to remove, so it is a check error.
+    let compiled = compile_program(&sealed_grant_source("unwrap"));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("names no type")
+                && diagnostic.message.contains("credential `phi_key`")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unwrap_grant_refuses_a_glob_list() {
+    // §14's original objection stands: there is no natural glob for `unwrap`,
+    // and a clause that reads as narrowed while meaning nothing is the
+    // over-promise the class system exists to avoid.
+    let compiled = compile_program(&sealed_grant_source(
+        "unwrap for PatientRecord [\"records/*\"]",
+    ));
+    assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
+        .message
+        .contains("carries a glob list as well as a type")));
+}
+
+#[test]
+fn non_narrowable_wrap_grant_refuses_narrowing() {
+    // `wrap` stays non-narrowable deliberately: sealing into a type is the
+    // author's own act on data it already holds.
+    let compiled = compile_program(&sealed_grant_source("wrap for PatientRecord"));
+    assert!(compiled
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("carries a narrowing clause")));
+}
+
+// --- DR-0074 §12: `seal` as a std.custody construct instance -----------------
+
+#[test]
+fn seal_is_a_package_effect_with_an_after_binding() {
+    // The whole point of §12: `seal` is a construct instance declared in the
+    // std.custody manifest, not a core effect kind. It must parse, create an
+    // effect, and have that effect's binding resolve in an `after` block —
+    // which is where an earlier cut failed, because the text-based scanner
+    // carried its own hardcoded verb list independent of the generated table.
+    let source = r#"
+use std.custody
+workflow SealDemo
+output result R
+class R { ok bool }
+
+class PatientRecord {
+  notes string
+}
+
+credential phi_key { kind raw }
+
+rule intake
+  when started
+=> {
+  record PatientRecord { notes "confidential" }
+}
+
+rule seal_it
+  when PatientRecord as patient
+=> {
+  seal patient with phi_key as sealing
+  after sealing succeeds {
+    complete result { ok true }
+  }
+  after sealing fails {
+    complete result { ok false }
+  }
+}
+"#;
+
+    let compiled = compile_program(source);
+    assert_eq!(compiled.diagnostics, Vec::new());
+    assert!(compiled.ir.is_some(), "seal compiles end to end");
+}
+
+#[test]
+fn seal_requires_its_credential_connective() {
+    // The slot carries the `with` connective, so omitting it is a parse error
+    // rather than a silently different effect.
+    let source = r#"
+use std.custody
+workflow SealDemo
+output result R
+class R { ok bool }
+class PatientRecord { notes string }
+credential phi_key { kind raw }
+
+rule seal_it
+  when PatientRecord as patient
+=> {
+  seal patient phi_key as sealing
+  after sealing succeeds {
+    complete result { ok true }
+  }
+}
+"#;
+
+    let compiled = compile_program(source);
+    assert!(
+        !compiled.diagnostics.is_empty(),
+        "a missing `with` must not parse as a valid seal"
+    );
+}

@@ -3796,6 +3796,17 @@ impl Parser<'_> {
                 span: map.span.join(close.span),
                 inner: Box::new(inner),
             }
+        } else if self.at_ident("sealed") {
+            // DR-0074 §10. Spelled after `map<...>` above, deliberately: a
+            // built-in constructor over one type, not a generic.
+            let sealed = self.advance().clone();
+            self.expect_symbol('<')?;
+            let inner = self.parse_type()?;
+            let close = self.expect_symbol('>')?;
+            TypeSyntax::Sealed {
+                span: sealed.span.join(close.span),
+                inner: Box::new(inner),
+            }
         } else if matches!(
             self.peek().map(|token| &token.kind),
             Some(TokenKind::String(_))

@@ -125,7 +125,12 @@ pub struct ConstructGrammarClause {
 
 pub const CONSTRUCT_GRAMMAR_SHAPE_EFFECT_OPERATION: &str = "effect_operation";
 pub const CONSTRUCT_GRAMMAR_SHAPE_DECLARATION_BLOCK: &str = "declaration_block";
-pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto"];
+/// `with` (DR-0074 §12) closes a gap rather than widening the set: core
+/// constructs already spell an instrument slot that way (`signed with <cred>`,
+/// `verify <v> with <handle>`), and it only surfaced when a construct instance
+/// first needed a credential slot.
+pub const CONSTRUCT_GRAMMAR_CONNECTIVES: &[&str] =
+    &["from", "for", "into", "to", "via", "onto", "with"];
 pub const CONSTRUCT_GRAMMAR_SLOT_KINDS: &[&str] = &["identifier", "expression"];
 pub const CONSTRUCT_GRAMMAR_BINDING_MODES: &[&str] = &["required", "optional", "none"];
 /// `declaration_block` clause value kinds (DR-0011 Shape 1, mirrors
@@ -142,7 +147,7 @@ pub const CONSTRUCT_GRAMMAR_CLAUSE_KINDS: &[&str] = &[
 /// `declaration_block` clause connectives: the Shape 2 slot connectives plus
 /// `by` (ledger `partition by`). Mirrors `build.rs`'s `CLAUSE_CONNECTIVES`.
 pub const CONSTRUCT_GRAMMAR_CLAUSE_CONNECTIVES: &[&str] =
-    &["from", "for", "into", "to", "via", "onto", "by"];
+    &["from", "for", "into", "to", "via", "onto", "by", "with"];
 
 /// The DR-0015 agent feature-class taxonomy, verbatim (spec/std-agent.md
 /// "Capability reports"). Shared vocabulary: the parser checks

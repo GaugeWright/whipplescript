@@ -775,17 +775,33 @@ pub fn validate_provider_binding_json(config_json: &str) -> Vec<ProviderValidati
     }
 }
 
-fn json_shape(value: &Value) -> Value {
+/// The payload-shape boundary (DR-0075): the single reduction every payload
+/// passes through before it reaches a durable record.
+///
+/// **Shape means the JSON type constructor and nothing derived from the value.**
+/// Not an object's key names, not its key count, not a string's length, not an
+/// array's length — each of those is a measurement of the data rather than its
+/// shape, and each is a disclosure that a record intended to redact should not
+/// make.
+///
+/// This is deliberately stricter than either implementation it replaces. There
+/// were two, with the more disclosing one on the more sensitive path: the
+/// provider-side copy emitted an object's key NAMES and fed `prompt_shape`,
+/// which is built from user data. DR-0024 §2 justified shape redaction as a
+/// necessity rather than a policy — "we redact because we cannot see in
+/// cleanly" — so nothing ever specified what it may reveal, and the two copies
+/// drifted. DR-0075 makes it a bounded disclosure with a stated level.
+///
+/// If the diagnostic value proves insufficient, loosening this is a decision to
+/// record, not a default to drift back to.
+pub(crate) fn json_shape(value: &Value) -> Value {
     match value {
         Value::Null => json!({"type": "null"}),
         Value::Bool(_) => json!({"type": "bool"}),
         Value::Number(_) => json!({"type": "number"}),
-        Value::String(value) => json!({"type": "string", "chars": value.chars().count()}),
-        Value::Array(values) => json!({"type": "array", "items": values.len()}),
-        Value::Object(object) => json!({
-            "type": "object",
-            "keys": object.keys().cloned().collect::<Vec<_>>(),
-        }),
+        Value::String(_) => json!({"type": "string"}),
+        Value::Array(_) => json!({"type": "array"}),
+        Value::Object(_) => json!({"type": "object"}),
     }
 }
 
@@ -1466,5 +1482,63 @@ mod tests {
         .expect_err("fixture does not support native stop");
 
         assert_eq!(error.code, "unsupported_configured_cancellation_depth");
+    }
+
+    // --- DR-0075: the payload-shape boundary discloses type only ---------------
+
+    #[test]
+    fn payload_shape_discloses_the_type_and_nothing_derived_from_the_value() {
+        // The whole point: a record that redacts a payload must not describe it.
+        // Key names, key counts, string lengths, and array lengths are all
+        // measurements of the data rather than its shape.
+        let shape = json_shape(&json!({
+            "patient_name": "Ada Lovelace",
+            "diagnosis": "confidential",
+        }));
+        assert_eq!(shape, json!({"type": "object"}));
+
+        let rendered = shape.to_string();
+        assert!(
+            !rendered.contains("patient_name"),
+            "key names must not leak"
+        );
+        assert!(!rendered.contains("diagnosis"), "key names must not leak");
+        assert!(!rendered.contains('2'), "key count must not leak");
+    }
+
+    #[test]
+    fn payload_shape_hides_string_and_array_lengths() {
+        // A note's character count is information about the note: the length of
+        // a free-text field distinguishes an empty one from a long one, and for
+        // a short domain it can approach the value.
+        assert_eq!(
+            json_shape(&json!("a very long clinical note")),
+            json!({"type": "string"})
+        );
+        assert_eq!(json_shape(&json!("")), json!({"type": "string"}));
+        assert_eq!(
+            json_shape(&json!([1, 2, 3])),
+            json!({"type": "array"}),
+            "array length is a count of the data, not its shape"
+        );
+    }
+
+    #[test]
+    fn payload_shape_is_one_function_for_every_path() {
+        // There were two `json_shape`s with different disclosure, and the more
+        // revealing one fed `prompt_shape`, which is built from user data. The
+        // lifecycle path must now produce byte-identical output to this one.
+        let payload = json!({"a": 1, "b": [1, 2], "c": "text"});
+        let observation = crate::native_lifecycle::NativeAgentTurnObservation::fixture(
+            crate::native_lifecycle::AgentTurnLifecycleKind::Completed,
+            "turn.completed",
+            None,
+            None,
+            json_shape(&payload),
+        );
+        assert_eq!(
+            observation.provider_payload_shape,
+            json!({"type": "object"})
+        );
     }
 }

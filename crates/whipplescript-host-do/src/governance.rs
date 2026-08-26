@@ -278,6 +278,95 @@ mod tests {
         assert!(wrong_root.verify(&signed).is_err());
     }
 
+    /// A policy carrying DR-0074 §2's type-narrowed unwrap grant, signed the
+    /// same way every other policy in this module is. Separate from
+    /// `policy_material` so the existing tests keep signing byte-identical
+    /// content and go on covering what they were written to cover.
+    fn custody_policy_material(seed: u8) -> (SigningKey, String, String) {
+        let key = SigningKey::from_slice(&[seed; 32]).expect("test key");
+        let public_key = hex::encode(
+            key.verifying_key()
+                .as_affine()
+                .to_sec1_point(true)
+                .as_bytes(),
+        );
+        let policy = serde_json::json!({
+            "authority": "acme",
+            "resources": { "credential:acme/phi-key": {} },
+            "bindings": { "PHIKey": "credential:acme/phi-key" },
+            "unwrap_grants": [
+                {
+                    "credential": "PHIKey",
+                    "type": "PatientRecord",
+                    "role": "acme::Clinician"
+                }
+            ]
+        })
+        .to_string();
+        (key, public_key, policy)
+    }
+
+    fn signed_custody_policy(seed: u8, signer: &str, epoch: u64) -> (String, String) {
+        let (key, public_key, policy) = custody_policy_material(seed);
+        let signing_bytes = external_signing_bytes_v2(
+            &policy,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+            epoch,
+            "acme",
+        )
+        .expect("canonical bytes");
+        let signature: Signature = key.sign(&signing_bytes);
+        let signed = SignedEnvelope::from_external_signature_v2(
+            &policy,
+            signer,
+            GAUGEDESK_ATTESTATION_ALGORITHM,
+            &public_key,
+            &hex::encode(signature.to_bytes()),
+            epoch,
+            "acme",
+        )
+        .expect("signed")
+        .to_json();
+        (public_key, signed)
+    }
+
+    #[test]
+    fn the_hosted_path_carries_a_type_narrowed_unwrap_grant() {
+        // DR-0074 §2 parity. The hosted path parses envelopes with the same
+        // kernel code the native one does, so parity holds by construction —
+        // but the last parity claim made by inspection on this host hid a
+        // fail-open, so it is asserted here instead of assumed.
+        let (key, signed) = signed_custody_policy(7, "authority:gaugedesk", 12);
+        let verified = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key)
+            .verify(&signed)
+            .expect("verified");
+        assert!(verified
+            .envelope
+            .may_unwrap("PHIKey", "PatientRecord", "acme::Clinician"));
+        // The narrowing survives the hosted trip intact: another type under the
+        // same credential is refused here exactly as it is natively.
+        assert!(!verified
+            .envelope
+            .may_unwrap("PHIKey", "BillingRecord", "acme::Clinician"));
+        assert!(!verified
+            .envelope
+            .may_unwrap("PHIKey", "PatientRecord", "acme::Billing"));
+    }
+
+    #[test]
+    fn a_hosted_unwrap_grant_is_inside_the_signature() {
+        // The grant is an authorization, so it must be signature-covered on the
+        // hosted path too. Widening the type it narrows to breaks verification
+        // rather than yielding a policy that opens more than acme signed for.
+        let (key, signed) = signed_custody_policy(7, "authority:gaugedesk", 12);
+        let widened = signed.replace("PatientRecord", "BillingRecord");
+        assert_ne!(widened, signed, "the grant is in the signed document");
+        let root = GaugeDeskGovernanceRoot::new("authority:gaugedesk", key);
+        assert!(root.verify(&widened).is_err());
+    }
+
     #[test]
     fn hosted_policy_rejects_tampering() {
         let (key, signed) = signed_policy_v2(7, "authority:gaugedesk", 12, "acme");

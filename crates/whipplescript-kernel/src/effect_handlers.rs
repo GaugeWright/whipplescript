@@ -2502,6 +2502,92 @@ pub fn run_memory_capability(
     }
 }
 
+/// The `std.custody` capability provider (DR-0074 §12), host-agnostic over any
+/// [`CustodyTransport`] — native's unix socket and the in-process transport both
+/// call this, so `seal` behaves identically on either.
+///
+/// Only `custody.wrap` is handled. `custody.unwrap` is deliberately absent:
+/// opening is DR-0074 §3's `open` region, which is Slice 2 and is governed by a
+/// type-narrowed grant. A provider that could unwrap before the region existed
+/// would be the over-grant this whole record removes.
+///
+/// The wrapping key never reaches whip. What comes back is the envelope, and
+/// only its identity and non-secret metadata cross into the effect's output —
+/// the ciphertext is the payload whip stores, not something it interprets.
+pub fn run_custody_capability(
+    transport: &dyn whipplescript_custody::CustodyTransport,
+    effect: &ClaimableEffect,
+    run_id: &str,
+) -> CapabilityOutcome {
+    use whipplescript_custody::{
+        CredentialName, CustodyCall, CustodyOk, CustodyOp, UseAttribution,
+    };
+
+    let fail = |message: String| CapabilityOutcome::Failed {
+        error_kind: "custody".to_owned(),
+        message,
+    };
+
+    match effect.target.as_deref() {
+        Some("custody.wrap") => {
+            let input = json_from_str(&effect.input_json);
+            let Some(credential) = input.get("credential").and_then(Value::as_str) else {
+                return fail("custody wrap: no credential named".to_owned());
+            };
+            let credential = match CredentialName::new(credential) {
+                Ok(name) => name,
+                Err(error) => return fail(format!("custody wrap: {error}")),
+            };
+            // The value is whip's own application data; the custodian never
+            // interprets it, so it crosses as opaque bytes.
+            let plaintext = input.get("value").cloned().unwrap_or(Value::Null);
+            let plaintext_b64 = crate::exec_http::base64_encode(plaintext.to_string().as_bytes());
+            // §13's context binding: the effect key is what an envelope is bound
+            // to, so a ciphertext produced for one effect cannot be unwrapped
+            // under another.
+            let context = effect.effect_id.clone();
+            // The label rides with the envelope (§13 carriage). Slice 2 fills
+            // this from the IFC layer; until `open` exists there is nothing to
+            // restore it to, so it is explicitly null rather than fabricated.
+            let label = Value::Null;
+
+            let call = CustodyCall::new(
+                UseAttribution {
+                    run_id: run_id.to_owned(),
+                    actor: None,
+                    effect_key: Some(effect.effect_id.clone()),
+                },
+                CustodyOp::Wrap {
+                    credential,
+                    plaintext_b64,
+                    label,
+                    context: context.clone(),
+                },
+            );
+
+            match transport.call(call) {
+                Err(error) => fail(format!("custody wrap: transport: {error}")),
+                Ok(reply) => match reply.outcome {
+                    Err(error) => fail(format!("custody wrap refused: {error}")),
+                    Ok(CustodyOk::Wrapped { envelope }) => CapabilityOutcome::Produced(json!({
+                        "credential": envelope.credential.as_str(),
+                        "context": envelope.context,
+                        "nonce_b64": envelope.nonce_b64,
+                        "ciphertext_b64": envelope.ciphertext_b64,
+                    })),
+                    Ok(other) => fail(format!(
+                        "custody wrap: custodian answered with a non-wrap result: {other:?}"
+                    )),
+                },
+            }
+        }
+        other => fail(format!(
+            "custody-provider does not handle capability `{}`",
+            other.unwrap_or_default()
+        )),
+    }
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): run the capability call + its terminal
 /// over a held `RuntimeKernel<S>` (only kernel methods, so `S: RuntimeStore`).
 pub fn run_capability_effect_generic<S: RuntimeStore>(
@@ -2872,5 +2958,135 @@ mod file_policy_tests {
                 .expect("out-of-glob write denied")
                 .contains("allow write")
         );
+    }
+}
+
+#[cfg(test)]
+mod custody_capability_tests {
+    use super::*;
+    use std::sync::Arc;
+    use whipplescript_custodian::store::SealedStore;
+    use whipplescript_custodian::{Custodian, DeniedEgress, InProcessTransport};
+    use whipplescript_custody::{CredentialKind, CredentialName};
+
+    fn effect(target: &str, input_json: &str) -> ClaimableEffect {
+        ClaimableEffect {
+            effect_id: "effect-seal-1".to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some(target.to_owned()),
+            profile: None,
+            input_json: input_json.to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        }
+    }
+
+    fn custodian_with_wrapping_key() -> InProcessTransport {
+        let mut store = SealedStore::create(None, "pw").expect("store");
+        store
+            .register(
+                CredentialName::new("phi_key").expect("name"),
+                // `raw` and `hmac_sha256` are the only kinds `supports` admits
+                // for wrap/unwrap; there is no dedicated symmetric kind yet.
+                CredentialKind::Raw,
+                zeroize::Zeroizing::new(vec![7u8; 32]),
+                None,
+            )
+            .expect("register");
+        InProcessTransport::new(Arc::new(Custodian::new(store, Box::new(DeniedEgress))))
+    }
+
+    #[test]
+    fn seal_produces_an_envelope_and_never_the_plaintext() {
+        let transport = custodian_with_wrapping_key();
+        let outcome = run_custody_capability(
+            &transport,
+            &effect(
+                "custody.wrap",
+                r#"{"credential":"phi_key","value":{"notes":"confidential"}}"#,
+            ),
+            "run-1",
+        );
+
+        let CapabilityOutcome::Produced(value) = outcome else {
+            panic!("expected a wrapped envelope");
+        };
+        assert_eq!(
+            value.get("credential").and_then(Value::as_str),
+            Some("phi_key")
+        );
+        assert!(
+            value.get("ciphertext_b64").is_some(),
+            "envelope carries ciphertext"
+        );
+        assert!(
+            value.get("nonce_b64").is_some(),
+            "envelope carries its nonce"
+        );
+
+        // The point of the whole record: what the effect produces is an
+        // envelope, and the plaintext is nowhere in it.
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("confidential"),
+            "plaintext must not appear in the effect output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn seal_binds_the_envelope_to_its_effect() {
+        // §13's AEAD context binding, carried by the effect id: a ciphertext
+        // produced for one effect cannot be opened under another.
+        let transport = custodian_with_wrapping_key();
+        let CapabilityOutcome::Produced(value) = run_custody_capability(
+            &transport,
+            &effect("custody.wrap", r#"{"credential":"phi_key","value":"x"}"#),
+            "run-1",
+        ) else {
+            panic!("expected a wrapped envelope");
+        };
+        assert_eq!(
+            value.get("context").and_then(Value::as_str),
+            Some("effect-seal-1")
+        );
+    }
+
+    #[test]
+    fn the_custody_provider_does_not_unwrap() {
+        // Opening is DR-0074 §3's `open` region, governed by a type-narrowed
+        // grant and not yet built. A provider that could unwrap before the
+        // region existed would be exactly the over-grant this record removes.
+        let transport = custodian_with_wrapping_key();
+        let outcome = run_custody_capability(
+            &transport,
+            &effect("custody.unwrap", r#"{"credential":"phi_key"}"#),
+            "run-1",
+        );
+        let CapabilityOutcome::Failed { message, .. } = outcome else {
+            panic!("custody.unwrap must not be handled here");
+        };
+        assert!(message.contains("does not handle capability `custody.unwrap`"));
+    }
+
+    #[test]
+    fn an_unknown_credential_is_refused_by_the_custodian() {
+        let transport = custodian_with_wrapping_key();
+        let outcome = run_custody_capability(
+            &transport,
+            &effect(
+                "custody.wrap",
+                r#"{"credential":"no_such_key","value":"x"}"#,
+            ),
+            "run-1",
+        );
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = outcome
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(error_kind, "custody");
+        assert!(message.contains("custody wrap refused"), "got: {message}");
     }
 }

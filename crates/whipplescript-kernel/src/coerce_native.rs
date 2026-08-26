@@ -179,6 +179,10 @@ fn schema_with_depth(ty: &IrType, schemas: &[IrSchema], depth: usize) -> Value {
             "type": "object",
             "additionalProperties": schema_with_depth(value_ty, schemas, depth + 1),
         }),
+        // DR-0074 §10: a sealed value is ciphertext the custodian produced.
+        // No model output can validate as one, so like `secret` (DR-0053 §5)
+        // its schema is `false` — nothing satisfies it.
+        IrType::Sealed(_) => json!(false),
         IrType::Union(variants) => union_schema(variants, schemas, depth),
     }
 }

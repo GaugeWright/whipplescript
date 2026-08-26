@@ -27,6 +27,71 @@
             "effect.output"
           ],
           "validation": "runtime_boundary"
+        },
+        {
+          "id": "custody.wrap",
+          "effect_kind": "capability.call",
+          "source_forms": [
+            "call custody.wrap",
+            "seal <value> with <credential> -> <binding>"
+          ],
+          "input_schema": {
+            "credential": "string",
+            "value": "json"
+          },
+          "output_schema": {
+            "credential": "string",
+            "context": "string",
+            "nonce_b64": "string",
+            "ciphertext_b64": "string"
+          },
+          "required_capabilities": [
+            "custody.wrap"
+          ],
+          "provider_kinds": [
+            "custody-provider"
+          ],
+          "validation": "runtime_boundary"
+        }
+      ],
+      "constructs": [
+        {
+          "id": "custody.seal",
+          "construct_family": "effect_operation",
+          "keyword": "seal",
+          "scope": "rule_body",
+          "grammar": {
+            "shape": "effect_operation",
+            "keyword": "seal",
+            "slots": [
+              {
+                "name": "value",
+                "kind": "expression"
+              },
+              {
+                "name": "credential",
+                "kind": "identifier",
+                "connective": "with"
+              }
+            ],
+            "payload": null,
+            "binding": "required",
+            "target_capability": "custody.wrap"
+          },
+          "requires": [
+            {
+              "kind": "Capability",
+              "name": "custody.wrap"
+            }
+          ],
+          "provides": [
+            {
+              "kind": "EffectHandle",
+              "type": "custody.wrap.output"
+            }
+          ],
+          "lowering_target": "capability_call",
+          "target_capability": "custody.wrap"
         }
       ]
     }
@@ -34,7 +99,16 @@
   "capabilities": [
     {
       "id": "custody.request",
-      "description": "Egress an authenticated HTTP request through the custodian (DR-0053 \u00a75). The request leaves whip carrying SENTINELS at the author's marked slots; the custodian substitutes material and signs, so the material never enters this process and no capability grants a way to read it."
+      "description": "Egress an authenticated HTTP request through the custodian (DR-0053 §5). The request leaves whip carrying SENTINELS at the author's marked slots; the custodian substitutes material and signs, so the material never enters this process and no capability grants a way to read it."
+    },
+    {
+      "id": "custody.wrap",
+      "description": "Seal a value into a custodian-held envelope. The wrapping key never reaches whip; the envelope carries the label and its AEAD context binding.",
+      "schema": {
+        "input": {
+          "credential": "string"
+        }
+      }
     }
   ],
   "providers": [
@@ -43,9 +117,25 @@
       "provider_kind": "custodian",
       "capability": "custody.request",
       "config": {}
+    },
+    {
+      "id": "provider-custody-wrap",
+      "provider_kind": "custody-provider",
+      "capability": "custody.wrap",
+      "config": {}
     }
   ],
-  "profiles": [],
+  "profiles": [
+    {
+      "id": "profile-custody-sealer",
+      "name": "custody-sealer",
+      "description": "Allow sealing values into custodian-held envelopes. Deliberately does not include unwrap: sealing is the safe direction, and opening is governed by a type-narrowed grant (DR-0074).",
+      "enforcement_mode": "enforce",
+      "allowed_capabilities": [
+        "custody.wrap"
+      ]
+    }
+  ],
   "bindings": [
     {
       "id": "binding-custody-request-default",
@@ -55,6 +145,13 @@
       "config": {
         "provider_id": "custodian"
       }
+    },
+    {
+      "id": "binding-custody-wrap-global",
+      "program_id": null,
+      "capability": "custody.wrap",
+      "provider": "custody-provider",
+      "config": {}
     }
   ]
 }

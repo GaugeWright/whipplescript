@@ -376,12 +376,57 @@ impl Operation {
         }
     }
 
-    /// The two grant classes of DR-0053 §14. Narrowable operations (`request`
-    /// host/method/path globs, `mint` vendor scope strings) *require* their
-    /// list in a grant; the rest are named bare and a glob list on one of
-    /// them is a check error, not silently ignored.
+    /// The grant classes of DR-0053 §14, extended to three by DR-0074 §2.
+    ///
+    /// A form that accepted narrowing uniformly would over-promise — a clause
+    /// that reads as narrowed while meaning nothing — so each operation
+    /// declares which axis, if any, it narrows on.
+    pub fn grant_class(&self) -> GrantClass {
+        match self {
+            Operation::Request | Operation::Mint => GrantClass::Narrowable,
+            Operation::Unwrap => GrantClass::TypeNarrowed,
+            Operation::Sign | Operation::Verify | Operation::Derive | Operation::Wrap => {
+                GrantClass::NonNarrowable
+            }
+        }
+    }
+
+    /// Whether this operation narrows by a glob list. Kept as the name DR-0053
+    /// §14 used, defined in terms of the class so there is one authority.
     pub fn narrowable(&self) -> bool {
-        matches!(self, Operation::Request | Operation::Mint)
+        matches!(self.grant_class(), GrantClass::Narrowable)
+    }
+}
+
+/// How an operation may be narrowed in a grant (DR-0053 §14, DR-0074 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantClass {
+    /// `request` (host/method/path globs) and `mint` (vendor scope strings).
+    /// The glob list is REQUIRED — a bare name is a check error.
+    Narrowable,
+    /// `unwrap`, which narrows by the wrapped payload's TYPE rather than by an
+    /// address pattern (DR-0074 §2). The type is REQUIRED; a glob list on it is
+    /// a check error. §14 originally classed `unwrap` non-narrowable because no
+    /// natural glob exists for it, which is true and is why the axis is a type.
+    TypeNarrowed,
+    /// `sign`, `verify`, `derive`, `wrap`. Named bare, granting the whole
+    /// operation; any narrowing clause is a check error rather than ignored.
+    ///
+    /// `wrap` stays here deliberately: sealing *into* a type is an author's own
+    /// act on data it already holds, so narrowing it protects nobody. The
+    /// dangerous direction is out, not in.
+    NonNarrowable,
+}
+
+impl GrantClass {
+    /// What a grant for this class must carry, for a diagnostic to quote.
+    pub fn requirement(&self) -> &'static str {
+        match self {
+            GrantClass::Narrowable => "a glob list",
+            GrantClass::TypeNarrowed => "a type after `for`",
+            GrantClass::NonNarrowable => "no narrowing clause",
+        }
     }
 }
 
@@ -977,6 +1022,10 @@ mod tests {
             .filter(Operation::narrowable)
             .collect();
         assert_eq!(narrowable, vec![Operation::Request, Operation::Mint]);
+        // DR-0074 §2: `unwrap` left the non-narrowable class for a third one.
+        assert_eq!(Operation::Unwrap.grant_class(), GrantClass::TypeNarrowed);
+        assert!(!Operation::Unwrap.narrowable());
+        assert_eq!(Operation::Wrap.grant_class(), GrantClass::NonNarrowable);
     }
 
     #[test]

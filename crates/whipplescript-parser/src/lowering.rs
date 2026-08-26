@@ -394,6 +394,7 @@ pub(crate) fn lower_program(
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
+    validate_turn_access_grant_credential_kinds(&ir, &mut diagnostics);
     // DR-0043 Decision 5: attach extracted regions onto their lowered rules.
     for rule in &mut ir.rules {
         if let Some(region) = pending_regions.get(&rule.name) {
@@ -2005,6 +2006,7 @@ pub(crate) fn lower_type(ty: TypeSyntax) -> IrType {
         TypeSyntax::Optional { inner, .. } => IrType::Optional(Box::new(lower_type(*inner))),
         TypeSyntax::Array { inner, .. } => IrType::Array(Box::new(lower_type(*inner))),
         TypeSyntax::Map { inner, .. } => IrType::Map(Box::new(lower_type(*inner))),
+        TypeSyntax::Sealed { inner, .. } => IrType::Sealed(Box::new(lower_type(*inner))),
         TypeSyntax::Union { variants, .. } => {
             IrType::Union(variants.into_iter().map(lower_type).collect())
         }

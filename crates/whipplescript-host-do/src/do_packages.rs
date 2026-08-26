@@ -43,6 +43,12 @@ pub const EMBEDDED_STD_MANIFESTS: &[(&str, &str)] = &[
         "std.ingress",
         include_str!("../../../std/manifests/ingress.json"),
     ),
+    // DR-0074 §12. Registered here in the same change as the CLI so the hosted
+    // path never knows a smaller package universe than the native one.
+    (
+        "std.custody",
+        include_str!("../../../std/manifests/custody.json"),
+    ),
     (
         "std.memory",
         include_str!("../../../std/manifests/memory.json"),

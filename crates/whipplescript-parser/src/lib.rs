@@ -989,6 +989,12 @@ pub enum TypeSyntax {
         inner: Box<TypeSyntax>,
         span: SourceSpan,
     },
+    /// DR-0074 §10: `sealed<T>`. Spelled after `map<string>`, an existing
+    /// lowercase built-in constructor with an angle-bracketed argument.
+    Sealed {
+        inner: Box<TypeSyntax>,
+        span: SourceSpan,
+    },
     Union {
         variants: Vec<TypeSyntax>,
         span: SourceSpan,
@@ -1003,6 +1009,7 @@ impl TypeSyntax {
             | Self::Optional { span, .. }
             | Self::Array { span, .. }
             | Self::Map { span, .. }
+            | Self::Sealed { span, .. }
             | Self::Union { span, .. }
             | Self::AgentRef { span, .. } => *span,
             Self::Ref { name } => name.span,
@@ -1474,6 +1481,10 @@ pub enum IrType {
     Optional(Box<IrType>),
     Array(Box<IrType>),
     Map(Box<IrType>),
+    /// DR-0074 §10: ciphertext whose payload type is `T`. A built-in
+    /// constructor over one type, like `Map` — not a generic, which this
+    /// language excludes.
+    Sealed(Box<IrType>),
     Union(Vec<IrType>),
 }
 
@@ -2172,6 +2183,11 @@ enum ExprType {
     Optional(Box<ExprType>),
     Array(Box<ExprType>),
     Map(Box<ExprType>),
+    /// DR-0074 §10: `sealed<T>`, ciphertext whose payload type is `T`. Like
+    /// `Secret` it unifies with nothing else, so no operator, comparison, or
+    /// interpolation accepts it; unlike `Secret` it has exactly one
+    /// eliminator, the `open` region of §3 (Slice 2, not yet built).
+    Sealed(Box<ExprType>),
     Finite {
         label: String,
         values: Vec<String>,
@@ -4263,6 +4279,7 @@ impl IrType {
             Self::Optional(inner) => format!("optional<{}>", inner.to_snapshot()),
             Self::Array(inner) => format!("array<{}>", inner.to_snapshot()),
             Self::Map(inner) => format!("map<{}>", inner.to_snapshot()),
+            Self::Sealed(inner) => format!("sealed<{}>", inner.to_snapshot()),
             Self::Union(variants) => {
                 let variants = variants
                     .iter()
@@ -4369,6 +4386,82 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                             ),
                         });
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Post-lowering check: a turn-access grant on a declared `credential` may only
+/// grant operations that credential's KIND can actually perform. Runs after the
+/// whole program is lowered so every credential declaration is visible
+/// regardless of source order.
+///
+/// This is S4's argument applied to custody. `CredentialKind::supports` is
+/// enforced by the custodian, which refuses the operation at runtime — so
+/// before this, `credential k { kind ed25519 }` granted `unwrap` compiled
+/// clean and failed in production. An ed25519 key cannot decrypt, and nothing
+/// about that depends on runtime state, so the compiler is where it belongs.
+///
+/// A grant whose resource is not a declared credential is left alone, as its
+/// file-store and memory-pool siblings do, so this stays zero-false-positive.
+/// An unparseable kind is left alone too: the credential declaration's own
+/// check owns that error, and reporting it twice from here would say nothing
+/// new.
+fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    use whipplescript_custody::{CredentialKind, Operation};
+
+    let kinds: BTreeMap<&str, &str> = ir
+        .credentials
+        .iter()
+        .map(|credential| (credential.name.as_str(), credential.kind.as_str()))
+        .collect();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                let Some(name) = grant.resource.strip_prefix("credential ") else {
+                    continue;
+                };
+                let Some(declared) = kinds.get(name) else {
+                    continue;
+                };
+                let Ok(kind) = CredentialKind::parse(declared) else {
+                    continue;
+                };
+                for op in &grant.operations {
+                    let Ok(operation) = Operation::parse(&op.operation) else {
+                        continue;
+                    };
+                    if kind.supports(operation) {
+                        continue;
+                    }
+                    let able: Vec<&str> = [
+                        CredentialKind::Bearer,
+                        CredentialKind::Basic,
+                        CredentialKind::Raw,
+                        CredentialKind::HmacSha256,
+                        CredentialKind::Ed25519,
+                        CredentialKind::AwsSigv4,
+                        CredentialKind::JwtRs256,
+                    ]
+                    .into_iter()
+                    .filter(|candidate| candidate.supports(operation))
+                    .map(|candidate| candidate.as_str())
+                    .collect();
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` grants `{}` on credential `{name}`, whose kind `{declared}` \
+                             cannot perform it",
+                            rule.name, op.operation
+                        ),
+                        suggestion: Some(format!(
+                            "`{}` needs a credential of kind {}",
+                            op.operation,
+                            able.join(" or ")
+                        )),
+                    });
                 }
             }
         }
@@ -6643,16 +6736,19 @@ fn schema_name_for_path(ty: &TypeSyntax) -> Option<String> {
     }
 }
 
-/// The complete standard-package universe (the 13 std packages of the
-/// standard-package campaign). `use std.<name>` outside this list is a check
-/// error: std resolution is a built-in registry, so an unknown name can never
-/// resolve later — a typo'd `use std.coercon` would otherwise silently import
-/// nothing (and downstream missing-import bite is advisory only).
+/// The complete standard-package universe: the standard-package campaign's
+/// fourteen, plus `std.custody` (DR-0074 §12, which made custody the fifteenth
+/// so `seal` could be a construct instance rather than core surgery).
+/// `use std.<name>` outside this list is a check error: std resolution is a
+/// built-in registry, so an unknown name can never resolve later — a typo'd
+/// `use std.coercon` would otherwise silently import nothing (and downstream
+/// missing-import bite is advisory only).
 pub const STD_PACKAGE_IDS: &[&str] = &[
     "std.agent",
     "std.vcs",
     "std.coercion",
     "std.coord",
+    "std.custody",
     "std.files",
     "std.human",
     "std.ingress",
@@ -7442,7 +7538,8 @@ fn validate_type_refs(
         }
         TypeSyntax::Optional { inner, .. }
         | TypeSyntax::Array { inner, .. }
-        | TypeSyntax::Map { inner, .. } => {
+        | TypeSyntax::Map { inner, .. }
+        | TypeSyntax::Sealed { inner, .. } => {
             validate_type_refs(inner, schema_names, agent_names, diagnostics)
         }
         TypeSyntax::Union { variants, .. } => {
@@ -7749,6 +7846,7 @@ fn validate_turn_access_grants(
                     ),
                 });
             }
+            validate_credential_grant_classes(rule, effect.span, grant, diagnostics);
             if !seen.insert(grant.resource.clone()) {
                 diagnostics.push(Diagnostic {
                     related: Vec::new(),
@@ -7763,6 +7861,74 @@ fn validate_turn_access_grants(
                 });
             }
         }
+    }
+}
+
+/// DR-0053 §14 as extended by DR-0074 §2: each custody operation declares how
+/// it may be narrowed, and a grant that narrows it the wrong way is a check
+/// error rather than a clause that reads as narrowed while meaning nothing.
+///
+/// Only `credential` grants are classed here. Every other resource keeps its
+/// own vocabulary, and an operation name that happens to collide with a custody
+/// one must not be dragged into custody's rules.
+fn validate_credential_grant_classes(
+    rule: &RuleDecl,
+    span: SourceSpan,
+    grant: &IrAccessGrant,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use whipplescript_custody::{GrantClass, Operation};
+
+    let Some(credential) = grant.resource.strip_prefix("credential ") else {
+        return;
+    };
+    for op in &grant.operations {
+        let Ok(operation) = Operation::parse(&op.operation) else {
+            continue;
+        };
+        let class = operation.grant_class();
+        let (bad, detail) = match class {
+            GrantClass::Narrowable => (op.globs.is_empty(), "names no glob list"),
+            GrantClass::TypeNarrowed => match (&op.target, op.globs.is_empty()) {
+                (None, _) => (true, "names no type"),
+                (Some(_), false) => (true, "carries a glob list as well as a type"),
+                (Some(_), true) => (false, ""),
+            },
+            GrantClass::NonNarrowable => (
+                op.target.is_some() || !op.globs.is_empty(),
+                "carries a narrowing clause",
+            ),
+        };
+        if !bad {
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "rule `{}` grants `{}` on credential `{credential}` but {detail}: this operation takes {}",
+                rule.name.name,
+                op.operation,
+                class.requirement()
+            ),
+            suggestion: Some(match class {
+                GrantClass::Narrowable => format!(
+                    "narrow it, as in `{} [\"host/path/*\"]`",
+                    op.operation
+                ),
+                // Failing closed is the point: reading a bare `unwrap` as
+                // "every type" would preserve exactly the over-grant DR-0074
+                // exists to remove.
+                GrantClass::TypeNarrowed => format!(
+                    "name the type it may open, as in `{} for PatientRecord`",
+                    op.operation
+                ),
+                GrantClass::NonNarrowable => format!(
+                    "name it bare, as in `{}`",
+                    op.operation
+                ),
+            }),
+        });
     }
 }
 
@@ -12549,6 +12715,9 @@ fn expr_type_from_type_syntax(ty: &TypeSyntax, semantic: &SemanticContext) -> Ex
         TypeSyntax::Array { inner, .. } => {
             ExprType::Array(Box::new(expr_type_from_type_syntax(inner, semantic)))
         }
+        TypeSyntax::Sealed { inner, .. } => {
+            ExprType::Sealed(Box::new(expr_type_from_type_syntax(inner, semantic)))
+        }
         TypeSyntax::Map { inner, .. } => {
             ExprType::Map(Box::new(expr_type_from_type_syntax(inner, semantic)))
         }
@@ -12680,6 +12849,7 @@ fn expr_type_label(ty: &ExprType) -> String {
         ExprType::Object => "object".to_owned(),
         ExprType::Array(inner) => format!("{}[]", expr_type_label(inner)),
         ExprType::Map(inner) => format!("map<{}>", expr_type_label(inner)),
+        ExprType::Sealed(inner) => format!("sealed<{}>", expr_type_label(inner)),
         ExprType::Optional(inner) => format!("{}?", expr_type_label(inner)),
         ExprType::Collection => "query".to_owned(),
         ExprType::Unknown => "unknown".to_owned(),
@@ -16969,6 +17139,23 @@ fn validate_literal_assignment(
                 );
             }
         }
+        // DR-0074 §1: a sealed value has no literal form. It arises only from
+        // `seal`, so a literal in this position is always wrong, and saying so
+        // is more useful than the mismatch it would otherwise surface later.
+        TypeSyntax::Sealed { .. } => {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "field `{record_schema}.{field}` expects `{}`, which has no literal form",
+                    field_ty.to_source()
+                ),
+                suggestion: Some(format!(
+                    "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
+                    field_ty.to_source()
+                )),
+            });
+        }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
     }
 }
@@ -17408,6 +17595,23 @@ fn validate_literal_against_type(
                     diagnostics,
                 );
             }
+        }
+        // DR-0074 §1: a sealed value has no literal form. It arises only from
+        // `seal`, so a literal in this position is always wrong, and saying so
+        // is more useful than the mismatch it would otherwise surface later.
+        TypeSyntax::Sealed { .. } => {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: rule.body.span,
+                message: format!(
+                    "field `{record_schema}.{field}` expects `{}`, which has no literal form",
+                    field_ty.to_source()
+                ),
+                suggestion: Some(format!(
+                    "seal a value first: `seal <value> as {} with <credential> -> v`, then use `v`",
+                    field_ty.to_source()
+                )),
+            });
         }
         TypeSyntax::Array { .. } | TypeSyntax::Map { .. } => {}
     }
@@ -18166,14 +18370,7 @@ fn parse_effect_line(line: &str) -> Option<(IrEffectKind, Option<String>)> {
         IrEffectKind::SchemaCoerce
     } else if line.starts_with("claim ") {
         IrEffectKind::TrackerClaim
-    } else if line.starts_with("call ")
-        || line.starts_with("recall ")
-        || line.starts_with("learn ")
-        || line.starts_with("curate ")
-        || line.starts_with("promote ")
-        || line.starts_with("undo ")
-        || line.starts_with("transport ")
-    {
+    } else if line.starts_with("call ") || body::starts_with_package_effect_verb(line) {
         IrEffectKind::CapabilityCall
     } else if line.starts_with("emit ") {
         IrEffectKind::EventEmit
@@ -18634,6 +18831,7 @@ impl TypeSyntax {
             Self::Optional { inner, .. } => format!("{}?", inner.to_source()),
             Self::Array { inner, .. } => format!("{}[]", inner.to_source()),
             Self::Map { inner, .. } => format!("map<{}>", inner.to_source()),
+            Self::Sealed { inner, .. } => format!("sealed<{}>", inner.to_source()),
             Self::Union { variants, .. } => variants
                 .iter()
                 .map(Self::to_source)

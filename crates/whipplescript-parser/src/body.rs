@@ -529,6 +529,22 @@ fn effect_operation_spec(keyword: &str) -> Option<&'static EffectOperationSpec> 
         .find(|spec| spec.keyword == keyword)
 }
 
+/// Whether a rule-body line starts with a package effect verb, i.e. a keyword
+/// the generated `effect_operation` table knows.
+///
+/// This exists so the text-based scanners in `lib.rs` derive the verb set from
+/// the SAME generated table the parser dispatches on. They previously carried
+/// their own hardcoded `starts_with` chain, which meant adding a construct
+/// instance to a manifest made it parse while leaving it invisible to the
+/// after-block binding check — the effect was created, and `after <binding>`
+/// then reported the binding as unknown. One table, one answer.
+pub(crate) fn starts_with_package_effect_verb(line: &str) -> bool {
+    EFFECT_OPERATION_GRAMMAR.iter().any(|spec| {
+        line.strip_prefix(spec.keyword)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecTarget {
     RawCommand(String),
@@ -1986,9 +2002,20 @@ impl<'a> BodyParser<'a> {
             }
             return true;
         }
-        let Some(resource) = self.ident_text("resource after `with access to`") else {
+        let Some(mut resource) = self.ident_text("resource after `with access to`") else {
             return false;
         };
+        // DR-0053 §5 spells a credential grant `with access to credential <name>`,
+        // two idents rather than one, so the resource is qualified. Joining them
+        // here keeps `IrAccessGrant.resource` one string and leaves every other
+        // resource's vocabulary untouched.
+        if resource == "credential" && !self.at_sym('{') {
+            let Some(name) = self.ident_text("credential name after `with access to credential`")
+            else {
+                return false;
+            };
+            resource = format!("credential {name}");
+        }
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(
@@ -4168,7 +4195,7 @@ mod tests {
     fn generated_effect_operation_grammar_covers_the_std_constructs() {
         // Drift canary for the build.rs codegen: the table generated from the
         // embedded std manifests (std/manifests/*.json) must contain exactly
-        // the seven shipped effect_operation keywords with their target
+        // the shipped effect_operation keywords with their target
         // capabilities. A manifest edit that adds, drops, or retargets a
         // keyword shows up here before it shows up in parse behavior.
         let table = EFFECT_OPERATION_GRAMMAR
@@ -4178,6 +4205,7 @@ mod tests {
         assert_eq!(
             table,
             vec![
+                ("seal", "custody.wrap"),
                 ("recall", "memory.query"),
                 ("learn", "memory.write"),
                 ("curate", "memory.curate"),

@@ -1,6 +1,6 @@
 //! Native provider lifecycle normalization.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentTurnLifecycleKind {
@@ -103,7 +103,9 @@ impl NativeAgentTurnObservation {
     // crates (whipplescript-provider-codex / -claude, DR-0024 split) — assemble
     // observations from raw provider events via `normalize_*` functions they own.
     // The shape-only redaction (`payload_shape` → `json_shape`) stays kernel-side
-    // so every provider inherits the same egress boundary.
+    // so every provider inherits the same egress boundary — and there is now
+    // exactly ONE `json_shape` (DR-0075), because two of them meant the boundary
+    // was not in fact uniform.
     pub fn new(kind: AgentTurnLifecycleKind, provider_event_type: impl Into<String>) -> Self {
         Self {
             kind,
@@ -132,7 +134,7 @@ impl NativeAgentTurnObservation {
     }
 
     pub fn payload_shape(mut self, payload: &Value) -> Self {
-        self.provider_payload_shape = json_shape(payload);
+        self.provider_payload_shape = crate::provider::json_shape(payload);
         self
     }
 }
@@ -144,17 +146,6 @@ impl NativeAgentTurnObservation {
 // belongs with the adapter that speaks the protocol; the kernel keeps only the
 // provider-agnostic `AgentTurnLifecycleKind` / `NativeAgentTurnObservation`
 // vocabulary and its shape-only redaction boundary (`payload_shape`).
-
-fn json_shape(value: &Value) -> Value {
-    match value {
-        Value::Null => json!({"type":"null"}),
-        Value::Bool(_) => json!({"type":"bool"}),
-        Value::Number(_) => json!({"type":"number"}),
-        Value::String(value) => json!({"type":"string","chars":value.chars().count()}),
-        Value::Array(values) => json!({"type":"array","items":values.len()}),
-        Value::Object(object) => json!({"type":"object","keys":object.len()}),
-    }
-}
 
 // The codex/claude normalizer tests live with their crates now (DR-0024). The
 // provider-agnostic kernel record path is covered by

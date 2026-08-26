@@ -24,6 +24,9 @@ use serde_json::Value;
 /// The root `std/` stays the single source of truth;
 /// `scripts/check-vendored-std.sh` fails the gate if a copy drifts from it.
 const STD_MANIFESTS: &[&str] = &[
+    // DR-0074 §12: custody is the fifteenth std package, carrying the
+    // `custody.seal` effect_operation construct.
+    "vendored-std/manifests/custody.json",
     "vendored-std/manifests/memory.json",
     "vendored-std/manifests/messaging.json",
     "vendored-std/manifests/vcs.json",
@@ -47,7 +50,11 @@ const DECL_GRAMMARS: &[&str] = &[
 /// The DR-0011 grammar vocabulary (mirrors whipplescript-core's
 /// `CONSTRUCT_GRAMMAR_*` constants; a build script cannot depend on the crate
 /// graph it builds for).
-const CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto"];
+// `with` (DR-0074 §12): the vocabulary lacked the word core constructs already
+// use for an instrument slot (`signed with <cred>`, `verify <v> with <handle>`),
+// which only surfaced when a construct instance first needed a credential.
+// Aligning the package-authorable set with the core spelling, not opening it.
+const CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "onto", "with"];
 const SLOT_KINDS: &[&str] = &["identifier", "expression"];
 const BINDING_MODES: &[&str] = &["required", "optional", "none"];
 
@@ -64,7 +71,7 @@ const CLAUSE_KINDS: &[&str] = &[
 
 /// Clause connective vocabulary: Shape 2's slot connectives plus `by` (ledger
 /// `partition by`), per the 2026-07-08 amendment.
-const CLAUSE_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "by"];
+const CLAUSE_CONNECTIVES: &[&str] = &["from", "for", "into", "to", "via", "by", "with"];
 
 fn main() {
     let manifest_dir = PathBuf::from(

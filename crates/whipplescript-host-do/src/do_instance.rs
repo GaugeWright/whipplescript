@@ -377,6 +377,36 @@ fn discover_workspace_skills<Sql: DoSql>(
 /// answers this from its bindings/secrets — the governance plane plugged in with
 /// the infra (mirrors the native `IfcDeliveryGovernance`).
 struct DoDeliveryGovernance;
+/// Refuses every custody capability on the hosted path (DR-0074 §12).
+///
+/// `CustodyTransport` has only in-process and unix-socket realizations and an
+/// isolate has neither, so a DO cannot reach a custodian. This exists so that
+/// gap is a REFUSAL rather than a fall-through to `FixtureCapabilityProvider`,
+/// which produces a success — a program would otherwise believe it had sealed
+/// its data while holding a fixture summary with no ciphertext in it.
+pub struct UnroutableCustodyProvider;
+
+impl whipplescript_kernel::effect_handlers::CapabilityProvider for UnroutableCustodyProvider {
+    fn label(&self) -> &'static str {
+        "custody-provider"
+    }
+
+    fn produce(
+        &self,
+        effect: &whipplescript_store::ClaimableEffect,
+        _config: &whipplescript_kernel::effect_config::EffectConfig,
+    ) -> whipplescript_kernel::effect_handlers::CapabilityOutcome {
+        whipplescript_kernel::effect_handlers::CapabilityOutcome::Failed {
+            error_kind: "custody".to_owned(),
+            message: format!(
+                "capability `{}` needs a custodian, and the hosted path has no transport to one \
+                 yet; run this workflow natively against `whip-custodian serve`",
+                effect.target.as_deref().unwrap_or("custody.*")
+            ),
+        }
+    }
+}
+
 impl DeliveryGovernance for DoDeliveryGovernance {
     fn any_internal_workflow(&self, _resources: &[String]) -> Result<bool, String> {
         Ok(false)
@@ -536,6 +566,27 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                         &config,
                         &DoCapabilityContract,
                         &provider,
+                    )?
+                } else if bound.as_deref() == Some("custody-provider") {
+                    // DR-0074 §12 + the DO-parity gap the tracker records:
+                    // `CustodyTransport` has only in-process and unix-socket
+                    // realizations, and an isolate has neither, so the hosted
+                    // path cannot reach a custodian yet.
+                    //
+                    // This branch exists to FAIL CLOSED. Without it a custody
+                    // effect falls through to the fixture provider below, which
+                    // PRODUCES A SUCCESS — a program would believe it had
+                    // sealed its data while holding a summary string with no
+                    // ciphertext in it, and would then record that as if it
+                    // were an envelope. Refusing is the only honest answer
+                    // until the transport exists.
+                    run_capability_effect_generic(
+                        &mut self.kernel,
+                        self.instance_id,
+                        effect,
+                        &config,
+                        &DoCapabilityContract,
+                        &UnroutableCustodyProvider,
                     )?
                 } else if bound.as_deref() == Some("memory-provider") {
                     let provider = crate::do_memory::DoMemoryCapabilityProvider {
@@ -2539,5 +2590,45 @@ mod tests {
             .find(|run| run.worker_id == "whip-turn-container")
             .expect("class-B run row");
         assert_eq!(run.status, "completed");
+    }
+}
+
+#[cfg(test)]
+mod custody_routing_tests {
+    use super::*;
+    use whipplescript_kernel::effect_handlers::{CapabilityOutcome, CapabilityProvider};
+
+    #[test]
+    fn the_hosted_path_refuses_custody_rather_than_faking_it() {
+        // The failure mode this guards: without an explicit branch, a custody
+        // effect falls through to FixtureCapabilityProvider, which PRODUCES a
+        // success. A program would believe it had sealed its data while holding
+        // a fixture summary containing no ciphertext at all.
+        let effect = whipplescript_store::ClaimableEffect {
+            effect_id: "e1".to_owned(),
+            kind: "capability.call".to_owned(),
+            target: Some("custody.wrap".to_owned()),
+            profile: None,
+            input_json: "{}".to_owned(),
+            required_capabilities_json: "[]".to_owned(),
+            declared_profiles_json: "[]".to_owned(),
+        };
+        let outcome = UnroutableCustodyProvider.produce(&effect, &EffectConfig::default());
+        let CapabilityOutcome::Failed {
+            error_kind,
+            message,
+        } = outcome
+        else {
+            panic!("the hosted path must refuse custody, not produce a value");
+        };
+        assert_eq!(error_kind, "custody");
+        assert!(
+            message.contains("custody.wrap"),
+            "names the capability: {message}"
+        );
+        assert!(
+            message.contains("custodian"),
+            "says what is missing: {message}"
+        );
     }
 }
