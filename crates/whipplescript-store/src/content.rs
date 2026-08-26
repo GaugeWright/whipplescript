@@ -82,6 +82,31 @@ pub enum EraseOutcome {
     Unsupported,
 }
 
+/// DR-0066 §3: check that `body` hashes to `id`, and refuse if it does not.
+///
+/// **Where this is and is not applied.** Verification costs a hash per read,
+/// and the manifest tree reads one blob per node, so hashing every local read
+/// would put a hash on the hot path that #240's work just cleared. The line
+/// drawn here is *trust boundary*, not *every read*: bytes are verified where
+/// the reader did not itself derive the id from those bytes — across a cache,
+/// across an authority, and on a manifest body before it is parsed into a
+/// closure. A store reading a row it hashed itself on the way in is not a
+/// boundary, and `ContentStore::get` deliberately does not pay for one.
+///
+/// That is narrower than §3 reads, and `spec/remote-substrate-conformance.md`
+/// records the narrowing rather than leaving it implied.
+pub fn verify_body(id: &str, body: &str, source: &'static str) -> crate::StoreResult<()> {
+    let actual = crate::stable_hash_hex(body);
+    if actual == id {
+        return Ok(());
+    }
+    Err(crate::StoreError::ContentMismatch {
+        id: id.to_owned(),
+        actual,
+        source,
+    })
+}
+
 /// The content-addressed put/get seam, object-safe so the versioned
 /// workspace (working sets, manifests) runs over any host's blob table:
 /// natively `ContentStore`, on the durable object a thin impl over the

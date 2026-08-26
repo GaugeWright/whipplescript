@@ -87,6 +87,22 @@ pub enum StoreError {
         effect_id: String,
         reason: String,
     },
+    /// DR-0066 §3: bytes fetched by a content hash did not hash to it.
+    ///
+    /// Distinct from [`StoreError::Conflict`] on purpose. `Conflict` means
+    /// someone else got there first and the caller should look again; this
+    /// means a store answered with bytes that are not the bytes asked for, and
+    /// looking again at the same store is not a remedy. Collapsing the two
+    /// would let a `Conflict(_)` assertion pass on silent corruption, which is
+    /// the failure this variant exists to make loud.
+    ContentMismatch {
+        /// The id the bytes were fetched by.
+        id: String,
+        /// The id the bytes actually hash to.
+        actual: String,
+        /// Which reader caught it — the cache, the authority, a manifest read.
+        source: &'static str,
+    },
     /// DR-0054 Phase B: persisted state is stamped with a version newer than
     /// this build supports (a rolled-back binary over a newer store). Fail
     /// closed — never open or fold it silently. The remediation is a build
@@ -6637,11 +6653,32 @@ impl SqliteStore {
     /// AFTER the caller has applied the plan's file ops and auto-checkpointed the
     /// pre-restore head (so the restore is itself undoable). The marker is
     /// appended before the rebuild so the unbounded rebuild folds it immediately.
+    /// DR-0073 §5. `expected_head` is the chain head observed when the restore
+    /// was *planned*, and this refuses if the log has moved since.
+    ///
+    /// The marker this appends does not extend the prefix, it **reinterprets**
+    /// it: replay and the rule pass both fold `context.restored` as
+    /// `live.retain(|k| k.sequence <= restored_to_sequence)`. And
+    /// `restored_to_sequence` is a head belief held across arbitrary filesystem
+    /// IO — plan, auto-checkpoint, write every file, then commit. Without the
+    /// compare-and-set, anything appended during that window is truncated away
+    /// with nothing reported.
+    ///
+    /// The idempotency key does not cover this. It is
+    /// `H(instance_id, cut_id, "restore")`, so it makes a *repeat of the same
+    /// restore* a no-op and says nothing about the head having moved.
+    ///
+    /// Nor does the step-2 checkpoint, though it looks like it should: its
+    /// quiescence test counts `effects WHERE status = 'running'`, and admitting
+    /// a signal creates no running effect. So an ingress daemon admitting at
+    /// sequence 55 while a restore planned at 40 is in flight passes quiescence
+    /// and loses the signal. Two shipped features, used exactly as designed.
     pub fn commit_restore(
         &mut self,
         instance_id: &str,
         restored_to_sequence: i64,
         cut_id: &str,
+        expected_head: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent> {
         let payload = json!({
@@ -6649,15 +6686,26 @@ impl SqliteStore {
             "restored_to_sequence": restored_to_sequence,
         })
         .to_string();
-        let marker = self.append_event(NewEvent {
-            instance_id,
-            event_type: "context.restored",
-            payload_json: &payload,
-            source: "restorable-context",
-            causation_id: None,
-            correlation_id: None,
-            idempotency_key,
-        })?;
+        // One transaction for the CAS and the append together. The public
+        // `append_event_cas` runs in autocommit, which would leave the check and
+        // the write separable — the very shape DR-0067 §2 exists to close.
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let marker = append_event_cas_on(
+            &tx,
+            expected_head,
+            NewEvent {
+                instance_id,
+                event_type: "context.restored",
+                payload_json: &payload,
+                source: "restorable-context",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key,
+            },
+        )?;
+        tx.commit()?;
         self.rebuild_projections(instance_id)?;
         Ok(marker)
     }
@@ -6854,6 +6902,7 @@ pub trait RuntimeStore {
         instance_id: &str,
         restored_to_sequence: i64,
         cut_id: &str,
+        expected_head: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent>;
     fn register_script_capability(
@@ -7227,6 +7276,7 @@ impl RuntimeStore for SqliteStore {
         instance_id: &str,
         restored_to_sequence: i64,
         cut_id: &str,
+        expected_head: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent> {
         SqliteStore::commit_restore(
@@ -7234,6 +7284,7 @@ impl RuntimeStore for SqliteStore {
             instance_id,
             restored_to_sequence,
             cut_id,
+            expected_head,
             idempotency_key,
         )
     }
@@ -10418,8 +10469,11 @@ fn skill_to_json(skill: &SkillView) -> StoreResult<Value> {
     }))
 }
 
-#[cfg(feature = "native")]
-pub(crate) fn stable_hash_hex(value: &str) -> String {
+/// Un-gated from `native` on 2026-08-25: DR-0066 §3's verification has to run
+/// on both hosts, and a content id the durable object cannot recompute is one
+/// it cannot check. `sha2` is pure-Rust and wasm-safe, so the gate was
+/// incidental rather than load-bearing.
+pub fn stable_hash_hex(value: &str) -> String {
     let mut hex = String::with_capacity(32);
     for byte in stable_hash_bytes(value) {
         hex.push_str(&format!("{byte:02x}"));
@@ -10489,7 +10543,6 @@ fn fingerprint_salt_from_metadata(metadata_json: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(feature = "native")]
 fn stable_hash_bytes(value: &str) -> [u8; 16] {
     // SHA-256/128 (the FNV-collision hardening swap): these digests cover
     // user-authored content — file bodies (`file.write.completed`
@@ -11631,22 +11684,39 @@ fn instance_owner_epoch_on(connection: &Connection, instance_id: &str) -> StoreR
 /// present on every append.
 ///
 /// The bump alone evicts the previous owner: from the moment it lands, the old
-/// epoch no longer matches and every append under it is refused. There is
-/// therefore no window between "ownership moved" and "the new owner's first
-/// append" for the old owner to interleave into — which is the property the
-/// tracker asked for and the one the model's transfer-window bite checks.
+/// epoch no longer matches and every append under it is refused.
+///
+/// **Corrected 2026-08-25.** This said there is "therefore no window between
+/// 'ownership moved' and 'the new owner's first append'... which is the
+/// property the model's transfer-window bite checks". Two things were wrong.
+/// The bite checks no such thing — TLA `Claim` is atomic, so the model cannot
+/// see a window the implementation had. And the implementation had one: the
+/// `UPDATE` and the read-back were separate statements in autocommit, so two
+/// concurrent claimants could both bump and both read the later value, each
+/// believing it held an epoch the other also holds.
+///
+/// `RETURNING` closes it — the bump and the value it yields are one statement.
+/// The wrong comment is worth recording because it is how the original
+/// over-generalisation survived: a claim about a guarantee, sitting beside a
+/// mechanism that did not provide it, citing a check that did not test it.
+///
+/// Per DR-0073 §3 this is the **durable-object host's** mechanism. The native
+/// host is deliberately multi-writer and excludes per write instead.
 #[cfg(feature = "native")]
 fn claim_instance_ownership_on(connection: &Connection, instance_id: &str) -> StoreResult<i64> {
-    let updated = connection.execute(
-        "UPDATE instances SET owner_epoch = owner_epoch + 1 WHERE instance_id = ?1",
-        params![instance_id],
-    )?;
-    if updated == 0 {
-        return Err(StoreError::Conflict(format!(
+    let claimed: Option<i64> = connection
+        .query_row(
+            "UPDATE instances SET owner_epoch = owner_epoch + 1 WHERE instance_id = ?1 \
+             RETURNING owner_epoch",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    claimed.ok_or_else(|| {
+        StoreError::Conflict(format!(
             "instance `{instance_id}` does not exist, so its log ownership cannot be claimed"
-        )));
-    }
-    instance_owner_epoch_on(connection, instance_id)
+        ))
+    })
 }
 
 /// DR-0067 §1: give `events` its hash chain, and §5's **backfill** resolution.
@@ -16793,6 +16863,96 @@ mod tests {
             .expect("file.write.completed fact derives");
     }
 
+    /// DR-0073 §5: a restore whose log moved underneath it is REFUSED, not
+    /// silently applied.
+    ///
+    /// The hazard is reachable through two shipped features used as designed.
+    /// `context.restored` does not extend the prefix, it reinterprets it —
+    /// replay folds it as `retain(sequence <= restored_to_sequence)` — and
+    /// `restored_to_sequence` is a head belief held across arbitrary filesystem
+    /// IO. Neither of the two things that look like they protect it do:
+    ///
+    ///  - the idempotency key is `H(instance, cut, "restore")`, so it makes a
+    ///    repeat of the same restore a no-op and says nothing about the head;
+    ///  - the auto-checkpoint's quiescence test counts
+    ///    `effects WHERE status = 'running'`, and admitting a signal creates no
+    ///    running effect, so an ingress daemon sails straight past it.
+    ///
+    /// Without the compare-and-set this test's appended event is truncated away
+    /// and nothing reports it.
+    #[test]
+    fn a_restore_whose_log_moved_underneath_it_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("RestoreCas", "source-1", "ir-1"))
+            .expect("program version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &version.program_id,
+                version_id: &version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        let id = &instance.instance_id;
+
+        record_file_write(&mut store, id, "w-a1", "a.txt", "A1");
+        store
+            .capture_checkpoint(CheckpointCapture {
+                instance_id: id,
+                cut_id: "cut-1",
+                transcript_ref: None,
+                idempotency_key: Some("cp-1"),
+            })
+            .expect("checkpoint captures");
+
+        let plan = match store.plan_restore(id, "cut-1").expect("plan") {
+            RestoreDecision::Ready(plan) => plan,
+            RestoreDecision::Refused { reason } => panic!("restore refused: {reason}"),
+        };
+
+        // The head as the restore would have observed it, before its file IO.
+        let expected_head = store.chain_head(id).expect("head").digest;
+
+        // ...and now a second writer admits something while the restore is in
+        // flight. This is `whip ingress serve --stdio`, which appends without
+        // advancing the instance and creates no running effect.
+        store
+            .append_event(NewEvent {
+                instance_id: id,
+                event_type: "signal.admitted",
+                payload_json: r#"{"signal":"tick"}"#,
+                source: "ingress",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some("delivery-1"),
+            })
+            .expect("the concurrent admission lands, as it should");
+
+        let refused = store.commit_restore(
+            id,
+            plan.restored_to_sequence,
+            "cut-1",
+            &expected_head,
+            Some("restore-1"),
+        );
+        let Err(StoreError::Conflict(message)) = refused else {
+            panic!("a restore must not truncate a log that moved under it, got {refused:?}");
+        };
+        assert!(
+            message.contains("compare-and-set"),
+            "the refusal must say the head moved, not merely conflict: {message}"
+        );
+
+        // And the admission is still there — the refusal cost nothing.
+        let events = store.list_events(id).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "signal.admitted"),
+            "the concurrently admitted signal must survive the refused restore"
+        );
+    }
+
     #[test]
     fn plan_restore_reconciles_files_and_commit_restore_rewinds_the_planes() {
         // RC-4c: plan_restore returns the full reconcile (write manifest paths
@@ -16843,7 +17003,13 @@ mod tests {
         // Commit the restore: the marker rewinds the file plane so a fresh
         // checkpoint of the (marker-folded) manifest hashes to the cut manifest.
         store
-            .commit_restore(id, plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .commit_restore(
+                id,
+                plan.restored_to_sequence,
+                "cut-1",
+                &store.chain_head(id).expect("head").digest,
+                Some("restore-1"),
+            )
             .expect("restore commits");
         let after = store
             .capture_checkpoint(CheckpointCapture {

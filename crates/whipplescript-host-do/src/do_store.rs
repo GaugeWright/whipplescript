@@ -966,18 +966,17 @@ pub(crate) fn int(n: i64) -> SqlValue {
     SqlValue::Int(n)
 }
 
-/// SHA-256/128, byte-identical to the native store's `stable_hash_hex` — the DO
-/// must compute the same skill/file `content_hash` the native path does so
-/// content registered under either backend has a stable identity. (Swapped
-/// from FNV-1a in the collision-hardening pass; keep the two in lockstep.)
+/// SHA-256/128 — now *the* native implementation rather than a copy of it.
+///
+/// This was a second implementation carrying a comment that asked whoever
+/// touched it to "keep the two in lockstep": a content id that differs between
+/// hosts breaks content addressing across them, and nothing checked the two
+/// agreed. The store's version was gated on `native` only incidentally — `sha2`
+/// is pure-Rust and wasm-safe — so un-gating it (2026-08-25, for DR-0066 §3's
+/// verification, which must run on both hosts) let the duplicate go and turned
+/// an obligation on the reader into one the compiler holds.
 pub(crate) fn stable_hash_hex(value: &str) -> String {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(value.as_bytes());
-    let mut hex = String::with_capacity(32);
-    for byte in &digest[..16] {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
+    whipplescript_store::stable_hash_hex(value)
 }
 
 /// Maps an 8-column skill row (`skill_id..required_capabilities`) to a `SkillView`.
@@ -6218,11 +6217,20 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         }))
     }
 
+    /// Native parity for DR-0073 §5's compare-and-set.
+    ///
+    /// This host serialises writers by platform, so the head cannot move under
+    /// a restore the way it can natively. The CAS is here anyway, for the
+    /// reason DR-0066 gives for parity generally: "the two hosts behave the
+    /// same" is the property, and a difference justified by a guarantee made
+    /// elsewhere is still a difference. It also means the marker that
+    /// reinterprets a prefix carries the same condition on both hosts.
     fn commit_restore(
         &mut self,
         instance_id: &str,
         restored_to_sequence: i64,
         cut_id: &str,
+        expected_head: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent> {
         let payload = serde_json::json!({
@@ -6230,8 +6238,9 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "restored_to_sequence": restored_to_sequence,
         })
         .to_string();
-        let marker = do_append_event(
+        let marker = do_append_event_cas(
             &self.sql,
+            expected_head,
             NewEvent {
                 instance_id,
                 event_type: "context.restored",
@@ -13979,7 +13988,13 @@ mod tests {
         assert_eq!(plan.removes, vec!["c.txt".to_owned()]);
 
         store
-            .commit_restore("i1", plan.restored_to_sequence, "cut-1", Some("restore-1"))
+            .commit_restore(
+                "i1",
+                plan.restored_to_sequence,
+                "cut-1",
+                &store.chain_head("i1").expect("head").digest,
+                Some("restore-1"),
+            )
             .expect("restore commits");
         let after = store
             .capture_checkpoint(CheckpointCapture {

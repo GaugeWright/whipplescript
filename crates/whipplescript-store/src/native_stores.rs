@@ -350,10 +350,16 @@ impl RuntimeStore for NativeStores {
         instance_id: &str,
         restored_to_sequence: i64,
         cut_id: &str,
+        expected_head: &str,
         idempotency_key: Option<&str>,
     ) -> StoreResult<StoredEvent> {
-        self.runtime
-            .commit_restore(instance_id, restored_to_sequence, cut_id, idempotency_key)
+        self.runtime.commit_restore(
+            instance_id,
+            restored_to_sequence,
+            cut_id,
+            expected_head,
+            idempotency_key,
+        )
     }
 
     fn register_script_capability(

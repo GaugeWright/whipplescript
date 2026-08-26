@@ -695,6 +695,18 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                 })
                 .map_err(|error| format!("auto-checkpoint before restore: {error:?}"))?;
         }
+        // DR-0073 §5, captured after the auto-checkpoint for the same reason as
+        // native: that checkpoint appends, so a plan-time head would refuse
+        // every restore.
+        let expected_head = {
+            let kernel = self.kernel.as_ref().ok_or("instance kernel consumed")?;
+            kernel
+                .store()
+                .chain_head(&instance_id)
+                .map_err(|error| format!("read log head: {error:?}"))?
+                .digest
+        };
+
         // 3) Apply the file reconcile through the DO file plane. Every content
         //    hash was verified present in step 1, so writes cannot fail for
         //    missing bytes.
@@ -725,6 +737,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     &instance_id,
                     plan.restored_to_sequence,
                     cut_id,
+                    &expected_head,
                     Some(&commit_key),
                 )
                 .map_err(|error| format!("commit restore: {error:?}"))?

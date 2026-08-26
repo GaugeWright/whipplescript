@@ -416,8 +416,10 @@ mod tests {
     }
 
     impl ContentBlobs for CountingBlobs {
+        /// `stable_hash_hex`, matching `ContentStore::put`. Said `sha256_hex`
+        /// until 2026-08-25 — a 256-bit id where the real store mints 128.
         fn put(&self, body: &str) -> StoreResult<String> {
-            let id = sha256_hex(body);
+            let id = crate::stable_hash_hex(body);
             self.writes.borrow_mut().push(id.clone());
             self.stored.borrow_mut().insert(id.clone(), body.to_owned());
             Ok(id)

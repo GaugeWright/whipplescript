@@ -14,11 +14,21 @@
 //! bad replication protocol, and every conclusion the design draws from
 //! content-addressing stops holding.
 //!
+//! **A mismatch is refused, not repaired.** Pulling through on a bad cache
+//! entry would hand the caller correct bytes and overwrite the bad ones, which
+//! is what a cache ordinarily should do. It is refused here because a cache
+//! returning bytes that are not the bytes asked for is a fault about which
+//! nothing else is known — the same store may be wrong in ways no hash catches
+//! — and a self-healing read makes that fault invisible for exactly as long as
+//! it stays survivable. DR-0068's gaps section reached the same conclusion for
+//! a lapsed pin: "the honest resolution is refusal on resume, not silent
+//! re-fetch."
+//!
 //! What is deliberately absent: eviction, size bounds, and cache warming. They
 //! are policy over a correct core, and none of them changes what an answer
-//! means. R2 (or S3, or any object store) plugs in as the `authority` —
-//! choosing and provisioning one is a deployment decision, and nothing in this
-//! file needs to know which was made.
+//! means. Any object store plugs in as the `authority` — choosing and
+//! provisioning one is a deployment decision, and nothing in this file needs to
+//! know which was made. (Named a vendor until 2026-08-25; DR-0071 refusal 1.)
 
 use crate::content::{BlobStatus, ContentBlobs, EraseOutcome};
 use crate::StoreResult;
@@ -58,6 +68,14 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
 
     fn get(&self, id: &str) -> StoreResult<Option<String>> {
         if let Some(body) = self.cache.get(id)? {
+            // THE VERIFICATION (DR-0066 §3). This is the boundary the whole
+            // cache-is-not-a-replica argument rests on: a cache "can never be
+            // wrong, only colder", and that is a property of content addressing
+            // only if somebody actually checks. Unverified, this line hands the
+            // caller whatever the cache said — which is the silent-wrong-bytes
+            // failure the substrate exists to exclude, reached through the one
+            // component added for speed.
+            crate::content::verify_body(id, &body, "read-through cache")?;
             return Ok(Some(body));
         }
         // THE PULL-THROUGH. Without this the cache's emptiness would be
@@ -65,6 +83,10 @@ impl<C: ContentBlobs, A: ContentBlobs> ContentBlobs for ReadThrough<C, A> {
         let Some(body) = self.authority.get(id)? else {
             return Ok(None);
         };
+        // The authority is verified too. It is more trusted than the cache, not
+        // trusted — §3 is an obligation on readers, and "I got it from the
+        // authority" is exactly the reasoning it refuses.
+        crate::content::verify_body(id, &body, "content authority")?;
         let _ = self.cache.put(&body);
         Ok(Some(body))
     }
@@ -139,8 +161,16 @@ mod tests {
     }
 
     impl ContentBlobs for CountingBlobs {
+        /// `stable_hash_hex`, because that is what `ContentStore::put` mints.
+        ///
+        /// This said `items::sha256_hex` until 2026-08-25 — a full 256-bit id
+        /// where the real store mints a 128-bit one. Every read-through test
+        /// was therefore running against a store whose ids no real backend
+        /// produces, and nothing noticed because no reader verified. Adding
+        /// DR-0066 §3's check broke five tests immediately, which is the check
+        /// doing precisely its job on its first outing.
         fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::items::sha256_hex(body);
+            let id = crate::stable_hash_hex(body);
             self.stored.borrow_mut().insert(id.clone(), body.to_owned());
             Ok(id)
         }
@@ -186,6 +216,80 @@ mod tests {
 
     fn layered() -> ReadThrough<CountingBlobs, CountingBlobs> {
         ReadThrough::new(CountingBlobs::default(), CountingBlobs::default())
+    }
+
+    /// A store that answers every id with bytes that are not that id's bytes.
+    ///
+    /// The whole point of the double: content addressing means a cache "cannot
+    /// be wrong, only colder" — but only if a reader checks. This is the store
+    /// that lies, and without one nothing distinguishes a reader that verifies
+    /// from a reader that trusts.
+    #[derive(Default)]
+    struct LyingBlobs;
+
+    impl ContentBlobs for LyingBlobs {
+        fn put(&self, body: &str) -> StoreResult<String> {
+            Ok(crate::stable_hash_hex(body))
+        }
+        fn get(&self, _id: &str) -> StoreResult<Option<String>> {
+            Ok(Some("not the bytes you asked for".to_owned()))
+        }
+        fn status(&self, _id: &str) -> StoreResult<BlobStatus> {
+            Ok(BlobStatus::Live { byte_len: 29 })
+        }
+    }
+
+    /// DR-0066 §3 on the cache side: the substrate's most emphatic obligation,
+    /// and until 2026-08-25 it was implemented on no read path at all and was
+    /// not listed among the obligations with no check. Two independent reviews
+    /// found it separately.
+    #[test]
+    fn a_lying_cache_is_refused_rather_than_returned() {
+        let layered = ReadThrough::new(LyingBlobs, CountingBlobs::default());
+        let id = layered
+            .put("the real body")
+            .expect("put reaches the authority");
+
+        let read = layered.get(&id);
+        let Err(crate::StoreError::ContentMismatch {
+            id: asked, source, ..
+        }) = read
+        else {
+            panic!("a cache answering with the wrong bytes must be refused, got {read:?}");
+        };
+        assert_eq!(asked, id, "the refusal must name the id that was asked for");
+        assert_eq!(
+            source, "read-through cache",
+            "and must say which reader caught it, since the authority is \
+             verified on the same path"
+        );
+    }
+
+    /// The authority gets no more trust than the cache. §3 is an obligation on
+    /// readers, and "it came from the authority" is the reasoning it refuses —
+    /// an object store with a corrupted object is exactly as wrong as a bad
+    /// cache, and is the harder of the two to notice.
+    #[test]
+    fn a_lying_authority_is_refused_too() {
+        let layered = ReadThrough::new(CountingBlobs::default(), LyingBlobs);
+
+        let read = layered.get("blob_that_the_authority_will_lie_about");
+        let Err(crate::StoreError::ContentMismatch { source, .. }) = read else {
+            panic!("an authority answering with the wrong bytes must be refused, got {read:?}");
+        };
+        assert_eq!(source, "content authority");
+    }
+
+    /// The refusal must not be reachable by an honest miss — otherwise "content
+    /// does not exist" and "content came back wrong" collapse into one answer,
+    /// which is the *absent*-for-*erased* confusion in a different register.
+    #[test]
+    fn an_honest_miss_is_still_none_not_a_mismatch() {
+        let layered = layered();
+        assert_eq!(
+            layered.get("nothing_was_ever_stored_here").expect("miss"),
+            None
+        );
     }
 
     /// The cache layer must satisfy the content contract itself, not merely

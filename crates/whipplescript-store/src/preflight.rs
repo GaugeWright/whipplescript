@@ -99,6 +99,12 @@ pub fn preflight_manifest<B: ContentBlobs + ?Sized>(
             reason: MissingReason::Absent,
         });
     };
+    // DR-0066 §3, before the bytes are given any meaning. A closure derived
+    // from an unverified manifest is a closure over whatever the store felt
+    // like returning: every id below comes out of this parse, so one wrong
+    // manifest silently redefines the whole run's inputs, and every per-input
+    // check that follows would then be checking the wrong things and passing.
+    crate::content::verify_body(manifest_hash, &manifest_body, "manifest")?;
     let manifest: std::collections::BTreeMap<String, String> =
         serde_json::from_str(&manifest_body)?;
 
@@ -140,6 +146,17 @@ mod tests {
     }
 
     impl FakeBlobs {
+        /// Store a manifest under its REAL content id and hand it back.
+        ///
+        /// Needed once `preflight_manifest` verifies the manifest against the
+        /// hash it was asked for (DR-0066 §3). Before that these tests named
+        /// the manifest `"m"`, which no store could ever mint — the fixture was
+        /// asserting on a manifest that could not exist.
+        fn put_manifest(&self, body: &str) -> String {
+            let id = crate::stable_hash_hex(body);
+            self.put_at(&id, body);
+            id
+        }
         fn put_at(&self, id: &str, body: &str) {
             self.live
                 .borrow_mut()
@@ -152,8 +169,13 @@ mod tests {
     }
 
     impl ContentBlobs for FakeBlobs {
+        /// Content-addressed, like the store it stands in for.
+        ///
+        /// This minted `format!("blob_{}", body.len())` until 2026-08-25, so
+        /// two distinct bodies of equal length shared an id — a double that
+        /// contradicted the one property the content plane is built on.
         fn put(&self, body: &str) -> StoreResult<String> {
-            let id = format!("blob_{}", body.len());
+            let id = crate::stable_hash_hex(body);
             self.put_at(&id, body);
             Ok(id)
         }
@@ -188,10 +210,10 @@ mod tests {
         let blobs = FakeBlobs::default();
         blobs.put_at("b1", "one");
         blobs.put_at("b2", "two");
-        blobs.put_at("m", &manifest_of(&[("a.txt", "b1"), ("b.txt", "b2")]));
+        let m = blobs.put_manifest(&manifest_of(&[("a.txt", "b1"), ("b.txt", "b2")]));
 
         assert_eq!(
-            preflight_manifest(&blobs, "m").expect("preflight runs"),
+            preflight_manifest(&blobs, &m).expect("preflight runs"),
             PreflightOutcome::Ready { checked: 2 }
         );
     }
@@ -203,12 +225,13 @@ mod tests {
         let blobs = FakeBlobs::default();
         blobs.put_at("b1", "one");
         blobs.erase_at("b2", 3);
-        blobs.put_at(
-            "m",
-            &manifest_of(&[("a.txt", "b1"), ("b.txt", "b2"), ("c.txt", "b3")]),
-        );
+        let m = blobs.put_manifest(&manifest_of(&[
+            ("a.txt", "b1"),
+            ("b.txt", "b2"),
+            ("c.txt", "b3"),
+        ]));
 
-        let outcome = preflight_manifest(&blobs, "m").expect("preflight runs");
+        let outcome = preflight_manifest(&blobs, &m).expect("preflight runs");
         let PreflightOutcome::Incomplete { checked, missing } = outcome else {
             panic!("expected an incomplete closure, got {outcome:?}");
         };
@@ -237,8 +260,8 @@ mod tests {
     #[test]
     fn every_missing_input_is_named_not_only_the_first() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("m", &manifest_of(&[("a", "x"), ("b", "y"), ("c", "z")]));
-        let outcome = preflight_manifest(&blobs, "m").expect("preflight runs");
+        let m = blobs.put_manifest(&manifest_of(&[("a", "x"), ("b", "y"), ("c", "z")]));
+        let outcome = preflight_manifest(&blobs, &m).expect("preflight runs");
         let PreflightOutcome::Incomplete { missing, .. } = outcome else {
             panic!("expected an incomplete closure");
         };
@@ -346,9 +369,9 @@ mod tests {
     #[test]
     fn a_genuinely_empty_manifest_is_ready() {
         let blobs = FakeBlobs::default();
-        blobs.put_at("m", &manifest_of(&[]));
+        let m = blobs.put_manifest(&manifest_of(&[]));
         assert_eq!(
-            preflight_manifest(&blobs, "m").expect("preflight runs"),
+            preflight_manifest(&blobs, &m).expect("preflight runs"),
             PreflightOutcome::Ready { checked: 0 }
         );
     }

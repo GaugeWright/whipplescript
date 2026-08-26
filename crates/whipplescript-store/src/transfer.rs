@@ -225,8 +225,10 @@ mod tests {
     }
 
     impl ContentBlobs for FakeBlobs {
+        /// `stable_hash_hex`, matching `ContentStore::put`. Said `sha256_hex`
+        /// until 2026-08-25 — a 256-bit id where the real store mints 128.
         fn put(&self, body: &str) -> StoreResult<String> {
-            let id = crate::items::sha256_hex(body);
+            let id = crate::stable_hash_hex(body);
             self.live.borrow_mut().insert(id.clone(), body.to_owned());
             Ok(id)
         }

@@ -21,12 +21,12 @@ use whipplescript_store::branches::{
     CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome, StatusOutcome,
     MAINLINE_BRANCH_ID,
 };
-use whipplescript_store::content::ContentBlobs;
+use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
 use whipplescript_store::event_chain;
 use whipplescript_store::{StoreError, StoreResult};
 
 use crate::do_store::{
-    as_opt_text, as_text, opt_text, sql_err, stable_hash_hex, text, DoSql, SqlValue,
+    as_i64, as_opt_text, as_text, opt_text, sql_err, stable_hash_hex, text, DoSql, SqlValue,
 };
 
 pub struct DoBranches<S: DoSql> {
@@ -1118,6 +1118,18 @@ impl<S: DoSql> DoContentBlobs<S> {
             &[],
         )
         .map_err(sql_err)?;
+        // DR-0066 §5's tombstone, added 2026-08-25. Without it this host could
+        // not tell *erased* from *absent* — see the `erase` impl below for why
+        // that was a conformance failure and not merely a missing feature.
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_erasures (
+                id TEXT PRIMARY KEY,
+                byte_len INTEGER NOT NULL,
+                erased_at TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
         Ok(Self { sql })
     }
 }
@@ -1140,5 +1152,97 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
             .query("SELECT body FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    /// Native parity for DR-0066 §5. Live from the blob row, else the
+    /// tombstone, else unknown.
+    ///
+    /// No pack or chunk-root arms, because this host has neither tier — the
+    /// native `status` consults both and would report `Live` for a packed
+    /// chunk. If a chunk tier ever lands here, those arms come with it.
+    fn status(&self, id: &str) -> StoreResult<BlobStatus> {
+        let live = self
+            .sql
+            .query(
+                "SELECT byte_len FROM content_blobs WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = live.first() {
+            return Ok(BlobStatus::Live {
+                byte_len: as_i64(&row[0]) as u64,
+            });
+        }
+        let erased = self
+            .sql
+            .query(
+                "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        if let Some(row) = erased.first() {
+            return Ok(BlobStatus::Erased {
+                byte_len: as_i64(&row[0]) as u64,
+            });
+        }
+        Ok(BlobStatus::Unknown)
+    }
+
+    /// Per-blob erasure: drop the payload, keep hash and size.
+    ///
+    /// **This host had no erasure at all until 2026-08-25**, inheriting the
+    /// trait defaults — `status` derived Live/Unknown from `get`, and `erase`
+    /// answered `Unsupported`. That default is honest for a store that *cannot*
+    /// delete bytes; it was not honest here, where bytes can be deleted and the
+    /// store simply had no memory of it. The consequence was that DR-0066 §5's
+    /// distinguished answer did not exist on the shipped cloud host: a caller
+    /// asking about erased content was told *absent* and would retry forever
+    /// for bytes that are gone, which is §5's own definition of non-conforming.
+    ///
+    /// The gap survived because the shared content conformance suite accepts
+    /// `Unsupported` unconditionally, so this host passed the suite by
+    /// declining the obligation rather than by meeting it.
+    fn erase(&self, id: &str, at: &str) -> StoreResult<EraseOutcome> {
+        let live = self
+            .sql
+            .query(
+                "SELECT byte_len FROM content_blobs WHERE id = ?1",
+                &[text(id)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = live.first() else {
+            // Not live. Either it was already erased — an idempotent retry,
+            // which must not read as "never existed" — or nothing was stored.
+            let tombstoned = self
+                .sql
+                .query(
+                    "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                    &[text(id)],
+                )
+                .map_err(sql_err)?;
+            return Ok(match tombstoned.first() {
+                Some(_) => EraseOutcome::AlreadyErased,
+                None => EraseOutcome::Unknown,
+            });
+        };
+        let byte_len = as_i64(&row[0]);
+        // Tombstone BEFORE the delete. The other order has a crash window that
+        // produces exactly the *absent*-for-*erased* substitution §5 refuses,
+        // and it is the same bottom-up discipline DR-0066 §4 applies to
+        // publication: the record that makes an absence honest must be durable
+        // before the bytes stop being there.
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO content_erasures (id, byte_len, erased_at) \
+                 VALUES (?1, ?2, ?3)",
+                &[text(id), SqlValue::Int(byte_len), text(at)],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute("DELETE FROM content_blobs WHERE id = ?1", &[text(id)])
+            .map_err(sql_err)?;
+        Ok(EraseOutcome::Erased {
+            byte_len: byte_len as u64,
+        })
     }
 }

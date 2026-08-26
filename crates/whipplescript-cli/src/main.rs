@@ -33678,6 +33678,23 @@ fn restore(options: &CliOptions) -> ExitCode {
         return report_store_error("failed to auto-checkpoint before restore", error);
     }
 
+    // DR-0073 §5: the head this restore commits against.
+    //
+    // Captured HERE, after the auto-checkpoint, because that checkpoint appends
+    // its own events — capturing at plan time would compare against a head the
+    // restore itself moved and refuse every time.
+    //
+    // What this covers is step 3: arbitrary filesystem IO, unbounded, the window
+    // in which an ingress daemon can admit a signal the commit would otherwise
+    // truncate away silently. What it does not cover is the short gap between
+    // step 1's plan and step 2's checkpoint, which contains two store calls and
+    // no IO. That residue is recorded in DR-0073's honest gaps rather than
+    // papered over.
+    let expected_head = match kernel.store().chain_head(instance_id) {
+        Ok(head) => head.digest,
+        Err(error) => return report_store_error("failed to read the log head", error),
+    };
+
     // 3) Apply the file reconcile through the native file store. Every content
     //    hash was verified present in step 1, so writes cannot fail for missing
     //    bytes.
@@ -33709,6 +33726,7 @@ fn restore(options: &CliOptions) -> ExitCode {
         instance_id,
         plan.restored_to_sequence,
         cut_id,
+        &expected_head,
         Some(&commit_key),
     ) {
         Ok(marker) if options.json => emit_json(json!({
@@ -40143,6 +40161,17 @@ fn store_error(error: StoreError) -> String {
         StoreError::Conflict(message) => message,
         StoreError::PolicyBlocked { reason, .. } => reason,
         StoreError::CapacityBlocked { reason, .. } => reason,
+        // DR-0066 §3: a store answered with bytes that are not the bytes asked
+        // for. Say which store, because the remedy differs — a bad cache entry
+        // is discardable, a bad authority object is data loss — and never
+        // suggest retrying, which is what a caller does with a Conflict and is
+        // exactly wrong here.
+        StoreError::ContentMismatch { id, actual, source } => format!(
+            "content integrity failure: the {source} returned bytes for `{id}` that hash to \
+             `{actual}`. These are not the bytes that id names. This is not a transient \
+             condition and retrying the same read will not fix it; the {source}'s copy is \
+             corrupt or has been tampered with"
+        ),
         // DR-0054 Phase B: a store written by a newer whip fails closed with
         // both versions named. The store is intact; deleting it is never the
         // remediation.

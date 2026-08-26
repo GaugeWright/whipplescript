@@ -253,6 +253,55 @@ mod tests {
         );
     }
 
+    /// DR-0066 §5 on this host, which had no erasure at all until 2026-08-25.
+    ///
+    /// The shared content suite already ran here and passed — by way of its
+    /// `EraseOutcome::Unsupported` arm, which accepts a store that declines the
+    /// obligation. So the suite could not tell "this host cannot erase" from
+    /// "this host erases and forgets", and the distinguished answer §5 exists
+    /// for was unavailable on the shipped cloud host. This test asserts the
+    /// obligation directly rather than through an arm that permits declining.
+    #[test]
+    fn do_erased_is_not_absent() {
+        use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
+
+        let blobs = crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
+            .expect("content blobs open");
+        let id = blobs.put("bytes that will be erased").expect("put");
+
+        assert!(
+            matches!(blobs.status(&id).expect("status"), BlobStatus::Live { .. }),
+            "stored content reads as live before erasure"
+        );
+
+        let outcome = blobs.erase(&id, "2026-08-25T00:00:00Z").expect("erase");
+        assert!(
+            matches!(outcome, EraseOutcome::Erased { .. }),
+            "this host must erase rather than answer Unsupported, got {outcome:?}"
+        );
+
+        // The distinction itself: erased content is NOT absent content.
+        let erased = blobs.status(&id).expect("status after erasure");
+        assert!(
+            matches!(erased, BlobStatus::Erased { .. }),
+            "erased content must read as erased, not as unknown — a caller told \
+             `absent` retries forever for bytes that are gone: {erased:?}"
+        );
+        assert_eq!(blobs.get(&id).expect("get after erasure"), None);
+
+        // And absence stays absence, or the distinction is only half made.
+        assert!(matches!(
+            blobs.status("never_stored").expect("status"),
+            BlobStatus::Unknown
+        ));
+
+        // Idempotent retry: erasing again is AlreadyErased, never Unknown.
+        assert!(matches!(
+            blobs.erase(&id, "2026-08-25T00:00:01Z").expect("re-erase"),
+            EraseOutcome::AlreadyErased
+        ));
+    }
+
     #[test]
     fn do_a_name_is_claimed_then_advanced() {
         let mut authority = authority();
