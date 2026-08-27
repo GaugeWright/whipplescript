@@ -1074,11 +1074,12 @@ fn run_view_from_row(row: &[SqlValue]) -> RunView {
     }
 }
 
-/// The 12-column instance-revision projection, used by the by-id / by-idempotency
+/// The 13-column instance-revision projection, used by the by-id / by-idempotency
 /// revision lookups.
 const REVISION_SELECT: &str = "SELECT revision_id, instance_id, epoch, from_version_id, \
-     to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, status, \
-     idempotency_key, created_at, activated_at FROM instance_revisions ";
+     to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, \
+     rule_carries_json, status, idempotency_key, created_at, activated_at \
+     FROM instance_revisions ";
 
 /// A revision by its id, mirroring `revision_by_id_on`.
 fn do_revision_by_id<Sql: DoSql>(
@@ -1110,6 +1111,13 @@ fn do_revision_by_idempotency<Sql: DoSql>(
     Ok(rows.first().map(|r| workflow_revision_from_row(r)))
 }
 
+/// Compares two recorded carry lists by value, mirroring the native
+/// `json_or_empty_array`: an absent, empty, or unparseable record all mean "no
+/// carries" and must not read as a conflicting activation.
+fn json_or_empty_array(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::Array(Vec::new()))
+}
+
 /// Guards that a reused revision idempotency key carries identical activation
 /// input, mirroring `ensure_revision_idempotency_matches`.
 fn ensure_revision_idempotency_matches(
@@ -1124,6 +1132,10 @@ fn ensure_revision_idempotency_matches(
         && existing.to_version_id.as_str() == activation.to_version_id
         && existing.cancellation_policy.as_str() == cancellation_policy
         && &existing_activation_policy == activation_policy
+        // The carry is operator input; the derived correspondence is not
+        // compared. Mirrors `ensure_revision_idempotency_matches` (DR-0077).
+        && json_or_empty_array(&existing.rule_carries_json)
+            == json_or_empty_array(activation.rule_carries_json)
     {
         return Ok(());
     }
@@ -1181,10 +1193,11 @@ fn workflow_revision_from_row(row: &[SqlValue]) -> WorkflowRevisionView {
         activated_by_event_id: as_text(&row[5]),
         activation_policy_json: as_text(&row[6]),
         cancellation_policy: as_text(&row[7]),
-        status: as_text(&row[8]),
-        idempotency_key: as_opt_text(&row[9]),
-        created_at: as_text(&row[10]),
-        activated_at: as_text(&row[11]),
+        rule_carries_json: as_text(&row[8]),
+        status: as_text(&row[9]),
+        idempotency_key: as_opt_text(&row[10]),
+        created_at: as_text(&row[11]),
+        activated_at: as_text(&row[12]),
     }
 }
 
@@ -2495,10 +2508,17 @@ fn do_replay_revision_activation<Sql: DoSql>(
         .get("cancellation_policy")
         .and_then(Value::as_str)
         .unwrap_or("keep");
+    // Replayed from the payload, never recomputed -- a later canonicalizer must
+    // not change what an already-activated revision meant (DR-0077).
+    let rule_carries_json = payload
+        .get("rule_carries")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "[]".to_owned());
     sql.execute(
         "INSERT INTO instance_revisions (revision_id, instance_id, epoch, from_version_id, \
-         to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, status, \
-         idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9) \
+         to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, \
+         rule_carries_json, status, idempotency_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10) \
          ON CONFLICT(revision_id) DO NOTHING",
         &[
             text(revision_id),
@@ -2509,6 +2529,7 @@ fn do_replay_revision_activation<Sql: DoSql>(
             text(event_id),
             text(&activation_policy_json),
             text(cancellation_policy),
+            text(&rule_carries_json),
             opt_text(idempotency_key),
         ],
     )
@@ -4793,9 +4814,9 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .sql
             .query(
                 "SELECT revision_id, instance_id, epoch, from_version_id, to_version_id, \
-                 activated_by_event_id, activation_policy_json, cancellation_policy, status, \
-                 idempotency_key, created_at, activated_at FROM instance_revisions \
-                 WHERE instance_id = ?1 ORDER BY epoch",
+                 activated_by_event_id, activation_policy_json, cancellation_policy, \
+                 rule_carries_json, status, idempotency_key, created_at, activated_at \
+                 FROM instance_revisions WHERE instance_id = ?1 ORDER BY epoch",
                 &[text(instance_id)],
             )
             .map_err(sql_err)?;
@@ -5038,6 +5059,10 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .first()
             .map(|r| as_text(&r[0]))
             .ok_or_else(|| sql_err("failed to mint revision id".to_string()))?;
+        let rule_carries: Value = serde_json::from_str(activation.rule_carries_json)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
+        let rule_correspondence: Value =
+            serde_json::from_str(activation.rule_correspondence_json).unwrap_or(Value::Null);
         let queued_effects = do_revision_policy_effects(&self.sql, activation.instance_id, false)?;
         let running_effects = do_revision_policy_effects(&self.sql, activation.instance_id, true)?;
         let queued_effects_for_policy = if cancellation_policy == "keep" {
@@ -5059,6 +5084,10 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             "to_epoch": next_epoch,
             "activation_policy": activation_policy,
             "cancellation_policy": cancellation_policy,
+            // Instruction and evidence, side by side and never merged
+            // (DR-0077). Mirrors the native activation payload.
+            "rule_carries": rule_carries,
+            "rule_correspondence": rule_correspondence,
             "terminal_cancel_effects": &queued_effects_for_policy,
             "request_cancel_effects": &running_effects_for_policy,
         })
@@ -5079,7 +5108,8 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .execute(
                 "INSERT INTO instance_revisions (revision_id, instance_id, epoch, from_version_id, \
                  to_version_id, activated_by_event_id, activation_policy_json, cancellation_policy, \
-                 status, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)",
+                 rule_carries_json, status, idempotency_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10)",
                 &[
                     text(&revision_id),
                     text(activation.instance_id),
@@ -5089,6 +5119,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                     text(&event.event_id),
                     text(activation.activation_policy_json),
                     text(cancellation_policy),
+                    text(&rule_carries.to_string()),
                     opt_text(activation.idempotency_key),
                 ],
             )
@@ -9831,7 +9862,8 @@ pub(crate) mod test_support {
                 revision_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, epoch INTEGER NOT NULL,
                 from_version_id TEXT NOT NULL, to_version_id TEXT NOT NULL,
                 activated_by_event_id TEXT NOT NULL, activation_policy_json TEXT NOT NULL DEFAULT '{}',
-                cancellation_policy TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT,
+                cancellation_policy TEXT NOT NULL, rule_carries_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL, idempotency_key TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -13446,6 +13478,8 @@ mod tests {
             to_version_id: "ver_b",
             activation_policy_json: "{}",
             cancellation_policy: "cancel_queued",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("act-1"),
         };
         let view = store.activate_revision(activation).expect("activate");
@@ -13474,6 +13508,8 @@ mod tests {
                 to_version_id: "ver_b",
                 activation_policy_json: "{}",
                 cancellation_policy: "cancel_queued",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("act-1"),
             })
             .expect("replay");
@@ -13488,6 +13524,8 @@ mod tests {
                 to_version_id: "ver_b",
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("act-2"),
             })
             .is_err());

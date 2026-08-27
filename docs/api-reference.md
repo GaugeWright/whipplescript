@@ -999,7 +999,8 @@ expectation as absent.
 whip [--store path] revise <instance> <workflow.whip> \
   [--root Workflow] \
   [--dry-run] \
-  [--cancel keep|queued|running]
+  [--cancel keep|queued|running] \
+  [--carry old=new]
 ```
 
 The command checks that a candidate bundle of source can become the active
@@ -1021,9 +1022,35 @@ A request to cancel work that runs is not a terminal result. A provider still
 records the eventual completion, failure, timeout, or acknowledgement of the
 cancel operation.
 
+The command reports what the revision does to the rules of the program. The
+identity of a rule firing is the name of the rule. Thus a revision that renames
+a rule fires that rule a second time for a trigger that the rule already fired
+on, and performs its action a second time. The command derives which removed
+rule corresponds to which added rule and reports each such correspondence, each
+removed rule that corresponds to nothing, and each correspondence that is too
+ambiguous to propose. These are diagnostics. The command does not treat them as
+incompatibility, and does not block the revision.
+
+The command does not act on a correspondence that it derives. No hash of the
+content of a rule distinguishes a rename from the deletion of one rule and the
+copy of its body into another. Thus the command suppresses the second firing
+only for the carry that the operator states:
+
+| Flag | Meaning |
+| --- | --- |
+| `--carry old=new` | A firing recorded under the rule `old` counts as a firing under the rule `new`. |
+
+The flag accepts either the bare name of a rule or the identity of the
+declaration (`rule old`), and the flag may appear more than once. The rule `new`
+must be a rule that the candidate program declares. The rule `old` must not be,
+because a rule whose name survives a revision was not renamed. The command
+records the carry and the derived correspondence on the activation, and keeps
+them apart: the carry is the instruction of the operator and the correspondence
+is the evidence of the system.
+
 The JSON output of a dry run has the candidate version, the diagnostics about
-the compatibility, the impact on the agents, the impact of the cancel policy,
-and no event of activation. The output of an activation has the version that the
+the compatibility, the rule correspondence, the carries, the impact on the
+agents, the impact of the cancel policy, and no event of activation. The output of an activation has the version that the
 command activated, the epoch of the revision, the policy for the cancel
 operation, the diagnostics, and the links to the evidence.
 

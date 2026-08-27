@@ -26,6 +26,7 @@ pub mod package_registry;
 pub mod principal;
 pub mod provider;
 pub mod provider_trust;
+pub mod rule_correspondence;
 pub mod rule_lowering;
 pub mod rule_pass;
 pub mod sansio;
@@ -4471,6 +4472,8 @@ rule noop
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-once"),
             })
             .expect("revision activates");
@@ -4481,6 +4484,8 @@ rule noop
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-once"),
             })
             .expect("idempotent retry returns existing revision");

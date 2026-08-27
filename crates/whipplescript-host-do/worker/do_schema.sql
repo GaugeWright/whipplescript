@@ -126,7 +126,8 @@
                 revision_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, epoch INTEGER NOT NULL,
                 from_version_id TEXT NOT NULL, to_version_id TEXT NOT NULL,
                 activated_by_event_id TEXT NOT NULL, activation_policy_json TEXT NOT NULL DEFAULT '{}',
-                cancellation_policy TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT,
+                cancellation_policy TEXT NOT NULL, rule_carries_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL, idempotency_key TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );

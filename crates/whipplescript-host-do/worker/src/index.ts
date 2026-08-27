@@ -400,6 +400,21 @@ function ensureSchema(sql: SqlStorage): void {
   if (hasOwnerEpoch.length === 0) {
     sql.exec(`ALTER TABLE instances ADD COLUMN owner_epoch INTEGER NOT NULL DEFAULT 0`);
   }
+  // DR-0077: the operator carries a revision was activated with. Additive, and
+  // read on EVERY rule pass (`rule_pass.rs` builds the carry chain), so an
+  // existing object without the column fails every step rather than only a
+  // revision. Its default is "no carries", which is what every revision
+  // recorded before this surface existed means.
+  const hasRuleCarries = sql
+    .exec(
+      `SELECT name FROM pragma_table_info('instance_revisions') WHERE name = 'rule_carries_json'`,
+    )
+    .toArray();
+  if (hasRuleCarries.length === 0) {
+    sql.exec(
+      `ALTER TABLE instance_revisions ADD COLUMN rule_carries_json TEXT NOT NULL DEFAULT '[]'`,
+    );
+  }
   // Native has enforced one event per (instance, sequence) since migration
   // 0001; this side never did, so two rows could share a position and the chain
   // would be meaningless. Adding it can only fail on an object that already

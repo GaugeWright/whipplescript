@@ -47,6 +47,7 @@ CREATE TABLE instance_revisions (
     activated_by_event_id TEXT NOT NULL REFERENCES events(event_id),
     activation_policy_json TEXT NOT NULL DEFAULT '{}',
     cancellation_policy TEXT NOT NULL,
+    rule_carries_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL,
     idempotency_key TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -24676,3 +24676,312 @@ rule finish
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The carry program pair: one rule, named `work` in v1 and `work_renamed` in
+/// v2, byte-identical otherwise. `Job` is never consumed, so the trigger stays
+/// live across the revision and the renamed rule has something to re-fire on --
+/// which is exactly the executed defect DR-0077 opens on.
+fn carry_program(rule: &str) -> String {
+    format!(
+        r#"
+workflow Rev
+
+output result Done
+
+class Job {{
+  id string
+}}
+
+class Outcome {{
+  job string
+}}
+
+class Done {{
+  note string
+}}
+
+table jobs as Job [
+  {{
+    id "j-1"
+  }}
+]
+
+rule {rule}
+  when Job as j
+=> {{
+  timer 2s as t
+
+  after t completes {{
+    record Outcome {{
+      job j.id
+    }}
+  }}
+}}
+
+rule finish
+  when Outcome as o
+=> {{
+  complete result {{
+    note o.job
+  }}
+}}
+"#
+    )
+}
+
+/// Start an instance on `v1` and step it once, so exactly one firing is open
+/// and its timer requested. Returns the instance id.
+fn carry_instance_with_one_open_firing(bin: &str, store_path: &TempStorePath, v1: &Path) -> String {
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let started = run_json_isolated(
+        bin,
+        store_path,
+        &[
+            "--store",
+            store,
+            "--json",
+            "start",
+            v1.to_str().expect("utf-8"),
+        ],
+    );
+    let instance_id = started
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .expect("instance id")
+        .to_owned();
+    let stepped = whip(bin, store_path)
+        .args([
+            "--store",
+            store,
+            "step",
+            &instance_id,
+            "--program",
+            v1.to_str().expect("utf-8"),
+        ])
+        .output()
+        .expect("step v1 runs");
+    assert!(
+        stepped.status.success(),
+        "step v1 failed: {}",
+        String::from_utf8_lossy(&stepped.stderr)
+    );
+    instance_id
+}
+
+fn carry_timer_count(bin: &str, store_path: &TempStorePath, instance_id: &str) -> usize {
+    let store = store_path.to_str().expect("utf-8 temp path");
+    run_json_isolated(
+        bin,
+        store_path,
+        &["--store", store, "--json", "effects", instance_id],
+    )
+    .as_array()
+    .expect("effects array")
+    .iter()
+    .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+    .count()
+}
+
+/// DR-0077 Decisions 4 and I1/I1s. The two halves of the ruling, asserted
+/// together because each is only meaningful against the other: WITH an operator
+/// carry the renamed rule does not re-fire, and WITHOUT one it does. The second
+/// is not a bug left standing — it is the safe direction the record chose, since
+/// no content hash separates a rename from a delete-plus-copy and a wrong
+/// suppression loses an emission silently.
+#[test]
+fn a_carry_suppresses_the_renamed_rules_refire_and_no_carry_does_not() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("carry-v1");
+    let v2 = temp_workflow_path("carry-v2");
+    fs::write(&v1, carry_program("work")).expect("v1 writes");
+    fs::write(&v2, carry_program("work_renamed")).expect("v2 writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let uncarried = carry_instance_with_one_open_firing(bin, &store_path, &v1);
+    let carried = carry_instance_with_one_open_firing(bin, &store_path, &v1);
+    assert_eq!(carry_timer_count(bin, &store_path, &uncarried), 1);
+    assert_eq!(carry_timer_count(bin, &store_path, &carried), 1);
+
+    for (instance_id, carry) in [(&uncarried, None), (&carried, Some("work=work_renamed"))] {
+        let mut args = vec![
+            "--store",
+            store,
+            "revise",
+            instance_id.as_str(),
+            v2.to_str().expect("utf-8"),
+        ];
+        if let Some(carry) = carry {
+            args.push("--carry");
+            args.push(carry);
+        }
+        let revised = whip(bin, &store_path)
+            .args(&args)
+            .output()
+            .expect("revise runs");
+        assert!(
+            revised.status.success(),
+            "revise failed: {}",
+            String::from_utf8_lossy(&revised.stderr)
+        );
+        let stepped = whip(bin, &store_path)
+            .args([
+                "--store",
+                store,
+                "step",
+                instance_id,
+                "--program",
+                v2.to_str().expect("utf-8"),
+            ])
+            .output()
+            .expect("step v2 runs");
+        assert!(
+            stepped.status.success(),
+            "step v2 failed: {}",
+            String::from_utf8_lossy(&stepped.stderr)
+        );
+    }
+
+    assert_eq!(
+        carry_timer_count(bin, &store_path, &carried),
+        1,
+        "the carried rename performs the action ONCE"
+    );
+    assert_eq!(
+        carry_timer_count(bin, &store_path, &uncarried),
+        2,
+        "an unconfirmed rename still re-fires -- a visible duplicate, never a \
+         silent suppression"
+    );
+}
+
+/// DR-0077 Decision 4, the second name-keyed consumer. `cancelled_identities`
+/// keys on the rule name exactly as `old_identity_set` does, so a carry that
+/// translated only the first would silently UN-CANCEL an operator-cancelled
+/// progression: the same defect class in the opposite direction, and worse,
+/// because the operator explicitly said stop.
+#[test]
+fn a_carry_keeps_a_cancelled_progression_cancelled_across_the_rename() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("carry-cancel-v1");
+    let v2 = temp_workflow_path("carry-cancel-v2");
+    fs::write(&v1, carry_program("work")).expect("v1 writes");
+    fs::write(&v2, carry_program("work_renamed")).expect("v2 writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+
+    let instance_id = carry_instance_with_one_open_firing(bin, &store_path, &v1);
+    let progressions = run_json_isolated(
+        bin,
+        &store_path,
+        &["--store", store, "--json", "progressions", &instance_id],
+    );
+    let firing_id = progressions
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|row| row.get("rule").and_then(Value::as_str) == Some("work"))
+        .and_then(|row| row.get("firing_id").and_then(Value::as_str))
+        .expect("work firing listed")
+        .to_owned();
+    let cancel = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "progression",
+            "cancel",
+            &instance_id,
+            &firing_id,
+            "--reason",
+            "operator says stop",
+        ])
+        .output()
+        .expect("cancel runs");
+    assert!(
+        cancel.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+
+    let revised = whip(bin, &store_path)
+        .args([
+            "--store",
+            store,
+            "revise",
+            &instance_id,
+            v2.to_str().expect("utf-8"),
+            "--carry",
+            "work=work_renamed",
+        ])
+        .output()
+        .expect("revise runs");
+    assert!(
+        revised.status.success(),
+        "revise failed: {}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    for _ in 0..2 {
+        let _ = whip(bin, &store_path)
+            .args([
+                "--store",
+                store,
+                "step",
+                &instance_id,
+                "--program",
+                v2.to_str().expect("utf-8"),
+            ])
+            .output();
+    }
+
+    assert_eq!(
+        carry_timer_count(bin, &store_path, &instance_id),
+        1,
+        "the cancellation follows the carry; the renamed rule stays stopped"
+    );
+}
+
+/// A carry naming a rule the candidate does not declare is refused, not
+/// recorded. Accepting it would put an instruction in the activation record
+/// that can never match anything — the operator would read a confirmed carry
+/// and get the un-carried behaviour.
+#[test]
+fn a_carry_that_lands_on_no_rule_is_refused() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let v1 = temp_workflow_path("carry-refuse-v1");
+    let v2 = temp_workflow_path("carry-refuse-v2");
+    fs::write(&v1, carry_program("work")).expect("v1 writes");
+    fs::write(&v2, carry_program("work_renamed")).expect("v2 writes");
+    let store = store_path.to_str().expect("utf-8 temp path");
+    let instance_id = carry_instance_with_one_open_firing(bin, &store_path, &v1);
+
+    for (carry, expected) in [
+        ("work=typo", "does not declare as a rule"),
+        // `finish` survives the revision, so it was not renamed.
+        ("finish=work_renamed", "was not renamed"),
+        ("work=work", "carries `work` to itself"),
+    ] {
+        let refused = whip(bin, &store_path)
+            .args([
+                "--store",
+                store,
+                "revise",
+                &instance_id,
+                v2.to_str().expect("utf-8"),
+                "--carry",
+                carry,
+            ])
+            .output()
+            .expect("revise runs");
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "`--carry {carry}` must be refused"
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(expected),
+            "`--carry {carry}` said: {stderr}"
+        );
+    }
+}

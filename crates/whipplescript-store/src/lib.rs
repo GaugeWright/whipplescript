@@ -1036,6 +1036,18 @@ pub struct RevisionActivation<'a> {
     pub to_version_id: &'a str,
     pub activation_policy_json: &'a str,
     pub cancellation_policy: &'a str,
+    /// DR-0077 Decision 3, the INSTRUCTION half: the operator's explicit
+    /// `old -> new` carries, as a JSON array. This is the only thing that
+    /// suppresses a firing across a rename, so it is part of what "the same
+    /// activation input" means for idempotency.
+    pub rule_carries_json: &'a str,
+    /// DR-0077 Decision 3, the EVIDENCE half: what the derivation proposed.
+    /// Recorded on the activation event and deliberately NOT compared for
+    /// idempotency -- it is a derived note, so two retries of one activation
+    /// that differ only in what a newer canonicalizer noticed are still the
+    /// same activation, and the first writer's evidence is what that revision
+    /// saw.
+    pub rule_correspondence_json: &'a str,
     pub idempotency_key: Option<&'a str>,
 }
 
@@ -1049,6 +1061,11 @@ pub struct WorkflowRevisionView {
     pub activated_by_event_id: String,
     pub activation_policy_json: String,
     pub cancellation_policy: String,
+    /// The operator carries this revision was activated with (DR-0077). Empty
+    /// for every revision that named none, which is the no-suppression
+    /// direction and what every revision recorded before this surface existed
+    /// means.
+    pub rule_carries_json: String,
     pub status: String,
     pub idempotency_key: Option<String>,
     pub created_at: String,
@@ -1627,6 +1644,7 @@ impl SqliteStore {
                 activated_by_event_id,
                 activation_policy_json,
                 cancellation_policy,
+                rule_carries_json,
                 status,
                 idempotency_key,
                 created_at,
@@ -1891,6 +1909,10 @@ impl SqliteStore {
         } else {
             Vec::new()
         };
+        let rule_carries: Value = serde_json::from_str(activation.rule_carries_json)
+            .unwrap_or_else(|_| Value::Array(Vec::new()));
+        let rule_correspondence: Value =
+            serde_json::from_str(activation.rule_correspondence_json).unwrap_or(Value::Null);
         let payload = json!({
             "revision_id": &revision_id,
             "instance_id": activation.instance_id,
@@ -1900,6 +1922,11 @@ impl SqliteStore {
             "to_epoch": next_epoch,
             "activation_policy": activation_policy,
             "cancellation_policy": cancellation_policy,
+            // Instruction and evidence, side by side and never merged: a
+            // reader must be able to see that the system proposed a carry and
+            // that a human either did or did not confirm it (DR-0077).
+            "rule_carries": rule_carries,
+            "rule_correspondence": rule_correspondence,
             "terminal_cancel_effects": &queued_effects_for_policy,
             "request_cancel_effects": &running_effects_for_policy,
         })
@@ -1928,10 +1955,11 @@ impl SqliteStore {
                 activated_by_event_id,
                 activation_policy_json,
                 cancellation_policy,
+                rule_carries_json,
                 status,
                 idempotency_key
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10)
             "#,
             params![
                 &revision_id,
@@ -1942,6 +1970,7 @@ impl SqliteStore {
                 event.event_id,
                 activation.activation_policy_json,
                 cancellation_policy,
+                rule_carries.to_string(),
                 activation.idempotency_key,
             ],
         )?;
@@ -10014,10 +10043,11 @@ fn workflow_revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workf
         activated_by_event_id: row.get(5)?,
         activation_policy_json: row.get(6)?,
         cancellation_policy: row.get(7)?,
-        status: row.get(8)?,
-        idempotency_key: row.get(9)?,
-        created_at: row.get(10)?,
-        activated_at: row.get(11)?,
+        rule_carries_json: row.get(8)?,
+        status: row.get(9)?,
+        idempotency_key: row.get(10)?,
+        created_at: row.get(11)?,
+        activated_at: row.get(12)?,
     })
 }
 
@@ -10038,6 +10068,7 @@ fn revision_by_id_on(
                 activated_by_event_id,
                 activation_policy_json,
                 cancellation_policy,
+                rule_carries_json,
                 status,
                 idempotency_key,
                 created_at,
@@ -10070,6 +10101,7 @@ fn revision_by_idempotency_on(
                 activated_by_event_id,
                 activation_policy_json,
                 cancellation_policy,
+                rule_carries_json,
                 status,
                 idempotency_key,
                 created_at,
@@ -10085,6 +10117,14 @@ fn revision_by_idempotency_on(
         .map_err(Into::into)
 }
 
+/// Compare two recorded carry lists by value, not by spelling: an absent or
+/// unparseable record and an explicitly empty one both mean "no carries", and
+/// must not read as a conflicting activation.
+#[cfg(feature = "native")]
+fn json_or_empty_array(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::Array(Vec::new()))
+}
+
 #[cfg(feature = "native")]
 fn ensure_revision_idempotency_matches(
     existing: &WorkflowRevisionView,
@@ -10098,6 +10138,11 @@ fn ensure_revision_idempotency_matches(
         && existing.to_version_id.as_str() == activation.to_version_id
         && existing.cancellation_policy.as_str() == cancellation_policy
         && &existing_activation_policy == activation_policy
+        // The carry is operator input, so reusing a key with a DIFFERENT carry
+        // is a different activation and must conflict. The derived
+        // correspondence is not compared -- see `RevisionActivation`.
+        && json_or_empty_array(&existing.rule_carries_json)
+            == json_or_empty_array(activation.rule_carries_json)
     {
         return Ok(());
     }
@@ -11199,6 +11244,13 @@ fn replay_revision_activation(
         .get("cancellation_policy")
         .and_then(Value::as_str)
         .unwrap_or("keep");
+    // The row is a projection of this event, so the carry is replayed from the
+    // payload rather than recomputed -- a later canonicalizer must not be able
+    // to change what an already-activated revision meant (DR-0077 Decision 3).
+    let rule_carries_json = payload
+        .get("rule_carries")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "[]".to_owned());
     connection.execute(
         r#"
         INSERT INTO instance_revisions (
@@ -11210,10 +11262,11 @@ fn replay_revision_activation(
             activated_by_event_id,
             activation_policy_json,
             cancellation_policy,
+            rule_carries_json,
             status,
             idempotency_key
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10)
         ON CONFLICT(revision_id) DO NOTHING
         "#,
         params![
@@ -11225,6 +11278,7 @@ fn replay_revision_activation(
             event_id,
             activation_policy_json,
             cancellation_policy,
+            rule_carries_json,
             idempotency_key,
         ],
     )?;
@@ -12192,6 +12246,7 @@ fn ensure_revision_schema(connection: &Connection) -> StoreResult<()> {
             activated_by_event_id TEXT NOT NULL REFERENCES events(event_id),
             activation_policy_json TEXT NOT NULL DEFAULT '{}',
             cancellation_policy TEXT NOT NULL,
+            rule_carries_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL,
             idempotency_key TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -12224,6 +12279,15 @@ fn ensure_revision_schema(connection: &Connection) -> StoreResult<()> {
             WHERE idempotency_key IS NOT NULL;
         "#,
     )?;
+    // A store written before the carry surface has the table but not the
+    // column; its existing revisions carried nothing, which is what the
+    // default records.
+    if !column_exists(connection, "instance_revisions", "rule_carries_json")? {
+        connection.execute(
+            "ALTER TABLE instance_revisions ADD COLUMN rule_carries_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
     if table_exists(connection, "effects")? && table_exists(connection, "instances")? {
         connection.execute(
             r#"
@@ -15009,6 +15073,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-keep"),
             })
             .expect("revision activates");
@@ -15054,6 +15120,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-keep"),
             })
             .expect("idempotent revision returns existing row");
@@ -15066,6 +15134,8 @@ mod tests {
             to_version_id: &version2.version_id,
             activation_policy_json: r#"{"changed":true}"#,
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("revise-keep"),
         });
         assert!(matches!(
@@ -15100,6 +15170,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-before-stale-commit"),
             })
             .expect("revision activates");
@@ -15168,6 +15240,8 @@ mod tests {
             to_version_id: &version2.version_id,
             activation_policy_json: "{}",
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("revise-incompatible-direct"),
         });
 
@@ -15229,6 +15303,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-agent-removal"),
             })
             .expect("revision activates");
@@ -15359,6 +15435,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "request_running",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-request-running"),
             })
             .expect("revision activates");
@@ -15564,6 +15642,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-keep-old-effects"),
             })
             .expect("first revision keeps existing work");
@@ -15582,6 +15662,8 @@ mod tests {
                 to_version_id: &version3.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "running",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-request-kept-effects"),
             })
             .expect("second revision applies policy to all existing old work");
@@ -15960,6 +16042,8 @@ mod tests {
                 to_version_id: &revised_parent_version.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-parent-after-invoke"),
             })
             .expect("parent revision activates");
@@ -15995,6 +16079,8 @@ mod tests {
                 to_version_id: &revised_child_version.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-child-after-invoke"),
             })
             .expect("child revision activates");
@@ -16394,6 +16480,8 @@ mod tests {
             to_version_id: &version2.version_id,
             activation_policy_json: "{}",
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("revise-terminal"),
         });
 
@@ -16466,6 +16554,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "request_running",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-replay-full"),
             })
             .expect("revision activates");
@@ -17539,6 +17629,8 @@ mod tests {
                 to_version_id: &version2.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some("revise-replay"),
             })
             .expect("revision activates");

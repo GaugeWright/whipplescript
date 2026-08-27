@@ -26,6 +26,7 @@ use whipplescript_core::json::{require_json_array_field, required_json_string};
 // attestation and the embedded std manifest bytes stay in the CLI below.
 use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::package_registry::*;
+use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
     effect_config::EffectConfig,
@@ -16111,6 +16112,10 @@ struct ReviseOptions {
     root: Option<String>,
     dry_run: bool,
     cancellation_policy: String,
+    /// DR-0077 Decision 4. The operator's explicit `old=new` carries -- the
+    /// only thing that suppresses a firing across a rename. The derived
+    /// correspondence is shown, never obeyed.
+    carries: Vec<RuleCarry>,
 }
 
 impl ReviseOptions {
@@ -16120,6 +16125,7 @@ impl ReviseOptions {
         let mut root = None;
         let mut dry_run = false;
         let mut cancellation_policy = "keep".to_owned();
+        let mut carries: Vec<RuleCarry> = Vec::new();
         let mut index = 0;
         while index < args.len() {
             match args[index].as_str() {
@@ -16131,6 +16137,20 @@ impl ReviseOptions {
                     root = Some(value.clone());
                 }
                 "--dry-run" => dry_run = true,
+                "--carry" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("expected `old=new` after `--carry`".to_owned());
+                    };
+                    let carry = RuleCarry::parse(value)?;
+                    if carries.iter().any(|existing| existing.from == carry.from) {
+                        return Err(format!(
+                            "`{}` is carried twice; a rule became one thing, not two",
+                            carry.from
+                        ));
+                    }
+                    carries.push(carry);
+                }
                 "--cancel" => {
                     index += 1;
                     let Some(value) = args.get(index) else {
@@ -16154,7 +16174,7 @@ impl ReviseOptions {
                 value if program_path.is_none() => program_path = Some(value.to_owned()),
                 _ => {
                     return Err(
-                        "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                        "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running] [--carry old=new]"
                             .to_owned(),
                     );
                 }
@@ -16163,13 +16183,13 @@ impl ReviseOptions {
         }
         let Some(instance_id) = instance_id else {
             return Err(
-                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running] [--carry old=new]"
                     .to_owned(),
             );
         };
         let Some(program_path) = program_path else {
             return Err(
-                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running]"
+                "usage: whip revise <instance> <workflow.whip> [--root Workflow] [--dry-run] [--cancel keep|queued|running] [--carry old=new]"
                     .to_owned(),
             );
         };
@@ -16179,6 +16199,7 @@ impl ReviseOptions {
             root,
             dry_run,
             cancellation_policy,
+            carries,
         })
     }
 }
@@ -16244,6 +16265,15 @@ fn revise(options: &CliOptions) -> ExitCode {
         Err(error) => return report_store_error("failed to analyze agent impact", error),
     };
 
+    // DR-0077: derive which removed rule looks like which added one, so the
+    // report can say so. Evidence only -- nothing here suppresses a firing.
+    let correspondence =
+        derive_revision_rule_correspondence(&store, &compatibility.active_version_id, &source);
+    if let Err(message) = validate_rule_carries(&revise_options.carries, &ir) {
+        eprintln!("{message}");
+        return ExitCode::from(2);
+    }
+
     if revise_options.dry_run {
         return emit_revision_dry_run(
             options,
@@ -16252,6 +16282,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             &source_hash,
             &ir_hash,
             &compatibility,
+            &correspondence,
             &impact,
             &agent_impact,
         );
@@ -16272,6 +16303,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             &source_hash,
             &ir_hash,
             &compatibility,
+            &correspondence,
             &impact,
             &agent_impact,
             None,
@@ -16313,12 +16345,22 @@ fn revise(options: &CliOptions) -> ExitCode {
         "agent_impact": revision_agent_impact_to_json(&agent_impact),
     })
     .to_string();
+    // Instruction and evidence, recorded apart (DR-0077 Decision 3): the carry
+    // is what the operator confirmed and is compared for idempotency; the
+    // correspondence is what the system proposed and is not, so a newer
+    // canonicalizer noticing more cannot turn a retry into a conflict.
+    let rule_carries =
+        whipplescript_kernel::rule_correspondence::carries_to_json(&revise_options.carries)
+            .to_string();
+    let recorded_correspondence = rule_correspondence_json(&correspondence).to_string();
     let activation = match store.activate_revision(RevisionActivation {
         instance_id: &revise_options.instance_id,
         from_version_id: &compatibility.active_version_id,
         to_version_id: &version.version_id,
         activation_policy_json: &activation_policy,
         cancellation_policy: &revise_options.cancellation_policy,
+        rule_carries_json: &rule_carries,
+        rule_correspondence_json: &recorded_correspondence,
         idempotency_key: Some(&idempotency_key(&[
             &revise_options.instance_id,
             "revision",
@@ -16337,6 +16379,7 @@ fn revise(options: &CliOptions) -> ExitCode {
         &source_hash,
         &ir_hash,
         &compatibility,
+        &correspondence,
         &impact,
         &agent_impact,
         Some(&activation),
@@ -41190,6 +41233,40 @@ fn revision_removed_agent_impact_to_json(impact: &RevisionRemovedAgentImpact) ->
     })
 }
 
+/// DR-0077 Decision 6. The report says what a revision does to rules with live
+/// history, which it previously did not: a revision renaming a rule reported
+/// `compatible: true` with an empty diagnostics array while being about to
+/// perform an external action a second time. These are diagnostics, never
+/// incompatibility -- the revision is legal and may be exactly what the operator
+/// intends.
+fn rule_correspondence_json(correspondence: &RuleCorrespondence) -> Value {
+    json!({
+        "underivable": correspondence.underivable,
+        "proposed_renames": correspondence
+            .proposed
+            .iter()
+            .map(|rename| json!({
+                "removed": rename.removed,
+                "added": rename.added,
+                "carry_with": format!(
+                    "--carry {}={}",
+                    whipplescript_kernel::rule_correspondence::rule_name(&rename.removed),
+                    whipplescript_kernel::rule_correspondence::rule_name(&rename.added),
+                ),
+            }))
+            .collect::<Vec<_>>(),
+        "refire_sites": correspondence.refire_sites,
+        "ambiguous": correspondence
+            .ambiguous
+            .iter()
+            .map(|ambiguous| json!({
+                "removed": ambiguous.removed,
+                "added": ambiguous.added,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn revision_report_json(
     dry_run: bool,
@@ -41198,12 +41275,17 @@ fn revision_report_json(
     source_hash: &str,
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
+    correspondence: &RuleCorrespondence,
     impact: &RevisionCancellationImpact,
     agent_impact: &RevisionAgentImpact,
     revision: Option<&WorkflowRevisionView>,
 ) -> Value {
     json!({
         "dry_run": dry_run,
+        "rule_correspondence": rule_correspondence_json(correspondence),
+        "rule_carries": whipplescript_kernel::rule_correspondence::carries_to_json(
+            &revise_options.carries,
+        ),
         "instance_id": revise_options.instance_id,
         "source_path": display_path(&revise_options.program_path),
         "root_workflow": ir.workflow,
@@ -41230,6 +41312,59 @@ fn revision_report_json(
     })
 }
 
+/// Refuse a carry that could not suppress anything, rather than letting it sit
+/// in the record doing nothing. A carry is checked against the CANDIDATE
+/// program only: `to` must be a rule the revision is activating, and `from`
+/// must not be, because a name present in the candidate survived the revision
+/// and so was never renamed. `from` is deliberately not checked against the
+/// active source -- the authority for what a firing was recorded under is the
+/// instance's history, which outlives any source the content store still holds.
+fn validate_rule_carries(carries: &[RuleCarry], ir: &IrProgram) -> Result<(), String> {
+    let names: std::collections::BTreeSet<&str> =
+        ir.rules.iter().map(|rule| rule.name.as_str()).collect();
+    for carry in carries {
+        if !names.contains(carry.to.as_str()) {
+            return Err(format!(
+                "`--carry {}={}` names `{}`, which the candidate program does not \
+                 declare as a rule; a carry must land on a rule this revision \
+                 activates",
+                carry.from, carry.to, carry.to
+            ));
+        }
+        if names.contains(carry.from.as_str()) {
+            return Err(format!(
+                "`--carry {}={}` carries `{}`, which the candidate program still \
+                 declares; a rule whose name survives a revision was not renamed",
+                carry.from, carry.to, carry.from
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Load the active version's source and derive the rule correspondence against
+/// the candidate. A version whose source is not in the content store -- one
+/// never driven since source pinning landed -- yields an underivable
+/// correspondence rather than a silently empty one: "we could not tell" and
+/// "there is nothing to tell" are different answers to the operator.
+fn derive_revision_rule_correspondence(
+    store: &SqliteStore,
+    active_version_id: &str,
+    candidate_source: &str,
+) -> RuleCorrespondence {
+    let underivable = RuleCorrespondence {
+        underivable: true,
+        ..RuleCorrespondence::default()
+    };
+    let Ok(Some(view)) = store.get_program_version(active_version_id) else {
+        return underivable;
+    };
+    let Ok(Some(active_source)) = store.get_content(&view.source_hash) else {
+        return underivable;
+    };
+    whipplescript_kernel::rule_correspondence::derive(&active_source, candidate_source)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_revision_dry_run(
     options: &CliOptions,
@@ -41238,6 +41373,7 @@ fn emit_revision_dry_run(
     source_hash: &str,
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
+    correspondence: &RuleCorrespondence,
     impact: &RevisionCancellationImpact,
     agent_impact: &RevisionAgentImpact,
 ) -> ExitCode {
@@ -41248,10 +41384,60 @@ fn emit_revision_dry_run(
         source_hash,
         ir_hash,
         compatibility,
+        correspondence,
         impact,
         agent_impact,
         None,
     )
+}
+
+/// The same report the JSON carries, for the operators who do not pass --json.
+/// Silence here is what the defect looked like: a revision renaming a rule
+/// printed nothing about it and went on to perform an external action twice.
+fn print_rule_correspondence(correspondence: &RuleCorrespondence, carries: &[RuleCarry]) {
+    if correspondence.underivable {
+        println!(
+            "rule correspondence: UNDERIVABLE (the active version's source is not \
+             recoverable, so renames cannot be detected for this revision)"
+        );
+        return;
+    }
+    for rename in &correspondence.proposed {
+        let from = whipplescript_kernel::rule_correspondence::rule_name(&rename.removed);
+        let to = whipplescript_kernel::rule_correspondence::rule_name(&rename.added);
+        // A confirmed proposal must not still be phrased as a warning: the
+        // operator has answered it, and repeating the un-carried consequence
+        // would read as though the carry had not taken.
+        if carries
+            .iter()
+            .any(|carry| carry.from == from && carry.to == to)
+        {
+            println!(
+                "rule correspondence: `{}` looks renamed to `{}`, and you carried it",
+                rename.removed, rename.added
+            );
+            continue;
+        }
+        println!(
+            "rule correspondence: `{}` looks renamed to `{}` -- a firing already \
+             recorded under the old name will RE-FIRE unless you carry it: \
+             --carry {from}={to}",
+            rename.removed, rename.added,
+        );
+    }
+    for site in &correspondence.refire_sites {
+        println!(
+            "rule correspondence: `{site}` is removed and matches nothing added; \
+             whatever replaces it fires fresh"
+        );
+    }
+    for ambiguous in &correspondence.ambiguous {
+        println!(
+            "rule correspondence: ambiguous -- removed {:?} and added {:?} are \
+             canonically identical, so no rename can be proposed between them",
+            ambiguous.removed, ambiguous.added
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41262,6 +41448,7 @@ fn emit_revision_report(
     source_hash: &str,
     ir_hash: &str,
     compatibility: &RevisionCompatibilityReport,
+    correspondence: &RuleCorrespondence,
     impact: &RevisionCancellationImpact,
     agent_impact: &RevisionAgentImpact,
     revision: Option<&WorkflowRevisionView>,
@@ -41275,10 +41462,23 @@ fn emit_revision_report(
             source_hash,
             ir_hash,
             compatibility,
+            correspondence,
             impact,
             agent_impact,
             revision,
         ));
+    }
+
+    print_rule_correspondence(correspondence, &revise_options.carries);
+    // Every carry is printed, including one the derivation did not propose --
+    // an operator may know a rename no content hash can see, and the record
+    // must say what was instructed, not only what was agreed with.
+    for carry in &revise_options.carries {
+        println!(
+            "rule carry: `{}` is carried to `{}` -- a firing recorded under the \
+             old name counts as already fired under the new one",
+            carry.from, carry.to
+        );
     }
 
     if let Some(revision) = revision {

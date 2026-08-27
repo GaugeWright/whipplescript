@@ -25,11 +25,18 @@ use crate::idempotency_key;
 use crate::lowering::{
     BranchReport, OwnedDependency, OwnedEffect, OwnedFact, OwnedLowering, OwnedWorkflowTerminal,
 };
+use crate::rule_correspondence::{carries_from_json, translate_forward, RuleCarry};
 use crate::rule_lowering::{
     context_from_record, context_record_json, json_from_str, lower_rule, ready_contexts_for,
     stable_hash_hex, GuardReport, RuleContext,
 };
 use crate::RuntimeKernel;
+
+/// One operator-cancelled firing: the rule's name, the firing identity, and the
+/// revision epoch the cancellation was recorded at. The epoch is what bounds a
+/// carry translation, so that a carry given at a later revision cannot reach
+/// backwards to a name recorded before it (DR-0077 Decision 5).
+type CancelledFiring = (String, Option<String>, i64);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StepReport {
@@ -143,11 +150,29 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         // timeline's firings are never re-applied); firings dedupe by
         // (rule, identity) against the live-match set below, so a
         // still-matching trigger contributes one context, not two.
+        // DR-0077 Decisions 4 and 5. The chain of operator carries this
+        // instance has been revised with, ascending by the epoch each one
+        // activated to. Only carries are read -- never the derived
+        // correspondence recorded beside them, which is evidence for an
+        // operator and suppresses nothing on its own.
+        let carry_chain: Vec<(i64, Vec<RuleCarry>)> = {
+            let mut chain: Vec<(i64, Vec<RuleCarry>)> = kernel
+                .store()
+                .list_instance_revisions(instance_id)?
+                .iter()
+                .map(|revision| {
+                    let carries = serde_json::from_str::<Value>(&revision.rule_carries_json)
+                        .map(|value| carries_from_json(&value))
+                        .unwrap_or_default();
+                    (revision.epoch, carries)
+                })
+                .filter(|(_, carries)| !carries.is_empty())
+                .collect();
+            chain.sort_by_key(|(epoch, _)| *epoch);
+            chain
+        };
         let pass_head_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
-        let (recorded_firings, cancelled_firings): (
-            Vec<RecordedFiring>,
-            std::collections::BTreeSet<(String, Option<String>)>,
-        ) = {
+        let (recorded_firings, cancelled_firings): (Vec<RecordedFiring>, Vec<CancelledFiring>) = {
             let mut live: Vec<&EventView> = Vec::new();
             for event in &events {
                 if event.event_type == "context.restored" {
@@ -170,19 +195,40 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             // `progression.cancelled` closure removes the firing from the
             // derived open set — pinned re-lowering never advances it again,
             // and the lapse arm deliberately does not run.
-            let cancelled: std::collections::BTreeSet<(String, Option<String>)> = live
-                .iter()
-                .filter(|event| event.event_type == "progression.cancelled")
-                .filter_map(|event| {
-                    if !cancelled_keys.contains_key(&event.event_id) {
-                        cancelled_keys.insert(
-                            event.event_id.clone(),
-                            cancelled_key_from_payload(&event.payload_json),
-                        );
+            //
+            // Each cancellation carries the epoch it was recorded at, because
+            // translating it forward through the carry chain (below) must not
+            // drag it through a carry that was given BEFORE it existed. The
+            // epoch is folded from the activation events in the same order the
+            // instance saw them.
+            let mut cancelled: std::collections::BTreeSet<(String, Option<String>)> =
+                std::collections::BTreeSet::new();
+            let mut cancelled_at: Vec<CancelledFiring> = Vec::new();
+            let mut epoch_here: i64 = 0;
+            for event in &live {
+                if event.event_type == "workflow.revision_activated" {
+                    if let Some(to_epoch) = serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload.get("to_epoch").and_then(Value::as_i64))
+                    {
+                        epoch_here = to_epoch;
                     }
-                    cancelled_keys[&event.event_id].clone()
-                })
-                .collect();
+                    continue;
+                }
+                if event.event_type != "progression.cancelled" {
+                    continue;
+                }
+                if !cancelled_keys.contains_key(&event.event_id) {
+                    cancelled_keys.insert(
+                        event.event_id.clone(),
+                        cancelled_key_from_payload(&event.payload_json),
+                    );
+                }
+                if let Some((rule, identity)) = cancelled_keys[&event.event_id].clone() {
+                    cancelled.insert((rule.clone(), identity.clone()));
+                    cancelled_at.push((rule, identity, epoch_here));
+                }
+            }
             let mut recorded = Vec::new();
             for event in live {
                 if event.event_type != "rule.committed" {
@@ -205,7 +251,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     recorded.push(firing.clone());
                 }
             }
-            (recorded, cancelled)
+            (recorded, cancelled_at)
         };
         // The `seen` dedup above admits at most one recorded firing per
         // (rule, identity), so keying by the (rule, identity, admission)
@@ -227,10 +273,21 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 )
             })
             .collect();
-        let cancelled_identities: std::collections::BTreeSet<(&str, Option<&str>)> =
+        // DR-0077 Decision 4: BOTH name-keyed consumers translate. Leaving this
+        // one alone would mean a carried rename silently UN-CANCELS an
+        // operator-cancelled progression -- the same defect class in the
+        // opposite direction, and the reason this record could not claim to
+        // reconcile two notions of "the same rule" while a second consumer
+        // still disagreed.
+        let cancelled_identities: std::collections::BTreeSet<(String, Option<&str>)> =
             cancelled_firings
                 .iter()
-                .map(|(rule, identity)| (rule.as_str(), identity.as_deref()))
+                .map(|(rule, identity, epoch)| {
+                    (
+                        translate_forward(rule, *epoch, &carry_chain),
+                        identity.as_deref(),
+                    )
+                })
                 .collect();
 
         // DR-0043 slice 3 (old-body completion): a firing admitted under an
@@ -248,9 +305,18 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     && firing.epoch == active_revision_epoch
                     || firing.version_id.is_none()
             });
-        let old_identity_set: std::collections::BTreeSet<(&str, Option<&str>)> = old_recorded
+        // A firing recorded under a name the operator has since carried is
+        // matched against what the ACTIVE program calls that rule. With no
+        // carry nothing moves and the renamed rule fires -- today's behaviour,
+        // and the safe direction (DR-0077 I1s).
+        let old_identity_set: std::collections::BTreeSet<(String, Option<&str>)> = old_recorded
             .iter()
-            .map(|firing| (firing.rule.as_str(), firing.context.identity.as_deref()))
+            .map(|firing| {
+                (
+                    translate_forward(&firing.rule, firing.epoch, &carry_chain),
+                    firing.context.identity.as_deref(),
+                )
+            })
             .collect();
         let mut old_irs: std::collections::BTreeMap<String, Option<IrProgram>> =
             std::collections::BTreeMap::new();
@@ -292,14 +358,14 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 // identity, DR-0043 Decision 4) -- it completes under its
                 // old body below, never re-admits under the new one.
                 .filter(|context| {
-                    !old_identity_set.contains(&(rule.name.as_str(), context.identity.as_deref()))
+                    !old_identity_set.contains(&(rule.name.clone(), context.identity.as_deref()))
                 })
                 // A cancelled firing never re-admits: fact identity is
                 // admission identity (Decision 4), so the same (rule,
                 // identity) IS the cancelled firing, live match or not.
                 .filter(|context| {
                     !cancelled_identities
-                        .contains(&(rule.name.as_str(), context.identity.as_deref()))
+                        .contains(&(rule.name.clone(), context.identity.as_deref()))
                 })
                 .collect();
             // Pinned firings (DR-0043 Decision 1): recorded contexts not

@@ -719,6 +719,8 @@ fn e2e_revision_keep_preserves_running_old_effect_and_changes_future_dispatch() 
             to_version_id: &version2.version_id,
             activation_policy_json: r#"{"test":"keep"}"#,
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("e2e-revision-keep"),
         })
         .expect("revision activates");
@@ -802,6 +804,8 @@ fn e2e_revision_queued_cancel_terminal_cancels_old_effects() {
             to_version_id: &version2.version_id,
             activation_policy_json: r#"{"test":"queued"}"#,
             cancellation_policy: "queued",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("e2e-revision-queued"),
         })
         .expect("queued revision activates");
@@ -850,6 +854,8 @@ fn e2e_revision_running_cancel_request_allows_late_terminal() {
             to_version_id: &version2.version_id,
             activation_policy_json: r#"{"test":"running"}"#,
             cancellation_policy: "running",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("e2e-revision-running"),
         })
         .expect("running revision activates");
@@ -951,6 +957,8 @@ fn e2e_parent_revision_preserves_running_child_invocation() {
             to_version_id: &parent_v2.version_id,
             activation_policy_json: r#"{"test":"parent"}"#,
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("e2e-revision-parent"),
         })
         .expect("parent revision activates");
@@ -1028,6 +1036,8 @@ fn e2e_child_revision_parent_observes_terminal_output() {
             to_version_id: &child_v2.version_id,
             activation_policy_json: r#"{"test":"child"}"#,
             cancellation_policy: "keep",
+            rule_carries_json: "[]",
+            rule_correspondence_json: "null",
             idempotency_key: Some("e2e-revision-child"),
         })
         .expect("child revision activates");

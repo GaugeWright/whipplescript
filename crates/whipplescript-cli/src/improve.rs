@@ -2328,6 +2328,8 @@ fn replay_scenario(
                 to_version_id: &version.version_id,
                 activation_policy_json: "{}",
                 cancellation_policy: "keep",
+                rule_carries_json: "[]",
+                rule_correspondence_json: "null",
                 idempotency_key: Some(&format!("replay-activate-{}", scenario.name)),
             })
             .map_err(|error| format!("failed to activate the candidate: {error:?}"))?;
