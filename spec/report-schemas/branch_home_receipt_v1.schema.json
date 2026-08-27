@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/branch_home_receipt_v1.schema.json",
+  "title": "WhippleScript Branch Home Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "branch_id",
+    "stream_id",
+    "line_branch_id",
+    "stream_status",
+    "authority_position",
+    "evidence_handle",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema": { "const": "branch_home_receipt_v1" },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "stream_id": { "type": ["string", "null"], "minLength": 1 },
+    "line_branch_id": { "type": ["string", "null"], "minLength": 1 },
+    "stream_status": {
+      "type": ["string", "null"],
+      "enum": ["active", "boundary_reserved", "ref_advanced", "archived", null]
+    },
+    "authority_position": { "type": "integer", "minimum": 0 },
+    "evidence_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "recorded_at": { "type": ["string", "null"], "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "stream_id": { "type": "null" } } },
+      "then": {
+        "properties": {
+          "line_branch_id": { "type": "null" },
+          "stream_status": { "type": "null" }
+        }
+      },
+      "else": {
+        "properties": {
+          "line_branch_id": { "type": "string", "minLength": 1 },
+          "stream_status": {
+            "enum": ["active", "boundary_reserved", "ref_advanced", "archived"]
+          }
+        }
+      }
+    }
+  ]
+}

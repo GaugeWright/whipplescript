@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/exact_fork_admission_v1.schema.json",
+  "title": "WhippleScript Exact Fork Admission v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "outcome"],
+  "properties": {
+    "schema": { "const": "exact_fork_admission_v1" },
+    "outcome": {
+      "enum": [
+        "forked",
+        "historical_home_closed",
+        "destination_missing",
+        "destination_reserved",
+        "destination_changed",
+        "fork_refused"
+      ]
+    },
+    "branch_id": { "type": "string", "minLength": 1 },
+    "source_cut_id": { "type": "string", "minLength": 1 },
+    "fork_evidence_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "home": { "$ref": "branch_home_receipt_v1.schema.json" },
+    "stream_id": { "type": "string", "minLength": 1 },
+    "detail": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "forked" } } },
+      "then": { "required": ["branch_id", "source_cut_id", "fork_evidence_handle", "home"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": ["historical_home_closed", "destination_missing", "destination_reserved"]
+          }
+        }
+      },
+      "then": { "required": ["stream_id"] }
+    }
+  ]
+}

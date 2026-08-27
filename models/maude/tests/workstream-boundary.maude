@@ -1,0 +1,89 @@
+load ../workstream-boundary.maude
+
+--- Each pair is bite then invariant: S, N.
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveMaterializeMeansMember(b1, p1, s1)
+  =>* C:Cfg badMembershipFromSubset(b1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  materializeSubset(b1, p1)
+  =>* C:Cfg badMembershipFromSubset(b1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveSparseDeletesAbsent(b1, p1, c1, p2) pathAt(b1, p1, c0) pathAt(b1, p2, c2)
+  =>* C:Cfg badAbsentPathDeleted(b1, p2) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  sparseImport(b1, p1, c1) pathAt(b1, p1, c0) pathAt(b1, p2, c2)
+  =>* C:Cfg badAbsentPathDeleted(b1, p2) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveJoinReserved(b1, s1) stream(s1, reserved)
+  =>* C:Cfg badTopologyDuringReservation(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  join(b1, s1) stream(s1, reserved)
+  =>* C:Cfg badTopologyDuringReservation(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveContributeReserved(b1, s1) stream(s1, reserved) home(b1, s1)
+  =>* C:Cfg badContributionDuringReservation(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  contribute(b1, s1) stream(s1, reserved) home(b1, s1)
+  =>* C:Cfg badContributionDuringReservation(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveConflictMovesMain(s1, c2) stream(s1, reserved)
+    reservation(s1, c0, c1, c2) mainAt(c1)
+  =>* C:Cfg badMainMovedOnConflict(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  conflict(s1) stream(s1, reserved) reservation(s1, c0, c1, c2) mainAt(c1)
+  =>* C:Cfg badMainMovedOnConflict(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveRollbackAfterCas(s1) stream(s1, advanced) refReceipt(s1, r1)
+  =>* C:Cfg badReturnedActiveAfterCas(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  recoverAfterCas(s1) stream(s1, advanced) refReceipt(s1, r1)
+  =>* C:Cfg badReturnedActiveAfterCas(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naivePromotionSettlesTarget(s1, t1) stream(s1, advanced) refReceipt(s1, r1)
+  =>* C:Cfg badPromotionCreatedExternalReceipt(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  promoteLocal(s1) stream(s1, advanced) refReceipt(s1, r1)
+  =>* C:Cfg badPromotionCreatedExternalReceipt(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveAdvanceOnFailedPreflight(s1) stream(s1, reserved)
+    reservation(s1, c0, c1, c2) lineAt(s1, c0) mainAt(c1)
+  =>* C:Cfg badAdvanceAfterFailedPreflight(s1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  preflightFailed(s1) stream(s1, reserved)
+    reservation(s1, c0, c1, c2) lineAt(s1, c0) mainAt(c1)
+  =>* C:Cfg badAdvanceAfterFailedPreflight(s1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveSettleSecond(t1)
+  =>* C:Cfg badSettlementOutOfOrder(t1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  settleSecond(t1)
+  =>* C:Cfg badSettlementOutOfOrder(t1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveForkAtDestination(b1, c0, s1) stream(s1, active) destinationHead(s1, c2)
+  =>* C:Cfg badForkUsedDestinationHead(b1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  forkExact(b1, c0, s1) stream(s1, active) destinationHead(s1, c2)
+  =>* C:Cfg badForkUsedDestinationHead(b1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveInheritArchivedHome(b1, s1) stream(s1, archived)
+  =>* C:Cfg badBranchFromArchivedHome(b1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  inheritHome(b1, s1) stream(s1, archived)
+  =>* C:Cfg badBranchFromArchivedHome(b1) .
+
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  naiveUseInheritedReceipt(b1, t1) inheritedReceipt(b1, t1, r1)
+  =>* C:Cfg badInheritedReceiptGrantedAuthority(b1) .
+search [1] in WHIPPLESCRIPT-WORKSTREAM-BOUNDARY :
+  useInheritedReceipt(b1, t1) inheritedReceipt(b1, t1, r1)
+  =>* C:Cfg badInheritedReceiptGrantedAuthority(b1) .

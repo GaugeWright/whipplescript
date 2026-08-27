@@ -13,7 +13,9 @@
 //! posture).
 
 use whipplescript_store::workstreams::{
-    ArchiveOutcome, CreateStreamOutcome, JoinOutcome, StreamStatus, WorkstreamRow, Workstreams,
+    branch_home_evidence_handle, ArchiveOutcome, BoundaryReservation, BranchHomeReceiptV1,
+    ClosePromotedOutcome, CreateStreamOutcome, JoinOutcome, RecordRefAdvancedOutcome,
+    ReleaseBoundaryOutcome, ReserveBoundaryOutcome, StreamStatus, WorkstreamRow, Workstreams,
 };
 use whipplescript_store::{StoreError, StoreResult};
 
@@ -44,9 +46,6 @@ impl<S: DoSql> DoWorkstreams<S> {
             "CREATE UNIQUE INDEX IF NOT EXISTS workstreams_idempotency_idx
                 ON workstreams(idempotency_key)
                 WHERE idempotency_key IS NOT NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS workstreams_active_name_idx
-                ON workstreams(name)
-                WHERE name IS NOT NULL AND status = 'active'",
             "CREATE TABLE IF NOT EXISTS workstream_members (
                 branch_id TEXT PRIMARY KEY,
                 stream_id TEXT NOT NULL,
@@ -54,6 +53,12 @@ impl<S: DoSql> DoWorkstreams<S> {
             )",
             "CREATE INDEX IF NOT EXISTS workstream_members_stream_idx
                 ON workstream_members(stream_id)",
+            "CREATE TABLE IF NOT EXISTS workstream_home_positions (
+                branch_id TEXT PRIMARY KEY,
+                authority_position INTEGER NOT NULL,
+                home_stream_id TEXT,
+                recorded_at TEXT NOT NULL
+            )",
         ] {
             self.sql.execute(statement, &[]).map_err(sql_err)?;
         }
@@ -63,24 +68,54 @@ impl<S: DoSql> DoWorkstreams<S> {
             .sql
             .query("PRAGMA table_info(workstreams)", &[])
             .map_err(sql_err)?;
-        let present = info.iter().any(|row| {
-            row.get(1)
-                .map(|value| as_text(value) == "staleness_seconds")
-                .unwrap_or(false)
-        });
-        if !present {
-            self.sql
-                .execute(
-                    "ALTER TABLE workstreams ADD COLUMN staleness_seconds INTEGER",
-                    &[],
-                )
-                .map_err(sql_err)?;
+        for (name, sql_type) in [
+            ("staleness_seconds", "INTEGER"),
+            ("reservation_id", "TEXT"),
+            ("expected_line_cut", "TEXT"),
+            ("expected_main_cut", "TEXT"),
+            ("proposed_main_cut", "TEXT"),
+            ("ref_position", "INTEGER"),
+            ("ref_receipt_handle", "TEXT"),
+        ] {
+            let present = info.iter().any(|row| {
+                row.get(1)
+                    .map(|value| as_text(value) == name)
+                    .unwrap_or(false)
+            });
+            if !present {
+                self.sql
+                    .execute(
+                        &format!("ALTER TABLE workstreams ADD COLUMN {name} {sql_type}"),
+                        &[],
+                    )
+                    .map_err(sql_err)?;
+            }
         }
+        self.sql
+            .execute("DROP INDEX IF EXISTS workstreams_active_name_idx", &[])
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS workstreams_live_name_idx
+                   ON workstreams(name)
+                   WHERE name IS NOT NULL AND status != 'archived'",
+                &[],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "INSERT OR IGNORE INTO workstream_home_positions
+                   (branch_id, authority_position, home_stream_id, recorded_at)
+                 SELECT branch_id, 1, stream_id, joined_at FROM workstream_members",
+                &[],
+            )
+            .map_err(sql_err)?;
         Ok(())
     }
 
     const ROW_COLUMNS: &'static str = "stream_id, name, line_branch_id, status, \
-        staleness_seconds, created_at, updated_at";
+        staleness_seconds, reservation_id, expected_line_cut, expected_main_cut, \
+        proposed_main_cut, ref_position, ref_receipt_handle, created_at, updated_at";
 
     fn decode_row(row: &[SqlValue]) -> WorkstreamRow {
         WorkstreamRow {
@@ -92,8 +127,17 @@ impl<S: DoSql> DoWorkstreams<S> {
                 SqlValue::Int(value) => Some(*value),
                 _ => None,
             },
-            created_at: as_text(&row[5]),
-            updated_at: as_text(&row[6]),
+            reservation_id: as_opt_text(&row[5]),
+            expected_line_cut: as_opt_text(&row[6]),
+            expected_main_cut: as_opt_text(&row[7]),
+            proposed_main_cut: as_opt_text(&row[8]),
+            ref_position: match &row[9] {
+                SqlValue::Int(value) => u64::try_from(*value).ok(),
+                _ => None,
+            },
+            ref_receipt_handle: as_opt_text(&row[10]),
+            created_at: as_text(&row[11]),
+            updated_at: as_text(&row[12]),
         }
     }
 
@@ -109,6 +153,27 @@ impl<S: DoSql> DoWorkstreams<S> {
             )
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| Self::decode_row(row)))
+    }
+
+    fn record_home_position(
+        &self,
+        branch_id: &str,
+        stream_id: Option<&str>,
+        at: &str,
+    ) -> StoreResult<()> {
+        self.sql
+            .execute(
+                "INSERT INTO workstream_home_positions
+                   (branch_id, authority_position, home_stream_id, recorded_at)
+                 VALUES (?1, 1, ?2, ?3)
+                 ON CONFLICT(branch_id) DO UPDATE SET
+                   authority_position = authority_position + 1,
+                   home_stream_id = ?2,
+                   recorded_at = ?3",
+                &[text(branch_id), opt_text(stream_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 
     /// Set (or clear) the staleness bound — governance surface, exactly
@@ -170,7 +235,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
                 .sql
                 .query(
                     "SELECT stream_id FROM workstreams \
-                     WHERE name = ?1 AND status = 'active'",
+                     WHERE name = ?1 AND status != 'archived'",
                     &[text(name)],
                 )
                 .map_err(sql_err)?;
@@ -235,10 +300,31 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         let Some(stream) = self.row_by_id(stream_id)? else {
             return Ok(JoinOutcome::StreamMissing);
         };
-        if stream.status != StreamStatus::Active {
-            return Ok(JoinOutcome::StreamArchived);
+        match stream.status {
+            StreamStatus::Active => {}
+            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced => {
+                return Ok(JoinOutcome::StreamReserved)
+            }
+            StreamStatus::Archived => return Ok(JoinOutcome::StreamArchived),
         }
         let previous = self.home_of(branch_id)?;
+        if previous.as_deref() == Some(stream_id) {
+            return Ok(JoinOutcome::Joined {
+                left_stream_id: None,
+            });
+        }
+        if let Some(previous_id) = previous.as_deref().filter(|id| *id != stream_id) {
+            if let Some(source) = self.row_by_id(previous_id)? {
+                if matches!(
+                    source.status,
+                    StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced
+                ) {
+                    return Ok(JoinOutcome::SourceReserved {
+                        stream_id: previous_id.to_owned(),
+                    });
+                }
+            }
+        }
         self.sql
             .execute(
                 "INSERT INTO workstream_members (branch_id, stream_id, joined_at) \
@@ -247,6 +333,7 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
                 &[text(branch_id), text(stream_id), text(at)],
             )
             .map_err(sql_err)?;
+        self.record_home_position(branch_id, Some(stream_id), at)?;
         Ok(JoinOutcome::Joined {
             left_stream_id: previous.filter(|prev| prev != stream_id),
         })
@@ -254,12 +341,27 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
 
     fn leave(&mut self, branch_id: &str) -> StoreResult<Option<String>> {
         let previous = self.home_of(branch_id)?;
+        if let Some(previous_id) = previous.as_deref() {
+            if let Some(source) = self.row_by_id(previous_id)? {
+                if matches!(
+                    source.status,
+                    StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced
+                ) {
+                    return Err(StoreError::Conflict(format!(
+                        "workstream `{previous_id}` has a reserved promotion boundary"
+                    )));
+                }
+            }
+        }
         self.sql
             .execute(
                 "DELETE FROM workstream_members WHERE branch_id = ?1",
                 &[text(branch_id)],
             )
             .map_err(sql_err)?;
+        if previous.is_some() {
+            self.record_home_position(branch_id, None, "leave")?;
+        }
         Ok(previous)
     }
 
@@ -272,6 +374,52 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
             )
             .map_err(sql_err)?;
         Ok(rows.first().map(|row| as_text(&row[0])))
+    }
+
+    fn home_receipt(&self, branch_id: &str) -> StoreResult<BranchHomeReceiptV1> {
+        let stream_id = self.home_of(branch_id)?;
+        let stream = match stream_id.as_deref() {
+            Some(stream_id) => self.row_by_id(stream_id)?,
+            None => None,
+        };
+        let rows = self
+            .sql
+            .query(
+                "SELECT authority_position, recorded_at
+                 FROM workstream_home_positions WHERE branch_id = ?1",
+                &[text(branch_id)],
+            )
+            .map_err(sql_err)?;
+        let authority_position = rows
+            .first()
+            .and_then(|row| match row.first() {
+                Some(SqlValue::Int(value)) => u64::try_from(*value).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let recorded_at = rows
+            .first()
+            .and_then(|row| row.get(1))
+            .and_then(as_opt_text);
+        let line_branch_id = stream.as_ref().map(|row| row.line_branch_id.clone());
+        let stream_status = stream.as_ref().map(|row| row.status);
+        let evidence_handle = branch_home_evidence_handle(
+            branch_id,
+            stream_id.as_deref(),
+            line_branch_id.as_deref(),
+            stream_status,
+            authority_position,
+        );
+        Ok(BranchHomeReceiptV1 {
+            schema: "branch_home_receipt_v1".to_owned(),
+            branch_id: branch_id.to_owned(),
+            stream_id,
+            line_branch_id,
+            stream_status,
+            authority_position,
+            evidence_handle,
+            recorded_at,
+        })
     }
 
     fn members(&self, stream_id: &str) -> StoreResult<Vec<String>> {
@@ -290,10 +438,16 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
         let Some(stream) = self.row_by_id(stream_id)? else {
             return Ok(ArchiveOutcome::StreamMissing);
         };
-        if stream.status != StreamStatus::Active {
-            return Ok(ArchiveOutcome::AlreadyArchived);
+        match stream.status {
+            StreamStatus::Active => {}
+            StreamStatus::BoundaryReserved => return Ok(ArchiveOutcome::BoundaryReserved),
+            StreamStatus::RefAdvanced => return Ok(ArchiveOutcome::RefAlreadyAdvanced),
+            StreamStatus::Archived => return Ok(ArchiveOutcome::AlreadyArchived),
         }
         let rehomed = self.members(stream_id)?;
+        for branch_id in &rehomed {
+            self.record_home_position(branch_id, None, at)?;
+        }
         self.sql
             .execute(
                 "UPDATE workstreams SET status = 'archived', updated_at = ?2 \
@@ -308,6 +462,177 @@ impl<S: DoSql> Workstreams for DoWorkstreams<S> {
             )
             .map_err(sql_err)?;
         Ok(ArchiveOutcome::Archived {
+            rehomed_branch_ids: rehomed,
+        })
+    }
+
+    fn reserve_boundary(
+        &mut self,
+        stream_id: &str,
+        reservation: BoundaryReservation<'_>,
+    ) -> StoreResult<ReserveBoundaryOutcome> {
+        let Some(stream) = self.row_by_id(stream_id)? else {
+            return Ok(ReserveBoundaryOutcome::StreamMissing);
+        };
+        match stream.status {
+            StreamStatus::Archived => return Ok(ReserveBoundaryOutcome::StreamArchived),
+            StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced => {
+                if stream.reservation_id.as_deref() == Some(reservation.reservation_id)
+                    && stream.expected_line_cut.as_deref() == Some(reservation.expected_line_cut)
+                    && stream.expected_main_cut.as_deref() == Some(reservation.expected_main_cut)
+                    && stream.proposed_main_cut.as_deref() == Some(reservation.proposed_main_cut)
+                {
+                    return Ok(ReserveBoundaryOutcome::Existing(stream));
+                }
+                return Ok(ReserveBoundaryOutcome::Busy {
+                    holder_reservation_id: stream.reservation_id.unwrap_or_default(),
+                });
+            }
+            StreamStatus::Active => {}
+        }
+        self.sql
+            .execute(
+                "UPDATE workstreams SET status = 'boundary_reserved', reservation_id = ?2,
+                 expected_line_cut = ?3, expected_main_cut = ?4, proposed_main_cut = ?5,
+                 ref_position = NULL, ref_receipt_handle = NULL, updated_at = ?6
+                 WHERE stream_id = ?1 AND status = 'active'",
+                &[
+                    text(stream_id),
+                    text(reservation.reservation_id),
+                    text(reservation.expected_line_cut),
+                    text(reservation.expected_main_cut),
+                    text(reservation.proposed_main_cut),
+                    text(reservation.at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(stream_id)?
+            .ok_or_else(|| StoreError::Conflict("reserved stream missing".to_owned()))?;
+        Ok(ReserveBoundaryOutcome::Reserved(row))
+    }
+
+    fn release_boundary(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<ReleaseBoundaryOutcome> {
+        let Some(stream) = self.row_by_id(stream_id)? else {
+            return Ok(ReleaseBoundaryOutcome::StreamMissing);
+        };
+        match stream.status {
+            StreamStatus::Active => return Ok(ReleaseBoundaryOutcome::AlreadyActive),
+            StreamStatus::Archived => return Ok(ReleaseBoundaryOutcome::StreamArchived),
+            StreamStatus::RefAdvanced => return Ok(ReleaseBoundaryOutcome::RefAlreadyAdvanced),
+            StreamStatus::BoundaryReserved => {}
+        }
+        if stream.reservation_id.as_deref() != Some(reservation_id) {
+            return Ok(ReleaseBoundaryOutcome::ReservationMismatch);
+        }
+        self.sql
+            .execute(
+                "UPDATE workstreams SET status = 'active', reservation_id = NULL,
+                 expected_line_cut = NULL, expected_main_cut = NULL,
+                 proposed_main_cut = NULL, ref_position = NULL,
+                 ref_receipt_handle = NULL, updated_at = ?3
+                 WHERE stream_id = ?1 AND reservation_id = ?2
+                   AND status = 'boundary_reserved'",
+                &[text(stream_id), text(reservation_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(ReleaseBoundaryOutcome::Released)
+    }
+
+    fn record_ref_advanced(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        ref_position: u64,
+        ref_receipt_handle: &str,
+        at: &str,
+    ) -> StoreResult<RecordRefAdvancedOutcome> {
+        let Some(stream) = self.row_by_id(stream_id)? else {
+            return Ok(RecordRefAdvancedOutcome::StreamMissing);
+        };
+        if stream.status == StreamStatus::Archived {
+            return Ok(RecordRefAdvancedOutcome::StreamArchived);
+        }
+        if stream.reservation_id.as_deref() != Some(reservation_id) {
+            return Ok(RecordRefAdvancedOutcome::ReservationMismatch);
+        }
+        if stream.status == StreamStatus::RefAdvanced {
+            if stream.ref_position == Some(ref_position)
+                && stream.ref_receipt_handle.as_deref() == Some(ref_receipt_handle)
+            {
+                return Ok(RecordRefAdvancedOutcome::Existing(stream));
+            }
+            return Ok(RecordRefAdvancedOutcome::ReservationMismatch);
+        }
+        if stream.status != StreamStatus::BoundaryReserved {
+            return Ok(RecordRefAdvancedOutcome::NotReserved);
+        }
+        let position = i64::try_from(ref_position).map_err(|_| {
+            StoreError::Conflict("ref authority position exceeds SQLite range".to_owned())
+        })?;
+        self.sql
+            .execute(
+                "UPDATE workstreams SET status = 'ref_advanced', ref_position = ?3,
+                 ref_receipt_handle = ?4, updated_at = ?5
+                 WHERE stream_id = ?1 AND reservation_id = ?2
+                   AND status = 'boundary_reserved'",
+                &[
+                    text(stream_id),
+                    text(reservation_id),
+                    SqlValue::Int(position),
+                    text(ref_receipt_handle),
+                    text(at),
+                ],
+            )
+            .map_err(sql_err)?;
+        let row = self
+            .row_by_id(stream_id)?
+            .ok_or_else(|| StoreError::Conflict("advanced stream missing".to_owned()))?;
+        Ok(RecordRefAdvancedOutcome::Recorded(row))
+    }
+
+    fn close_promoted(
+        &mut self,
+        stream_id: &str,
+        reservation_id: &str,
+        at: &str,
+    ) -> StoreResult<ClosePromotedOutcome> {
+        let Some(stream) = self.row_by_id(stream_id)? else {
+            return Ok(ClosePromotedOutcome::StreamMissing);
+        };
+        if stream.reservation_id.as_deref() != Some(reservation_id) {
+            return Ok(ClosePromotedOutcome::ReservationMismatch);
+        }
+        if stream.status == StreamStatus::Archived {
+            return Ok(ClosePromotedOutcome::AlreadyClosed);
+        }
+        if stream.status != StreamStatus::RefAdvanced {
+            return Ok(ClosePromotedOutcome::RefNotAdvanced);
+        }
+        let rehomed = self.members(stream_id)?;
+        for branch_id in &rehomed {
+            self.record_home_position(branch_id, None, at)?;
+        }
+        self.sql
+            .execute(
+                "DELETE FROM workstream_members WHERE stream_id = ?1",
+                &[text(stream_id)],
+            )
+            .map_err(sql_err)?;
+        self.sql
+            .execute(
+                "UPDATE workstreams SET status = 'archived', updated_at = ?3
+                 WHERE stream_id = ?1 AND reservation_id = ?2
+                   AND status = 'ref_advanced'",
+                &[text(stream_id), text(reservation_id), text(at)],
+            )
+            .map_err(sql_err)?;
+        Ok(ClosePromotedOutcome::Closed {
             rehomed_branch_ids: rehomed,
         })
     }
@@ -442,16 +767,10 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         else {
             return failed("vcs.promote input names no stream".to_owned());
         };
-        let streams = match DoWorkstreams::new(self.sql.clone()) {
+        let mut streams = match DoWorkstreams::new(self.sql.clone()) {
             Ok(streams) => streams,
             Err(error) => return failed(format!("workstream store unavailable: {error:?}")),
         };
-        let Ok(Some(stream)) = streams.get_stream(stream_id) else {
-            return failed(format!("no such stream `{stream_id}`"));
-        };
-        if stream.status != StreamStatus::Active {
-            return failed(format!("stream `{stream_id}` is archived"));
-        }
         let branches = match crate::do_branches::DoBranches::new(self.sql.clone()) {
             Ok(branches) => branches,
             Err(error) => return failed(format!("branch store unavailable: {error:?}")),
@@ -463,52 +782,154 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
         let mut vcs = whipplescript_store::vcs::WorkspaceVcs::from_parts(branches, content);
         let seed = crate::do_store::stable_hash_hex(&format!("promote|{}", effect.effect_id));
         let at = format!("promote:{}", effect.effect_id);
-        match vcs.sync_to_line(
-            &stream.line_branch_id,
-            whipplescript_store::branches::MAINLINE_BRANCH_ID,
-            &format!("cut-{seed}-promote"),
-            &at,
-        ) {
-            Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
-                CapabilityOutcome::Produced(serde_json::json!({
+        let reservation_id = format!("effect-{}", effect.effect_id);
+        let proposed_main = format!("cut-{seed}-promote");
+        let mut stream = match streams.get_stream(stream_id) {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return failed(format!("no such stream `{stream_id}`")),
+            Err(error) => return failed(format!("workstream read failed: {error:?}")),
+        };
+        if stream.status == StreamStatus::Archived {
+            return match stream.boundary_receipt("durable-object-workspace") {
+                Some(receipt) => CapabilityOutcome::Produced(serde_json::json!({
                     "variant": "Promoted",
                     "stream": stream_id,
-                    "sync_cut_id": sync_cut_id,
-                    "detail": "",
-                }))
+                    "sync_cut_id": receipt.proposed_main_cut,
+                    "detail": "recovered",
+                    "boundary_receipt": receipt,
+                })),
+                None => failed(format!("stream `{stream_id}` is archived")),
+            };
+        }
+        if stream.status == StreamStatus::Active {
+            let line = match vcs.get_branch(&stream.line_branch_id) {
+                Ok(Some(line)) => line,
+                Ok(None) => return failed("stream line is missing".to_owned()),
+                Err(error) => return failed(format!("stream line read failed: {error:?}")),
+            };
+            let main = match vcs.get_branch(whipplescript_store::branches::MAINLINE_BRANCH_ID) {
+                Ok(Some(main)) => main,
+                Ok(None) => return failed("Main is missing".to_owned()),
+                Err(error) => return failed(format!("Main read failed: {error:?}")),
+            };
+            let expected_line = line.head_cut_id.unwrap_or_default();
+            let expected_main = main.head_cut_id.unwrap_or_default();
+            stream = match streams.reserve_boundary(
+                stream_id,
+                BoundaryReservation {
+                    reservation_id: &reservation_id,
+                    expected_line_cut: &expected_line,
+                    expected_main_cut: &expected_main,
+                    proposed_main_cut: &proposed_main,
+                    at: &at,
+                },
+            ) {
+                Ok(ReserveBoundaryOutcome::Reserved(row))
+                | Ok(ReserveBoundaryOutcome::Existing(row)) => row,
+                Ok(other) => return failed(format!("boundary reservation refused: {other:?}")),
+                Err(error) => return failed(format!("boundary reservation failed: {error:?}")),
+            };
+        }
+
+        let reservation_id = stream.reservation_id.clone().unwrap_or_default();
+        let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
+        let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
+        let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
+        if stream.status == StreamStatus::RefAdvanced {
+            if let Err(error) = streams.close_promoted(stream_id, &reservation_id, &at) {
+                return failed(format!("post-CAS close failed: {error:?}"));
             }
-            Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
-                CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Promoted",
-                    "stream": stream_id,
-                    "sync_cut_id": "",
-                    "detail": "up_to_date",
-                }))
+        } else if stream.status == StreamStatus::BoundaryReserved {
+            fn cut_value(value: &str) -> Option<&str> {
+                (!value.is_empty()).then_some(value)
             }
-            Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
-                CapabilityOutcome::Produced(serde_json::json!({
-                    "variant": "Conflicted",
-                    "stream": stream_id,
-                    "sync_cut_id": "",
-                    "detail": serde_json::to_string(
-                        &conflicts
-                            .iter()
-                            .map(|conflict| {
-                                serde_json::json!({
+            let evidence = match vcs.boundary_ref_evidence(
+                &stream.line_branch_id,
+                cut_value(&expected_main),
+                &proposed_main,
+            ) {
+                Ok(evidence) => evidence,
+                Err(error) => return failed(format!("boundary recovery failed: {error:?}")),
+            };
+            let (position, handle) = match evidence {
+                Some(evidence) => evidence,
+                None => match vcs.promote_line_exact(
+                    &stream.line_branch_id,
+                    cut_value(&expected_line),
+                    cut_value(&expected_main),
+                    &proposed_main,
+                    &at,
+                ) {
+                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                        ref_position,
+                        ref_receipt_handle,
+                        ..
+                    }) => (ref_position, ref_receipt_handle),
+                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted {
+                        conflicts,
+                    }) => {
+                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        return CapabilityOutcome::Produced(serde_json::json!({
+                            "variant": "Conflicted",
+                            "stream": stream_id,
+                            "sync_cut_id": "",
+                            "detail": serde_json::to_string(
+                                &conflicts.iter().map(|conflict| serde_json::json!({
                                     "path": conflict.path,
                                     "base": conflict.base,
                                     "ours": conflict.ours,
                                     "theirs": conflict.theirs,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    )
-                    .unwrap_or_default(),
-                }))
+                                })).collect::<Vec<_>>()
+                            ).unwrap_or_default(),
+                        }));
+                    }
+                    Ok(whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
+                        ..
+                    }) => {
+                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        return failed("exact stream/Main cut moved; retry".to_owned());
+                    }
+                    Ok(other) => {
+                        let _ = streams.release_boundary(stream_id, &reservation_id, &at);
+                        return failed(format!("promotion refused: {other:?}"));
+                    }
+                    Err(error) => return failed(format!("promotion failed: {error:?}")),
+                },
+            };
+            match streams.record_ref_advanced(stream_id, &reservation_id, position, &handle, &at) {
+                Ok(RecordRefAdvancedOutcome::Recorded(_))
+                | Ok(RecordRefAdvancedOutcome::Existing(_)) => {}
+                Ok(other) => return failed(format!("ref receipt refused: {other:?}")),
+                Err(error) => return failed(format!("ref receipt failed: {error:?}")),
             }
-            Ok(other) => failed(format!("promotion refused: {other:?}")),
-            Err(error) => failed(format!("promotion failed: {error:?}")),
+            match streams.close_promoted(stream_id, &reservation_id, &at) {
+                Ok(ClosePromotedOutcome::Closed { .. })
+                | Ok(ClosePromotedOutcome::AlreadyClosed) => {}
+                Ok(other) => return failed(format!("post-CAS close refused: {other:?}")),
+                Err(error) => return failed(format!("post-CAS close failed: {error:?}")),
+            }
+        } else {
+            return failed(format!(
+                "stream `{stream_id}` cannot promote from {}",
+                stream.status.as_str()
+            ));
         }
+
+        let receipt = match streams.get_stream(stream_id) {
+            Ok(Some(row)) => match row.boundary_receipt("durable-object-workspace") {
+                Some(receipt) => receipt,
+                None => return failed("closed promotion has no receipt".to_owned()),
+            },
+            Ok(None) => return failed("promoted stream vanished".to_owned()),
+            Err(error) => return failed(format!("receipt read failed: {error:?}")),
+        };
+        CapabilityOutcome::Produced(serde_json::json!({
+            "variant": "Promoted",
+            "stream": stream_id,
+            "sync_cut_id": receipt.proposed_main_cut,
+            "detail": "",
+            "boundary_receipt": receipt,
+        }))
     }
 }
 
@@ -757,6 +1178,9 @@ mod tests {
                 left_stream_id: None
             }
         ));
+        let first_home = streams.home_receipt("member-1").expect("home receipt");
+        assert_eq!(first_home.authority_position, 1);
+        assert_eq!(first_home.stream_id.as_deref(), Some("triage"));
         // Single-valued membership: joining hotfix leaves triage in one step.
         let rehomed = streams.join("member-1", "hotfix", "t4").expect("join");
         assert!(
@@ -766,6 +1190,9 @@ mod tests {
             streams.home_of("member-1").expect("home").as_deref(),
             Some("hotfix")
         );
+        let transferred = streams.home_receipt("member-1").expect("transferred");
+        assert_eq!(transferred.authority_position, 2);
+        assert_ne!(transferred.evidence_handle, first_home.evidence_handle);
         // Archive re-homes members and refuses further joins.
         let archived = streams.archive_stream("hotfix", "t5").expect("archive");
         assert!(
@@ -775,6 +1202,9 @@ mod tests {
             streams.join("member-2", "hotfix", "t6").expect("join"),
             JoinOutcome::StreamArchived
         ));
+        let main_home = streams.home_receipt("member-1").expect("main receipt");
+        assert_eq!(main_home.authority_position, 3);
+        assert_eq!(main_home.stream_id, None);
     }
 
     /// DR-0052 R4 (DO parity): the selective verbs over the instance's
@@ -958,17 +1388,17 @@ mod tests {
         let provider = DoVcsPromoteCapabilityProvider {
             sql: Rc::clone(&sql),
         };
-        let effect = |id: &str| whipplescript_store::ClaimableEffect {
+        let effect = |id: &str, stream: &str| whipplescript_store::ClaimableEffect {
             effect_id: id.to_owned(),
             kind: "capability.call".to_owned(),
             target: Some("vcs.promote".to_owned()),
             profile: None,
-            input_json: r#"{"stream":"triage"}"#.to_owned(),
+            input_json: serde_json::json!({ "stream": stream }).to_string(),
             required_capabilities_json: "[]".to_owned(),
             declared_profiles_json: "[]".to_owned(),
         };
         let config = whipplescript_kernel::effect_config::EffectConfig::default();
-        let outcome = provider.produce(&effect("eff-1"), &config);
+        let outcome = provider.produce(&effect("eff-1", "triage"), &config);
         let CapabilityOutcome::Produced(value) = outcome else {
             panic!("expected produced, got failure");
         };
@@ -983,9 +1413,22 @@ mod tests {
             .expect("present");
         assert_eq!(main_manifest, "stream work");
 
+        // A promoted stream is closed historical evidence. Use a distinct
+        // live stream for the conflict case; retrying eff-1 would correctly
+        // recover its Promoted receipt instead of reopening history.
+        vcs.create_branch(
+            "line-conflict",
+            None,
+            whipplescript_store::branches::MAINLINE_BRANCH_ID,
+            "t3",
+        )
+        .expect("conflict line");
+        streams
+            .create_stream("conflict", None, "line-conflict", "t3", None)
+            .expect("conflict stream");
         // Divergent edits on both sides: the hop refuses as data.
         vcs.write(
-            "line-triage",
+            "line-conflict",
             "contested.md",
             Some("stream side"),
             "cut_2",
@@ -1000,7 +1443,7 @@ mod tests {
             "t4",
         )
         .expect("write");
-        let outcome = provider.produce(&effect("eff-2"), &config);
+        let outcome = provider.produce(&effect("eff-2", "conflict"), &config);
         let CapabilityOutcome::Produced(value) = outcome else {
             panic!("expected produced, got failure");
         };

@@ -126,3 +126,4 @@ workflow-revision.maude	SSSSNNNNN
 workflow-runtime-marker-reresolution.maude	SSSNNN
 workflow-scoping.maude	SSSSSSNNN
 workstream.maude	SSSNNNNN
+workstream-boundary.maude	SNSNSNSNSNSNSNSNSNSNSNSN

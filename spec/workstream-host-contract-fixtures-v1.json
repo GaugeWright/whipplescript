@@ -1,0 +1,141 @@
+{
+  "schema": "whipplescript.workstream_host_contract_fixtures.v1",
+  "contract_revision": "whipplescript-workstream-host/v1.0.0",
+  "cases": [
+    {
+      "id": "reservation_freezes_topology_and_contribution",
+      "given": {
+        "status": "active",
+        "expected_stream_cut": "cut-line-7",
+        "expected_main_cut": "cut-main-11",
+        "proposed_main_cut": "cut-main-12"
+      },
+      "when": "reserve_boundary",
+      "expect": {
+        "status": "boundary_reserved",
+        "join": "stream_reserved",
+        "leave": "refused",
+        "transfer": "stream_reserved",
+        "reconcile": "boundary_reserved"
+      },
+      "coverage": "workstreams::tests::reservation_freezes_both_sides_of_atomic_transfer"
+    },
+    {
+      "id": "conflict_releases_without_main_movement",
+      "given": {
+        "status": "boundary_reserved",
+        "expected_main_cut": "cut-main-11",
+        "conflicting_path": "src/config.whip"
+      },
+      "when": "promote_line_exact",
+      "expect": {
+        "outcome": "conflicted",
+        "status": "active",
+        "main_cut": "cut-main-11",
+        "ref_receipt_handle": null
+      },
+      "coverage": "vcs::tests::boundary_conflict_moves_no_pointer"
+    },
+    {
+      "id": "post_cas_recovery_closes_forward",
+      "given": {
+        "status": "boundary_reserved",
+        "main_cut": "cut-main-12",
+        "proposed_main_cut": "cut-main-12"
+      },
+      "when": "recover_boundary_ref_evidence",
+      "expect": {
+        "status_sequence": ["ref_advanced", "archived"],
+        "main_cas_count": 0,
+        "ref_receipt_handle": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "coverage": "vcs::tests::reserved_boundary_promotes_with_one_exact_main_cas"
+    },
+    {
+      "id": "sparse_member_import_preserves_absent_partition",
+      "given": {
+        "manifest_paths": ["target-a/src.txt", "target-b/src.txt"],
+        "materialized_paths": ["target-a/src.txt"]
+      },
+      "when": "import_scratch",
+      "expect": {
+        "changed_paths": ["target-a/src.txt"],
+        "removed_paths": [],
+        "untouched_paths": ["target-b/src.txt"]
+      },
+      "coverage": "materialize::tests::subset_materialization_respects_closure_and_budget"
+    },
+    {
+      "id": "exact_fork_admits_home_without_rematerialization",
+      "given": {
+        "source_cut": "chat-1",
+        "source_tip": "chat-2",
+        "destination_head": "line-1",
+        "destination_status": "active"
+      },
+      "when": "fork_at_cut_and_admit",
+      "expect": {
+        "outcome": "forked",
+        "branch_point_cut": "chat-1",
+        "content_source": "chat-1",
+        "home_stream_id": "live"
+      },
+      "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "archived_inherited_home_creates_nothing",
+      "given": {
+        "source_cut": "chat-1",
+        "destination_stream_id": "closed",
+        "destination_status": "archived"
+      },
+      "when": "fork_at_cut_and_admit",
+      "expect": {
+        "outcome": "historical_home_closed",
+        "branch_created": false,
+        "membership_created": false,
+        "main_substituted": false
+      },
+      "coverage": "workstreams::tests::exact_fork_admission_keeps_source_content_and_rejects_closed_home_first"
+    },
+    {
+      "id": "home_rejoin_has_new_authority_position",
+      "given": {
+        "home_sequence": ["one", "two", "one"]
+      },
+      "when": "transfer",
+      "expect": {
+        "authority_positions": [1, 2, 3],
+        "first_and_last_evidence_differ": true
+      },
+      "coverage": "workstreams::tests::home_receipt_positions_distinguish_rejoin_history"
+    },
+    {
+      "id": "concurrent_reservation_has_one_winner",
+      "given": {
+        "status": "active",
+        "reservation_ids": ["race-a", "race-b"]
+      },
+      "when": "reserve_boundary_concurrently",
+      "expect": {
+        "reserved_count": 1,
+        "busy_count": 1
+      },
+      "coverage": "workstreams::tests::concurrent_boundary_reservations_have_one_winner"
+    },
+    {
+      "id": "concurrent_main_cas_has_one_winner",
+      "given": {
+        "expected_main_cut": "main-1",
+        "proposed_main_cuts": ["main-race-a", "main-race-b"]
+      },
+      "when": "promote_line_exact_concurrently",
+      "expect": {
+        "promoted_count": 1,
+        "expected_cuts_moved_count": 1,
+        "main_advance_count": 1
+      },
+      "coverage": "vcs::tests::concurrent_exact_promotions_have_one_main_cas_winner"
+    }
+  ]
+}

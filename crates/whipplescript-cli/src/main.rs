@@ -23482,90 +23482,57 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
         else {
             return failed("vcs.promote input names no stream".to_owned());
         };
-        let streams = match whipplescript_store::workstreams::WorkstreamStore::open(
+        let mut streams = match whipplescript_store::workstreams::WorkstreamStore::open(
             workstream_store_path(),
         ) {
             Ok(streams) => streams,
             Err(error) => return failed(format!("workstream store unavailable: {error:?}")),
         };
-        use whipplescript_store::workstreams::{StreamStatus, Workstreams};
-        let Ok(Some(stream)) = streams.get_stream(stream_id) else {
-            return failed(format!("no such stream `{stream_id}`"));
-        };
-        if stream.status != StreamStatus::Active {
-            return failed(format!("stream `{stream_id}` is archived"));
-        }
         let mut vcs = match open_vcs() {
             Ok(vcs) => vcs,
             Err(_) => return failed("branch stores unavailable".to_owned()),
         };
         let at = now_stamp();
-        // The boundary hop runs under the adoption lease on mainline —
-        // identical to the CLI verb; a held lease is a retryable refusal.
         let holder = format!("whip-promote-{}", effect.effect_id);
-        let lease_key = format!(
-            "{}::{}",
-            branch_store_path().display(),
-            whipplescript_store::branches::MAINLINE_BRANCH_ID
-        );
-        let mut coordination = match whipplescript_store::coordination::CoordinationStore::open(
-            coordination_store_path(),
-        ) {
-            Ok(coordination) => coordination,
-            Err(error) => return failed(format!("coordination store unavailable: {error:?}")),
-        };
-        match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
-            Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
-            Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
-                return failed(format!("adoption lease held by {holders:?}; retry"));
-            }
-            Err(error) => return failed(format!("adoption lease unavailable: {error:?}")),
-        }
-        let sync_cut = generated_cut_id();
-        let outcome = vcs.sync_to_line(
-            &stream.line_branch_id,
-            whipplescript_store::branches::MAINLINE_BRANCH_ID,
-            &format!("{sync_cut}-promote"),
+        let reservation_id = format!("effect-{}", effect.effect_id);
+        match run_reserved_boundary_promotion(
+            &mut streams,
+            &mut vcs,
+            stream_id,
+            &reservation_id,
+            &holder,
             &at,
-        );
-        let _ = coordination.release("adoption", &lease_key, &holder);
-        match outcome {
-            Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
+        ) {
+            Ok(BoundaryRunOutcome::Promoted {
+                receipt,
+                member_branches,
+            }) => {
                 let mut promoted_facts: Vec<(String, Value)> = Vec::new();
-                if let Ok(member_branches) = streams.members(stream_id) {
-                    for member in member_branches {
-                        promoted_facts.push((
-                            "vcs.stream.promoted".to_owned(),
-                            json!({
-                                "branch": member,
-                                "stream": stream_id,
-                                "cut": sync_cut_id,
-                                "at": at,
-                            }),
-                        ));
-                    }
+                for member in member_branches {
+                    promoted_facts.push((
+                        "vcs.stream.promoted".to_owned(),
+                        json!({
+                            "branch": member,
+                            "stream": stream_id,
+                            "cut": receipt.proposed_main_cut,
+                            "receipt": receipt.ref_receipt_handle,
+                            "at": at,
+                        }),
+                    ));
                 }
                 route_workspace_facts(&vcs, promoted_facts, &self.store_path);
                 CapabilityOutcome::Produced(json!({
                     "variant": "Promoted",
                     "stream": stream_id,
-                    "sync_cut_id": sync_cut_id,
+                    "sync_cut_id": receipt.proposed_main_cut,
                     "detail": "",
+                    "boundary_receipt": receipt,
                 }))
             }
-            Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
-                CapabilityOutcome::Produced(json!({
-                    "variant": "Promoted",
-                    "stream": stream_id,
-                    "sync_cut_id": "",
-                    "detail": "up_to_date",
-                }))
-            }
-            Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
+            Ok(BoundaryRunOutcome::Conflicted { conflicts }) => {
                 let stall = vec![(
                     "vcs.reconcile.stalled".to_owned(),
                     json!({
-                        "branch": stream.line_branch_id,
                         "stream": stream_id,
                         "boundary": "promotion",
                         "paths": conflicts
@@ -23587,8 +23554,7 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsPromoteCap
                     .unwrap_or_default(),
                 }))
             }
-            Ok(other) => failed(format!("promotion refused: {other:?}")),
-            Err(error) => failed(format!("promotion failed: {error:?}")),
+            Ok(BoundaryRunOutcome::Refused(message)) | Err(message) => failed(message),
         }
     }
 }
@@ -34639,6 +34605,265 @@ fn stream_row_json(row: &whipplescript_store::workstreams::WorkstreamRow) -> Val
     })
 }
 
+#[derive(Debug)]
+enum BoundaryRunOutcome {
+    Promoted {
+        receipt: Box<whipplescript_store::workstreams::WorkstreamBoundaryReceiptV1>,
+        member_branches: Vec<String>,
+    },
+    Conflicted {
+        conflicts: Vec<whipplescript_store::merge::PathConflict>,
+    },
+    Refused(String),
+}
+
+fn cut_value(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// DR-0078's native promotion coordinator. The workstream reservation freezes
+/// the line before preflight; `promote_line_exact` owns the single Main CAS;
+/// the `ref_advanced` row makes every post-CAS crash close forward on retry.
+fn run_reserved_boundary_promotion(
+    streams: &mut whipplescript_store::workstreams::WorkstreamStore,
+    vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs,
+    stream_id: &str,
+    reservation_seed: &str,
+    holder: &str,
+    at: &str,
+) -> Result<BoundaryRunOutcome, String> {
+    use whipplescript_store::branches::MAINLINE_BRANCH_ID;
+    use whipplescript_store::workstreams::{
+        BoundaryReservation, ClosePromotedOutcome, RecordRefAdvancedOutcome,
+        ReserveBoundaryOutcome, StreamStatus, Workstreams,
+    };
+
+    vcs.init(at)
+        .map_err(|error| format!("workspace unavailable: {error:?}"))?;
+    let mut stream = streams
+        .get_stream(stream_id)
+        .map_err(|error| format!("workstream read failed: {error:?}"))?
+        .ok_or_else(|| format!("no such stream `{stream_id}`"))?;
+
+    if stream.status == StreamStatus::Archived {
+        let receipt = stream
+            .boundary_receipt("native-workspace")
+            .ok_or_else(|| format!("stream `{stream_id}` is archived"))?;
+        return Ok(BoundaryRunOutcome::Promoted {
+            receipt: Box::new(receipt),
+            member_branches: Vec::new(),
+        });
+    }
+
+    if stream.status == StreamStatus::Active {
+        let line = vcs
+            .get_branch(&stream.line_branch_id)
+            .map_err(|error| format!("stream line read failed: {error:?}"))?
+            .ok_or_else(|| format!("stream `{stream_id}` has no line"))?;
+        let main = vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .map_err(|error| format!("Main read failed: {error:?}"))?
+            .ok_or_else(|| "Main is missing".to_owned())?;
+        let expected_line = line.head_cut_id.unwrap_or_default();
+        let expected_main = main.head_cut_id.unwrap_or_default();
+        let proposed_main = format!("{}-promote", generated_cut_id());
+        match streams
+            .reserve_boundary(
+                stream_id,
+                BoundaryReservation {
+                    reservation_id: reservation_seed,
+                    expected_line_cut: &expected_line,
+                    expected_main_cut: &expected_main,
+                    proposed_main_cut: &proposed_main,
+                    at,
+                },
+            )
+            .map_err(|error| format!("boundary reservation failed: {error:?}"))?
+        {
+            ReserveBoundaryOutcome::Reserved(row) | ReserveBoundaryOutcome::Existing(row) => {
+                stream = row;
+            }
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "boundary reservation refused: {other:?}"
+                )))
+            }
+        }
+    }
+
+    if stream.status == StreamStatus::RefAdvanced {
+        let reservation_id = stream.reservation_id.as_deref().unwrap_or_default();
+        match streams
+            .close_promoted(stream_id, reservation_id, at)
+            .map_err(|error| format!("post-CAS close failed: {error:?}"))?
+        {
+            ClosePromotedOutcome::Closed { rehomed_branch_ids } => {
+                let receipt = streams
+                    .get_stream(stream_id)
+                    .map_err(|error| format!("receipt read failed: {error:?}"))?
+                    .and_then(|row| row.boundary_receipt("native-workspace"))
+                    .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+                return Ok(BoundaryRunOutcome::Promoted {
+                    receipt: Box::new(receipt),
+                    member_branches: rehomed_branch_ids,
+                });
+            }
+            ClosePromotedOutcome::AlreadyClosed => {
+                let receipt = streams
+                    .get_stream(stream_id)
+                    .map_err(|error| format!("receipt read failed: {error:?}"))?
+                    .and_then(|row| row.boundary_receipt("native-workspace"))
+                    .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+                return Ok(BoundaryRunOutcome::Promoted {
+                    receipt: Box::new(receipt),
+                    member_branches: Vec::new(),
+                });
+            }
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "post-CAS close refused: {other:?}"
+                )))
+            }
+        }
+    }
+
+    if stream.status != StreamStatus::BoundaryReserved {
+        return Ok(BoundaryRunOutcome::Refused(format!(
+            "stream `{stream_id}` cannot promote from {}",
+            stream.status.as_str()
+        )));
+    }
+    let reservation_id = stream.reservation_id.clone().unwrap_or_default();
+    let expected_line = stream.expected_line_cut.clone().unwrap_or_default();
+    let expected_main = stream.expected_main_cut.clone().unwrap_or_default();
+    let proposed_main = stream.proposed_main_cut.clone().unwrap_or_default();
+    if reservation_id.is_empty() || proposed_main.is_empty() {
+        return Ok(BoundaryRunOutcome::Refused(
+            "reserved stream is missing its durable recovery coordinate".to_owned(),
+        ));
+    }
+
+    let lease_key = format!("{}::{MAINLINE_BRANCH_ID}", branch_store_path().display());
+    let mut coordination =
+        whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
+            .map_err(|error| format!("coordination store unavailable: {error:?}"))?;
+    match coordination.try_acquire("adoption", &lease_key, 1, 60, holder) {
+        Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
+        Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
+            return Ok(BoundaryRunOutcome::Refused(format!(
+                "adoption lease held by {holders:?}; retry"
+            )))
+        }
+        Err(error) => {
+            return Err(format!("adoption lease unavailable: {error:?}"));
+        }
+    }
+
+    let operation = (|| -> Result<BoundaryRunOutcome, String> {
+        // Crash recovery after the CAS: observe the proposed immutable cut and
+        // record it without issuing a second CAS.
+        if let Some((position, handle)) = vcs
+            .boundary_ref_evidence(
+                &stream.line_branch_id,
+                cut_value(&expected_main),
+                &proposed_main,
+            )
+            .map_err(|error| format!("boundary recovery read failed: {error:?}"))?
+        {
+            match streams
+                .record_ref_advanced(stream_id, &reservation_id, position, &handle, at)
+                .map_err(|error| format!("ref receipt record failed: {error:?}"))?
+            {
+                RecordRefAdvancedOutcome::Recorded(_) | RecordRefAdvancedOutcome::Existing(_) => {}
+                other => {
+                    return Ok(BoundaryRunOutcome::Refused(format!(
+                        "ref receipt record refused: {other:?}"
+                    )))
+                }
+            }
+        } else {
+            let outcome = vcs
+                .promote_line_exact(
+                    &stream.line_branch_id,
+                    cut_value(&expected_line),
+                    cut_value(&expected_main),
+                    &proposed_main,
+                    at,
+                )
+                .map_err(|error| format!("promotion failed: {error:?}"))?;
+            match outcome {
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Promoted {
+                    ref_position,
+                    ref_receipt_handle,
+                    ..
+                } => match streams
+                    .record_ref_advanced(
+                        stream_id,
+                        &reservation_id,
+                        ref_position,
+                        &ref_receipt_handle,
+                        at,
+                    )
+                    .map_err(|error| format!("ref receipt record failed: {error:?}"))?
+                {
+                    RecordRefAdvancedOutcome::Recorded(_)
+                    | RecordRefAdvancedOutcome::Existing(_) => {}
+                    other => {
+                        return Ok(BoundaryRunOutcome::Refused(format!(
+                            "ref receipt record refused: {other:?}"
+                        )))
+                    }
+                },
+                whipplescript_store::vcs::BoundaryPromotionOutcome::Conflicted { conflicts } => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    return Ok(BoundaryRunOutcome::Conflicted { conflicts });
+                }
+                whipplescript_store::vcs::BoundaryPromotionOutcome::ExpectedCutsMoved {
+                    ..
+                } => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    return Ok(BoundaryRunOutcome::Refused(
+                        "the exact stream/Main cut moved before promotion; retry from active"
+                            .to_owned(),
+                    ));
+                }
+                other => {
+                    let _ = streams.release_boundary(stream_id, &reservation_id, at);
+                    return Ok(BoundaryRunOutcome::Refused(format!(
+                        "promotion refused: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        let members = streams
+            .members(stream_id)
+            .map_err(|error| format!("member read failed: {error:?}"))?;
+        match streams
+            .close_promoted(stream_id, &reservation_id, at)
+            .map_err(|error| format!("post-CAS close failed: {error:?}"))?
+        {
+            ClosePromotedOutcome::Closed { .. } | ClosePromotedOutcome::AlreadyClosed => {}
+            other => {
+                return Ok(BoundaryRunOutcome::Refused(format!(
+                    "post-CAS close refused: {other:?}"
+                )))
+            }
+        }
+        let receipt = streams
+            .get_stream(stream_id)
+            .map_err(|error| format!("receipt read failed: {error:?}"))?
+            .and_then(|row| row.boundary_receipt("native-workspace"))
+            .ok_or_else(|| "closed promotion has no receipt".to_owned())?;
+        Ok(BoundaryRunOutcome::Promoted {
+            receipt: Box::new(receipt),
+            member_branches: members,
+        })
+    })();
+    let _ = coordination.release("adoption", &lease_key, holder);
+    operation
+}
+
 /// `whip stream …` — the workstream tier: named shared lines +
 /// membership. Members auto-admit during `whip branch reconcile`
 /// (greedy, certificate-gated); promotion is the explicit boundary hop
@@ -34795,88 +35020,48 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                 eprintln!("{STREAM_USAGE}");
                 return ExitCode::from(2);
             };
-            let Ok(Some(stream)) = streams.get_stream(stream_id) else {
-                eprintln!("no such stream `{stream_id}`");
-                return ExitCode::FAILURE;
-            };
-            if stream.status != StreamStatus::Active {
-                eprintln!("stream `{stream_id}` is archived");
-                return ExitCode::FAILURE;
-            }
             let mut vcs = match open_vcs() {
                 Ok(vcs) => vcs,
                 Err(code) => return code,
             };
-            // The boundary hop runs under the adoption lease on mainline.
             let holder = format!("whip-{}", std::process::id());
-            let lease_key = format!(
-                "{}::{}",
-                branch_store_path().display(),
-                whipplescript_store::branches::MAINLINE_BRANCH_ID
-            );
-            let mut coordination = match whipplescript_store::coordination::CoordinationStore::open(
-                coordination_store_path(),
-            ) {
-                Ok(coordination) => coordination,
-                Err(error) => {
-                    eprintln!("coordination store unavailable: {error:?}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match coordination.try_acquire("adoption", &lease_key, 1, 60, &holder) {
-                Ok(whipplescript_store::coordination::AcquireOutcome::Held) => {}
-                Ok(whipplescript_store::coordination::AcquireOutcome::Contended { holders }) => {
-                    eprintln!("adoption lease is held by {holders:?}; retry");
-                    return ExitCode::FAILURE;
-                }
-                Err(error) => {
-                    eprintln!("adoption lease unavailable: {error:?}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            let sync_cut = generated_cut_id();
-            let outcome = vcs.sync_to_line(
-                &stream.line_branch_id,
-                whipplescript_store::branches::MAINLINE_BRANCH_ID,
-                &format!("{sync_cut}-promote"),
+            let reservation_id = format!("cli-{}", generated_cut_id());
+            match run_reserved_boundary_promotion(
+                &mut streams,
+                &mut vcs,
+                stream_id,
+                &reservation_id,
+                &holder,
                 &at,
-            );
-            let _ = coordination.release("adoption", &lease_key, &holder);
-            match outcome {
-                Ok(whipplescript_store::vcs::SyncOutcome::Synced { sync_cut_id }) => {
-                    // DR-0052 A5: the boundary hop, as a fact — delivered
-                    // to every member branch's bound running instances
-                    // (`when <stream> promoted as p` sugar's lowering).
+            ) {
+                Ok(BoundaryRunOutcome::Promoted {
+                    receipt,
+                    member_branches,
+                }) => {
                     let mut promoted_facts: Vec<(String, Value)> = Vec::new();
-                    if let Ok(member_branches) = streams.members(stream_id) {
-                        for member in member_branches {
-                            promoted_facts.push((
-                                "vcs.stream.promoted".to_owned(),
-                                json!({
-                                    "branch": member,
-                                    "stream": stream_id,
-                                    "cut": sync_cut_id,
-                                    "at": at,
-                                }),
-                            ));
-                        }
+                    for member in member_branches {
+                        promoted_facts.push((
+                            "vcs.stream.promoted".to_owned(),
+                            json!({
+                                "branch": member,
+                                "stream": stream_id,
+                                "cut": receipt.proposed_main_cut,
+                                "receipt": receipt.ref_receipt_handle,
+                                "at": at,
+                            }),
+                        ));
                     }
                     route_workspace_facts(&vcs, promoted_facts, &options.store_path);
                     emit_json(json!({
                         "promoted": stream_id, "into": "main",
-                        "sync_cut_id": sync_cut_id,
+                        "sync_cut_id": receipt.proposed_main_cut,
+                        "boundary_receipt": receipt,
                     }))
                 }
-                Ok(whipplescript_store::vcs::SyncOutcome::UpToDate) => {
-                    emit_json(json!({"promoted": stream_id, "outcome": "up_to_date"}))
-                }
-                Ok(whipplescript_store::vcs::SyncOutcome::Conflicts { conflicts }) => {
-                    // Promotion refusal surfaces as a fact, not only an
-                    // error (note §7.5: refusal-as-fact).
+                Ok(BoundaryRunOutcome::Conflicted { conflicts }) => {
                     let stall = vec![(
                         "vcs.reconcile.stalled".to_owned(),
                         json!({
-                            "branch": stream.line_branch_id,
                             "stream": stream_id,
                             "boundary": "promotion",
                             "paths": conflicts
@@ -34895,12 +35080,8 @@ fn stream_command(options: &CliOptions) -> ExitCode {
                     eprintln!("promotion conflicted: {payload}");
                     ExitCode::FAILURE
                 }
-                Ok(other) => {
-                    eprintln!("promotion refused: {other:?}");
-                    ExitCode::FAILURE
-                }
-                Err(error) => {
-                    eprintln!("promotion failed: {error:?}");
+                Ok(BoundaryRunOutcome::Refused(message)) | Err(message) => {
+                    eprintln!("promotion refused: {message}");
                     ExitCode::FAILURE
                 }
             }
@@ -36379,9 +36560,38 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                 use whipplescript_store::workstreams::{StreamStatus, Workstreams};
                 let stream_home = streams.as_ref().and_then(|streams| {
                     let stream_id = streams.home_of(&row.branch_id).ok().flatten()?;
-                    let stream = streams.get_stream(&stream_id).ok().flatten()?;
-                    (stream.status == StreamStatus::Active).then_some(stream)
+                    streams.get_stream(&stream_id).ok().flatten()
                 });
+                // A boundary reservation freezes both topology and contribution.
+                // Do not let the reconciliation daemon become a side door that
+                // advances the frozen line after the exact promotion cuts were
+                // captured. RefAdvanced is also frozen: recovery must close the
+                // recorded boundary forward, never resume ordinary work.
+                if let Some(stream) = &stream_home {
+                    match stream.status {
+                        StreamStatus::BoundaryReserved | StreamStatus::RefAdvanced => {
+                            report.push(json!({
+                                "branch_id": row.branch_id,
+                                "outcome": "boundary_reserved",
+                                "stream_id": stream.stream_id,
+                                "reservation_id": stream.reservation_id,
+                            }));
+                            continue;
+                        }
+                        StreamStatus::Archived => {
+                            // Archive atomically removes every membership. Seeing
+                            // an archived home means the topology store is corrupt;
+                            // refusing preserves the historical line.
+                            report.push(json!({
+                                "branch_id": row.branch_id,
+                                "outcome": "invalid_archived_home",
+                                "stream_id": stream.stream_id,
+                            }));
+                            continue;
+                        }
+                        StreamStatus::Active => {}
+                    }
+                }
                 // The staleness bound (DR-0052 S1, the one real §7.1 knob):
                 // a member whose base lags its line's head by more than the
                 // stream's bound gets `vcs.staleness.exceeded` — an

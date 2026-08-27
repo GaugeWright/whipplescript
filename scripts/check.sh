@@ -154,6 +154,9 @@ echo "== durable object schema =="
 node scripts/check-do-schema-consistency.mjs --selftest
 node scripts/check-do-schema-consistency.mjs
 
+echo "== workstream host contract =="
+python3 scripts/check-workstream-host-contract.py
+
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command.

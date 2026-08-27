@@ -1,0 +1,183 @@
+--- Joint workstream/ref-authority boundary model, DR-0078 / GWPW-2.
+---
+--- Each accepted rule has a deliberately named naive counterpart used only by
+--- the test module. Every property is tested twice: the naive command reaches a
+--- violation (the bite), while the accepted command has no such execution.
+mod WHIPPLESCRIPT-WORKSTREAM-BOUNDARY is
+  protecting BOOL .
+
+  sorts Cfg Stream Branch Cut Path Target Receipt Status .
+
+  ops s1 s2 : -> Stream [ctor] .
+  ops b1 b2 : -> Branch [ctor] .
+  ops c0 c1 c2 : -> Cut [ctor] .
+  ops p1 p2 : -> Path [ctor] .
+  op t1 : -> Target [ctor] .
+  ops r1 r2 : -> Receipt [ctor] .
+  ops active reserved advanced archived : -> Status [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op stream : Stream Status -> Cfg [ctor] .
+  op lineAt : Stream Cut -> Cfg [ctor] .
+  op mainAt : Cut -> Cfg [ctor] .
+  op home : Branch Stream -> Cfg [ctor] .
+  op materialized : Branch Path -> Cfg [ctor] .
+  op pathAt : Branch Path Cut -> Cfg [ctor] .
+  op contribution : Branch Stream -> Cfg [ctor] .
+  op admitted : Branch Stream -> Cfg [ctor] .
+  op reservation : Stream Cut Cut Cut -> Cfg [ctor] .
+  op refReceipt : Stream Receipt -> Cfg [ctor] .
+  op externalReceipt : Target Receipt -> Cfg [ctor] .
+  op inheritedReceipt : Branch Target Receipt -> Cfg [ctor] .
+  op effect : Branch Target -> Cfg [ctor] .
+  op branchAt : Branch Cut -> Cfg [ctor] .
+  op destinationHead : Stream Cut -> Cfg [ctor] .
+  op settledFirst : Target -> Cfg [ctor] .
+  op settledSecond : Target -> Cfg [ctor] .
+
+  --- Commands and violation witnesses.
+  op materializeSubset : Branch Path -> Cfg [ctor] .
+  op naiveMaterializeMeansMember : Branch Path Stream -> Cfg [ctor] .
+  op sparseImport : Branch Path Cut -> Cfg [ctor] .
+  op naiveSparseDeletesAbsent : Branch Path Cut Path -> Cfg [ctor] .
+  op join : Branch Stream -> Cfg [ctor] .
+  op naiveJoinReserved : Branch Stream -> Cfg [ctor] .
+  op contribute : Branch Stream -> Cfg [ctor] .
+  op naiveContributeReserved : Branch Stream -> Cfg [ctor] .
+  op conflict : Stream -> Cfg [ctor] .
+  op naiveConflictMovesMain : Stream Cut -> Cfg [ctor] .
+  op recoverAfterCas : Stream -> Cfg [ctor] .
+  op naiveRollbackAfterCas : Stream -> Cfg [ctor] .
+  op promoteLocal : Stream -> Cfg [ctor] .
+  op naivePromotionSettlesTarget : Stream Target -> Cfg [ctor] .
+  op preflightFailed : Stream -> Cfg [ctor] .
+  op naiveAdvanceOnFailedPreflight : Stream -> Cfg [ctor] .
+  op settleSecond : Target -> Cfg [ctor] .
+  op naiveSettleSecond : Target -> Cfg [ctor] .
+  op forkExact : Branch Cut Stream -> Cfg [ctor] .
+  op naiveForkAtDestination : Branch Cut Stream -> Cfg [ctor] .
+  op inheritHome : Branch Stream -> Cfg [ctor] .
+  op naiveInheritArchivedHome : Branch Stream -> Cfg [ctor] .
+  op useInheritedReceipt : Branch Target -> Cfg [ctor] .
+  op naiveUseInheritedReceipt : Branch Target -> Cfg [ctor] .
+
+  op badMembershipFromSubset : Branch -> Cfg [ctor] .
+  op badAbsentPathDeleted : Branch Path -> Cfg [ctor] .
+  op badTopologyDuringReservation : Stream -> Cfg [ctor] .
+  op badContributionDuringReservation : Stream -> Cfg [ctor] .
+  op badMainMovedOnConflict : Stream -> Cfg [ctor] .
+  op badReturnedActiveAfterCas : Stream -> Cfg [ctor] .
+  op badPromotionCreatedExternalReceipt : Stream -> Cfg [ctor] .
+  op badAdvanceAfterFailedPreflight : Stream -> Cfg [ctor] .
+  op badSettlementOutOfOrder : Target -> Cfg [ctor] .
+  op badForkUsedDestinationHead : Branch -> Cfg [ctor] .
+  op badBranchFromArchivedHome : Branch -> Cfg [ctor] .
+  op badInheritedReceiptGrantedAuthority : Branch -> Cfg [ctor] .
+
+  vars B : Branch .
+  vars S : Stream .
+  vars C C' P : Cut .
+  vars X Y : Path .
+  var T : Target .
+  var R : Receipt .
+
+  --- Materialization is a projection, never topology authority.
+  rl [materialize-subset] : materializeSubset(B, X)
+    => materialized(B, X) .
+  rl [naive-materialize-membership] : naiveMaterializeMeansMember(B, X, S)
+    => materialized(B, X) home(B, S) badMembershipFromSubset(B) .
+
+  --- Sparse import changes only paths explicitly present in the projection.
+  rl [sparse-import] : sparseImport(B, X, C) pathAt(B, X, C')
+    => pathAt(B, X, C) .
+  rl [naive-sparse-delete] :
+    naiveSparseDeletesAbsent(B, X, C, Y) pathAt(B, X, C') pathAt(B, Y, P)
+    => pathAt(B, X, C) badAbsentPathDeleted(B, Y) .
+
+  --- Active topology changes are atomic. Reserved topology has no accepted
+  --- join/leave/transfer rule; the naive rule demonstrates the missing guard.
+  rl [join-active] : join(B, S) stream(S, active)
+    => home(B, S) stream(S, active) .
+  rl [naive-join-reserved] : naiveJoinReserved(B, S) stream(S, reserved)
+    => home(B, S) stream(S, reserved) badTopologyDuringReservation(S) .
+
+  --- Contributions likewise have an active-only rule.
+  rl [contribute-active] : contribute(B, S) stream(S, active) home(B, S)
+    => admitted(B, S) stream(S, active) home(B, S) .
+  rl [naive-contribute-reserved] :
+    naiveContributeReserved(B, S) stream(S, reserved) home(B, S)
+    => admitted(B, S) stream(S, reserved) home(B, S)
+       badContributionDuringReservation(S) .
+
+  --- A conflict releases the reservation and preserves Main exactly.
+  rl [conflict-release] :
+    conflict(S) stream(S, reserved) reservation(S, C, C', P) mainAt(C')
+    => stream(S, active) lineAt(S, C) mainAt(C') .
+  rl [naive-conflict-moves-main] :
+    naiveConflictMovesMain(S, P) stream(S, reserved)
+      reservation(S, C, C', P) mainAt(C')
+    => stream(S, active) lineAt(S, C) mainAt(P)
+       badMainMovedOnConflict(S) .
+
+  --- Post-CAS recovery closes forward. There is no accepted transition from
+  --- advanced back to active.
+  rl [recover-close-forward] :
+    recoverAfterCas(S) stream(S, advanced) refReceipt(S, R)
+    => stream(S, archived) refReceipt(S, R) .
+  rl [naive-post-cas-rollback] :
+    naiveRollbackAfterCas(S) stream(S, advanced) refReceipt(S, R)
+    => stream(S, active) refReceipt(S, R) badReturnedActiveAfterCas(S) .
+
+  --- Local promotion evidence is not an external target receipt.
+  rl [promote-local-only] :
+    promoteLocal(S) stream(S, advanced) refReceipt(S, R)
+    => stream(S, archived) refReceipt(S, R) .
+  rl [naive-promotion-settles-target] :
+    naivePromotionSettlesTarget(S, T) stream(S, advanced) refReceipt(S, R)
+    => stream(S, archived) refReceipt(S, R) externalReceipt(T, R)
+       badPromotionCreatedExternalReceipt(S) .
+
+  --- A failed combined preflight releases without any local advance.
+  rl [preflight-failed-release] :
+    preflightFailed(S) stream(S, reserved) reservation(S, C, C', P)
+      lineAt(S, C) mainAt(C')
+    => stream(S, active) lineAt(S, C) mainAt(C') .
+  rl [naive-preflight-partial-advance] :
+    naiveAdvanceOnFailedPreflight(S) stream(S, reserved)
+      reservation(S, C, C', P) lineAt(S, C) mainAt(C')
+    => stream(S, active) lineAt(S, P) mainAt(C')
+       badAdvanceAfterFailedPreflight(S) .
+
+  --- A same-target lane admits its second settlement only after the first.
+  rl [settle-second-ordered] : settleSecond(T) settledFirst(T)
+    => settledFirst(T) settledSecond(T) .
+  rl [naive-settle-second-unordered] : naiveSettleSecond(T)
+    => settledSecond(T) badSettlementOutOfOrder(T) .
+
+  --- Historical source content and current destination admission are separate.
+  rl [fork-exact-admit-current] :
+    forkExact(B, C, S) stream(S, active) destinationHead(S, C')
+    => branchAt(B, C) home(B, S) stream(S, active) destinationHead(S, C') .
+  rl [naive-fork-destination-head] :
+    naiveForkAtDestination(B, C, S) stream(S, active) destinationHead(S, C')
+    => branchAt(B, C') home(B, S) stream(S, active) destinationHead(S, C')
+       badForkUsedDestinationHead(B) .
+
+  --- Archived-home inheritance is refused before branch creation.
+  rl [inherit-home-active] : inheritHome(B, S) stream(S, active)
+    => branchAt(B, c0) home(B, S) stream(S, active) .
+  rl [naive-inherit-archived] : naiveInheritArchivedHome(B, S) stream(S, archived)
+    => branchAt(B, c0) home(B, S) stream(S, archived)
+       badBranchFromArchivedHome(B) .
+
+  --- Receipts are evidence, not authority.
+  rl [observe-inherited-receipt] :
+    useInheritedReceipt(B, T) inheritedReceipt(B, T, R)
+    => inheritedReceipt(B, T, R) .
+  rl [naive-inherited-authority] :
+    naiveUseInheritedReceipt(B, T) inheritedReceipt(B, T, R)
+    => inheritedReceipt(B, T, R) effect(B, T)
+       badInheritedReceiptGrantedAuthority(B) .
+endm

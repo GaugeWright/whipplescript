@@ -24363,8 +24363,9 @@ fn workstream_members_auto_admit_and_promote() {
         "a failed contribution never moves the line"
     );
 
-    // Promotion: the boundary hop lands the line's state on mainline;
-    // the stream survives.
+    // Promotion: the boundary hop lands the line's state on mainline and
+    // closes the reserved settlement boundary. Members are re-homed as part
+    // of that same durable close; a retry returns the original receipt.
     let promoted = whip(&["stream", "promote", "triage"]);
     assert_eq!(promoted.get("into").and_then(Value::as_str), Some("main"));
     assert_eq!(
@@ -24374,20 +24375,19 @@ fn workstream_members_auto_admit_and_promote() {
         Some("A work")
     );
     let show = whip(&["stream", "show", "triage"]);
-    assert_eq!(show.get("status").and_then(Value::as_str), Some("active"));
+    assert_eq!(show.get("status").and_then(Value::as_str), Some("archived"));
     assert_eq!(
         show.get("members").and_then(Value::as_array).map(Vec::len),
-        Some(3)
+        Some(0)
     );
-
-    // Archive re-homes the members (their next reconcile targets main).
-    let archived = whip(&["stream", "archive", "triage"]);
     assert_eq!(
-        archived
-            .get("rehomed_branch_ids")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(3)
+        whip(&["stream", "promote", "triage"])
+            .get("boundary_receipt")
+            .and_then(|receipt| receipt.get("reservation_id")),
+        promoted
+            .get("boundary_receipt")
+            .and_then(|receipt| receipt.get("reservation_id")),
+        "promotion retry returns the terminal boundary receipt"
     );
 
     let _ = fs::remove_file(store_path);

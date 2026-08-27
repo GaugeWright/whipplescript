@@ -1,0 +1,48 @@
+{
+  "schema": "whipplescript.workstream_host_contract_pin.v1",
+  "contract_revision": "whipplescript-workstream-host/v1.0.0",
+  "contract_digest": "7766b8cb9a824ae43c7523fd92295dca21f26e7c9abf156f5a46663ce9b1b0f7",
+  "authority": "WhippleScript DR-0078",
+  "normative_surface": "std.vcs durable boundary protocol",
+  "operations": [
+    "reserve_boundary",
+    "release_boundary",
+    "record_ref_advanced",
+    "close_promoted",
+    "home_receipt",
+    "transfer",
+    "promote_line_exact",
+    "boundary_ref_evidence",
+    "fork_binding_for_instance_at_cut",
+    "fork_at_cut_and_admit",
+    "materialize_manifest_subset",
+    "import_scratch"
+  ],
+  "schemas": [
+    {
+      "name": "workstream_boundary_receipt_v1",
+      "path": "spec/report-schemas/workstream_boundary_receipt_v1.schema.json",
+      "sha256": "abfd0f69156b1360360669d2efcc356e7642abad6afee5482c3f054b5eccceeb"
+    },
+    {
+      "name": "branch_home_receipt_v1",
+      "path": "spec/report-schemas/branch_home_receipt_v1.schema.json",
+      "sha256": "80aaf4afa51cf4937f7400f40d0077753ab2e64400fff3e23565cd827a60d260"
+    },
+    {
+      "name": "exact_fork_admission_v1",
+      "path": "spec/report-schemas/exact_fork_admission_v1.schema.json",
+      "sha256": "0147ace16c4c6abe743bab2f76f2a387202dbb87cf7d38f051324f10ffe80435"
+    }
+  ],
+  "fixtures": {
+    "path": "spec/workstream-host-contract-fixtures-v1.json",
+    "sha256": "2bb33f85ae3a4e04c31eb0ffd5a6eba0c6c7458c652572ea282d5eb707363db5"
+  },
+  "compatibility": {
+    "earlier_revision_accepted": false,
+    "receipt_handles_are_evidence_only": true,
+    "target_settlement_is_out_of_scope": true,
+    "workspace_content_in_receipts": false
+  }
+}

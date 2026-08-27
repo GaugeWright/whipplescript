@@ -231,6 +231,29 @@ pub enum MergeProbeOutcome {
     NoParent,
 }
 
+/// DR-0078's exact-cut promotion commit. The workstream store owns the
+/// reservation around this call; this method owns the one mutable-name CAS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundaryPromotionOutcome {
+    Promoted {
+        main_cut_id: String,
+        manifest_hash: String,
+        ref_position: u64,
+        ref_receipt_handle: String,
+    },
+    Conflicted {
+        conflicts: Vec<PathConflict>,
+    },
+    ExpectedCutsMoved {
+        current_line_cut: Option<String>,
+        current_main_cut: Option<String>,
+    },
+    StreamLineMissing,
+    StreamLineNotActive,
+    MainMissing,
+    MainNotActive,
+}
+
 /// Restore (un-tie's `revert` mapping): re-point the branch head to a
 /// recorded cut's state AS A NEW CUT — a proposal over the immutable
 /// record, never a rewind of history.
@@ -386,6 +409,36 @@ pub enum InstanceForkBinding {
     TargetAlreadyBound { branch_id: String },
 }
 
+/// Exact historical branch half of a host point-fork. Unlike
+/// `InstanceForkBinding`, the caller supplies the immutable source cut; later
+/// movement of either the source or destination line cannot replace it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactInstanceForkBinding {
+    Forked {
+        source_branch_id: String,
+        source_cut_id: String,
+        fork_branch: Box<BranchRow>,
+        evidence_handle: String,
+    },
+    SourceUnbound,
+    SourceBranchUnavailable {
+        branch_id: String,
+    },
+    SourceCutMissing {
+        cut_id: String,
+    },
+    SourceCutNotOnBranch {
+        cut_id: String,
+        recorded_branch_id: String,
+    },
+    ForkBranchIdTaken {
+        branch_id: String,
+    },
+    TargetAlreadyBound {
+        branch_id: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UndoOpOutcome {
     Undone {
@@ -486,6 +539,62 @@ impl NativeWorkspaceVcs {
 }
 
 impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
+    fn boundary_receipt_handle(
+        &self,
+        stream_line_id: &str,
+        expected_main_cut: Option<&str>,
+        proposed_main_cut: &str,
+        manifest_hash: &str,
+        ref_position: u64,
+    ) -> String {
+        format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(
+                format!(
+                    "workstream-boundary-v1|{stream_line_id}|{}|{proposed_main_cut}|{manifest_hash}|{ref_position}",
+                    expected_main_cut.unwrap_or("")
+                )
+                .as_bytes()
+            )
+        )
+    }
+
+    /// Recover the evidence for an already-landed DR-0078 Main cut without
+    /// issuing another CAS. `None` means Main does not currently name that cut
+    /// or the immutable cut record is unavailable.
+    pub fn boundary_ref_evidence(
+        &self,
+        stream_line_id: &str,
+        expected_main_cut: Option<&str>,
+        proposed_main_cut: &str,
+    ) -> StoreResult<Option<(u64, String)>> {
+        let Some(main) = self.branches.get_branch(MAINLINE_BRANCH_ID)? else {
+            return Ok(None);
+        };
+        if main.head_cut_id.as_deref() != Some(proposed_main_cut) {
+            return Ok(None);
+        }
+        let Some(cut) = self.branches.get_cut(proposed_main_cut)? else {
+            return Ok(None);
+        };
+        let ref_position = u64::try_from(
+            self.branches
+                .list_cuts(MAINLINE_BRANCH_ID, usize::MAX)?
+                .len(),
+        )
+        .unwrap_or(u64::MAX);
+        Ok(Some((
+            ref_position,
+            self.boundary_receipt_handle(
+                stream_line_id,
+                expected_main_cut,
+                proposed_main_cut,
+                &cut.manifest_hash,
+                ref_position,
+            ),
+        )))
+    }
+
     /// Compose a workspace VCS from any host's branch + content seams
     /// (the DO host passes its `DoSql`-backed implementations).
     pub fn from_parts(branches: B, content: C) -> Self {
@@ -1833,6 +1942,142 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(MergeProbeOutcome::Clean {
             merged_manifest_hash,
             changed_paths,
+        })
+    }
+
+    /// Promote one reserved stream line to Main without first moving the
+    /// stream line. The merge is probed against immutable manifests, exact
+    /// line/Main heads are re-read immediately before commit, and Main advances
+    /// through one `advance_head` compare-and-set. A conflict or stale cut moves
+    /// no pointer; certified content written by the probe is unreferenced and
+    /// collected normally if the operation refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn promote_line_exact(
+        &mut self,
+        stream_line_id: &str,
+        expected_line_cut: Option<&str>,
+        expected_main_cut: Option<&str>,
+        proposed_main_cut: &str,
+        at: &str,
+    ) -> StoreResult<BoundaryPromotionOutcome> {
+        let Some(line) = self.branches.get_branch(stream_line_id)? else {
+            return Ok(BoundaryPromotionOutcome::StreamLineMissing);
+        };
+        if line.status != BranchStatus::Active {
+            return Ok(BoundaryPromotionOutcome::StreamLineNotActive);
+        }
+        let Some(main) = self.branches.get_branch(MAINLINE_BRANCH_ID)? else {
+            return Ok(BoundaryPromotionOutcome::MainMissing);
+        };
+        if main.status != BranchStatus::Active {
+            return Ok(BoundaryPromotionOutcome::MainNotActive);
+        }
+        if line.head_cut_id.as_deref() != expected_line_cut
+            || main.head_cut_id.as_deref() != expected_main_cut
+        {
+            return Ok(BoundaryPromotionOutcome::ExpectedCutsMoved {
+                current_line_cut: line.head_cut_id,
+                current_main_cut: main.head_cut_id,
+            });
+        }
+
+        let manifest_hash = match self.merge_probe(stream_line_id)? {
+            MergeProbeOutcome::Clean {
+                merged_manifest_hash,
+                ..
+            } => merged_manifest_hash,
+            MergeProbeOutcome::UpToDate => main
+                .head_manifest_hash
+                .clone()
+                .unwrap_or_else(|| self.store_manifest(&BTreeMap::new()).unwrap_or_default()),
+            MergeProbeOutcome::Conflicted { conflicts } => {
+                return Ok(BoundaryPromotionOutcome::Conflicted { conflicts })
+            }
+            MergeProbeOutcome::BranchMissing => {
+                return Ok(BoundaryPromotionOutcome::StreamLineMissing)
+            }
+            MergeProbeOutcome::BranchNotActive => {
+                return Ok(BoundaryPromotionOutcome::StreamLineNotActive)
+            }
+            MergeProbeOutcome::NoParent => return Ok(BoundaryPromotionOutcome::MainMissing),
+        };
+
+        // Re-read both names after the pure probe. The workstream reservation
+        // excludes line movement; the exact check is still load-bearing against
+        // an implementation path that forgot to consult it.
+        let current_line = self.branches.get_branch(stream_line_id)?;
+        let current_main = self.branches.get_branch(MAINLINE_BRANCH_ID)?;
+        let current_line_cut = current_line
+            .as_ref()
+            .and_then(|row| row.head_cut_id.clone());
+        let current_main_cut = current_main
+            .as_ref()
+            .and_then(|row| row.head_cut_id.clone());
+        if current_line_cut.as_deref() != expected_line_cut
+            || current_main_cut.as_deref() != expected_main_cut
+        {
+            return Ok(BoundaryPromotionOutcome::ExpectedCutsMoved {
+                current_line_cut,
+                current_main_cut,
+            });
+        }
+
+        let advanced = match self.branches.advance_head(
+            MAINLINE_BRANCH_ID,
+            expected_main_cut,
+            proposed_main_cut,
+            &manifest_hash,
+            at,
+        )? {
+            AdvanceOutcome::Advanced(advanced) => advanced,
+            AdvanceOutcome::Stale {
+                current_head_cut_id,
+            } => {
+                return Ok(BoundaryPromotionOutcome::ExpectedCutsMoved {
+                    current_line_cut,
+                    current_main_cut: current_head_cut_id,
+                })
+            }
+            AdvanceOutcome::NotActive { .. } => return Ok(BoundaryPromotionOutcome::MainNotActive),
+            AdvanceOutcome::NotFound => return Ok(BoundaryPromotionOutcome::MainMissing),
+        };
+        let origin = format!("promote:{stream_line_id}");
+        self.branches.record_cut(CutRecord {
+            cut_id: proposed_main_cut,
+            change_id: proposed_main_cut,
+            branch_id: MAINLINE_BRANCH_ID,
+            manifest_hash: &manifest_hash,
+            parent_cut_id: expected_main_cut,
+            origin: Some(&origin),
+            actor: self.actor.as_deref(),
+            intent: self.intent.as_deref(),
+            recorded_at: at,
+        })?;
+        self.log_op(
+            &format!("op-{proposed_main_cut}"),
+            "promote-boundary",
+            vec![Self::op_delta(Some(&main), &advanced)],
+            Some(&origin),
+            at,
+        )?;
+        let ref_position = u64::try_from(
+            self.branches
+                .list_cuts(MAINLINE_BRANCH_ID, usize::MAX)?
+                .len(),
+        )
+        .unwrap_or(u64::MAX);
+        let ref_receipt_handle = self.boundary_receipt_handle(
+            stream_line_id,
+            expected_main_cut,
+            proposed_main_cut,
+            &manifest_hash,
+            ref_position,
+        );
+        Ok(BoundaryPromotionOutcome::Promoted {
+            main_cut_id: proposed_main_cut.to_owned(),
+            manifest_hash,
+            ref_position,
+            ref_receipt_handle,
         })
     }
 
@@ -3506,6 +3751,108 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(InstanceForkBinding::Forked {
             source_branch_id,
             fork_branch: Box::new(fork_branch),
+        })
+    }
+
+    /// Exact-cut variant for application fork snapshots. Content always comes
+    /// from `source_cut_id`; destination workstream admission is deliberately
+    /// a separate authority operation and must not replace the branch point.
+    pub fn fork_binding_for_instance_at_cut(
+        &mut self,
+        source_instance: &str,
+        source_cut_id: &str,
+        target_instance: &str,
+        fork_branch_id: &str,
+        name: Option<&str>,
+        at: &str,
+    ) -> StoreResult<ExactInstanceForkBinding> {
+        let Some(source_branch_id) = self.instance_branch(source_instance)? else {
+            return Ok(ExactInstanceForkBinding::SourceUnbound);
+        };
+        let Some(source_branch) = self.get_branch(&source_branch_id)? else {
+            return Ok(ExactInstanceForkBinding::SourceBranchUnavailable {
+                branch_id: source_branch_id,
+            });
+        };
+        if source_branch.status != BranchStatus::Active {
+            return Ok(ExactInstanceForkBinding::SourceBranchUnavailable {
+                branch_id: source_branch_id,
+            });
+        }
+        let Some(source_cut) = self.get_cut(source_cut_id)? else {
+            return Ok(ExactInstanceForkBinding::SourceCutMissing {
+                cut_id: source_cut_id.to_owned(),
+            });
+        };
+        if source_cut.branch_id != source_branch_id {
+            return Ok(ExactInstanceForkBinding::SourceCutNotOnBranch {
+                cut_id: source_cut_id.to_owned(),
+                recorded_branch_id: source_cut.branch_id,
+            });
+        }
+        if let Some(branch_id) = self.instance_branch(target_instance)? {
+            return Ok(ExactInstanceForkBinding::TargetAlreadyBound { branch_id });
+        }
+        let fork_branch = match self.fork_with_lineage(
+            fork_branch_id,
+            name,
+            &source_branch_id,
+            Some(source_cut_id),
+            at,
+        )? {
+            CreateBranchOutcome::Created(row) => row,
+            CreateBranchOutcome::Existing(row)
+                if row.parent_branch_id.as_deref() == Some(source_branch_id.as_str())
+                    && row.branch_point_cut_id.as_deref() == Some(source_cut_id) =>
+            {
+                row
+            }
+            CreateBranchOutcome::Existing(row) => {
+                return Ok(ExactInstanceForkBinding::ForkBranchIdTaken {
+                    branch_id: row.branch_id,
+                })
+            }
+            CreateBranchOutcome::NameTaken { holder_branch_id } => {
+                return Ok(ExactInstanceForkBinding::ForkBranchIdTaken {
+                    branch_id: holder_branch_id,
+                })
+            }
+            CreateBranchOutcome::ParentMissing | CreateBranchOutcome::ParentNotActive { .. } => {
+                return Ok(ExactInstanceForkBinding::SourceBranchUnavailable {
+                    branch_id: source_branch_id,
+                })
+            }
+        };
+        match self.bind_instance(target_instance, &fork_branch.branch_id, at)? {
+            crate::branches::BindOutcome::Bound => {}
+            crate::branches::BindOutcome::AlreadyBound { branch_id }
+                if branch_id == fork_branch.branch_id => {}
+            crate::branches::BindOutcome::AlreadyBound { branch_id } => {
+                return Ok(ExactInstanceForkBinding::TargetAlreadyBound { branch_id })
+            }
+            crate::branches::BindOutcome::BranchMissing
+            | crate::branches::BindOutcome::BranchNotActive { .. } => {
+                return Err(StoreError::Conflict(format!(
+                    "exact fork branch `{}` closed underneath its own creation",
+                    fork_branch.branch_id
+                )))
+            }
+        }
+        let evidence_handle = format!(
+            "sha256:{}",
+            crate::chunking::content_hash_hex(
+                format!(
+                    "exact-fork-v1|{source_branch_id}|{source_cut_id}|{}|{}",
+                    fork_branch.branch_id, source_cut.manifest_hash
+                )
+                .as_bytes()
+            )
+        );
+        Ok(ExactInstanceForkBinding::Forked {
+            source_branch_id,
+            source_cut_id: source_cut_id.to_owned(),
+            fork_branch: Box::new(fork_branch),
+            evidence_handle,
         })
     }
 
@@ -5523,5 +5870,205 @@ mod tests {
                 branch_id: "chat_main".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn exact_instance_fork_uses_historical_cut_not_source_tip() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.create_branch("chat", None, MAINLINE_BRANCH_ID, "t1")
+            .expect("chat");
+        vcs.bind_instance("source", "chat", "t1")
+            .expect("bind source");
+        vcs.write("chat", "answer.md", Some("historical"), "chat-1", "t2")
+            .expect("historical write");
+        vcs.write("chat", "answer.md", Some("later tip"), "chat-2", "t3")
+            .expect("later write");
+
+        let outcome = vcs
+            .fork_binding_for_instance_at_cut("source", "chat-1", "child", "chat-child", None, "t4")
+            .expect("exact fork");
+        let ExactInstanceForkBinding::Forked {
+            fork_branch,
+            evidence_handle,
+            ..
+        } = outcome
+        else {
+            panic!("expected exact fork");
+        };
+        assert_eq!(fork_branch.branch_point_cut_id.as_deref(), Some("chat-1"));
+        assert_eq!(
+            vcs.read("chat-child", "answer.md").expect("child read"),
+            Some("historical".to_owned())
+        );
+        assert!(evidence_handle.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn reserved_boundary_promotes_with_one_exact_main_cas() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line-ws", "work.md", Some("work"), "line-1", "t3")
+            .expect("stream work");
+
+        let outcome = vcs
+            .promote_line_exact("line-ws", Some("line-1"), Some("main-1"), "main-2", "t4")
+            .expect("promote");
+        let BoundaryPromotionOutcome::Promoted {
+            main_cut_id,
+            ref_position,
+            ref_receipt_handle,
+            ..
+        } = outcome
+        else {
+            panic!("expected promotion");
+        };
+        assert_eq!(main_cut_id, "main-2");
+        assert!(ref_position >= 2);
+        assert!(ref_receipt_handle.starts_with("sha256:"));
+        assert_eq!(
+            vcs.boundary_ref_evidence("line-ws", Some("main-1"), "main-2")
+                .expect("recover landed ref"),
+            Some((ref_position, ref_receipt_handle.clone())),
+            "a crash after the Main CAS recovers the same body-free receipt"
+        );
+        assert_eq!(
+            vcs.read(MAINLINE_BRANCH_ID, "work.md").expect("main read"),
+            Some("work".to_owned())
+        );
+        assert_eq!(
+            vcs.get_branch("line-ws")
+                .expect("line read")
+                .expect("line")
+                .head_cut_id
+                .as_deref(),
+            Some("line-1"),
+            "promotion never advances the frozen stream line"
+        );
+
+        let stale = vcs
+            .promote_line_exact("line-ws", Some("line-1"), Some("main-1"), "main-3", "t5")
+            .expect("stale attempt");
+        assert!(matches!(
+            stale,
+            BoundaryPromotionOutcome::ExpectedCutsMoved {
+                current_main_cut: Some(ref cut),
+                ..
+            } if cut == "main-2"
+        ));
+        assert!(vcs.get_cut("main-3").expect("cut lookup").is_none());
+    }
+
+    #[test]
+    fn boundary_conflict_moves_no_pointer() {
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.write(MAINLINE_BRANCH_ID, "same.md", Some("base"), "main-1", "t1")
+            .expect("seed main");
+        vcs.create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        vcs.write("line-ws", "same.md", Some("stream"), "line-1", "t3")
+            .expect("stream work");
+        vcs.write(MAINLINE_BRANCH_ID, "same.md", Some("main"), "main-2", "t4")
+            .expect("main work");
+
+        let outcome = vcs
+            .promote_line_exact("line-ws", Some("line-1"), Some("main-2"), "main-3", "t5")
+            .expect("probe");
+        assert!(matches!(
+            outcome,
+            BoundaryPromotionOutcome::Conflicted { .. }
+        ));
+        assert_eq!(
+            vcs.get_branch(MAINLINE_BRANCH_ID)
+                .expect("main read")
+                .expect("main")
+                .head_cut_id
+                .as_deref(),
+            Some("main-2")
+        );
+        assert_eq!(
+            vcs.get_branch("line-ws")
+                .expect("line read")
+                .expect("line")
+                .head_cut_id
+                .as_deref(),
+            Some("line-1")
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_promotions_have_one_main_cas_winner() {
+        let dir = std::env::temp_dir().join(format!(
+            "whipplescript-boundary-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let branches = dir.join("branches.sqlite");
+        let content = dir.join("content.sqlite");
+        let mut setup = NativeWorkspaceVcs::open(&branches, &content).expect("setup");
+        setup.init("t0").expect("init");
+        setup
+            .write(MAINLINE_BRANCH_ID, "base.md", Some("base"), "main-1", "t1")
+            .expect("main");
+        setup
+            .create_branch("line-ws", None, MAINLINE_BRANCH_ID, "t2")
+            .expect("line");
+        setup
+            .write("line-ws", "work.md", Some("work"), "line-1", "t3")
+            .expect("work");
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for proposed in ["main-race-a", "main-race-b"] {
+            let branches = branches.clone();
+            let content = content.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                let mut vcs = NativeWorkspaceVcs::open(branches, content).expect("racing vcs");
+                barrier.wait();
+                vcs.promote_line_exact("line-ws", Some("line-1"), Some("main-1"), proposed, "race")
+                    .expect("promotion outcome")
+            }));
+        }
+        barrier.wait();
+        let outcomes = joins
+            .into_iter()
+            .map(|join| join.join().expect("thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, BoundaryPromotionOutcome::Promoted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(outcome, BoundaryPromotionOutcome::ExpectedCutsMoved { .. })
+                })
+                .count(),
+            1
+        );
+        let final_vcs = NativeWorkspaceVcs::open(&branches, &content).expect("final vcs");
+        let main = final_vcs
+            .get_branch(MAINLINE_BRANCH_ID)
+            .expect("main read")
+            .expect("main");
+        assert!(matches!(
+            main.head_cut_id.as_deref(),
+            Some("main-race-a" | "main-race-b")
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whipplescript.dev/schemas/workstream_boundary_receipt_v1.schema.json",
+  "title": "WhippleScript Workstream Boundary Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "workspace_authority_id",
+    "stream_id",
+    "reservation_id",
+    "outcome",
+    "expected_stream_cut",
+    "expected_main_cut",
+    "proposed_main_cut",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema": { "const": "workstream_boundary_receipt_v1" },
+    "workspace_authority_id": { "$ref": "#/$defs/nonempty" },
+    "stream_id": { "$ref": "#/$defs/nonempty" },
+    "reservation_id": { "$ref": "#/$defs/nonempty" },
+    "outcome": {
+      "enum": ["reserved", "conflicted", "ref_advanced", "archived", "indeterminate"]
+    },
+    "expected_stream_cut": { "type": "string" },
+    "expected_main_cut": { "type": "string" },
+    "proposed_main_cut": { "$ref": "#/$defs/nonempty" },
+    "main_ref_position": { "type": ["integer", "null"], "minimum": 0 },
+    "ref_receipt_handle": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "recorded_at": { "$ref": "#/$defs/nonempty" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "enum": ["ref_advanced", "archived"] } } },
+      "then": {
+        "required": ["main_ref_position", "ref_receipt_handle"],
+        "properties": {
+          "main_ref_position": { "type": "integer", "minimum": 0 },
+          "ref_receipt_handle": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1 }
+  }
+}

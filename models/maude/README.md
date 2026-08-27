@@ -243,6 +243,10 @@ merge-confluence.maude           certified-merge confluence: pairwise-disjoint e
 workstream.maude                 workstream tier invariants: membership-gates-autosync
                                  with certificate-gated auto-admit, single-valued
                                  membership, archive-rehomes-members to mainline
+workstream-boundary.maude        DR-0078 joint workstream/ref boundary: exact-cut
+                                 reservation, topology/contribution freeze, one-way
+                                 post-CAS close, sparse/fork separation, receipt
+                                 non-authority, and an explicit bite for every rule
 branch-effect-key.maude          branch-distinct effect idempotency keys: the naive
                                  branch-blind key dedupes counterfactual vs real
                                  effects (both directions demonstrated); the branch
