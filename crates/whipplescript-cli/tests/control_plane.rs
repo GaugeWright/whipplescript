@@ -7833,15 +7833,15 @@ class Halted {
   reason string
 }
 
-rule trouble
-  when started
-=> {
-  timer 4s as spark
+signal ops.incident {
+  sev string
+}
 
-  after spark completes {
-    record Incident {
-      sev "sev1"
-    }
+rule trouble
+  when ops.incident as raised
+=> {
+  record Incident {
+    sev raised.sev
   }
 }
 
@@ -7850,7 +7850,7 @@ rule ship
 => {
   until exists(Incident where sev == "sev1") {
     then plan <- timer 1s
-    then approved <- timer 30s
+    then approved <- timer 300s
     complete result {
       note "shipped"
     }
@@ -7887,34 +7887,20 @@ rule ship
         .expect("instance id")
         .to_owned();
 
-    // Phase 1: let plan (1s) settle BEFORE the incident (4s) and drive, so
-    // the region requests its 30s second step — the in-flight work the lapse
-    // must cancel.
+    // The precondition the lapse must find: the region's first step settled and
+    // its second in flight. That is a STATE, so the test waits for the state
+    // instead of guessing a duration — drive, look, repeat, and fail on a
+    // deadline rather than on a sleep that was long enough yesterday.
     //
-    // This phase is the test's one wall-clock assumption, and its margin is
-    // 2.5s: everything below must finish before `spark` (4s) comes due. If it
-    // does not, the incident lands in the same worker pass that settles `plan`,
-    // the region lapses before it ever requests `approved`, and the pinned view
-    // reads `{"approved":"not_requested"}` where the assertion below wants
-    // `cancelled_by_lapse` — the in-flight step the test exists to observe never
-    // exists. Measured 2026-08-26: four subprocess spawns typically spend a
-    // fraction of that, an injected stall of +3s straddles the cliff
-    // (nondeterministic), and +4s and beyond fail every time. CPU load alone
-    // does not reproduce it — 10 runs at loadavg 52 stayed green — so if this
-    // ever does go red, suspect I/O stalls on the SQLite opens, not the CPU.
-    //
-    // Widening `spark` (4s -> 20s) buys a 10x margin for 16s of test time. The
-    // real repair is a virtual clock, and the obstacle there is NOT the
-    // plumbing — `resolve_due_time_effects` already takes an injected `now` and
-    // `WorkerOptions::virtual_now` already threads it. It is the anchor: a
-    // relative timer is due per `strftime('%s', now) - strftime('%s',
-    // created_at) >= timeout_seconds`, and `created_at` is a real
-    // `CURRENT_TIMESTAMP` written at insert. An injected instant governs only
-    // the comparison side, so `given clock at` is a coarse fire-everything /
-    // fire-nothing switch and cannot say "plan is due but spark is not" without
-    // reading the anchor back out of the store.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    for _ in 0..2 {
+    // This is what removed the wall-clock race. The incident used to arrive on
+    // a `timer 4s` that phase 1 had to outrun, leaving a 2.5s margin for four
+    // subprocess spawns; when it lost, the incident landed in the same pass
+    // that settled `plan`, the region lapsed before ever requesting `approved`,
+    // and the pinned view read `not_requested` where the assertion wants
+    // `cancelled_by_lapse`. The incident now arrives on a signal the test
+    // injects, so the ordering the test is about is caused rather than timed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
         let _ = whip(bin, &store_path)
             .args([
                 "--store",
@@ -7935,12 +7921,64 @@ rule ship
                 workflow_path.to_str().expect("utf-8"),
             ])
             .output();
+        let effects = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "effects", &instance_id],
+        );
+        let timers: Vec<&Value> = effects
+            .as_array()
+            .expect("effects array")
+            .iter()
+            .filter(|effect| effect.get("kind").and_then(Value::as_str) == Some("timer.wait"))
+            .collect();
+        let settled = timers
+            .iter()
+            .filter(|effect| effect.get("status").and_then(Value::as_str) == Some("completed"))
+            .count();
+        // Two timers with exactly one completed is `plan` settled and
+        // `approved` outstanding: the region requests its second step only
+        // after the first lands, and `approved` is 300s so it cannot have
+        // fired. No duration is read to decide this.
+        if timers.len() >= 2 && settled == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the region never reached one settled step and one in flight: {effects}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    // Phase 2: the incident lands while the 30s `approved` timer is still in
-    // flight — no step can advance, and the region lapses anyway on the next
-    // pass. That mid-effect lapse is the point of a region (DR-0043 Dec. 5).
-    std::thread::sleep(std::time::Duration::from_millis(3200));
-    for _ in 0..3 {
+
+    // The incident lands while `approved` is still in flight — no step can
+    // advance, and the region lapses anyway on the next pass. That mid-effect
+    // lapse is the point of a region (DR-0043 Dec. 5).
+    let signaled = run_json_isolated(
+        bin,
+        &store_path,
+        &[
+            "--store",
+            store,
+            "--json",
+            "signal",
+            &instance_id,
+            "--name",
+            "ops.incident",
+            "--data",
+            r#"{"sev":"sev1"}"#,
+            "--program",
+            workflow_path.to_str().expect("utf-8"),
+        ],
+    );
+    assert_eq!(
+        signaled.get("signal").and_then(Value::as_str),
+        Some("ops.incident"),
+        "the incident is admitted on demand: {signaled}"
+    );
+
+    // Drive to the terminal the lapse arm produces, again on state not duration.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
         let _ = whip(bin, &store_path)
             .args([
                 "--store",
@@ -7961,6 +7999,19 @@ rule ship
                 workflow_path.to_str().expect("utf-8"),
             ])
             .output();
+        let probe = run_json_isolated(
+            bin,
+            &store_path,
+            &["--store", store, "--json", "status", &instance_id],
+        );
+        if probe.pointer("/instance/status").and_then(Value::as_str) != Some("running") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the region never lapsed to a terminal: {probe}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     let status = run_json_isolated(
