@@ -166,6 +166,9 @@
             CREATE TABLE skills (
                 skill_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, version TEXT NOT NULL,
                 source TEXT NOT NULL, source_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+                -- `register_skill` has always written this column; this side never
+                -- declared it, so the insert could only ever fail on a real object.
+                body TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '', required_capabilities TEXT NOT NULL DEFAULT '[]',
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );

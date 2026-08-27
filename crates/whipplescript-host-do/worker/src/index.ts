@@ -405,6 +405,15 @@ function ensureSchema(sql: SqlStorage): void {
   // existing object without the column fails every step rather than only a
   // revision. Its default is "no carries", which is what every revision
   // recorded before this surface existed means.
+  // `register_skill` writes `skills.body` and this side never declared the
+  // column, so the insert failed on every object -- fresh or not. Fresh objects
+  // are fixed in `do_schema.sql`; existing ones are fixed here.
+  const hasSkillBody = sql
+    .exec(`SELECT name FROM pragma_table_info('skills') WHERE name = 'body'`)
+    .toArray();
+  if (hasSkillBody.length === 0) {
+    sql.exec(`ALTER TABLE skills ADD COLUMN body TEXT NOT NULL DEFAULT ''`);
+  }
   const hasRuleCarries = sql
     .exec(
       `SELECT name FROM pragma_table_info('instance_revisions') WHERE name = 'rule_carries_json'`,

@@ -142,6 +142,18 @@ scripts/check-actions-pinned.sh
 echo "== sans-IO purity =="
 scripts/check-sansio-purity.sh
 
+# The Durable Object's table layout is written out three times -- the worker's
+# `do_schema.sql`, the Rust test fixture in `do_store.rs`, and the lazy
+# column-adds in `index.ts` -- and nothing checked that they agreed. A column
+# added to the fixture alone made every Rust DO test green over a schema
+# production does not have (DR-0077's `rule_carries_json`, which surfaced as
+# eight session tests reporting 502 with nothing naming a column), and this
+# check's first run found `skills.body`, written by `register_skill` and never
+# declared on this side at all. Node-only, so it belongs in the required bar.
+echo "== durable object schema =="
+node scripts/check-do-schema-consistency.mjs --selftest
+node scripts/check-do-schema-consistency.mjs
+
 echo "== production dependency advisories =="
 # The audit lives here rather than in a workflow step so that the documented
 # local green bar and the enforced gate stay the same command.
