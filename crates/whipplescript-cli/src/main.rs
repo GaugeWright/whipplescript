@@ -19799,20 +19799,6 @@ pub(crate) fn content_store_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(".whipplescript/harness-content.sqlite"))
 }
 
-/// Native path-based release for callers that hold only a runtime-store kernel
-/// (the `pause`/`cancel` control paths): open the workspace coordination and
-/// work-items stores directly and release this holder's leases/claims.
-fn release_holder_resources_native(instance_id: &str) {
-    if let Ok(mut coordination) =
-        whipplescript_store::coordination::CoordinationStore::open(coordination_store_path())
-    {
-        let _ = coordination.release_all_for_holder(instance_id);
-    }
-    if let Ok(mut items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) {
-        let _ = items.release_claims_for_holder(instance_id);
-    }
-}
-
 /// Workspace-scoped builtin tracker path: the backlog outlives disposable
 /// run stores.
 fn items_store_path() -> PathBuf {
@@ -27508,7 +27494,7 @@ fn acceptance_run_actions(
     let Some(actions) = fixture.get("actions").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
-    let store = open_store_or_exit(options)?;
+    let store = open_native_stores_or_exit(options)?;
     let mut kernel = RuntimeKernel::new(store);
     let mut reports = Vec::new();
     for (index, action) in actions.iter().enumerate() {
@@ -27536,9 +27522,7 @@ fn acceptance_run_actions(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("acceptance fixture cancel");
-                kernel
-                    .cancel_instance(instance_id, Some(reason), Some(&idempotency))
-                    .inspect(|_| release_holder_resources_native(instance_id))
+                kernel.cancel_instance(instance_id, Some(reason), Some(&idempotency))
             }
             other => {
                 eprintln!(
@@ -33860,13 +33844,11 @@ fn cancel(options: &CliOptions) -> ExitCode {
         options,
         "usage: whip cancel <instance>",
         |kernel, instance_id| {
-            kernel
-                .cancel_instance(
-                    instance_id,
-                    Some("operator cancel"),
-                    Some(&idempotency_key(&[instance_id, "cancel"])),
-                )
-                .inspect(|_| release_holder_resources_native(instance_id))
+            kernel.cancel_instance(
+                instance_id,
+                Some("operator cancel"),
+                Some(&idempotency_key(&[instance_id, "cancel"])),
+            )
         },
     )
 }
@@ -37605,14 +37587,14 @@ fn transition_instance(
     options: &CliOptions,
     usage: &str,
     transition: impl FnOnce(
-        &mut RuntimeKernel<SqliteStore>,
+        &mut RuntimeKernel<whipplescript_store::native_stores::NativeStores>,
         &str,
     ) -> Result<whipplescript_store::StoredEvent, StoreError>,
 ) -> ExitCode {
     let Some(instance_id) = single_arg(options, usage) else {
         return ExitCode::from(2);
     };
-    let store = match open_store_or_exit(options) {
+    let store = match open_native_stores_or_exit(options) {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -37670,6 +37652,36 @@ fn single_arg<'a>(options: &'a CliOptions, usage: &str) -> Option<&'a str> {
         eprintln!("{usage}");
         None
     }
+}
+
+/// The three native stores as one handle, for control paths that can drive an
+/// instance to a terminal. DR-0076 P2 put the holder discharge inside the
+/// terminal transitions and bounded them on `Coordination + WorkItems`, so a
+/// path that can cancel must be able to release; this is what supplies that
+/// capability. It replaces the path-based `release_holder_resources_native`
+/// duplicate, which existed only because these callers held a bare runtime
+/// store and had to reopen the other two by path to clean up after themselves.
+fn open_native_stores_or_exit(
+    options: &CliOptions,
+) -> Result<whipplescript_store::native_stores::NativeStores, ExitCode> {
+    let opened = if options.store_path.to_string_lossy() == ":memory:" {
+        whipplescript_store::native_stores::NativeStores::open_in_memory()
+    } else {
+        if let Some(parent) = options.store_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        whipplescript_store::native_stores::NativeStores::open(
+            &options.store_path,
+            coordination_store_path(),
+            items_store_path(),
+        )
+    };
+    opened.map_err(|error| {
+        eprintln!("{}", store_error(error));
+        ExitCode::FAILURE
+    })
 }
 
 fn open_store_or_exit(options: &CliOptions) -> Result<SqliteStore, ExitCode> {

@@ -106,6 +106,17 @@ impl CoordinationStore {
         // them to arrive at a fresh file has to establish WAL against the
         // others. `establish_wal` is what survives that race.
         crate::establish_wal(&connection)?;
+        Self::from_connection(connection)
+    }
+
+    /// In-memory coordination store, for tests that need a handle satisfying
+    /// `Coordination` without a file. No WAL: `:memory:` has no journal to
+    /// establish, and `establish_wal` exists for the multi-worker file race.
+    pub fn open_in_memory() -> StoreResult<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(connection: Connection) -> StoreResult<Self> {
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         ensure_partitioned_schema(&connection)?;
         Ok(Self { connection })

@@ -548,9 +548,9 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     match event {
                         Ok(_) => {
                             report.committed_rules += 1;
-                            // A workflow terminal auto-releases every held lease
-                            // (spec/coordination.md), the same as the typed path.
-                            release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
+                            // The release used to be here. It now lives inside
+                            // `fail_instance_internal` (DR-0076 P2) so that
+                            // reaching a terminal discharges, whoever gets there.
                             made_progress = true;
                             break 'rules;
                         }

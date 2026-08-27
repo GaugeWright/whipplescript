@@ -54,6 +54,8 @@ use whipplescript_parser::{
     DependencyPredicate, IrPrimitiveType, IrProgram, IrSchema, IrType, IrWorkflowContractKind,
     SourceSpan,
 };
+use whipplescript_store::coordination::Coordination;
+use whipplescript_store::items::WorkItems;
 use whipplescript_store::{
     ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
     EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
@@ -1437,18 +1439,34 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         Ok(event)
     }
 
+    /// DR-0076 P2: the holder-lifetime bound is owed by REACHING a terminal,
+    /// not by whoever transitioned the instance to one. The discharge happens
+    /// here, and the `Coordination + WorkItems` bound is what makes forgetting
+    /// it a compile error rather than a discipline — a caller holding a store
+    /// that cannot release does not get to cancel. That refusal is the point:
+    /// this same omission shipped twice (cancel leaving held state behind, and
+    /// #236's `update_todo` reaching an unguarded release).
+    ///
+    /// What this does NOT fix is the atomicity hazard: the transition and the
+    /// release are not one transaction, so a crash between them still leaves a
+    /// holder holding. P5 cannot express that and does not license it; the TTL
+    /// backstop remains the only answer there.
     pub fn cancel_instance(
         &mut self,
         instance_id: &str,
         reason: Option<&str>,
         idempotency_key: Option<&str>,
-    ) -> StoreResult<StoredEvent> {
+    ) -> StoreResult<StoredEvent>
+    where
+        S: Coordination + WorkItems,
+    {
         let event = self.store.transition_instance(InstanceTransition {
             instance_id,
             status: "cancelled",
             reason,
             idempotency_key,
         })?;
+        crate::rule_pass::release_holder_resources_on_terminal(&mut self.store, instance_id);
         self.emit(TraceEvent::InstanceCancelled);
         Ok(event)
     }
@@ -1466,13 +1484,18 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         instance_id: &str,
         reason: &str,
         idempotency_key: Option<&str>,
-    ) -> StoreResult<StoredEvent> {
+    ) -> StoreResult<StoredEvent>
+    where
+        S: Coordination + WorkItems,
+    {
         let event = self.store.transition_instance(InstanceTransition {
             instance_id,
             status: "failed",
             reason: Some(reason),
             idempotency_key,
         })?;
+        // Same bound, same reason as `cancel_instance` above.
+        crate::rule_pass::release_holder_resources_on_terminal(&mut self.store, instance_id);
         self.emit(TraceEvent::InstanceFailed);
         Ok(event)
     }
@@ -5596,9 +5619,58 @@ rule wait
         check_trace(kernel.trace()).expect("kernel trace conforms");
     }
 
+    /// DR-0076 P2: reaching a terminal discharges the holder's acquisitions,
+    /// and `cancel_instance` is a way of reaching one. Before P2 the release
+    /// lived in the CLI, bolted onto the call with `.inspect(...)`, so a caller
+    /// that forgot left the lease held — the defect that shipped once already.
+    /// The `Coordination + WorkItems` bound now makes forgetting a compile
+    /// error; this asserts the release actually happens.
+    #[test]
+    fn cancel_instance_releases_the_holders_leases() {
+        use whipplescript_store::coordination::{AcquireOutcome, Coordination};
+
+        let store = whipplescript_store::native_stores::NativeStores::open_in_memory()
+            .expect("stores open");
+        let mut kernel = RuntimeKernel::new(store);
+        let version = kernel
+            .create_program_version(ProgramVersionInput {
+                program_name: "Holder",
+                source_hash: "source",
+                ir_hash: "ir",
+                compiler_version: "test",
+            })
+            .expect("version records");
+        let instance_id = kernel.create_instance(&version, "{}").expect("instance");
+
+        assert_eq!(
+            Coordination::try_acquire(kernel.store_mut(), "env", "staging", 1, 60, &instance_id)
+                .expect("lease acquires"),
+            AcquireOutcome::Held,
+        );
+        assert_eq!(
+            Coordination::list_leases(kernel.store(), Some("env"))
+                .expect("leases list")
+                .len(),
+            1,
+            "precondition: the instance holds the lease it is about to lose",
+        );
+
+        kernel
+            .cancel_instance(&instance_id, Some("operator"), Some("cancel-instance"))
+            .expect("instance cancels");
+
+        assert!(
+            Coordination::list_leases(kernel.store(), Some("env"))
+                .expect("leases list")
+                .is_empty(),
+            "cancelling the holder released its lease without the caller asking",
+        );
+    }
+
     #[test]
     fn kernel_cancels_effect_and_instance() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
+        let store = whipplescript_store::native_stores::NativeStores::open_in_memory()
+            .expect("stores open");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {
@@ -5668,7 +5740,8 @@ rule wait
 
     #[test]
     fn kernel_fail_instance_internal_marks_failed_terminal() {
-        let store = SqliteStore::open_in_memory().expect("store opens");
+        let store = whipplescript_store::native_stores::NativeStores::open_in_memory()
+            .expect("stores open");
         let mut kernel = RuntimeKernel::new(store);
         let version = kernel
             .create_program_version(ProgramVersionInput {

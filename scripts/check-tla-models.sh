@@ -94,6 +94,29 @@ coord_bite() {
   echo "coord bite OK ($model $what guard is load-bearing)"
 }
 coord_bite CoordLease   'Cardinality(held[k]) < Slots' MutualExclusion
+# DR-0076 P5: TerminalRelease needs its own teeth, and its load-bearing guard is
+# the one that keeps a terminated holder from acquiring again -- without it the
+# terminal's release is undone a step later and the bound means nothing. Matched
+# as 'notin terminated' rather than 'h \notin terminated' for the reason the
+# CredentialCustody section below documents at length: awk's -v unescapes once,
+# and \n is a known escape, so the backslash form would become a newline in both
+# awks and match nothing. The substring hits the guard in Acquire and Deny (and
+# the double-terminate guard, harmlessly); Acquire's is the one that bites.
+coord_bite CoordLease   'notin terminated'            TerminalRelease
+
+# TerminalRelease says a terminated holder holds no slot ON ANY KEY, and that is
+# only distinguishable from a per-key release when Keys has more than one
+# element. Neither the base check nor the bite above notices a one-key ConstInit:
+# with Keys = {"k1"} a Terminate freeing only k1 still satisfies the invariant,
+# and the guard-dropped mutant still violates it, so both stay green while the
+# across-all-keys content is gone. Guard the constant directly.
+echo "== coord: CoordLease ConstInit must carry more than one key"
+COORD_KEYS="$(awk '/^ConstInit ==/{f=1} f && /Keys =/{gsub(/.*\{|\}.*/,""); n=split($0, a, ","); print n; exit}' "$ROOT/models/tla/CoordLease.tla")"
+if [[ -z "$COORD_KEYS" || "$COORD_KEYS" -lt 2 ]]; then
+  echo "CoordLease.tla ConstInit carries ${COORD_KEYS:-0} key(s); TerminalRelease's across-all-keys claim is vacuous below two" >&2
+  exit 1
+fi
+echo "coord OK (CoordLease ConstInit carries $COORD_KEYS keys)"
 coord_bite CoordCounter 'consumed + a <= Cap'           CapInvariant
 coord_bite CoordLedger  'notin appended'                   NoLostEntry
 

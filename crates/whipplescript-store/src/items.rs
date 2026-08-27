@@ -219,6 +219,17 @@ impl WorkItemStore {
         }
         let connection = Connection::open(path)?;
         crate::establish_wal(&connection)?;
+        Self::from_connection(connection)
+    }
+
+    /// In-memory work-item store, for tests that need a handle satisfying
+    /// `WorkItems` without a file. No WAL, for the reason `CoordinationStore`
+    /// gives.
+    pub fn open_in_memory() -> StoreResult<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(connection: Connection) -> StoreResult<Self> {
         connection.execute_batch(TRACKER_SCHEMA_SQL)?;
         // Self-heal a pre-phase-B `tracker_events` (the ADR-0002 v1 linear log
         // had neither column): `CREATE TABLE IF NOT EXISTS` never alters an

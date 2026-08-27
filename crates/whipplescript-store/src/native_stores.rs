@@ -27,6 +27,19 @@ pub struct NativeStores {
 }
 
 impl NativeStores {
+    /// All three stores in memory. This exists so a test can hold a handle
+    /// satisfying `RuntimeStore + Coordination + WorkItems` — which the
+    /// terminal transitions now require, since discharging a holder's
+    /// acquisitions is part of reaching a terminal rather than something each
+    /// caller remembers (DR-0076 P2).
+    pub fn open_in_memory() -> StoreResult<Self> {
+        Ok(Self {
+            runtime: SqliteStore::open_in_memory()?,
+            coord: CoordinationStore::open_in_memory()?,
+            items: WorkItemStore::open_in_memory()?,
+        })
+    }
+
     /// Open all three native connections: the per-run runtime store, the
     /// workspace coordination store, and the workspace work-items store.
     pub fn open(

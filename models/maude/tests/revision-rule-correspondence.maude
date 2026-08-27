@@ -1,0 +1,74 @@
+load ../revision-rule-correspondence.maude
+
+--- Coverage: a unique match records the correspondence in the activation.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init1 =>* { active(e1) corr(e1, work, renamed) RESIDUAL:Cfg } .
+
+--- I1 BITE: the renamed rule admits NO new firing for the trigger the old
+--- name already fired on. This is the executed defect -- two timer.wait
+--- effects -- stated as an unreachability.
+search in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init1 =>* { fired(e1, renamed, t1) RESIDUAL:Cfg } .
+
+--- THE SAFETY PROPERTY of the ruled design, and the reason it was ruled: with
+--- the SAME unique match but no operator confirmation, the renamed rule FIRES.
+--- A derived match suppresses nothing on its own, so the delete-plus-copy case
+--- -- one removed rule, one added rule whose body was copied from it, a unique
+--- hash match -- cannot silently swallow a firing that should happen. The
+--- failure direction is a duplicate, which the operator can see.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init1unconfirmed =>* { fired(e1, renamed, t1) RESIDUAL:Cfg } .
+
+--- The evidence is still recorded when unconfirmed: the operator has to be able
+--- to see what was proposed and that nobody confirmed it.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init1unconfirmed =>* { corr(e1, work, renamed) RESIDUAL:Cfg } .
+
+--- I1 NON-VACUITY: the same revision with no prior firing DOES fire under the
+--- new name. Without this, the No-solution above would be satisfied by a state
+--- that is unreachable for unrelated reasons rather than by the carry.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init1bare =>* { fired(e1, renamed, t1) RESIDUAL:Cfg } .
+
+--- I2: under an ambiguous match no correspondence is recorded, so the
+--- colliding NEW rule still fires. This search is the uniqueness guard's bite:
+--- admitting a correspondence on an ambiguous match pairs work with extra and
+--- suppresses this firing, turning a duplicate into a MISSING emission, and
+--- this Solution becomes a No solution.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init2 =>* { fired(e1, extra, t1) RESIDUAL:Cfg } .
+
+--- I2, the other side: with nothing recorded, the renamed rule fires too. The
+--- guard's failure direction is a duplicate -- today's behaviour -- which is
+--- the safe one.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init2 =>* { fired(e1, renamed, t1) RESIDUAL:Cfg } .
+
+--- I3 CORRECTED, and it is a bite rather than coverage. A body change under the
+--- SAME rule name admits no new firing: the name-keyed carry suppresses it. The
+--- retracted version of this record claimed the opposite and hid it by naming
+--- the changed rule differently, which is a rename with no match.
+search in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init3same =>* { fired(e1, work, t1) RESIDUAL:Cfg } .
+
+--- Middle of the ladder: a firing recorded at e1 and renamed at the e1->e2
+--- activation is carried too. Without this fixture carryTo(e1, N, e2, C) is
+--- dead code and a regression in it is free.
+search in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  initMid =>* { fired(e2, w3, t1) RESIDUAL:Cfg } .
+
+--- The recorded correspondence is a function only because at most one is ever
+--- recorded per activation. Documented as a reachability fact, not proved as a
+--- design invariant: `step` is ill-defined on a state binding one name twice,
+--- and Decision 2's uniqueness requirement is what is supposed to exclude it.
+search in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init2 =>* { corr(e1, work, renamed) corr(e1, work, extra) RESIDUAL:Cfg } .
+
+--- Coverage: two activations, two recorded correspondences.
+search [1] in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init4 =>* { active(e2) corr(e1, work, renamed) corr(e2, renamed, w3) RESIDUAL:Cfg } .
+
+--- I4 BITE: a rename carried across TWO revisions still suppresses. The chain
+--- composes; it is not one hop.
+search in WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE :
+  init4 =>* { fired(e2, w3, t1) RESIDUAL:Cfg } .

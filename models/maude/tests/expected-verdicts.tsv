@@ -95,6 +95,7 @@ repair-containment.maude	SSNNSSNSNS
 resolution-memory.maude	SNSSN
 restorable-context.maude	SSSNNNN
 restore-replay.maude	SNSN
+revision-rule-correspondence.maude	SNSSSSSNNNSN
 rule-autofail.maude	SSSSNNNNN
 script-capability-seeding.maude	SNN
 script-hard-off.maude	SNNNNNSS

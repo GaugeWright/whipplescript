@@ -1,0 +1,199 @@
+--- The revision rule correspondence (DR-0077).
+---
+--- A rule renamed across a revision re-fires for a trigger it already fired
+--- on, because candidate selection suppresses a live match only when an OLD
+--- firing carries the SAME RULE NAME (rule_pass.rs, old_identity_set). This
+--- model is of the repair: an activation records a correspondence between the
+--- removed and added rule, and candidate selection consults it, so the old
+--- firing's name is carried forward and the live match is suppressed under the
+--- new name.
+---
+--- ABSTRACTION BOUNDARY. The activation's CLASSIFICATION of a match is an
+--- input here -- uniqueM, ambiguousM, or noneM -- rather than something this
+--- model derives. Whether two declarations have equal rename_hash is DR-0054's
+--- question and is modeled in alpha-canonicalization.maude; what is under test
+--- here is what the activation does with the answer, which is where the defect
+--- and the guard both live. The epoch ladder is fixed at e0 < e1 < e2, which is
+--- what I4 (composition across two revisions) needs and no more.
+---
+--- Out of scope, deliberately: the old firing completing under its ADMITTING
+--- body is DR-0043 and is modeled in pinned-progressions.maude. This model says
+--- only that no NEW firing is admitted for a carried name.
+---
+--- Invariants:
+---   I1 no duplicate       a renamed rule admits no new firing for a live
+---                         trigger whose firing was recorded under the old name
+---   I2 no suppression     under an ambiguous match no correspondence is
+---                         recorded, so a colliding NEW rule still fires --
+---                         the guard's failure direction is a duplicate
+---                         today's behaviour, and never a missing firing
+---   I3 body change     RETRACTED and replaced. The first version claimed a
+---                      rule whose body changed still fires, and encoded the
+---                      body change as a differently NAMED rule -- which is a
+---                      rename with no match, not a body change. Stated
+---                      faithfully, a body edit under one name is SUPPRESSED by
+---                      the name-keyed filter, which is DR-0043 behaviour and
+---                      not this model's subject. init3same records it.
+---   I4 composition        a rename across two revisions still suppresses
+---
+--- The state is WRAPPED in { _ } so a guard sees the whole soup: `carries` is
+--- a global predicate over every recorded firing, and a bare associative-
+--- commutative match would let extension bind the rest to none and bypass it.
+
+mod WHIPPLESCRIPT-REVISION-RULE-CORRESPONDENCE is
+  protecting BOOL .
+
+  sorts RName Ident Epoch Match Fact Cfg State .
+  subsort Fact < Cfg .
+
+  ops work renamed extra changed w3 : -> RName [ctor] .
+  op t1 : -> Ident [ctor] .
+  ops e0 e1 e2 : -> Epoch [ctor] .
+  ops uniqueM ambiguousM : -> Match [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op {_} : Cfg -> State [ctor] .
+
+  op active : Epoch -> Fact [ctor] .            --- the active revision epoch
+  op ruleAt : Epoch RName -> Fact [ctor] .      --- rule N is declared at epoch E
+  op trigger : Ident -> Fact [ctor] .           --- a live, unconsumed trigger
+  op firing : Epoch RName Ident -> Fact [ctor] . --- a recorded firing
+  op fired : Epoch RName Ident -> Fact [ctor] . --- the emission a duplicate means
+  op corr : Epoch RName RName -> Fact [ctor] .  --- DERIVED evidence, recorded
+  op carry : Epoch RName RName -> Fact [ctor] . --- OPERATOR instruction
+  op confirm : Epoch Epoch -> Fact [ctor] .     --- the operator confirms E0->E1
+  op pending : Epoch Epoch RName RName Match -> Fact [ctor] .
+  op pendingNone : Epoch Epoch -> Fact [ctor] . --- an activation proposing no pair
+
+  vars C : Cfg .
+  vars E E0 E1 : Epoch .
+  vars N N0 N1 : RName .
+  var T : Ident .
+
+  --- One step of the correspondence chain: the name N carries to at the
+  --- activation into E1, identity when that activation recorded nothing.
+  --- DR-0077 as ruled: the chain follows the CARRY. Derived `corr` is evidence
+  --- and moves nothing on its own, which is what keeps a delete-plus-copy from
+  --- silently suppressing a rule that was never renamed.
+  op step : Epoch RName Cfg -> RName .
+  eq step(E1, N, carry(E1, N, N1) C) = N1 .
+  eq step(E1, N, C) = N [owise] .
+
+  op hasConfirm : Epoch Epoch Cfg -> Bool .
+  eq hasConfirm(E0, E1, confirm(E0, E1) C) = true .
+  eq hasConfirm(E0, E1, C) = false [owise] .
+
+  --- The chain, composed along the fixed ladder (Decision 5).
+  op carryTo : Epoch RName Epoch Cfg -> RName .
+  eq carryTo(e0, N, e1, C) = step(e1, N, C) .
+  eq carryTo(e0, N, e2, C) = step(e2, step(e1, N, C), C) .
+  eq carryTo(e1, N, e2, C) = step(e2, N, C) .
+  eq carryTo(E0, N, E, C) = N [owise] .
+
+  --- Does some recorded firing carry to (E, N) for this trigger? This covers
+  --- same-epoch dedup too: at E0 == E the chain is the identity, so it is true
+  --- exactly when the names agree.
+  op carries : Epoch RName Ident Cfg -> Bool .
+  ceq carries(E, N, T, firing(E0, N0, T) C) = true
+    if carryTo(E0, N0, E, firing(E0, N0, T) C) == N .
+  eq carries(E, N, T, C) = false [owise] .
+
+  --- A unique match is OFFERED as evidence. Whether it also becomes an
+  --- instruction is the operator's call, and only the instruction suppresses.
+  crl [activate-unique-confirmed] :
+    { active(E0) pending(E0, E1, N0, N1, uniqueM) C }
+    => { active(E1) corr(E1, N0, N1) carry(E1, N0, N1) C }
+    if hasConfirm(E0, E1, active(E0) pending(E0, E1, N0, N1, uniqueM) C) = true .
+
+  crl [activate-unique-unconfirmed] :
+    { active(E0) pending(E0, E1, N0, N1, uniqueM) C }
+    => { active(E1) corr(E1, N0, N1) C }
+    if hasConfirm(E0, E1, active(E0) pending(E0, E1, N0, N1, uniqueM) C) = false .
+
+  --- An ambiguous match is not a correspondence: the rules are treated as one
+  --- removal and one addition, which is today's behaviour. Dropping the
+  --- classification here -- letting this rule record corr(E1, N0, N1) -- is the
+  --- mutation I2 is the bite for.
+  --- An ambiguous match is reported as ambiguous and offered as nothing, so it
+  --- cannot be confirmed into a carry either.
+  rl [activate-ambiguous] :
+    { active(E0) pending(E0, E1, N0, N1, ambiguousM) C }
+    => { active(E1) C } .
+
+  rl [activate-none] :
+    { active(E0) pendingNone(E0, E1) C }
+    => { active(E1) C } .
+
+  --- Candidate selection: a live match admits a firing unless some recorded
+  --- firing carries to this name. Removing the `carries` consult is the
+  --- mutation I1 is the bite for.
+  crl [admit] :
+    { active(E) ruleAt(E, N) trigger(T) C }
+    => { active(E) ruleAt(E, N) trigger(T) firing(E, N, T) fired(E, N, T) C }
+    if carries(E, N, T, active(E) ruleAt(E, N) trigger(T) C) = false .
+
+  --- I1: the rename, matched uniquely. The old firing is recorded at e0.
+  op init1 : -> State .
+  eq init1 =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work) firing(e0, work, t1) fired(e0, work, t1)
+      ruleAt(e1, renamed) pending(e0, e1, work, renamed, uniqueM)
+      confirm(e0, e1) } .
+
+  --- THE SAFETY FIXTURE for the ruled design: the same unique match with NO
+  --- operator confirmation. The renamed rule fires -- today's behaviour -- and
+  --- this is what makes a delete-plus-copy harmless: the system may offer the
+  --- carry, but nothing is suppressed until a human says so.
+  op init1unconfirmed : -> State .
+  eq init1unconfirmed =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work) firing(e0, work, t1) fired(e0, work, t1)
+      ruleAt(e1, renamed) pending(e0, e1, work, renamed, uniqueM) } .
+
+  --- I1's non-vacuity fixture: the SAME revision with no prior firing. The
+  --- renamed rule must fire here, which is what proves init1's No-solution is
+  --- the carry doing work rather than the state being unreachable.
+  op init1bare : -> State .
+  eq init1bare =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work)
+      ruleAt(e1, renamed) pending(e0, e1, work, renamed, uniqueM)
+      confirm(e0, e1) } .
+
+  --- I2: two added rules share the hash, so the match is ambiguous. The
+  --- proposed pair is (work, extra); with the guard, nothing is recorded.
+  op init2 : -> State .
+  eq init2 =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work) firing(e0, work, t1) fired(e0, work, t1)
+      ruleAt(e1, renamed) ruleAt(e1, extra)
+      pending(e0, e1, work, extra, ambiguousM) } .
+
+  --- I3, corrected: a body change under the SAME name. No correspondence is
+  --- proposed, and the name-keyed carry suppresses the live match anyway -- the
+  --- pre-existing behaviour this record does not change. `changed` is retained
+  --- as a distinct name only so the retracted fixture's shape stays legible.
+  op init3same : -> State .
+  eq init3same =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work) firing(e0, work, t1) fired(e0, work, t1)
+      ruleAt(e1, work) pendingNone(e0, e1) } .
+
+  --- Coverage for the middle of the ladder: a firing recorded at e1, renamed at
+  --- the e1->e2 activation. Without this, carryTo(e1, N, e2, C) is dead code --
+  --- mutating it to the identity changed no verdict.
+  op initMid : -> State .
+  eq initMid =
+    { active(e1) trigger(t1)
+      ruleAt(e1, renamed) firing(e1, renamed, t1) fired(e1, renamed, t1)
+      ruleAt(e2, w3) pending(e1, e2, renamed, w3, uniqueM) confirm(e1, e2) } .
+
+  --- I4: renamed twice, each match unique.
+  op init4 : -> State .
+  eq init4 =
+    { active(e0) trigger(t1)
+      ruleAt(e0, work) firing(e0, work, t1) fired(e0, work, t1)
+      ruleAt(e1, renamed) pending(e0, e1, work, renamed, uniqueM) confirm(e0, e1)
+      ruleAt(e2, w3) pending(e1, e2, renamed, w3, uniqueM) confirm(e1, e2) } .
+endm

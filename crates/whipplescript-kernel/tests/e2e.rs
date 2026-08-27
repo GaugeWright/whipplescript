@@ -9,6 +9,8 @@ use whipplescript_kernel::{
     AgentTurnExecution, CoerceExecution, ProgramVersionInput, RuntimeKernel,
 };
 use whipplescript_parser::compile_program;
+use whipplescript_store::native_stores::NativeStores;
+use whipplescript_store::RuntimeStore;
 use whipplescript_store::{
     EffectCompletion, NewEffect, NewEffectDependency, NewFact, NewWorkflowInvocation,
     ProgramVersionRecord, RevisionActivation, RuleCommit, RunStart, SqliteStore, StoreError,
@@ -1173,12 +1175,12 @@ source clock as wake_once {
     );
 }
 
-fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel, String) {
+fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel<NativeStores>, String) {
     let compiled = compile_program(source);
     assert_eq!(compiled.diagnostics, Vec::new());
     let ir = compiled.ir.expect("source compiles");
     assert_eq!(ir.workflow, name);
-    let store = SqliteStore::open_in_memory().expect("store opens");
+    let store = NativeStores::open_in_memory().expect("stores open");
     let mut kernel = RuntimeKernel::new(store);
     let version = kernel
         .create_program_version(ProgramVersionInput {
@@ -1212,8 +1214,8 @@ fn revision_kernel(
     (kernel, instance_id, version1, version2)
 }
 
-fn revision_program_version(
-    kernel: &mut RuntimeKernel,
+fn revision_program_version<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
     workflow_name: &str,
     label: &str,
 ) -> ProgramVersionRecord {
@@ -1242,8 +1244,8 @@ rule {label}_noop
         .expect("revision program version creates")
 }
 
-fn commit_single_effect(
-    kernel: &mut RuntimeKernel,
+fn commit_single_effect<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
     effect: NewEffect<'_>,
     rule: &str,
@@ -1307,7 +1309,7 @@ fn coerce_request() -> CoerceRequest {
     }
 }
 
-fn assert_e2e_trace(name: &str, kernel: &RuntimeKernel) {
+fn assert_e2e_trace<S: RuntimeStore>(name: &str, kernel: &RuntimeKernel<S>) {
     let path = std::env::temp_dir().join(format!(
         "whipplescript-e2e-{name}-{}-trace.txt",
         std::process::id()
