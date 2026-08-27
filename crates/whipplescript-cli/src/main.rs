@@ -24028,7 +24028,9 @@ fn run_file_export_effect(
 /// when no virtual clock is injected. The kernel never reads wall time
 /// itself (std.coord slice 3: the counter period derives from THIS injected
 /// instant and is recorded on the outcome), so the host resolves it once
-/// here; a `--virtual-now` still wins at every call site.
+/// here. The only injection is `WorkerOptions::virtual_now`, which a `given
+/// clock at` scenario sets; there is no operator-facing clock override, and a
+/// `worker`/`step` against a real store always reads this wall clock.
 fn wall_clock_instant() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

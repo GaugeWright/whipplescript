@@ -12,11 +12,63 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Every run keeps its own transcript, because the reflex on a red bar — run it
+# again — destroys the only copy of the evidence. That costs nothing on a
+# reproducible failure and everything on an intermittent one: a rerun that goes
+# green says the flake did not happen this time, never which test failed last
+# time. Piping the gate through `tail`/`grep`, which the output volume invites,
+# discards it just as completely. So the transcript goes to a file whether the
+# run passes or fails, and a failure prints its path.
+#
+# Kept under `target/` (already ignored) and pruned to the ten most recent, so
+# a flake caught on a Tuesday is still readable on a Thursday.
+check_log_dir="target/check-logs"
+mkdir -p "$check_log_dir"
+# The pid disambiguates: the timestamp is second-granular, so two runs started
+# in the same second would otherwise name one file and the second would
+# truncate the first — losing a transcript exactly when runs come in bursts.
+check_log="$check_log_dir/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)-$$.log"
+# `|| true` is load-bearing under `set -euo pipefail`: with no logs yet, the
+# glob does not expand, `ls` exits 2, and pipefail would abort the gate on its
+# very first run in a fresh checkout.
+# `+10`, not `+11`: this prunes before the current run's transcript exists, so
+# it leaves nine behind and this run makes ten.
+ls -1t "$check_log_dir"/*.log 2>/dev/null | tail -n +10 | xargs -r rm -f || true
+# fd 3 is the real terminal, kept so the trap can report the path after the
+# transcript is closed.
+exec 3>&2
+# A named pipe rather than `> >(tee …)`: with process substitution the script
+# can exit while tee still holds buffered output, which loses the tail of the
+# run — the failure detail — and spills it into the next run's terminal. Naming
+# the pipe means the tee has a pid, so the trap can close the write end and
+# wait for it to drain.
+check_log_fifo="$(mktemp -u)"
+mkfifo "$check_log_fifo"
+tee "$check_log" < "$check_log_fifo" &
+check_log_tee=$!
+exec > "$check_log_fifo" 2>&1
+# Unlinked immediately; the open descriptors keep it alive, so no path lingers.
+rm -f "$check_log_fifo"
+
 # The tracker store otherwise resolves to `.whipplescript/items.sqlite` in the
 # working directory, so a check run would share one SQLite file with the
 # developer's own tracker and with any concurrent run. Give this run its own.
 items_store_root="$(mktemp -d)"
-trap 'rm -rf "$items_store_root"' EXIT
+# One EXIT trap, so the cleanup, the transcript drain, and the report share it.
+finish() {
+    status=$?
+    rm -rf "$items_store_root"
+    # Restoring stdout/stderr closes the pipe's write end, which is the tee's
+    # EOF; without the wait the script can outrun its own transcript.
+    exec 1>&3 2>&3
+    wait "$check_log_tee" 2>/dev/null || true
+    if [ "$status" -ne 0 ]; then
+        printf '== check.sh FAILED (status %s) — full transcript: %s ==\n' \
+            "$status" "$check_log" >&3
+    fi
+    exit "$status"
+}
+trap finish EXIT
 export WHIPPLESCRIPT_ITEMS_STORE="$items_store_root/items.sqlite"
 
 # The green bar also runs on the public mirror, which is a curated projection

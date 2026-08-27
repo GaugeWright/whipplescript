@@ -1431,19 +1431,57 @@ struct StreamCancelProbe {
     store_path: PathBuf,
     instance_ref: String,
     command_id: String,
-    last_read: std::cell::Cell<Option<std::time::Instant>>,
+    clock: ProbeClock,
+    last_read: std::cell::Cell<Option<Duration>>,
     latched: std::cell::Cell<bool>,
     store: std::cell::RefCell<Option<SqliteStore>>,
+}
+
+/// The probe's source of now, as a reading on one monotonic scale. A turn
+/// reads the machine's clock; a test holds the reading itself and advances it
+/// explicitly, so an assertion about the throttle window states what the
+/// window does rather than how much real time a loaded machine happened to
+/// spend between two streamed lines.
+#[derive(Clone, Debug)]
+enum ProbeClock {
+    Machine(std::time::Instant),
+    #[cfg(test)]
+    Held(std::rc::Rc<std::cell::Cell<Duration>>),
+}
+
+impl ProbeClock {
+    fn now(&self) -> Duration {
+        match self {
+            Self::Machine(origin) => origin.elapsed(),
+            #[cfg(test)]
+            Self::Held(reading) => reading.get(),
+        }
+    }
 }
 
 impl StreamCancelProbe {
     const READ_INTERVAL: Duration = Duration::from_millis(250);
 
     fn new(store_path: PathBuf, instance_ref: String, command_id: String) -> Self {
+        Self::on_clock(
+            store_path,
+            instance_ref,
+            command_id,
+            ProbeClock::Machine(std::time::Instant::now()),
+        )
+    }
+
+    fn on_clock(
+        store_path: PathBuf,
+        instance_ref: String,
+        command_id: String,
+        clock: ProbeClock,
+    ) -> Self {
         Self {
             store_path,
             instance_ref,
             command_id,
+            clock,
             last_read: std::cell::Cell::new(None),
             latched: std::cell::Cell::new(false),
             store: std::cell::RefCell::new(None),
@@ -1455,14 +1493,15 @@ impl StreamCancelProbe {
         if self.latched.get() {
             return true;
         }
+        let now = self.clock.now();
         if self
             .last_read
             .get()
-            .is_some_and(|at| at.elapsed() < Self::READ_INTERVAL)
+            .is_some_and(|at| now.saturating_sub(at) < Self::READ_INTERVAL)
         {
             return false;
         }
-        self.last_read.set(Some(std::time::Instant::now()));
+        self.last_read.set(Some(now));
         let mut slot = self.store.borrow_mut();
         if slot.is_none() {
             *slot = SqliteStore::open(&self.store_path).ok();
@@ -5455,6 +5494,10 @@ workflow Method {
     struct ProbeAssertingDriver<'a> {
         handle: HostCancellationHandle,
         probe: &'a StreamCancelProbe,
+        /// The probe's now, held by the test: the window is left and re-entered
+        /// by advancing this, never by spending real time. A machine under load
+        /// can otherwise leave the window between two adjacent statements.
+        clock: std::rc::Rc<Cell<Duration>>,
         checked: Cell<bool>,
     }
 
@@ -5467,7 +5510,10 @@ workflow Method {
                 !self.probe.observed(),
                 "a read inside the throttle answers from the last read"
             );
-            std::thread::sleep(StreamCancelProbe::READ_INTERVAL + Duration::from_millis(50));
+            // Exactly the window: the throttle admits the next read at the
+            // interval, not one tick after it.
+            self.clock
+                .set(self.clock.get() + StreamCancelProbe::READ_INTERVAL);
             assert!(self.probe.observed(), "the durable request is observed");
             assert!(self.probe.released(), "the observation latches");
             assert!(
@@ -5614,14 +5660,17 @@ workflow Method {
         };
         let instance = runtime.open_instance(&open, &Packages).expect("instance");
         let command = turn(&instance.instance_ref, &open.policy, 1);
-        let probe = StreamCancelProbe::new(
+        let clock = std::rc::Rc::new(Cell::new(Duration::ZERO));
+        let probe = StreamCancelProbe::on_clock(
             path.clone(),
             command.instance_ref.clone(),
             command.command_id.clone(),
+            ProbeClock::Held(clock.clone()),
         );
         let driver = ProbeAssertingDriver {
             handle: runtime.cancellation_handle(&command.instance_ref, &command.command_id),
             probe: &probe,
+            clock,
             checked: Cell::new(false),
         };
         let execution = runtime

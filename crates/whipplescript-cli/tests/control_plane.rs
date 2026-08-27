@@ -7890,6 +7890,29 @@ rule ship
     // Phase 1: let plan (1s) settle BEFORE the incident (4s) and drive, so
     // the region requests its 30s second step — the in-flight work the lapse
     // must cancel.
+    //
+    // This phase is the test's one wall-clock assumption, and its margin is
+    // 2.5s: everything below must finish before `spark` (4s) comes due. If it
+    // does not, the incident lands in the same worker pass that settles `plan`,
+    // the region lapses before it ever requests `approved`, and the pinned view
+    // reads `{"approved":"not_requested"}` where the assertion below wants
+    // `cancelled_by_lapse` — the in-flight step the test exists to observe never
+    // exists. Measured 2026-08-26: four subprocess spawns typically spend a
+    // fraction of that, an injected stall of +3s straddles the cliff
+    // (nondeterministic), and +4s and beyond fail every time. CPU load alone
+    // does not reproduce it — 10 runs at loadavg 52 stayed green — so if this
+    // ever does go red, suspect I/O stalls on the SQLite opens, not the CPU.
+    //
+    // Widening `spark` (4s -> 20s) buys a 10x margin for 16s of test time. The
+    // real repair is a virtual clock, and the obstacle there is NOT the
+    // plumbing — `resolve_due_time_effects` already takes an injected `now` and
+    // `WorkerOptions::virtual_now` already threads it. It is the anchor: a
+    // relative timer is due per `strftime('%s', now) - strftime('%s',
+    // created_at) >= timeout_seconds`, and `created_at` is a real
+    // `CURRENT_TIMESTAMP` written at insert. An injected instant governs only
+    // the comparison side, so `given clock at` is a coarse fire-everything /
+    // fire-nothing switch and cannot say "plan is due but spark is not" without
+    // reading the anchor back out of the store.
     std::thread::sleep(std::time::Duration::from_millis(1500));
     for _ in 0..2 {
         let _ = whip(bin, &store_path)
