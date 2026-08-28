@@ -272,6 +272,16 @@ if [ -f spec/TRACKERS.md ]; then
     scripts/check-trackers.sh
 fi
 
+# A check nothing invokes reads exactly like a passing one. This gate is the
+# cheap total version of the discipline the mutation sweep applies to refusals:
+# it costs milliseconds and it closes the category rather than instances.
+#
+# Guarded like the checks above: the mirror withholds `.github/`, and without
+# the workflows every gate they own would read as unreachable.
+if [ -d .github/workflows ]; then
+    scripts/check-gate-reachability.sh
+fi
+
 echo "== hosted runtime contracts =="
 worker=crates/whipplescript-host-do/worker
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then

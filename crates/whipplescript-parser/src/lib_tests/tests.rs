@@ -14160,6 +14160,113 @@ rule delegate
     )
 }
 
+fn nested_sealed_source(sent: &str, grant: &str) -> String {
+    format!(
+        r#"
+use std.custody
+use std.agent
+@service
+workflow NestedSealed
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Batch {{
+  claims Claim[]
+}}
+
+agent Specialist {{ provider fixture  profile "repo-writer"  capacity 1 }}
+credential phi_key {{ kind raw }}
+
+@external
+rule delegate
+  when Claim as claim
+=> {{
+  tell Specialist
+{grant}
+    "Look at {{{{ {sent} }}}}" as summary
+}}
+"#
+    )
+}
+
+fn nested_errors(sent: &str, grant: &str) -> Vec<String> {
+    compile_program(&nested_sealed_source(sent, grant))
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .filter(|message| message.contains("would receive ciphertext"))
+        .collect()
+}
+
+#[test]
+fn a_sealed_field_reached_through_a_record_is_refused_too() {
+    // The gap this closes. `dotted_paths` yields only paths with at least one
+    // field, so a value passed WHOLE was invisible to the check — while the
+    // runtime walker recurses into objects to find exactly that envelope. The
+    // checker disagreed with the resolution it is supposed to be gating, and
+    // the provider got ciphertext in a nested field.
+    let errors = nested_errors("claim", "");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("claim.body"),
+        "names the field: {errors:?}"
+    );
+}
+
+#[test]
+fn naming_the_record_and_the_field_reports_the_sealed_value_once() {
+    // Keyed by WHERE the sealed value is, not by how it was reached, so a
+    // prompt mentioning both does not report the same field twice.
+    let errors = nested_errors("claim }} and {{ claim.body", "");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn a_grant_admits_the_nested_sealed_field() {
+    // The other half: worker-side opening recurses, so a granted turn may pass
+    // the whole record and have its envelope opened in place.
+    let errors = nested_errors(
+        "claim",
+        "    with access to credential phi_key {\n\
+         \x20     unwrap for PatientRecord\n\
+         \x20   }",
+    );
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+#[test]
+fn a_sealed_value_inside_a_collection_is_reached() {
+    // A sealed value in an array still renders as ciphertext, and the runtime
+    // walker descends into arrays, so the checker must too.
+    let errors = nested_errors("batch", "");
+    assert!(
+        errors.is_empty(),
+        "no `batch` binding in this rule: {errors:?}"
+    );
+
+    let source =
+        nested_sealed_source("claim", "").replace("  when Claim as claim", "  when Batch as batch");
+    let messages: Vec<String> = compile_program(&source.replace("{{ claim }}", "{{ batch }}"))
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .filter(|message| message.contains("would receive ciphertext"))
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("claims.body")),
+        "reached through the array: {messages:?}"
+    );
+}
+
 #[test]
 fn a_sealed_value_reaching_a_provider_without_a_grant_is_refused() {
     // The trap: a sealed value interpolated into a prompt renders as its

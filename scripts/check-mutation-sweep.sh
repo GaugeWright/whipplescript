@@ -7,8 +7,9 @@
 # one refusal at a time and runs the suite; a suite that still passes names an
 # unexercised refusal.
 #
-# Deliberately NOT in scripts/check.sh: one crate rebuild per refusal puts a
-# whole file in the hours. Run it against the area you changed, on dispatch.
+# dispatch: run by hand against the area you changed (AGENTS.md "Check"), and
+# deliberately NOT in scripts/check.sh — one crate rebuild per refusal puts a
+# whole file in the hours.
 #
 #   scripts/check-mutation-sweep.sh <file> <cargo-test-filter> [limit] [lines]
 #

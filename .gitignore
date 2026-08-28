@@ -19,5 +19,12 @@ __pycache__/
 # (spec/skills.md), and ignoring the directory would silently hide it.
 **/.whipplescript/**/*.sqlite*
 **/.whipplescript/*.sqlite*
+# The file store `examples/file-store-demo.whip` declares. Running the examples
+# writes into it, and `check-rule-coverage.sh` runs every fixture-runnable
+# example — so wiring that script to a runner (2026-08-28) made this artifact
+# routine. Scoped to the one demo root for the same reason as the carve-out
+# above: an untracked file is invisible to the checks that read `git ls-files`,
+# so it has to be ignored deliberately rather than left lying in the tree.
+**/.whipplescript/filestore-demo/
 .dev.vars
 crates/whipplescript-host-do/worker/.wrangler/

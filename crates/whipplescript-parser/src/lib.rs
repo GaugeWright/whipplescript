@@ -17778,6 +17778,46 @@ fn validate_known_field_paths_in_index(
     }
 }
 
+/// Every `sealed<T>` a type REACHES, as `(field path, payload type)`.
+///
+/// The empty path means the type is itself sealed. Recurses through class
+/// references, and through `Optional`/`Array`/`Map` because a sealed value
+/// inside a collection still renders as ciphertext. Cycle-guarded on class
+/// name: a self-referential schema would otherwise not terminate.
+fn collect_reachable_sealed(
+    schemas: &SchemaIndex,
+    ty: &TypeSyntax,
+    prefix: String,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<(String, String)>,
+) {
+    match ty {
+        TypeSyntax::Sealed { inner, .. } => out.push((prefix, inner.to_source())),
+        TypeSyntax::Optional { inner, .. }
+        | TypeSyntax::Array { inner, .. }
+        | TypeSyntax::Map { inner, .. } => {
+            collect_reachable_sealed(schemas, inner, prefix, seen, out)
+        }
+        TypeSyntax::Ref { name } => {
+            if !seen.insert(name.name.clone()) {
+                return;
+            }
+            if let Some(fields) = schemas.classes.get(&name.name) {
+                for (field, field_ty) in fields {
+                    let next = if prefix.is_empty() {
+                        field.clone()
+                    } else {
+                        format!("{prefix}.{field}")
+                    };
+                    collect_reachable_sealed(schemas, field_ty, next, seen, out);
+                }
+            }
+            seen.remove(&name.name);
+        }
+        _ => {}
+    }
+}
+
 /// A `sealed<T>` reaching an effect's input must be accompanied by an
 /// `unwrap for T` grant on that same effect.
 ///
@@ -17833,41 +17873,83 @@ fn validate_sealed_effect_inputs(
                     .filter(|op| op.operation == "unwrap")
                     .filter_map(|op| op.target.as_deref())
                     .collect();
+                // Both shapes a sealed value can arrive in: named directly
+                // (`claim.body`) and reached through a value passed whole
+                // (`claim`, whose `body` field is sealed). `dotted_paths`
+                // yields only paths with at least one field, so the second
+                // shape was invisible — which is the gap this closes.
+                let mut found: BTreeSet<(String, String)> = BTreeSet::new();
                 for source in &sources {
-                    for (root, path) in dotted_paths(source) {
+                    let mut roots = BTreeSet::new();
+                    if let Ok(expr) = parse_expression(source) {
+                        collect_expr_binding_roots(&expr, &mut roots);
+                    } else {
+                        collect_template_binding_roots(source, &mut roots);
+                    }
+                    let targets = dotted_paths(source)
+                        .into_iter()
+                        .chain(roots.into_iter().map(|root| (root, Vec::new())));
+                    for (root, path) in targets {
                         let Some(root_schema) = binding_types.get(&root) else {
                             continue;
                         };
-                        let Ok(TypeSyntax::Sealed { inner, .. }) =
-                            semantic.schemas.resolve_field_path(root_schema, &path)
+                        let Ok(resolved) = semantic.schemas.resolve_field_path(root_schema, &path)
                         else {
                             continue;
                         };
-                        let payload = inner.to_source();
-                        if granted.contains(payload.as_str()) {
-                            continue;
-                        }
                         let full = if path.is_empty() {
                             root.clone()
                         } else {
                             format!("{root}.{}", path.join("."))
                         };
-                        diagnostics.push(Diagnostic {
-                            related: Vec::new(),
-                            span: effect.span,
-                            message: format!(
-                                "rule `{}` passes `{full}` to an effect, but it is \
-                                 `sealed<{payload}>` and the effect has no `unwrap for \
-                                 {payload}` grant — the provider would receive ciphertext",
-                                rule.name.name
-                            ),
-                            suggestion: Some(format!(
-                                "grant the turn worker-side opening: `with access to credential \
-                                 <cred> {{ unwrap for {payload} }}`, or send a value the \
-                                 provider can read"
-                            )),
-                        });
+                        // Every sealed field this value REACHES, not only the
+                        // case where the value is itself sealed. A record
+                        // carrying an envelope renders the same ciphertext into
+                        // the request, and the runtime walker already recurses
+                        // into objects and arrays to find one — so a checker
+                        // that looked only at the top level disagreed with the
+                        // resolution it is supposed to be gating.
+                        let mut seen = BTreeSet::new();
+                        let mut reachable = Vec::new();
+                        collect_reachable_sealed(
+                            &semantic.schemas,
+                            &resolved,
+                            String::new(),
+                            &mut seen,
+                            &mut reachable,
+                        );
+                        for (field_path, payload) in reachable {
+                            if granted.contains(payload.as_str()) {
+                                continue;
+                            }
+                            let at = if field_path.is_empty() {
+                                full.clone()
+                            } else {
+                                format!("{full}.{field_path}")
+                            };
+                            // Keyed by WHERE the sealed value is, so naming a
+                            // record and its sealed field in one prompt reports
+                            // the field once rather than twice.
+                            found.insert((at, payload));
+                        }
                     }
+                }
+                for (at, payload) in found {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` passes `{at}` to an effect, which is \
+                             `sealed<{payload}>`, and the effect has no `unwrap for {payload}` \
+                             grant — the provider would receive ciphertext",
+                            rule.name.name
+                        ),
+                        suggestion: Some(format!(
+                            "grant the turn worker-side opening: `with access to credential \
+                             <cred> {{ unwrap for {payload} }}`, or send a value the provider \
+                             can read — `redact` drops a sealed field"
+                        )),
+                    });
                 }
             }
             body::BodyStmt::After(after) => validate_sealed_effect_inputs(
