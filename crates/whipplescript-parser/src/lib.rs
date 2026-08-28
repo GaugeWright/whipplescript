@@ -10329,6 +10329,28 @@ fn collect_egress_payload_reads(
                     collect_payload_field_roots(fields, None, &mut roots);
                     out.push((queue.clone(), roots));
                 }
+                // A mint's exchange egresses its URL, its non-credential
+                // header values and its body, exactly as a request does.
+                body::BodyEffectKind::MintCredential {
+                    parent,
+                    url,
+                    headers,
+                    body,
+                    ..
+                } => {
+                    let mut roots = BTreeSet::new();
+                    collect_template_binding_roots(url, &mut roots);
+                    for header in headers {
+                        if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
+                            collect_expr_binding_roots(expr, &mut roots);
+                        }
+                    }
+                    if let Some((source, expr)) = body {
+                        collect_expr_binding_roots(expr, &mut roots);
+                        collect_template_binding_roots(source, &mut roots);
+                    }
+                    out.push((parent.clone(), roots));
+                }
                 body::BodyEffectKind::FileWrite {
                     store, path, body, ..
                 } => {
@@ -11490,6 +11512,11 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
             signed_with,
             ..
         } => request_credential_handle(headers, signed_with.as_deref()).map(str::to_owned),
+        // A mint spends its parent at a token endpoint, which is an egress
+        // under that credential like any other. The PARENT is the sink
+        // identity — the child does not exist yet, and the checker guarantees
+        // the exchange presents exactly the parent.
+        body::BodyEffectKind::MintCredential { parent, .. } => Some(parent.clone()),
         _ => None,
     }
 }

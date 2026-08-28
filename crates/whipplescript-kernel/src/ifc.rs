@@ -4156,7 +4156,68 @@ pub fn check_with_envelope_imports(
                             }
                         }
                     }
-                    _ => {}
+                    // A mint spends its parent at a token endpoint, so the
+                    // exchange is an egress under that credential and the
+                    // reply comes back in — the same reading as `request`,
+                    // for the same reason.
+                    IrEffectKind::MintCredential => {
+                        reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Claiming, releasing, renewing and finishing all mutate a
+                    // shared tracker row that other actors and humans read.
+                    // `finish` additionally carries a summary; its queue is not
+                    // knowable here (it names an item binding, not a tracker),
+                    // which is why `collect_egress_payload_reads` cannot record
+                    // what that summary reads. Recorded on the flow-checker
+                    // tracker rather than left as an unexplained gap.
+                    IrEffectKind::TrackerClaim
+                    | IrEffectKind::TrackerRelease
+                    | IrEffectKind::TrackerRenew
+                    | IrEffectKind::TrackerFinish => {
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Renewing a lease is the same bidirectional coordination
+                    // as acquiring one.
+                    IrEffectKind::LeaseRenew => {
+                        reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // An exec sends its argv and stdin out to a process and
+                    // reads its stdout back. Both directions, and the resource
+                    // is the script capability or `exec:raw`.
+                    IrEffectKind::ExecCommand => {
+                        reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Invoking a child workflow ships it a payload and takes
+                    // its result back.
+                    IrEffectKind::WorkflowInvoke => {
+                        reads.push(resource);
+                        writes.push(resource);
+                        span.get_or_insert(effect.span);
+                    }
+                    // Handled elsewhere in this function, deliberately, and
+                    // named here so the match stays exhaustive rather than
+                    // letting a wildcard decide for a kind nobody considered.
+                    //
+                    // `AgentTell` egresses to its agent's PROVIDER, which is a
+                    // different resource from `effect.resource`; the block
+                    // below reads the agent declaration to find it.
+                    // `EventEmit`/`SignalEmit` push the `stream` sink below.
+                    // `SchemaCoerce` egresses to `model`, resolved through the
+                    // marked-crossing machinery rather than by resource.
+                    IrEffectKind::AgentTell
+                    | IrEffectKind::EventEmit
+                    | IrEffectKind::SignalEmit
+                    | IrEffectKind::SchemaCoerce => {}
+                    // A timer carries no payload in either direction: it waits
+                    // and reports that it waited.
+                    IrEffectKind::TimerWait => {}
                 }
             }
             for grant in &effect.access_grants {
@@ -11935,6 +11996,124 @@ rule seed
             messages.iter().all(|m| !m.contains("for that type")),
             "{messages:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mint_egress_tests {
+    //! A `mint` spends its parent at a token endpoint, so the exchange is an
+    //! egress under that credential. It shipped without an IFC resource — the
+    //! same gap `request` had, in work done the same week — so the checker
+    //! could not see it at all.
+
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    fn program() -> IrProgram {
+        let compiled = compile_program(
+            r#"
+@service
+workflow MintEgress
+
+use std.custody
+use std.ingress
+
+credential stripe_api { kind bearer }
+
+signal charge.disputed { note string }
+
+output result R
+class R { v string }
+
+rule scoped
+  when charge.disputed as charge
+=> {
+  mint credential from stripe_api {
+    at POST "https://connect.stripe.com/oauth/token"
+    header "Authorization" basic stripe_api
+    header "X-Note" charge.note
+    body "grant_type=client_credentials"
+    token at "access_token"
+  } as token
+
+  after token succeeds { complete result { v "minted" } }
+}
+"#,
+        );
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    #[test]
+    fn a_mint_exchange_is_an_egress_sink_the_checker_can_see() {
+        let ir = program();
+        let node = ir
+            .rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == IrEffectKind::MintCredential)
+            .expect("the mint lowers to an effect node");
+        // The PARENT is the sink: the child does not exist yet.
+        assert_eq!(node.resource.as_deref(), Some("stripe_api"));
+        let reads = ir
+            .rules
+            .iter()
+            .find_map(|rule| rule.metadata.egress_payload_reads.get("stripe_api"))
+            .expect("the exchange records what its payload reads");
+        assert!(reads.contains("charge"), "{reads:?}");
+    }
+
+    #[test]
+    fn a_confidential_value_in_a_mint_exchange_is_denied() {
+        let ir = program();
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        let denial = messages
+            .iter()
+            .find(|m| m.contains("denied flow"))
+            .unwrap_or_else(|| {
+                panic!("a confidential value in an exchange must be denied: {messages:#?}")
+            });
+        assert!(denial.contains("stripe_api"), "{denial}");
+    }
+
+    #[test]
+    fn a_cleared_mint_still_compiles() {
+        let ir = program();
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "stripe_api": { "reader": "confidential" },
+                "result": { "reader": "confidential" }
+            },
+            "request_scopes": {
+                "stripe_api": ["POST https://connect.stripe.com/oauth/token"]
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(messages.is_empty(), "{messages:#?}");
     }
 }
 

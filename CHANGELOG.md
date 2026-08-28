@@ -68,6 +68,24 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ### Fixed
 
+- **A `mint` exchange was invisible to the information-flow checker.** It
+  shipped two days after `request` and repeated that gap exactly: no
+  `resource_for_body` arm, so the token exchange — an egress under the parent
+  credential — had no sink and no payload reads. The parent is the sink
+  identity, since the child does not exist yet.
+
+  Found by making `check_with_envelope`'s reader-set match **exhaustive**, on
+  the model of DR-0074's `collect_effect_binding_roots`: every `IrEffectKind`
+  is now named, several with an arm that does nothing and says why, so adding a
+  variant is a compile error rather than a silent escape. Writing the `mint`
+  arm and noticing it could never fire is what surfaced the missing resource.
+
+  The exhaustive match is a backstop against the next hole, not a fix for the
+  remaining ones: an arm only matters if the kind has an IFC resource, and
+  seven kinds still have none, so their arms are written and unreachable. That
+  is recorded on `spec/flow-checker-resource-kind-tracker.md` with the list,
+  rather than left to read as more than it is.
+
 - **A filed tracker issue was invisible to the information-flow checker.**
   DR-0051 §1 gave trackers a *read* side — a `when <tracker> has ready issue`
   trigger keys the bare handle — and never a write side. So a rule could
