@@ -150,6 +150,33 @@ jobs:
   # rather than the whole bar because the rest of the bar needs a toolchain this
   # runner deliberately does without. windows-latest on both repositories — the
   # -src runner pool is Linux-only.
+  # A refusal this change ADDS must be pinned by a test that fails without it.
+  #
+  # Its own job rather than a step in the green bar: cost is one crate rebuild
+  # per touched refusal, which is proportional to the change but not to zero,
+  # and a pull request that adds none finishes in seconds. `check.sh` stays the
+  # one command for the required set; this asks a question only a DIFF can ask,
+  # and there is no diff at all when the bar runs locally on a clean tree.
+  new-refusals:
+    # `-src` only. The mirror is a squash-published projection with disjoint
+    # history, so a merge base there names the whole projection rather than a
+    # change, and the sweep would try to pin every refusal in the repository.
+    if: ${{ github.repository != 'GaugeWright/whipplescript' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          # The sweep diffs against the merge base, which a shallow clone does
+          # not have.
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Sweep the refusals this change touched
+        run: scripts/check-new-refusals.sh "origin/${{ github.base_ref || 'main' }}"
+
   windows-compiles:
     runs-on: windows-latest
     # An optimised `dist`-profile build of the whole workspace, cold on the

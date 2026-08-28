@@ -347,12 +347,26 @@ def main() -> int:
         "otherwise re-runs every site in the file, and the whole point of the "
         "two-phase shape is that the expensive phase is small.",
     )
+    parser.add_argument(
+        "--list-sites",
+        action="store_true",
+        help="print the refusal sites as `<line>\\t<label>` and exit, mutating "
+        "nothing. A caller that wants to sweep only the sites a diff touched "
+        "has to know which lines hold one first: passing every changed line to "
+        "--only-lines instead would report each ordinary line as a stale "
+        "candidate, which is a true statement about the wrong question.",
+    )
     args = parser.parse_args()
 
     target = args.target
     if not os.path.exists(target):
         print(f"no such target: {target}", file=sys.stderr)
         return 2
+
+    if args.list_sites:
+        for site in find_sites(open(target).read().split("\n")):
+            print(f"{site.line}\t{site.label}")
+        return 0
 
     backup = target + ".sweepbak"
     missing: set[int] = set()

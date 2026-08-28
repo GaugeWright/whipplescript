@@ -7,6 +7,9 @@
 # one refusal at a time and runs the suite; a suite that still passes names an
 # unexercised refusal.
 #
+# Driven per pull request by `scripts/check-new-refusals.sh`, which scopes it to
+# the refusal sites a diff touches so the cost is proportional to the change.
+#
 # dispatch: run by hand against the area you changed (AGENTS.md "Check"), and
 # deliberately NOT in scripts/check.sh — one crate rebuild per refusal puts a
 # whole file in the hours.
