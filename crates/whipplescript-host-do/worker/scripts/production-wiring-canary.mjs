@@ -305,6 +305,21 @@ export async function runManagedHost(
     }, [200, 201]);
     const imported = await responseJson(importedResponse, "fork import");
     assert.equal(typeof imported?.target?.instance_ref, "string", "fork import omitted target");
+    const forkPath = `/host/instances/${encodeURIComponent(imported.target.instance_ref)}`;
+    const discardedResponse = await route(`${forkPath}/discard`, {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          protocol: hostProtocol,
+          request_id: "production-wiring-canary:managed:discard:v1",
+          instance_ref: imported.target.instance_ref,
+          policy: policy.ref,
+        },
+      }),
+    });
+    const discarded = await responseJson(discardedResponse, "fork discard");
+    assert.equal(discarded?.instance_ref, imported.target.instance_ref);
+    assert.equal(discarded?.discarded_at?.instance_ref, imported.target.instance_ref);
 
     const cancelCommand = "production-wiring-canary-cancel-v1";
     const cancelableTurn = route("/host/turns", {

@@ -32,8 +32,8 @@ use crate::governance::GaugeDeskGovernanceRoot;
 use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization};
 use whipplescript_kernel::host_package::{AuthoredAgentPackage, PackageResolver};
 use whipplescript_kernel::host_protocol::{
-    EventPosition, ForkInstanceCommand, ForkedInstance, OpenInstanceCommand, PolicyEpochRef,
-    ResourceRef, StartTurnCommand, HOST_PROTOCOL,
+    DiscardInstanceCommand, DiscardedInstance, EventPosition, ForkInstanceCommand, ForkedInstance,
+    OpenInstanceCommand, PolicyEpochRef, ResourceRef, StartTurnCommand, HOST_PROTOCOL,
 };
 use whipplescript_kernel::AgentThreadSeed;
 use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
@@ -105,6 +105,85 @@ pub fn host_open_instance(
         .open_instance(&command, &package)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     serde_json::to_string(&opened).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Terminally discard a host instance whose embedding chat fork was not
+/// admitted. Replays return the original terminal coordinate.
+#[wasm_bindgen]
+pub fn host_discard_instance(
+    bridge: DoSqlBridge,
+    signed_envelope: &str,
+    expected_signer: &str,
+    public_key_hex: &str,
+    command_json: &str,
+) -> Result<String, JsValue> {
+    let mut facade = hosted_facade(bridge, signed_envelope, expected_signer, public_key_hex)?;
+    let command: DiscardInstanceCommand = serde_json::from_str(command_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    command
+        .validate()
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if command.policy != *facade.policy_ref() {
+        return Err(JsValue::from_str(
+            "discarded instance policy epoch does not match runtime",
+        ));
+    }
+    let instance = facade
+        .kernel()
+        .store()
+        .get_instance(&command.instance_ref)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        .ok_or_else(|| JsValue::from_str("discarded host instance is unavailable"))?;
+    let metadata: serde_json::Value = serde_json::from_str(&instance.input_json)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    if metadata.get("protocol").and_then(serde_json::Value::as_str) != Some(HOST_PROTOCOL)
+        || metadata.get("policy") != Some(&serde_json::to_value(&command.policy).unwrap())
+    {
+        return Err(JsValue::from_str(
+            "discarded instance does not belong to the admitted host policy",
+        ));
+    }
+    let event = match facade
+        .kernel()
+        .store()
+        .event_by_idempotency_key(&command.instance_ref, &command.request_id)
+        .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+    {
+        Some(event) => event,
+        None => {
+            let running = facade
+                .kernel()
+                .store()
+                .list_effects(&command.instance_ref)
+                .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+                .into_iter()
+                .any(|effect| effect.status == "running");
+            if running {
+                return Err(JsValue::from_str(
+                    "host instance with a running effect cannot be discarded",
+                ));
+            }
+            facade
+                .kernel_mut()
+                .cancel_instance(
+                    &command.instance_ref,
+                    Some("embedding host did not admit fork"),
+                    Some(&command.request_id),
+                )
+                .map_err(|error| JsValue::from_str(&format!("{error:?}")))?
+        }
+    };
+    serde_json::to_string(&DiscardedInstance {
+        protocol: HOST_PROTOCOL.to_owned(),
+        request_id: command.request_id,
+        instance_ref: command.instance_ref.clone(),
+        discarded_at: EventPosition {
+            instance_ref: command.instance_ref,
+            sequence: u64::try_from(event.sequence)
+                .map_err(|_| JsValue::from_str("discard event position is invalid"))?,
+        },
+    })
+    .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// Phase one of a hosted turn: validate the signed epoch, instance, package,

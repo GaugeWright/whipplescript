@@ -19,6 +19,7 @@ const hostOperations = [
   ["runtime.host.instance.open", "POST", "/host/instances/open", "http-json", "session", "critical"],
   ["runtime.host.turn.begin", "POST", "/host/turns", "http-json", "mutation", "critical"],
   ["runtime.host.fork.import", "POST", "/host/forks/import", "http-json", "mutation", "critical"],
+  ["runtime.host.instance.discard", "POST", "/host/instances/:instance/discard", "http-json", "mutation", "critical"],
   ["runtime.host.turn.cancel", "POST", "/host/instances/:instance/turns/:turn/cancel", "http-json", "mutation", "critical"],
   ["runtime.host.files.sync", "POST", "/host/instances/:instance/files/sync", "http-json", "mutation", "critical"],
   ["runtime.host.checkpoint", "POST", "/host/instances/:instance/checkpoint", "http-json", "mutation", "important"],

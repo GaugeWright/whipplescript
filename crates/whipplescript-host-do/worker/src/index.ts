@@ -85,6 +85,13 @@ const hostFunctions = bindings as unknown as {
     packageSource: string,
     systemPrompt: string,
   ) => string;
+  host_discard_instance: (
+    bridge: unknown,
+    signedEnvelope: string,
+    expectedSigner: string,
+    publicKeyHex: string,
+    commandJson: string,
+  ) => string;
   host_validate_turn: (
     bridge: unknown,
     signedEnvelope: string,
@@ -1176,6 +1183,10 @@ export class WorkflowInstance implements DurableObject {
     const fileSync = url.pathname.match(/^\/host\/instances\/([^/]+)\/files\/sync$/);
     if (fileSync) {
       return this.syncHostFiles(decodeURIComponent(fileSync[1]), parsed);
+    }
+    const discard = url.pathname.match(/^\/host\/instances\/([^/]+)\/discard$/);
+    if (discard) {
+      return this.discardHostInstance(decodeURIComponent(discard[1]), parsed);
     }
     const checkpoint = url.pathname.match(
       /^\/host\/instances\/([^/]+)\/(checkpoint|restore)$/,
@@ -4271,6 +4282,37 @@ export class WorkflowInstance implements DurableObject {
     }
   }
 
+  private async discardHostInstance(
+    instanceId: string,
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const command = parsed.command;
+    if (!command || typeof command !== "object" || Array.isArray(command)) {
+      return Response.json({ error: "discard requires a host command" }, { status: 400 });
+    }
+    const record = command as Record<string, unknown>;
+    if (record.instance_ref !== instanceId) {
+      return Response.json({ error: "discard path and command instance disagree" }, { status: 400 });
+    }
+    const policy = await this.hostPolicy(record);
+    if (policy instanceof Response) return policy;
+    const root = this.pinnedGovernanceRoot();
+    if (root instanceof Response) return root;
+    ensureSchema(this.ctx.storage.sql);
+    try {
+      const discarded = JSON.parse(hostFunctions.host_discard_instance(
+        makeBridge(this.ctx.storage.sql),
+        policy.signed_envelope,
+        root.signer,
+        root.key,
+        JSON.stringify(record),
+      ));
+      return Response.json(discarded, { status: 200 });
+    } catch (error) {
+      return Response.json({ error: `discard rejected: ${String(error)}` }, { status: 409 });
+    }
+  }
+
   private async bootstrapHostPolicy(
     parsed: Record<string, unknown>,
   ): Promise<Response> {
@@ -4741,6 +4783,7 @@ export default {
         url.pathname === "/host/instances/open" ||
         url.pathname === "/host/turns" ||
         url.pathname === "/host/forks/import" ||
+        /^\/host\/instances\/[^/]+\/discard$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/(events|evidence|files|position|pending|checkpoint|restore)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/events\/(stream|live)$/.test(url.pathname) ||
         /^\/host\/instances\/[^/]+\/human\/answer$/.test(url.pathname) ||

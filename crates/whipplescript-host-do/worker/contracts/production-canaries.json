@@ -49,6 +49,7 @@
         "runtime.host.events.stream",
         "runtime.host.files.sync",
         "runtime.host.fork.import",
+        "runtime.host.instance.discard",
         "runtime.host.instance.open",
         "runtime.host.policy",
         "runtime.host.restore",

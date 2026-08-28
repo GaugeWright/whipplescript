@@ -90,6 +90,12 @@ test("managed canary crosses placement forwarding and restores its baseline", as
     if (path === "/host/forks/import") {
       return json({ target: { instance_ref: "instance:synthetic-fork" } }, 201);
     }
+    if (path.endsWith("/discard")) {
+      return json({
+        instance_ref: body.command.instance_ref,
+        discarded_at: { instance_ref: body.command.instance_ref, sequence: 4 },
+      });
+    }
     if (path.endsWith("/cancel")) {
       return json({ command_id: body?.command_id, status: "requested" }, 202);
     }

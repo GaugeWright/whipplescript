@@ -113,6 +113,17 @@
       "authentication": "runtime-control-bearer"
     },
     {
+      "id": "runtime.host.instance.discard",
+      "method": "POST",
+      "path": "/host/instances/:instance/discard",
+      "samplePath": "/host/instances/instance-canary/discard",
+      "transport": "http-json",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "producer": "whipplescript-host-worker",
+      "authentication": "runtime-control-bearer"
+    },
+    {
       "id": "runtime.host.turn.cancel",
       "method": "POST",
       "path": "/host/instances/:instance/turns/:turn/cancel",

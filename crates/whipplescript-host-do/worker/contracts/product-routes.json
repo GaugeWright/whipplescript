@@ -363,6 +363,42 @@
       }
     },
     {
+      "id": "runtime.host.instance.discard",
+      "jurisdiction": "managed-workflow-placement",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/host/instances/:instance/discard",
+      "producer": "whipplescript-host-worker",
+      "consumer": "WhippleScript host protocol client",
+      "authentication": "runtime-control-bearer",
+      "scope": "tenant-placement",
+      "capability": "workflow-control",
+      "requestSchema": "typescript:whipplescript-runtime/runtime.host.instance.discard/request",
+      "responseSchema": "typescript:whipplescript-runtime/runtime.host.instance.discard/response",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "authority": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ],
+        "journey": [
+          "src/authenticated-host.integration.test.ts#authenticated-placement-journey"
+        ],
+        "deployed": [],
+        "property": [
+          "src/authenticated-host.integration.test.ts#declared-route-surface"
+        ]
+      }
+    },
+    {
       "id": "runtime.host.turn.cancel",
       "jurisdiction": "managed-workflow-placement",
       "transport": "http-json",

@@ -223,6 +223,53 @@ impl ForkedInstance {
     }
 }
 
+/// Tombstone a fork target that its embedding host could not admit. This is a
+/// lifecycle terminal, not history deletion: the exact fork evidence remains
+/// auditable, while the abandoned instance can never execute a turn.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiscardInstanceCommand {
+    pub protocol: String,
+    pub request_id: String,
+    pub instance_ref: String,
+    pub policy: PolicyEpochRef,
+}
+
+impl DiscardInstanceCommand {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        nonempty("discard-instance request id", &self.request_id)?;
+        nonempty("discarded instance ref", &self.instance_ref)?;
+        self.policy.validate()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiscardedInstance {
+    pub protocol: String,
+    pub request_id: String,
+    pub instance_ref: String,
+    pub discarded_at: EventPosition,
+}
+
+impl DiscardedInstance {
+    pub fn validate_for(&self, command: &DiscardInstanceCommand) -> Result<(), ProtocolError> {
+        command.validate()?;
+        if self.protocol != HOST_PROTOCOL {
+            return Err(ProtocolError::WrongVersion(self.protocol.clone()));
+        }
+        if self.request_id != command.request_id
+            || self.instance_ref != command.instance_ref
+            || self.discarded_at.instance_ref != command.instance_ref
+            || self.discarded_at.sequence == 0
+        {
+            return Err(ProtocolError::Mismatch("discarded instance"));
+        }
+        Ok(())
+    }
+}
+
 /// The command GaugeDesk admits before WhippleScript begins a turn.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartTurnCommand {
@@ -534,6 +581,32 @@ mod tests {
         assert_eq!(
             mixed.validate_for(&command),
             Err(ProtocolError::Mismatch("forked instance"))
+        );
+    }
+
+    #[test]
+    fn discarded_instance_receipt_binds_the_terminal_to_the_exact_command() {
+        let command = DiscardInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: "discard-chat-2".to_owned(),
+            instance_ref: "whip:instance:target".to_owned(),
+            policy: policy(),
+        };
+        let discarded = DiscardedInstance {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: command.request_id.clone(),
+            instance_ref: command.instance_ref.clone(),
+            discarded_at: EventPosition {
+                instance_ref: command.instance_ref.clone(),
+                sequence: 4,
+            },
+        };
+        discarded.validate_for(&command).expect("bound discard");
+        let mut mixed = discarded;
+        mixed.discarded_at.instance_ref = "whip:instance:other".to_owned();
+        assert_eq!(
+            mixed.validate_for(&command),
+            Err(ProtocolError::Mismatch("discarded instance"))
         );
     }
 

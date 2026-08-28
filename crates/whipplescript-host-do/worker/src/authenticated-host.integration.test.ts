@@ -1291,6 +1291,52 @@ describe("real WorkflowInstance hibernation", () => {
     );
     expect(forkPosition.status, await forkPosition.clone().text()).toBe(200);
 
+    const discardCommand = {
+      protocol: HOST_PROTOCOL,
+      request_id: "discard-fork-placement-journey",
+      instance_ref: imported.target.instance_ref,
+      policy: POLICY_REF,
+    };
+    const discardPath =
+      `/host/instances/${encodeURIComponent(imported.target.instance_ref)}/discard`;
+    const discardedResponse = await placementFetch(discardPath, {
+      method: "POST",
+      body: JSON.stringify({ command: discardCommand }),
+    });
+    expect(
+      discardedResponse.status,
+      await discardedResponse.clone().text(),
+    ).toBe(200);
+    const discarded = await discardedResponse.json<{
+      instance_ref: string;
+      discarded_at: { instance_ref: string; sequence: number };
+    }>();
+    expect(discarded).toMatchObject({
+      instance_ref: imported.target.instance_ref,
+      discarded_at: { instance_ref: imported.target.instance_ref },
+    });
+    expect(discarded.discarded_at.sequence).toBeGreaterThan(0);
+    const replayedDiscard = await placementFetch(discardPath, {
+      method: "POST",
+      body: JSON.stringify({ command: discardCommand }),
+    });
+    expect(replayedDiscard.status, await replayedDiscard.clone().text()).toBe(200);
+    expect(await replayedDiscard.json()).toEqual(discarded);
+    const discardedTurn = await placementFetch("/host/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        command: {
+          ...turnCommand,
+          command_id: "turn-discarded-fork",
+          run_ref: "gaugedesk:run:discarded-fork",
+          instance_ref: imported.target.instance_ref,
+        },
+        package: packageDocs,
+        image_bodies: [],
+      }),
+    });
+    expect(discardedTurn.status).toBe(400);
+
     eventSocket!.close(1000, "done");
     const cancelCommandId = "turn-placement-cancel";
     const cancelableTurn = placementFetch("/host/turns", {
@@ -1645,7 +1691,7 @@ describe("real WorkflowInstance hibernation", () => {
       || path.startsWith("/host/")
       || path.startsWith("/public/session/")
     );
-    expect(operations.length).toBe(27);
+    expect(operations.length).toBe(28);
 
     for (const operation of operations) {
       for (const authorization of [undefined, "Bearer wrong-control-token"]) {
