@@ -256,6 +256,7 @@ pub enum LoopObservation {
         tool_name: String,
         policy: String,
         output_class: String,
+        retention_direction: String,
         result_status: ToolStatus,
         experiment_label: String,
         original_bytes: usize,
@@ -613,10 +614,11 @@ where
                 observations.push(LoopObservation::ToolOutputTruncated {
                     call_id: call.id.clone(),
                     tool_name: call.name.clone(),
-                    policy: "middle_v1".to_owned(),
+                    policy: "class_aware_v1".to_owned(),
                     output_class: "text/plain".to_owned(),
+                    retention_direction: tool_output_retention(&call.name).to_owned(),
                     result_status: outcome.status,
-                    experiment_label: "middle_v1_control".to_owned(),
+                    experiment_label: "pi_class_aware_v1".to_owned(),
                     original_bytes,
                     retained_bytes: outcome.content.len(),
                     recall_id,
@@ -1348,10 +1350,11 @@ where
                     .push(LoopObservation::ToolOutputTruncated {
                         call_id: call.id.clone(),
                         tool_name: call.name.clone(),
-                        policy: "middle_v1".to_owned(),
+                        policy: "class_aware_v1".to_owned(),
                         output_class: "text/plain".to_owned(),
+                        retention_direction: tool_output_retention(&call.name).to_owned(),
                         result_status: outcome.status,
-                        experiment_label: "middle_v1_control".to_owned(),
+                        experiment_label: "pi_class_aware_v1".to_owned(),
                         original_bytes,
                         retained_bytes: outcome.content.len(),
                         recall_id,
@@ -1374,54 +1377,12 @@ where
 fn normalize_media_input(
     media: &[MediaInput],
 ) -> (Vec<ImageBlock>, Vec<String>, Vec<LoopObservation>) {
-    let mut images = Vec::new();
-    let mut notices = Vec::new();
-    let mut observations = Vec::new();
-    for item in media {
-        let supported_image = matches!(
-            item.media_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-        );
-        if supported_image {
-            if let Some(data) = item.data_base64.as_deref().filter(|data| !data.is_empty()) {
-                let derivative_hash = crate::rule_lowering::stable_hash_hex(data);
-                images.push(ImageBlock {
-                    media_type: item.media_type.clone(),
-                    data_base64: data.to_owned(),
-                });
-                observations.push(LoopObservation::MediaNormalized {
-                    artifact_ref: item.artifact_ref.clone(),
-                    media_type: item.media_type.clone(),
-                    normalization: "provider_image".to_owned(),
-                    derivative_hash: Some(derivative_hash),
-                });
-                continue;
-            }
-        }
-        let reason = if item.media_type.trim().is_empty() {
-            "media type is missing"
-        } else if supported_image {
-            "image body is unavailable"
-        } else {
-            "selected model adapter has no admitted representation for this media type"
-        };
-        notices.push(format!(
-            "[Unsupported media: artifact_ref={}, media_type={}, reason={reason}]",
-            item.artifact_ref,
-            if item.media_type.is_empty() {
-                "unknown"
-            } else {
-                &item.media_type
-            }
-        ));
-        observations.push(LoopObservation::MediaNormalized {
-            artifact_ref: item.artifact_ref.clone(),
-            media_type: item.media_type.clone(),
-            normalization: "unsupported_explicit".to_owned(),
-            derivative_hash: None,
-        });
-    }
-    (images, notices, observations)
+    let normalized = crate::media::normalize_provider_media(media);
+    (
+        normalized.images,
+        normalized.text_parts,
+        normalized.observations,
+    )
 }
 
 fn recall_request_observation(call: &ToolCall) -> Option<LoopObservation> {
@@ -1438,7 +1399,7 @@ fn recall_request_observation(call: &ToolCall) -> Option<LoopObservation> {
         content_id: content_id.to_owned(),
         offset: call.arguments.get("offset").and_then(Value::as_u64),
         limit: call.arguments.get("limit").and_then(Value::as_u64),
-        experiment_label: "middle_v1_control".to_owned(),
+        experiment_label: "pi_class_aware_v1".to_owned(),
     })
 }
 
@@ -1708,6 +1669,66 @@ pub fn recall_footer(tool: &str, byte_len: usize, id: &str) -> String {
     format!(
         "\n[full `{tool}` output: {byte_len} bytes, id {id} — call `recall` with this id (and optional line offset/limit) to read the rest]"
     )
+}
+
+/// Semantic end retained for an oversized text result. Unknown tools default
+/// to the head: the start normally carries schema, headings, or an explanation,
+/// while only explicitly command/log-like streams make the latest tail the
+/// useful end.
+pub fn tool_output_retention(tool: &str) -> &'static str {
+    let lower = tool.to_ascii_lowercase();
+    if matches!(lower.as_str(), "bash" | "shell" | "exec" | "command.run")
+        || lower.ends_with(".bash")
+        || lower.ends_with(".exec")
+        || lower.contains("log")
+    {
+        "tail"
+    } else {
+        "head"
+    }
+}
+
+/// Apply DR-0080's Pi-style class-aware byte cap. Complete output recovery is
+/// supplied by the caller's content store and named by `recall_id` when capture
+/// succeeded. UTF-8 boundaries are preserved and a small result is unchanged.
+pub fn truncate_tool_output(
+    tool: &str,
+    text: &str,
+    max_bytes: usize,
+    recall_id: Option<&str>,
+) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let direction = tool_output_retention(tool);
+    let keep = max_bytes.saturating_sub(256).max(1);
+    let (retained, omitted_where) = if direction == "tail" {
+        let mut start = text.len().saturating_sub(keep);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        (&text[start..], "beginning")
+    } else {
+        let mut end = keep.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&text[..end], "end")
+    };
+    let omitted = text.len().saturating_sub(retained.len());
+    let marker = format!(
+        "[... {omitted} of {} bytes omitted from the {omitted_where}; retained {direction} ...]",
+        text.len()
+    );
+    let mut output = if direction == "tail" {
+        format!("{marker}\n{retained}")
+    } else {
+        format!("{retained}\n{marker}")
+    };
+    if let Some(id) = recall_id {
+        output.push_str(&recall_footer(tool, text.len(), id));
+    }
+    output
 }
 
 /// Marker preceding the recall id in a [`recall_footer`], used to parse it back.

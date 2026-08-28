@@ -25,6 +25,12 @@ sha2 = "0.11"
 # model-facing contract through `WhipShell`.
 bashkit = { version = "=0.16.0", default-features = false, features = ["jq"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
+# DR-0080 provider-input normalization. Feature-minimized, pure-Rust codecs keep
+# native and Durable Object placements on the same deterministic conversion path.
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+pdf-extract = "0.12.0"
+office_oxide = { version = "0.1.8", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["rt", "time"] }

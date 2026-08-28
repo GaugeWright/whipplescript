@@ -1653,6 +1653,7 @@ fn native_coerce_turn(
         api_key: config.api_key.clone(),
         model: config.model.clone(),
         prompt,
+        media: Vec::new(),
         output_schema: schema,
         wrapped,
         schema_name: schema_name.to_owned(),

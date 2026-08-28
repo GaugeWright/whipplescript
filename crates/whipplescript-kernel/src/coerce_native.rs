@@ -359,6 +359,9 @@ pub struct CoerceCall<'a> {
     pub model: &'a str,
     /// Fully interpolated prompt (arguments already substituted).
     pub prompt: &'a str,
+    /// Typed media supplied by any schema.coerce source form. The same shared
+    /// normalizer used by agent.tell converts these before request rendering.
+    pub media: Option<&'a [crate::harness_loop::MediaInput]>,
     /// Object-rooted output schema (see [`output_schema_envelope`]).
     pub output_schema: &'a Value,
     /// A stable name for the schema/tool (the output type name).
@@ -395,9 +398,11 @@ pub fn build_request(call: &CoerceCall<'_>) -> HttpRequest {
 /// implemented equivalent of the Responses API's `text.format`). The base URL is
 /// always the caller's configured endpoint.
 fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let normalized = normalized_coerce_input(call);
+    let content = openai_compat_content(&normalized.text, &normalized.images);
     let body = json!({
         "model": call.model,
-        "messages": [{ "role": "user", "content": call.prompt }],
+        "messages": [{ "role": "user", "content": content }],
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -430,13 +435,15 @@ fn build_openai_compat_request(call: &CoerceCall<'_>) -> HttpRequest {
 /// `text.format` structured-output constraint. Always streams (the endpoint is
 /// SSE); the transport assembles the `response.completed` payload.
 fn build_codex_request(call: &CoerceCall<'_>, codex: CodexAuth<'_>) -> HttpRequest {
+    let normalized = normalized_coerce_input(call);
+    let content = openai_responses_content(&normalized.text, &normalized.images);
     let body = json!({
         "model": call.model,
         "instructions": "Respond only with a value matching the required output schema.",
         "input": [{
             "type": "message",
             "role": "user",
-            "content": [{ "type": "input_text", "text": call.prompt }],
+            "content": content,
         }],
         "tools": [],
         "tool_choice": "auto",
@@ -497,9 +504,11 @@ fn with_idempotency_key(
 }
 
 fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let normalized = normalized_coerce_input(call);
+    let content = openai_responses_content(&normalized.text, &normalized.images);
     let body = json!({
         "model": call.model,
-        "input": [{ "role": "user", "content": call.prompt }],
+        "input": [{ "role": "user", "content": content }],
         "text": {
             "format": {
                 "type": "json_schema",
@@ -530,6 +539,8 @@ fn build_openai_request(call: &CoerceCall<'_>) -> HttpRequest {
 }
 
 fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
+    let normalized = normalized_coerce_input(call);
+    let content = anthropic_content(&normalized.text, &normalized.images);
     let tool_name = format!("emit_{}", sanitize_name(call.schema_name));
     let body = json!({
         "model": call.model,
@@ -540,7 +551,7 @@ fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
             "input_schema": call.output_schema,
         }],
         "tool_choice": { "type": "tool", "name": tool_name },
-        "messages": [{ "role": "user", "content": call.prompt }],
+        "messages": [{ "role": "user", "content": content }],
     });
     // Anthropic coerce uses a console API key only (`x-api-key`). Reusing a
     // Claude Code OAuth token (`sk-ant-oat*`) for the API is a terms gray area
@@ -558,6 +569,67 @@ fn build_anthropic_request(call: &CoerceCall<'_>) -> HttpRequest {
         ),
         body,
     }
+}
+
+struct NormalizedCoerceInput {
+    text: String,
+    images: Vec<crate::harness_loop::ImageBlock>,
+}
+
+fn normalized_coerce_input(call: &CoerceCall<'_>) -> NormalizedCoerceInput {
+    let normalized = crate::media::normalize_provider_media(call.media.unwrap_or(&[]));
+    let mut text = call.prompt.to_owned();
+    for part in normalized.text_parts {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&part);
+    }
+    NormalizedCoerceInput {
+        text,
+        images: normalized.images,
+    }
+}
+
+fn openai_responses_content(text: &str, images: &[crate::harness_loop::ImageBlock]) -> Vec<Value> {
+    let mut content = vec![json!({ "type": "input_text", "text": text })];
+    content.extend(images.iter().map(|image| {
+        json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", image.media_type, image.data_base64),
+        })
+    }));
+    content
+}
+
+fn openai_compat_content(text: &str, images: &[crate::harness_loop::ImageBlock]) -> Value {
+    if images.is_empty() {
+        return Value::String(text.to_owned());
+    }
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    content.extend(images.iter().map(|image| json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{};base64,{}", image.media_type, image.data_base64) },
+    })));
+    Value::Array(content)
+}
+
+fn anthropic_content(text: &str, images: &[crate::harness_loop::ImageBlock]) -> Value {
+    if images.is_empty() {
+        return Value::String(text.to_owned());
+    }
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    content.extend(images.iter().map(|image| {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data_base64,
+            },
+        })
+    }));
+    Value::Array(content)
 }
 
 /// Whether a token is a Claude Code / `ant auth login` OAuth token (`sk-ant-oat*`)
@@ -838,6 +910,7 @@ pub struct NativeCoerceClient<'a, T: CoerceTransport> {
     pub api_key: String,
     pub model: String,
     pub prompt: String,
+    pub media: Vec<crate::harness_loop::MediaInput>,
     pub output_schema: Value,
     pub wrapped: bool,
     pub schema_name: String,
@@ -858,6 +931,7 @@ impl<T: CoerceTransport> CoerceClient for NativeCoerceClient<'_, T> {
             api_key: &self.api_key,
             model: &self.model,
             prompt: &self.prompt,
+            media: Some(&self.media),
             output_schema: &self.output_schema,
             schema_name: &self.schema_name,
             max_tokens: self.max_tokens,
@@ -1215,6 +1289,7 @@ mod tests {
             api_key: "sk-test",
             model: "gpt-4o",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1237,6 +1312,39 @@ mod tests {
     }
 
     #[test]
+    fn coerce_request_uses_the_shared_media_normalizer() {
+        let schema = json!({ "type": "object" });
+        let media = [crate::harness_loop::MediaInput {
+            artifact_ref: "artifact:scan".to_owned(),
+            media_type: "image/png".to_owned(),
+            data_base64: Some(crate::exec_http::base64_encode(b"png-bytes")),
+            metadata: std::collections::BTreeMap::new(),
+        }];
+        let call = CoerceCall {
+            provider: CoerceProvider::OpenAi,
+            base_url: "https://api.openai.com",
+            api_key: "sk-test",
+            model: "gpt-4o",
+            prompt: "Describe the attachment",
+            media: Some(&media),
+            output_schema: &schema,
+            schema_name: "Description",
+            max_tokens: 1024,
+            codex: None,
+            idempotency_key: "",
+        };
+        let request = build_request(&call);
+        assert_eq!(request.body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            request.body["input"][0]["content"][1]["type"],
+            "input_image"
+        );
+        assert!(request.body["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
     fn openai_compat_request_uses_chat_completions_with_response_format() {
         let schema = json!({ "type": "object" });
         let call = CoerceCall {
@@ -1245,6 +1353,7 @@ mod tests {
             api_key: "sk-test",
             model: "llama-3.3-70b",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1295,6 +1404,7 @@ mod tests {
             api_key: "sk-test",
             model: "gpt-4o-mini",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1324,6 +1434,7 @@ mod tests {
             api_key: "xai-test",
             model: "grok-4",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1396,6 +1507,7 @@ mod tests {
             api_key: "sk-test",
             model: "gpt-4o",
             prompt: "p",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1447,6 +1559,7 @@ mod tests {
             api_key: "oauth-jwt",
             model: "gpt-5.5",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1497,6 +1610,7 @@ mod tests {
             api_key: "key",
             model: "claude-opus-4-8",
             prompt: "Classify this",
+            media: None,
             output_schema: &schema,
             schema_name: "WorkReview",
             max_tokens: 1024,
@@ -1543,6 +1657,7 @@ mod tests {
             api_key: "k",
             model: "gpt-4o",
             prompt: "p",
+            media: None,
             output_schema: &schema,
             schema_name: "Bag",
             max_tokens: 256,
@@ -1638,6 +1753,7 @@ mod tests {
             api_key: "key".to_owned(),
             model: "claude-opus-4-8".to_owned(),
             prompt: "Classify this".to_owned(),
+            media: Vec::new(),
             output_schema: json!({ "type": "object" }),
             wrapped: false,
             schema_name: "WorkReview".to_owned(),
@@ -1671,6 +1787,7 @@ mod tests {
             api_key: "k".to_owned(),
             model: "gpt-4o".to_owned(),
             prompt: "p".to_owned(),
+            media: Vec::new(),
             output_schema: json!({ "type": "object" }),
             wrapped: false,
             schema_name: "X".to_owned(),
@@ -1710,6 +1827,7 @@ mod tests {
                 api_key: "key",
                 model: "m",
                 prompt: "Classify this",
+                media: None,
                 output_schema: schema,
                 schema_name: "WorkReview",
                 max_tokens: 1024,

@@ -21831,8 +21831,14 @@ fn run_coerce_effect(
     // fixture coerce should return; it takes precedence over the variant knob and
     // the generated placeholder.
     let injected_output = options.coerce_outputs.get(&function_name).cloned();
+    let media: Vec<whipplescript_kernel::harness_loop::MediaInput> = input
+        .get("media")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let request =
-        CoerceRequest::with_evidence_hashes(function_name, arguments_json, output_type.clone());
+        CoerceRequest::with_evidence_hashes(function_name, arguments_json, output_type.clone())
+            .commit_media(&media);
     // Sum-type outputs carry embedded per-variant fixtures: return the
     // selected (or first declared) tagged variant (spec/sum-types.md).
     let value = injected_output
@@ -22588,6 +22594,11 @@ fn run_native_coerce_effect(
         .ir
         .ok_or_else(|| StoreError::Conflict("native coerce: program did not compile".to_owned()))?;
     let arguments = json_from_str(&request.arguments_json);
+    let media = input
+        .get("media")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let (prompt, output_schema, wrapped, schema_name) = if request.function_name == "prompt" {
         let prompt = input
             .get("prompt")
@@ -22626,6 +22637,7 @@ fn run_native_coerce_effect(
         api_key: config.api_key,
         model: config.model,
         prompt,
+        media,
         output_schema,
         wrapped,
         schema_name,

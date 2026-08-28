@@ -21,6 +21,7 @@ pub mod ingress_pass;
 pub mod instance_machine;
 pub mod lowering;
 pub mod mcp;
+pub mod media;
 pub mod native_lifecycle;
 pub mod package_registry;
 pub mod principal;
@@ -238,6 +239,7 @@ fn brokered_observation_evidence(
             tool_name,
             policy,
             output_class,
+            retention_direction,
             result_status,
             experiment_label,
             original_bytes,
@@ -250,6 +252,7 @@ fn brokered_observation_evidence(
                 "tool": tool_name,
                 "policy": policy,
                 "output_class": output_class,
+                "retention_direction": retention_direction,
                 "result_status": match result_status {
                     ToolStatus::Ok => "ok",
                     ToolStatus::Error => "error",

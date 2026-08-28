@@ -1392,19 +1392,28 @@ impl FileToolExecutor {
         if full.len() <= self.max_bytes {
             return full;
         }
-        let truncated = middle_truncate(&full, self.max_bytes);
         let Some(path) = &self.content_store_path else {
-            return truncated;
+            return whipplescript_kernel::harness_loop::truncate_tool_output(
+                tool,
+                &full,
+                self.max_bytes,
+                None,
+            );
         };
         match ContentStore::open(path).and_then(|store| store.put(&full)) {
-            // The footer format is owned by the kernel so the `ToolResultCompactor`
-            // can parse the recall id back (context-assembly Phase 5).
-            Ok(id) => format!(
-                "{truncated}{}",
-                whipplescript_kernel::harness_loop::recall_footer(tool, full.len(), &id)
+            Ok(id) => whipplescript_kernel::harness_loop::truncate_tool_output(
+                tool,
+                &full,
+                self.max_bytes,
+                Some(&id),
             ),
             // Capture failure degrades to plain truncation (never blocks the turn).
-            Err(_) => truncated,
+            Err(_) => whipplescript_kernel::harness_loop::truncate_tool_output(
+                tool,
+                &full,
+                self.max_bytes,
+                None,
+            ),
         }
     }
 
@@ -1988,7 +1997,12 @@ impl FileToolExecutor {
         }
         let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        let combined = middle_truncate(&combined, self.max_bytes);
+        let combined = whipplescript_kernel::harness_loop::truncate_tool_output(
+            TOOL_BASH,
+            &combined,
+            self.max_bytes,
+            None,
+        );
         match output.status.code() {
             Some(0) => Ok(combined),
             Some(code) => Err(format!("command exited with status {code}\n{combined}")),
@@ -2722,10 +2736,11 @@ impl ToolExecutor for FileToolExecutor {
                 status: ToolStatus::Ok,
                 content: self.cap_and_capture(&call.name, content),
             },
-            // Errors are operational (small); cap without capture.
+            // Oversized errors obey the originating tool's semantic direction
+            // and remain losslessly recallable just like successful output.
             Err(reason) => ToolOutcome {
                 status: ToolStatus::Error,
-                content: middle_truncate(&reason, self.max_bytes),
+                content: self.cap_and_capture(&call.name, reason),
             },
         }
     }
@@ -2908,37 +2923,6 @@ fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> St
         return String::new();
     }
     lines[start..end].join("\n")
-}
-
-/// Bound returned content to a byte budget, appending a truncation marker.
-/// Middle-truncate a tool output to at most ~`max_bytes` (context-assembly Phase 4,
-/// Layer A — deterministic, always-on capture-time cap). Keeps a head and a tail
-/// with an elision marker between, so both the start and end of a large output
-/// survive and a runaway output cannot bloat the context (the full output stays
-/// addressable as evidence). A small output is returned unchanged.
-fn middle_truncate(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    // Reserve room for the elision marker; split the remainder head/tail.
-    let keep = max_bytes.saturating_sub(96);
-    let head_len = keep / 2;
-    let tail_len = keep - head_len;
-    let mut head_end = head_len.min(text.len());
-    while head_end > 0 && !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = text.len().saturating_sub(tail_len);
-    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    let elided = tail_start.saturating_sub(head_end);
-    format!(
-        "{}\n[... {elided} of {} bytes elided (full output kept as evidence) ...]\n{}",
-        &text[..head_end],
-        text.len(),
-        &text[tail_start..]
-    )
 }
 
 /// Recursively walk `dir` (under `root`), invoking `visit` with each file's
@@ -5316,17 +5300,33 @@ mod tests {
     }
 
     #[test]
-    fn middle_truncate_keeps_head_and_tail_within_budget() {
+    fn class_aware_truncation_keeps_semantic_end_within_budget() {
         // Small output is untouched.
-        assert_eq!(middle_truncate("hello", 100), "hello");
+        assert_eq!(
+            whipplescript_kernel::harness_loop::truncate_tool_output(TOOL_READ, "hello", 100, None),
+            "hello"
+        );
 
-        // A large output keeps both ends, elides the middle, and fits the budget.
+        // Read output keeps its head; command output keeps its tail.
         let big: String = (0..4000).map(|i| format!("line-{i}\n")).collect();
-        let out = middle_truncate(&big, 800);
-        assert!(out.len() <= 800 + 128, "over budget: {}", out.len());
-        assert!(out.contains("line-0\n"), "head dropped");
-        assert!(out.contains("line-3999"), "tail dropped");
-        assert!(out.contains("elided"), "no elision marker");
+        let head =
+            whipplescript_kernel::harness_loop::truncate_tool_output(TOOL_READ, &big, 800, None);
+        assert!(head.len() <= 900, "over budget: {}", head.len());
+        assert!(head.contains("line-0\n"), "head dropped");
+        assert!(
+            !head.contains("line-3999"),
+            "read unexpectedly retained tail"
+        );
+        assert!(head.contains("retained head"), "no head marker");
+
+        let tail =
+            whipplescript_kernel::harness_loop::truncate_tool_output(TOOL_BASH, &big, 800, None);
+        assert!(
+            !tail.contains("line-0\n"),
+            "command unexpectedly retained head"
+        );
+        assert!(tail.contains("line-3999"), "tail dropped");
+        assert!(tail.contains("retained tail"), "no tail marker");
     }
 
     #[test]

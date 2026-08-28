@@ -1,10 +1,11 @@
 //! Content-addressed blob store for large tool outputs (context-assembly Phase 5).
 //!
 //! When an owned-harness tool produces an output too large for the model context,
-//! the executor middle-truncates what the model sees but stores the FULL bytes here,
+//! the executor truncates what the model sees according to the tool's output class but
+//! stores the FULL bytes here,
 //! keyed by a stable content hash, and hands the model a recall id. The `recall`
-//! tool reads the full bytes back (paginated) — so truncation is lossless, not
-//! lossy (the WhippleScript edge over Codex/pi). It is also what makes Layer A's
+//! tool reads the full bytes back (paginated), so truncation is lossless. The
+//! durable object is also what makes Layer A's
 //! "full output kept as evidence" promise true, and what the `ToolResultCompactor`
 //! elides old tool results down to.
 //!

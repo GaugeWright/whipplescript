@@ -88,7 +88,9 @@ pub struct ProviderBindingRef {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TurnInput {
     pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Typed media resources. The Rust field and serialized `images` spelling
+    /// remain for host.v1 compatibility; deserializers also accept `media`.
+    #[serde(default, alias = "media", skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ResourceRef>,
 }
 

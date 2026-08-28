@@ -1419,6 +1419,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
+                let media: Vec<MediaInput> = input
+                    .get("media")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
                 let output_type = input
                     .get("output_type")
                     .and_then(|value| value.as_str())
@@ -1439,7 +1444,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     function_name,
                     arguments.to_string(),
                     output_type,
-                );
+                )
+                .commit_media(&media);
                 match incoming {
                     // Prepare: build the provider request and suspend on `fetch`.
                     None => {
@@ -1459,6 +1465,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             api_key: &cfg.api_key,
                             model: &cfg.model,
                             prompt: &prompt,
+                            media: Some(&media),
                             output_schema: &output_schema,
                             schema_name: &schema_name,
                             max_tokens: cfg.max_tokens,

@@ -742,14 +742,19 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// content-addressed first so the truncation footer can hand the model a
     /// `recall` id (mirrors native `cap_and_capture`). A small output is returned
     /// unchanged and nothing is captured.
-    fn cap_and_capture(&self, text: &str) -> String {
+    fn cap_and_capture(&self, tool: &str, text: &str) -> String {
         if text.len() <= DEFAULT_MAX_BYTES {
             return text.to_string();
         }
         // Capture the full bytes so `recall id=<id>` can page through them; on a
         // capture failure fall back to an id-less truncation (still honest).
         let id = self.store().put_content(text).ok();
-        middle_truncate(text, DEFAULT_MAX_BYTES, id.as_deref())
+        whipplescript_kernel::harness_loop::truncate_tool_output(
+            tool,
+            text,
+            DEFAULT_MAX_BYTES,
+            id.as_deref(),
+        )
     }
 }
 
@@ -764,14 +769,13 @@ impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
         match self.dispatch(call) {
             Ok(content) => ToolOutcome {
                 status: ToolStatus::Ok,
-                content: self.cap_and_capture(&content),
+                content: self.cap_and_capture(&call.name, &content),
             },
             // A tool error is an informative result, not a Rust error: the model
-            // sees it and retries (anti-idempotence, DR-0024). Errors are capped
-            // id-less — an error message is not evidence worth capturing.
+            // sees it and retries. Oversized errors retain complete recall too.
             Err(message) => ToolOutcome {
                 status: ToolStatus::Error,
-                content: middle_truncate(&message, DEFAULT_MAX_BYTES, None),
+                content: self.cap_and_capture(&call.name, &message),
             },
         }
     }
@@ -973,37 +977,6 @@ fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> St
         return String::new();
     }
     lines[start..end].join("\n")
-}
-
-/// Middle-truncate a tool output to at most ~`max_bytes` (deterministic,
-/// always-on capture-time cap): keep a head and a tail with an elision marker
-/// between. A small output is returned unchanged. When `recall_id` is present
-/// the full bytes were captured content-addressed and the footer tells the model
-/// how to page through them with the `recall` tool.
-fn middle_truncate(text: &str, max_bytes: usize, recall_id: Option<&str>) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let keep = max_bytes.saturating_sub(128);
-    let head_len = keep / 2;
-    let tail_len = keep - head_len;
-    let mut head_end = head_len.min(text.len());
-    while head_end > 0 && !text.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = text.len().saturating_sub(tail_len);
-    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    let elided = tail_start.saturating_sub(head_end);
-    let footer = match recall_id {
-        Some(id) => format!(
-            "[... {elided} of {} bytes elided; recall id={id} for the full output ...]",
-            text.len()
-        ),
-        None => format!("[... {elided} of {} bytes elided ...]", text.len()),
-    };
-    format!("{}\n{footer}\n{}", &text[..head_end], &text[tail_start..])
 }
 
 /// Map a TodoWrite-style status to the builtin tracker's item status.
@@ -1575,7 +1548,7 @@ mod tests {
         assert!(read.content.len() <= DEFAULT_MAX_BYTES);
         let id = read
             .content
-            .split("recall id=")
+            .split(", id ")
             .nth(1)
             .and_then(|rest| rest.split_whitespace().next())
             .expect("footer carries a recall id")

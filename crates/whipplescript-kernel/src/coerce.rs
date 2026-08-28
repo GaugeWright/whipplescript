@@ -71,6 +71,19 @@ impl CoerceRequest {
             output_schema_hash,
         }
     }
+
+    /// Fold the exact normalized provider derivatives into the existing input
+    /// evidence commitment without adding media bodies to evidence. This keeps
+    /// resumed `coerce`/`prompt` calls bound to what the provider actually saw.
+    pub fn commit_media(mut self, media: &[crate::harness_loop::MediaInput]) -> Self {
+        let normalized = crate::media::normalize_provider_media(media);
+        let summary = serde_json::to_string(&normalized.observations).unwrap_or_default();
+        self.input_schema_hash = crate::rule_lowering::stable_hash_hex(&format!(
+            "{}\nnormalized_media={summary}",
+            self.input_schema_hash
+        ));
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

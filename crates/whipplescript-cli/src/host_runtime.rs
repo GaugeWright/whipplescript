@@ -1188,13 +1188,38 @@ impl ResourceResolver for NativeWorkspaceResolver {
         let locator = image.selector.as_deref().unwrap_or(&image.handle);
         let path = self.resolve(locator, false)?;
         let bytes =
-            fs::read(&path).map_err(|error| format!("cannot read image `{locator}`: {error}"))?;
-        let media_type = match path.extension().and_then(|extension| extension.to_str()) {
+            fs::read(&path).map_err(|error| format!("cannot read media `{locator}`: {error}"))?;
+        let media_type = match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("png") => "image/png",
             Some("jpg" | "jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
-            _ => return Err("unsupported image media type".to_owned()),
+            Some("bmp") => "image/bmp",
+            Some("tif" | "tiff") => "image/tiff",
+            Some("ico") => "image/vnd.microsoft.icon",
+            Some("pnm" | "pbm" | "pgm" | "ppm") => "image/x-portable-anymap",
+            Some("tga") => "image/x-tga",
+            Some("qoi") => "image/qoi",
+            Some("pdf") => "application/pdf",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("pptx") => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
+            Some("doc") => "application/msword",
+            Some("xls") => "application/vnd.ms-excel",
+            Some("ppt") => "application/vnd.ms-powerpoint",
+            Some("wav") => "audio/wav",
+            Some("mp3") => "audio/mpeg",
+            Some("mp4") => "video/mp4",
+            _ => return Err("unsupported media type".to_owned()),
         };
         Ok(ResolvedImage {
             media_type: media_type.to_owned(),

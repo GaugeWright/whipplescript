@@ -1248,6 +1248,88 @@ pub fn unwrap_optional_type(ty: &IrType) -> Option<&IrType> {
     }
 }
 
+fn is_media_primitive(primitive: &IrPrimitiveType) -> bool {
+    matches!(
+        primitive,
+        IrPrimitiveType::Image
+            | IrPrimitiveType::Pdf
+            | IrPrimitiveType::Audio
+            | IrPrimitiveType::Video
+    )
+}
+
+fn media_input_json(value: &Value, primitive: &IrPrimitiveType) -> Value {
+    if let Some(object) = value.as_object() {
+        if object.contains_key("artifact_ref") || object.contains_key("data_base64") {
+            return value.clone();
+        }
+    }
+    let raw = value.as_str().unwrap_or_default();
+    let default_type = match primitive {
+        IrPrimitiveType::Image => "image/*",
+        IrPrimitiveType::Pdf => "application/pdf",
+        IrPrimitiveType::Audio => "audio/*",
+        IrPrimitiveType::Video => "video/*",
+        _ => "application/octet-stream",
+    };
+    if let Some(rest) = raw.strip_prefix("data:") {
+        if let Some((header, data)) = rest.split_once(',') {
+            if let Some(media_type) = header.strip_suffix(";base64") {
+                return json!({
+                    "artifact_ref": format!("inline:{}", stable_hash_hex(raw)),
+                    "media_type": if media_type.is_empty() { default_type } else { media_type },
+                    "data_base64": data,
+                    "metadata": { "source": "typed_data_uri" },
+                });
+            }
+        }
+    }
+    json!({
+        "artifact_ref": raw,
+        "media_type": default_type,
+        "metadata": { "source": "typed_resource_handle" },
+    })
+}
+
+/// Media-valued interpolations in an inline prompt are attachments, not path
+/// guesses. Only a bound field path (`{{ turn.scan }}`) is recognized.
+fn prompt_media_interpolations(
+    template: &str,
+    ir: &IrProgram,
+    context: &RuleContext,
+) -> Vec<(String, IrPrimitiveType)> {
+    let mut found = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            break;
+        };
+        let expr = after[..close].trim();
+        let path = expr
+            .split('.')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if let Some((binding, fields)) = path.split_first() {
+            if let Some((_, fact)) = context
+                .bindings
+                .iter()
+                .find(|(candidate, _)| candidate == binding)
+            {
+                if let Some(primitive) =
+                    ir_path_primitive(ir, &fact.name, fields).filter(is_media_primitive)
+                {
+                    found.push((expr.to_owned(), primitive));
+                }
+            }
+        }
+        rest = &after[close + 2..];
+    }
+    found
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn lower_rule(
     instance_id: &str,
@@ -4437,7 +4519,7 @@ pub fn parsed_effect_input_json(
         }
         "schema.coerce" => {
             let function_name = effect.name.as_deref().unwrap_or("coerce");
-            let coerce_prompt = if function_name == "prompt" {
+            let mut coerce_prompt = if function_name == "prompt" {
                 Some(ParsedPrompt {
                     text: effect.prompt.clone().unwrap_or_default(),
                     content_type: effect.prompt_content_type.clone(),
@@ -4465,11 +4547,49 @@ pub fn parsed_effect_input_json(
                     .unwrap_or_else(|| "json".to_owned())
             };
             let mut arguments = serde_json::Map::new();
+            let mut media = Vec::new();
+            let mut prompt_media_values = Vec::new();
+            let declaration = ir
+                .coerces
+                .iter()
+                .find(|coerce| coerce.name == function_name);
             for (index, arg) in effect.args.iter().enumerate() {
-                arguments.insert(
-                    format!("arg{index}"),
-                    parse_field_value_scoped(arg, context, live_facts, live_effects, live_ir),
-                );
+                let value =
+                    parse_field_value_scoped(arg, context, live_facts, live_effects, live_ir);
+                if let Some(primitive) = declaration
+                    .and_then(|coerce| coerce.params.get(index))
+                    .and_then(|param| unwrap_optional_type(&param.ty))
+                    .and_then(|ty| match ty {
+                        IrType::Primitive(primitive) => Some(primitive),
+                        _ => None,
+                    })
+                    .filter(|primitive| is_media_primitive(primitive))
+                {
+                    media.push(media_input_json(&value, primitive));
+                }
+                arguments.insert(format!("arg{index}"), value);
+            }
+            if function_name == "prompt" {
+                for (expr, primitive) in prompt_media_interpolations(
+                    effect.prompt_template.as_deref().unwrap_or_default(),
+                    ir,
+                    context,
+                ) {
+                    let value =
+                        parse_field_value_scoped(&expr, context, live_facts, live_effects, live_ir);
+                    if let Some(raw) = value.as_str().filter(|raw| !raw.is_empty()) {
+                        prompt_media_values.push(raw.to_owned());
+                    }
+                    media.push(media_input_json(&value, &primitive));
+                }
+            }
+            if let Some(prompt) = coerce_prompt.as_mut() {
+                for raw in &prompt_media_values {
+                    prompt.text = prompt.text.replace(
+                        raw,
+                        "[Attached media supplied as a separate provider input]",
+                    );
+                }
             }
             let mut input = json!({
                 "function_name": function_name,
@@ -4478,6 +4598,7 @@ pub fn parsed_effect_input_json(
                 "output_type": output_type,
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
+                "media": media,
             });
             // Sum-type output (spec/sum-types.md): embed deterministic
             // per-variant fixture values so a fixture run returns a tagged
@@ -7885,8 +8006,9 @@ mod block_token_regression_tests {
     //! token, with no diagnostic anywhere. A refusal enforced at one layer and
     //! discarded at the next is the failure this project exists to prevent.
 
-    use super::{block_tokens, lower_rule, ready_contexts};
-    use whipplescript_parser::compile_program;
+    use super::{block_tokens, lower_rule, media_input_json, ready_contexts};
+    use serde_json::Value;
+    use whipplescript_parser::{compile_program, IrPrimitiveType};
     use whipplescript_store::FactView;
 
     fn fact(name: &str, key: &str, value_json: &str) -> FactView {
@@ -7985,5 +8107,17 @@ rule r
         assert_eq!(input["mode"], "append");
         // And the body keeps every word the author wrote.
         assert_eq!(input["body"], "x mode create y");
+    }
+
+    #[test]
+    fn typed_media_data_uri_lowers_as_an_attachment() {
+        let value = Value::String("data:image/bmp;base64,Qk0=".to_owned());
+        let media = media_input_json(&value, &IrPrimitiveType::Image);
+        assert_eq!(media["media_type"], "image/bmp");
+        assert_eq!(media["data_base64"], "Qk0=");
+        assert_eq!(media["metadata"]["source"], "typed_data_uri");
+        assert!(media["artifact_ref"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("inline:")));
     }
 }

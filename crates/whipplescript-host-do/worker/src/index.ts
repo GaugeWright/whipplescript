@@ -955,18 +955,23 @@ function validatePublicMessage(parsed: {
   request_id?: unknown;
   text?: unknown;
   images?: unknown;
+  media?: unknown;
 }):
   | { ok: true; requestId: string; text: string; images: PublicImageBody[] }
   | { ok: false; response: Response } {
   const requestId =
     typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
   const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
-  if (parsed.images !== undefined && !Array.isArray(parsed.images)) {
-    return { ok: false, response: Response.json({ error: "turn images must be an array" }, { status: 422 }) };
+  if (parsed.images !== undefined && parsed.media !== undefined) {
+    return { ok: false, response: Response.json({ error: "turn accepts media or legacy images, not both" }, { status: 422 }) };
   }
-  const images = (Array.isArray(parsed.images) ? parsed.images : []) as unknown[];
+  const supplied = parsed.media ?? parsed.images;
+  if (supplied !== undefined && !Array.isArray(supplied)) {
+    return { ok: false, response: Response.json({ error: "turn media must be an array" }, { status: 422 }) };
+  }
+  const images = (Array.isArray(supplied) ? supplied : []) as unknown[];
   if (images.length > 16) {
-    return { ok: false, response: Response.json({ error: "turn accepts at most 16 images" }, { status: 413 }) };
+    return { ok: false, response: Response.json({ error: "turn accepts at most 16 media items" }, { status: 413 }) };
   }
   let imageBytes = 0;
   for (const body of images) {
@@ -976,13 +981,13 @@ function validatePublicMessage(parsed: {
     const image = body as { media_type?: unknown; data_base64?: unknown };
     if (
       typeof image.media_type !== "string" ||
-      !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(image.media_type) ||
+      !isMediaType(image.media_type) ||
       typeof image.data_base64 !== "string" ||
       !image.data_base64 ||
       image.data_base64.length % 4 !== 0 ||
       !/^[A-Za-z0-9+/]*={0,2}$/.test(image.data_base64)
     ) {
-      return { ok: false, response: Response.json({ error: "turn image is not supported base64 image input" }, { status: 422 }) };
+      return { ok: false, response: Response.json({ error: "turn media item is not a supported base64 input" }, { status: 422 }) };
     }
     const padding = image.data_base64.endsWith("==") ? 2 : image.data_base64.endsWith("=") ? 1 : 0;
     const bytes = image.data_base64.length / 4 * 3 - padding;
@@ -999,6 +1004,11 @@ function validatePublicMessage(parsed: {
     return { ok: false, response: Response.json({ error: "turn requires a valid request_id and non-empty text" }, { status: 422 }) };
   }
   return { ok: true, requestId, text, images: images as PublicImageBody[] };
+}
+
+function isMediaType(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(value);
 }
 
 export class WorkflowInstance implements DurableObject {
@@ -2536,6 +2546,7 @@ export class WorkflowInstance implements DurableObject {
     request_id?: unknown;
     text?: unknown;
     images?: unknown;
+    media?: unknown;
   }): Promise<Response> {
     const session = await this.readPublicSessionState();
     if (!session) {
@@ -3872,7 +3883,7 @@ export class WorkflowInstance implements DurableObject {
       if (admitted.handle !== "turn_images" || admitted.kind !== "image"
         || admitted.selector !== String(index)
         || typeof candidate.media_type !== "string"
-        || !["image/png", "image/jpeg", "image/webp", "image/gif"].includes(candidate.media_type)
+        || !isMediaType(candidate.media_type)
         || typeof candidate.data_base64 !== "string"
         || !/^[A-Za-z0-9+/]*={0,2}$/.test(candidate.data_base64)) {
         return Response.json(
