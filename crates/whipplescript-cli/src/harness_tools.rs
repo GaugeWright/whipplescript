@@ -20,14 +20,22 @@ use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::{
     json_schema_for_type, CoerceProvider, CoerceTransportError, HttpRequest, HttpResponse,
 };
-use whipplescript_kernel::context_assembly::{assemble, BundleKind, ContextBundle};
+use whipplescript_kernel::context_assembly::{
+    assemble, contribution, ContributionLifecycle, InstructionAuthority, InstructionContribution,
+    InstructionRole,
+};
 use whipplescript_kernel::harness_loop::{
     BrokeredTurnInput, ChatMessage, HarnessModelClient, HarnessModelError, HttpModelClient,
-    ImageBlock, ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
+    MediaInput, ModelReply, ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::harness_model::RealHarnessModelClient;
 use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
+use whipplescript_kernel::world_state::{
+    AgentRelation, AgentState, AgentTopology, ComputeResources, EffectiveTurnEnvelope,
+    EnvironmentState, ExecutionIdentity, GovernanceDisposition, GovernanceRule, HarnessClass,
+    VisibleAgent, WorldMutability, WorldSnapshot,
+};
 use whipplescript_kernel::{BrokeredTurnContext, RuntimeKernel};
 use whipplescript_parser::IrWorkflowContractKind;
 use whipplescript_store::content::ContentStore;
@@ -38,7 +46,7 @@ use whipplescript_store::items::{
     ReleaseOutcome, WorkItemStore,
 };
 use whipplescript_store::{
-    RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
+    EffectView, RegisteredProfilePolicy, SqliteStore, StoreError, StoreResult, StoredEvent,
 };
 
 use crate::coerce_runtime::UreqCoerceTransport;
@@ -2814,11 +2822,15 @@ fn owned_context_bundles(
     skills: &[SkillCatalogueEntry],
     project_instructions: &[crate::project_context::ProjectInstruction],
     mcp_trust: &[(String, whipplescript_kernel::mcp::McpRung, Vec<String>)],
-) -> Vec<ContextBundle> {
-    let mut bundles = vec![ContextBundle::new(
-        BundleKind::Persona,
+) -> Vec<InstructionContribution> {
+    let mut bundles = vec![contribution(
+        "persona",
         "builtin:persona",
         "v1",
+        InstructionAuthority::Runtime,
+        InstructionRole::System,
+        "010-persona",
+        ContributionLifecycle::Stable,
         OWNED_PERSONA,
     )];
 
@@ -2839,10 +2851,14 @@ fn owned_context_bundles(
                 tools.join(", ")
             ));
         }
-        bundles.push(ContextBundle::new(
-            BundleKind::Guidelines,
+        bundles.push(contribution(
+            "mcp-trust",
             "builtin:mcp-trust",
             "v1",
+            InstructionAuthority::Governance,
+            InstructionRole::System,
+            "020-mcp-trust",
+            ContributionLifecycle::Turn,
             body.trim_end(),
         ));
     }
@@ -2851,33 +2867,49 @@ fn owned_context_bundles(
     for line in OWNED_GUIDELINES {
         guidelines.push_str(&format!("- {line}\n"));
     }
-    bundles.push(ContextBundle::new(
-        BundleKind::Guidelines,
+    bundles.push(contribution(
+        "guidelines",
         "builtin:guidelines",
         "v1",
+        InstructionAuthority::Runtime,
+        InstructionRole::System,
+        "021-guidelines",
+        ContributionLifecycle::Stable,
         guidelines.trim_end(),
     ));
 
-    bundles.push(ContextBundle::new(
-        BundleKind::Date,
+    bundles.push(contribution(
+        "date",
         "host:clock",
         "v1",
+        InstructionAuthority::Runtime,
+        InstructionRole::System,
+        "060-date",
+        ContributionLifecycle::Turn,
         format!("Current date: {date}"),
     ));
-    bundles.push(ContextBundle::new(
-        BundleKind::Cwd,
+    bundles.push(contribution(
+        "cwd",
         "host:cwd",
         "v1",
+        InstructionAuthority::Runtime,
+        InstructionRole::System,
+        "070-cwd",
+        ContributionLifecycle::Turn,
         format!("Current working directory: {cwd}"),
     ));
 
-    // Project instructions (AGENTS.md / CLAUDE.md), injected verbatim wrapped in
+    // Managed project instructions (hierarchical AGENTS.md), injected verbatim wrapped in
     // `<project_context>` (context-assembly Phase 3). The host discovers them.
     if !project_instructions.is_empty() {
-        bundles.push(ContextBundle::new(
-            BundleKind::ProjectContext,
+        bundles.push(contribution(
+            "project-context",
             "fs:project-instructions",
             "v1",
+            InstructionAuthority::Project,
+            InstructionRole::Developer,
+            "040-project-context",
+            ContributionLifecycle::Turn,
             crate::project_context::render_project_context(project_instructions),
         ));
     }
@@ -2886,10 +2918,14 @@ fn owned_context_bundles(
     // read-class tool is present — otherwise the model cannot load a skill body.
     // The assembler renders this in its canonical slot regardless of push order.
     if !skills.is_empty() && has_read_class_tool(tools) {
-        bundles.push(ContextBundle::new(
-            BundleKind::AvailableSkills,
+        bundles.push(contribution(
+            "available-skills",
             "registry:skills",
             "v1",
+            InstructionAuthority::Registry,
+            InstructionRole::Developer,
+            "050-available-skills",
+            ContributionLifecycle::Turn,
             render_available_skills(skills),
         ));
     }
@@ -2910,6 +2946,213 @@ fn owned_context_date() -> String {
     chrono::DateTime::from_timestamp(secs as i64, 0)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_model_visible_world(
+    program_path: Option<&Path>,
+    instance_id: &str,
+    effect_id: &str,
+    agent: &str,
+    workspace: &Path,
+    tools: &[ToolSpec],
+    access: &TurnToolAccess,
+    max_steps: usize,
+    topology: &AgentTopology,
+) -> Result<WorldSnapshot, String> {
+    let program = program_path.map(|path| path.display().to_string());
+    let revision = program_path
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| whipplescript_kernel::exec_http::sha256_hex(&bytes));
+    let identity = ExecutionIdentity {
+        program,
+        revision,
+        instance: instance_id.to_owned(),
+        agent: agent.to_owned(),
+        effect: effect_id.to_owned(),
+        turn: effect_id.to_owned(),
+        harness: HarnessClass::Managed,
+        placement: "native".to_owned(),
+    };
+    let shell_family = tools
+        .iter()
+        .any(|tool| tool.name == TOOL_BASH)
+        .then(|| "whip-shell/bash".to_owned());
+    let environment = EnvironmentState {
+        cwd: Some(workspace.display().to_string()),
+        workspace_roots: vec![workspace.display().to_string()],
+        // Native owned-context date semantics use UTC; advertise that same clock
+        // basis rather than guessing from the host's locale.
+        timezone: Some("UTC".to_owned()),
+        shell_family,
+    };
+    let compute = ComputeResources {
+        max_model_rounds: Some(max_steps),
+        remaining_model_rounds: Some(max_steps),
+        concurrency_class: Some("native-owned-turn".to_owned()),
+        ..ComputeResources::default()
+    };
+    let mut envelope = EffectiveTurnEnvelope::default();
+    if access.file.scopes.is_empty() {
+        envelope.filesystem.push(GovernanceRule {
+            resource: "filesystem".to_owned(),
+            disposition: GovernanceDisposition::Unavailable,
+            scope: vec!["no file store granted".to_owned()],
+        });
+    } else {
+        for scope in &access.file.scopes {
+            let root = workspace.join(&scope.root).display().to_string();
+            if let Some(globs) = &scope.grant_read {
+                envelope.filesystem.push(GovernanceRule {
+                    resource: format!("filesystem:read:{}", scope.store_name),
+                    disposition: GovernanceDisposition::Enforced,
+                    scope: std::iter::once(root.clone())
+                        .chain(globs.iter().cloned())
+                        .collect(),
+                });
+            }
+            if let Some(globs) = &scope.grant_write {
+                envelope.filesystem.push(GovernanceRule {
+                    resource: format!("filesystem:write:{}", scope.store_name),
+                    disposition: GovernanceDisposition::Enforced,
+                    scope: std::iter::once(root).chain(globs.iter().cloned()).collect(),
+                });
+            }
+        }
+    }
+    if access.web_search || access.web_fetch || !access.mcp.is_empty() {
+        let mut scope = Vec::new();
+        if access.web_search {
+            scope.push("web.search".to_owned());
+        }
+        if access.web_fetch {
+            scope.push(
+                "web.fetch: public HTTP(S); private and metadata destinations denied".to_owned(),
+            );
+        }
+        scope.extend(access.mcp.keys().map(|server| format!("mcp:{server}")));
+        envelope.network.push(GovernanceRule {
+            resource: "network".to_owned(),
+            disposition: GovernanceDisposition::Enforced,
+            scope,
+        });
+    } else {
+        envelope.network.push(GovernanceRule {
+            resource: "network".to_owned(),
+            disposition: GovernanceDisposition::Unavailable,
+            scope: vec!["default deny".to_owned()],
+        });
+    }
+    envelope.process.push(GovernanceRule {
+        resource: "process:shell".to_owned(),
+        disposition: if access.command_run {
+            GovernanceDisposition::Enforced
+        } else {
+            GovernanceDisposition::Unavailable
+        },
+        scope: if access.command_run {
+            vec!["governed in-process whip shell".to_owned()]
+        } else {
+            vec!["command run not granted".to_owned()]
+        },
+    });
+    envelope
+        .tools
+        .extend(tools.iter().map(|tool| GovernanceRule {
+            resource: format!("tool:{}", tool.name),
+            disposition: GovernanceDisposition::Enforced,
+            scope: vec!["offered this turn".to_owned()],
+        }));
+    envelope.approvals.push(GovernanceRule {
+        resource: "human_approval".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["this Managed turn has no approval mechanism".to_owned()],
+    });
+    envelope.custody.push(GovernanceRule {
+        resource: "credentials".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec![
+            "provider credentials are resolved only at egress and are not model-visible".to_owned(),
+        ],
+    });
+    envelope.budgets.push(GovernanceRule {
+        resource: "model_rounds".to_owned(),
+        disposition: GovernanceDisposition::Enforced,
+        scope: vec![format!("maximum {max_steps}")],
+    });
+    WorldSnapshot::new(effect_id)
+        .with_section("identity", &identity)?
+        .with_section("environment", &environment)?
+        .with_section("compute", &compute)?
+        .with_section("governance", &envelope.model_projection())?
+        .with_agent_topology(topology)?
+        .with_section("mutability", &WorldMutability::default())
+}
+
+fn effect_state_for_agent(effects: &[EffectView], agent: &str) -> (AgentState, Option<String>) {
+    let matching: Vec<_> = effects
+        .iter()
+        .filter(|effect| effect.kind == "agent.tell" && effect.target.as_deref() == Some(agent))
+        .collect();
+    let select = |statuses: &[&str]| {
+        matching
+            .iter()
+            .rev()
+            .find(|effect| statuses.contains(&effect.status.as_str()))
+            .copied()
+    };
+    let (state, effect) = if let Some(effect) = select(&["running", "claimed"]) {
+        (AgentState::Running, Some(effect))
+    } else if let Some(effect) = select(&["queued"]) {
+        (AgentState::Starting, Some(effect))
+    } else if let Some(effect) = select(&[
+        "blocked",
+        "blocked_by_dependency",
+        "blocked_by_capacity",
+        "blocked_by_policy",
+    ]) {
+        (AgentState::Waiting, Some(effect))
+    } else if let Some(effect) = select(&["completed"]) {
+        (AgentState::Completed, Some(effect))
+    } else if let Some(effect) = select(&["failed", "timed_out", "cancelled"]) {
+        (AgentState::Failed, Some(effect))
+    } else {
+        (AgentState::Unavailable, None)
+    };
+    (
+        state,
+        effect.map(|effect| format!("agent.tell effect {}", effect.effect_id)),
+    )
+}
+
+fn native_agent_topology(
+    program_path: Option<&Path>,
+    current_agent: &str,
+    effects: &[EffectView],
+) -> AgentTopology {
+    let Some(source) = program_path.and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return AgentTopology::default();
+    };
+    let Some(ir) = whipplescript_parser::compile_program(&source).ir else {
+        return AgentTopology::default();
+    };
+    let agents = ir
+        .agents
+        .iter()
+        .filter(|candidate| candidate.name != current_agent)
+        .map(|candidate| {
+            let (state, assignment_summary) = effect_state_for_agent(effects, &candidate.name);
+            VisibleAgent {
+                agent_id: candidate.name.clone(),
+                relation: AgentRelation::Peer,
+                state,
+                assignment_summary,
+                // A workflow peer is visible, not controlled by this leaf turn.
+                allowed_operations: Vec::new(),
+            }
+        })
+        .collect();
+    AgentTopology { agents }
 }
 
 /// Default per-turn model-step budget (overridable via WHIPPLESCRIPT_HARNESS_MAX_STEPS).
@@ -3475,32 +3718,56 @@ fn turn_pinned_skills_from_input(input_json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Inline images attached to the tell effect input (pi-conformance §6): an
-/// optional `images` array of `{media_type|mediaType, data_base64|data}` objects
-/// alongside the prompt. Entries missing either field are skipped (best-effort,
-/// like the other optional input keys); text-only turns yield an empty vec.
-fn turn_images_from_input(input_json: &str) -> Vec<ImageBlock> {
+/// Typed media attached to the tell effect. Every array entry becomes an item,
+/// including malformed or unsupported entries; the kernel then emits either an
+/// admitted provider derivative or an explicit unavailable-media notice.
+fn turn_media_from_input(input_json: &str) -> Vec<MediaInput> {
     serde_json::from_str::<Value>(input_json)
         .ok()
         .and_then(|input| {
             input.get("images").and_then(Value::as_array).map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| {
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let artifact_ref = item
+                            .get("artifact_ref")
+                            .or_else(|| item.get("artifactRef"))
+                            .or_else(|| item.get("ref"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("input:images:{index}"));
                         let media_type = item
                             .get("media_type")
                             .or_else(|| item.get("mediaType"))
                             .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())?;
+                            .unwrap_or_default()
+                            .to_owned();
                         let data_base64 = item
                             .get("data_base64")
                             .or_else(|| item.get("data"))
                             .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())?;
-                        Some(ImageBlock {
-                            media_type: media_type.to_owned(),
-                            data_base64: data_base64.to_owned(),
-                        })
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                        let metadata = item
+                            .get("metadata")
+                            .and_then(Value::as_object)
+                            .map(|metadata| {
+                                metadata
+                                    .iter()
+                                    .filter_map(|(key, value)| {
+                                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        MediaInput {
+                            artifact_ref,
+                            media_type,
+                            data_base64,
+                            metadata,
+                        }
                     })
                     .collect()
             })
@@ -4204,7 +4471,7 @@ pub fn run_owned_agent_turn(
         // Large-tool-output capture + `recall` (context-assembly Phase 5): full
         // outputs are stored content-addressed in the workspace-scoped store.
         .with_content_store(crate::content_store_path());
-    // Project instructions (AGENTS.md / CLAUDE.md) rooted at the workspace, plus an
+    // Managed AGENTS.md instructions rooted at the workspace, plus an
     // optional env-configured global directory (context-assembly Phase 3).
     let global_context_dir =
         std::env::var_os("WHIPPLESCRIPT_GLOBAL_CONTEXT_DIR").map(PathBuf::from);
@@ -4217,7 +4484,7 @@ pub fn run_owned_agent_turn(
     // solely in the provider-native tool field. The host supplies date/cwd plus
     // the skill catalogue and project instructions;
     // the kernel assembler renders them in canonical order (context-assembly
-    // Phase 1). Per-bundle provenance (`assembled.bundles`) is recorded as
+    // Phase 1). Per-contribution provenance (`assembled.contributions`) is recorded as
     // `context.bundle` evidence by `run_brokered_agent_turn` (Decision 5).
     let assembled = assemble(owned_context_bundles(
         &tools,
@@ -4227,19 +4494,39 @@ pub fn run_owned_agent_turn(
         &project_instructions,
         &mcp_trust,
     ));
+    let max_steps = owned_max_steps();
+    let topology = native_agent_topology(
+        program_path,
+        agent,
+        &kernel.store().list_effects(instance_id)?,
+    );
+    let world = native_model_visible_world(
+        program_path,
+        instance_id,
+        effect_id,
+        agent,
+        &workspace,
+        &tools,
+        &turn_tool_access,
+        max_steps,
+        &topology,
+    )
+    .map_err(StoreError::Conflict)?;
     let input = BrokeredTurnInput {
         system: assembled.system_prompt,
         user: input_json.to_string(),
         tools,
-        max_steps: owned_max_steps(),
+        max_steps,
         // The runner populates resume_from from any persisted transcript on
         // crash recovery (slice 6); a fresh turn starts empty.
         resume_from: Vec::new(),
         // Inline images from the tell effect input (pi-conformance §6).
-        user_images: turn_images_from_input(input_json),
+        user_images: Vec::new(),
+        user_media: turn_media_from_input(input_json),
+        world: Some(world),
         // Per-bundle provenance for the assembled prompt; the runner records one
         // context.bundle evidence row each before the turn (Decision 5).
-        context_bundles: assembled.bundles,
+        context_bundles: assembled.contributions,
         // Turn-scoped `with skills [...]` pins (Phase 7), carried on the tell effect
         // input; recorded once as `skills.pinned` provenance by the runner.
         pinned_skills: turn_pinned_skills_from_input(input_json),
@@ -4629,7 +4916,7 @@ mod tests {
             .expect("cwd marker present");
         assert!(persona_at < date_at && date_at < cwd_at);
         // One provenance row per included bundle (persona, guidelines, date, cwd).
-        assert_eq!(assembled.bundles.len(), 4);
+        assert_eq!(assembled.contributions.len(), 4);
     }
 
     #[test]
@@ -4644,7 +4931,7 @@ mod tests {
         ));
         assert!(!assembled.system_prompt.contains("Available tools:"));
         // Persona, guidelines, date, and cwd are independent of tool authority.
-        assert_eq!(assembled.bundles.len(), 4);
+        assert_eq!(assembled.contributions.len(), 4);
     }
 
     #[test]
@@ -4675,9 +4962,9 @@ mod tests {
         ));
         assert!(with_read.system_prompt.contains("Triage the inbox."));
         assert!(with_read
-            .bundles
+            .contributions
             .iter()
-            .any(|bundle| bundle.kind == BundleKind::AvailableSkills));
+            .any(|item| item.contribution_id == "available-skills"));
 
         // Without a read-class tool the model can't fetch a body, so no catalogue.
         let no_read = assemble(owned_context_bundles(
@@ -5154,11 +5441,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_images_from_input_parses_both_key_spellings_and_defaults_empty() {
+    fn turn_media_from_input_preserves_supported_and_malformed_items() {
         // No `images` key (the common text-only tell) → empty.
-        assert!(turn_images_from_input(r#"{"prompt":"work"}"#).is_empty());
-        // Both accepted spellings parse; malformed entries are skipped.
-        let images = turn_images_from_input(
+        assert!(turn_media_from_input(r#"{"prompt":"work"}"#).is_empty());
+        // Both accepted spellings parse; malformed entries remain explicit.
+        let media = turn_media_from_input(
             r#"{
                 "prompt": "what is this?",
                 "images": [
@@ -5168,19 +5455,14 @@ mod tests {
                 ]
             }"#,
         );
-        assert_eq!(
-            images,
-            vec![
-                ImageBlock {
-                    media_type: "image/png".to_owned(),
-                    data_base64: "aGVsbG8=".to_owned(),
-                },
-                ImageBlock {
-                    media_type: "image/jpeg".to_owned(),
-                    data_base64: "QUJD".to_owned(),
-                },
-            ]
-        );
+        assert_eq!(media.len(), 3);
+        assert_eq!(media[0].media_type, "image/png");
+        assert_eq!(media[0].data_base64.as_deref(), Some("aGVsbG8="));
+        assert_eq!(media[1].media_type, "image/jpeg");
+        assert_eq!(media[1].data_base64.as_deref(), Some("QUJD"));
+        assert_eq!(media[2].media_type, "image/gif");
+        assert_eq!(media[2].data_base64, None);
+        assert_eq!(media[2].artifact_ref, "input:images:2");
     }
 
     #[test]

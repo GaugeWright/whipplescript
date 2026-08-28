@@ -5854,9 +5854,9 @@ workflow SkillCatalogueSmoke {
     assert!(
         evidence.iter().any(|item| {
             item.get("kind").and_then(Value::as_str) == Some("context.bundle")
-                && item.get("summary").and_then(Value::as_str) == Some("available_skills")
+                && item.get("summary").and_then(Value::as_str) == Some("available-skills")
         }),
-        "expected an available_skills context.bundle evidence row (loaded skill offered in the catalogue)"
+        "expected an available-skills context.bundle evidence row (loaded skill offered in the catalogue)"
     );
 
     let _ = fs::remove_dir_all(&ws);
@@ -6114,9 +6114,9 @@ workflow ProjCtxSmoke {
     assert!(
         evidence.iter().any(|item| {
             item.get("kind").and_then(Value::as_str) == Some("context.bundle")
-                && item.get("summary").and_then(Value::as_str) == Some("project_context")
+                && item.get("summary").and_then(Value::as_str) == Some("project-context")
         }),
-        "expected a project_context context.bundle evidence row from the workspace AGENTS.md"
+        "expected a project-context context.bundle evidence row from the workspace AGENTS.md"
     );
 
     let _ = fs::remove_dir_all(&ws);

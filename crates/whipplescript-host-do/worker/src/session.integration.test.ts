@@ -676,6 +676,91 @@ describe("real WorkflowInstance hibernation", () => {
     socket.close(1000, "done");
   });
 
+  it("applies an idempotent manual compaction command at a model boundary", async () => {
+    let releaseFirst!: () => void;
+    const firstRoundGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let round = 0;
+    const providerFetch = vi.fn(async () => {
+      round += 1;
+      if (round === 1) {
+        await firstRoundGate;
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "tool-before-compact",
+                name: "read",
+                arguments: JSON.stringify({ path: "README.md" }),
+              },
+            })}`,
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: { output: [], usage: { input_tokens: 3, output_tokens: 1 } },
+            })}`,
+            "",
+          ].join("\n"),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        [
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "compacted" })}`,
+          `data: ${JSON.stringify({
+            type: "response.completed",
+            response: { output: [], usage: { input_tokens: 3, output_tokens: 1 } },
+          })}`,
+          "",
+        ].join("\n"),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    vi.stubGlobal("fetch", providerFetch);
+
+    const namespace = (env as unknown as TestEnv).WORKFLOW_INSTANCE;
+    const stub = namespace.get(namespace.idFromName("session-manual-compact"));
+    await bootstrapSession(stub, "session-manual-compact");
+    const socket = await openSocket(stub);
+    expect(await nextMessage(socket)).toMatchObject({ type: "session_ready" });
+    socket.send(JSON.stringify({
+      type: "send_message",
+      request_id: "turn-compact",
+      text: "start",
+    }));
+    await vi.waitFor(() => expect(providerFetch).toHaveBeenCalledOnce());
+    const compact = {
+      type: "compact",
+      request_id: "compact-1",
+    };
+    socket.send(JSON.stringify(compact));
+    socket.send(JSON.stringify(compact));
+    // Let the hibernatable-socket handler durably enqueue both deliveries
+    // before the blocked provider round is released. The runtime boundary is
+    // the behavior under test, not a race between two test callbacks.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    releaseFirst();
+
+    const observed: Record<string, unknown>[] = [];
+    for (let index = 0; index < 100; index += 1) {
+      const message = await nextMessage(socket);
+      observed.push(message);
+      if (message.type === "turn_terminal" || message.type === "error") break;
+    }
+    expect(observed.filter(({ type }) => type === "turn_command_applied"))
+      .toEqual([
+        expect.objectContaining({ request_id: "compact-1", kind: "compact" }),
+      ]);
+    expect(observed.at(-1)).toMatchObject({
+      type: "turn_terminal",
+      request_id: "turn-compact",
+    });
+    vi.unstubAllGlobals();
+    socket.close(1000, "done");
+  });
+
   it("stops cooperatively at the next model boundary without starting another round", async () => {
     let releaseFirst!: () => void;
     const firstRoundGate = new Promise<void>((resolve) => {

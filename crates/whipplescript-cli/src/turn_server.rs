@@ -30,15 +30,17 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
 use whipplescript_kernel::coerce_native::CoerceProvider;
-use whipplescript_kernel::coerce_native::CoerceTransport;
 use whipplescript_kernel::harness_loop::{
-    run_brokered_loop, BrokeredTurnInput, BrokeredTurnOutcome, ChatMessage, HarnessModelClient,
-    HarnessModelError, HttpModelClient, ModelReply, ToolSpec, TurnStatus,
+    compactor_for_strategy, run_brokered_turn_http, BrokeredTurnInput, BrokeredTurnOutcome,
+    ImageBlock, MediaInput, TurnStatus,
 };
 use whipplescript_kernel::harness_model::{MessagesApiClient, RealHarnessModelClient};
+use whipplescript_kernel::world_state::WorldSnapshot;
 
 use crate::coerce_runtime::UreqCoerceTransport;
-use crate::harness_tools::{file_tool_specs_for_profile, FileToolExecutor, FixtureModelClient};
+use crate::harness_tools::{
+    file_tool_specs_for_profile, FileToolExecutor, FixtureHost, FixtureModelClient,
+};
 use whipplescript::host_runtime::AuthoredAgentPackage;
 
 /// Wire protocol marker for the Class-B turn channel.
@@ -402,13 +404,53 @@ pub fn run_turn_in_workspace(
             tools = resolved.tools;
         }
     }
+    let decode_array = |name: &str| -> Result<Vec<Value>, BrokeredTurnOutcome> {
+        match request.get(name) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(values)) => Ok(values.clone()),
+            Some(_) => Err(failed_outcome(&format!("turn `{name}` must be an array"))),
+        }
+    };
+    let user_images = match decode_array("images").and_then(|items| {
+        items
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value::<ImageBlock>(item)
+                    .map_err(|error| failed_outcome(&format!("invalid turn image: {error}")))
+            })
+            .collect()
+    }) {
+        Ok(images) => images,
+        Err(outcome) => return outcome,
+    };
+    let user_media = match decode_array("media").and_then(|items| {
+        items
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value::<MediaInput>(item)
+                    .map_err(|error| failed_outcome(&format!("invalid turn media: {error}")))
+            })
+            .collect()
+    }) {
+        Ok(media) => media,
+        Err(outcome) => return outcome,
+    };
+    let world = match request.get("world") {
+        None | Some(Value::Null) => None,
+        Some(value) => match serde_json::from_value::<WorldSnapshot>(value.clone()) {
+            Ok(world) => Some(world),
+            Err(error) => return failed_outcome(&format!("invalid turn world: {error}")),
+        },
+    };
     let input = BrokeredTurnInput {
         system,
         user,
         tools,
         max_steps,
         resume_from: Vec::new(),
-        user_images: Vec::new(),
+        user_images,
+        user_media,
+        world,
         context_bundles: Vec::new(),
         pinned_skills: Vec::new(),
     };
@@ -429,9 +471,20 @@ pub fn run_turn_in_workspace(
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or("fixture");
+    let compactor =
+        compactor_for_strategy(request.get("compaction_strategy").and_then(Value::as_str));
     if provider_name == "fixture" {
         let client = FixtureModelClient::from_env();
-        return run_brokered_loop(&client, &executor, &input, &mut checkpoint);
+        return run_brokered_turn_http(
+            &client,
+            &executor,
+            &input,
+            &mut checkpoint,
+            &FixtureHost,
+            compactor.as_ref(),
+            None,
+            None,
+        );
     }
     let coerce_provider = match provider_name {
         "anthropic" => CoerceProvider::Anthropic,
@@ -477,11 +530,16 @@ pub fn run_turn_in_workspace(
             u64::from(max_tokens),
             Some(turn_id.to_owned()),
         );
-        let client = TransportedModelClient {
-            client,
-            transport: &transport,
-        };
-        return run_brokered_loop(&client, &executor, &input, &mut checkpoint);
+        return run_brokered_turn_http(
+            &client,
+            &executor,
+            &input,
+            &mut checkpoint,
+            &transport,
+            compactor.as_ref(),
+            None,
+            None,
+        );
     }
     let client = RealHarnessModelClient::new(
         &transport,
@@ -492,7 +550,16 @@ pub fn run_turn_in_workspace(
         u64::from(max_tokens),
         Some(turn_id.to_owned()),
     );
-    run_brokered_loop(&client, &executor, &input, &mut checkpoint)
+    run_brokered_turn_http(
+        &client,
+        &executor,
+        &input,
+        &mut checkpoint,
+        &transport,
+        compactor.as_ref(),
+        None,
+        None,
+    )
 }
 
 fn failed_outcome(reason: &str) -> BrokeredTurnOutcome {
@@ -503,24 +570,6 @@ fn failed_outcome(reason: &str) -> BrokeredTurnOutcome {
         observations: Vec::new(),
         usage: json!({"input_tokens": 0, "output_tokens": 0}),
         last_input_tokens: 0,
-    }
-}
-
-struct TransportedModelClient<'a, C, T> {
-    client: C,
-    transport: &'a T,
-}
-
-impl<C: HttpModelClient, T: CoerceTransport> HarnessModelClient
-    for TransportedModelClient<'_, C, T>
-{
-    fn next(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolSpec],
-    ) -> Result<ModelReply, HarnessModelError> {
-        let request = self.client.build_request(messages, tools);
-        self.client.parse_response(self.transport.post(&request))
     }
 }
 

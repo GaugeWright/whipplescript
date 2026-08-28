@@ -71,6 +71,7 @@ invoke-result-typing.maude	SSSSNNSSSN
 lowering-class-lifecycle.maude	SSSSSSSSSSSNNNNNNNNNNNNNNN
 lowering-runtime-handoff.maude	SSSSSNNNNNNNNNNNNN
 mcp-admission.maude	SSSSSSNNNNNN
+model-visible-world.maude	SNSSNSSSNSSNSSNS
 merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
 messaging-capability-report.maude	SSSSNNNN

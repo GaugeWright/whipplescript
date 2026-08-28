@@ -288,6 +288,9 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // Phase 3 item 4) — content-addressed, idempotent by position, read by
         // the agent turn's store-backed context resolution.
         for (position, (path, body)) in project_context.iter().enumerate() {
+            if !whipplescript_kernel::context_assembly::is_managed_agents_path(path) {
+                continue;
+            }
             kernel
                 .store()
                 .register_project_context_doc(position as i64, path, body)

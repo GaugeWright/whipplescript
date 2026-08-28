@@ -567,7 +567,7 @@ pub struct CapabilityBindingView {
     pub config_json: String,
 }
 
-/// One project-instruction document (AGENTS.md / CLAUDE.md) registered for the
+/// One Managed project-instruction document (`AGENTS.md`) registered for the
 /// durable object's store-backed context resolution (context-assembly Phase 3
 /// item 4). `position` is the injection order (root-most first, nearest-cwd
 /// last); `content_hash` is the body's hash so it is content-addressed and

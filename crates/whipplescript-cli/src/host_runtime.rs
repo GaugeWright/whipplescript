@@ -16,12 +16,16 @@ use serde_json::{json, Value};
 use whipplescript_kernel::coerce_native::CoerceProvider;
 pub use whipplescript_kernel::harness_loop::ToolCall;
 use whipplescript_kernel::harness_loop::{
-    BrokeredTurnInput, ChatMessage, ImageBlock, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
+    BrokeredTurnInput, ChatMessage, MediaInput, NoopCompactor, ToolExecutor, ToolOutcome, ToolSpec,
     ToolStatus,
 };
 use whipplescript_kernel::harness_model::MessagesApiClient;
 use whipplescript_kernel::sansio::{HostDriver, HttpResponse, IoRequest, IoResult, TransportError};
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
+use whipplescript_kernel::world_state::{
+    AgentTopology, ComputeResources, EffectiveTurnEnvelope, EnvironmentState, ExecutionIdentity,
+    GovernanceDisposition, GovernanceRule, HarnessClass, WorldMutability, WorldSnapshot,
+};
 use whipplescript_kernel::{
     idempotency_key, AgentThreadSeed, BrokeredTurnContext, ProgramVersionInput, RuntimeKernel,
 };
@@ -603,6 +607,18 @@ pub trait ResourceResolver {
         TurnWitness::Unavailable
     }
 
+    /// Environment facts the resolver can attest for this turn. Opaque remote
+    /// resolvers leave fields unavailable instead of letting the runtime infer
+    /// ambient host state that the model cannot actually access.
+    fn model_visible_environment(&self) -> EnvironmentState {
+        EnvironmentState {
+            cwd: None,
+            workspace_roots: Vec::new(),
+            timezone: None,
+            shell_family: None,
+        }
+    }
+
     /// Live projection of the assistant's answer text while a turn is
     /// running: called once per provider `output_text` delta, in order, as
     /// the stream arrives. This is the native host's synchronous activity
@@ -612,6 +628,103 @@ pub trait ResourceResolver {
     /// replaces whatever was projected. Reasoning deltas are never offered.
     /// The default observes nothing.
     fn observe_text_delta(&self, _delta: &str) {}
+}
+
+fn hosted_model_visible_world<R: ResourceResolver + ?Sized>(
+    command: &StartTurnCommand,
+    package: &ResolvedPackage,
+    resources: &R,
+) -> Result<WorldSnapshot, String> {
+    let identity = ExecutionIdentity {
+        program: Some(package.program.workflow.clone()),
+        revision: Some(command.package_version_ref.clone()),
+        instance: command.instance_ref.clone(),
+        agent: package.agent.clone(),
+        effect: command.command_id.clone(),
+        turn: command.command_id.clone(),
+        harness: HarnessClass::Managed,
+        placement: "native_host_facade".to_owned(),
+    };
+    let mut environment = resources.model_visible_environment();
+    if package.tools.iter().any(|tool| tool.name == "bash") {
+        environment.shell_family = Some("whip-shell/bash".to_owned());
+    }
+    let compute = ComputeResources {
+        max_model_rounds: Some(package.max_steps),
+        remaining_model_rounds: Some(package.max_steps),
+        concurrency_class: Some("host-facade-owned-turn".to_owned()),
+        ..ComputeResources::default()
+    };
+    let mut envelope = EffectiveTurnEnvelope::default();
+    for capability in ["workspace.read", "workspace.write"] {
+        let disposition = if package.capabilities.iter().any(|item| item == capability) {
+            GovernanceDisposition::Enforced
+        } else {
+            GovernanceDisposition::Unavailable
+        };
+        envelope.filesystem.push(GovernanceRule {
+            resource: capability.to_owned(),
+            disposition,
+            scope: command
+                .resources
+                .iter()
+                .filter(|resource| resource.kind == "file_store")
+                .map(|resource| resource.handle.clone())
+                .collect(),
+        });
+    }
+    envelope.network.push(GovernanceRule {
+        resource: "network".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["no model-facing network capability".to_owned()],
+    });
+    envelope.process.push(GovernanceRule {
+        resource: "process:shell".to_owned(),
+        disposition: if package
+            .capabilities
+            .iter()
+            .any(|item| item == "command.run")
+        {
+            GovernanceDisposition::Enforced
+        } else {
+            GovernanceDisposition::Unavailable
+        },
+        scope: command
+            .resources
+            .iter()
+            .filter(|resource| resource.kind == "command")
+            .map(|resource| resource.handle.clone())
+            .collect(),
+    });
+    envelope
+        .tools
+        .extend(package.tools.iter().map(|tool| GovernanceRule {
+            resource: format!("tool:{}", tool.name),
+            disposition: GovernanceDisposition::Enforced,
+            scope: vec!["offered this turn".to_owned()],
+        }));
+    envelope.approvals.push(GovernanceRule {
+        resource: "human_approval".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["this Managed turn has no approval mechanism".to_owned()],
+    });
+    envelope.custody.push(GovernanceRule {
+        resource: "provider_credentials".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["resolved only at the host egress boundary".to_owned()],
+    });
+    envelope.budgets.push(GovernanceRule {
+        resource: "model_rounds".to_owned(),
+        disposition: GovernanceDisposition::Enforced,
+        scope: vec![format!("maximum {}", package.max_steps)],
+    });
+    WorldSnapshot::new(&command.command_id)
+        .with_section("identity", &identity)?
+        .with_section("environment", &environment)?
+        .with_section("compute", &compute)?
+        .with_section("governance", &envelope.model_projection())?
+        .with_agent_topology(&AgentTopology::default())?
+        .with_section("mutability", &WorldMutability::default())
 }
 
 /// WhippleScript-owned native implementation of the workspace capability used
@@ -1061,6 +1174,16 @@ impl NativeWorkspaceResolver {
 }
 
 impl ResourceResolver for NativeWorkspaceResolver {
+    fn model_visible_environment(&self) -> EnvironmentState {
+        let root = self.root.display().to_string();
+        EnvironmentState {
+            cwd: Some(root.clone()),
+            workspace_roots: vec![root],
+            timezone: Some("UTC".to_owned()),
+            shell_family: None,
+        }
+    }
+
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String> {
         let locator = image.selector.as_deref().unwrap_or(&image.handle);
         let path = self.resolve(locator, false)?;
@@ -2416,7 +2539,7 @@ impl GovernedHostRuntime {
         // first committed. A suspended effect already has its exact brokered
         // transcript; resumption must not require the embedding host to retain
         // or replay the original ephemeral bytes.
-        let images = if resumed_effect {
+        let media = if resumed_effect {
             Vec::new()
         } else {
             command
@@ -2432,9 +2555,14 @@ impl GovernedHostRuntime {
                             "resolved image has no media type".to_owned(),
                         ));
                     }
-                    Ok(ImageBlock {
+                    Ok(MediaInput {
+                        artifact_ref: image
+                            .selector
+                            .clone()
+                            .unwrap_or_else(|| image.handle.clone()),
                         media_type: resolved.media_type,
-                        data_base64: base64_encode(&resolved.bytes),
+                        data_base64: Some(base64_encode(&resolved.bytes)),
+                        metadata: BTreeMap::new(),
                     })
                 })
                 .collect::<Result<Vec<_>, HostRuntimeError>>()?
@@ -2493,13 +2621,17 @@ impl GovernedHostRuntime {
                 Some(command.command_id.clone()),
             ),
         };
+        let world = hosted_model_visible_world(command, &package, resources)
+            .map_err(HostRuntimeError::Resolver)?;
         let input = BrokeredTurnInput {
             system: package.system_prompt,
             user: command.input.text.clone(),
             tools: package.tools.clone(),
             max_steps: package.max_steps,
             resume_from: Vec::new(),
-            user_images: images,
+            user_images: Vec::new(),
+            user_media: media,
+            world: Some(world),
             context_bundles: Vec::new(),
             pinned_skills: Vec::new(),
         };

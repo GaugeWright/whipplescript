@@ -1,0 +1,43 @@
+mod WHIPPLESCRIPT-MODEL-VISIBLE-WORLD is
+  sort Authority Role Relation Operation MediaState WorldState Cfg .
+
+  ops package project runtime : -> Authority [ctor] .
+  ops user developer system : -> Role [ctor] .
+  ops child peer : -> Relation [ctor] .
+  ops none steer : -> Operation [ctor] .
+  ops unsupported explicitUnavailable dropped : -> MediaState [ctor] .
+  ops snap0 snap1 snap2 : -> WorldState [ctor] .
+
+  op admit : Authority Role -> Cfg [ctor] .
+  ops admitted selfPromoted faithful drift replayed staleApplied honestControl
+      dishonestControl mediaPreserved mediaDropped : -> Cfg [ctor] .
+  op envelopeProjection : Role Role -> Cfg [ctor] .
+  op apply : WorldState WorldState -> Cfg [ctor] .
+  op applyDuplicate : WorldState WorldState -> Cfg [ctor] .
+  op topology : Relation Operation -> Cfg [ctor] .
+  op normalize : MediaState -> Cfg [ctor] .
+
+  rl [runtime-system] : admit(runtime, system) => admitted .
+  rl [project-developer] : admit(project, developer) => admitted .
+  rl [package-user] : admit(package, user) => admitted .
+
+  rl [projection-fidelity] : envelopeProjection(user, user) => faithful .
+  rl [projection-fidelity-dev] : envelopeProjection(developer, developer) => faithful .
+
+  rl [advance] : apply(snap0, snap1) => replayed .
+  rl [duplicate] : applyDuplicate(snap1, snap1) => replayed .
+
+  rl [peer-honest] : topology(peer, none) => honestControl .
+  rl [child-steer] : topology(child, steer) => honestControl .
+
+  rl [unsupported-visible] : normalize(unsupported) => mediaPreserved .
+
+  --- Deliberate mutants prove each corresponding no-solution search has bite.
+  ops mutantSelfPromotion mutantProjectionDrift mutantStaleDiff
+     mutantPeerControl mutantMediaDrop : -> Cfg [ctor] .
+  rl [mutant-self-promotion] : mutantSelfPromotion => selfPromoted .
+  rl [mutant-projection-drift] : mutantProjectionDrift => drift .
+  rl [mutant-stale-diff] : mutantStaleDiff => staleApplied .
+  rl [mutant-peer-control] : mutantPeerControl => dishonestControl .
+  rl [mutant-media-drop] : mutantMediaDrop => mediaDropped .
+endm

@@ -9951,6 +9951,12 @@ pub(crate) mod test_support {
                 announced INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, applied_at TEXT
             );
+            CREATE TABLE public_compaction_commands (
+                command_id TEXT PRIMARY KEY, turn_command_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                announced INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, applied_at TEXT
+            );
             CREATE TABLE tracker_events (
                 event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
@@ -10065,9 +10071,30 @@ pub fn do_pending_turn_commands<Sql: DoSql>(
     effect_id: &str,
     kind: whipplescript_kernel::harness_loop::TurnCommandKind,
 ) -> StoreResult<Vec<whipplescript_kernel::harness_loop::PendingTurnCommand>> {
+    if kind == whipplescript_kernel::harness_loop::TurnCommandKind::Compact {
+        let rows = sql
+            .query(
+                "SELECT command_id FROM public_compaction_commands \
+                 WHERE turn_command_id = ?1 AND status = 'pending' \
+                 ORDER BY created_at, command_id",
+                &[text(effect_id)],
+            )
+            .map_err(sql_err)?;
+        return Ok(rows
+            .into_iter()
+            .map(
+                |row| whipplescript_kernel::harness_loop::PendingTurnCommand {
+                    command_id: as_text(&row[0]),
+                    text: String::new(),
+                    images: Vec::new(),
+                },
+            )
+            .collect());
+    }
     let kind = match kind {
         whipplescript_kernel::harness_loop::TurnCommandKind::Steer => "steer",
         whipplescript_kernel::harness_loop::TurnCommandKind::FollowUp => "follow_up",
+        whipplescript_kernel::harness_loop::TurnCommandKind::Compact => unreachable!(),
     };
     let rows = sql
         .query(
@@ -10100,6 +10127,13 @@ pub fn do_mark_turn_commands_applied<Sql: DoSql>(
     for command_id in command_ids {
         sql.execute(
             "UPDATE public_turn_commands SET status = 'applied', \
+             applied_at = CURRENT_TIMESTAMP WHERE turn_command_id = ?1 \
+             AND command_id = ?2 AND status = 'pending'",
+            &[text(effect_id), text(command_id)],
+        )
+        .map_err(sql_err)?;
+        sql.execute(
+            "UPDATE public_compaction_commands SET status = 'applied', \
              applied_at = CURRENT_TIMESTAMP WHERE turn_command_id = ?1 \
              AND command_id = ?2 AND status = 'pending'",
             &[text(effect_id), text(command_id)],

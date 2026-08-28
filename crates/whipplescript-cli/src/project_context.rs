@@ -1,8 +1,8 @@
 //! Project-instruction discovery (context-assembly tracker Phase 3).
 //!
-//! Mirrors pi's `AGENTS.md` / `CLAUDE.md` discovery: the owned harness injects
-//! these files verbatim into the system prompt as a `<project_context>` bundle so
-//! the model sees the repo's conventions. Discovery is deterministic and
+//! Discovers the Managed harness's hierarchical `AGENTS.md` files and injects
+//! them verbatim into the system prompt as a `<project_context>` contribution.
+//! Discovery is deterministic and
 //! host-agnostic in shape (the bytes are content-addressable); the durable object,
 //! which has no filesystem, resolves the same content from the store (a later
 //! follow-on — the DO agent turn is still a no-tools stub).
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// Candidate project-instruction filenames, in precedence order (first match per
 /// directory wins).
-const CONTEXT_FILENAMES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+const CONTEXT_FILENAME: &str = "AGENTS.md";
 
 /// Env flag disabling project-instruction injection (pi's `--no-context-files`).
 const DISABLE_ENV: &str = "WHIPPLESCRIPT_NO_CONTEXT_FILES";
@@ -25,7 +25,7 @@ pub use whipplescript_kernel::context_assembly::{render_project_context, Project
 ///
 /// Order mirrors pi: the global agent directory first (if any), then the cwd →
 /// filesystem-root chain injected **root-most first, nearest-cwd last**. The first
-/// matching filename in a directory wins; paths are de-duped. Returns empty when
+/// `AGENTS.md` in each directory is cumulative; paths are de-duped. Returns empty when
 /// `WHIPPLESCRIPT_NO_CONTEXT_FILES` is set.
 pub fn discover_project_instructions(
     cwd: &Path,
@@ -79,17 +79,15 @@ fn discover_project_instructions_inner(
     out
 }
 
-/// The first existing/readable context file in `dir` (by filename precedence).
+/// The Managed instruction file in `dir`, when readable.
 fn first_context_file(dir: &Path) -> Option<ProjectInstruction> {
-    for name in CONTEXT_FILENAMES {
-        let path = dir.join(name);
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                return Some(ProjectInstruction {
-                    path: path.to_string_lossy().into_owned(),
-                    content,
-                });
-            }
+    let path = dir.join(CONTEXT_FILENAME);
+    if path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return Some(ProjectInstruction {
+                path: path.to_string_lossy().into_owned(),
+                content,
+            });
         }
     }
     None
@@ -108,16 +106,15 @@ mod tests {
     fn discovers_root_most_first_nearest_last_with_filename_precedence() {
         let base = std::env::temp_dir().join(format!("whip-ctx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        // base/AGENTS.md (root-most) and base/child/CLAUDE.md (nearest cwd).
+        // base/AGENTS.md (root-most) and base/child/AGENTS.md (nearest cwd).
         write(&base, "AGENTS.md", "root rules");
-        // A directory with both files: AGENTS.md wins by precedence.
         let child = base.join("child");
         write(&child, "AGENTS.md", "child agents");
         write(&child, "CLAUDE.md", "child claude");
 
         let found = discover_project_instructions_inner(&child, None, false);
         let bodies: Vec<&str> = found.iter().map(|i| i.content.as_str()).collect();
-        // root-most first, nearest last; child's AGENTS.md wins over its CLAUDE.md.
+        // Root-most first, nearest last; CLAUDE.md is not a Managed source.
         assert_eq!(bodies, vec!["root rules", "child agents"]);
 
         let rendered = render_project_context(&found);
@@ -127,6 +124,15 @@ mod tests {
         assert!(rendered.contains("child agents"));
         assert!(rendered.trim_end().ends_with("</project_context>"));
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claude_md_is_not_a_managed_context_source() {
+        let base = std::env::temp_dir().join(format!("whip-ctx-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        write(&base, "CLAUDE.md", "provider-specific ambient instruction");
+        assert!(discover_project_instructions_inner(&base, None, false).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 

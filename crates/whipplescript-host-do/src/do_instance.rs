@@ -24,8 +24,8 @@ use whipplescript_kernel::coerce_native::{
     build_coerce_call_parts, build_request, parse_response, CoerceCall,
 };
 use whipplescript_kernel::context_assembly::{
-    assemble, render_available_skills, render_project_context, BundleKind, ContextBundle,
-    ProjectInstruction, SkillCatalogueEntry,
+    assemble, contribution, render_available_skills, render_project_context, ContributionLifecycle,
+    InstructionAuthority, InstructionRole, ProjectInstruction, SkillCatalogueEntry,
 };
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{
@@ -41,7 +41,8 @@ use whipplescript_kernel::exec_http::{
 use whipplescript_kernel::harness_loop::{
     compactor_for_strategy, provider_result_from_brokered_turn, Awaiting, BrokeredTurnInput,
     BrokeredTurnMachine, BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient,
-    ImageBlock, PendingTurnCommand, ToolExecutor, TurnCommandKind, TurnCommandSource, TurnStatus,
+    ImageBlock, MediaInput, PendingTurnCommand, ToolExecutor, TurnCommandKind, TurnCommandSource,
+    TurnStatus, WorldStateSource,
 };
 use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
@@ -50,12 +51,19 @@ use whipplescript_kernel::rule_pass::step_instance_generic;
 use whipplescript_kernel::sansio::{
     HttpResponse, IoRequest, IoResult, Outcome, StepMachine, TransportError,
 };
+use whipplescript_kernel::world_state::{
+    AgentRelation, AgentState, AgentTopology, ComputeResources, EffectiveTurnEnvelope,
+    EnvironmentState, ExecutionIdentity, GovernanceDisposition, GovernanceRule, HarnessClass,
+    VisibleAgent, WorldMutability, WorldSnapshot,
+};
 use whipplescript_kernel::AgentTurnExecution;
 use whipplescript_kernel::{idempotency_key, CoerceExecution, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
-use whipplescript_store::{ClaimableEffect, EvidenceRecord, RunStart, RuntimeStore, StoreError};
+use whipplescript_store::{
+    ClaimableEffect, EffectView, EvidenceRecord, RunStart, RuntimeStore, StoreError,
+};
 
 /// What a model round about to be issued should be called (DR 0061).
 ///
@@ -330,6 +338,187 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
 struct DoTurnCommandSource<Sql: DoSql> {
     sql: Sql,
     effect_id: String,
+}
+
+struct DoWorldStateSource<'a, Sql: DoSql + Clone> {
+    sql: Sql,
+    ir: &'a IrProgram,
+    instance_id: &'a str,
+    effect_id: &'a str,
+    agent: &'a str,
+    tools: &'a [whipplescript_kernel::harness_loop::ToolSpec],
+    max_steps: usize,
+}
+
+impl<Sql: DoSql + Clone> WorldStateSource for DoWorldStateSource<'_, Sql> {
+    fn current(&mut self, model_step: usize) -> Result<WorldSnapshot, String> {
+        let store = DoSqliteStore::new(self.sql.clone());
+        let effects = store
+            .list_effects(self.instance_id)
+            .map_err(|error| format!("world topology read failed: {error:?}"))?;
+        let topology = do_agent_topology(self.ir, self.agent, &effects);
+        do_model_visible_world(
+            self.ir,
+            self.instance_id,
+            self.effect_id,
+            self.agent,
+            self.tools,
+            self.max_steps,
+            model_step,
+            "durable_object",
+            &topology,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_model_visible_world(
+    ir: &IrProgram,
+    instance_id: &str,
+    effect_id: &str,
+    agent: &str,
+    tools: &[whipplescript_kernel::harness_loop::ToolSpec],
+    max_steps: usize,
+    completed_steps: usize,
+    placement: &str,
+    topology: &AgentTopology,
+) -> Result<WorldSnapshot, String> {
+    let identity = ExecutionIdentity {
+        program: Some(ir.workflow.clone()),
+        revision: None,
+        instance: instance_id.to_owned(),
+        agent: agent.to_owned(),
+        effect: effect_id.to_owned(),
+        turn: effect_id.to_owned(),
+        harness: HarnessClass::Managed,
+        placement: placement.to_owned(),
+    };
+    let has_tool = |name: &str| tools.iter().any(|tool| tool.name == name);
+    let environment = EnvironmentState {
+        cwd: Some("/workspace".to_owned()),
+        workspace_roots: vec!["/workspace".to_owned()],
+        timezone: Some("UTC".to_owned()),
+        shell_family: has_tool("bash").then(|| "whip-shell/bash".to_owned()),
+    };
+    let compute = ComputeResources {
+        max_model_rounds: Some(max_steps),
+        remaining_model_rounds: Some(max_steps.saturating_sub(completed_steps)),
+        concurrency_class: Some("durable-object-owned-turn".to_owned()),
+        ..ComputeResources::default()
+    };
+    let mut envelope = EffectiveTurnEnvelope::default();
+    let read_tools = ["read", "grep", "find", "ls", "recall"];
+    let write_tools = ["write", "edit"];
+    for (resource, names) in [
+        ("filesystem:read", read_tools.as_slice()),
+        ("filesystem:write", write_tools.as_slice()),
+    ] {
+        envelope.filesystem.push(GovernanceRule {
+            resource: resource.to_owned(),
+            disposition: if names.iter().any(|name| has_tool(name)) {
+                GovernanceDisposition::Enforced
+            } else {
+                GovernanceDisposition::Unavailable
+            },
+            scope: vec!["/workspace".to_owned()],
+        });
+    }
+    envelope.network.push(GovernanceRule {
+        resource: "network".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["model tools have no network egress".to_owned()],
+    });
+    envelope.process.push(GovernanceRule {
+        resource: "process:shell".to_owned(),
+        disposition: if has_tool("bash") {
+            GovernanceDisposition::Enforced
+        } else {
+            GovernanceDisposition::Unavailable
+        },
+        scope: vec!["governed in-isolate whip shell".to_owned()],
+    });
+    envelope
+        .tools
+        .extend(tools.iter().map(|tool| GovernanceRule {
+            resource: format!("tool:{}", tool.name),
+            disposition: GovernanceDisposition::Enforced,
+            scope: vec!["offered this turn".to_owned()],
+        }));
+    envelope.approvals.push(GovernanceRule {
+        resource: "human_approval".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["this Managed turn has no approval mechanism".to_owned()],
+    });
+    envelope.custody.push(GovernanceRule {
+        resource: "credentials".to_owned(),
+        disposition: GovernanceDisposition::Unavailable,
+        scope: vec!["provider credentials resolve only at final fetch".to_owned()],
+    });
+    envelope.budgets.push(GovernanceRule {
+        resource: "model_rounds".to_owned(),
+        disposition: GovernanceDisposition::Enforced,
+        scope: vec![format!("maximum {max_steps}")],
+    });
+    let mut world = WorldSnapshot::new(effect_id)
+        .with_section("identity", &identity)?
+        .with_section("environment", &environment)?
+        .with_section("compute", &compute)?
+        .with_section("governance", &envelope.model_projection())?
+        .with_agent_topology(topology)?
+        .with_section("mutability", &WorldMutability::default())?;
+    world.world_epoch = completed_steps as u64;
+    Ok(world)
+}
+
+fn do_agent_topology(ir: &IrProgram, current_agent: &str, effects: &[EffectView]) -> AgentTopology {
+    let agents = ir
+        .agents
+        .iter()
+        .filter(|candidate| candidate.name != current_agent)
+        .map(|candidate| {
+            let matching: Vec<_> = effects
+                .iter()
+                .filter(|effect| {
+                    effect.kind == "agent.tell"
+                        && effect.target.as_deref() == Some(candidate.name.as_str())
+                })
+                .collect();
+            let select = |statuses: &[&str]| {
+                matching
+                    .iter()
+                    .rev()
+                    .find(|effect| statuses.contains(&effect.status.as_str()))
+                    .copied()
+            };
+            let (state, effect) = if let Some(effect) = select(&["running", "claimed"]) {
+                (AgentState::Running, Some(effect))
+            } else if let Some(effect) = select(&["queued"]) {
+                (AgentState::Starting, Some(effect))
+            } else if let Some(effect) = select(&[
+                "blocked",
+                "blocked_by_dependency",
+                "blocked_by_capacity",
+                "blocked_by_policy",
+            ]) {
+                (AgentState::Waiting, Some(effect))
+            } else if let Some(effect) = select(&["completed"]) {
+                (AgentState::Completed, Some(effect))
+            } else if let Some(effect) = select(&["failed", "timed_out", "cancelled"]) {
+                (AgentState::Failed, Some(effect))
+            } else {
+                (AgentState::Unavailable, None)
+            };
+            VisibleAgent {
+                agent_id: candidate.name.clone(),
+                relation: AgentRelation::Peer,
+                state,
+                assignment_summary: effect
+                    .map(|effect| format!("agent.tell effect {}", effect.effect_id)),
+                allowed_operations: Vec::new(),
+            }
+        })
+        .collect();
+    AgentTopology { agents }
 }
 
 impl<Sql: DoSql> TurnCommandSource for DoTurnCommandSource<Sql> {
@@ -669,6 +858,73 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     &effect.effect_id,
                     &input,
                 )?;
+                let agent = effect.target.as_deref().unwrap_or("agent");
+                let tools = self
+                    .agent_tool_specs
+                    .map(<[_]>::to_vec)
+                    .unwrap_or_else(crate::do_tools::do_tool_specs);
+                let docs: Vec<_> = self
+                    .kernel
+                    .store()
+                    .list_project_context_docs()?
+                    .into_iter()
+                    .filter(|doc| {
+                        whipplescript_kernel::context_assembly::is_managed_agents_path(&doc.path)
+                    })
+                    .collect();
+                let mut contributions = vec![contribution(
+                    "persona",
+                    "package:system-prompt",
+                    "v1",
+                    InstructionAuthority::Runtime,
+                    InstructionRole::System,
+                    "010-persona",
+                    ContributionLifecycle::Stable,
+                    self.system_prompt,
+                )];
+                for doc in &docs {
+                    contributions.push(contribution(
+                        format!("project-context:{}", doc.position),
+                        doc.path.clone(),
+                        doc.content_hash.clone(),
+                        InstructionAuthority::Project,
+                        InstructionRole::Developer,
+                        format!("040-project-context:{:020}", doc.position),
+                        ContributionLifecycle::Turn,
+                        render_project_context(&[ProjectInstruction {
+                            path: doc.path.clone(),
+                            content: doc.body.clone(),
+                        }]),
+                    ));
+                }
+                let assembled = assemble(contributions);
+                let topology = do_agent_topology(
+                    self.ir,
+                    agent,
+                    &self.kernel.store().list_effects(self.instance_id)?,
+                );
+                let world = do_model_visible_world(
+                    self.ir,
+                    self.instance_id,
+                    &effect.effect_id,
+                    agent,
+                    &tools,
+                    cfg.max_steps as usize,
+                    0,
+                    "turn_container",
+                    &topology,
+                )
+                .map_err(StoreError::Conflict)?;
+                let user_media: Vec<MediaInput> = user_images
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| MediaInput {
+                        artifact_ref: format!("turn_images:{index}"),
+                        media_type: image.media_type.clone(),
+                        data_base64: Some(image.data_base64.clone()),
+                        metadata: std::collections::BTreeMap::new(),
+                    })
+                    .collect();
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
                 let lease_id =
                     idempotency_key(&[self.instance_id, &effect.effect_id, "agent-lease"]);
@@ -696,10 +952,13 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                                 "protocol": "whip-turn/1",
                                 "turn_id": effect.effect_id,
                                 "provider": cfg.provider,
+                                "system": assembled.system_prompt,
                                 "user": prompt,
-                                "images": user_images,
+                                "media": user_media,
+                                "world": world,
                                 "tools": "file",
                                 "max_steps": cfg.max_steps,
+                                "compaction_strategy": "turn_summary",
                             }),
                         };
                         return Ok(EffectStep::NeedsHttp(request));
@@ -848,14 +1107,26 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     Vec::new()
                 };
                 // Store-backed project instructions (context-assembly Phase 3
-                // item 4): the DO has no filesystem, so AGENTS.md/CLAUDE.md
+                // item 4): the DO has no filesystem, so hierarchical AGENTS.md
                 // content registered at deploy resolves from the store — the
                 // same wrapper bytes the native fs path injects.
-                let docs = self.kernel.store().list_project_context_docs()?;
-                let mut bundles = vec![ContextBundle::new(
-                    BundleKind::Persona,
+                let docs: Vec<_> = self
+                    .kernel
+                    .store()
+                    .list_project_context_docs()?
+                    .into_iter()
+                    .filter(|doc| {
+                        whipplescript_kernel::context_assembly::is_managed_agents_path(&doc.path)
+                    })
+                    .collect();
+                let mut bundles = vec![contribution(
+                    "persona",
                     "package:system-prompt",
                     "v1",
+                    InstructionAuthority::Runtime,
+                    InstructionRole::System,
+                    "010-persona",
+                    ContributionLifecycle::Stable,
                     self.system_prompt,
                 )];
                 if !docs.is_empty() {
@@ -864,10 +1135,14 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             path: doc.path.clone(),
                             content: doc.body.clone(),
                         };
-                        bundles.push(ContextBundle::new(
-                            BundleKind::ProjectContext,
+                        bundles.push(contribution(
+                            format!("project-context:{}", doc.position),
                             doc.path.clone(),
                             doc.content_hash.clone(),
+                            InstructionAuthority::Project,
+                            InstructionRole::Developer,
+                            format!("040-project-context:{:020}", doc.position),
+                            ContributionLifecycle::Turn,
                             render_project_context(&[instruction]),
                         ));
                     }
@@ -882,14 +1157,35 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     self.agent_workspace_resources,
                 )?;
                 if !skills.is_empty() && tools.iter().any(|tool| tool.name == "read") {
-                    bundles.push(ContextBundle::new(
-                        BundleKind::AvailableSkills,
+                    bundles.push(contribution(
+                        "available-skills",
                         "workspace:skills",
                         "v1",
+                        InstructionAuthority::Registry,
+                        InstructionRole::Developer,
+                        "050-available-skills",
+                        ContributionLifecycle::Turn,
                         render_available_skills(&skills),
                     ));
                 }
                 let assembled = assemble(bundles);
+                let topology = do_agent_topology(
+                    self.ir,
+                    agent,
+                    &self.kernel.store().list_effects(self.instance_id)?,
+                );
+                let world = do_model_visible_world(
+                    self.ir,
+                    self.instance_id,
+                    &effect.effect_id,
+                    agent,
+                    &tools,
+                    self.max_steps,
+                    0,
+                    "durable_object",
+                    &topology,
+                )
+                .map_err(StoreError::Conflict)?;
                 let turn_input = BrokeredTurnInput {
                     system: assembled.system_prompt,
                     user: prompt,
@@ -900,7 +1196,9 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     max_steps: self.max_steps,
                     resume_from,
                     user_images,
-                    context_bundles: assembled.bundles,
+                    user_media: Vec::new(),
+                    world: Some(world),
+                    context_bundles: assembled.contributions,
                     pinned_skills: Vec::new(),
                 };
                 let run_id = idempotency_key(&[self.instance_id, &effect.effect_id, "agent-run"]);
@@ -922,9 +1220,17 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     // duplicate) — same discipline as the native owned turn.
                     for bundle in &turn_input.context_bundles {
                         let metadata = serde_json::json!({
-                            "kind": bundle.kind.tag(),
+                            "contribution_id": bundle.contribution_id,
                             "source": bundle.source,
                             "version": bundle.version,
+                            "authority": bundle.authority,
+                            "scope": bundle.scope,
+                            "audience": bundle.audience,
+                            "message_role": bundle.message_role,
+                            "ordering_key": bundle.ordering_key,
+                            "replacement_key": bundle.replacement_key,
+                            "sequence": bundle.sequence,
+                            "lifecycle": bundle.lifecycle,
                             "content_hash": bundle.content_hash,
                         })
                         .to_string();
@@ -935,7 +1241,7 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                             subject_id: &run_id,
                             causation_id: None,
                             correlation_id: Some(&effect.effect_id),
-                            summary: Some(bundle.kind.tag()),
+                            summary: Some(&bundle.contribution_id),
                             metadata_json: &metadata,
                         })?;
                     }
@@ -1013,6 +1319,15 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     sql: self.kernel.store().sql.clone(),
                     effect_id: effect.effect_id.clone(),
                 };
+                let mut world_source = DoWorldStateSource {
+                    sql: self.kernel.store().sql.clone(),
+                    ir: self.ir,
+                    instance_id: self.instance_id,
+                    effect_id: &effect.effect_id,
+                    agent,
+                    tools: &turn_input.tools,
+                    max_steps: self.max_steps,
+                };
                 let mut machine = match loaded {
                     None => BrokeredTurnMachine::new(
                         model,
@@ -1035,7 +1350,8 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     }
                 }
                 .with_cancel_check(&cancel_probe)
-                .with_command_source(&mut command_source);
+                .with_command_source(&mut command_source)
+                .with_world_source(&mut world_source);
                 let step = machine.step(incoming.map(IoResult::Http));
                 // Snapshot before acknowledging any injected user command. If
                 // the object is evicted between these writes, restore sees the
@@ -2492,14 +2808,14 @@ mod tests {
         );
         assert!(
             bundles.iter().any(|row| {
-                row.metadata_json.contains("project_context")
+                row.metadata_json.contains("project-context")
                     && row.metadata_json.contains("repo/AGENTS.md")
             }),
             "{bundles:?}"
         );
         assert!(
             bundles.iter().any(|row| {
-                row.metadata_json.contains("available_skills")
+                row.metadata_json.contains("available-skills")
                     && row.metadata_json.contains("workspace:skills")
             }),
             "{bundles:?}"
@@ -2526,6 +2842,19 @@ mod tests {
             assert!(request.url.ends_with("/turn"), "{}", request.url);
             assert_eq!(request.body["protocol"], serde_json::json!("whip-turn/1"));
             assert_eq!(request.body["tools"], serde_json::json!("file"));
+            assert_eq!(
+                request.body["system"],
+                serde_json::json!("You are a WhippleScript agent.")
+            );
+            assert_eq!(
+                request.body["world"]["sections"]["identity"]["placement"],
+                serde_json::json!("turn_container")
+            );
+            assert_eq!(
+                request.body["world"]["sections"]["environment"]["cwd"],
+                serde_json::json!("/workspace")
+            );
+            assert!(request.body["media"].is_array());
             assert_eq!(
                 request.body["provider"]["provider"],
                 serde_json::json!("fixture")

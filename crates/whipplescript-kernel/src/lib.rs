@@ -34,6 +34,7 @@ pub mod source_merge;
 pub mod time_pass;
 pub mod trace;
 pub mod whip_shell;
+pub mod world_state;
 
 use artifact_manifest::{
     artifact_capture_failed_payload, provider_artifact_manifest, validate_artifact_manifest,
@@ -232,6 +233,49 @@ fn brokered_observation_evidence(
                 },
             }),
         ),
+        LoopObservation::ToolOutputTruncated {
+            call_id,
+            tool_name,
+            policy,
+            output_class,
+            result_status,
+            experiment_label,
+            original_bytes,
+            retained_bytes,
+            recall_id,
+        } => (
+            "context.tool_output_truncated",
+            json!({
+                "call_id": call_id,
+                "tool": tool_name,
+                "policy": policy,
+                "output_class": output_class,
+                "result_status": match result_status {
+                    ToolStatus::Ok => "ok",
+                    ToolStatus::Error => "error",
+                },
+                "experiment_label": experiment_label,
+                "original_bytes": original_bytes,
+                "retained_bytes": retained_bytes,
+                "recall_id": recall_id,
+            }),
+        ),
+        LoopObservation::RecallRequested {
+            call_id,
+            content_id,
+            offset,
+            limit,
+            experiment_label,
+        } => (
+            "context.tool_output_recall",
+            json!({
+                "call_id": call_id,
+                "content_id": content_id,
+                "offset": offset,
+                "limit": limit,
+                "experiment_label": experiment_label,
+            }),
+        ),
         LoopObservation::Compacted {
             epoch,
             folded_messages,
@@ -251,7 +295,34 @@ fn brokered_observation_evidence(
                 "kind": match kind {
                     TurnCommandKind::Steer => "steer",
                     TurnCommandKind::FollowUp => "follow_up",
+                    TurnCommandKind::Compact => "compact",
                 },
+            }),
+        ),
+        LoopObservation::WorldProjected {
+            epoch,
+            projection,
+            content_hash,
+        } => (
+            "context.world",
+            json!({
+                "epoch": epoch,
+                "projection": projection,
+                "content_hash": content_hash,
+            }),
+        ),
+        LoopObservation::MediaNormalized {
+            artifact_ref,
+            media_type,
+            normalization,
+            derivative_hash,
+        } => (
+            "context.media_normalized",
+            json!({
+                "artifact_ref": artifact_ref,
+                "media_type": media_type,
+                "normalization": normalization,
+                "derivative_hash": derivative_hash,
             }),
         ),
     }
@@ -413,11 +484,19 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     subject_id: &run_id,
                     causation_id: None,
                     correlation_id: Some(ctx.effect_id),
-                    summary: Some(bundle.kind.tag()),
+                    summary: Some(&bundle.contribution_id),
                     metadata_json: &json!({
-                        "kind": bundle.kind.tag(),
+                        "contribution_id": bundle.contribution_id,
                         "source": bundle.source,
                         "version": bundle.version,
+                        "authority": bundle.authority,
+                        "scope": bundle.scope,
+                        "audience": bundle.audience,
+                        "message_role": bundle.message_role,
+                        "ordering_key": bundle.ordering_key,
+                        "replacement_key": bundle.replacement_key,
+                        "sequence": bundle.sequence,
+                        "lifecycle": bundle.lifecycle,
                         "content_hash": bundle.content_hash,
                     })
                     .to_string(),
@@ -4276,6 +4355,29 @@ mod tests {
         EffectCancellation, EffectCancellationRequest, EffectCompletion, LeaseRenewal, NewEffect,
         NewFact, RetryEffect, RevisionActivation, RuleCommit, RunStart, SkillRegistration,
     };
+
+    #[test]
+    fn every_new_model_visible_plane_maps_to_hash_or_derivative_evidence() {
+        let (world_kind, world) =
+            brokered_observation_evidence(&crate::harness_loop::LoopObservation::WorldProjected {
+                epoch: 2,
+                projection: "update".to_owned(),
+                content_hash: "world-hash".to_owned(),
+            });
+        assert_eq!(world_kind, "context.world");
+        assert_eq!(world["content_hash"], "world-hash");
+
+        let (media_kind, media) =
+            brokered_observation_evidence(&crate::harness_loop::LoopObservation::MediaNormalized {
+                artifact_ref: "artifact:image".to_owned(),
+                media_type: "image/png".to_owned(),
+                normalization: "provider_image".to_owned(),
+                derivative_hash: Some("derivative-hash".to_owned()),
+            });
+        assert_eq!(media_kind, "context.media_normalized");
+        assert_eq!(media["artifact_ref"], "artifact:image");
+        assert_eq!(media["derivative_hash"], "derivative-hash");
+    }
 
     #[test]
     fn kernel_scaffold_links_to_store() {

@@ -647,7 +647,14 @@ fn unix_socket_daemon_serves_and_refuses_get() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let dir = std::env::temp_dir().join(format!("whip-custodian-sock-{}", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "whip-custodian-sock-{}-{nonce}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let socket_path = dir.join("custodian.sock");
 
@@ -663,12 +670,26 @@ fn unix_socket_daemon_serves_and_refuses_get() {
             let _ = whipplescript_custodian::serve::serve(c, &socket_path);
         });
     }
+    let mut listener_ready = false;
     for _ in 0..100 {
-        if socket_path.exists() {
-            break;
+        match UnixStream::connect(&socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                listener_ready = true;
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("wait for custodian listener: {error}"),
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert!(listener_ready, "custodian listener did not become ready");
 
     // A well-formed call over the client transport.
     let transport = whipplescript_custodian::serve::UnixSocketTransport::new(socket_path.clone());

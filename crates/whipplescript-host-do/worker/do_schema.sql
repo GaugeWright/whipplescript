@@ -225,6 +225,15 @@
             );
             CREATE INDEX idx_public_turn_commands_pending
                 ON public_turn_commands(turn_command_id, kind, status, position);
+            CREATE TABLE public_compaction_commands (
+                command_id TEXT PRIMARY KEY,
+                turn_command_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'applied', 'removed')),
+                announced INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                applied_at TEXT
+            );
             CREATE TABLE public_turn_binding (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 request_id TEXT NOT NULL,

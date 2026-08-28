@@ -210,7 +210,7 @@ export interface Env {
   // a per-turn container instance (idFromName over the turn id) — the 1:1
   // container-per-turn pattern. Unset = agent turns use the in-DO machine.
   WHIP_TURN_URL?: string;
-  // Deploy-shipped AGENTS.md/CLAUDE.md and script capabilities. These are
+  // Deploy-shipped Managed AGENTS.md hierarchy and script capabilities. These are
   // operator configuration, not public runtime input.
   WHIP_PROJECT_CONTEXT_JSON?: string;
   WHIP_SCRIPT_CAPABILITIES_JSON?: string;
@@ -472,6 +472,17 @@ function ensureSchema(sql: SqlStorage): void {
   )`);
   sql.exec(`CREATE INDEX IF NOT EXISTS idx_public_turn_commands_pending
     ON public_turn_commands(turn_command_id, kind, status, position)`);
+  // Kept separate from the historical steer/follow-up table so deployments
+  // whose original CHECK constraint predates manual compaction migrate safely.
+  sql.exec(`CREATE TABLE IF NOT EXISTS public_compaction_commands (
+    command_id TEXT PRIMARY KEY,
+    turn_command_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'applied', 'removed')),
+    announced INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    applied_at TEXT
+  )`);
   // Correlation-only browser command binding. WhippleScript's effect state,
   // never this row, decides whether the turn is running or terminal.
   sql.exec(`CREATE TABLE IF NOT EXISTS public_turn_binding (
@@ -2121,6 +2132,14 @@ export class WorkflowInstance implements DurableObject {
         }
         return;
       }
+      if (attachment?.publicSession && parsed.type === "compact") {
+        const response = await this.enqueuePublicCompaction(parsed);
+        if (!response.ok) {
+          const body = await response.json<{ error?: string }>();
+          throw new Error(body.error ?? `compaction command rejected (${response.status})`);
+        }
+        return;
+      }
       if (
         attachment?.publicSession &&
         ["queue_edit", "queue_remove", "queue_reorder", "queue_promote"].includes(
@@ -2297,6 +2316,34 @@ export class WorkflowInstance implements DurableObject {
     return Response.json({ admitted: true, command_id: message.requestId }, { status: 202 });
   }
 
+  private async enqueuePublicCompaction(
+    parsed: Record<string, unknown>,
+  ): Promise<Response> {
+    const session = await this.readPublicSessionState();
+    if (!session) {
+      return Response.json({ error: "public session is not bootstrapped" }, { status: 409 });
+    }
+    const requestId =
+      typeof parsed.request_id === "string" ? parsed.request_id.trim() : "";
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(requestId)) {
+      return Response.json({ error: "compact requires a valid request_id" }, { status: 422 });
+    }
+    ensureSchema(this.ctx.storage.sql);
+    const active = this.ctx.storage.sql
+      .exec("SELECT command_id FROM public_turn_binding WHERE singleton = 1")
+      .toArray() as { command_id: string }[];
+    if (active.length === 0) {
+      return Response.json({ error: "session has no running turn" }, { status: 409 });
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO public_compaction_commands (command_id, turn_command_id)
+       VALUES (?1, ?2) ON CONFLICT(command_id) DO NOTHING`,
+      requestId,
+      active[0].command_id,
+    );
+    return Response.json({ admitted: true, command_id: requestId }, { status: 202 });
+  }
+
   private mutatePublicTurnQueue(parsed: Record<string, unknown>): Response {
     ensureSchema(this.ctx.storage.sql);
     const commandId =
@@ -2406,7 +2453,6 @@ export class WorkflowInstance implements DurableObject {
         kind: string;
         text: string;
       }[];
-    if (rows.length === 0) return;
     for (const row of rows) {
       const active = this.ctx.storage.sql
         .exec(
@@ -2454,7 +2500,25 @@ export class WorkflowInstance implements DurableObject {
         row.command_id,
       );
     }
-    this.publishPublicTurnQueue();
+    if (rows.length > 0) this.publishPublicTurnQueue();
+    const compactions = this.ctx.storage.sql
+      .exec(
+        `SELECT command_id, turn_command_id FROM public_compaction_commands
+          WHERE status = 'applied' AND announced = 0 ORDER BY applied_at, command_id`,
+      )
+      .toArray() as { command_id: string; turn_command_id: string }[];
+    for (const row of compactions) {
+      this.appendPublicEvent({
+        type: "turn_command_applied",
+        request_id: row.command_id,
+        command_id: row.turn_command_id,
+        kind: "compact",
+      }, `turn-command-applied:${row.command_id}`);
+      this.ctx.storage.sql.exec(
+        "UPDATE public_compaction_commands SET announced = 1 WHERE command_id = ?1",
+        row.command_id,
+      );
+    }
   }
 
   private async beginPublicTurn(parsed: {

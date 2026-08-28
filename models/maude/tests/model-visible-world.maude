@@ -1,0 +1,22 @@
+load ../model-visible-world.maude
+
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : admit(runtime, system) =>* admitted .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : admit(package, system) =>* selfPromoted .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : mutantSelfPromotion =>* selfPromoted .
+
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : envelopeProjection(user, user) =>* faithful .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : envelopeProjection(user, developer) =>* drift .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : mutantProjectionDrift =>* drift .
+
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : apply(snap0, snap1) =>* replayed .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : applyDuplicate(snap1, snap1) =>* replayed .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : apply(snap2, snap1) =>* staleApplied .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : mutantStaleDiff =>* staleApplied .
+
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : topology(peer, none) =>* honestControl .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : topology(peer, steer) =>* dishonestControl .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : mutantPeerControl =>* dishonestControl .
+
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : normalize(unsupported) =>* mediaPreserved .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : normalize(unsupported) =>* mediaDropped .
+search [1] in WHIPPLESCRIPT-MODEL-VISIBLE-WORLD : mutantMediaDrop =>* mediaDropped .

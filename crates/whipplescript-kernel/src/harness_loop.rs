@@ -24,6 +24,10 @@ use crate::sansio::{
     run_to_completion, HostDriver, HttpRequest, HttpResponse, IoRequest, IoResult, Outcome,
     StepMachine, TransportError,
 };
+use crate::world_state::{
+    project_remaining_model_rounds, project_world, render_world_projection, WorldProjection,
+    WorldSnapshot,
+};
 
 /// A model-facing tool: its name, a one-line description, and the JSON Schema for
 /// its arguments. Built from the file-tool set in slice 1.
@@ -85,6 +89,17 @@ pub struct ImageBlock {
     pub media_type: String,
     /// The raw image bytes, base64-encoded.
     pub data_base64: String,
+}
+
+/// Original typed user-media item before provider-capability normalization.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaInput {
+    pub artifact_ref: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// One message in the model conversation the driver maintains.
@@ -236,6 +251,24 @@ pub enum LoopObservation {
         name: String,
         status: ToolStatus,
     },
+    ToolOutputTruncated {
+        call_id: String,
+        tool_name: String,
+        policy: String,
+        output_class: String,
+        result_status: ToolStatus,
+        experiment_label: String,
+        original_bytes: usize,
+        retained_bytes: usize,
+        recall_id: Option<String>,
+    },
+    RecallRequested {
+        call_id: String,
+        content_id: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
+        experiment_label: String,
+    },
     /// A conversation compaction was applied at this epoch (Phase 4 Layer B): the
     /// summary was recorded and the transcript folded to a fresh stable prefix. The
     /// kernel records this as a `context.compaction` evidence artifact (Decision 8).
@@ -253,6 +286,21 @@ pub enum LoopObservation {
         command_id: String,
         kind: TurnCommandKind,
     },
+    /// A full model-visible world or an idempotent update was appended before a
+    /// model round. The hash binds evidence to the exact canonical state.
+    WorldProjected {
+        epoch: u64,
+        projection: String,
+        content_hash: String,
+    },
+    /// One original media item was either admitted as a provider derivative or
+    /// represented explicitly as unavailable. No item disappears silently.
+    MediaNormalized {
+        artifact_ref: String,
+        media_type: String,
+        normalization: String,
+        derivative_hash: Option<String>,
+    },
 }
 
 /// Runtime-owned user commands that can join an already-running agent turn.
@@ -263,6 +311,9 @@ pub enum TurnCommandKind {
     Steer,
     /// Continue only after the model would otherwise finish.
     FollowUp,
+    /// Request the selected existing compactor at the next coherent model
+    /// boundary. Carries no user prose and is apply-once by command id.
+    Compact,
 }
 
 /// One durable command supplied by the host. Command ids are stable across
@@ -279,6 +330,12 @@ pub struct PendingTurnCommand {
 /// durable, closing the crash window between injection and acknowledgement.
 pub trait TurnCommandSource {
     fn pending(&mut self, kind: TurnCommandKind) -> Result<Vec<PendingTurnCommand>, String>;
+}
+
+/// Host collector for mutable model-visible world state. It reads only already
+/// admitted runtime state; returning a snapshot cannot grant authority.
+pub trait WorldStateSource {
+    fn current(&mut self, model_step: usize) -> Result<WorldSnapshot, String>;
 }
 
 /// Terminal status of a brokered turn (layer 3). Maps to the existing
@@ -387,12 +444,19 @@ pub struct BrokeredTurnInput {
     /// Empty for text-only turns (the default); providers that lack vision error
     /// informatively in v1 (no omission-note degradation yet).
     pub user_images: Vec<ImageBlock>,
+    /// Original typed media. The kernel normalizes these against the currently
+    /// supported provider input boundary; `user_images` remains the resolved
+    /// compatibility path for existing hosts and persisted commands.
+    pub user_media: Vec<MediaInput>,
+    /// Canonical initial world collected from the effective turn envelope.
+    /// `None` is retained for delegated/test callers that do not own context.
+    pub world: Option<WorldSnapshot>,
     /// Per-bundle provenance for the assembled system prompt (context-assembly
     /// Phase 1, Decision 5). The turn runner records one `context.bundle` evidence
     /// row per entry, before the turn, on a fresh start only (not on resume, so
     /// recovery does not duplicate). Empty when the host does not assemble context
     /// (e.g. the current DO agent stub).
-    pub context_bundles: Vec<crate::context_assembly::BundleProvenance>,
+    pub context_bundles: Vec<crate::context_assembly::ContributionProvenance>,
     /// Turn-scoped skills pinned by `tell … with skills [...]` (context-assembly
     /// Phase 7). Recorded once as `skills.pinned` provenance before the turn (fresh
     /// start only), like `context_bundles`. Provenance only — the discover-all
@@ -536,12 +600,28 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
+            if let Some(observation) = recall_request_observation(call) {
+                observations.push(observation);
+            }
             let outcome = execute_offered_tool(executor, &input.tools, call);
             observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
+                observations.push(LoopObservation::ToolOutputTruncated {
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    policy: "middle_v1".to_owned(),
+                    output_class: "text/plain".to_owned(),
+                    result_status: outcome.status,
+                    experiment_label: "middle_v1_control".to_owned(),
+                    original_bytes,
+                    retained_bytes: outcome.content.len(),
+                    recall_id,
+                });
+            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -608,6 +688,10 @@ pub struct BrokeredTurnSnapshot {
     /// its queue rows applied.
     #[serde(default)]
     pub applied_command_ids: std::collections::BTreeSet<String>,
+    /// Last state durably projected to the model, for replay-safe diffing after
+    /// eviction. Old snapshots deserialize as unknown and force a full refresh.
+    #[serde(default)]
+    pub visible_world: Option<WorldSnapshot>,
 }
 
 /// `serde(default)` seed for [`BrokeredTurnSnapshot::awaiting`] on pre-Phase-4
@@ -657,6 +741,8 @@ where
     /// Durable steering/follow-up source. Hosts without interactive commands
     /// leave this absent and retain the ordinary one-shot lifecycle.
     command_source: Option<&'a mut dyn TurnCommandSource>,
+    world_source: Option<&'a mut dyn WorldStateSource>,
+    visible_world: Option<WorldSnapshot>,
 }
 
 impl<'a, M, E> BrokeredTurnMachine<'a, M, E>
@@ -692,6 +778,8 @@ where
             cancel_check: None,
             stream_released: None,
             command_source: None,
+            world_source: None,
+            visible_world: None,
         }
     }
 
@@ -731,6 +819,8 @@ where
             cancel_check: None,
             stream_released: None,
             command_source: None,
+            world_source: None,
+            visible_world: snapshot.visible_world,
         }
     }
 
@@ -755,6 +845,11 @@ where
         self
     }
 
+    pub fn with_world_source(mut self, source: &'a mut dyn WorldStateSource) -> Self {
+        self.world_source = Some(source);
+        self
+    }
+
     /// Capture the machine's full mid-turn state so a host can persist it between
     /// provider rounds and later [`restore`](Self::restore) it byte-for-byte.
     pub fn snapshot(&self) -> BrokeredTurnSnapshot {
@@ -770,7 +865,41 @@ where
             pending_compaction: self.pending_compaction.clone(),
             overflow_trims: self.overflow_trims,
             applied_command_ids: self.applied_command_ids.clone(),
+            visible_world: self.visible_world.clone(),
         }
+    }
+
+    fn project_current_world(&mut self) -> Result<bool, String> {
+        let current = if let Some(source) = self.world_source.as_mut() {
+            Some(source.current(self.step)?)
+        } else if self.visible_world.is_none() {
+            self.input.world.clone()
+        } else {
+            self.visible_world.as_ref().and_then(|visible| {
+                project_remaining_model_rounds(visible, self.input.max_steps, self.step)
+            })
+        };
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let projection = project_world(self.visible_world.as_ref(), &current);
+        let Some(rendered) = render_world_projection(&projection) else {
+            return Ok(false);
+        };
+        let projection_kind = match projection {
+            WorldProjection::Full(_) => "full",
+            WorldProjection::Update(_) => "update",
+            WorldProjection::Unchanged => unreachable!("renderer returned content"),
+        };
+        self.messages.push(ChatMessage::System(rendered));
+        self.observations.push(LoopObservation::WorldProjected {
+            epoch: current.world_epoch,
+            projection: projection_kind.to_owned(),
+            content_hash: current.content_hash(),
+        });
+        self.visible_world = Some(current);
+        (self.checkpoint)(&self.messages);
+        Ok(true)
     }
 
     fn inject_commands(
@@ -819,7 +948,20 @@ where
             context_window: self.model.context_window(),
             message_count: self.messages.len(),
         };
-        if self.compactor.should_compact(&stats) {
+        let manual_compaction = match self.take_manual_compaction_request() {
+            Ok(requested) => requested,
+            Err(error) => {
+                return Outcome::Settle(BrokeredTurnOutcome {
+                    status: TurnStatus::Failed,
+                    summary: format!("durable compaction command read failed: {error}"),
+                    steps: self.step,
+                    observations: std::mem::take(&mut self.observations),
+                    usage: std::mem::take(&mut self.usage),
+                    last_input_tokens: self.last_input_tokens,
+                });
+            }
+        };
+        if manual_compaction || self.compactor.should_compact(&stats) {
             match self.compactor.plan(&self.messages, &stats) {
                 CompactionOutcome::Deterministic(rewritten) => {
                     // A pure rewrite (front-trim / hard-reset): install it, disarm,
@@ -833,6 +975,7 @@ where
                         folded_messages,
                         summary_bytes: 0,
                     });
+                    self.anchor_current_world_after_compaction();
                     (self.checkpoint)(&self.messages);
                 }
                 CompactionOutcome::NeedsModel(request) => {
@@ -850,6 +993,38 @@ where
         self.main_call()
     }
 
+    fn take_manual_compaction_request(&mut self) -> Result<bool, String> {
+        let Some(source) = self.command_source.as_mut() else {
+            return Ok(false);
+        };
+        for command in source.pending(TurnCommandKind::Compact)? {
+            if !self.applied_command_ids.insert(command.command_id.clone()) {
+                continue;
+            }
+            self.observations.push(LoopObservation::UserCommandApplied {
+                command_id: command.command_id,
+                kind: TurnCommandKind::Compact,
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn anchor_current_world_after_compaction(&mut self) {
+        let Some(world) = self.visible_world.clone() else {
+            return;
+        };
+        let Some(rendered) = render_world_projection(&WorldProjection::Full(world.clone())) else {
+            unreachable!("a full world projection always renders")
+        };
+        self.messages.push(ChatMessage::System(rendered));
+        self.observations.push(LoopObservation::WorldProjected {
+            epoch: world.world_epoch,
+            projection: "full".to_owned(),
+            content_hash: world.content_hash(),
+        });
+    }
+
     /// Prepare the main agent model call for the current step (observe + build).
     fn main_call(&mut self) -> Outcome<BrokeredTurnOutcome> {
         // Cooperative cancel (pi-conformance §3): every model round funnels
@@ -860,6 +1035,16 @@ where
             return Outcome::Settle(BrokeredTurnOutcome {
                 status: TurnStatus::Cancelled,
                 summary: "turn cancelled by request".to_owned(),
+                steps: self.step,
+                observations: std::mem::take(&mut self.observations),
+                usage: std::mem::take(&mut self.usage),
+                last_input_tokens: self.last_input_tokens,
+            });
+        }
+        if let Err(error) = self.project_current_world() {
+            return Outcome::Settle(BrokeredTurnOutcome {
+                status: TurnStatus::Failed,
+                summary: format!("model-visible world collection failed: {error}"),
                 steps: self.step,
                 observations: std::mem::take(&mut self.observations),
                 usage: std::mem::take(&mut self.usage),
@@ -916,13 +1101,33 @@ where
         if !self.started {
             self.started = true;
             self.messages = if self.input.resume_from.is_empty() {
-                vec![
-                    ChatMessage::System(self.input.system.clone()),
-                    ChatMessage::User {
-                        text: self.input.user.clone(),
-                        images: self.input.user_images.clone(),
-                    },
-                ]
+                let (media_images, media_notices, media_observations) =
+                    normalize_media_input(&self.input.user_media);
+                self.observations.extend(media_observations);
+                let mut messages = vec![ChatMessage::System(self.input.system.clone())];
+                if let Some(world) = self.input.world.clone() {
+                    let projection = WorldProjection::Full(world.clone());
+                    if let Some(rendered) = render_world_projection(&projection) {
+                        messages.push(ChatMessage::System(rendered));
+                        self.observations.push(LoopObservation::WorldProjected {
+                            epoch: world.world_epoch,
+                            projection: "full".to_owned(),
+                            content_hash: world.content_hash(),
+                        });
+                        self.visible_world = Some(world);
+                    }
+                }
+                let mut text = self.input.user.clone();
+                for notice in media_notices {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&notice);
+                }
+                let mut images = self.input.user_images.clone();
+                images.extend(media_images);
+                messages.push(ChatMessage::User { text, images });
+                messages
             } else {
                 sanitize_resume_messages(self.input.resume_from.clone())
             };
@@ -984,6 +1189,7 @@ where
                     folded_messages,
                     summary_bytes,
                 });
+                self.anchor_current_world_after_compaction();
                 (self.checkpoint)(&self.messages);
             }
             self.last_input_tokens = 0;
@@ -1012,6 +1218,7 @@ where
                             folded_messages,
                             summary_bytes: 0,
                         });
+                        self.anchor_current_world_after_compaction();
                         (self.checkpoint)(&self.messages);
                         return self.main_call();
                     }
@@ -1127,12 +1334,29 @@ where
                 call_id: call.id.clone(),
                 name: call.name.clone(),
             });
+            if let Some(observation) = recall_request_observation(call) {
+                self.observations.push(observation);
+            }
             let outcome = execute_offered_tool(self.executor, &self.input.tools, call);
             self.observations.push(LoopObservation::ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
+                self.observations
+                    .push(LoopObservation::ToolOutputTruncated {
+                        call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        policy: "middle_v1".to_owned(),
+                        output_class: "text/plain".to_owned(),
+                        result_status: outcome.status,
+                        experiment_label: "middle_v1_control".to_owned(),
+                        original_bytes,
+                        retained_bytes: outcome.content.len(),
+                        recall_id,
+                    });
+            }
             results.push(ToolResultMsg {
                 tool_call_id: call.id.clone(),
                 tool_name: call.name.clone(),
@@ -1145,6 +1369,103 @@ where
         self.step += 1;
         self.decide_next_call()
     }
+}
+
+fn normalize_media_input(
+    media: &[MediaInput],
+) -> (Vec<ImageBlock>, Vec<String>, Vec<LoopObservation>) {
+    let mut images = Vec::new();
+    let mut notices = Vec::new();
+    let mut observations = Vec::new();
+    for item in media {
+        let supported_image = matches!(
+            item.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        );
+        if supported_image {
+            if let Some(data) = item.data_base64.as_deref().filter(|data| !data.is_empty()) {
+                let derivative_hash = crate::rule_lowering::stable_hash_hex(data);
+                images.push(ImageBlock {
+                    media_type: item.media_type.clone(),
+                    data_base64: data.to_owned(),
+                });
+                observations.push(LoopObservation::MediaNormalized {
+                    artifact_ref: item.artifact_ref.clone(),
+                    media_type: item.media_type.clone(),
+                    normalization: "provider_image".to_owned(),
+                    derivative_hash: Some(derivative_hash),
+                });
+                continue;
+            }
+        }
+        let reason = if item.media_type.trim().is_empty() {
+            "media type is missing"
+        } else if supported_image {
+            "image body is unavailable"
+        } else {
+            "selected model adapter has no admitted representation for this media type"
+        };
+        notices.push(format!(
+            "[Unsupported media: artifact_ref={}, media_type={}, reason={reason}]",
+            item.artifact_ref,
+            if item.media_type.is_empty() {
+                "unknown"
+            } else {
+                &item.media_type
+            }
+        ));
+        observations.push(LoopObservation::MediaNormalized {
+            artifact_ref: item.artifact_ref.clone(),
+            media_type: item.media_type.clone(),
+            normalization: "unsupported_explicit".to_owned(),
+            derivative_hash: None,
+        });
+    }
+    (images, notices, observations)
+}
+
+fn recall_request_observation(call: &ToolCall) -> Option<LoopObservation> {
+    if call.name != "recall" {
+        return None;
+    }
+    let content_id = call
+        .arguments
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?;
+    Some(LoopObservation::RecallRequested {
+        call_id: call.id.clone(),
+        content_id: content_id.to_owned(),
+        offset: call.arguments.get("offset").and_then(Value::as_u64),
+        limit: call.arguments.get("limit").and_then(Value::as_u64),
+        experiment_label: "middle_v1_control".to_owned(),
+    })
+}
+
+fn truncation_metadata(content: &str) -> Option<(usize, Option<String>)> {
+    if let Some(marker) = content.rfind("[full `") {
+        let footer = &content[marker..];
+        let bytes_at = footer.find(" output: ")? + " output: ".len();
+        let bytes = footer[bytes_at..].split_whitespace().next()?.parse().ok()?;
+        let recall_id = footer
+            .find(", id ")
+            .map(|start| &footer[start + ", id ".len()..])
+            .and_then(|tail| tail.split_whitespace().next())
+            .map(str::to_owned);
+        return Some((bytes, recall_id));
+    }
+    let marker = content.find(" of ")?;
+    let tail = &content[marker + " of ".len()..];
+    let bytes = tail.split_whitespace().next()?.parse().ok()?;
+    let recall_id = content
+        .find("recall id=")
+        .map(|start| &content[start + "recall id=".len()..])
+        .and_then(|tail| tail.split_whitespace().next())
+        .map(|id| {
+            id.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .to_owned()
+        });
+    Some((bytes, recall_id))
 }
 
 /// Native driver for a brokered turn over an HTTP model client: run the
@@ -1345,7 +1666,7 @@ impl Compactor for TurnSummarizingCompactor {
     fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
         // Anchors: the System message + the first User message (the seeded head, or
         // the held handoff after a prior compaction) — the stable cache prefix.
-        let anchor_end = transcript.len().min(2);
+        let anchor_end = stable_anchor_end(transcript);
         let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
         // The fold region is everything between the anchors and the recent tail.
         // Nothing to fold → a no-op rewrite that disarms until the next reply.
@@ -1426,6 +1747,17 @@ fn recent_tail_start(messages: &[ChatMessage], tail_budget_bytes: usize) -> usiz
     start
 }
 
+/// Stable anchors are every leading system-plane message plus the first user
+/// message. This preserves the instruction plane and initial full world when a
+/// turn has more than one system message, while retaining the legacy two-message
+/// anchor for ordinary text-only turns.
+fn stable_anchor_end(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .position(|message| matches!(message, ChatMessage::User { .. }))
+        .map_or(messages.len(), |index| index + 1)
+}
+
 /// Strategy #2: hard-reset (no-LLM, Codex's token-budget mode). When the trigger
 /// fires, DISCARD the middle entirely — no summary, no model round — keeping only the
 /// System + first-User anchors and a byte-budgeted recent tail. The cheapest strategy:
@@ -1465,7 +1797,7 @@ impl Compactor for HardResetCompactor {
     }
 
     fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
-        let anchor_end = transcript.len().min(2);
+        let anchor_end = stable_anchor_end(transcript);
         let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
         // Nothing between anchors and tail → a no-op rewrite that disarms.
         if tail_start <= anchor_end {
@@ -1526,7 +1858,7 @@ impl Compactor for ToolResultCompactor {
     }
 
     fn plan(&self, transcript: &[ChatMessage], _stats: &CompactionStats) -> CompactionOutcome {
-        let anchor_end = transcript.len().min(2);
+        let anchor_end = stable_anchor_end(transcript);
         let tail_start = recent_tail_start(transcript, self.tail_budget_bytes).max(anchor_end);
         if tail_start <= anchor_end {
             return CompactionOutcome::Deterministic(transcript.to_vec());
@@ -1647,7 +1979,7 @@ fn is_context_overflow(error: &HarnessModelError) -> bool {
 /// whose assistant call was dropped, so the provider still accepts it. Aims to shed
 /// roughly half the middle; always keeps at least the final message.
 fn front_trim(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let anchor_end = messages.len().min(2);
+    let anchor_end = stable_anchor_end(messages);
     if messages.len() <= anchor_end + 1 {
         return messages.to_vec(); // anchors + one tail message: no progress possible
     }
@@ -2006,9 +2338,69 @@ mod tests {
             max_steps,
             resume_from: Vec::new(),
             user_images: Vec::new(),
+            user_media: Vec::new(),
+            world: None,
             context_bundles: Vec::new(),
             pinned_skills: Vec::new(),
         }
+    }
+
+    #[test]
+    fn managed_turn_projects_a_full_world_then_budget_diffs() {
+        let http = ScriptedHttpClient::new(vec![
+            Ok(tool_reply("call-1", "read")),
+            Ok(final_reply("done")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "read".to_owned(),
+        });
+        let mut turn = input(4);
+        turn.world = Some(
+            WorldSnapshot::new("turn-1")
+                .with_section(
+                    "compute",
+                    &crate::world_state::ComputeResources {
+                        max_model_rounds: Some(4),
+                        remaining_model_rounds: Some(4),
+                        ..crate::world_state::ComputeResources::default()
+                    },
+                )
+                .expect("world"),
+        );
+        let checkpoints = RefCell::new(Vec::<Vec<ChatMessage>>::new());
+        let outcome = run_brokered_turn_http(
+            &http,
+            &exec,
+            &turn,
+            &mut |messages| checkpoints.borrow_mut().push(messages.to_vec()),
+            &DummyHost,
+            &NoopCompactor,
+            None,
+            None,
+        );
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        let projections: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter_map(|observation| match observation {
+                LoopObservation::WorldProjected {
+                    epoch, projection, ..
+                } => Some((*epoch, projection.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projections, vec![(0, "full"), (1, "update")]);
+        let final_messages = checkpoints.borrow();
+        let final_messages = final_messages.last().expect("checkpoint");
+        assert!(final_messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System(text) if text.contains("<whip_world kind=\"full\"")
+        )));
+        assert!(final_messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System(text) if text.contains("<whip_world kind=\"update\"")
+        )));
     }
 
     /// A no-op checkpoint for tests that do not exercise persistence.
@@ -2663,6 +3055,68 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_uses_the_selected_compactor_once_at_a_boundary() {
+        let http = ScriptedHttpClient::new(vec![Ok(final_reply("done"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let mut turn_input = input(8);
+        turn_input.resume_from = vec![
+            ChatMessage::System("system".to_owned()),
+            ChatMessage::user_text("task"),
+            ChatMessage::Assistant {
+                text: "old-a".repeat(20),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::user_text("old-b".repeat(20)),
+            ChatMessage::user_text("recent"),
+        ];
+        turn_input.world = Some(
+            WorldSnapshot::new("turn-compact")
+                .with_section("environment", &serde_json::json!({ "timezone": "UTC" }))
+                .expect("world"),
+        );
+        let mut checkpoint = |_: &[ChatMessage]| {};
+        let (mut commands, control) = SharedCommands::new();
+        control
+            .borrow_mut()
+            .push((TurnCommandKind::Compact, user_command("compact-1", "")));
+        let compactor = HardResetCompactor::new(9, 2, 10);
+        let mut machine =
+            BrokeredTurnMachine::new(&http, &exec, &turn_input, &mut checkpoint, &compactor)
+                .with_command_source(&mut commands);
+
+        assert!(matches!(machine.step(None), Outcome::NeedsIo(_)));
+        let snapshot = machine.snapshot();
+        assert!(snapshot.applied_command_ids.contains("compact-1"));
+        assert_eq!(snapshot.compaction_epoch, 1);
+        assert!(snapshot.messages.len() < turn_input.resume_from.len());
+        assert!(snapshot.messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::System(text)
+                if text.contains("<whip_world kind=\"full\"")
+                    && text.contains("turn-compact")
+        )));
+        let outcome = match machine.step(Some(DummyHost.fulfill(&IoRequest::Http(HttpRequest {
+            url: "https://fake/model".to_owned(),
+            headers: Vec::new(),
+            body: json!({}),
+        })))) {
+            Outcome::Settle(outcome) => outcome,
+            Outcome::NeedsIo(_) => panic!("final reply should settle"),
+        };
+        assert_eq!(
+            outcome
+                .observations
+                .iter()
+                .filter(|observation| matches!(observation, LoopObservation::Compacted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn brokered_turn_machine_matches_loop_tool_then_final() {
         assert_loops_equivalent(
             || vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))],
@@ -2819,7 +3273,11 @@ mod tests {
                 }
                 LoopObservation::ModelRequest { .. }
                 | LoopObservation::Compacted { .. }
-                | LoopObservation::UserCommandApplied { .. } => {}
+                | LoopObservation::UserCommandApplied { .. }
+                | LoopObservation::WorldProjected { .. }
+                | LoopObservation::MediaNormalized { .. }
+                | LoopObservation::ToolOutputTruncated { .. }
+                | LoopObservation::RecallRequested { .. } => {}
             }
         }
     }
@@ -3027,6 +3485,46 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_media_is_model_visible_and_evidenced_instead_of_dropped() {
+        let mut turn = input(2);
+        turn.user_media = vec![MediaInput {
+            artifact_ref: "artifact:audio-1".to_owned(),
+            media_type: "audio/wav".to_owned(),
+            data_base64: Some("UklGRg==".to_owned()),
+            metadata: std::collections::BTreeMap::new(),
+        }];
+        let http = ScriptedHttpClient::new(vec![Ok(final_reply("ack"))]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: String::new(),
+        });
+        let transcript = RefCell::new(Vec::new());
+        let outcome = run_brokered_turn_http(
+            &http,
+            &exec,
+            &turn,
+            &mut |messages| *transcript.borrow_mut() = messages.to_vec(),
+            &DummyHost,
+            &NoopCompactor,
+            None,
+            None,
+        );
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert!(transcript.borrow().iter().any(|message| matches!(
+            message,
+            ChatMessage::User { text, .. }
+                if text.contains("Unsupported media")
+                    && text.contains("artifact:audio-1")
+                    && text.contains("audio/wav")
+        )));
+        assert!(outcome.observations.iter().any(|observation| matches!(
+            observation,
+            LoopObservation::MediaNormalized { artifact_ref, normalization, .. }
+                if artifact_ref == "artifact:audio-1" && normalization == "unsupported_explicit"
+        )));
+    }
+
+    #[test]
     fn checkpoint_is_invoked_during_the_loop() {
         let client =
             ScriptedClient::new(vec![Ok(tool_reply("c1", "read")), Ok(final_reply("done"))]);
@@ -3099,6 +3597,33 @@ mod tests {
         assert!(!c.should_compact(&stats(181_000, 200_000, 3)));
         // The 0-token starting/just-compacted signal never fires.
         assert!(!c.should_compact(&stats(0, 200_000, 40)));
+    }
+
+    #[test]
+    fn truncation_and_recall_observations_capture_policy_and_ranges() {
+        let native = "head\n[full `read` output: 90000 bytes, id sha256:abc — call `recall`]";
+        assert_eq!(
+            truncation_metadata(native),
+            Some((90_000, Some("sha256:abc".to_owned())))
+        );
+        let hosted =
+            "head\n[... 500 of 1000 bytes elided; recall id=blob123 for the full output ...]\ntail";
+        assert_eq!(
+            truncation_metadata(hosted),
+            Some((1_000, Some("blob123".to_owned())))
+        );
+        assert!(matches!(
+            recall_request_observation(&ToolCall {
+                id: "call".to_owned(),
+                name: "recall".to_owned(),
+                arguments: json!({"id": "blob123", "offset": 20, "limit": 40}),
+            }),
+            Some(LoopObservation::RecallRequested {
+                offset: Some(20),
+                limit: Some(40),
+                ..
+            })
+        ));
     }
 
     #[test]
