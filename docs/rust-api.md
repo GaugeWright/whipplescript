@@ -26,7 +26,14 @@ The `ResourceRef::handle` field names the capability that governance and IFC
 check. The `ResourceRef::selector` field can name one object that is local to
 the resolver, below that capability. An ephemeral image for a turn is an
 example. A selector never makes a principal for a policy. A selector never
-contains the body of a resource.
+contains the body of a resource. For file-store references, optional
+`ResourceRef::writable` attenuates that selected object to read-only when false;
+an omitted value retains the resolver's legacy access posture. On both native
+and Durable Object placements, a selector is the admitted workspace-relative
+file or directory root: every read, write, search, and virtual-shell result must
+remain beneath at least one selected root, and a mutation must also resolve to a
+writable reference. An unselected or read-only mutation is refused before any
+workspace change; unselected files are not made available to the virtual shell.
 
 The `host_runtime::GovernedHostRuntime` type is the native facade that persists:
 

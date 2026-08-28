@@ -33,7 +33,7 @@ use whipplescript_kernel::host_facade::{GovernedHostFacade, ProviderRealization}
 use whipplescript_kernel::host_package::{AuthoredAgentPackage, PackageResolver};
 use whipplescript_kernel::host_protocol::{
     EventPosition, ForkInstanceCommand, ForkedInstance, OpenInstanceCommand, PolicyEpochRef,
-    StartTurnCommand, HOST_PROTOCOL,
+    ResourceRef, StartTurnCommand, HOST_PROTOCOL,
 };
 use whipplescript_kernel::AgentThreadSeed;
 use whipplescript_store::{EffectCancellationRequest, NewEvent, RuntimeStore};
@@ -877,6 +877,27 @@ fn parse_turn_config(json: &str) -> Result<TurnContainerConfig, String> {
     })
 }
 
+fn parse_workspace_resources(json: &str) -> Result<Option<Vec<ResourceRef>>, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let Some(resources) = value.get("workspace_resources") else {
+        return Ok(None);
+    };
+    let resources: Vec<ResourceRef> = serde_json::from_value(resources.clone())
+        .map_err(|error| format!("invalid workspace_resources: {error}"))?;
+    for resource in &resources {
+        if resource.handle.trim().is_empty() || resource.kind.trim().is_empty() {
+            return Err("workspace resource handle and kind must be nonempty".to_owned());
+        }
+        if resource.selector.as_deref().is_some_and(str::is_empty) {
+            return Err("workspace resource selector must be nonempty".to_owned());
+        }
+        if resource.writable.is_some() && resource.kind != "file_store" {
+            return Err("workspace resource write attenuation requires kind file_store".to_owned());
+        }
+    }
+    Ok(Some(resources))
+}
+
 /// The durable-object instance as the Worker shell sees it.
 #[wasm_bindgen]
 pub struct WasmDurableInstance {
@@ -901,6 +922,12 @@ impl WasmDurableInstance {
         let resolved = package
             .resolve(package.version_ref())
             .map_err(|error| JsValue::from_str(&error))?;
+        let agent_workspace_resources = agent_config_json
+            .as_deref()
+            .map(parse_workspace_resources)
+            .transpose()
+            .map_err(|error| JsValue::from_str(&error))?
+            .flatten();
         let agent_model: Option<Box<dyn whipplescript_kernel::harness_loop::HttpModelClient>> =
             match agent_config_json {
                 Some(config) => Some(Box::new(
@@ -916,6 +943,7 @@ impl WasmDurableInstance {
             resolved.max_steps,
             DurableEffectPorts {
                 agent_model,
+                agent_workspace_resources,
                 agent_tool_specs: Some(resolved.tools),
                 ..DurableEffectPorts::default()
             },

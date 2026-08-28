@@ -9,9 +9,11 @@
 //! call is an in-isolate SQLite round with no `fetch` and no filesystem.
 //!
 //! The workspace IS the flat `files` table (key TEXT PRIMARY KEY, content TEXT):
-//! a path argument is the key directly, with no root-join and no path policy in
-//! v1 — the DO file plane is itself the sandbox. `ls`/`find`/`grep` therefore
-//! work over that flat key space (prefix filter + glob/substring), not a tree.
+//! a path argument is the key directly. For governed host turns the admitted
+//! `ResourceRef` selectors further attenuate that sandbox, including read-only
+//! roots; legacy authored turns retain the whole file plane. `ls`/`find`/`grep`
+//! work over the resulting flat key space (prefix filter + glob/substring), not
+//! a tree.
 //!
 //! Tool SCHEMAS mirror the native set exactly (so a program's model sees the same
 //! tools on either backend); the schemas are the contract, this is a second
@@ -33,6 +35,7 @@ use whipplescript_kernel::harness_loop::{
     ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
 use whipplescript_kernel::host_package::workspace_tool_specs_from_registry;
+use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, WorkItems};
 use whipplescript_store::RuntimeStore;
@@ -131,6 +134,13 @@ fn tracker_tool_specs() -> Vec<ToolSpec> {
 pub struct DoToolExecutor<Sql: DoSql> {
     sql: Rc<Sql>,
     key_prefix: String,
+    file_scopes: Option<Vec<DoFileScope>>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DoFileScope {
+    root: String,
+    writable: bool,
 }
 
 impl<Sql: DoSql> DoToolExecutor<Sql> {
@@ -138,6 +148,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Self {
             sql,
             key_prefix: String::new(),
+            file_scopes: None,
         }
     }
 
@@ -145,7 +156,58 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Self {
             sql,
             key_prefix: format!("{instance_id}/"),
+            file_scopes: None,
         }
+    }
+
+    /// Confine this executor to the exact file-store objects admitted for the
+    /// current host turn. A missing selector keeps the legacy whole-workspace
+    /// scope; `writable: false` attenuates every mutating tool, including bash.
+    pub fn with_resources(mut self, resources: &[ResourceRef]) -> Result<Self, String> {
+        let mut scopes = resources
+            .iter()
+            .filter(|resource| resource.kind == "file_store")
+            .map(|resource| {
+                Ok(DoFileScope {
+                    root: match resource.selector.as_deref() {
+                        Some(selector) => normalize_workspace_path(selector)?,
+                        None => String::new(),
+                    },
+                    writable: resource.writable.unwrap_or(true),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if scopes.is_empty() {
+            return Err("turn has no admitted file-store capability".to_owned());
+        }
+        scopes.sort();
+        scopes.dedup();
+        self.file_scopes = Some(scopes);
+        Ok(self)
+    }
+
+    fn path_access(&self, path: &str, write: bool) -> Result<String, String> {
+        let normalized = normalize_workspace_path(path)?;
+        let Some(scopes) = &self.file_scopes else {
+            return Ok(normalized);
+        };
+        let matching = scopes
+            .iter()
+            .filter(|scope| path_is_within(&normalized, &scope.root))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(format!(
+                "workspace path `{path}` is outside the admitted file-store selectors"
+            ));
+        }
+        if write && !matching.iter().any(|scope| scope.writable) {
+            return Err(format!("workspace path `{path}` is read-only"));
+        }
+        Ok(normalized)
+    }
+
+    fn path_writable(&self, path: &str) -> bool {
+        self.path_access(path, true).is_ok()
     }
 
     fn storage_key(&self, path: &str) -> String {
@@ -236,7 +298,11 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 "workspace contains more than the supported {MAX_FILES_WALKED} files"
             ));
         }
-        Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+        Ok(rows
+            .iter()
+            .map(|row| as_text(&row[0]))
+            .filter(|key| self.path_access(key, false).is_ok())
+            .collect())
     }
 
     /// All `files` rows as `(key, content)`, sorted and capped exactly as
@@ -268,6 +334,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         Ok(rows
             .iter()
             .map(|row| (as_text(&row[0]), as_text(&row[1])))
+            .filter(|(key, _)| self.path_access(key, false).is_ok())
             .collect())
     }
 
@@ -282,11 +349,12 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         let mut before = BTreeMap::new();
         let mut files = Vec::with_capacity(workspace.len());
         for (key, content) in workspace {
+            let writable = self.path_writable(&key);
             before.insert(key.clone(), content.clone().into_bytes());
             files.push(ShellFile {
                 path: key,
                 content: content.into_bytes(),
-                writable: true,
+                writable,
             });
         }
 
@@ -305,12 +373,23 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
                 .map_err(|_| format!("bash produced binary workspace file `{path}`"))?;
             after.insert(path, content);
         }
+        let remaining = after.keys().cloned().collect::<BTreeSet<_>>();
+        for (path, content) in &after {
+            if before.get(path).map(Vec::as_slice) != Some(content.as_bytes()) {
+                self.path_access(path, true)?;
+            }
+        }
+        for removed in before.keys().filter(|path| !remaining.contains(*path)) {
+            self.path_access(removed, true)?;
+        }
+        // The complete delta is now known to be admitted. Only now may any
+        // SQLite row change, so one invalid shell output cannot leave a partial
+        // multi-root mutation behind.
         for (path, content) in &after {
             if before.get(path).map(Vec::as_slice) != Some(content.as_bytes()) {
                 self.store_file(path, content)?;
             }
         }
-        let remaining = after.keys().cloned().collect::<BTreeSet<_>>();
         for removed in before.keys().filter(|path| !remaining.contains(*path)) {
             let storage_key = self.storage_key(removed);
             self.sql
@@ -334,9 +413,9 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     fn read(&self, args: &Value) -> Result<String, String> {
-        let path = str_arg(args, "path")?;
+        let path = self.path_access(str_arg(args, "path")?, false)?;
         let content = self
-            .file_content(path)?
+            .file_content(&path)?
             .ok_or_else(|| format!("no such file: {path}"))?;
         // Binary guard (pi-conformance): a NUL byte in the head means this is not
         // text — refuse with a clean error rather than emit garbage.
@@ -350,20 +429,20 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     }
 
     fn write(&self, args: &Value) -> Result<String, String> {
-        let path = str_arg(args, "path")?;
+        let path = self.path_access(str_arg(args, "path")?, true)?;
         let content = str_arg(args, "content")?;
-        self.store_file(path, content)?;
+        self.store_file(&path, content)?;
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
     fn edit(&self, args: &Value) -> Result<String, String> {
-        let path = str_arg(args, "path")?;
+        let path = self.path_access(str_arg(args, "path")?, true)?;
         let edits_value = edits_argument(args)?;
         let edits = edits_value
             .as_array()
             .ok_or_else(|| "`edits` must be an array".to_string())?;
         let mut content = self
-            .file_content(path)?
+            .file_content(&path)?
             .ok_or_else(|| format!("no such file: {path}"))?;
         // A UTF-8 BOM is invisible in the model's view: strip it before matching
         // so an edit anchored at the file start applies, restore it on write.
@@ -419,14 +498,15 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
         } else {
             content
         };
-        self.store_file(path, &output)?;
+        self.store_file(&path, &output)?;
         Ok(format!("applied {applied} edit(s) to {path}"))
     }
 
     /// List `files` keys under a prefix (flat-key `ls`): keys starting with the
     /// given path, or all keys when none is given. Sorted, capped.
     fn ls(&self, args: &Value) -> Result<String, String> {
-        let prefix = directory_prefix(optional_str_arg(args, "path"));
+        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
+        let prefix = directory_prefix(Some(&admitted));
         let limit = usize_arg(args, "limit").unwrap_or(500);
         let mut entries = BTreeSet::new();
         for key in self.all_keys()? {
@@ -456,7 +536,8 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// `*`-wildcard match over the key, optionally prefix-filtered by `path`.
     fn find(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let prefix = directory_prefix(optional_str_arg(args, "path"));
+        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
+        let prefix = directory_prefix(Some(&admitted));
         let limit = usize_arg(args, "limit").unwrap_or(1000);
         let mut hits: Vec<String> = self
             .all_keys()?
@@ -478,7 +559,8 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// pasted code fragment remains searchable.
     fn grep(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
-        let prefix = directory_prefix(optional_str_arg(args, "path"));
+        let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
+        let prefix = directory_prefix(Some(&admitted));
         let ignore_case = args
             .get("ignoreCase")
             .and_then(Value::as_bool)
@@ -714,6 +796,33 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
 
 fn optional_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+fn normalize_workspace_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() || path == "." {
+        return Ok(String::new());
+    }
+    if path.starts_with('/') || path.contains('\\') {
+        return Err(format!("workspace path `{path}` escapes its capability"));
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return Err(format!("workspace path `{path}` escapes its capability")),
+            component => components.push(component),
+        }
+    }
+    Ok(components.join("/"))
+}
+
+fn path_is_within(path: &str, root: &str) -> bool {
+    root.is_empty()
+        || path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Convert an optional directory argument into an unambiguous flat-key prefix.
@@ -1490,6 +1599,86 @@ mod tests {
         assert_eq!(out.status, ToolStatus::Ok);
         let read = exec.execute(&call("read", json!({ "path": "output.txt" })));
         assert_eq!(read.content, "HELLO");
+    }
+
+    #[test]
+    fn hosted_workspace_tools_honor_selectors_and_write_attenuation_atomically() {
+        let exec = executor();
+        for (path, content) in [
+            ("targets/t-a/file.txt", "a"),
+            ("targets/t-b/file.txt", "b"),
+            (".runtime/targets.json", "{}"),
+            ("outside.txt", "secret"),
+        ] {
+            let outcome = exec.execute(&call("write", json!({ "path": path, "content": content })));
+            assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+        }
+        let exec = exec
+            .with_resources(&[
+                ResourceRef {
+                    handle: "target_a".to_owned(),
+                    kind: "file_store".to_owned(),
+                    selector: Some("targets/t-a".to_owned()),
+                    writable: Some(true),
+                },
+                ResourceRef {
+                    handle: "target_b".to_owned(),
+                    kind: "file_store".to_owned(),
+                    selector: Some("targets/t-b".to_owned()),
+                    writable: Some(false),
+                },
+                ResourceRef {
+                    handle: "target_manifest".to_owned(),
+                    kind: "file_store".to_owned(),
+                    selector: Some(".runtime/targets.json".to_owned()),
+                    writable: Some(false),
+                },
+            ])
+            .expect("scoped executor");
+
+        for path in [
+            "targets/t-a/file.txt",
+            "targets/t-b/file.txt",
+            ".runtime/targets.json",
+        ] {
+            assert_eq!(
+                exec.execute(&call("read", json!({ "path": path }))).status,
+                ToolStatus::Ok
+            );
+        }
+        let outside = exec.execute(&call("read", json!({ "path": "outside.txt" })));
+        assert_eq!(outside.status, ToolStatus::Error);
+        assert!(outside.content.contains("outside the admitted"));
+
+        assert_eq!(
+            exec.execute(&call(
+                "write",
+                json!({ "path": "targets/t-a/new.txt", "content": "ok" }),
+            ))
+            .status,
+            ToolStatus::Ok
+        );
+        let read_only = exec.execute(&call(
+            "write",
+            json!({ "path": "targets/t-b/file.txt", "content": "changed" }),
+        ));
+        assert_eq!(read_only.status, ToolStatus::Error);
+        assert!(read_only.content.contains("read-only"));
+
+        let invalid_delta = exec.execute(&call(
+            "bash",
+            json!({
+                "command": "echo changed > targets/t-a/file.txt; echo leak > outside.txt"
+            }),
+        ));
+        assert_eq!(invalid_delta.status, ToolStatus::Error);
+        assert!(invalid_delta.content.contains("outside the admitted"));
+        assert_eq!(
+            exec.execute(&call("read", json!({ "path": "targets/t-a/file.txt" }),))
+                .content,
+            "a",
+            "a rejected multi-file shell delta must import nothing"
+        );
     }
 
     #[test]

@@ -639,6 +639,12 @@ struct WitnessState {
     taint: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdmittedFileScope {
+    root: PathBuf,
+    writable: bool,
+}
+
 impl NativeWorkspaceResolver {
     fn witness_write(&self, path: &str, existed: bool, content: &[u8]) {
         let mut state = self.witness.lock().expect("witness lock");
@@ -731,6 +737,59 @@ impl NativeWorkspaceResolver {
         Ok(resolved)
     }
 
+    fn admitted_file_scopes(
+        &self,
+        resources: &[ResourceRef],
+    ) -> Result<Vec<AdmittedFileScope>, String> {
+        let file_stores = resources
+            .iter()
+            .filter(|resource| resource.kind == "file_store")
+            .collect::<Vec<_>>();
+        if file_stores.is_empty() {
+            return Err("turn has no admitted file-store capability".to_owned());
+        }
+        let mut scopes = file_stores
+            .into_iter()
+            .map(|resource| {
+                let root = resource
+                    .selector
+                    .as_deref()
+                    .map(|selector| normalize_relative(Path::new(selector)))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(AdmittedFileScope {
+                    root,
+                    writable: resource.writable.unwrap_or(true),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        scopes.sort();
+        scopes.dedup();
+        Ok(scopes)
+    }
+
+    fn resolve_admitted(
+        &self,
+        path: &str,
+        write: bool,
+        scopes: &[AdmittedFileScope],
+    ) -> Result<PathBuf, String> {
+        let relative = normalize_relative(Path::new(path))?;
+        let matching = scopes
+            .iter()
+            .filter(|scope| relative.starts_with(&scope.root))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(format!(
+                "workspace path `{path}` is outside the admitted file-store selectors"
+            ));
+        }
+        if write && !matching.iter().any(|scope| scope.writable) {
+            return Err(format!("workspace path `{path}` is read-only"));
+        }
+        self.resolve(path, write)
+    }
+
     fn cap(&self, text: String) -> String {
         if text.len() <= self.max_output_bytes {
             return text;
@@ -745,10 +804,10 @@ impl NativeWorkspaceResolver {
         )
     }
 
-    fn read(&self, arguments: &Value) -> Result<String, String> {
+    fn read(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
+        let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
-        let resolved = self.resolve(path, false)?;
         let text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot read workspace path `{path}`: {error}"))?;
         let offset = arguments
@@ -771,10 +830,10 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(lines))
     }
 
-    fn write(&self, arguments: &Value) -> Result<String, String> {
+    fn write(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
         let content = string_argument(arguments, "content")?;
-        let resolved = self.resolve(path, true)?;
+        let resolved = self.resolve_admitted(path, true, scopes)?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
@@ -787,9 +846,9 @@ impl NativeWorkspaceResolver {
         Ok(format!("wrote {} bytes to {path}", content.len()))
     }
 
-    fn edit(&self, arguments: &Value) -> Result<String, String> {
+    fn edit(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = string_argument(arguments, "path")?;
-        let resolved = self.resolve(path, true)?;
+        let resolved = self.resolve_admitted(path, true, scopes)?;
         let mut text = fs::read_to_string(&resolved)
             .map_err(|error| format!("cannot edit workspace path `{path}`: {error}"))?;
         let edits = arguments
@@ -813,10 +872,10 @@ impl NativeWorkspaceResolver {
         Ok(format!("applied {} edit(s) to {path}", edits.len()))
     }
 
-    fn list(&self, arguments: &Value) -> Result<String, String> {
+    fn list(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
-        let resolved = self.resolve(path, false)?;
         let mut names = fs::read_dir(&resolved)
             .map_err(|error| format!("cannot list workspace path `{path}`: {error}"))?
             .filter_map(Result::ok)
@@ -832,11 +891,11 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(names.join("\n")))
     }
 
-    fn find(&self, arguments: &Value) -> Result<String, String> {
+    fn find(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
-        let resolved = self.resolve(path, false)?;
         let mut matches = Vec::new();
         walk_workspace(&self.root, &resolved, &mut |relative, _| {
             if wildcard_matches(pattern, relative) {
@@ -848,12 +907,12 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(matches.join("\n")))
     }
 
-    fn grep(&self, arguments: &Value) -> Result<String, String> {
+    fn grep(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let resolved = self.resolve_admitted(path, false, scopes)?;
         self.witness_read(path);
         let pattern = string_argument(arguments, "pattern")?;
         let matcher = regex::Regex::new(pattern).ok();
-        let resolved = self.resolve(path, false)?;
         let mut matches = Vec::new();
         walk_workspace(&self.root, &resolved, &mut |relative, absolute| {
             let Ok(text) = fs::read_to_string(absolute) else {
@@ -876,7 +935,7 @@ impl NativeWorkspaceResolver {
         Ok(self.cap(matches.join("\n")))
     }
 
-    fn bash(&self, arguments: &Value) -> Result<String, String> {
+    fn bash(&self, arguments: &Value, scopes: &[AdmittedFileScope]) -> Result<String, String> {
         let command = string_argument(arguments, "command")?.trim();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
@@ -892,40 +951,65 @@ impl NativeWorkspaceResolver {
         }
 
         let mut before = BTreeMap::new();
-        let mut files = Vec::new();
+        let mut admitted_files = BTreeMap::new();
         let mut load_error = None;
-        walk_workspace(&self.root, &self.root, &mut |relative, absolute| {
-            if files.len() >= 5_000 {
-                load_error = Some("bash workspace contains more than 5000 files".to_owned());
-                return false;
-            }
-            match fs::read(absolute) {
-                Ok(content) => {
-                    let relative = relative.replace('\\', "/");
-                    let path = Path::new(&relative);
-                    let writable = !self
-                        .read_only
-                        .iter()
-                        .any(|protected| path.starts_with(protected));
-                    before.insert(relative.clone(), content.clone());
-                    files.push(ShellFile {
-                        path: relative,
-                        content,
-                        writable,
-                    });
-                    true
+        let mut roots = scopes
+            .iter()
+            .map(|scope| {
+                if scope.root.as_os_str().is_empty() {
+                    Ok(self.root.clone())
+                } else {
+                    self.resolve(&scope.root.to_string_lossy(), false)
                 }
-                Err(error) => {
-                    load_error = Some(format!(
-                        "cannot load bash workspace file `{relative}`: {error}"
-                    ));
-                    false
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            walk_workspace(&self.root, &root, &mut |relative, absolute| {
+                if admitted_files.len() >= 5_000 {
+                    load_error = Some("bash workspace contains more than 5000 files".to_owned());
+                    return false;
                 }
+                match fs::read(absolute) {
+                    Ok(content) => {
+                        admitted_files.insert(relative.replace('\\', "/"), content);
+                        true
+                    }
+                    Err(error) => {
+                        load_error = Some(format!(
+                            "cannot load bash workspace file `{relative}`: {error}"
+                        ));
+                        false
+                    }
+                }
+            })?;
+            if load_error.is_some() {
+                break;
             }
-        })?;
+        }
         if let Some(error) = load_error {
             return Err(error);
         }
+        let files = admitted_files
+            .iter()
+            .map(|(relative, content)| {
+                let path = Path::new(relative);
+                let writable = scopes
+                    .iter()
+                    .any(|scope| scope.writable && path.starts_with(&scope.root))
+                    && !self
+                        .read_only
+                        .iter()
+                        .any(|protected| path.starts_with(protected));
+                before.insert(relative.clone(), content.clone());
+                ShellFile {
+                    path: relative.clone(),
+                    content: content.clone(),
+                    writable,
+                }
+            })
+            .collect();
 
         let output = WhipShell::default().execute(ShellRequest {
             command: command.to_owned(),
@@ -936,7 +1020,7 @@ impl NativeWorkspaceResolver {
         // workspace. This preserves the same capability and read-only ceilings
         // as the first-class file tools.
         for (path, content) in &output.files {
-            let resolved = self.resolve(path, true)?;
+            let resolved = self.resolve_admitted(path, true, scopes)?;
             if let Some(parent) = resolved.parent() {
                 reject_symlinks_between(&self.root, parent, path)?;
             }
@@ -944,7 +1028,7 @@ impl NativeWorkspaceResolver {
         }
         let after_paths = output.files.keys().cloned().collect::<BTreeSet<_>>();
         for removed in before.keys().filter(|path| !after_paths.contains(*path)) {
-            let resolved = self.resolve(removed, true)?;
+            let resolved = self.resolve_admitted(removed, true, scopes)?;
             fs::remove_file(&resolved).map_err(|error| {
                 format!("cannot delete bash workspace path `{removed}`: {error}")
             })?;
@@ -954,7 +1038,7 @@ impl NativeWorkspaceResolver {
             if before.get(path) == Some(content) {
                 continue;
             }
-            let resolved = self.resolve(path, true)?;
+            let resolved = self.resolve_admitted(path, true, scopes)?;
             if let Some(parent) = resolved.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("cannot create parent for `{path}`: {error}"))?;
@@ -1000,19 +1084,15 @@ impl ResourceResolver for NativeWorkspaceResolver {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String> {
-        if !admitted_resources
-            .iter()
-            .any(|resource| resource.kind == "file_store")
-        {
-            return Err("turn has no admitted file-store capability".to_owned());
-        }
+        let scopes = self.admitted_file_scopes(admitted_resources)?;
+        let scopes = scopes.as_slice();
         match call.name.as_str() {
-            "read" => self.read(&call.arguments),
-            "write" => self.write(&call.arguments),
-            "edit" => self.edit(&call.arguments),
-            "ls" => self.list(&call.arguments),
-            "find" => self.find(&call.arguments),
-            "grep" => self.grep(&call.arguments),
+            "read" => self.read(&call.arguments, scopes),
+            "write" => self.write(&call.arguments, scopes),
+            "edit" => self.edit(&call.arguments, scopes),
+            "ls" => self.list(&call.arguments, scopes),
+            "find" => self.find(&call.arguments, scopes),
+            "grep" => self.grep(&call.arguments, scopes),
             "bash" => {
                 if !admitted_resources
                     .iter()
@@ -1020,7 +1100,7 @@ impl ResourceResolver for NativeWorkspaceResolver {
                 {
                     return Err("turn has no admitted command capability".to_owned());
                 }
-                self.bash(&call.arguments)
+                self.bash(&call.arguments, scopes)
             }
             _ => Err("tool has no native workspace implementation".to_owned()),
         }
@@ -3229,10 +3309,11 @@ fn certified_output_flow(command: &StartTurnCommand) -> Vec<CertifiedOutputField
     let mut reads = command.resources.clone();
     reads.extend(command.input.images.iter().cloned());
     reads.sort_by(|left, right| {
-        (&left.handle, &left.kind, &left.selector).cmp(&(
+        (&left.handle, &left.kind, &left.selector, &left.writable).cmp(&(
             &right.handle,
             &right.kind,
             &right.selector,
+            &right.writable,
         ))
     });
     reads.dedup();
@@ -4213,6 +4294,7 @@ workflow UnsafeHostChat {
                 handle: "project".to_owned(),
                 kind: "file_store".to_owned(),
                 selector: None,
+                writable: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "model".to_owned(),
@@ -4307,6 +4389,7 @@ workflow UnsafeHostChat {
                         handle: "project".to_owned(),
                         kind: "file_store".to_owned(),
                         selector: None,
+                        writable: None,
                     }],
                 },
                 CertifiedOutputFieldFlow {
@@ -4315,6 +4398,7 @@ workflow UnsafeHostChat {
                         handle: "project".to_owned(),
                         kind: "file_store".to_owned(),
                         selector: None,
+                        writable: None,
                     }],
                 },
             ]
@@ -4692,6 +4776,7 @@ workflow UnsafeHostChat {
             handle: "project".to_owned(),
             kind: "file_store".to_owned(),
             selector: None,
+            writable: None,
         }];
 
         let read = resolver
@@ -4749,6 +4834,97 @@ workflow UnsafeHostChat {
     }
 
     #[test]
+    fn native_workspace_tools_honor_every_file_store_selector() {
+        let root = std::env::temp_dir().join(format!(
+            "whip-native-selectors-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("targets/t-a")).expect("target a");
+        fs::create_dir_all(root.join("targets/t-b")).expect("target b");
+        fs::create_dir_all(root.join(".runtime")).expect("runtime");
+        fs::write(root.join("targets/t-a/a.txt"), "a").expect("a");
+        fs::write(root.join("targets/t-b/b.txt"), "b").expect("b");
+        fs::write(root.join(".runtime/targets.json"), "{}").expect("manifest");
+        fs::write(root.join("outside.txt"), "secret").expect("outside");
+        let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
+        let resources = [
+            ResourceRef {
+                handle: "target-a".to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some("targets/t-a".to_owned()),
+                writable: Some(true),
+            },
+            ResourceRef {
+                handle: "target-b".to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some("targets/t-b".to_owned()),
+                writable: Some(true),
+            },
+            ResourceRef {
+                handle: "target-manifest".to_owned(),
+                kind: "file_store".to_owned(),
+                selector: Some(".runtime/targets.json".to_owned()),
+                writable: Some(false),
+            },
+            ResourceRef {
+                handle: "command".to_owned(),
+                kind: "command".to_owned(),
+                selector: None,
+                writable: None,
+            },
+        ];
+        let call = |name: &str, arguments: Value| ToolCall {
+            id: format!("{name}-selector-test"),
+            name: name.to_owned(),
+            arguments,
+        };
+
+        resolver
+            .execute_tool(
+                &resources,
+                &call("read", json!({ "path": ".runtime/targets.json" })),
+            )
+            .expect("manifest is explicitly admitted");
+        resolver
+            .execute_tool(
+                &resources,
+                &call(
+                    "write",
+                    json!({ "path": "targets/t-b/new.txt", "content": "candidate" }),
+                ),
+            )
+            .expect("selected target is writable");
+        for call in [
+            call("read", json!({ "path": "outside.txt" })),
+            call("ls", json!({ "path": "." })),
+            call(
+                "write",
+                json!({ "path": "outside-new.txt", "content": "escape" }),
+            ),
+            call(
+                "bash",
+                json!({ "command": "echo escape > outside-new.txt" }),
+            ),
+        ] {
+            assert!(
+                resolver.execute_tool(&resources, &call).is_err(),
+                "{} must remain inside admitted selectors",
+                call.name
+            );
+        }
+        assert!(!root.join("outside-new.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("outside.txt")).expect("outside unchanged"),
+            "secret"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn native_command_tool_is_governed_virtual_bash() {
         let root = std::env::temp_dir().join(format!(
             "whip-native-command-{}-{}",
@@ -4767,6 +4943,7 @@ workflow UnsafeHostChat {
             handle: "project".to_owned(),
             kind: "file_store".to_owned(),
             selector: None,
+            writable: None,
         }];
         let admitted = [
             project_only[0].clone(),
@@ -4774,6 +4951,7 @@ workflow UnsafeHostChat {
                 handle: "command".to_owned(),
                 kind: "command".to_owned(),
                 selector: None,
+                writable: None,
             },
         ];
         let call = |command: &str| ToolCall {
@@ -5131,6 +5309,7 @@ workflow HostChat {
             handle: "command".to_owned(),
             kind: "command".to_owned(),
             selector: None,
+            writable: None,
         });
         let turn4 = runtime
             .run_turn_with_driver(

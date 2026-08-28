@@ -4001,6 +4001,13 @@ export class WorkflowInstance implements DurableObject {
           wire: binding.wire,
           session_id: instanceId,
           cache_key: String(request.command.command_id ?? ""),
+          // The same admitted resource references drive the in-isolate tool
+          // executor. WhippleScript, not this Worker, interprets selectors and
+          // write attenuation; the shell only carries the validated command.
+          workspace_resources:
+            Array.isArray(request.command.resources) && request.command.resources.length > 0
+              ? request.command.resources
+              : undefined,
         }),
       );
       const driven = await this.driveInstance(

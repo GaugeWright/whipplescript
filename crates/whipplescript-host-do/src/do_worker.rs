@@ -18,6 +18,7 @@
 
 use whipplescript_kernel::coerce_native::CoerceProvider;
 use whipplescript_kernel::harness_loop::{HttpModelClient, ToolExecutor};
+use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::sansio::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::{idempotency_key, ProgramVersionInput, RuntimeKernel};
@@ -89,6 +90,10 @@ pub struct DurableEffectPorts {
     pub coerce: Option<ResolvedCoercionConfig>,
     pub agent_model: Option<Box<dyn HttpModelClient>>,
     pub agent_tools: Option<Box<dyn ToolExecutor>>,
+    /// Exact file-store references admitted for this host turn. When present,
+    /// the default in-isolate executor serves only these selectors and honors
+    /// their write attenuation.
+    pub agent_workspace_resources: Option<Vec<ResourceRef>>,
     pub agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8).
     pub exec: Option<ExecutorSidecarConfig>,
@@ -123,6 +128,7 @@ pub struct DurableInstance<Sql: DoSql> {
     coerce: Option<ResolvedCoercionConfig>,
     agent_model: Option<Box<dyn HttpModelClient>>,
     agent_tools: Box<dyn ToolExecutor>,
+    agent_workspace_resources: Option<Vec<ResourceRef>>,
     agent_tool_specs: Option<Vec<whipplescript_kernel::harness_loop::ToolSpec>>,
     exec: Option<ExecutorSidecarConfig>,
     turn: Option<TurnContainerConfig>,
@@ -190,6 +196,19 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         let default_files: Box<dyn FileStore> = Box::new(DoFileStore::new(
             DoSqlStorage::for_instance(Rc::clone(&sql), instance_id),
         ));
+        let agent_tools = match ports.agent_tools {
+            Some(tools) => tools,
+            None => {
+                let executor =
+                    crate::do_tools::DoToolExecutor::for_instance(Rc::clone(&sql), instance_id);
+                match ports.agent_workspace_resources.as_deref() {
+                    Some(resources) => {
+                        Box::new(executor.with_resources(resources)?) as Box<dyn ToolExecutor>
+                    }
+                    None => Box::new(executor) as Box<dyn ToolExecutor>,
+                }
+            }
+        };
         Ok(Self {
             kernel: Some(kernel),
             ir,
@@ -200,12 +219,8 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             files: ports.files.unwrap_or(default_files),
             coerce: ports.coerce,
             agent_model: ports.agent_model,
-            agent_tools: ports.agent_tools.unwrap_or_else(|| {
-                Box::new(crate::do_tools::DoToolExecutor::for_instance(
-                    Rc::clone(&sql),
-                    instance_id,
-                ))
-            }),
+            agent_tools,
+            agent_workspace_resources: ports.agent_workspace_resources,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -495,6 +510,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             agent_tools: ports
                 .agent_tools
                 .unwrap_or_else(|| Box::new(crate::do_tools::DoToolExecutor::new(Rc::clone(&sql)))),
+            agent_workspace_resources: ports.agent_workspace_resources,
             agent_tool_specs: ports.agent_tool_specs,
             exec: ports.exec,
             turn: ports.turn,
@@ -598,6 +614,7 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
             coerce: self.coerce.as_ref(),
             agent_model: self.agent_model.as_deref(),
             agent_tools: self.agent_tools.as_ref(),
+            agent_workspace_resources: self.agent_workspace_resources.as_deref(),
             agent_tool_specs: self.agent_tool_specs.as_deref(),
             exec: self.exec.as_ref(),
             turn: self.turn.as_ref(),

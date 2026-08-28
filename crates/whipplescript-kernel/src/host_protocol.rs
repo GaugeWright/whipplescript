@@ -65,6 +65,11 @@ pub struct ResourceRef {
     /// new policy principal or carrying its body in the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    /// Optional host capability attenuation for a selected file-store object.
+    /// `false` makes the selected object readable but not writable on every
+    /// placement. `None` preserves the resolver's legacy access posture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable: Option<bool>,
 }
 
 /// A credential-free provider binding. Secret material is resolved ephemerally
@@ -261,6 +266,11 @@ impl StartTurnCommand {
             if let Some(selector) = &resource.selector {
                 nonempty("resource selector", selector)?;
             }
+            if resource.writable.is_some() && resource.kind != "file_store" {
+                return Err(ProtocolError::Invalid(
+                    "resource write attenuation requires kind file_store",
+                ));
+            }
         }
         Ok(())
     }
@@ -411,6 +421,7 @@ mod tests {
                 handle: "gaugedesk:resource:project".to_owned(),
                 kind: "file_store".to_owned(),
                 selector: None,
+                writable: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),
@@ -431,6 +442,29 @@ mod tests {
         assert!(!json.contains("resource body"));
         let decoded: StartTurnCommand = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn resource_write_attenuation_is_backward_compatible_and_file_store_only() {
+        let legacy: ResourceRef = serde_json::from_str(
+            r#"{"handle":"project","kind":"file_store","selector":"targets/t-a"}"#,
+        )
+        .expect("legacy resource ref");
+        assert_eq!(legacy.writable, None);
+
+        let mut invalid = command();
+        invalid.resources.push(ResourceRef {
+            handle: "command".to_owned(),
+            kind: "command".to_owned(),
+            selector: None,
+            writable: Some(false),
+        });
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProtocolError::Invalid(
+                "resource write attenuation requires kind file_store"
+            ))
+        ));
     }
 
     #[test]

@@ -43,6 +43,7 @@ use whipplescript_kernel::harness_loop::{
     BrokeredTurnMachine, BrokeredTurnOutcome, BrokeredTurnSnapshot, ChatMessage, HttpModelClient,
     ImageBlock, PendingTurnCommand, ToolExecutor, TurnCommandKind, TurnCommandSource, TurnStatus,
 };
+use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::instance_machine::{EffectStep, InstanceDriver};
 use whipplescript_kernel::rule_lowering::json_from_str;
 use whipplescript_kernel::rule_pass::step_instance_generic;
@@ -309,6 +310,9 @@ pub struct DoInstanceDriver<'a, Sql: DoSql> {
     /// DO brokers these as HTTP to a sidecar; tests inject a fake.
     pub agent_tools: &'a dyn ToolExecutor,
     pub agent_tool_specs: Option<&'a [whipplescript_kernel::harness_loop::ToolSpec]>,
+    /// Exact host-turn workspace references used by implicit context discovery
+    /// as well as explicit tools. `None` is the legacy authored-instance view.
+    pub agent_workspace_resources: Option<&'a [ResourceRef]>,
     /// Executor-sidecar wiring for Class-A exec effects (compute plane P8), or
     /// `None` if no sidecar is configured (an `exec.command` then errors).
     pub exec: Option<&'a ExecutorSidecarConfig>,
@@ -338,6 +342,7 @@ impl<Sql: DoSql> TurnCommandSource for DoTurnCommandSource<Sql> {
 fn discover_workspace_skills<Sql: DoSql>(
     sql: &Sql,
     instance_id: &str,
+    resources: Option<&[ResourceRef]>,
 ) -> Result<Vec<SkillCatalogueEntry>, StoreError> {
     let prefix = format!("{instance_id}/");
     let rows = sql
@@ -350,6 +355,9 @@ fn discover_workspace_skills<Sql: DoSql>(
     let mut skills = Vec::new();
     for row in rows {
         let path = crate::do_store::as_text(&row[0]);
+        if !workspace_path_is_admitted(resources, &path) {
+            continue;
+        }
         let body = crate::do_store::as_text(&row[1]);
         let Some(parent) = path.rsplit_once('/').map(|(parent, _)| parent) else {
             continue;
@@ -370,6 +378,24 @@ fn discover_workspace_skills<Sql: DoSql>(
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     skills.dedup_by(|left, right| left.name == right.name);
     Ok(skills)
+}
+
+fn workspace_path_is_admitted(resources: Option<&[ResourceRef]>, path: &str) -> bool {
+    let Some(resources) = resources else {
+        return true;
+    };
+    resources
+        .iter()
+        .filter(|resource| resource.kind == "file_store")
+        .any(|resource| match resource.selector.as_deref() {
+            None => true,
+            Some(root) => {
+                path == root
+                    || path
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+        })
 }
 
 /// Durable-object delivery governance. The mock DO is ungoverned (no envelope in
@@ -850,7 +876,11 @@ impl<Sql: DoSql + Clone> InstanceDriver for DoInstanceDriver<'_, Sql> {
                     .agent_tool_specs
                     .map(<[_]>::to_vec)
                     .unwrap_or_else(crate::do_tools::do_tool_specs);
-                let skills = discover_workspace_skills(&self.kernel.store().sql, self.instance_id)?;
+                let skills = discover_workspace_skills(
+                    &self.kernel.store().sql,
+                    self.instance_id,
+                    self.agent_workspace_resources,
+                )?;
                 if !skills.is_empty() && tools.iter().any(|tool| tool.name == "read") {
                     bundles.push(ContextBundle::new(
                         BundleKind::AvailableSkills,
@@ -1769,6 +1799,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
+            agent_workspace_resources: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -1933,6 +1964,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
+            agent_workspace_resources: None,
             exec: Some(&exec_cfg),
             turn: None,
             ir: &ir,
@@ -2103,6 +2135,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
+            agent_workspace_resources: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -2218,6 +2251,7 @@ mod tests {
             agent_model: Some(&model),
             agent_tools: &NoTools,
             agent_tool_specs: None,
+            agent_workspace_resources: None,
             exec: None,
             turn: None,
             ir: &ir,
@@ -2360,6 +2394,22 @@ mod tests {
                 ],
             )
             .expect("skill file seeds");
+        kernel
+            .store()
+            .sql
+            .execute(
+                "INSERT INTO files (key, content) VALUES (?1, ?2)",
+                &[
+                    crate::do_store::SqlValue::Text(format!(
+                        "{instance_id}/private/skills/hidden/SKILL.md"
+                    )),
+                    crate::do_store::SqlValue::Text(
+                        "---\nname: hidden\ndescription: Must not cross a selector.\n---\n"
+                            .to_owned(),
+                    ),
+                ],
+            )
+            .expect("out-of-scope skill file seeds");
 
         let model = CapturingModel {
             systems: RefCell::new(Vec::new()),
@@ -2369,6 +2419,12 @@ mod tests {
         let tool_specs = whipplescript_kernel::host_package::workspace_tool_specs_from_registry(
             true, false, false,
         );
+        let workspace_resources = [ResourceRef {
+            handle: "skills".to_owned(),
+            kind: "file_store".to_owned(),
+            selector: Some(".agents/skills/theo".to_owned()),
+            writable: Some(false),
+        }];
         let driver = DoInstanceDriver {
             kernel,
             files: &NoFiles,
@@ -2376,6 +2432,7 @@ mod tests {
             agent_model: Some(&model),
             agent_tools: &NoTools,
             agent_tool_specs: Some(&tool_specs),
+            agent_workspace_resources: Some(&workspace_resources),
             exec: None,
             turn: None,
             ir: &ir,
@@ -2408,6 +2465,7 @@ mod tests {
             system.contains("<skill name=\"theo\" location=\".agents/skills/theo/SKILL.md\">"),
             "{system}"
         );
+        assert!(!system.contains("name=\"hidden\""), "{system}");
         assert!(system.contains("Explain Theory A."), "{system}");
 
         // One context.bundle provenance row rode the Phase 1 seam.
@@ -2560,6 +2618,7 @@ mod tests {
             agent_model: None,
             agent_tools: &NoTools,
             agent_tool_specs: None,
+            agent_workspace_resources: None,
             exec: None,
             turn: Some(&turn_cfg),
             ir: &ir,
