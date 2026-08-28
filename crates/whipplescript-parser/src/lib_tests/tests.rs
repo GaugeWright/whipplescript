@@ -12609,6 +12609,139 @@ rule j
     );
 }
 
+fn mint_program(parent: &str, presents: &str, extra: &str) -> CompileOutput {
+    compile_program(&format!(
+        r#"
+@service
+workflow MintScopedToken
+
+use std.custody
+use std.ingress
+
+credential stripe_api {{ kind bearer }}
+{extra}
+
+signal charge.disputed {{ note string }}
+
+output result R
+class R {{ v string }}
+rule scoped
+  when charge.disputed as charge
+=> {{
+  mint credential from {parent} {{
+    at POST "https://connect.stripe.com/oauth/token"
+    header "Authorization" basic {presents}
+    body "grant_type=client_credentials&scope=charges:write"
+    token at "access_token"
+    public ["expires_in"]
+  }} as token
+
+  after token succeeds {{
+    complete result {{ v "minted" }}
+  }}
+}}
+"#
+    ))
+}
+
+#[test]
+fn a_mint_carries_its_exchange_and_declares_no_scope() {
+    // DR-0053 §5 as amended. The exchange is the author's; the vendor scope is
+    // a body field because that is what it is, and there is no `scope` clause
+    // beside it that could say something different.
+    let compiled = mint_program("stripe_api", "stripe_api", "");
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "{:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("compiles");
+    let node = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.effects.iter())
+        .find(|effect| effect.kind == IrEffectKind::MintCredential)
+        .expect("the mint lowers to an effect node");
+    let mint = node.mint_credential.as_ref().expect("payload");
+    assert_eq!(mint.parent, "stripe_api");
+    assert_eq!(mint.token_path, "access_token");
+    assert_eq!(mint.public_paths, vec!["expires_in".to_owned()]);
+    // The parent is a MARKED SLOT, so the exchange presents it without any
+    // expression ever yielding material.
+    assert_eq!(mint.exchange.slot_count(), 1);
+}
+
+#[test]
+fn a_mint_must_present_the_credential_it_mints_from() {
+    // The confusion worth refusing: the child inherits `{parent}`'s ceiling by
+    // name, so an exchange spending a DIFFERENT credential would produce a
+    // child bounded by an authority it was never derived from.
+    let compiled = mint_program(
+        "stripe_api",
+        "other_key",
+        "credential other_key { kind basic }",
+    );
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("but the exchange presents `other_key`")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+#[test]
+fn a_mint_from_an_undeclared_credential_is_refused() {
+    let compiled = mint_program("ghost", "ghost", "");
+    assert!(
+        compiled.diagnostics.iter().any(|d| d
+            .message
+            .contains("mints from undeclared credential `ghost`")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+#[test]
+fn a_mint_exchange_must_say_where_the_token_is() {
+    // Defaulting to a conventional name would guess one vendor's spelling on
+    // every vendor's behalf, and a wrong guess is a mint that silently finds
+    // nothing.
+    let compiled = compile_program(
+        r#"
+@service
+workflow MintNoPath
+
+use std.custody
+
+credential stripe_api { kind bearer }
+
+output result R
+class R { v string }
+signal go.now { x string }
+rule scoped
+  when go.now as g
+=> {
+  mint credential from stripe_api {
+    at POST "https://issuer/token"
+    header "Authorization" basic stripe_api
+  } as token
+
+  after token succeeds { complete result { v "ok" } }
+}
+"#,
+    );
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("must say where the token is")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
 #[test]
 fn a_secret_carries_its_credential_kind() {
     // DR-0053 §15. The kind-conditioned checks are name-keyed, and every one

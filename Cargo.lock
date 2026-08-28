@@ -2203,6 +2203,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "url",
+ "whipplescript-core",
 ]
 
 [[package]]

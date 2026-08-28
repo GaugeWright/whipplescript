@@ -5,6 +5,67 @@ follow [Semantic Versioning](https://semver.org). Dates are UTC.
 
 ## [Unreleased]
 
+### Added
+
+- **`mint credential from <parent> { … }`** (DR-0053 §5, as amended
+  2026-08-27) — spend a credential at an issuer's token endpoint for a scoped
+  child. The exchange is the author's, in the block form `request` established;
+  the custodian executes it so the minted token never enters whip. Three
+  refusals: an undeclared parent, an exchange presenting nothing, and an
+  exchange presenting a different credential than the one minted from.
+
+- **A minted credential can never reach further than the credential it was
+  minted from** (DR-0053 §5, as amended 2026-08-27).
+
+  The custodian registers a mint as `{parent}/mint-{fingerprint}` and credential
+  names are `/`-separated, so the egress ceiling now walks up the name. Nearest
+  ancestor wins, so governance can narrow one mint further by naming it without
+  restating the parent's list — and a governed-but-unscoped parent bounds its
+  mints at nothing, rather than letting a child be the way around the ceiling.
+
+  This is what `mint` is bounded by instead of a declared scope. `scope` and
+  `ttl` are gone from `CustodyOp::Mint`: both were accepted and ignored
+  (`_scope`, `let _ = ttl_secs`), both are vendor protocol, and both belong in
+  the exchange body that actually goes on the wire. A clause beside the body
+  duplicating it is the separate modifier §5 refuses for credentials — and the
+  divergence was unresolvable, since §3 keeps the custodian from parsing the
+  body, so a declared scope could never be checked against the exchanged one.
+
+  whip therefore does not police which scope a mint *requests* — that string's
+  meaning lives inside the vendor — and keeps the guarantee it can verify.
+
+- **A credential's egress reach is bounded by governance** (DR-0053 §14, as
+  amended 2026-08-27).
+
+  ```text
+  grant credential stripe_api -> credential:acme/stripe-live sealed at hardware
+  grant request    stripe_api for POST https://api.stripe.com/v1/refunds/*
+  ```
+
+  §14 grounded scope narrowing in the *turn* grant, which attaches only to
+  `tell` and `invoke`. The rule-body `request` — the one construct that reaches
+  the custodian — had no list to consult, and an agent had no custody surface,
+  so the turn clause parsed, passed its class check, and bound nothing.
+
+  The ceiling now lives in the signed envelope, where it binds regardless of
+  which construct uses the credential and no program text can widen it. It is
+  in the canonical form, so the signature covers it. Refused at check time for
+  a literal URL and at egress always. It applies once governance *binds* the
+  credential; a policy that never mentions one does not constrain it.
+
+  Matching is component-wise against a parsed URL: `*` never crosses from host
+  into path, and userinfo cannot impersonate a host. A leading `*` must stand
+  for a whole label — `*.stripe.com` is the subdomain wildcard, `*stripe.com`
+  is refused because it reads as narrowed while admitting `evil-stripe.com`.
+
+- **Agents can make authenticated requests, narrowed by their turn grant.** A
+  `credential_request` tool is offered only to a turn whose grant lists
+  `request` on a credential, and enumerates exactly those credentials. A call
+  is admitted only when the turn's globs *and* the envelope's scope both admit
+  it — a turn narrows, never widens, the same way a file-store turn grant sits
+  under the store's own `allow` globs. The material never enters the agent's
+  process: the turn names a credential and the custodian substitutes at egress.
+
 ### Fixed
 
 - **A filed tracker issue was invisible to the information-flow checker.**

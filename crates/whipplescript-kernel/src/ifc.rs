@@ -165,6 +165,15 @@ pub struct Envelope {
     /// answers *may this program decrypt*; the labels answer *where may the
     /// plaintext go*, and only the second is a composition question.
     unwrap_grants: Vec<UnwrapGrant>,
+    /// DR-0053 §14 as amended 2026-08-27: a credential's egress allow-list,
+    /// keyed by the credential handle as written. This is the CEILING — it
+    /// binds a credential's reach regardless of which construct uses it, and a
+    /// turn grant narrows beneath it rather than beside it.
+    ///
+    /// Absent is not the same as empty. An absent list means governance never
+    /// said where this credential may reach, which the caller treats as a
+    /// refusal for a governed program; an empty one cannot be written.
+    request_scopes: BTreeMap<String, Vec<String>>,
     /// signal resources (`signal:<name>`) governance marks INTERNAL (H8 stage b): an
     /// internal signal is an internal channel, NOT an external entry point, so its
     /// integrity at a receiver is DERIVED from its emitters (carriage) rather than
@@ -341,6 +350,7 @@ impl Envelope {
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
+        let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -598,6 +608,26 @@ impl Envelope {
                 });
             }
         }
+        // The canonical form of the egress allow-list. Parsed through the same
+        // `egress::parse_scope` the DSL uses, so a JSON envelope cannot carry
+        // an entry the DSL would refuse.
+        if let Some(object) = value.get("request_scopes").and_then(|d| d.as_object()) {
+            for (credential, entries) in object {
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("invalid IFC envelope: {problem}"))?;
+                let Some(items) = entries.as_array() else {
+                    return Err("invalid IFC envelope: request_scopes values must be arrays".into());
+                };
+                let raw: Vec<String> = items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                whipplescript_custody::egress::parse_scope(&raw.join(","))
+                    .map_err(|problem| format!("invalid IFC envelope: request scope: {problem}"))?;
+                request_scopes.insert(credential.clone(), raw);
+            }
+        }
         if let Some(pairs) = value.get("declassifications").and_then(|d| d.as_array()) {
             for pair in pairs {
                 if let Some(items) = pair.as_array() {
@@ -637,6 +667,7 @@ impl Envelope {
             governed,
             deleg,
             declassify,
+            request_scopes,
             integrity,
             endorse,
             unwrap_grants,
@@ -673,6 +704,7 @@ impl Envelope {
         let mut deleg = Vec::new();
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
+        let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -785,6 +817,49 @@ impl Envelope {
                     payload_type: payload_type.to_owned(),
                     role: qualify_role(role, authority_ref),
                 });
+                continue;
+            }
+            // `grant request <Credential> for <entry>[, <entry> …]` (DR-0053 §14
+            // as amended 2026-08-27) — the egress allow-list. Entries are
+            // comma-separated because one entry carries an optional method and
+            // a url, and whitespace already separates this DSL's tokens.
+            //
+            // No `to <Role>`: reach is a property of the credential, not of who
+            // holds it. Conflating them would make one clause answer two
+            // questions and neither of them well.
+            //
+            // Matched before the generic `grant <kind> <handle> -> <address>`
+            // arm for the same reason `unwrap` is: there is no `->` on this
+            // line, so the generic arm would reject it complaining about a
+            // resource id it does not want.
+            if tokens.first().copied() == Some("grant") && tokens.get(1).copied() == Some("request")
+            {
+                let (Some(credential), Some("for")) =
+                    (tokens.get(2).copied(), tokens.get(3).copied())
+                else {
+                    return Err(format!(
+                        "line {}: request grant needs \
+                         `grant request <Credential> for <entry>[, <entry> …]` \
+                         (DR-0053 §14: the list is required, not a default)",
+                        index + 1
+                    ));
+                };
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                let raw = tokens[4..].join(" ");
+                // Parsed HERE, as the policy is admitted, so a malformed or
+                // over-promising entry is an error the operator sees when they
+                // write it rather than a silent never-match at egress.
+                whipplescript_custody::egress::parse_scope(&raw)
+                    .map_err(|problem| format!("line {}: request grant: {problem}", index + 1))?;
+                request_scopes
+                    .entry(credential.to_owned())
+                    .or_default()
+                    .extend(
+                        raw.split(',')
+                            .map(|entry| entry.trim().to_owned())
+                            .filter(|entry| !entry.is_empty()),
+                    );
                 continue;
             }
             // `require mcp <rung>` sets the minimum MCP trust rung (design note
@@ -1069,6 +1144,7 @@ impl Envelope {
             governed,
             deleg,
             declassify,
+            request_scopes,
             integrity,
             endorse,
             unwrap_grants,
@@ -1237,6 +1313,18 @@ impl Envelope {
                             "role": grant.role,
                         })
                     })
+                    .collect(),
+            );
+        }
+        // The egress allow-list MUST be covered for the same reason the unwrap
+        // grants are: a scope outside the signature is a reach anyone holding
+        // the file could widen. Emitted only when present, so an envelope that
+        // grants no request scope keeps its existing hash.
+        if !self.request_scopes.is_empty() {
+            canonical["request_scopes"] = serde_json::Value::Object(
+                self.request_scopes
+                    .iter()
+                    .map(|(credential, entries)| (credential.clone(), serde_json::json!(entries)))
                     .collect(),
             );
         }
@@ -1581,6 +1669,69 @@ impl Envelope {
         self.mcp_min_rung
     }
 
+    /// A credential's egress allow-list, or `None` when governance never named
+    /// one (DR-0053 §14 as amended). `None` and `Some(empty)` are different
+    /// answers and only the first is reachable: an empty list cannot be
+    /// written, so the caller reading `None` knows governance was silent
+    /// rather than restrictive.
+    pub fn request_scope(&self, credential: &str) -> Option<&[String]> {
+        // A minted credential is registered under its parent —
+        // `{parent}/mint-{fingerprint}` — and `CredentialName` is
+        // `/`-separated segments, so the namespace is genuinely hierarchical.
+        // Walking up it is what makes the property hold: a minted credential
+        // can never reach further than the credential it was minted from
+        // (DR-0053 §5 Amendment 2026-08-27).
+        //
+        // Nearest ancestor wins, so governance may narrow one child further by
+        // naming it, without having to restate the parent's list.
+        for probe in credential_ancestors(credential) {
+            if let Some(entries) = self
+                .request_scopes
+                .get(probe)
+                .or_else(|| self.request_scopes.get(self.resolve(probe)))
+            {
+                return Some(entries.as_slice());
+            }
+        }
+        None
+    }
+
+    /// Whether this policy admits `method url` under `credential` — the one
+    /// question the egress boundary asks.
+    ///
+    /// A governed policy that names no scope for the credential refuses. That
+    /// is §14's "the list is required" read as an admission rule rather than a
+    /// well-formedness one: a credential nobody scoped is a credential nobody
+    /// said may reach anywhere.
+    pub fn admits_request(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
+        let Some(entries) = self.request_scope(credential) else {
+            // Governance that never mentions this credential does not constrain
+            // it, exactly as an unlabelled resource is the public bottom rather
+            // than a refusal. Taking a credential under management is what
+            // obliges a policy to be complete about it: once `grant credential
+            // X -> …` exists, silence about reach is an omission rather than a
+            // decision, and the fail-closed reading is the right one.
+            // Governance that binds the PARENT binds its mints too, or a
+            // minted child would be the way around a ceiling.
+            if !credential_ancestors(credential).any(|probe| self.governs(probe)) {
+                return Ok(());
+            }
+            return Err(format!(
+                "governance binds credential `{credential}` but names no egress scope for it: \
+                 add `grant request {credential} for <method> <url-glob>` to the policy"
+            ));
+        };
+        let target = whipplescript_custody::egress::EgressTarget::parse(method, url)?;
+        let parsed = whipplescript_custody::egress::parse_scope(&entries.join(","))?;
+        if whipplescript_custody::egress::admits(&parsed, &target) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{}` is outside the egress scope governance grants credential `{credential}`",
+            target.render()
+        ))
+    }
+
     /// The minimum credential sealing rung this policy requires, if any
     /// (DR-0053 §4). Compared against the rung the custodian derives and
     /// reports on every reply — a reply below the floor is refused.
@@ -1691,6 +1842,18 @@ impl Envelope {
         }
         granted && self.dominates(&raised, &self.integrity_sink(write))
     }
+}
+
+/// A credential name and each of its `/`-separated ancestors, nearest first:
+/// `acme/stripe/mint-a1` yields `acme/stripe/mint-a1`, `acme/stripe`, `acme`.
+///
+/// The hierarchy is not a convention this reads into the name — the custodian
+/// registers a minted credential as `{parent}/mint-{fingerprint}`, so the
+/// parent is structurally present in the child.
+fn credential_ancestors(credential: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(credential), |probe| {
+        probe.rfind('/').map(|cut| &probe[..cut])
+    })
 }
 
 /// Render a compartment set for diagnostics: `public` (the bottom) when empty, else
@@ -2722,6 +2885,18 @@ impl VerifiedEnvelope {
     /// any (DR-0053 §4).
     pub fn credential_min_rung(&self) -> Option<whipplescript_custody::Rung> {
         self.envelope.credential_min_rung()
+    }
+
+    /// A credential's egress allow-list under this verified policy, or `None`
+    /// when governance named none (DR-0053 §14 as amended). The CEILING: a turn
+    /// grant narrows beneath it and cannot widen it.
+    pub fn request_scope(&self, credential: &str) -> Option<&[String]> {
+        self.envelope.request_scope(credential)
+    }
+
+    /// Whether this verified policy admits `method url` under `credential`.
+    pub fn admits_request(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
+        self.envelope.admits_request(credential, method, url)
     }
 
     /// The custody class this verified policy demands of any endpoint delegated
@@ -3953,6 +4128,33 @@ pub fn check_with_envelope_imports(
                         reads.push(resource);
                         writes.push(resource);
                         span.get_or_insert(effect.span);
+                        // The governance ceiling, refused at CHECK time when
+                        // the URL is a literal (DR-0053 §14 as amended). An
+                        // interpolated URL is not knowable here and is refused
+                        // at egress instead; this catches what it can prove,
+                        // which is the common case and the better diagnostic.
+                        if let Some(request) = effect.http_request.as_ref() {
+                            if !request.url.contains("{{") {
+                                if let Err(problem) =
+                                    envelope.admits_request(resource, &request.method, &request.url)
+                                {
+                                    diagnostics.push(Diagnostic {
+                                        span: effect.span,
+                                        message: format!(
+                                            "denied egress in rule `{}`: {problem}",
+                                            rule.name
+                                        ),
+                                        suggestion: Some(format!(
+                                            "add `grant request {resource} for {} {}` to the \
+                                             policy, or point the request inside the scope it \
+                                             already grants",
+                                            request.method, request.url
+                                        )),
+                                        related: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -11927,6 +12129,150 @@ rule refund
     }
 
     #[test]
+    fn governance_bounds_where_a_credential_may_reach() {
+        // DR-0053 §14 as amended: the CEILING lives in the signed envelope, so
+        // it binds regardless of which construct uses the credential.
+        let ir = program("charge.note");
+        let scoped = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds\n",
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(scoped))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages.iter().all(|m| !m.contains("denied egress")),
+            "a request inside its granted scope must compile: {messages:#?}"
+        );
+
+        // The same program under a scope that names a different path.
+        let narrow = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/charges\n",
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(narrow))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        let denial = messages
+            .iter()
+            .find(|m| m.contains("denied egress"))
+            .unwrap_or_else(|| panic!("out-of-scope egress must be refused: {messages:#?}"));
+        assert!(denial.contains("api.stripe.com/v1/refunds"), "{denial}");
+    }
+
+    #[test]
+    fn a_credential_governance_never_scoped_may_not_reach_at_all() {
+        // §14's "the list is required", read as an admission rule. A governed
+        // policy that binds the credential but never says where it may reach
+        // refuses — silence is not permission.
+        let ir = program("charge.note");
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n",
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope))
+            .into_iter()
+            .map(|d| d.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("denied egress") && m.contains("names no egress scope")),
+            "{messages:#?}"
+        );
+    }
+
+    #[test]
+    fn a_minted_credential_inherits_its_parents_ceiling() {
+        // DR-0053 §5 Amendment: the property the whole mint ruling rests on.
+        // whip does not police the vendor scope a mint REQUESTS — that string's
+        // meaning lives inside the vendor — but it does bound where the
+        // resulting token may go, and the bound is the parent's.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds/*\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+
+        // The child the custodian registers, which governance never named.
+        let child = "stripe_api/mint-a1b2c3d4";
+        assert!(verified
+            .admits_request(child, "POST", "https://api.stripe.com/v1/refunds/re_1")
+            .is_ok());
+        // And it reaches no further than its parent could.
+        let refused = verified
+            .admits_request(child, "POST", "https://api.stripe.com/v1/charges")
+            .expect_err("outside the parent's ceiling");
+        assert!(refused.contains("outside the egress scope"), "{refused}");
+
+        // A parent that is governed but unscoped refuses its mints too, or the
+        // child would be the way around the ceiling.
+        let unscoped = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n",
+        )
+        .expect("valid envelope");
+        let error = VerifiedEnvelope::for_test(unscoped)
+            .admits_request(child, "POST", "https://api.stripe.com/v1/refunds/re_1")
+            .expect_err("an unscoped parent bounds its mints at nothing");
+        assert!(error.contains("names no egress scope"), "{error}");
+    }
+
+    #[test]
+    fn a_child_may_be_narrowed_further_than_its_parent() {
+        // Nearest ancestor wins, so governance can tighten one mint without
+        // restating the parent's list — and cannot accidentally widen it,
+        // because the child's own line is the only thing that overrides.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for https://api.stripe.com/v1/*\n\
+             grant request stripe_api/mint-a1b2c3d4 for GET https://api.stripe.com/v1/charges\n",
+        )
+        .expect("valid envelope");
+        let verified = VerifiedEnvelope::for_test(envelope);
+        let child = "stripe_api/mint-a1b2c3d4";
+        assert!(verified
+            .admits_request(child, "GET", "https://api.stripe.com/v1/charges")
+            .is_ok());
+        // The parent's wider list does not leak back down to the named child.
+        assert!(verified
+            .admits_request(child, "POST", "https://api.stripe.com/v1/refunds")
+            .is_err());
+        // The parent itself keeps its own, wider, list.
+        assert!(verified
+            .admits_request("stripe_api", "POST", "https://api.stripe.com/v1/refunds")
+            .is_ok());
+    }
+
+    #[test]
+    fn the_egress_scope_is_covered_by_the_signature() {
+        // A scope outside the signature is a reach anyone holding the file
+        // could widen, which is the same reason the unwrap grants are covered.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential stripe_api -> credential:acme/stripe-live sealed at hardware\n\
+             grant request stripe_api for POST https://api.stripe.com/v1/refunds/*\n",
+        )
+        .expect("valid envelope");
+        let canonical = envelope.to_canonical_json().to_string();
+        assert!(canonical.contains("request_scopes"), "{canonical}");
+        assert!(
+            canonical.contains("api.stripe.com/v1/refunds/*"),
+            "{canonical}"
+        );
+    }
+
+    #[test]
     fn a_request_is_an_egress_sink_the_checker_can_see() {
         // The credential is the sink identity: it is the resource the program
         // declares and the one governance grants by identity.
@@ -12030,12 +12376,19 @@ rule refund
     fn a_cleared_endpoint_still_compiles() {
         // The refusal has to be about the LABEL, not about `request` existing.
         // Without this the fix above could be "deny every request" and pass.
+        //
+        // Both dimensions must clear: the reader set for the confidentiality
+        // flow, and the egress scope for where the credential may reach. They
+        // are independent, and this is the case where each is satisfied.
         let ir = program("charge.note");
         let envelope = Envelope::from_json(
             r#"{ "resources": {
                 "signal:charge.disputed": { "confidential": true },
                 "stripe_api": { "reader": "confidential" },
                 "result": { "reader": "confidential" }
+            },
+            "request_scopes": {
+                "stripe_api": ["POST https://api.stripe.com/v1/refunds"]
             } }"#,
         )
         .expect("valid envelope");

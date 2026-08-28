@@ -1903,6 +1903,8 @@ pub struct IrEffectNode {
     pub exec_target: Option<IrExecTarget>,
     /// Present exactly on `IrEffectKind::HttpRequest`.
     pub http_request: Option<IrHttpRequest>,
+    /// Present exactly on `IrEffectKind::MintCredential`.
+    pub mint_credential: Option<IrMintCredential>,
 }
 
 /// The two `exec` source forms (spec/std-script.md): a raw command string
@@ -1924,6 +1926,19 @@ pub struct IrHttpRequest {
     pub body: Option<String>,
     /// `signed with <handle>` — canonicalized and signed custodian-side.
     pub signed_with: Option<String>,
+}
+
+/// DR-0053 §5 as amended: a credential exchange. The exchange itself reuses
+/// `IrHttpRequest` because it IS one — the same headers, the same marked slots,
+/// the same body — and only the extraction is new.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrMintCredential {
+    /// The credential the exchange spends, and whose egress ceiling the minted
+    /// child inherits.
+    pub parent: String,
+    pub exchange: IrHttpRequest,
+    pub token_path: String,
+    pub public_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2009,6 +2024,9 @@ pub enum IrEffectKind {
     /// Authenticated outbound HTTP (DR-0053 §5). Distinct from `web`, which is
     /// a GET-only unauthenticated harness tool rather than language surface.
     HttpRequest,
+    /// DR-0053 §5 as amended: a credential exchange, custodian-executed so the
+    /// minted token never enters this process.
+    MintCredential,
     TrackerFile,
     TrackerClaim,
     TrackerRenew,
@@ -4065,6 +4083,16 @@ fn effect_contract_for_kind(
             strings(&["effect.output"]),
             TypedOutputValidation::RuntimeBoundary,
         ),
+        IrEffectKind::MintCredential => (
+            "std.custody",
+            strings(&["mint"]),
+            Some("custody.mint.input"),
+            Some("custody.mint.output"),
+            strings(&["custody.mint"]),
+            strings(&["custodian"]),
+            strings(&["effect.output"]),
+            TypedOutputValidation::RuntimeBoundary,
+        ),
         IrEffectKind::TrackerFile => (
             "std.tracker",
             strings(&["file"]),
@@ -4245,6 +4273,7 @@ impl IrEffectKind {
             Self::TimerWait => "timer.wait",
             Self::ExecCommand => "exec.command",
             Self::HttpRequest => "custody.request",
+            Self::MintCredential => "custody.mint",
             Self::TrackerFile => "tracker.file",
             Self::TrackerClaim => "tracker.claim",
             Self::TrackerRenew => "tracker.renew",
@@ -9460,6 +9489,7 @@ fn analyze_rule(
                 selected_by: None,
                 exec_target: None,
                 http_request: None,
+                mint_credential: None,
             });
         }
     }
@@ -10493,6 +10523,7 @@ fn terminal_completed_payload_type(
         IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
         IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
+        | IrEffectKind::MintCredential
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -10994,6 +11025,7 @@ fn ir_effect_kind_for_body(kind: &body::BodyEffectKind) -> IrEffectKind {
         body::BodyEffectKind::Timer { .. } => IrEffectKind::TimerWait,
         body::BodyEffectKind::Exec { .. } => IrEffectKind::ExecCommand,
         body::BodyEffectKind::HttpRequest { .. } => IrEffectKind::HttpRequest,
+        body::BodyEffectKind::MintCredential { .. } => IrEffectKind::MintCredential,
         // DR-0053 §11 files a tracker item; it is not a custody OPERATION, so
         // it lowers onto the tracker-file effect kind rather than minting a
         // kind whose only difference is which fields the handler adds.
@@ -11082,6 +11114,79 @@ fn workflow_target_for_body(kind: &body::BodyEffectKind) -> Option<String> {
 /// check-time gates classify exec effects without re-scanning rule-body text.
 /// Walk every `request` in a rule body, including inside `after` blocks and
 /// `case` arms — an unauthenticated request nested in a branch is still one.
+/// DR-0053 §5 as amended. Three refusals, and each closes a way the exchange
+/// could quietly not mean what it says.
+fn validate_mint_credential(
+    rule: &RuleDecl,
+    effect: &body::EffectStmt,
+    declared_credentials: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let body::BodyEffectKind::MintCredential {
+        parent, headers, ..
+    } = &effect.kind
+    else {
+        return;
+    };
+    if !declared_credentials.contains(parent.as_str()) {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: effect.span,
+            message: format!(
+                "rule `{}` mints from undeclared credential `{parent}`",
+                rule.name.name
+            ),
+            suggestion: Some(format!(
+                "declare it: `credential {parent} {{ kind bearer }}`"
+            )),
+        });
+    }
+    let presented: BTreeSet<&str> = headers
+        .iter()
+        .filter_map(|header| match &header.value {
+            body::RequestHeaderValue::Credential { handle, .. } => Some(handle.as_str()),
+            body::RequestHeaderValue::Expr { .. } => None,
+        })
+        .collect();
+    // An exchange that presents NOTHING spends nothing: a token endpoint would
+    // refuse it, and more to the point the mint would not be an exercise of the
+    // parent's authority at all.
+    if presented.is_empty() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: effect.span,
+            message: format!(
+                "rule `{}` mints from `{parent}` without presenting it",
+                rule.name.name
+            ),
+            suggestion: Some(format!(
+                "present the parent at a marked slot: `header \"Authorization\" basic {parent}`"
+            )),
+        });
+    }
+    // Presenting a DIFFERENT credential is the confusion worth naming: the
+    // child inherits `{parent}`'s ceiling by name, so an exchange spending some
+    // other credential would produce a child bounded by an authority it was
+    // never derived from.
+    for handle in presented {
+        if handle != parent {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: effect.span,
+                message: format!(
+                    "rule `{}` mints from `{parent}` but the exchange presents `{handle}`",
+                    rule.name.name
+                ),
+                suggestion: Some(
+                    "a mint spends exactly the credential it mints from — the child inherits \
+                     that parent's egress ceiling through its name"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+}
+
 fn validate_http_requests(
     rule: &RuleDecl,
     statements: &[body::BodyStmt],
@@ -11093,6 +11198,7 @@ fn validate_http_requests(
             body::BodyStmt::Effect(effect) => {
                 validate_http_request(rule, effect, declared_credentials, diagnostics);
                 validate_obtain_credential(rule, effect, declared_credentials, diagnostics);
+                validate_mint_credential(rule, effect, declared_credentials, diagnostics);
             }
             body::BodyStmt::After(after) => {
                 validate_http_requests(rule, &after.body, declared_credentials, diagnostics)
@@ -11212,6 +11318,52 @@ fn validate_http_request(
             ),
         });
     }
+}
+
+fn mint_credential_for_body(kind: &body::BodyEffectKind) -> Option<IrMintCredential> {
+    let body::BodyEffectKind::MintCredential {
+        parent,
+        method,
+        url,
+        headers,
+        body,
+        token_path,
+        public_paths,
+    } = kind
+    else {
+        return None;
+    };
+    Some(IrMintCredential {
+        parent: parent.clone(),
+        exchange: IrHttpRequest {
+            method: method.clone(),
+            url: url.clone(),
+            headers: headers
+                .iter()
+                .map(|header| IrRequestHeader {
+                    name: header.name.clone(),
+                    value: match &header.value {
+                        body::RequestHeaderValue::Credential {
+                            presentation,
+                            handle,
+                        } => IrRequestHeaderValue::Credential {
+                            presentation: presentation.as_str().to_owned(),
+                            handle: handle.clone(),
+                        },
+                        body::RequestHeaderValue::Expr { source, .. } => {
+                            IrRequestHeaderValue::Expr(source.clone())
+                        }
+                    },
+                })
+                .collect(),
+            body: body.as_ref().map(|(source, _)| source.clone()),
+            // A mint's exchange is never `signed with`: it presents the parent
+            // at a marked slot, which is what spending a credential means here.
+            signed_with: None,
+        },
+        token_path: token_path.clone(),
+        public_paths: public_paths.clone(),
+    })
 }
 
 fn http_request_for_body(kind: &body::BodyEffectKind) -> Option<IrHttpRequest> {
@@ -11383,6 +11535,8 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
             // `request … { … } as x` closes its `as` on the block line, the
             // same shape as `send via`, so the line scanner cannot see it.
             | body::BodyEffectKind::HttpRequest { .. }
+            // `mint credential from … { … } as x` closes the same way.
+            | body::BodyEffectKind::MintCredential { .. }
             | body::BodyEffectKind::Decide { .. }
             | body::BodyEffectKind::TrackerFile { .. }
             | body::BodyEffectKind::ObtainCredential { .. }
@@ -11567,6 +11721,7 @@ fn walk_effects(
                 let declassified = declassified_for_body(&effect.kind);
                 let exec_target = exec_target_for_body(&effect.kind);
                 let http_request = http_request_for_body(&effect.kind);
+                let mint_credential = mint_credential_for_body(&effect.kind);
                 effects.push(IrEffectNode {
                     id,
                     kind,
@@ -11590,6 +11745,7 @@ fn walk_effects(
                     selected_by: case_stack.last().cloned(),
                     exec_target,
                     http_request,
+                    mint_credential,
                 });
             }
             body::BodyStmt::After(after) => {
@@ -14365,6 +14521,7 @@ fn effect_binding_schema(
         IrEffectKind::AgentTell
         | IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
+        | IrEffectKind::MintCredential
         | IrEffectKind::EventEmit
         | IrEffectKind::WorkflowInvoke
         | IrEffectKind::TimerWait
@@ -15289,6 +15446,21 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
             for header in headers {
                 // A credential header is a MARKED SLOT the custodian fills
                 // (DR-0053 §5); it carries a handle, never a binding.
+                if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
+                    collect_expr_binding_roots(expr, out);
+                }
+            }
+            if let Some((_, expr)) = body {
+                collect_expr_binding_roots(expr, out);
+            }
+        }
+        // A mint's exchange reaches the same durable outbox row a request's
+        // does, and carries the same shapes.
+        body::BodyEffectKind::MintCredential {
+            url, headers, body, ..
+        } => {
+            source(url, out);
+            for header in headers {
                 if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
                     collect_expr_binding_roots(expr, out);
                 }
@@ -16562,7 +16734,8 @@ fn check_conditioned_effect_reads(
                 expression(&field.source, diagnostics);
             }
         }
-        body::BodyEffectKind::HttpRequest { headers, body, .. } => {
+        body::BodyEffectKind::MintCredential { headers, body, .. }
+        | body::BodyEffectKind::HttpRequest { headers, body, .. } => {
             // A credential slot is a handle, not an expression — it never
             // reaches the expression checker, which is the point: there is no
             // expression that yields material.

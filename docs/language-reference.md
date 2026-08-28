@@ -2187,6 +2187,89 @@ The credential must be declared. An escalation naming an undeclared handle is a
 check error: it would ask a human for a credential no rule can ever use, and
 the escalation would look answered while changing nothing.
 
+### Minting a scoped child
+
+A `mint` spends a credential at an issuer's token endpoint and gets a child
+handle back. The exchange is the token request you would have written anyway:
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+mint credential from stripe_api {
+  at POST "https://connect.stripe.com/oauth/token"
+  header "Authorization" basic stripe_api
+  body "grant_type=client_credentials&scope=charges:write"
+  token at "access_token"
+  public ["expires_in"]
+} as token
+```
+
+The custodian executes the exchange, so the minted token never enters whip. The
+binding carries the child's handle, its fingerprint, and whatever `public`
+names — no field on it yields material.
+
+There is no `scope` clause and no `ttl` clause. Both are vendor protocol and
+both belong in the body, which is the only place they can be true: a clause
+beside the body could say something the body does not, and nothing could tell,
+because the custodian does not read the body.
+
+What bounds a mint is **the parent's egress ceiling, which the child inherits**.
+The child is registered beneath its parent, so the scope lookup walks up the
+name and the guarantee is one sentence: a minted credential can never reach
+further than the credential it was minted from. Governance may narrow one child
+further by naming it; the nearest ancestor wins.
+
+Three refusals: minting from an undeclared credential, an exchange that
+presents nothing, and an exchange that presents a *different* credential than
+the one being minted from — the last because the child inherits the named
+parent's ceiling, so spending another credential would produce a child bounded
+by an authority it was never derived from.
+
+### Where a credential may reach
+
+The signed envelope bounds a credential's egress. The clause sits beside the
+binding and applies to every construct that uses the credential — a rule-body
+`request`, an agent turn, anything later:
+
+```text
+grant credential stripe_api -> credential:acme/stripe-live sealed at hardware
+grant request    stripe_api for POST https://api.stripe.com/v1/refunds/*,
+                                 GET  https://api.stripe.com/v1/charges/*
+```
+
+Each entry is `[METHOD ]scheme://host/path`; entries are separated by commas,
+and a missing method matches any. There is no `to <role>` clause: reach is a
+property of the credential, not of who holds it.
+
+A request outside the scope is refused — at check time when the URL is a
+literal, and at egress always, because an interpolated URL is not knowable to
+the compiler. The clause applies once governance *binds* the credential; a
+policy that never mentions one does not constrain it.
+
+Matching is component-wise against a parsed URL. Method, scheme, host and path
+each match their own part, so `*` never crosses from the host into the path,
+and the host of `https://api.stripe.com@evil.example/v1` is `evil.example`. A
+leading `*` in a host must stand for a whole label: `*.stripe.com` is the
+subdomain wildcard; `*stripe.com` is a check error, because it reads as
+narrowed to that host while admitting `evil-stripe.com`.
+
+An agent turn narrows beneath that ceiling, and never widens it:
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+tell deployer
+  with access to credential stripe_api {
+    request ["POST https://api.stripe.com/v1/refunds/*"]
+  }
+"Refund the disputed charge."
+```
+
+The turn is then offered a `credential_request` tool naming exactly the
+credentials it was granted. A call is admitted only when both the turn's globs
+and the envelope's scope admit it — the same relationship a turn's file-store
+grant has with the store's own `allow` globs. The material never enters the
+agent's process: the turn names a credential, and the custodian substitutes at
+egress.
+
 ### The sealing rung and the governance floor
 
 The custodian seals material at a rung that it derives from evidence:

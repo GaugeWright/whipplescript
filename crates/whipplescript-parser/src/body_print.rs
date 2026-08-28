@@ -129,6 +129,44 @@ pub(crate) fn print_effect(
                 .unwrap_or_default();
             format!("request {method} {url:?}{block}{signed}")
         }
+        BodyEffectKind::MintCredential {
+            parent,
+            method,
+            url,
+            headers,
+            body,
+            token_path,
+            public_paths,
+        } => {
+            let mut lines = vec![format!("    at {method} {url:?}")];
+            for header in headers {
+                let value = match &header.value {
+                    body::RequestHeaderValue::Credential {
+                        presentation,
+                        handle,
+                    } => format!("{} {}", presentation.as_str(), rn(handle)),
+                    body::RequestHeaderValue::Expr { source, .. } => rn(source),
+                };
+                lines.push(format!("    header {:?} {value}", header.name));
+            }
+            if let Some((source, _)) = body {
+                lines.push(format!("    body {}", rn(source)));
+            }
+            lines.push(format!("    token at {token_path:?}"));
+            if !public_paths.is_empty() {
+                let paths = public_paths
+                    .iter()
+                    .map(|path| format!("{path:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("    public [{paths}]"));
+            }
+            format!(
+                "mint credential from {} {{\n{}\n  }}",
+                rn(parent),
+                lines.join("\n")
+            )
+        }
         BodyEffectKind::Tell {
             target,
             access_grants,

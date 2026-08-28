@@ -190,6 +190,48 @@ fn file_tool_specs_for_turn(
 /// The web tools ride the `with access to web { search fetch }` grant only
 /// (per the accepted design notes): search is provider-resolved at call
 /// time, fetch is structurally GET-only behind the central guard.
+pub const TOOL_CREDENTIAL_REQUEST: &str = "credential_request";
+
+/// The agent-facing custody surface (DR-0053 §14). Offered only to a turn whose
+/// grant lists `request` on at least one credential, and the credentials it may
+/// name are exactly those — so a turn granted nothing sees no tool at all,
+/// rather than a tool that always refuses.
+///
+/// This is what makes §14's turn grant mean something. Before it, an agent had
+/// no way to reach `CustodyOp::Request`, so the narrowing clause parsed, passed
+/// its class check, and bound nothing.
+fn credential_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    if access.credentials.is_empty() {
+        return Vec::new();
+    }
+    let handles: Vec<String> = access.credentials.scopes.keys().cloned().collect();
+    vec![ToolSpec {
+        name: TOOL_CREDENTIAL_REQUEST.into(),
+        description: format!(
+            "Send an authenticated HTTP request under a credential this turn was granted \
+             ({}). The material never enters this process and no response reveals it: the \
+             custodian substitutes at egress. Requests outside the granted scope are refused.",
+            handles.join(", ")
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "credential": { "type": "string", "enum": handles },
+                "method": { "type": "string" },
+                "url": { "type": "string" },
+                "headers": {
+                    "type": "object",
+                    "description": "extra headers; the credential header is added by the custodian",
+                    "additionalProperties": { "type": "string" }
+                },
+                "body": { "type": "string" }
+            },
+            "required": ["credential", "method", "url"],
+            "additionalProperties": false
+        }),
+    }]
+}
+
 fn web_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
     let mut specs = Vec::new();
     if access.web_search {
@@ -348,6 +390,10 @@ pub struct FileToolExecutor {
     /// `None` preserves direct/test executor behavior; live owned turns install
     /// `Some` so tracker mutations are bound to `with access to tracker { ... }`.
     tracker_access: Option<TurnTrackerAccess>,
+    /// Per-credential egress narrowing for this turn (DR-0053 §14). `None` =
+    /// no grant, so the tool is not offered and any call refuses — direct and
+    /// test executors never expose it.
+    credential_access: Option<TurnCredentialAccess>,
     /// Per-pool memory authority (MEM-5). `None` = deny (direct/test
     /// executors never expose the memory tools).
     memory_access: Option<TurnMemoryAccess>,
@@ -458,6 +504,59 @@ struct TurnToolAccess {
     /// resource, exactly like a memory pool; the operations are raw tool/role
     /// names resolved against the live manifest at turn setup.
     mcp: crate::mcp_tools::McpTurnAccess,
+    /// `with access to credential <name> { request ["<glob>", …] }` — DR-0053
+    /// §14's turn-grant narrowing, which until now bound nothing because an
+    /// agent had no custody surface to narrow. It is a narrowing BENEATH the
+    /// governance ceiling, never beside it: the envelope says where a
+    /// credential may reach at all, and this says where this turn may take it.
+    credentials: TurnCredentialAccess,
+}
+
+/// Per-credential egress narrowing for one turn, keyed by the handle as the
+/// grant writes it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TurnCredentialAccess {
+    scopes: BTreeMap<String, Vec<String>>,
+}
+
+impl TurnCredentialAccess {
+    fn grant(&mut self, credential: &str, globs: Vec<String>) {
+        self.scopes
+            .entry(credential.to_owned())
+            .or_default()
+            .extend(globs);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// Whether this turn may take `credential` to `target`, and why not when it
+    /// may not. The governance ceiling is a separate question asked after this
+    /// one — a turn grant can only narrow.
+    fn admits(
+        &self,
+        credential: &str,
+        target: &whipplescript_custody::egress::EgressTarget,
+    ) -> Result<(), String> {
+        let Some(entries) = self.scopes.get(credential) else {
+            return Err(format!(
+                "this turn was granted no `request` on credential `{credential}`"
+            ));
+        };
+        // §14 requires the list on a narrowable operation, and the checker
+        // refuses a bare one, so an empty list here is unreachable rather than
+        // a wildcard. Treating it as "everything" would be the over-promise
+        // that rule exists to prevent.
+        let parsed = whipplescript_custody::egress::parse_scope(&entries.join(","))?;
+        if whipplescript_custody::egress::admits(&parsed, &target.clone()) {
+            return Ok(());
+        }
+        Err(format!(
+            "`{}` is outside this turn's grant on credential `{credential}`",
+            target.render()
+        ))
+    }
 }
 
 impl TurnToolAccess {
@@ -467,6 +566,7 @@ impl TurnToolAccess {
             file_resources: Vec::new(),
             command_run: false,
             tracker: TurnTrackerAccess::deny_all(),
+            credentials: TurnCredentialAccess::default(),
             memory: TurnMemoryAccess::deny_all(),
             web_search: false,
             web_fetch: false,
@@ -848,6 +948,7 @@ impl FileToolExecutor {
             web_search_granted: false,
             web_fetch_granted: false,
             tracker_access: None,
+            credential_access: None,
             memory_access: None,
             mcp: None,
             workflow_tools: Vec::new(),
@@ -1072,6 +1173,7 @@ impl FileToolExecutor {
         self.web_fetch_granted = access.web_fetch;
         self.tracker_access = Some(access.tracker);
         self.memory_access = Some(access.memory);
+        self.credential_access = Some(access.credentials);
         self
     }
 
@@ -1192,6 +1294,7 @@ impl FileToolExecutor {
             TOOL_BASH => self.bash(args),
             TOOL_WEB_SEARCH => self.web_search(args),
             TOOL_WEB_FETCH => self.web_fetch(args),
+            TOOL_CREDENTIAL_REQUEST => self.credential_request(args),
             TOOL_RECALL_MEMORY => self.recall_memory(args),
             TOOL_LEARN_MEMORY => self.learn_memory(args),
             TOOL_READ => self.read(args),
@@ -2079,6 +2182,119 @@ impl FileToolExecutor {
             .file_item(&queue, content, "", &[], &json!({}), Some(&holder))
             .map_err(|error| format!("file_item: {error:?}"))?;
         Ok(json!({ "id": item.id }).to_string())
+    }
+
+    /// DR-0053 §14: an authenticated request from inside a turn.
+    ///
+    /// Two ceilings, intersected, in the order that makes the diagnostic
+    /// useful: this turn's grant first (what the author asked for), then the
+    /// governance scope (what the envelope allows at all). A turn grant can
+    /// only narrow — it never widens the envelope, which is the same
+    /// relationship a file-store turn grant has with the store's own `allow`
+    /// globs.
+    fn credential_request(&self, args: &Value) -> Result<String, String> {
+        let credential = args
+            .get("credential")
+            .and_then(Value::as_str)
+            .ok_or("credential_request needs a `credential`")?;
+        let method = args
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or("credential_request needs a `method`")?;
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("credential_request needs a `url`")?;
+        let target = whipplescript_custody::egress::EgressTarget::parse(method, url)?;
+
+        // Ceiling 1: this turn's grant.
+        let Some(access) = self.credential_access.as_ref() else {
+            return Err("this turn was granted no credential".to_owned());
+        };
+        access.admits(credential, &target)?;
+        // Ceiling 2: the signed envelope. A REJECTED policy is an error rather
+        // than a silent "no scope" — a tampered policy must not read as a
+        // permissive one.
+        match crate::ifc::VerifiedEnvelope::load_from_env() {
+            crate::ifc::EnvelopeStatus::Ungoverned => {}
+            crate::ifc::EnvelopeStatus::Rejected(message) => {
+                return Err(format!("governance envelope rejected: {message}"))
+            }
+            crate::ifc::EnvelopeStatus::Verified(verified) => {
+                verified.admits_request(credential, method, url)?;
+            }
+        }
+
+        let name = whipplescript_custody::CredentialName::new(credential)
+            .map_err(|error| format!("credential name: {error}"))?;
+        let mut headers: Vec<(String, String)> = args
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|text| (key.clone(), text.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The credential slot is added HERE rather than accepted from the
+        // model: a sentinel the turn could write is a sentinel the turn could
+        // aim at a header the author never designated.
+        headers.push((
+            "Authorization".to_owned(),
+            whipplescript_custody::Sentinel {
+                credential: name.clone(),
+                form: whipplescript_custody::PresentationForm::Bearer,
+            }
+            .render(),
+        ));
+        let request = whipplescript_custody::EgressRequest {
+            method: method.to_ascii_uppercase(),
+            url: url.to_owned(),
+            headers,
+            body_b64: args
+                .get("body")
+                .and_then(Value::as_str)
+                .map(|body| whipplescript_custody::encode_body_b64(body.as_bytes())),
+        };
+        let Some(transport) = crate::custody_egress_transport()? else {
+            return Err(
+                "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): an authenticated request \
+                 cannot be sent without one"
+                    .to_owned(),
+            );
+        };
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: self.work_unit.clone(),
+                actor: Some(self.holder.clone()),
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Request {
+                credential: name,
+                request,
+                slots: 1,
+            },
+        );
+        let reply = transport
+            .call(call)
+            .map_err(|error| format!("custodian unreachable: {error:?}"))?;
+        match reply.outcome {
+            Ok(whipplescript_custody::CustodyOk::Requested { response }) => {
+                let body = response
+                    .body_b64
+                    .as_deref()
+                    .map(whipplescript_custody::decode_body_b64)
+                    .transpose()?
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                Ok(json!({ "status": response.status, "body": body }).to_string())
+            }
+            Ok(other) => Err(format!("custodian answered a request with {other:?}")),
+            Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
+        }
     }
 
     fn list_todos(&self, args: &Value) -> Result<String, String> {
@@ -3787,6 +4003,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     let mut scopes = Vec::<FileStoreScope>::new();
     let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
+    let mut credentials = TurnCredentialAccess::default();
     let mut tracker = TurnTrackerAccess::deny_all();
     let mut memory = TurnMemoryAccess::deny_all();
     let mut web_search = false;
@@ -3822,6 +4039,13 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
         // recognizable by using only memory verbs.
         const MEMORY_VERBS: &[&str] = &["recall", "learn", "curate"];
         let declared_file_store = grant.get("store_policy").is_some();
+        // A credential grant's resource is the two-ident `credential <name>`
+        // the parser joins (DR-0053 §5), which no MCP server name can be — so
+        // it is recognised by shape rather than by guessing from its verbs.
+        // Without this it reaches the MCP arm below and is reported as an
+        // unregistered server, because `request` is not a built-in file or
+        // tracker verb.
+        let declared_credential = resource.starts_with("credential ");
         let declared_memory_pool = !operations.is_empty()
             && operations.iter().all(|operation| {
                 operation
@@ -3834,6 +4058,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             && resource != "command"
             && !declared_file_store
             && !declared_memory_pool
+            && !declared_credential
         {
             let registry = match mcp_registry {
                 Some(ref registry) => registry,
@@ -3909,6 +4134,16 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                     has_file_operation = true;
                     merge_grant_globs(&mut grant_write, globs)
                 }
+                // DR-0053 §14: the credential grant's resource is the
+                // two-ident `credential <name>`, so the handle is what follows
+                // the keyword. `request` is the narrowable class; the globs are
+                // this turn's narrowing beneath the governance ceiling.
+                "request" if resource.starts_with("credential ") => {
+                    let handle = resource.trim_start_matches("credential ").trim();
+                    if !handle.is_empty() {
+                        credentials.grant(handle, globs);
+                    }
+                }
                 "run" if resource == "command" => command_run = true,
                 "search" if resource == WEB_RESOURCE => web_search = true,
                 "fetch" if resource == WEB_RESOURCE => web_fetch = true,
@@ -3973,6 +4208,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
         }
     }
     Ok(TurnToolAccess {
+        credentials,
         file: TurnFileAccess { scopes },
         file_resources,
         command_run,
@@ -4342,6 +4578,7 @@ pub fn run_owned_agent_turn(
     let mut tools = file_tool_specs_for_turn(&profile_policy, &turn_tool_access);
     // Web tools (accepted 2026-07-07 design notes): granted-only egress doors.
     tools.extend(web_tool_specs_for_turn(&turn_tool_access));
+    tools.extend(credential_tool_specs_for_turn(&turn_tool_access));
     // Memory tools (MEM-5): granted-only, per-pool, per-operation.
     tools.extend(memory_tool_specs_for_turn(&turn_tool_access));
     // External MCP servers (spec/mcp-support-design-note.md): connect each
@@ -5477,6 +5714,92 @@ mod tests {
         assert_eq!(blocked.status, ToolStatus::Error);
         assert!(blocked.content.contains("not granted"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// DR-0053 §14, the point of the whole clause: a turn grant on a credential
+    /// finally binds something. Before the agent surface existed, this parsed,
+    /// passed its class check, and narrowed nothing.
+    #[test]
+    fn a_turn_grant_narrows_which_urls_a_credential_may_reach() {
+        let input = json!({
+            "access_grants": [
+                {
+                    "resource": "credential stripe_api",
+                    "operations": [
+                        { "operation": "request", "target": null,
+                          "globs": ["POST https://api.stripe.com/v1/refunds/*"] }
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        let access = turn_tool_access_from_input(&input).expect("grants parse");
+
+        let inside = whipplescript_custody::egress::EgressTarget::parse(
+            "POST",
+            "https://api.stripe.com/v1/refunds/re_1",
+        )
+        .expect("target");
+        assert!(access.credentials.admits("stripe_api", &inside).is_ok());
+
+        // A different path, a different method, and a different host are each
+        // refused on their own.
+        for (method, url) in [
+            ("POST", "https://api.stripe.com/v1/charges"),
+            ("DELETE", "https://api.stripe.com/v1/refunds/re_1"),
+            ("POST", "https://evil.example/v1/refunds/re_1"),
+        ] {
+            let outside =
+                whipplescript_custody::egress::EgressTarget::parse(method, url).expect("target");
+            let error = access
+                .credentials
+                .admits("stripe_api", &outside)
+                .expect_err("outside the grant");
+            assert!(error.contains("outside this turn's grant"), "{error}");
+        }
+
+        // A credential this turn was never granted is refused by name, not by
+        // scope — the tool never offers it either.
+        let error = access
+            .credentials
+            .admits("release_signing", &inside)
+            .expect_err("ungranted credential");
+        assert!(error.contains("granted no `request`"), "{error}");
+    }
+
+    #[test]
+    fn the_custody_tool_is_offered_only_for_granted_credentials() {
+        // A turn with no credential grant sees no tool at all, rather than a
+        // tool that always refuses: the surface itself is the grant's shape.
+        let none = turn_tool_access_from_input(&json!({ "access_grants": [] }).to_string())
+            .expect("grants parse");
+        assert!(credential_tool_specs_for_turn(&none).is_empty());
+
+        let granted = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "credential stripe_api",
+                        "operations": [
+                            { "operation": "request", "target": null,
+                              "globs": ["https://api.stripe.com/v1/*"] }
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+        let specs = credential_tool_specs_for_turn(&granted);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, TOOL_CREDENTIAL_REQUEST);
+        // The credential enum is exactly what was granted, so the model cannot
+        // name one the turn does not hold.
+        let enumerated = specs[0].input_schema["properties"]["credential"]["enum"]
+            .as_array()
+            .expect("enum");
+        assert_eq!(enumerated.len(), 1);
+        assert_eq!(enumerated[0].as_str(), Some("stripe_api"));
     }
 
     #[test]

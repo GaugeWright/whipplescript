@@ -19659,6 +19659,7 @@ fn run_claimable_effect(
             options,
         ),
         "custody.request" => run_custody_request_effect(store_path, instance_id, effect, options),
+        "custody.mint" => run_custody_mint_effect(store_path, instance_id, effect, options),
         "exec.command" => run_exec_effect(
             store_path,
             instance_id,
@@ -24777,7 +24778,7 @@ fn run_queue_effect(
 /// to name, and an `Infallible` placeholder would still have to satisfy
 /// `CustodyTransport` at the call site.
 #[cfg(target_family = "unix")]
-fn custody_egress_transport(
+pub(crate) fn custody_egress_transport(
 ) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
     Ok(
         whipplescript_custody::client::UnixSocketTransport::from_env().map(|transport| {
@@ -24787,7 +24788,7 @@ fn custody_egress_transport(
 }
 
 #[cfg(not(target_family = "unix"))]
-fn custody_egress_transport(
+pub(crate) fn custody_egress_transport(
 ) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
     match custodian_socket_unreachable() {
         Some(message) => Err(message),
@@ -24816,6 +24817,225 @@ fn custody_egress_transport(
 /// TRANSFORMS the credential -- hashing it, returning a prefix -- is not
 /// caught, and a binary body passes through. It is defence in depth behind the
 /// type system, not a second guarantee.
+/// DR-0053 §5 as amended: exchange a credential for a scoped child.
+///
+/// The exchange is the author's, presenting the PARENT at a marked slot, and
+/// the custodian executes it so the minted token never enters this process.
+/// The child is registered as `{parent}/mint-{fingerprint}` and therefore
+/// inherits the parent's egress ceiling by name — which is what bounds a mint,
+/// since whip does not model the vendor scope the exchange requests.
+fn run_custody_mint_effect(
+    store_path: &Path,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    options: &WorkerOptions,
+) -> Result<whipplescript_store::StoredEvent, StoreError> {
+    use whipplescript_custody::{
+        CredentialName, CustodyCall, CustodyOk, CustodyOp, EgressRequest, MintExtraction, Sentinel,
+        UseAttribution,
+    };
+
+    let mut kernel = RuntimeKernel::new(SqliteStore::open(store_path)?);
+    let config = options.effect_config();
+    let input: Value = serde_json::from_str(&effect.input_json).unwrap_or_else(|_| json!({}));
+    let run_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-mint-run"]);
+    let lease_id = idempotency_key(&[instance_id, &effect.effect_id, "custody-mint-lease"]);
+
+    kernel.start_run(RunStart {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        lease_id: &lease_id,
+        lease_expires_at: "2030-01-01T00:00:00Z",
+        metadata_json: &json!({ "input": input }).to_string(),
+    })?;
+
+    let fail = |kernel: &mut RuntimeKernel<SqliteStore>, summary: &str| {
+        kernel.fail_run(EffectCompletion {
+            instance_id,
+            effect_id: &effect.effect_id,
+            run_id: &run_id,
+            provider: &config.provider,
+            worker_id: "whip-worker",
+            status: "failed",
+            exit_code: Some(1),
+            summary: Some(summary),
+            metadata_json: &json!({ "error": summary }).to_string(),
+            idempotency_key: None,
+        })
+    };
+
+    let Some(parent) = input.get("parent").and_then(Value::as_str) else {
+        return fail(&mut kernel, "a `mint` reached the runtime naming no parent");
+    };
+    let parent_name = match CredentialName::new(parent) {
+        Ok(name) => name,
+        Err(err) => return fail(&mut kernel, &format!("credential name: {err}")),
+    };
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for header in input
+        .get("headers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let name = header
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if let Some(handle) = header.get("credential").and_then(Value::as_str) {
+            let form = header
+                .get("presentation")
+                .and_then(Value::as_str)
+                .unwrap_or("raw");
+            let handle_name = match CredentialName::new(handle) {
+                Ok(name) => name,
+                Err(err) => return fail(&mut kernel, &format!("credential name: {err}")),
+            };
+            headers.push((
+                name,
+                Sentinel {
+                    credential: handle_name,
+                    form: match whipplescript_custody::PresentationForm::parse(form) {
+                        Ok(form) => form,
+                        Err(err) => return fail(&mut kernel, &err),
+                    },
+                }
+                .render(),
+            ));
+        } else {
+            let value = match header.get("value") {
+                Some(Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            headers.push((name, value));
+        }
+    }
+
+    let exchange = EgressRequest {
+        method: input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("POST")
+            .to_owned(),
+        url: input
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        headers,
+        body_b64: input
+            .get("body")
+            .filter(|body| !body.is_null())
+            .map(|body| match body {
+                Value::String(text) => whipplescript_custody::encode_body_b64(text.as_bytes()),
+                other => whipplescript_custody::encode_body_b64(other.to_string().as_bytes()),
+            }),
+    };
+
+    // The governance ceiling applies to the exchange too: spending a credential
+    // at a token endpoint is an egress under that credential like any other.
+    match crate::ifc::VerifiedEnvelope::load_from_env() {
+        crate::ifc::EnvelopeStatus::Ungoverned => {}
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            return fail(
+                &mut kernel,
+                &format!("governance envelope rejected: {message}"),
+            )
+        }
+        crate::ifc::EnvelopeStatus::Verified(verified) => {
+            if let Err(problem) = verified.admits_request(parent, &exchange.method, &exchange.url) {
+                return fail(&mut kernel, &format!("denied egress: {problem}"));
+            }
+        }
+    }
+
+    let transport = match custody_egress_transport() {
+        Ok(Some(transport)) => transport,
+        Ok(None) => {
+            return fail(
+                &mut kernel,
+                "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): a mint cannot be \
+                 exchanged without one",
+            )
+        }
+        Err(message) => return fail(&mut kernel, &message),
+    };
+    let call = CustodyCall::new(
+        UseAttribution {
+            run_id: run_id.clone(),
+            actor: Some(instance_id.to_owned()),
+            effect_key: Some(effect.effect_id.clone()),
+        },
+        CustodyOp::Mint {
+            credential: parent_name,
+            exchange,
+            extraction: MintExtraction {
+                token_path: input
+                    .get("token_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                public_paths: input
+                    .get("public_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            exchange_slots: input.get("slots").and_then(Value::as_u64).unwrap_or(1) as usize,
+        },
+    );
+    let reply = match transport.call(call) {
+        Ok(reply) => reply,
+        Err(err) => return fail(&mut kernel, &format!("custodian unreachable: {err:?}")),
+    };
+    let (credential, fingerprint, public) = match reply.outcome {
+        Ok(CustodyOk::Minted {
+            credential,
+            fingerprint,
+            public,
+        }) => (credential, fingerprint, public),
+        Ok(other) => {
+            return fail(
+                &mut kernel,
+                &format!("custodian answered a mint with {other:?}"),
+            )
+        }
+        Err(refusal) => return fail(&mut kernel, &format!("custodian refused: {refusal:?}")),
+    };
+
+    // The HANDLE and the non-secret half. No field here yields material, which
+    // is the property `Minted` exists to preserve.
+    let output = json!({
+        "credential": credential.as_str(),
+        "fingerprint": fingerprint,
+        "public": public,
+    });
+    kernel.complete_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id: &run_id,
+        provider: &config.provider,
+        worker_id: "whip-worker",
+        status: "completed",
+        exit_code: Some(0),
+        summary: Some("credential minted"),
+        metadata_json: &json!({ "output": output }).to_string(),
+        idempotency_key: None,
+    })
+}
+
 fn run_custody_request_effect(
     store_path: &Path,
     instance_id: &str,
@@ -24954,6 +25174,33 @@ fn run_custody_request_effect(
         headers,
         body_b64,
     };
+
+    // The governance ceiling (DR-0053 §14 as amended): where this credential
+    // may reach, checked before anything leaves. A REJECTED envelope is an
+    // error rather than a silent "no scope" — a tampered policy must not read
+    // as a permissive one, which is the same discipline `envelope_mcp_min_rung`
+    // applies.
+    //
+    // Checked here rather than only at the checker because a URL may be
+    // interpolated: the compiler sees `{{ … }}` and the runtime sees the host
+    // it resolved to. The static check refuses what it can prove; this refuses
+    // what it can see.
+    match crate::ifc::VerifiedEnvelope::load_from_env() {
+        crate::ifc::EnvelopeStatus::Ungoverned => {}
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            return fail(
+                &mut kernel,
+                &format!("governance envelope rejected: {message}"),
+            )
+        }
+        crate::ifc::EnvelopeStatus::Verified(verified) => {
+            if let Err(problem) =
+                verified.admits_request(credential.as_str(), &request.method, &request.url)
+            {
+                return fail(&mut kernel, &format!("denied egress: {problem}"));
+            }
+        }
+    }
 
     // No custodian means no way to authenticate. Failing loudly is the point:
     // the alternative would be egressing unauthenticated, which is the

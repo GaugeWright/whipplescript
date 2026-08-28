@@ -23,6 +23,7 @@
 pub mod canon;
 #[cfg(target_family = "unix")]
 pub mod client;
+pub mod egress;
 
 use std::fmt;
 
@@ -764,10 +765,21 @@ pub enum CustodyOp {
     },
     /// Credential exchange, custodian-executed so whip never sees the token
     /// in the response body. Returns a handle plus the non-secret half.
+    /// There is deliberately no `scope` and no `ttl` field. Both are vendor
+    /// protocol, and both belong in the `exchange` body the program writes —
+    /// which is the only place they can be true, since that is what goes on
+    /// the wire (DR-0053 §5 Amendment 2026-08-27). Carrying them here as well
+    /// made them a CLAIM beside the reality: a program could declare
+    /// `charges:read` and exchange for `charges:write`, and nothing could tell,
+    /// because §3 keeps the custodian from parsing the body. They were also
+    /// both read as `_scope` / `let _ = ttl_secs` — accepted and ignored, which
+    /// is an over-promise sitting in the protocol waiting for someone to trust
+    /// it.
+    ///
+    /// What bounds a mint instead is the parent's egress ceiling, which the
+    /// child inherits structurally through its name.
     Mint {
         credential: CredentialName,
-        scope: Vec<String>,
-        ttl_secs: u64,
         exchange: EgressRequest,
         extraction: MintExtraction,
         /// Slots the constructing program placed in `exchange`, declared out of

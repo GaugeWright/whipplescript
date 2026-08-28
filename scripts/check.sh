@@ -249,6 +249,29 @@ echo "== docs =="
 scripts/check-docs-snippets.sh
 scripts/check-docs-fences.sh
 
+# The vendored `std/` copies. `std/` is the source of truth and each crate
+# carries a build-time copy; `crates/whipplescript-parser/build.rs`,
+# `crates/whipplescript-cli/src/lib.rs` and `spec/distribution-tracker.md` all
+# say this script "fails the gate on drift". Until 2026-08-27 nothing invoked
+# it, in check.sh or in any workflow, so those three statements were false and
+# a drifted copy would have shipped. Found while adding a manifest entry by
+# hand — the same day one of its copies turned out to be missing from the
+# script's own map, and therefore checked by nothing at all.
+scripts/check-vendored-std.sh
+
+# The tracker registry. `spec/TRACKERS.md` is the status ledger and this script
+# is its enforcement, but nothing invoked it — so on 2026-08-27 trunk carried a
+# closed tracker with a forward horizon and no gate said so. Found the same day,
+# and the same way, as the vendored-std gate above: by running a documented
+# check by hand and watching it fail on work that had already merged.
+#
+# Guarded like the agent guide above and for the same reason: the registry and
+# the trackers it indexes live under `spec/`, which the mirror withholds, so
+# this can only run where the full tree is.
+if [ -f spec/TRACKERS.md ]; then
+    scripts/check-trackers.sh
+fi
+
 echo "== hosted runtime contracts =="
 worker=crates/whipplescript-host-do/worker
 if [ -n "${WHIPPLESCRIPT_CHECK_SKIP_HOSTED:-}" ]; then

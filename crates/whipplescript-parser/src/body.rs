@@ -348,6 +348,28 @@ pub enum BodyEffectKind {
         /// `signed with <handle>` — canonicalized and signed custodian-side.
         signed_with: Option<String>,
     },
+    /// `mint credential from <parent> { at <METHOD> "<url>" header … body …
+    /// token at "<path>" public ["<path>", …] } as <binding>` (DR-0053 §5 as
+    /// amended 2026-08-27).
+    ///
+    /// The exchange is the author's, in the same block `request` uses, and
+    /// there is deliberately no `scope` and no `ttl`: both are vendor protocol,
+    /// both belong in the body that goes on the wire, and a clause beside the
+    /// body duplicating it is the separate modifier §5 refuses for credentials.
+    MintCredential {
+        /// The credential the exchange presents — the one being spent to get a
+        /// child, and the one whose egress ceiling the child inherits.
+        parent: String,
+        method: String,
+        url: String,
+        headers: Vec<RequestHeader>,
+        body: Option<(String, Expr)>,
+        /// Dotted path to the minted token in the reply. The custodian applies
+        /// it; whip never sees what it selects.
+        token_path: String,
+        /// Dotted paths to non-secret members handed back beside the handle.
+        public_paths: Vec<String>,
+    },
     Exec {
         target: ExecTarget,
         /// `-> Schema` / `-> each Schema`: deterministic JSON ingestion of
@@ -1456,6 +1478,7 @@ impl<'a> BodyParser<'a> {
             "decide" => self.parse_decide(),
             "call" => self.parse_call(),
             "request" => self.parse_http_request(),
+            "mint" => self.parse_mint_credential(),
             "invoke" => self.parse_invoke(),
             "read" => self.parse_read(),
             "write" => self.parse_write(),
@@ -2245,6 +2268,227 @@ impl<'a> BodyParser<'a> {
             requires,
             timeout_seconds,
             prompt: Some(prompt),
+            span: self.span_from(start),
+        }))
+    }
+
+    /// `mint credential from <parent> { at <METHOD> "<url>" … } as <binding>`
+    /// (DR-0053 §5 as amended 2026-08-27).
+    fn parse_mint_credential(&mut self) -> Option<BodyStmt> {
+        let start = self.pos;
+        self.pos += 1; // mint
+        if !self.consume_ident("credential") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `credential` after `mint`".to_owned(),
+                Some("write `mint credential from <parent> { … } as token`".to_owned()),
+            );
+            return None;
+        }
+        if !self.consume_ident("from") {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `from <parent>` after `mint credential`".to_owned(),
+                Some(
+                    "a mint spends a credential to get a child: \
+                     `mint credential from stripe_api { … } as token`"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        }
+        let parent = self.ident_text("parent credential handle after `from`")?;
+        if !self.consume_sym('{') {
+            let span = self.span_here();
+            self.error(
+                span,
+                "expected `{` to open the exchange block".to_owned(),
+                Some(
+                    "the exchange is the token request this mint sends, written as a \
+                     `request` block"
+                        .to_owned(),
+                ),
+            );
+            return None;
+        }
+        let mut method_url: Option<(String, String)> = None;
+        let mut headers = Vec::new();
+        let mut body = None;
+        let mut token_path: Option<String> = None;
+        let mut public_paths: Vec<String> = Vec::new();
+        loop {
+            if self.at_sym('}') {
+                self.pos += 1;
+                break;
+            }
+            match self.peek().map(|t| t.tok.clone()) {
+                Some(Tok::Ident(word)) if word == "at" => {
+                    self.pos += 1;
+                    let method = match self.peek().map(|t| t.tok.clone()) {
+                        Some(Tok::Ident(word)) if word.chars().all(|c| c.is_ascii_uppercase()) => {
+                            self.pos += 1;
+                            word
+                        }
+                        _ => {
+                            let span = self.span_here();
+                            self.error(
+                                span,
+                                "expected an HTTP method after `at`".to_owned(),
+                                Some("write `at POST \"https://issuer/token\"`".to_owned()),
+                            );
+                            return None;
+                        }
+                    };
+                    let Some(Tok::Str(url)) = self.peek().map(|t| t.tok.clone()) else {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            format!("expected a quoted URL after `at {method}`"),
+                            None,
+                        );
+                        return None;
+                    };
+                    self.pos += 1;
+                    method_url = Some((method, url));
+                }
+                Some(Tok::Ident(word)) if word == "header" => {
+                    let header_start = self.pos;
+                    self.pos += 1;
+                    let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "expected a quoted header name after `header`".to_owned(),
+                            Some("write `header \"Authorization\" basic stripe_api`".to_owned()),
+                        );
+                        return None;
+                    };
+                    self.pos += 1;
+                    let value = match self.peek().map(|t| t.tok.clone()) {
+                        Some(Tok::Ident(word))
+                            if CredentialPresentation::parse(&word).is_some()
+                                && matches!(
+                                    self.peek_at(1).map(|t| t.tok.clone()),
+                                    Some(Tok::Ident(_))
+                                ) =>
+                        {
+                            let presentation =
+                                CredentialPresentation::parse(&word).expect("guarded by the match");
+                            self.pos += 1;
+                            let handle =
+                                self.ident_text("credential handle after the presentation")?;
+                            RequestHeaderValue::Credential {
+                                presentation,
+                                handle,
+                            }
+                        }
+                        _ => {
+                            let (source, expr) = self.parse_value_expression()?;
+                            RequestHeaderValue::Expr { source, expr }
+                        }
+                    };
+                    headers.push(RequestHeader {
+                        name,
+                        value,
+                        span: self.span_from(header_start),
+                    });
+                }
+                Some(Tok::Ident(word)) if word == "body" => {
+                    if body.is_some() {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "an exchange carries at most one `body`".to_owned(),
+                            None,
+                        );
+                        return None;
+                    }
+                    self.pos += 1;
+                    body = Some(self.parse_value_expression()?);
+                }
+                Some(Tok::Ident(word)) if word == "token" => {
+                    self.pos += 1;
+                    if !self.consume_ident("at") {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "expected `at \"<path>\"` after `token`".to_owned(),
+                            Some("write `token at \"$.access_token\"`".to_owned()),
+                        );
+                        return None;
+                    }
+                    let Some(Tok::Str(path)) = self.peek().map(|t| t.tok.clone()) else {
+                        let span = self.span_here();
+                        self.error(
+                            span,
+                            "expected a quoted path after `token at`".to_owned(),
+                            None,
+                        );
+                        return None;
+                    };
+                    self.pos += 1;
+                    token_path = Some(path);
+                }
+                Some(Tok::Ident(word)) if word == "public" => {
+                    self.pos += 1;
+                    public_paths = self.parse_string_array()?;
+                }
+                _ => {
+                    let span = self.span_here();
+                    self.error(
+                        span,
+                        "expected `at`, `header`, `body`, `token at` or `public` inside an \
+                         exchange block"
+                            .to_owned(),
+                        None,
+                    );
+                    return None;
+                }
+            }
+        }
+        let Some((method, url)) = method_url else {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "a mint exchange must name its endpoint".to_owned(),
+                Some("add `at POST \"https://issuer/token\"` inside the block".to_owned()),
+            );
+            return None;
+        };
+        // The extraction path is REQUIRED. Without it the custodian has no way
+        // to find the minted token, and defaulting to a conventional name
+        // would guess at one vendor's spelling on every vendor's behalf.
+        let Some(token_path) = token_path else {
+            let span = self.span_from(start);
+            self.error(
+                span,
+                "a mint exchange must say where the token is".to_owned(),
+                Some("add `token at \"$.access_token\"` inside the block".to_owned()),
+            );
+            return None;
+        };
+        let mut binding = None;
+        let mut requires = Vec::new();
+        let mut timeout_seconds = None;
+        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+            return None;
+        }
+        Some(BodyStmt::Effect(EffectStmt {
+            kind: BodyEffectKind::MintCredential {
+                parent,
+                method,
+                url,
+                headers,
+                body,
+                token_path,
+                public_paths,
+            },
+            binding,
+            requires,
+            timeout_seconds,
+            prompt: None,
             span: self.span_from(start),
         }))
     }

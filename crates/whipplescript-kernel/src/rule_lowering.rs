@@ -3066,6 +3066,27 @@ pub fn parse_effect_statements(
                 required_capabilities: Vec::new(),
                 after: current_after,
             });
+        } else if trimmed.starts_with("mint credential ") {
+            // mint credential from <parent> { at … } as <binding> (DR-0053 §5
+            // as amended). Same shape as `request` below: the text scan finds
+            // the statement and its binding, and every value the input builder
+            // needs comes off the IR node.
+            let (statement, next_index) =
+                parse_statement_until_balanced_braces(&lines, index, trimmed);
+            effects.push(ParsedEffect {
+                timeout_seconds: parse_timeout_clause_seconds(&statement),
+                kind: "custody.mint".to_owned(),
+                target: None,
+                name: Some("mint".to_owned()),
+                binding: binding_after_as(&statement),
+                args: Vec::new(),
+                prompt: None,
+                prompt_content_type: None,
+                prompt_template: None,
+                required_capabilities: vec!["custody.mint".to_owned()],
+                after: current_after,
+            });
+            index = next_index;
         } else if trimmed.strip_prefix("request ").is_some() {
             // request <METHOD> "<url>" { header … body … } [signed with <h>]
             // as <binding> (DR-0053 §5). The block spans lines; everything the
@@ -4895,6 +4916,71 @@ pub fn parsed_effect_input_json(
                 "message": Value::Object(message),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
+            })
+        }
+        // DR-0053 §5 as amended. A mint's exchange is a request, so its input
+        // is built the same way; what it adds is where the token is.
+        "custody.mint" => {
+            let node = rule.metadata.effects.iter().find(|node| {
+                node.kind == IrEffectKind::MintCredential
+                    && node.binding.as_ref() == effect.binding.as_ref()
+            });
+            let mint = match node.and_then(|node| node.mint_credential.as_ref()) {
+                Some(mint) => mint,
+                None => {
+                    errors.push(format!(
+                        "rule `{}`: a `mint credential` effect lost its lowered shape",
+                        rule.name
+                    ));
+                    return json!({}).to_string();
+                }
+            };
+            let headers: Vec<Value> = mint
+                .exchange
+                .headers
+                .iter()
+                .map(|header| match &header.value {
+                    IrRequestHeaderValue::Credential {
+                        presentation,
+                        handle,
+                    } => json!({
+                        "name": header.name,
+                        "credential": handle,
+                        "presentation": presentation,
+                    }),
+                    IrRequestHeaderValue::Expr(source) => json!({
+                        "name": header.name,
+                        "value": parse_field_value_scoped(
+                            source,
+                            context,
+                            live_facts,
+                            live_effects,
+                            live_ir,
+                        ),
+                    }),
+                })
+                .collect();
+            json!({
+                "parent": mint.parent,
+                "method": mint.exchange.method,
+                "url": mint.exchange.url,
+                "headers": headers,
+                "body": mint.exchange.body.as_ref().map(|source| parse_field_value_scoped(
+                    source,
+                    context,
+                    live_facts,
+                    live_effects,
+                    live_ir,
+                )),
+                // Declared out of band from the exchange text, for the reason
+                // `request` declares its own: the custodian scans finished text
+                // for sentinels and cannot tell a slot the author wrote from
+                // one that arrived inside interpolated data.
+                "slots": mint.exchange.slot_count(),
+                "token_path": mint.token_path,
+                "public_paths": mint.public_paths,
+                "rule": rule.name,
+                "bindings": context_bindings_json(context),
             })
         }
         // DR-0053 §5. The text scan found the statement; the SHAPE comes off

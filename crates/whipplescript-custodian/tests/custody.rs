@@ -455,13 +455,16 @@ fn mint_returns_a_handle_and_the_non_secret_half_only() {
     let reply = c.handle(&call(CustodyOp::Mint {
         credential: name("stripe_api"),
         exchange_slots: 1,
-        scope: vec!["charges:write".into()],
-        ttl_secs: 900,
+        // The vendor scope and TTL live in the exchange BODY, which is what
+        // goes on the wire — not as op fields beside it that could disagree
+        // with it (DR-0053 §5 Amendment 2026-08-27).
         exchange: EgressRequest {
             method: "POST".into(),
             url: "https://api.stripe.com/v1/tokens".into(),
             headers: vec![("Authorization".into(), sentinel)],
-            body_b64: None,
+            body_b64: Some(whipplescript_custody::encode_body_b64(
+                b"grant_type=client_credentials&scope=charges:write&expires_in=900",
+            )),
         },
         extraction: MintExtraction {
             token_path: "access_token".into(),

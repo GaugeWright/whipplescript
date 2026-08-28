@@ -305,21 +305,11 @@ impl Custodian {
                 envelope, context, ..
             } => op_unwrap(&name, &material, envelope, context),
             CustodyOp::Mint {
-                scope,
-                ttl_secs,
                 exchange,
                 extraction,
                 exchange_slots,
                 ..
-            } => self.op_mint(
-                &name,
-                &material,
-                scope,
-                *ttl_secs,
-                exchange,
-                extraction,
-                *exchange_slots,
-            ),
+            } => self.op_mint(&name, &material, exchange, extraction, *exchange_slots),
         }
     }
 
@@ -488,8 +478,6 @@ impl Custodian {
         &self,
         name: &CredentialName,
         material: &[u8],
-        _scope: &[String],
-        ttl_secs: u64,
         exchange: &EgressRequest,
         extraction: &MintExtraction,
         exchange_slots: usize,
@@ -545,7 +533,6 @@ impl Custodian {
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
             })?;
-        let _ = ttl_secs; // r0 records no expiry; lease enforcement arrives with lifecycle verbs.
 
         let mut public = serde_json::Map::new();
         for path in &extraction.public_paths {

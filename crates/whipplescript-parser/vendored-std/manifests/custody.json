@@ -29,6 +29,25 @@
           "validation": "runtime_boundary"
         },
         {
+          "id": "custody.mint",
+          "effect_kind": "custody.mint",
+          "source_forms": [
+            "mint credential from <parent> { \u2026 }"
+          ],
+          "input_schema": "custody.mint.input",
+          "output_schema": "custody.mint.output",
+          "required_capabilities": [
+            "custody.mint"
+          ],
+          "provider_kinds": [
+            "custodian"
+          ],
+          "projected_facts": [
+            "effect.output"
+          ],
+          "validation": "runtime_boundary"
+        },
+        {
           "id": "custody.wrap",
           "effect_kind": "capability.call",
           "source_forms": [
@@ -167,7 +186,11 @@
   "capabilities": [
     {
       "id": "custody.request",
-      "description": "Egress an authenticated HTTP request through the custodian (DR-0053 §5). The request leaves whip carrying SENTINELS at the author's marked slots; the custodian substitutes material and signs, so the material never enters this process and no capability grants a way to read it."
+      "description": "Egress an authenticated HTTP request through the custodian (DR-0053 \u00a75). The request leaves whip carrying SENTINELS at the author's marked slots; the custodian substitutes material and signs, so the material never enters this process and no capability grants a way to read it."
+    },
+    {
+      "id": "custody.mint",
+      "description": "Exchange a credential for a scoped child, custodian-executed so the minted token never enters this process (DR-0053 \u00a75). The child is registered beneath its parent and inherits the parent's egress ceiling, which is what bounds a mint \u2014 whip does not model the vendor scope the exchange requests."
     },
     {
       "id": "custody.wrap",
@@ -180,7 +203,7 @@
     },
     {
       "id": "custody.unwrap",
-      "description": "Open a custodian-held envelope back to its payload (DR-0074 §3). The plaintext lives in the opening effect's `after` block and is never written to a durable record; the grant is narrowed by the payload's declared type.",
+      "description": "Open a custodian-held envelope back to its payload (DR-0074 \u00a73). The plaintext lives in the opening effect's `after` block and is never written to a durable record; the grant is narrowed by the payload's declared type.",
       "schema": {
         "input": {
           "credential": "string"
@@ -193,6 +216,12 @@
       "id": "custodian",
       "provider_kind": "custodian",
       "capability": "custody.request",
+      "config": {}
+    },
+    {
+      "id": "custodian-mint",
+      "provider_kind": "custodian",
+      "capability": "custody.mint",
       "config": {}
     },
     {
@@ -227,6 +256,15 @@
       "provider": "custodian",
       "config": {
         "provider_id": "custodian"
+      }
+    },
+    {
+      "id": "binding-custody-mint-default",
+      "program_id": null,
+      "capability": "custody.mint",
+      "provider": "custodian",
+      "config": {
+        "provider_id": "custodian-mint"
       }
     },
     {
