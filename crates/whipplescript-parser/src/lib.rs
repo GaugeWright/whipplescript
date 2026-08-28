@@ -2145,6 +2145,11 @@ struct SemanticContext {
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
     memory_pools: BTreeSet<String>,
+    /// Declared `tracker` names (std.tracker). A `when <tracker> has ready
+    /// issue as <b>` trigger is matched against these rather than on the shape
+    /// of the words alone, so a fact class followed by `has ready issue` is not
+    /// mistaken for a queue — the same discipline `ifc.rs` applies on its side.
+    trackers: BTreeSet<String>,
     /// DR-0043 regions by rule name, stashed by `extract_rule_regions` before the
     /// rule body was rewritten to its condition-HOLDS variant. The `on lapse` arm
     /// is spliced out of that body, so it reaches no other pass; analysis reads it
@@ -5890,6 +5895,7 @@ impl SemanticContext {
         let mut channel_providers = BTreeMap::new();
         let mut credentials = BTreeMap::new();
         let mut memory_pools = BTreeSet::new();
+        let mut trackers = BTreeSet::new();
 
         for item in &program.items {
             schemas.insert_item(item);
@@ -5938,6 +5944,9 @@ impl SemanticContext {
                 Item::MemoryPool(pool) => {
                     memory_pools.insert(pool.name.name.clone());
                 }
+                Item::Tracker(queue) => {
+                    trackers.insert(queue.name.name.clone());
+                }
                 _ => {}
             }
         }
@@ -5960,6 +5969,7 @@ impl SemanticContext {
             channel_providers,
             credentials,
             memory_pools,
+            trackers,
             regions: BTreeMap::new(),
         }
     }
@@ -9503,8 +9513,12 @@ fn analyze_rule(
         }
     }
 
+    // One resolution of the rule's item/lease bindings, shared by the effect
+    // walk and the payload-reads walk so the two cannot disagree about which
+    // queue a `finish` lands in.
+    let resolved_bindings = binding_resources(rule, &body_ast.statements, &semantic.trackers);
     let (ast_effects, ast_dependencies) =
-        collect_effects_from_ast(&body_ast.statements, &rule.name.name);
+        collect_effects_from_ast(&body_ast.statements, &rule.name.name, &resolved_bindings);
     metadata.effects = ast_effects;
     metadata.dependencies = ast_dependencies;
 
@@ -9571,7 +9585,7 @@ fn analyze_rule(
         &mut metadata.bounded_egresses,
     );
     let mut egress_reads = Vec::new();
-    collect_egress_payload_reads(&body_ast.statements, &mut egress_reads);
+    collect_egress_payload_reads(&body_ast.statements, &resolved_bindings, &mut egress_reads);
     for (sink, roots) in egress_reads {
         metadata
             .egress_payload_reads
@@ -10249,6 +10263,7 @@ fn collect_payload_field_roots(
 /// fields are copied). A sink with no recorded entry references nothing resolvable.
 fn collect_egress_payload_reads(
     statements: &[body::BodyStmt],
+    binding_resources: &BTreeMap<String, String>,
     out: &mut Vec<(String, BTreeSet<String>)>,
 ) {
     for statement in statements {
@@ -10324,6 +10339,18 @@ fn collect_egress_payload_reads(
                 // value. `finish item { summary … }` is NOT here — it names an
                 // item binding rather than a tracker, so its queue is not known
                 // statically. That residual is recorded on the tracker.
+                // `finish <item> { summary … }` writes its fields into the
+                // same durable row `file issue` does, so what it reads is
+                // recorded against the same sink. The queue comes from the
+                // binding map, since the statement names an item.
+                body::BodyEffectKind::TrackerFinish { item, fields } => {
+                    let Some(queue) = binding_resources.get(item) else {
+                        continue;
+                    };
+                    let mut roots = BTreeSet::new();
+                    collect_payload_field_roots(fields, None, &mut roots);
+                    out.push((queue.clone(), roots));
+                }
                 body::BodyEffectKind::TrackerFile { queue, fields } => {
                     let mut roots = BTreeSet::new();
                     collect_payload_field_roots(fields, None, &mut roots);
@@ -10366,10 +10393,12 @@ fn collect_egress_payload_reads(
                 }
                 _ => {}
             },
-            body::BodyStmt::After(after) => collect_egress_payload_reads(&after.body, out),
+            body::BodyStmt::After(after) => {
+                collect_egress_payload_reads(&after.body, binding_resources, out)
+            }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
-                    collect_egress_payload_reads(&branch.body, out);
+                    collect_egress_payload_reads(&branch.body, binding_resources, out);
                 }
             }
             _ => {}
@@ -11466,7 +11495,10 @@ fn declassified_for_body(kind: &body::BodyEffectKind) -> bool {
 
 /// The named resource a direct file/channel effect touches, surfaced for
 /// information-flow analysis. `None` for effects with no named resource.
-fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
+fn resource_for_body(
+    kind: &body::BodyEffectKind,
+    binding_resources: &BTreeMap<String, String>,
+) -> Option<String> {
     match kind {
         body::BodyEffectKind::FileRead { store, .. }
         | body::BodyEffectKind::FileWrite { store, .. }
@@ -11495,6 +11527,31 @@ fn resource_for_body(kind: &body::BodyEffectKind) -> Option<String> {
         // file store are, so both directions name the same resource.
         body::BodyEffectKind::TrackerFile { queue, .. } => Some(queue.clone()),
         body::BodyEffectKind::CounterConsume { counter, .. } => Some(format!("resource:{counter}")),
+        // The four item verbs and `renew` name a BINDING rather than a queue or
+        // a lease, so each resolves through the rule's binding map. An
+        // unresolvable binding keeps no resource, which is the pre-existing
+        // behaviour rather than a guess at which queue was meant.
+        body::BodyEffectKind::TrackerClaim { item, .. }
+        | body::BodyEffectKind::TrackerRelease { item }
+        | body::BodyEffectKind::TrackerFinish { item, .. } => binding_resources.get(item).cloned(),
+        // `renew` is one body kind serving two effect kinds: it is a tracker
+        // renew when its binding names a claim and a lease renew otherwise, and
+        // the binding map already carries whichever it is, because a claim
+        // inherits its item's queue.
+        body::BodyEffectKind::LeaseRenew {
+            acquire_binding, ..
+        } => binding_resources.get(acquire_binding).cloned(),
+        // An exec ships argv and stdin to a process and reads stdout back. The
+        // resource is spelled exactly as `output_tokens_for_root` already
+        // spells it, so the two sides of the checker name one thing.
+        body::BodyEffectKind::Exec { target, .. } => Some(match target {
+            body::ExecTarget::Capability { name, .. } => format!("script:{name}"),
+            body::ExecTarget::RawCommand(_) => "exec:raw".to_owned(),
+        }),
+        // A child workflow is an egress of its payload and a read of its
+        // result. `invoke:<name>` is the envelope's own spelling for a workflow
+        // endpoint — `is_internal_workflow` already keys it that way.
+        body::BodyEffectKind::Invoke { workflow, .. } => Some(format!("invoke:{workflow}")),
         // DR-0053 §5: a `request` leaves the process for an external endpoint
         // under exactly one credential — the checker guarantees the "exactly
         // one". Before this it had no IFC resource at all, so the construct
@@ -11649,9 +11706,68 @@ fn collect_terminal_complete_bindings(statements: &[body::BodyStmt], out: &mut V
     }
 }
 
+/// Which resource each item/lease binding in a rule refers to.
+///
+/// The four tracker item verbs and `renew` name a BINDING, not a queue or a
+/// lease, so without this they have no IFC resource and their arms in the
+/// reader-set match can never fire. Resolving the binding is what gives them
+/// one.
+///
+/// Three sources, and a claim chains through them: a `when <tracker> has ready
+/// issue as v` trigger, a `file issue into <q> … as b` in this body, and an
+/// `acquire <resource> as b`. A binding from anywhere else stays unresolved and
+/// the effect keeps no resource, which is the pre-existing behaviour rather
+/// than a guess.
+fn binding_resources(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    trackers: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+    for when in &rule.whens {
+        let pattern = when.text.split(" where ").next().unwrap_or(&when.text);
+        let words: Vec<&str> = pattern.split_whitespace().collect();
+        // `<tracker> has ready issue as <binding>`
+        if let ([handle, "has", "ready", "issue"], Some(binding)) =
+            (&words[..words.len().min(4)], binding_after_as(pattern))
+        {
+            if trackers.contains(*handle) {
+                resolved.insert(binding.to_owned(), (*handle).to_owned());
+            }
+        }
+    }
+    // Two passes so a `claim` naming an item filed later in the same body still
+    // resolves; the graph is shallow and this is cheaper than ordering it.
+    for _ in 0..2 {
+        for_each_body(statements, &mut |stmt| {
+            let body::BodyStmt::Effect(effect) = stmt else {
+                return;
+            };
+            let Some(binding) = effect.binding.as_deref() else {
+                return;
+            };
+            let source = match &effect.kind {
+                body::BodyEffectKind::TrackerFile { queue, .. } => Some(queue.clone()),
+                body::BodyEffectKind::LeaseAcquire { resource, .. } => {
+                    Some(format!("resource:{resource}"))
+                }
+                // A claim carries its item's queue forward, so `renew <claim>`
+                // and `finish <claim>` land on the same tracker.
+                body::BodyEffectKind::TrackerClaim { item, .. } => resolved.get(item).cloned(),
+                _ => None,
+            };
+            if let Some(source) = source {
+                resolved.insert(binding.to_owned(), source);
+            }
+        });
+    }
+    resolved
+}
+
 fn collect_effects_from_ast(
     statements: &[body::BodyStmt],
     rule_name: &str,
+    binding_resources: &BTreeMap<String, String>,
 ) -> (Vec<IrEffectNode>, Vec<IrEffectDependency>) {
     let mut effects = Vec::new();
     let mut dependencies = Vec::new();
@@ -11668,6 +11784,7 @@ fn collect_effects_from_ast(
         statements,
         rule_name,
         &claim_bindings,
+        binding_resources,
         &mut counter,
         &mut after_stack,
         &mut case_stack,
@@ -11699,6 +11816,7 @@ fn walk_effects(
     statements: &[body::BodyStmt],
     rule_name: &str,
     claim_bindings: &BTreeSet<String>,
+    binding_resources: &BTreeMap<String, String>,
     counter: &mut usize,
     after_stack: &mut Vec<(String, DependencyPredicate)>,
     case_stack: &mut Vec<(String, String)>,
@@ -11749,7 +11867,7 @@ fn walk_effects(
                 let turn_skills = turn_skills_for_body(&effect.kind);
                 let on_stream = on_stream_for_body(&effect.kind);
                 let (selection_source, transport_onto) = vcs_selective_for_body(&effect.kind);
-                let resource = resource_for_body(&effect.kind);
+                let resource = resource_for_body(&effect.kind, binding_resources);
                 let agent = agent_for_body(&effect.kind);
                 let coerce_target = coerce_target_for_body(&effect.kind);
                 let workflow_target = workflow_target_for_body(&effect.kind);
@@ -11819,6 +11937,7 @@ fn walk_effects(
                     &after.body,
                     rule_name,
                     claim_bindings,
+                    binding_resources,
                     counter,
                     after_stack,
                     case_stack,
@@ -11836,6 +11955,7 @@ fn walk_effects(
                         &branch.body,
                         rule_name,
                         claim_bindings,
+                        binding_resources,
                         counter,
                         after_stack,
                         case_stack,

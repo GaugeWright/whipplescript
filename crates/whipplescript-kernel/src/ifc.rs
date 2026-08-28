@@ -2195,7 +2195,10 @@ fn classify_op(operation: &str, resource_is_declared: bool) -> (bool, bool) {
 fn is_coordination_effect(kind: &IrEffectKind) -> bool {
     matches!(
         kind,
-        IrEffectKind::LeaseAcquire | IrEffectKind::LedgerAppend | IrEffectKind::CounterConsume
+        IrEffectKind::LeaseAcquire
+            | IrEffectKind::LeaseRenew
+            | IrEffectKind::LedgerAppend
+            | IrEffectKind::CounterConsume
     )
 }
 
@@ -4165,20 +4168,31 @@ pub fn check_with_envelope_imports(
                         writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
-                    // Claiming, releasing, renewing and finishing all mutate a
-                    // shared tracker row that other actors and humans read.
-                    // `finish` additionally carries a summary; its queue is not
-                    // knowable here (it names an item binding, not a tracker),
-                    // which is why `collect_egress_payload_reads` cannot record
-                    // what that summary reads. Recorded on the flow-checker
-                    // tracker rather than left as an unexplained gap.
-                    IrEffectKind::TrackerClaim
-                    | IrEffectKind::TrackerRelease
-                    | IrEffectKind::TrackerRenew
-                    | IrEffectKind::TrackerFinish => {
+                    // `finish <item> { … }` carries a SUMMARY into a durable
+                    // tracker row that other actors and humans read, so it is a
+                    // data sink like `file issue`.
+                    IrEffectKind::TrackerFinish => {
                         writes.push(resource);
                         span.get_or_insert(effect.span);
                     }
+                    // Claim, release and renew carry no rule data: what they
+                    // write is the HOLDER and a TTL, not anything the rule
+                    // read. Treating them as data sinks over-reports, and not
+                    // in a harmless direction — it refuses DR-0051 §3's
+                    // endorsed claim, which is the sanctioned crossing itself,
+                    // because the rule's untrusted trigger would then inject
+                    // into the queue it claims from.
+                    //
+                    // Their real influence is implicit: the DECISION to claim
+                    // was shaped by whatever the rule read. That is the
+                    // implicit-flow gap `spec/ifc-guard-query-implicit-flow-note.md`
+                    // records deliberately, and chasing it for one construct
+                    // while leaving it everywhere else would be inconsistent
+                    // rather than safer. They keep a resource — the queue is
+                    // now knowable — so a later pass has something to name.
+                    IrEffectKind::TrackerClaim
+                    | IrEffectKind::TrackerRelease
+                    | IrEffectKind::TrackerRenew => {}
                     // Renewing a lease is the same bidirectional coordination
                     // as acquiring one.
                     IrEffectKind::LeaseRenew => {
@@ -12654,5 +12668,241 @@ rule r
         // rather than introducing a second mechanism.
         let granted = format!("{POLICY}grant declassify fact:Claim to public\n");
         assert_eq!(messages(&granted), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod resolved_resource_tests {
+    //! The seven kinds DR-0072's successor left with an arm and no resource.
+    //!
+    //! `check_with_envelope`'s match became exhaustive first, which made the
+    //! gap visible: an arm only fires when `resource_for_body` returns
+    //! something, and for these it returned `None`. Each test here fails
+    //! against that state, so they pin the resource rather than the arm.
+
+    use super::*;
+    use whipplescript_parser::compile_program;
+
+    fn ir(body: &str, extra_decls: &str) -> IrProgram {
+        let source = format!(
+            r#"
+@service
+workflow Resolved
+
+use std.ingress
+use std.tracker
+
+tracker ops {{ provider builtin }}
+{extra_decls}
+
+signal charge.disputed {{ note string }}
+
+output result R
+class R {{ v string }}
+
+rule act
+  when charge.disputed as charge
+=> {{
+{body}
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        compiled.ir.expect("ir")
+    }
+
+    fn resource_of(ir: &IrProgram, kind: IrEffectKind) -> Option<String> {
+        ir.rules
+            .iter()
+            .flat_map(|rule| rule.metadata.effects.iter())
+            .find(|effect| effect.kind == kind)
+            .and_then(|effect| effect.resource.clone())
+    }
+
+    #[test]
+    fn an_exec_names_its_script_capability_or_raw() {
+        let raw = ir(
+            "  exec \"echo hi\" as ran\n  after ran succeeds { complete result { v \"ok\" } }",
+            "",
+        );
+        assert_eq!(
+            resource_of(&raw, IrEffectKind::ExecCommand).as_deref(),
+            Some("exec:raw"),
+            "an ungoverned exec is spelled exactly as the token resolver spells it"
+        );
+    }
+
+    #[test]
+    fn an_item_verb_resolves_its_queue_through_the_binding() {
+        // `claim`/`finish` name an ITEM binding, not a queue. Resolving it is
+        // what gives them a resource at all.
+        let program = ir(
+            "  file issue into ops { title \"t\" body charge.note } as filed\n\
+             \x20 after filed succeeds {\n\
+             \x20   claim filed as held\n\
+             \x20   finish held { summary charge.note }\n\
+             \x20   complete result { v \"ok\" }\n\
+             \x20 }",
+            "",
+        );
+        assert_eq!(
+            resource_of(&program, IrEffectKind::TrackerClaim).as_deref(),
+            Some("ops")
+        );
+        // A claim carries its item's queue forward, so `finish <claim>` lands
+        // on the same tracker rather than nowhere.
+        assert_eq!(
+            resource_of(&program, IrEffectKind::TrackerFinish).as_deref(),
+            Some("ops")
+        );
+        // And the summary's reads are recorded against that queue, which is
+        // what makes `finish` a data sink rather than only a state change.
+        let reads = program
+            .rules
+            .iter()
+            .find_map(|rule| rule.metadata.egress_payload_reads.get("ops"))
+            .expect("the finish summary records what it reads");
+        assert!(reads.contains("charge"), "{reads:?}");
+    }
+
+    #[test]
+    fn a_finished_summary_cannot_carry_a_confidential_value_into_an_open_queue() {
+        // The refusal the resolution buys. `finish` is the only one of the four
+        // item verbs that carries rule data.
+        //
+        // The item comes from a TRIGGER and nothing files an issue, so the only
+        // candidate sink is the finish itself. An earlier version of this test
+        // filed one, and passed on that sink instead — it survived a mutation
+        // that made `finish` resolve to nothing, which is how it was caught.
+        let source = r#"
+@service
+workflow FinishOnly
+
+use std.ingress
+use std.tracker
+
+tracker ops { provider builtin }
+
+signal charge.disputed { note string }
+
+output result R
+class R { v string }
+
+rule act
+  when charge.disputed as charge
+  when ops has ready issue as item
+=> {
+  claim item as held
+  finish held { summary charge.note }
+  complete result { v "ok" }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let program = compiled.ir.expect("ir");
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "result": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> =
+            check_with_envelope(&program, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .map(|d| d.message)
+                .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("denied flow") && m.contains("ops")),
+            "{messages:#?}"
+        );
+    }
+
+    #[test]
+    fn claiming_is_not_a_data_sink() {
+        // Claim, release and renew write the HOLDER, not the rule's data.
+        // Treating them as data sinks refuses DR-0051 §3's endorsed claim — the
+        // sanctioned crossing itself — so the resource exists and the sink
+        // deliberately does not.
+        //
+        // The item comes from a `when <tracker> has ready issue as v` trigger,
+        // which is also the only coverage of that branch of the binding map.
+        // Nothing here files an issue, so the only candidate sink is the claim.
+        let source = r#"
+@service
+workflow ClaimOnly
+
+use std.ingress
+use std.tracker
+
+tracker ops { provider builtin }
+
+signal charge.disputed { note string }
+
+output result R
+class R { v string }
+
+rule act
+  when charge.disputed as charge
+  when ops has ready issue as item
+=> {
+  claim item as held
+  complete result { v "ok" }
+}
+"#;
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "fixture must compile: {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        let program = compiled.ir.expect("ir");
+        // The trigger resolved the item binding, so the claim has a resource.
+        assert_eq!(
+            resource_of(&program, IrEffectKind::TrackerClaim).as_deref(),
+            Some("ops")
+        );
+
+        let envelope = Envelope::from_json(
+            r#"{ "resources": {
+                "signal:charge.disputed": { "confidential": true },
+                "result": { "reader": "confidential" },
+                "ops": { "reader": "confidential" }
+            } }"#,
+        )
+        .expect("valid envelope");
+        let messages: Vec<String> =
+            check_with_envelope(&program, &VerifiedEnvelope::for_test(envelope))
+                .into_iter()
+                .map(|d| d.message)
+                .collect();
+        assert!(
+            messages.iter().all(|m| !m.contains("denied flow")),
+            "a claim carries no rule data and must not be denied: {messages:#?}"
+        );
     }
 }
