@@ -61,6 +61,7 @@
           "output_schema": {
             "credential": "string",
             "context": "string",
+            "label": "json",
             "nonce_b64": "string",
             "ciphertext_b64": "string"
           },

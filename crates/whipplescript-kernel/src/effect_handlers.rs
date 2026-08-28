@@ -2545,6 +2545,226 @@ pub fn run_memory_capability(
 /// The wrapping key never reaches whip. What comes back is the envelope, and
 /// only its identity and non-secret metadata cross into the effect's output —
 /// the ciphertext is the payload whip stores, not something it interprets.
+/// An effect input whose sealed values have been opened for the provider call
+/// (DR-0074 §4, the worker arm: "inside a worker executing one run, having
+/// opened a sealed effect input").
+///
+/// **The type is the guarantee.** §4's other arm — the interpreter — is
+/// enforced by the checker, but nothing structural stops a worker writing
+/// opened plaintext back into a durable record, and the obvious implementation
+/// does exactly that: the natural resolution point is
+/// `resolve_effect_input_after_bindings`, whose output reaches `start_run`'s
+/// `metadata_json`. That is not an exotic mistake, it is the first thing anyone
+/// would write.
+///
+/// So this carries no `Serialize`, no `Clone`, no `Display`, and a `Debug` that
+/// prints nothing of the payload. The only way to the bytes is
+/// [`provider_payload`](Self::provider_payload), whose name says where they are
+/// allowed to go. Persisting one is a compile error rather than a review miss.
+pub struct OpenedEffectInput(String);
+
+impl OpenedEffectInput {
+    /// The request body for the provider call, and nothing else. Every other
+    /// consumer — the run's metadata, a diagnostic, an event payload — is a §4
+    /// violation, which is why there is no other accessor.
+    pub fn provider_payload(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OpenedEffectInput {
+    /// Redacted rather than absent: something eventually formats a struct that
+    /// holds one, and a `{:?}` that printed opened plaintext into a log would
+    /// be a §4 violation nobody had to write deliberately.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpenedEffectInput(<opened>)")
+    }
+}
+
+/// The unwrap grants an effect carries, as `payload type -> credential`.
+///
+/// Read from the effect's own durable row: the lowering records `access_grants`
+/// with the operation and its narrowed `target`, so the authorization travels
+/// with the work rather than being re-derived from the program here.
+fn effect_unwrap_grants(input: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut grants = std::collections::BTreeMap::new();
+    for grant in input
+        .get("access_grants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(credential) = grant
+            .get("resource")
+            .and_then(Value::as_str)
+            .and_then(|resource| resource.strip_prefix("credential "))
+        else {
+            continue;
+        };
+        for op in grant
+            .get("operations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if op.get("operation").and_then(Value::as_str) != Some("unwrap") {
+                continue;
+            }
+            // A bare `unwrap` never reaches here — the checker refuses it — but
+            // skipping rather than admitting keeps the runtime fail-closed on
+            // its own terms.
+            if let Some(target) = op.get("target").and_then(Value::as_str) {
+                grants.insert(target.to_owned(), credential.to_owned());
+            }
+        }
+    }
+    grants
+}
+
+/// A transport that reaches no custodian.
+///
+/// Exists so a host with no custody transport takes the SAME code path as one
+/// that has it: `open_sealed_effect_inputs` returns early when a turn carries
+/// no unwrap grant, so an ordinary turn never touches this, and a granted turn
+/// fails here rather than silently sending ciphertext. Refusing inside the
+/// resolver rather than at the call site is what keeps the "grants present?"
+/// decision in one place.
+pub struct NoCustodyTransport;
+
+impl whipplescript_custody::CustodyTransport for NoCustodyTransport {
+    fn call(
+        &self,
+        _call: whipplescript_custody::CustodyCall,
+    ) -> Result<whipplescript_custody::CustodyReply, whipplescript_custody::TransportError> {
+        Err(whipplescript_custody::TransportError::Unavailable(
+            "this host has no custody transport; run the turn where a custodian is \
+             reachable"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Open the sealed values in an effect's input for the provider call
+/// (DR-0074 §4, worker arm).
+///
+/// Runs AFTER the run's metadata is recorded, deliberately: the durable row
+/// keeps the envelopes, and only the value handed to the provider carries
+/// plaintext. That ordering is the whole design, and
+/// [`OpenedEffectInput`] is what keeps it from being an ordering anyone can
+/// forget.
+///
+/// A sealed value is recognised by its envelope shape and opened only when the
+/// effect carries an `unwrap` grant naming the CREDENTIAL it was sealed under.
+/// The type narrowing is the checker's — `validate_sealed_effect_inputs`
+/// refuses a sealed input whose payload type no grant on that effect names — so
+/// what remains here is the credential match, which is the part a runtime can
+/// answer from the envelope itself.
+pub fn open_sealed_effect_inputs(
+    transport: &dyn whipplescript_custody::CustodyTransport,
+    effect: &ClaimableEffect,
+    input_json: &str,
+    run_id: &str,
+) -> Result<OpenedEffectInput, String> {
+    use whipplescript_custody::{
+        CredentialName, CustodyCall, CustodyOk, CustodyOp, Envelope, UseAttribution,
+    };
+
+    let mut input = json_from_str(input_json);
+    let grants = effect_unwrap_grants(&input);
+    if grants.is_empty() {
+        return Ok(OpenedEffectInput(input_json.to_owned()));
+    }
+    let granted_credentials: std::collections::BTreeSet<&String> = grants.values().collect();
+
+    // The envelope shape `seal` produces. Structural rather than tagged, and
+    // narrowed by the credential match below: an envelope under a credential
+    // this effect was not granted is left sealed rather than opened.
+    fn envelope_of(value: &Value) -> Option<Envelope> {
+        let object = value.as_object()?;
+        for field in ["credential", "context", "nonce_b64", "ciphertext_b64"] {
+            object.get(field)?.as_str()?;
+        }
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    let mut failure: Option<String> = None;
+    fn walk(
+        value: &mut Value,
+        granted: &std::collections::BTreeSet<&String>,
+        open: &mut dyn FnMut(Envelope) -> Result<Value, String>,
+        failure: &mut Option<String>,
+    ) {
+        if failure.is_some() {
+            return;
+        }
+        if let Some(envelope) = envelope_of(value) {
+            if granted.contains(&envelope.credential.as_str().to_owned()) {
+                match open(envelope) {
+                    Ok(plaintext) => *value = plaintext,
+                    Err(error) => *failure = Some(error),
+                }
+                return;
+            }
+        }
+        match value {
+            Value::Object(map) => {
+                for (_, child) in map.iter_mut() {
+                    walk(child, granted, open, failure);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, granted, open, failure);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut open = |envelope: Envelope| -> Result<Value, String> {
+        let credential = envelope.credential.clone();
+        let context = envelope.context.clone();
+        let call = CustodyCall::new(
+            UseAttribution {
+                run_id: run_id.to_owned(),
+                actor: None,
+                effect_key: Some(effect.effect_id.clone()),
+            },
+            CustodyOp::Unwrap {
+                credential: CredentialName::new(credential.as_str())
+                    .map_err(|error| format!("custody unwrap: {error}"))?,
+                envelope,
+                context,
+            },
+        );
+        match transport
+            .call(call)
+            .map_err(|error| format!("custody unwrap: transport: {error}"))?
+            .outcome
+        {
+            Err(error) => Err(format!("custody unwrap refused: {error}")),
+            Ok(CustodyOk::Unwrapped { plaintext_b64, .. }) => {
+                let bytes = crate::exec_http::base64_decode(&plaintext_b64)
+                    .ok_or_else(|| "custody unwrap: payload is not base64".to_owned())?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| "custody unwrap: payload is not UTF-8".to_owned())?;
+                // `seal` wrapped the value's JSON, so the payload parses back
+                // into the value the author sealed rather than a string of it.
+                Ok(json_from_str(&text))
+            }
+            Ok(other) => Err(format!(
+                "custody unwrap: custodian answered with a non-unwrap result: {other:?}"
+            )),
+        }
+    };
+
+    walk(&mut input, &granted_credentials, &mut open, &mut failure);
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(OpenedEffectInput(input.to_string()))
+}
+
 pub fn run_custody_capability(
     transport: &dyn whipplescript_custody::CustodyTransport,
     effect: &ClaimableEffect,
@@ -2600,9 +2820,17 @@ pub fn run_custody_capability(
                 Err(error) => fail(format!("custody wrap: transport: {error}")),
                 Ok(reply) => match reply.outcome {
                     Err(error) => fail(format!("custody wrap refused: {error}")),
+                    // The WHOLE envelope, `label` included. Slice 1 emitted
+                    // four of the five fields, which made the stored value
+                    // un-round-trippable: `Envelope` will not deserialize
+                    // without its label, so nothing could reconstruct one to
+                    // unwrap. The label is DR-0053 §13's carriage — the
+                    // boundary does not launder — so dropping it also dropped
+                    // what `unwrap` is supposed to restore.
                     Ok(CustodyOk::Wrapped { envelope }) => CapabilityOutcome::Produced(json!({
                         "credential": envelope.credential.as_str(),
                         "context": envelope.context,
+                        "label": envelope.label,
                         "nonce_b64": envelope.nonce_b64,
                         "ciphertext_b64": envelope.ciphertext_b64,
                     })),
@@ -3052,6 +3280,147 @@ mod custody_capability_tests {
             )
             .expect("register");
         InProcessTransport::new(Arc::new(Custodian::new(store, Box::new(DeniedEgress))))
+    }
+
+    /// Seal a value through the real custodian and return the envelope, so the
+    /// worker-side tests open something that was genuinely sealed rather than a
+    /// hand-built fixture that could drift from the wire form.
+    fn sealed_envelope(transport: &InProcessTransport, plaintext: &str) -> Value {
+        let CapabilityOutcome::Produced(envelope) = run_custody_capability(
+            transport,
+            &effect(
+                "custody.wrap",
+                &format!(r#"{{"credential":"phi_key","value":{plaintext}}}"#),
+            ),
+            "run-1",
+        ) else {
+            panic!("expected a wrapped envelope");
+        };
+        envelope
+    }
+
+    fn granted_effect(envelope: &Value, target: &str) -> whipplescript_store::ClaimableEffect {
+        let input = json!({
+            "prompt": "Summarize",
+            "bindings": { "record": envelope },
+            "access_grants": [{
+                "resource": "credential phi_key",
+                "operations": [{ "operation": "unwrap", "target": target, "globs": [] }],
+            }],
+        });
+        let mut claimable = effect("agent.tell", &input.to_string());
+        claimable.kind = "agent.tell".to_owned();
+        claimable
+    }
+
+    #[test]
+    fn a_granted_turn_opens_its_sealed_input_for_the_provider() {
+        // DR-0074 §4's worker arm: "inside a worker executing one run, having
+        // opened a sealed effect input".
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let opened = open_sealed_effect_inputs(
+            &transport,
+            &granted_effect(&envelope, "PatientRecord"),
+            &granted_effect(&envelope, "PatientRecord").input_json,
+            "run-1",
+        )
+        .expect("opened");
+        assert!(
+            opened.provider_payload().contains("chest pain"),
+            "the provider sees the record, not ciphertext"
+        );
+    }
+
+    #[test]
+    fn an_ungranted_turn_leaves_the_envelope_sealed() {
+        // Fail-closed on the runtime's own terms. The checker refuses this
+        // program, but a worker must not open on the strength of holding a
+        // transport — the grant travels with the effect, in its durable row.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let input = json!({
+            "prompt": "Summarize",
+            "bindings": { "record": envelope },
+            "access_grants": [],
+        })
+        .to_string();
+        let opened =
+            open_sealed_effect_inputs(&transport, &effect("agent.tell", &input), &input, "run-1")
+                .expect("no grant is not an error");
+        assert!(
+            !opened.provider_payload().contains("chest pain"),
+            "an ungranted envelope stays sealed"
+        );
+        assert!(opened.provider_payload().contains("ciphertext_b64"));
+    }
+
+    #[test]
+    fn opening_never_touches_the_input_that_gets_persisted() {
+        // The load-bearing test, and the one the design exists for. The
+        // obvious implementation resolves plaintext into the effect input,
+        // whose value reaches `start_run`'s durable `metadata_json`. Opening
+        // returns a SEPARATE value; the input string is untouched.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let claimable = granted_effect(&envelope, "PatientRecord");
+        let persisted = claimable.input_json.clone();
+        let opened =
+            open_sealed_effect_inputs(&transport, &claimable, &persisted, "run-1").expect("opened");
+        assert!(opened.provider_payload().contains("chest pain"));
+        assert!(
+            !persisted.contains("chest pain"),
+            "the durable input still holds the envelope: {persisted}"
+        );
+        assert_eq!(persisted, claimable.input_json, "the input was not mutated");
+    }
+
+    #[test]
+    fn a_turn_that_opens_nothing_needs_no_custodian() {
+        // The ordinary path must not acquire a custody dependency. A turn with
+        // no unwrap grant returns early, before any transport is consulted —
+        // which is why a host with no custodian can still run every turn that
+        // does not open.
+        let input = json!({ "prompt": "hello", "bindings": {} }).to_string();
+        let opened = open_sealed_effect_inputs(
+            &NoCustodyTransport,
+            &effect("agent.tell", &input),
+            &input,
+            "run-1",
+        )
+        .expect("no grants, no custodian needed");
+        assert_eq!(opened.provider_payload(), input);
+    }
+
+    #[test]
+    fn a_granted_turn_without_a_custodian_fails_rather_than_sending_ciphertext() {
+        // The other side of the same decision. Proceeding would hand the
+        // provider an envelope and collect a confident answer about nothing.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let claimable = granted_effect(&envelope, "PatientRecord");
+        let error = open_sealed_effect_inputs(
+            &NoCustodyTransport,
+            &claimable,
+            &claimable.input_json,
+            "run-1",
+        )
+        .expect_err("a granted turn needs a custodian");
+        assert!(error.contains("custodian"), "{error}");
+    }
+
+    #[test]
+    fn a_debug_format_of_an_opened_input_discloses_nothing() {
+        // Something eventually formats a struct holding one. A `{:?}` that
+        // printed opened plaintext into a log would be a §4 violation nobody
+        // had to write deliberately.
+        let transport = custodian_with_wrapping_key();
+        let envelope = sealed_envelope(&transport, r#"{"notes":"chest pain"}"#);
+        let claimable = granted_effect(&envelope, "PatientRecord");
+        let opened =
+            open_sealed_effect_inputs(&transport, &claimable, &claimable.input_json, "run-1")
+                .expect("opened");
+        assert_eq!(format!("{opened:?}"), "OpenedEffectInput(<opened>)");
     }
 
     #[test]

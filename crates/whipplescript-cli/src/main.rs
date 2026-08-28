@@ -20563,6 +20563,14 @@ fn run_agent_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input_json = resolve_effect_input_after_bindings(store_path, instance_id, effect)?;
+    // DR-0074 §4, worker arm: a turn granted `unwrap for <T>` has its sealed
+    // inputs opened for the PROVIDER REQUEST only. `input_json` keeps its
+    // envelopes and is what the outbox row and the run record already hold;
+    // the opened value has no route to either — `OpenedEffectInput` carries no
+    // Serialize, and the native request persists `prompt_shape` rather than the
+    // prompt (DR-0075).
+    let opened = open_agent_input_for_provider(effect, &input_json)?;
+    let input_json = opened.provider_payload().to_owned();
     let config_paths = provider_config_paths_with_env(&options.provider_config_paths);
     let provider_selection =
         agent_provider_selection_with_config_paths(effect, &options.provider, &config_paths)?;
@@ -23658,6 +23666,39 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for DesktopCapabi
 /// stable. Memory pools are provider-*less* by design — selection is owned by
 /// the binding, not the pool declaration — so all three memory capabilities
 /// route here.
+/// Open a granted turn's sealed inputs for its provider request (DR-0074 §4).
+///
+/// A turn with no `unwrap` grant is returned untouched, so the ordinary path
+/// pays nothing and needs no custodian. A turn that DOES carry one and cannot
+/// reach a custodian fails rather than proceeding: the provider would otherwise
+/// receive ciphertext and answer about nothing, which is the failure mode the
+/// checker's sealed-input refusal exists to prevent at compile time.
+fn open_agent_input_for_provider(
+    effect: &ClaimableEffect,
+    input_json: &str,
+) -> Result<whipplescript_kernel::effect_handlers::OpenedEffectInput, StoreError> {
+    let run_id = idempotency_key(&[&effect.effect_id, "custody-open"]);
+    #[cfg(target_family = "unix")]
+    {
+        if let Some(transport) = whipplescript_custody::client::UnixSocketTransport::from_env() {
+            return whipplescript_kernel::effect_handlers::open_sealed_effect_inputs(
+                &transport, effect, input_json, &run_id,
+            )
+            .map_err(StoreError::Conflict);
+        }
+    }
+    // No transport. Harmless when the turn opens nothing; a hard error when it
+    // does, on the rule the hosted path already follows — a security operation
+    // must not appear to have happened.
+    whipplescript_kernel::effect_handlers::open_sealed_effect_inputs(
+        &whipplescript_kernel::effect_handlers::NoCustodyTransport,
+        effect,
+        input_json,
+        &run_id,
+    )
+    .map_err(StoreError::Conflict)
+}
+
 /// The `std.custody` capability provider (DR-0074 §12). The wrap logic is
 /// host-agnostic (`run_custody_capability`); this native provider only supplies
 /// the transport, which is the unix socket a running `whip-custodian serve`

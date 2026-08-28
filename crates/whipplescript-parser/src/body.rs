@@ -255,6 +255,19 @@ pub struct EffectStmt {
     pub span: SourceSpan,
 }
 
+impl BodyEffectKind {
+    /// The `with access to …` grants declared on this effect, if its kind
+    /// carries any. Only `tell` and `invoke` do: a turn's grants narrow the
+    /// authority the worker runs under, and an invoke's narrow the child's.
+    pub fn access_grants(&self) -> &[AccessGrant] {
+        match self {
+            BodyEffectKind::Tell { access_grants, .. }
+            | BodyEffectKind::Invoke { access_grants, .. } => access_grants,
+            _ => &[],
+        }
+    }
+}
+
 /// Access grant metadata (`with access to <resource> { <grant clauses> }`) on an
 /// effect. On `tell`, it narrows the turn's effective authority per Proposal A
 /// (spec/agent-harness.md). On `invoke`, it is the explicit start-grant surface for

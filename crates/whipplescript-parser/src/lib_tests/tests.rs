@@ -14126,6 +14126,101 @@ fn non_narrowable_wrap_grant_refuses_narrowing() {
         .any(|diagnostic| diagnostic.message.contains("carries a narrowing clause")));
 }
 
+// --- Worker-side opening: a sealed input needs an unwrap grant ---------------
+
+fn sealed_input_source(grant: &str) -> String {
+    format!(
+        r#"
+use std.custody
+use std.agent
+@service
+workflow SealedInput
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+agent Specialist {{ provider fixture  profile "repo-writer"  capacity 1 }}
+credential phi_key {{ kind raw }}
+
+@external
+rule delegate
+  when Claim as claim
+=> {{
+  tell Specialist
+{grant}
+    "Summarize this record: {{{{ claim.body }}}}" as summary
+}}
+"#
+    )
+}
+
+#[test]
+fn a_sealed_value_reaching_a_provider_without_a_grant_is_refused() {
+    // The trap: a sealed value interpolated into a prompt renders as its
+    // ENVELOPE, so the provider receives base64 ciphertext and answers about
+    // nothing. It compiles, it runs, and the failure looks like a plausible
+    // model reply. There is no sentinel machinery for payloads the way DR-0053
+    // §5 provides one for credentials.
+    let compiled = compile_program(&sealed_input_source(""));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("the provider would receive ciphertext")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_unwrap_grant_on_the_turn_admits_the_sealed_input() {
+    // The other statement an effect can be making: worker-side opening. The
+    // effect's durable row already records `unwrap` narrowed to the type,
+    // which is the authorization half — what is missing is the runtime
+    // resolution, not the surface.
+    let compiled = compile_program(&sealed_input_source(
+        "    with access to credential phi_key {\n\
+         \x20     unwrap for PatientRecord\n\
+         \x20   }",
+    ));
+    assert_eq!(compiled.diagnostics, Vec::new());
+}
+
+#[test]
+fn a_grant_for_another_type_does_not_admit_it() {
+    // The narrowing has to bite here too, or the grant is possession-based
+    // again: holding `unwrap for` anything would admit every sealed input.
+    let compiled = compile_program(&sealed_input_source(
+        "    with access to credential phi_key {\n\
+             \x20     unwrap for Claim\n\
+             \x20   }",
+    ));
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("no `unwrap for PatientRecord` grant")
+        }),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 // --- DR-0074 §3: `open` and the confinement region ---------------------------
 
 fn open_source(body: &str) -> String {

@@ -9255,6 +9255,15 @@ fn analyze_rule(
         &binding_types,
         diagnostics,
     );
+    // A sealed value reaching a provider as ciphertext is always a mistake;
+    // worker-side opening is what the `unwrap for <T>` grant asks for.
+    validate_sealed_effect_inputs(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
     // DR-0074 §10: a sealed value's payload type must match the field it is
     // stored in, or `open`'s three-way agreement rests on a declaration the
     // bytes never satisfied.
@@ -15397,15 +15406,37 @@ fn collect_open_bindings(statements: &[body::BodyStmt], out: &mut BTreeSet<Strin
 /// what a wildcard arm would reopen: one route checked, another reaching the
 /// same table unchecked. Adding a variant must fail to compile here.
 fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<String>) {
-    let source = |text: &str, out: &mut BTreeSet<String>| {
+    let mut sources = Vec::new();
+    collect_effect_expression_sources(kind, &mut sources);
+    for text in &sources {
         if let Ok(expr) = parse_expression(text) {
             collect_expr_binding_roots(&expr, out);
         } else {
             collect_template_binding_roots(text, out);
         }
-    };
-    let fields = |fields: &[body::FieldAssign], out: &mut BTreeSet<String>| {
-        collect_payload_field_roots(fields, None, out);
+    }
+}
+
+/// Every expression SOURCE an effect carries into its durable input, whatever
+/// its kind — the one exhaustive walk over the twenty-three effect kinds.
+///
+/// [`collect_effect_binding_roots`] is derived from this rather than repeating
+/// the match, because two exhaustive walks over the same enum is the shape that
+/// produced DR-0075: they agree on the day they are written and drift after.
+/// One owner, two questions asked of it — which bindings does this effect carry
+/// (the §4 crossing rule), and what does each of them resolve to (the sealed
+/// input check).
+///
+/// Exhaustive with no `_` arm, deliberately: a new effect kind is a new durable
+/// input, and adding one must fail to compile here.
+fn collect_effect_expression_sources(kind: &body::BodyEffectKind, out: &mut Vec<String>) {
+    let source = |text: &str, out: &mut Vec<String>| out.push(text.to_owned());
+    let fields = |fields: &[body::FieldAssign], out: &mut Vec<String>| {
+        for field in fields {
+            if let body::FieldValue::Expr { source, .. } = &field.value {
+                out.push(source.clone());
+            }
+        }
     };
     match kind {
         // A turn carries its prompt (collected by the caller from
@@ -15446,12 +15477,12 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
             for header in headers {
                 // A credential header is a MARKED SLOT the custodian fills
                 // (DR-0053 §5); it carries a handle, never a binding.
-                if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
-                    collect_expr_binding_roots(expr, out);
+                if let body::RequestHeaderValue::Expr { source: text, .. } = &header.value {
+                    out.push(text.clone());
                 }
             }
-            if let Some((_, expr)) = body {
-                collect_expr_binding_roots(expr, out);
+            if let Some((text, _)) = body {
+                out.push(text.clone());
             }
         }
         // A mint's exchange reaches the same durable outbox row a request's
@@ -15461,18 +15492,20 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
         } => {
             source(url, out);
             for header in headers {
-                if let body::RequestHeaderValue::Expr { expr, .. } = &header.value {
-                    collect_expr_binding_roots(expr, out);
+                // A credential header is a MARKED SLOT the custodian fills
+                // (DR-0053 §5); it carries a handle, never a binding.
+                if let body::RequestHeaderValue::Expr { source: text, .. } = &header.value {
+                    out.push(text.clone());
                 }
             }
-            if let Some((_, expr)) = body {
-                collect_expr_binding_roots(expr, out);
+            if let Some((text, _)) = body {
+                out.push(text.clone());
             }
         }
         body::BodyEffectKind::Exec { target, .. } => match target {
             body::ExecTarget::RawCommand(command) => source(command, out),
             body::ExecTarget::Capability { stdin_binding, .. } => {
-                out.insert(stdin_binding.clone());
+                out.push(stdin_binding.clone());
             }
         },
         body::BodyEffectKind::TrackerFile { fields: f, .. } => fields(f, out),
@@ -15490,7 +15523,7 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
         body::BodyEffectKind::LeaseRenew {
             acquire_binding, ..
         } => {
-            out.insert(acquire_binding.clone());
+            out.push(acquire_binding.clone());
         }
         body::BodyEffectKind::LedgerAppend { fields: f, .. } => fields(f, out),
         body::BodyEffectKind::CounterConsume {
@@ -15509,7 +15542,7 @@ fn collect_effect_binding_roots(kind: &body::BodyEffectKind, out: &mut BTreeSet<
         } => {
             source(target_expr, out);
             if let Some(from) = from {
-                out.insert(from.clone());
+                out.push(from.clone());
             }
             fields(f, out);
         }
@@ -17595,6 +17628,137 @@ fn validate_known_field_paths_in_index(
 ) {
     for (root, path) in dotted_paths(line) {
         check_field_path(rule, &root, &path, span, scopes, binding_types, diagnostics);
+    }
+}
+
+/// A `sealed<T>` reaching an effect's input must be accompanied by an
+/// `unwrap for T` grant on that same effect.
+///
+/// **The trap this closes.** A sealed value interpolated into a prompt renders
+/// as its ENVELOPE — `{credential, context, nonce_b64, ciphertext_b64}` — so the
+/// provider receives base64 ciphertext and answers about nothing. It compiles,
+/// it runs, and the failure is a plausible-looking model reply. There is no
+/// sentinel machinery for payloads the way DR-0053 §5 provides one for
+/// credentials: `IrType::Sealed` appears in the lowering only as a shape
+/// descriptor.
+///
+/// So an effect carrying a sealed input is making one of two statements. With a
+/// matching grant it is asking for worker-side opening — the effect's durable
+/// row already records `unwrap` narrowed to the type, which is the whole
+/// authorization half. Without one it is asking the provider to read
+/// ciphertext, which is a mistake in every case, and is refused here rather
+/// than in production.
+fn validate_sealed_effect_inputs(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                // Every expression this effect carries into its durable input,
+                // plus its prompt: the prompt is where a sealed value most
+                // naturally lands, and it is not part of the effect kind.
+                // `open` is the one effect whose sealed input is the point.
+                // Its authorization is the `with <credential>` slot and the
+                // envelope-side unwrap grant, not a turn access grant, and
+                // DR-0074 §3's obligation-3 check already relates its type.
+                if let body::BodyEffectKind::ConstructCapabilityCall {
+                    target_capability, ..
+                } = &effect.kind
+                {
+                    if target_capability == CUSTODY_UNWRAP_CAPABILITY {
+                        continue;
+                    }
+                }
+                let mut sources: Vec<String> = Vec::new();
+                collect_effect_expression_sources(&effect.kind, &mut sources);
+                if let Some(prompt) = &effect.prompt {
+                    sources.push(prompt.text.clone());
+                }
+                let granted: BTreeSet<&str> = effect
+                    .kind
+                    .access_grants()
+                    .iter()
+                    .flat_map(|grant| grant.operations.iter())
+                    .filter(|op| op.operation == "unwrap")
+                    .filter_map(|op| op.target.as_deref())
+                    .collect();
+                for source in &sources {
+                    for (root, path) in dotted_paths(source) {
+                        let Some(root_schema) = binding_types.get(&root) else {
+                            continue;
+                        };
+                        let Ok(TypeSyntax::Sealed { inner, .. }) =
+                            semantic.schemas.resolve_field_path(root_schema, &path)
+                        else {
+                            continue;
+                        };
+                        let payload = inner.to_source();
+                        if granted.contains(payload.as_str()) {
+                            continue;
+                        }
+                        let full = if path.is_empty() {
+                            root.clone()
+                        } else {
+                            format!("{root}.{}", path.join("."))
+                        };
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` passes `{full}` to an effect, but it is \
+                                 `sealed<{payload}>` and the effect has no `unwrap for \
+                                 {payload}` grant — the provider would receive ciphertext",
+                                rule.name.name
+                            ),
+                            suggestion: Some(format!(
+                                "grant the turn worker-side opening: `with access to credential \
+                                 <cred> {{ unwrap for {payload} }}`, or send a value the \
+                                 provider can read"
+                            )),
+                        });
+                    }
+                }
+            }
+            body::BodyStmt::After(after) => validate_sealed_effect_inputs(
+                rule,
+                &after.body,
+                semantic,
+                binding_types,
+                diagnostics,
+            ),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_sealed_effect_inputs(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_sealed_effect_inputs(
+                    rule,
+                    &region.body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+                validate_sealed_effect_inputs(
+                    rule,
+                    &region.lapse_body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+            _ => {}
+        }
     }
 }
 
