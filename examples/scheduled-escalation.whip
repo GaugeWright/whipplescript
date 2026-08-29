@@ -54,7 +54,7 @@ rule request_review_with_deadline
         cancel deadline
         complete result {
           id review.id
-          decision decided.summary
+          decision answer.summary
         }
       }
       Failed as failure => {

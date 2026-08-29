@@ -44,10 +44,10 @@ rules
         TimedOut payload=object<{summary string, effect_id string, run_id string}> span=865..885
         Cancelled payload=object<{summary string, effect_id string, run_id string}> span=865..885
     terminal_branches
-      case answer Completed binding=decided guard=- body_hash=f49ce0252e380558208a738da49f96e7 span=865..885
-      case answer Failed binding=failure guard=- body_hash=facd9e6a4c0e9bc76c035f3657b07899 span=1043..1060
-      case answer TimedOut binding=timeout guard=- body_hash=834f79e48c14a82456e43f12ba642f5a span=1186..1205
-      case answer Cancelled binding=cancel guard=- body_hash=5b8cf1a332bc80229610a04d05243a1c span=1332..1351
-    body_hash 0e7807679bb77d4415752ffcf1c810d6
+      case answer Completed binding=decided guard=- body_hash=d1bfe768dba38c10e100f65e4fb44408 span=865..885
+      case answer Failed binding=failure guard=- body_hash=facd9e6a4c0e9bc76c035f3657b07899 span=1042..1059
+      case answer TimedOut binding=timeout guard=- body_hash=834f79e48c14a82456e43f12ba642f5a span=1185..1204
+      case answer Cancelled binding=cancel guard=- body_hash=5b8cf1a332bc80229610a04d05243a1c span=1331..1350
+    body_hash 9123f3b8b3baea6e89579daa2c138107
 rule_dependencies
   table_reviews --schema:ReviewRequest--> request_review_with_deadline
