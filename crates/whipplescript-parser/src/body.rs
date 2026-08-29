@@ -263,7 +263,8 @@ impl BodyEffectKind {
         match self {
             BodyEffectKind::Tell { access_grants, .. }
             | BodyEffectKind::Invoke { access_grants, .. }
-            | BodyEffectKind::Exec { access_grants, .. } => access_grants,
+            | BodyEffectKind::Exec { access_grants, .. }
+            | BodyEffectKind::Coerce { access_grants, .. } => access_grants,
             _ => &[],
         }
     }
@@ -307,6 +308,10 @@ pub enum BodyEffectKind {
     Coerce {
         name: String,
         args: Vec<String>,
+        /// `with access to credential <c> { unwrap for <T> }` (DR-0074 §4):
+        /// a coerce reaches a model provider, so a sealed argument needs the
+        /// same worker-side opening a `tell` does.
+        access_grants: Vec<AccessGrant>,
         /// the `endorsed` source marker (DR-0027 I-IFC3): the author declares this
         /// coerce is an integrity-raising crossing, making the trusted surface
         /// visible at the crossing point. Authorization still lives in governance.
@@ -2173,7 +2178,15 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+        let mut access_grants = Vec::new();
+        if !self.parse_effect_modifiers_with_access(
+            &mut binding,
+            &mut requires,
+            &mut timeout_seconds,
+            &mut access_grants,
+            None,
+            None,
+        ) {
             return None;
         }
         // optional trailing source-crossing markers (I-IFC3); must come last.
@@ -2192,6 +2205,7 @@ impl<'a> BodyParser<'a> {
             kind: BodyEffectKind::Coerce {
                 name,
                 args,
+                access_grants,
                 endorsed,
                 declassified,
             },

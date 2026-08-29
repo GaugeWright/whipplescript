@@ -21811,6 +21811,13 @@ fn run_coerce_effect(
     options: &WorkerOptions,
 ) -> Result<whipplescript_store::StoredEvent, StoreError> {
     let input_json = resolve_effect_input_after_bindings(store_path, instance_id, effect)?;
+    // DR-0074 §4, worker arm: a granted coerce has its sealed arguments opened
+    // for the PROVIDER REQUEST only. The effect's durable row keeps its
+    // envelopes; the native request persists `prompt_shape` rather than the
+    // prompt (DR-0075), so a request built from opened plaintext discloses only
+    // its JSON type.
+    let opened = open_agent_input_for_provider(effect, &input_json)?;
+    let input_json = opened.provider_payload().to_owned();
     let input = json_from_str(&input_json);
     let function_name = input
         .get("function_name")

@@ -225,6 +225,7 @@ pub(crate) fn print_effect(
         BodyEffectKind::Coerce {
             name,
             args,
+            access_grants,
             endorsed,
             declassified,
         } => {
@@ -239,7 +240,10 @@ pub(crate) fn print_effect(
             push_stmt_line(
                 out,
                 indent,
-                &format!("coerce {name}({args}){binding}{timeout}{endorsed}{declassified}"),
+                &format!(
+                    "coerce {name}({args}){grants}{binding}{timeout}{endorsed}{declassified}",
+                    grants = format_access_grants(access_grants, rn)
+                ),
             );
             return;
         }

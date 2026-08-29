@@ -11081,7 +11081,8 @@ fn ir_access_grants_for_body(kind: &body::BodyEffectKind) -> Vec<IrAccessGrant> 
     match kind {
         body::BodyEffectKind::Tell { access_grants, .. }
         | body::BodyEffectKind::Invoke { access_grants, .. }
-        | body::BodyEffectKind::Exec { access_grants, .. } => access_grants
+        | body::BodyEffectKind::Exec { access_grants, .. }
+        | body::BodyEffectKind::Coerce { access_grants, .. } => access_grants
             .iter()
             .map(|grant| IrAccessGrant {
                 resource: grant.resource.clone(),

@@ -14192,6 +14192,139 @@ fn non_narrowable_wrap_grant_refuses_narrowing() {
         .any(|diagnostic| diagnostic.message.contains("carries a narrowing clause")));
 }
 
+// --- The coerce unwrap grant, and why `invoke` deliberately has none ---------
+
+fn coerce_grant_source(grant: &str) -> String {
+    format!(
+        r#"
+use std.custody
+use std.coercion
+@service
+workflow CoerceGrant
+
+class PatientRecord {{
+  notes string
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Verdict {{
+  ok bool
+}}
+
+credential phi_key {{ kind raw }}
+
+coerce assess(record sealed<PatientRecord>) -> Verdict {{
+  prompt """markdown
+  Assess {{{{ record }}}}.
+  """
+}}
+
+@external
+rule r
+  when Claim as claim
+=> {{
+  coerce assess(claim.body){grant} as v
+  after v succeeds as o {{
+    record Verdict {{ ok o.ok }}
+  }}
+}}
+"#
+    )
+}
+
+#[test]
+fn coerce_takes_an_unwrap_grant() {
+    // A coerce reaches a model provider, so a sealed argument needs the same
+    // worker-side opening a `tell` does.
+    let compiled = compile_program(&coerce_grant_source(
+        " with access to credential phi_key { unwrap for PatientRecord }",
+    ));
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("ir");
+    let effect = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.effects.iter())
+        .find(|effect| effect.kind == IrEffectKind::SchemaCoerce)
+        .expect("coerce effect");
+    assert!(
+        effect.access_grants.iter().any(|grant| {
+            grant
+                .operations
+                .iter()
+                .any(|op| op.operation == "unwrap" && op.target.as_deref() == Some("PatientRecord"))
+        }),
+        "grants were: {:?}",
+        effect.access_grants
+    );
+}
+
+#[test]
+fn a_coerce_without_the_grant_refuses_its_sealed_argument() {
+    let compiled = compile_program(&coerce_grant_source(""));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("would receive ciphertext")),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_invoke_passes_the_envelope_and_never_opens_it() {
+    // DR-0074 §4, and the reason `invoke` is NOT wired for worker-side opening
+    // while `tell`, `coerce` and `exec` are: a child workflow's payload becomes
+    // `instances.input_json`, which is DURABLE. Opening at the invoke site
+    // would write plaintext into one of the very tables §4 names.
+    //
+    // The envelope passes through instead, and an `unwrap` grant on the invoke
+    // authorizes the CHILD — the grants become its `ChildStartAuthority`, so
+    // the child opens under its own delegated authority, where its own effects
+    // are checked.
+    let source = r#"
+use std.custody
+@service
+workflow Parent
+
+class PatientRecord { notes string }
+class Claim { id string  body sealed<PatientRecord> }
+
+credential phi_key { kind raw }
+
+@external
+rule r
+  when Claim as claim
+=> {
+  invoke Child { body claim.body } with access to credential phi_key { unwrap for PatientRecord } as c
+}
+"#;
+    let compiled = compile_program(source);
+    // The invoke target is unresolvable in this fixture, so the assertion is
+    // narrow: the sealed payload itself is not what is refused.
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("would receive ciphertext")),
+        "a granted invoke carries the envelope to the child: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 // --- The exec unwrap grant: a deterministic projection of a sealed value -----
 
 fn exec_grant_source(grant: &str) -> String {

@@ -4599,6 +4599,15 @@ pub fn parsed_effect_input_json(
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
                 "media": media,
+                // DR-0074 §4: a coerce reaches a model provider, so a sealed
+                // argument needs the same worker-side opening a `tell` does.
+                // The grant travels in the effect's own durable row.
+                "access_grants": effect_access_grants_json(
+                    rule,
+                    effect,
+                    IrEffectKind::SchemaCoerce,
+                    &ir.file_stores,
+                ),
             });
             // Sum-type output (spec/sum-types.md): embed deterministic
             // per-variant fixture values so a fixture run returns a tagged
