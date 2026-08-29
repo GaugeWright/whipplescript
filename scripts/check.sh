@@ -276,8 +276,10 @@ fi
 # cheap total version of the discipline the mutation sweep applies to refusals:
 # it costs milliseconds and it closes the category rather than instances.
 #
-# Guarded like the checks above: the mirror withholds `.github/`, and without
-# the workflows every gate they own would read as unreachable.
+# The guard is not a mirror carve-out — the projection publishes five workflow
+# files, so this runs there too, which is the point. It is for trees that carry
+# no workflows at all: with the workflow root absent, every gate a workflow owns
+# would read as unreachable and the check would accuse the whole set.
 if [ -d .github/workflows ]; then
     scripts/check-gate-reachability.sh
 fi

@@ -3,6 +3,13 @@
 # "it is proven": reject any sorry/admit/native_decide/axiom so no theorem can pass
 # the gate on an unproven hole. The project is pinned to an installed toolchain and
 # uses no Mathlib, so this is hermetic and offline.
+#
+# dispatch: run by hand when models/lean changes, per the deep-suite list in
+# AGENTS.md. It is out of the bar and off the gates because it needs a Lean
+# toolchain (`lake`) that no runner installs — and it says so here rather than
+# reading as covered. It was reachable from nothing at all until 2026-08-29:
+# `sync-public-mirror.yml` names it in a `paths:` trigger filter, and the
+# reachability gate read that mention as a caller.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
