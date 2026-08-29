@@ -19,17 +19,19 @@ coerces
   coerce classifyMessage(title string, body string) -> ref<MessageClassification>
 rules
   rule classify_request
-    when WorkItem as request
+    when review has ready issue as request
     reads
-      schema:WorkItem
+      pattern:review has ready issue as request
     writes
       schema:ClassifiedMessage
     effects
+      active_claim kind=tracker.claim binding=active_claim key=3d04fedec851786f38bf4e8fe5acc9e2
       classification kind=schema.coerce binding=classification key=44afbf47e063e5764d019b64e8b18e22
-      effect2 kind=tracker.file binding=- key=4276d9a1e676a740490eadaae19fa52c
+      effect3 kind=tracker.file binding=- key=eb527750949abe45eecc99a09085da09
     dependencies
-      classification --fails--> effect2
-    body_hash 9f955c4d5e83568d940f713ee54928a5
+      active_claim --succeeds--> classification
+      classification --fails--> effect3
+    body_hash b6d9e2b83b3d31373d82a37fb990d818
   rule route_classified
     when ClassifiedMessage as message
     reads

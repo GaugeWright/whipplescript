@@ -2554,6 +2554,51 @@ fn lint_readmission_unprotected_effects(ir: &IrProgram) -> Vec<LintFinding> {
     findings
 }
 
+/// An envelope field read off a `Completed` payload that cannot carry it.
+///
+/// `after x completes as o` binds the terminal envelope — `{tag, status,
+/// summary, effect_id, run_id}` — and `case o { Completed as v => … }` binds the
+/// effect's own output. When the effect declares no output schema, `v` is a
+/// runtime boundary: `whip check` accepts any field name on it, by design.
+///
+/// So an author who writes `v.summary` gets a program that compiles, runs the
+/// effect, and only then fails to lower the branch — after a billed,
+/// non-idempotent turn has already committed. That is the mistake
+/// `examples/scheduled-escalation.whip` shipped, and it survived every gate
+/// because the read is unresolvable rather than wrong.
+///
+/// Warning rather than error: the runtime lifts none of the five envelope
+/// fields into a `Completed` payload, but a model's own output CAN have a
+/// `summary` key, so the read is not refusable. Zero-false-positive in the
+/// sense that matters — it fires only on the five names the envelope provides,
+/// never on an ordinary output field, so a legitimate `v.verdict` is silent.
+fn lint_envelope_field_on_payload(ir: &IrProgram) -> Vec<LintFinding> {
+    ir.rules
+        .iter()
+        .flat_map(|rule| {
+            rule.metadata
+                .envelope_reads_on_payload
+                .iter()
+                .map(move |read| LintFinding {
+                    code: "lint.envelope_field_on_payload",
+                    severity: Severity::Warning,
+                    message: format!(
+                        "rule `{}` reads `{}.{}` off the `Completed` payload of `{}`, whose shape is not statically known; `{}` is a field of the terminal envelope — read it as `{}.{}`",
+                        rule.name,
+                        read.binding,
+                        read.field,
+                        read.scrutinee,
+                        read.field,
+                        read.scrutinee,
+                        read.field,
+                    ),
+                    name: Some(rule.name.clone()),
+                    span: None,
+                })
+        })
+        .collect()
+}
+
 fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let mut findings = lint_unused_coerces(ir);
     findings.extend(lint_missing_coercion_import(ir));
@@ -2572,6 +2617,7 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_tool_grant_requires_owned_harness(ir));
     findings.extend(lint_mark_consumption_boundaries(ir));
     findings.extend(lint_readmission_unprotected_effects(ir));
+    findings.extend(lint_envelope_field_on_payload(ir));
     // Resolve each finding's declaration name to its source span. Top-level names are
     // program-unique, so a single `document_symbols` match is the declaration site.
     let symbols = whipplescript_parser::document_symbols(source);

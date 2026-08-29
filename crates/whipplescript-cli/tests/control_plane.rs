@@ -12802,6 +12802,79 @@ rule run
     wf
 }
 
+/// The `Completed` payload of an effect that declares no output schema is a
+/// runtime boundary: `whip check` accepts any field name on it, by design.
+/// That includes the five the terminal ENVELOPE carries — `tag`, `status`,
+/// `summary`, `effect_id`, `run_id` — which the payload does NOT, since
+/// `terminal_payload_for_tag("Completed")` returns the effect's own result and
+/// lifts none of them in. So the program compiles, runs the turn, and only then
+/// fails to lower the branch, after a billed and non-idempotent effect has
+/// committed. `examples/scheduled-escalation.whip` shipped exactly that read.
+///
+/// The three cases below differ ONLY in whether the effect types its output and
+/// which binding is read; the read text is the same `summary` in two of them.
+#[test]
+fn lint_flags_an_envelope_field_read_off_an_untyped_payload() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("lint-envelope-payload");
+
+    // `tell` declares no output schema; `coerce … -> Verdict` does, and Verdict
+    // carries a real `summary`, so the typed case is a legitimate read of the
+    // same name.
+    let tell = "  tell reviewer as answer \"\"\"markdown\n  Review {{ t.id }}.\n  \"\"\"";
+    let coerce = "  coerce judge(t.id) as answer";
+    let program = |effect: &str, read: &str| -> String {
+        format!(
+            "use std.agent\nuse std.coercion\n\nworkflow EnvRead\n\noutput result R\n\nclass R {{\n  detail string\n}}\n\nclass Ticket {{\n  id string\n}}\n\nclass Verdict {{\n  summary string\n}}\n\nagent reviewer {{\n  provider fixture\n  profile \"repo-reader\"\n  capacity 1\n}}\n\ncoerce judge(id string) -> Verdict {{\n  prompt \"Judge the ticket\"\n}}\n\ntable tickets as Ticket [\n  {{\n    id \"T-1\"\n  }}\n]\n\nrule read\n  when Ticket as t\n=> {{\n{effect}\n\n  after answer completes {{\n    case answer {{\n      Completed as decided => {{\n        complete result {{\n          detail {read}\n        }}\n      }}\n      _ => {{\n        complete result {{\n          detail \"other\"\n        }}\n      }}\n    }}\n  }}\n}}\n"
+        )
+    };
+
+    let flagged = |effect: &str, read: &str| -> bool {
+        let wf = dir.join("envelope.whip");
+        fs::write(&wf, program(effect, read)).expect("write workflow");
+        // Every variant must be one `whip check` ACCEPTS. A lint finding on a
+        // program the checker already rejects would prove nothing about the
+        // gap this closes.
+        let checked = whip(bin, &stores)
+            .args(["check", wf.to_str().expect("present")])
+            .output()
+            .expect("check runs");
+        assert!(
+            checked.status.success(),
+            "check must accept the variant: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let output = whip(bin, &stores)
+            .args(["--json", "lint", wf.to_str().expect("present")])
+            .output()
+            .expect("lint runs");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
+        report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings")
+            .iter()
+            .filter_map(|finding| finding.get("code").and_then(Value::as_str))
+            .any(|code| code == "lint.envelope_field_on_payload")
+    };
+
+    assert!(
+        flagged(tell, "decided.summary"),
+        "an envelope field read off an untyped `Completed` payload must be flagged"
+    );
+    assert!(
+        !flagged(tell, "answer.summary"),
+        "the envelope alias DOES carry `summary`; reading it there is the fix, not the fault"
+    );
+    assert!(
+        !flagged(coerce, "decided.summary"),
+        "a payload the effect TYPED is checked by `whip check`, and Verdict has a real `summary`"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn lint_flags_deep_after_nesting() {
     // A rule nesting `after` blocks ≥4 levels deep is flagged (suggest a `flow`); a

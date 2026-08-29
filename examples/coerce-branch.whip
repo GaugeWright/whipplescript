@@ -45,10 +45,17 @@ coerce classifyMessage(title string, body string) -> MessageClassification {
   """
 }
 
+# A readiness projection re-presents whenever its row changes, so the claim is
+# what decides whether a re-admission repeats the coercion or rides the draining
+# firing's result (DR-0043). Claim first, coerce inside the claim.
 rule classify_request
-  when WorkItem as request
+  when review has ready issue as request
 => {
-  coerce classifyMessage(request.title, request.body) as classification
+  claim request as active_claim
+
+  after active_claim succeeds {
+    coerce classifyMessage(request.title, request.body) as classification
+  }
 
   after classification succeeds {
     record ClassifiedMessage {

@@ -1671,6 +1671,9 @@ pub struct IrRuleMetadata {
     pub case_branches: Vec<IrRuleCaseBranch>,
     pub terminal_outputs: Vec<IrTerminalOutput>,
     pub terminal_branches: Vec<IrTerminalCaseBranch>,
+    /// Envelope fields read off an untyped `Completed` payload — see
+    /// `IrEnvelopeFieldOnPayload`. Lint-only (NOT in the `.ir` snapshot).
+    pub envelope_reads_on_payload: Vec<IrEnvelopeFieldOnPayload>,
     /// The output bindings this rule `complete`s (the `name` of each `complete
     /// <binding> {…}` in the body, recursing into after/case/branch/handler blocks).
     /// Surfaced for the information-flow checker: a `complete result` returns a value
@@ -2105,6 +2108,39 @@ pub struct IrTerminalCaseBranch {
     pub guard: Option<IrExpression>,
     pub body_hash: String,
     pub pattern_span: SourceSpan,
+}
+
+/// A read of a terminal-ENVELOPE field off a `Completed` PAYLOAD binding whose
+/// shape is not statically known.
+///
+/// `after x completes as o` binds the envelope — `{tag, status, summary,
+/// effect_id, run_id}` — while `case o { Completed as v => … }` binds the
+/// effect's own output. When the effect declares no output schema (an
+/// `agent.tell`, say) `v` has no type, so `check_field_path` returns `Unbound`
+/// and every field name on it is accepted. That is correct: reading real output
+/// fields off `v` is the construct's purpose, and the shape is a runtime
+/// boundary.
+///
+/// It stops being correct when the field named is one the ENVELOPE carries.
+/// `terminal_payload_for_tag("Completed")` returns the effect's result, and the
+/// runtime lifts none of the five envelope fields into it — unlike the failure
+/// tags, which do carry `summary`/`effect_id`/`run_id`. So the read resolves
+/// only if the model's output happens to have a key by that name, and the
+/// author almost certainly meant the alias that is in scope one line up.
+///
+/// Recorded rather than refused: an output CAN legitimately contain a
+/// `summary` key, so this is a lint (`lint.envelope_field_on_payload`), not a
+/// diagnostic. Lint-only metadata — deliberately NOT rendered in the `.ir`
+/// snapshot, so it adds no golden/hash churn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrEnvelopeFieldOnPayload {
+    /// The envelope alias the field is available on (`after x completes as o`).
+    pub scrutinee: String,
+    /// The payload binding it was read off instead (`Completed as v`).
+    pub binding: String,
+    /// The envelope field named.
+    pub field: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9536,6 +9572,7 @@ fn analyze_rule(
     metadata.fact_consumes.dedup();
     metadata.terminal_outputs = terminal_metadata.outputs;
     metadata.terminal_branches = terminal_metadata.branches;
+    metadata.envelope_reads_on_payload = terminal_metadata.envelope_reads_on_payload;
     // DR-0044 Q5 / P1: an after-arm `case … where <guard>` guard query observes
     // live fact state at continuation time — the same firing-decision implicit
     // flow as a `when`-guard query (the IFC checker reads `projection_reads` to
@@ -10492,6 +10529,7 @@ fn record_payload_reads(record: &body::RecordStmt) -> (String, BTreeSet<String>)
 struct TerminalMetadata {
     outputs: Vec<IrTerminalOutput>,
     branches: Vec<IrTerminalCaseBranch>,
+    envelope_reads_on_payload: Vec<IrEnvelopeFieldOnPayload>,
 }
 
 #[derive(Clone, Debug)]
@@ -10819,10 +10857,25 @@ fn collect_terminal_case_metadata(
         let (tag, binding) = parse_terminal_pattern_parts(&branch.pattern);
         let mut branch_scope = binding_types.clone();
         if let (Some(tag), Some(binding)) = (&tag, &binding) {
-            if let Some(schema) =
-                terminal_payload_schema_for_tag(tag, &branch.scrutinee, effect_payload_types)
-            {
-                branch_scope.insert(binding.clone(), schema);
+            match terminal_payload_schema_for_tag(tag, &branch.scrutinee, effect_payload_types) {
+                Some(schema) => {
+                    branch_scope.insert(binding.clone(), schema);
+                }
+                // No schema, so `binding` stays out of scope and every field
+                // read on it below resolves to `FieldPathCheck::Unbound` —
+                // unchecked, which is right for a runtime-boundary shape.
+                // Record the reads that name an ENVELOPE field anyway: the
+                // payload does not carry those, and the alias that does is in
+                // scope. See `IrEnvelopeFieldOnPayload`.
+                None => metadata
+                    .envelope_reads_on_payload
+                    .extend(envelope_fields_read_on_payload(
+                        binding,
+                        &branch.scrutinee,
+                        &branch.body,
+                        branch.guard.as_deref(),
+                        branch.pattern_span,
+                    )),
             }
         }
         if let Some(guard) = &branch.guard {
@@ -10862,7 +10915,55 @@ fn collect_terminal_case_metadata(
         (left.scrutinee.as_str(), left.pattern_span.start)
             .cmp(&(right.scrutinee.as_str(), right.pattern_span.start))
     });
+    metadata.envelope_reads_on_payload.sort_by(|left, right| {
+        (left.span.start, left.binding.as_str(), left.field.as_str()).cmp(&(
+            right.span.start,
+            right.binding.as_str(),
+            right.field.as_str(),
+        ))
+    });
     metadata
+}
+
+/// The terminal envelope's field set — the class `TerminalOutcome` the
+/// `after x completes as o` alias binds.
+const TERMINAL_ENVELOPE_FIELDS: [&str; 5] = ["tag", "status", "summary", "effect_id", "run_id"];
+
+/// Envelope fields read off `binding`, the untyped `Completed` payload of
+/// `scrutinee`. Deduplicated per branch: one finding per field named, however
+/// many times the branch reads it.
+fn envelope_fields_read_on_payload(
+    binding: &str,
+    scrutinee: &str,
+    body: &str,
+    guard: Option<&str>,
+    span: SourceSpan,
+) -> Vec<IrEnvelopeFieldOnPayload> {
+    let mut fields = BTreeSet::new();
+    for text in std::iter::once(body).chain(guard) {
+        for (root, path) in dotted_paths(text) {
+            if root != binding {
+                continue;
+            }
+            // The HEAD of the path is what the payload would have to carry;
+            // `v.summary.detail` is the same confusion one level deeper.
+            if path
+                .first()
+                .is_some_and(|field| TERMINAL_ENVELOPE_FIELDS.contains(&field.as_str()))
+            {
+                fields.insert(path[0].clone());
+            }
+        }
+    }
+    fields
+        .into_iter()
+        .map(|field| IrEnvelopeFieldOnPayload {
+            scrutinee: scrutinee.to_owned(),
+            binding: binding.to_owned(),
+            field,
+            span,
+        })
+        .collect()
 }
 
 fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {

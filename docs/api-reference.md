@@ -395,6 +395,19 @@ These are the other analyses:
   `provider owned` or a harness of the `owned` kind. The grant is dead, because
   the system resolves and offers a sub-workflow tool only in the brokered loop
   of the owned harness.
+- **`lint.envelope_field_on_payload`** — a read of a terminal envelope field
+  off a `Completed` payload whose shape is not statically known. The statement
+  `after x completes as o` binds the envelope, which carries `tag`, `status`,
+  `summary`, `effect_id`, and `run_id`. The arm `case o { Completed as v => … }`
+  binds the output of the effect itself. When the effect declares no output
+  schema, as an agent turn does, `v` is a boundary of the runtime, and `whip
+  check` accepts each field name on it. That is correct, because a read of a
+  real output field is the purpose of the arm. It stops being correct when the
+  name is one of the five, because the runtime lifts none of them into a
+  `Completed` payload. The program compiles, runs the effect, and then fails to
+  lower the arm, once a billed and non-idempotent turn has committed. The
+  finding is advice, not a rejection, because the output of a model can carry a
+  key of that name. Read the field off the alias of the envelope.
 - **`lint.missing_coercion_import`**, **`lint.missing_coord_import`**,
   **`lint.missing_files_import`**, **`lint.missing_tracker_import`**, and
   **`lint.missing_ingress_import`** — the program uses a construct with no
