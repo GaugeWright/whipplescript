@@ -262,7 +262,8 @@ impl BodyEffectKind {
     pub fn access_grants(&self) -> &[AccessGrant] {
         match self {
             BodyEffectKind::Tell { access_grants, .. }
-            | BodyEffectKind::Invoke { access_grants, .. } => access_grants,
+            | BodyEffectKind::Invoke { access_grants, .. }
+            | BodyEffectKind::Exec { access_grants, .. } => access_grants,
             _ => &[],
         }
     }
@@ -388,6 +389,12 @@ pub enum BodyEffectKind {
         /// `-> Schema` / `-> each Schema`: deterministic JSON ingestion of
         /// stdout at the effect-result boundary (spec/json-ingestion.md).
         parse_target: Option<ExecParse>,
+        /// `with access to credential <c> { unwrap for <T> }` (DR-0074 §4):
+        /// the grant that lets the worker open a sealed stdin before running
+        /// the script. Sited in MODIFIER position, after the target and the
+        /// `->` contract, so it never collides with `exec <cap> with
+        /// <stdin-binding>` — that `with` is consumed before modifiers begin.
+        access_grants: Vec<AccessGrant>,
     },
     /// `obtain credential <name> into <tracker> { … } [as <b>]` — DR-0053 §11.
     ///
@@ -3962,7 +3969,15 @@ impl<'a> BodyParser<'a> {
         let mut binding = None;
         let mut requires = Vec::new();
         let mut timeout_seconds = None;
-        if !self.parse_effect_modifiers(&mut binding, &mut requires, &mut timeout_seconds) {
+        let mut access_grants = Vec::new();
+        if !self.parse_effect_modifiers_with_access(
+            &mut binding,
+            &mut requires,
+            &mut timeout_seconds,
+            &mut access_grants,
+            None,
+            None,
+        ) {
             return None;
         }
         match &parse_target {
@@ -3988,6 +4003,7 @@ impl<'a> BodyParser<'a> {
             kind: BodyEffectKind::Exec {
                 target,
                 parse_target,
+                access_grants,
             },
             binding,
             requires,
@@ -5080,6 +5096,7 @@ mod tests {
         assert!(matches!(&effect.kind, BodyEffectKind::Exec {
             target: ExecTarget::Capability { name, stdin_binding },
             parse_target: Some(ExecParse { schema, each: false }),
+            ..
         } if name == "backup_repo" && stdin_binding == "request" && schema == "Report"));
         assert_eq!(effect.binding.as_deref(), Some("result"));
     }

@@ -4891,6 +4891,14 @@ pub fn parsed_effect_input_json(
                     "rule": rule.name,
                 })
             };
+            // DR-0074 §4: the unwrap grant travels in the effect's own durable
+            // row, so the worker opens on the strength of what was authorized
+            // at commit rather than of what it can reach at execution.
+            insert_json_field(
+                &mut input,
+                "access_grants",
+                effect_access_grants_json(rule, effect, IrEffectKind::ExecCommand, &ir.file_stores),
+            );
             let parse_spec_index = 1;
             if let Some(spec) = effect.args.get(parse_spec_index) {
                 let (each, schema) = match spec.strip_prefix("each ") {

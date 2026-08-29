@@ -14126,6 +14126,122 @@ fn non_narrowable_wrap_grant_refuses_narrowing() {
         .any(|diagnostic| diagnostic.message.contains("carries a narrowing clause")));
 }
 
+// --- The exec unwrap grant: a deterministic projection of a sealed value -----
+
+fn exec_grant_source(grant: &str) -> String {
+    format!(
+        r#"
+use std.custody
+use std.script
+@service
+workflow ExecGrant
+
+class PatientRecord {{
+  notes string
+  acuity string
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+class Acuity {{
+  acuity string
+}}
+
+credential phi_key {{ kind raw }}
+
+@external
+rule project
+  when Claim as claim
+=> {{
+  exec project_acuity with claim -> Acuity
+{grant}
+    as a
+  after a succeeds as r {{
+    record Acuity {{ acuity r.acuity }}
+  }}
+}}
+"#
+    )
+}
+
+#[test]
+fn exec_takes_an_unwrap_grant_in_modifier_position() {
+    // The grammar question this construct posed: `exec <cap> with <binding>`
+    // already spends `with` on the stdin binding, so a grant clause looked like
+    // it needed a new spelling. It does not — the stdin `with` is consumed by
+    // the target parse, and the grant sits in MODIFIER position alongside `as`,
+    // `requires` and `timeout`, where every other construct puts it.
+    let compiled = compile_program(&exec_grant_source(
+        "    with access to credential phi_key {\n\
+         \x20     unwrap for PatientRecord\n\
+         \x20   }",
+    ));
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("ir");
+    let effect = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.effects.iter())
+        .find(|effect| effect.kind == IrEffectKind::ExecCommand)
+        .expect("exec effect");
+    // The grant must reach the effect's DURABLE row: the worker opens on the
+    // strength of what was authorized at commit, not of what it can reach at
+    // execution.
+    assert!(
+        effect.access_grants.iter().any(|grant| {
+            grant.resource == "credential phi_key"
+                && grant.operations.iter().any(|op| {
+                    op.operation == "unwrap" && op.target.as_deref() == Some("PatientRecord")
+                })
+        }),
+        "grants were: {:?}",
+        effect.access_grants
+    );
+}
+
+#[test]
+fn an_exec_without_the_grant_still_refuses_the_sealed_stdin() {
+    // Without the grant the script receives ciphertext on stdin, which is the
+    // same failure the check exists to prevent for a model prompt.
+    let compiled = compile_program(&exec_grant_source(""));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("would receive ciphertext")),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_exec_grant_narrows_by_type_like_every_other() {
+    let compiled = compile_program(&exec_grant_source(
+        "    with access to credential phi_key {\n\
+         \x20     unwrap for Acuity\n\
+         \x20   }",
+    ));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unwrap for PatientRecord")),
+        "diagnostics were: {:?}",
+        compiled
+            .diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 // --- Worker-side opening: a sealed input needs an unwrap grant ---------------
 
 fn sealed_input_source(grant: &str) -> String {

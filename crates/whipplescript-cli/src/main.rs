@@ -24148,6 +24148,7 @@ fn run_script_capability_exec(
     script_manifest: Option<&ScriptManifest>,
     capability: &str,
     input: &Value,
+    opened: Option<&whipplescript_kernel::effect_handlers::OpenedEffectInput>,
     parse_contract: &Option<Value>,
     // SC6: structured failure evidence (spec/std-script.md "operator surface
     // polish") — a hash mismatch sets {expected_sha256, actual_sha256, path}
@@ -24239,11 +24240,24 @@ fn run_script_capability_exec(
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let stdin_json = input
-        .get("stdin")
-        .cloned()
-        .unwrap_or(Value::Null)
-        .to_string();
+    // DR-0074 §4: stdin is the ONLY place opened plaintext may go. Never argv
+    // — that is visible in `ps` and is part of the content key — and never the
+    // metadata, which `input` still carries in its sealed form.
+    //
+    // Taken at the last moment, immediately before the write to the child, so
+    // the opened value's lifetime is as short as the code allows.
+    let stdin_json = match opened {
+        Some(opened) => json_from_str(opened.provider_payload())
+            .get("stdin")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string(),
+        None => input
+            .get("stdin")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string(),
+    };
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -24545,10 +24559,37 @@ fn run_exec_effect(
     let outcome = if let Some(result) = cached_result {
         Ok(result)
     } else if mode == "capability" {
+        // Opened AFTER the cache key above, which is computed over the SEALED
+        // stdin. Reversing that would make the effect's content key a function
+        // of opened plaintext — a cache keyed on secrets, and a violation of
+        // DR-0074 §8's rule that an in-region effect's identity is a function
+        // of envelope identity only.
+        let opened = match open_agent_input_for_provider(effect, &input.to_string()) {
+            Ok(opened) => opened,
+            Err(error) => {
+                return kernel.fail_run(EffectCompletion {
+                    instance_id,
+                    effect_id: &effect.effect_id,
+                    run_id: &run_id,
+                    provider: "exec",
+                    worker_id: "whip-exec",
+                    status: "failed",
+                    exit_code: Some(1),
+                    summary: Some(&format!("{error:?}")),
+                    metadata_json: &json!({ "mode": mode, "capability": capability }).to_string(),
+                    idempotency_key: Some(&idempotency_key(&[
+                        instance_id,
+                        &effect.effect_id,
+                        "terminal",
+                    ])),
+                });
+            }
+        };
         run_script_capability_exec(
             script_manifest,
             &capability,
             &input,
+            Some(&opened),
             &parse_contract,
             &mut failure_evidence,
         )

@@ -345,6 +345,7 @@ pub(crate) fn print_effect(
         BodyEffectKind::Exec {
             target,
             parse_target,
+            access_grants,
         } => {
             let parse = match parse_target {
                 Some(parse) if parse.each => format!(" -> each {}", parse.schema),
@@ -358,7 +359,12 @@ pub(crate) fn print_effect(
                     stdin_binding,
                 } => format!("exec {name} with {stdin_binding}"),
             };
-            push_stmt_line(out, indent, &format!("{head}{parse}{binding}{timeout}"));
+            let grants = format_access_grants(access_grants, rn);
+            push_stmt_line(
+                out,
+                indent,
+                &format!("{head}{parse}{grants}{binding}{timeout}"),
+            );
             return;
         }
         BodyEffectKind::ObtainCredential {
