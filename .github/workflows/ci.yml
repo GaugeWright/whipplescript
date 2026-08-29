@@ -260,6 +260,32 @@ jobs:
       - name: Formal model checks
         run: WHIPPLESCRIPT_FORMAL_SKIP_TLA=1 scripts/check-formal-models.sh
 
+  # Mirror only — the Lean proof layer, on the deep schedule with the other
+  # model suites. It is the quick one: hermetic, offline, no Mathlib, fifteen
+  # targets. Until #291 it ran nowhere at all, and read as covered because
+  # `sync-public-mirror.yml` names the script in a `paths:` trigger filter.
+  lean-models:
+    if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      # Installs elan and the toolchain `models/lean/lean-toolchain` pins, and
+      # caches `.lake`. It is told to build nothing: `check-lean-models.sh` owns
+      # the build because it also refuses sorry/admit/axiom/native_decide, and a
+      # `lake build` beside it would report a green that skipped that refusal.
+      - uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1.6.0
+        with:
+          lake-package-directory: models/lean
+          auto-config: 'false'
+          build: 'false'
+          test: 'false'
+          lint: 'false'
+      - name: Lean proof checks
+        run: scripts/check-lean-models.sh
+
   # Mirror only — Nix plus TLC.
   tla-models:
     if: ${{ github.repository == 'GaugeWright/whipplescript' && (github.event_name == 'schedule' || inputs.deep) }}

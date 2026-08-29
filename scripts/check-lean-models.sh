@@ -4,12 +4,11 @@
 # the gate on an unproven hole. The project is pinned to an installed toolchain and
 # uses no Mathlib, so this is hermetic and offline.
 #
-# dispatch: run by hand when models/lean changes, per the deep-suite list in
-# AGENTS.md. It is out of the bar and off the gates because it needs a Lean
-# toolchain (`lake`) that no runner installs — and it says so here rather than
-# reading as covered. It was reachable from nothing at all until 2026-08-29:
-# `sync-public-mirror.yml` names it in a `paths:` trigger filter, and the
-# reachability gate read that mention as a caller.
+# Run by the `lean-models` job on the mirror's deep schedule, and by hand when
+# models/lean changes — it needs a Lean toolchain (`lake`), which is why it is a
+# deep suite rather than part of the bar. It was reachable from nothing at all
+# until 2026-08-29: `sync-public-mirror.yml` names it in a `paths:` trigger
+# filter, and the reachability gate read that mention as a caller.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
