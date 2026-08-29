@@ -39,7 +39,7 @@ rules
       deadline kind=timer.wait binding=deadline key=26087ebeaf3660262e29b16f9ca6e494
     terminal_outputs
       answer span=865..885
-        Completed payload=object<{summary string, effect_id string, run_id string}> span=865..885
+        Completed payload=object<{}> span=865..885
         Failed payload=object<{reason string, summary string, effect_id string, run_id string}> span=865..885
         TimedOut payload=object<{summary string, effect_id string, run_id string}> span=865..885
         Cancelled payload=object<{summary string, effect_id string, run_id string}> span=865..885

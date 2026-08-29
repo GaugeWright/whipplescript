@@ -3912,6 +3912,72 @@ rule_dependencies
 }
 
 #[test]
+fn an_unknown_completed_payload_claims_no_fields() {
+    // The `Completed` payload of an effect whose result shape is not statically
+    // known must claim NOTHING. It used to claim `{summary, effect_id,
+    // run_id}` — the terminal ENVELOPE's fields, which the runtime never puts
+    // in the payload — and the IR snapshot saying so is what made
+    // `examples/scheduled-escalation.whip` read `decided.summary` where it
+    // wanted `answer.summary`.
+    //
+    // Nothing enforces a payload's field set, so this is an accuracy property
+    // rather than a refusal: the test is here because an IR that states
+    // something untrue about the runtime misleads every reader of it, and
+    // nothing else would notice it changing back.
+    let compiled = compile_program(
+        r#"
+@service
+workflow OpaquePayload
+
+use std.agent
+use std.ingress
+
+agent worker { provider fixture }
+signal go.now { x string }
+
+output result R
+class R { v string }
+
+rule r
+  when go.now as g
+=> {
+  tell worker as answer "do it"
+  after answer completes {
+    case answer {
+      Completed as done => { complete result { v "ok" } }
+      Failed as f => { complete result { v "no" } }
+      TimedOut as t => { complete result { v "t" } }
+      Cancelled as c => { complete result { v "c" } }
+    }
+  }
+}
+"#,
+    );
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let snapshot = compiled.ir.expect("lowered IR").to_snapshot();
+
+    assert!(
+        snapshot.contains("Completed payload=object<{}>"),
+        "an unknown Completed payload must claim no fields: {snapshot}"
+    );
+    // The failure tags keep theirs, because `terminal_payload_for_tag` really
+    // does lift `summary`/`effect_id`/`run_id` into those payloads. Only the
+    // `Completed` side was fiction, and a fix that flattened all four would be
+    // trading one wrong claim for three.
+    assert!(
+        snapshot.contains(
+            "Failed payload=object<{reason string, summary string, effect_id string, run_id string}>"
+        ),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot
+            .contains("TimedOut payload=object<{summary string, effect_id string, run_id string}>"),
+        "{snapshot}"
+    );
+}
+
+#[test]
 fn example_ir_snapshots_are_stable() {
     let examples = [
         (

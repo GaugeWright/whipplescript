@@ -10580,7 +10580,16 @@ fn terminal_completed_payload_type(
             .cloned()
             .map(lower_type)
             .unwrap_or_else(terminal_unknown_payload_type),
-        IrEffectKind::AgentTell => IrType::Ref("AgentTurn".to_owned()),
+        // An agent turn's `Completed` payload is the TURN'S OUTPUT, whose shape
+        // is a runtime boundary — not the `AgentTurn` envelope, whose fields
+        // reach a rule through the `after … completes as o` alias instead.
+        //
+        // This arm read `Ref("AgentTurn")` and was unreachable:
+        // `effect_payload_statements` admits only `coerce` and `claim` lines,
+        // so a `tell` never arrives here. Left correct rather than removed, so
+        // that widening the collection later cannot quietly assert the
+        // envelope's shape onto the payload.
+        IrEffectKind::AgentTell => terminal_unknown_payload_type(),
         IrEffectKind::CapabilityCall
         | IrEffectKind::HttpRequest
         | IrEffectKind::MintCredential
@@ -11031,12 +11040,29 @@ fn terminal_cancelled_payload_type() -> IrType {
     ])
 }
 
+/// The `Completed` payload of an effect whose result shape is not statically
+/// known: an object that claims NO fields.
+///
+/// It used to claim `{summary, effect_id, run_id}`, and that was a wrong claim
+/// rather than a conservative default. Those three belong to the terminal
+/// ENVELOPE — the `after x completes as o` alias, typed `TerminalOutcome` — and
+/// the runtime's `Completed` payload is `value.value`/`value.output`, the
+/// effect's own result, which carries none of them.
+///
+/// The cost of the old claim was a reader misled, not a program broken: nothing
+/// enforces a payload's field set (`whip check` accepts any field name on a
+/// dynamically-shaped payload), so the three fields only ever appeared in the
+/// IR snapshot. But that snapshot is what an author consults, and it said
+/// `summary` was on the payload — which is exactly the mistake
+/// `examples/scheduled-escalation.whip` shipped, reading `decided.summary`
+/// where it wanted `answer.summary`.
+///
+/// The failure tags keep their fields: `Failed`, `TimedOut` and `Cancelled` DO
+/// carry `summary`/`effect_id`/`run_id` at runtime, because
+/// `terminal_payload_for_tag` lifts them into those payloads. Only the
+/// `Completed` side was fiction.
 fn terminal_unknown_payload_type() -> IrType {
-    IrType::Object(vec![
-        ir_field("summary", IrType::Primitive(IrPrimitiveType::String)),
-        ir_field("effect_id", IrType::Primitive(IrPrimitiveType::String)),
-        ir_field("run_id", IrType::Primitive(IrPrimitiveType::String)),
-    ])
+    IrType::Object(Vec::new())
 }
 
 fn ir_field(name: &str, ty: IrType) -> IrClassField {
