@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use whipplescript_kernel::harness_loop::{chat_messages_from_json, ChatMessage};
 use whipplescript_kernel::harness_model::ModelWire;
 use whipplescript_kernel::host_protocol::{
-    EventPosition, LabeledRuntimeEvent, RuntimeEvidencePointer, StartTurnCommand, TurnReceipt,
-    TurnStatus, HOST_PROTOCOL,
+    EventPosition, LabeledRuntimeEvent, PinnedPosition, RuntimeEvidencePointer, StartTurnCommand,
+    TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use whipplescript_kernel::idempotency_key;
 use whipplescript_store::{EventView, EvidenceRecord, NewEvent, RuntimeStore, StoreError};
@@ -66,6 +66,32 @@ pub struct HostedToolCallObservation {
     pub arguments: Value,
     pub result: Option<String>,
     pub ok: Option<bool>,
+}
+
+/// The instance's current durable coordinate, **with the digest that makes it
+/// verifiable** (DR-0068 §3).
+///
+/// [`current_position`] answers where the authority says it is, which is enough
+/// for an in-process check — quiescence before a fork — and means nothing to a
+/// reader on another machine, who cannot tell a complete prefix from a
+/// truncated or substituted one. This is the form that crosses the boundary.
+///
+/// # Errors
+/// Propagates store failures.
+pub fn pinned_position<Sql: DoSql>(
+    store: &DoSqliteStore<Sql>,
+    instance_id: &str,
+) -> Result<PinnedPosition, StoreError> {
+    let head = store.chain_head(instance_id)?;
+    Ok(PinnedPosition {
+        instance_ref: instance_id.to_owned(),
+        // An empty log sits at 0 with the genesis digest, so "nothing yet" is
+        // still a pin rather than an absence a reader has to special-case.
+        sequence: u64::try_from(head.sequence.unwrap_or(0)).map_err(|_| {
+            StoreError::Conflict("runtime event position cannot be negative".to_owned())
+        })?,
+        head_digest: head.digest,
+    })
 }
 
 /// The instance's current durable coordinate.
@@ -584,6 +610,59 @@ fn store_error(error: StoreError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The round trip that was impossible.**
+    ///
+    /// `list_events_pinned` is implemented and tested on both hosts and had
+    /// zero production callers, because the only position that crossed a
+    /// machine boundary carried no digest — a reader could not obtain a pin, so
+    /// the verified read could not be reached from outside. This asserts the
+    /// two halves meet: what `pinned_position` hands out is exactly what the
+    /// pinned read accepts.
+    #[test]
+    fn a_position_handed_out_is_a_pin_the_verified_read_accepts() {
+        let store = crate::do_store::test_support::store();
+        store
+            .append_event(crate::do_store::tests::chain_event("i1"))
+            .expect("first appends");
+
+        let pin = pinned_position(&store, "i1").expect("position reads");
+        assert_ne!(
+            pin.head_digest, "",
+            "a position without a digest is not something a reader can pin to"
+        );
+
+        store
+            .append_event(crate::do_store::tests::chain_event("i1"))
+            .expect("a later event appends");
+
+        let head = whipplescript_store::event_chain::ChainHead {
+            sequence: Some(i64::try_from(pin.sequence).expect("fits")),
+            digest: pin.head_digest.clone(),
+        };
+        let served = store
+            .list_events_pinned("i1", &head)
+            .expect("the pinned read verifies against the position it was handed");
+        assert_eq!(
+            served.len(),
+            1,
+            "the pin must bound the read to where the caller was, not to where the log now is"
+        );
+    }
+
+    /// An empty log is a position, not an absence.
+    ///
+    /// A reader that pins before anything has happened holds a real claim —
+    /// "nothing was committed as of here" — and it is one the verified read can
+    /// check. Answering `None` would push a special case onto every caller and
+    /// leave the one moment a truncation is easiest to hide unpinnable.
+    #[test]
+    fn an_empty_log_still_hands_out_a_pin() {
+        let store = crate::do_store::test_support::store();
+        let pin = pinned_position(&store, "never-opened").expect("position reads");
+        assert_eq!(pin.sequence, 0);
+        assert_ne!(pin.head_digest, "", "the genesis digest is still a digest");
+    }
 
     #[test]
     fn usage_projection_preserves_cached_input_for_exact_settlement() {

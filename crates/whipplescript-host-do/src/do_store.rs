@@ -10144,7 +10144,7 @@ pub fn do_mark_turn_commands_applied<Sql: DoSql>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Backs `DoSql` with real in-memory SQLite, so the ported store SQL is
@@ -10563,7 +10563,7 @@ mod tests {
         );
     }
 
-    fn chain_event(instance_id: &str) -> NewEvent<'_> {
+    pub(crate) fn chain_event(instance_id: &str) -> NewEvent<'_> {
         NewEvent {
             instance_id,
             event_type: "rule.fired",

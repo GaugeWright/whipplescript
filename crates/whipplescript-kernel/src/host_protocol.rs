@@ -332,6 +332,38 @@ pub struct EventPosition {
     pub sequence: u64,
 }
 
+/// A position a reader can **pin to**: a coordinate, plus the digest that makes
+/// it verifiable.
+///
+/// DR-0068 §3 requires every read of a mutable name to be pinned at the point
+/// of resolution, and a bare [`EventPosition`] cannot be pinned to — a sequence
+/// number says where the authority claims to be and nothing about what it
+/// served. Until 2026-08-30 this was the only position that crossed a machine
+/// boundary, so **no caller could obtain a pin at all**: the hosted
+/// `/host/instances/:id/position` route answered `{instance_ref, sequence}`,
+/// `current_position` read the head sequence and discarded the digest beside
+/// it, and `list_events_pinned` — implemented and tested on both hosts — had
+/// nothing that could reach it.
+///
+/// Deliberately a **separate type** rather than a nullable field on
+/// `EventPosition`. Most positions in this protocol are historical coordinates
+/// — where a fork was taken, where an instance was discarded — and their
+/// verifiable digest is the fold up to that sequence, not the current head.
+/// A nullable field would have been `None` at every one of those sites, which
+/// is a claim nobody would ever come back and fill in. The split also says the
+/// thing DR-0068 §3 turns on: an in-process coordinate check does not need a
+/// pin, and a read crossing a machine boundary does.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PinnedPosition {
+    pub instance_ref: String,
+    /// The last committed sequence, `0` for an empty log.
+    pub sequence: u64,
+    /// DR-0067 §2's digest over the whole committed prefix at `sequence` — the
+    /// genesis digest when the log is empty, never absent, so "no events yet"
+    /// is a pin a reader can hold rather than a gap.
+    pub head_digest: String,
+}
+
 /// One ordered runtime happening. Label and payload bodies remain
 /// WhippleScript-owned and are named by stable evidence references.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

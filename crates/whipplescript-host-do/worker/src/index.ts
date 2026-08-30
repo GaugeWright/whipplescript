@@ -1674,17 +1674,39 @@ export class WorkflowInstance implements DurableObject {
     if (events) {
       const instanceId = decodeURIComponent(events[1]);
       const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
+      // 501 to learn whether a 502nd exists. The page said nothing about being
+      // a page until 2026-08-30: a reader handed exactly 500 events saw an
+      // answer indistinguishable from a complete one, which is the same defect
+      // as an unverifiable prefix in a cheaper form.
+      const page = 500;
       const rows = this.ctx.storage.sql
         .exec(
           `SELECT event_id AS evidence_ref, sequence, event_type AS kind,
                   occurred_at, correlation_id AS command_id
              FROM events WHERE instance_id = ?1 AND sequence > ?2
-            ORDER BY sequence LIMIT 500`,
+            ORDER BY sequence LIMIT ?3`,
           instanceId,
           after,
+          page + 1,
         )
         .toArray();
-      return Response.json({ events: rows });
+      const complete = rows.length <= page;
+      // DR-0068 §3: an observation surface cannot be READ against a pin — a
+      // live tail is by definition unpinned — but it must CARRY one, or a
+      // watcher that sees something worth verifying has no position to verify
+      // it against. This is the whole reason `list_events_pinned` was
+      // unreachable: nothing on the wire ever emitted a digest.
+      const position = JSON.parse(
+        hostFunctions.host_current_position(
+          makeBridge(this.ctx.storage.sql),
+          instanceId,
+        ),
+      );
+      return Response.json({
+        events: rows.slice(0, page),
+        position,
+        complete,
+      });
     }
     const evidence = url.pathname.match(/^\/host\/instances\/([^/]+)\/evidence$/);
     if (evidence) {

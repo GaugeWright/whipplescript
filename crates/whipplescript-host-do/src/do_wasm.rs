@@ -297,10 +297,16 @@ pub fn host_project_turn(
 }
 
 /// Current durable event coordinate for exact turn/fork cuts.
+///
+/// Answers the PINNED form (DR-0068 §3): the sequence plus the digest over the
+/// committed prefix. This served `{instance_ref, sequence}` until 2026-08-30,
+/// so nothing on the far side of the boundary could obtain a pin, and
+/// `list_events_pinned` — implemented and tested on both hosts — was reachable
+/// by nothing.
 #[wasm_bindgen]
 pub fn host_current_position(bridge: DoSqlBridge, instance_id: &str) -> Result<String, JsValue> {
     let store = crate::do_store::DoSqliteStore::new(std::rc::Rc::new(JsDoSql { bridge }));
-    let position = crate::host_projection::current_position(&store, instance_id)
+    let position = crate::host_projection::pinned_position(&store, instance_id)
         .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
     serde_json::to_string(&position).map_err(|error| JsValue::from_str(&error.to_string()))
 }

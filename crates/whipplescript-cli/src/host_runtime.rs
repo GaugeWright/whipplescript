@@ -36,7 +36,7 @@ use whipplescript_store::{
 
 use crate::host_protocol::{
     EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent, OpenInstanceCommand,
-    OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
+    OpenedInstance, PinnedPosition, PolicyEpochRef, ProtocolError, ProviderBindingRef, ResourceRef,
     RuntimeEvidencePointer, StartTurnCommand, TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 use crate::ifc::VerifiedEnvelope;
@@ -1862,18 +1862,52 @@ impl GovernedHostRuntime {
         }))
     }
 
+    /// Where this instance's log currently is.
+    ///
+    /// Read off the chain head rather than by listing. This folded the WHOLE
+    /// log — every row, payload included — to take one integer off its last
+    /// element, which the durable-object host stopped doing and this did not.
     pub fn current_position(&self, instance_ref: &str) -> Result<EventPosition, HostRuntimeError> {
-        let events = self
+        let head = self
             .kernel
             .store()
-            .list_events(instance_ref)
+            .chain_head(instance_ref)
             .map_err(HostRuntimeError::Store)?;
-        let latest = events
-            .last()
+        // An instance with no events is not a position: the callers here are
+        // quiescence checks before a fork, and "nowhere yet" is not somewhere
+        // to fork from. Preserved from the listing form deliberately.
+        let sequence = head
+            .sequence
             .ok_or_else(|| HostRuntimeError::UnknownInstance(instance_ref.to_owned()))?;
         Ok(EventPosition {
             instance_ref: instance_ref.to_owned(),
-            sequence: positive_sequence(latest.sequence)?,
+            sequence: positive_sequence(sequence)?,
+        })
+    }
+
+    /// The same coordinate **with the digest that makes it verifiable**
+    /// (DR-0068 §3), for a reader that will hold it across a boundary.
+    ///
+    /// Native parity for `host_projection::pinned_position`. Unlike
+    /// [`Self::current_position`] an empty log is a position here — sequence 0
+    /// at the genesis digest — because a reader pinning before anything has
+    /// happened is holding a real claim about the log, not an absence.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn pinned_position(&self, instance_ref: &str) -> Result<PinnedPosition, HostRuntimeError> {
+        let head = self
+            .kernel
+            .store()
+            .chain_head(instance_ref)
+            .map_err(HostRuntimeError::Store)?;
+        Ok(PinnedPosition {
+            instance_ref: instance_ref.to_owned(),
+            sequence: match head.sequence {
+                Some(sequence) => positive_sequence(sequence)?,
+                None => 0,
+            },
+            head_digest: head.digest,
         })
     }
 

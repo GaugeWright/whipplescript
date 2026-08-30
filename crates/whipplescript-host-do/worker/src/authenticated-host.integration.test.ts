@@ -1238,6 +1238,24 @@ describe("real WorkflowInstance hibernation", () => {
       expect(await projection.text()).not.toContain("not found");
     }
 
+    // DR-0068 §3: an observation surface must CARRY a pin even though it is
+    // not read against one. Until 2026-08-30 the loop above only asserted 200
+    // and "not not-found", so it passed against a response that gave a reader
+    // no position at all — and `list_events_pinned`, implemented and tested on
+    // both hosts, was reachable from nothing.
+    const eventsPage = await placementFetch(`${instancePath}/events`);
+    const eventsBody = (await eventsPage.json()) as {
+      events: unknown[];
+      position: { instance_ref: string; sequence: number; head_digest: string };
+      complete: boolean;
+    };
+    expect(eventsBody.position.instance_ref).toBe(opened.instance_ref);
+    expect(eventsBody.position.head_digest).toBeTruthy();
+    expect(eventsBody.position.sequence).toBeGreaterThan(0);
+    // A page that does not say it is a page reads as a complete answer.
+    expect(eventsBody.complete).toBe(true);
+    expect(eventsBody.events.length).toBeLessThanOrEqual(500);
+
     const eventStream = await placementFetch(
       `${instancePath}/events/stream?after=0`,
     );
