@@ -24,7 +24,7 @@ use whipplescript_core::json::{require_json_array_field, required_json_string};
 // The pure, wasm-kernel-hostable package-registry parse + validation core, lifted
 // out of this binary (S7 Step 3). The filesystem-coupled DR-0025 `@tool`
 // attestation and the embedded std manifest bytes stay in the CLI below.
-use whipplescript_kernel::exec_http::{ingest_exec_stdout, ExecIngest};
+use whipplescript_kernel::exec_http::{encode_cached_exec_result, ingest_exec_stdout, ExecIngest};
 use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
 use whipplescript_kernel::{
@@ -24549,27 +24549,6 @@ fn decode_cached_exec_result(
     Some((exit_code, stdout, stderr, ingested))
 }
 
-/// Encode a successful exec outcome for the delta-kernel result cache.
-fn encode_cached_exec_result(
-    exit_code: i32,
-    stdout: &str,
-    stderr: &str,
-    ingested: &Option<ExecIngest>,
-) -> String {
-    let ingested_value = match ingested {
-        None => Value::Null,
-        Some(ExecIngest::Single(value)) => json!({"single": value}),
-        Some(ExecIngest::Stream(elements)) => json!({"stream": elements}),
-    };
-    json!({
-        "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-        "ingested": ingested_value,
-    })
-    .to_string()
-}
-
 fn run_exec_effect(
     store_path: &Path,
     instance_id: &str,
@@ -24739,9 +24718,9 @@ fn run_exec_effect(
 
     match outcome {
         Ok((exit_code, stdout, stderr, ingested)) => {
-            let cache_payload = cache_key
-                .as_ref()
-                .map(|_| encode_cached_exec_result(exit_code, &stdout, &stderr, &ingested));
+            let cache_payload = cache_key.as_ref().map(|_| {
+                encode_cached_exec_result(i64::from(exit_code), &stdout, &stderr, &ingested)
+            });
             let mut value = json!({
                 "mode": mode,
                 "command": command,

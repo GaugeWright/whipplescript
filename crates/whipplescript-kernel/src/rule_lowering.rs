@@ -1441,7 +1441,7 @@ pub fn lower_rule(
         let payload = if block.body.trim().is_empty() {
             serde_json::Map::new()
         } else {
-            parse_record_fields(&block.body, &context, None, &mut lowering.errors)
+            parse_record_fields(&block.body, &context, &mut lowering.errors)
         };
         let fact_name = format!("workflow.milestone:{}", block.name);
         let value_json = json!({
@@ -4672,7 +4672,6 @@ pub fn parsed_effect_input_json(
             let fields = parse_record_fields(
                 effect.args.first().map(String::as_str).unwrap_or_default(),
                 context,
-                None,
                 errors,
             );
             let mut input = json!({
@@ -4714,7 +4713,6 @@ pub fn parsed_effect_input_json(
                 let fields = parse_record_fields(
                     effect.args.get(1).map(String::as_str).unwrap_or_default(),
                     context,
-                    None,
                     errors,
                 );
                 insert_json_field(&mut input, "payload", Value::Object(fields));
@@ -4828,7 +4826,6 @@ pub fn parsed_effect_input_json(
             let entry = Value::Object(parse_record_fields(
                 effect.args.get(1).map(String::as_str).unwrap_or_default(),
                 context,
-                None,
                 errors,
             ));
             let partition = ledger
@@ -5240,7 +5237,7 @@ pub fn parsed_effect_input_json(
             let body = effect.args.first().map(String::as_str).unwrap_or_default();
             json!({
                 "target_workflow": effect.target,
-                "input": Value::Object(parse_record_fields(body, context, None, errors)),
+                "input": Value::Object(parse_record_fields(body, context, errors)),
                 "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke, &ir.file_stores),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
@@ -6574,11 +6571,10 @@ pub fn parse_record_fields_with_from(
 pub fn parse_record_fields(
     body: &str,
     context: &RuleContext,
-    from_binding: Option<&str>,
     errors: &mut Vec<String>,
 ) -> serde_json::Map<String, Value> {
     let empty_ir = empty_ir_program();
-    parse_record_fields_scoped(body, context, from_binding, errors, &[], &[], &empty_ir)
+    parse_record_fields_scoped(body, context, None, errors, &[], &[], &empty_ir)
 }
 
 pub fn parse_record_fields_scoped(
@@ -6798,11 +6794,6 @@ pub fn parse_field_value_scoped(
         .find(|(binding, _)| binding == value)
         .map(|(_, fact)| json_from_str(&fact.value_json))
         .unwrap_or_else(|| Value::String(value.to_owned()))
-}
-
-pub fn parse_inline_object_literal(value: &str, context: &RuleContext) -> Option<Value> {
-    let empty_ir = empty_ir_program();
-    parse_inline_object_literal_scoped(value, context, &[], &[], &empty_ir)
 }
 
 pub fn parse_inline_object_literal_scoped(

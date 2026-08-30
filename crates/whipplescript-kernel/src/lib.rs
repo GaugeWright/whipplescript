@@ -42,6 +42,7 @@ use artifact_manifest::{
     ArtifactCaptureFailure,
 };
 use coerce::{CoerceClient, CoerceRequest, CoerceResult, CoerceStatus};
+use effect_handlers::effect_failure_base;
 use harness::{
     AgentHarness, AgentTurnRequest, ProviderFailure, ProviderRunResult, ProviderRunStatus,
 };
@@ -50,6 +51,7 @@ use provider::{
     NativeProviderAdapter, NativeProviderArtifactRef, NativeProviderCancellation,
     NativeProviderEvent, NativeProviderEventKind, NativeProviderTurnRequest,
 };
+use rule_lowering::json_from_str;
 use serde_json::{json, Value};
 use trace::{DependencyEdge, EffectStatus, TraceEvent, TraceRecord};
 use whipplescript_core::Severity;
@@ -2454,7 +2456,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         // as e` binds); on success it is the coerced output. The prior `null` on
         // failure shadowed the error blob, so the bound value was unreadable.
         let value_field = if succeeded {
-            result_value_payload(true, result.value_json.as_deref())
+            result_value_payload(result.value_json.as_deref())
         } else {
             // DR-0032 + redaction (D4): coerce is provider-backed, so the raw
             // `error_json` is confidential model output. The base `reason` must be
@@ -3669,40 +3671,12 @@ fn json_shape(value: &Value) -> Value {
     }
 }
 
-fn result_value_payload(succeeded: bool, source: Option<&str>) -> Option<Value> {
-    source.map(|source| {
-        if succeeded {
-            json_from_str(source)
-        } else {
-            json_payload_summary(source)
-        }
-    })
+fn result_value_payload(source: Option<&str>) -> Option<Value> {
+    source.map(json_from_str)
 }
 
 fn result_error_payload(source: Option<&str>) -> Option<Value> {
     source.map(json_payload_summary)
-}
-
-/// The `EffectError` base object (DR-0032) that `after <effect> fails as f` binds.
-/// Every effect kind's `.failed` fact carries this under its `value` key so the
-/// bound `f` is uniform: `reason`/`summary` are the human-facing failure text,
-/// `effect_id`/`run_id` locate the run, `kind` names the effect. Per-kind extras are
-/// kept elsewhere on the fact (raw, telemetry) and are not read by `f` until a
-/// variant exposes them.
-fn effect_failure_base(
-    kind: &str,
-    reason: &str,
-    summary: &str,
-    effect_id: &str,
-    run_id: &str,
-) -> Value {
-    json!({
-        "reason": reason,
-        "summary": summary,
-        "effect_id": effect_id,
-        "run_id": run_id,
-        "kind": kind,
-    })
 }
 
 fn sanitized_provider_artifact_metadata(
@@ -4317,10 +4291,6 @@ fn coerce_metadata(result: &CoerceResult) -> String {
         "usage": json_from_str(&result.usage_json),
     })
     .to_string()
-}
-
-fn json_from_str(source: &str) -> Value {
-    serde_json::from_str(source).unwrap_or_else(|_| Value::String(source.to_owned()))
 }
 
 fn string_array_field(value: &Value, field: &str) -> Option<Vec<String>> {

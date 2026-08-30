@@ -8,7 +8,8 @@
 //! fictional design and have been removed (no real provider implements a
 //! `/coerce` POST). See `spec/coerce.md`.
 
-use serde_json::{json, Value};
+use crate::rule_lowering::json_from_str;
+use serde_json::json;
 
 /// The coercion-config fingerprint folded into `schema.coerce` effect
 /// admission keys (DR-0014 amendment; spec/std-coercion.md "Idempotency And
@@ -179,10 +180,6 @@ impl CoerceClient for FakeCoerceClient {
         result.transcript.push_str(&request_json.to_string());
         result
     }
-}
-
-fn json_from_str(source: &str) -> Value {
-    serde_json::from_str(source).unwrap_or_else(|_| Value::String(source.to_owned()))
 }
 
 #[cfg(test)]

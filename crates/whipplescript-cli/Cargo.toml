@@ -25,7 +25,6 @@ sha2 = "0.11"
 # RFC6455 handshake digest for the Class-B turn server (compute plane P8).
 sha1 = "0.11"
 chrono = { version = "0.4.45", default-features = false, features = ["alloc", "std"] }
-chrono-tz = "0.10.4"
 # Isolated workspace HTTPS is intercepted by the trusted outer Worker. Load the
 # sandbox image's system roots so the Worker-installed egress CA is honored;
 # bundled public WebPKI roots alone correctly reject that private certificate.

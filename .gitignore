@@ -28,3 +28,7 @@ __pycache__/
 **/.whipplescript/filestore-demo/
 .dev.vars
 crates/whipplescript-host-do/worker/.wrangler/
+# A Codex sidecar writes its startup transcript here when run from the repository
+# root. It carries a ChatGPT account identifier, so it is ignored rather than left
+# to be picked up by a `git add .` the way it was in #49.
+error.log

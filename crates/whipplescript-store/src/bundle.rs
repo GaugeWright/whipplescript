@@ -59,19 +59,12 @@ pub struct WorkspaceBundle {
 }
 
 /// Collect the manifest's reachable blobs through the content seam,
-/// erasure-respecting: tombstoned payloads never travel.
-pub fn collect_blobs(
-    manifest: &BTreeMap<String, String>,
-    content: &dyn ContentBlobs,
-) -> StoreResult<Vec<BundleBlob>> {
-    collect_blobs_delta(manifest, content, &std::collections::BTreeSet::new())
-}
-
-/// `collect_blobs` with pull-missing (rsync-class incremental): every
-/// transferable unit — plain blob OR individual chunk — whose id is in
-/// `have` travels as structure only (`omitted: true`, no body). Chunk
-/// roots always carry their chunk lists (structure is cheap; the
-/// receiver re-links without re-chunking) and never a body.
+/// erasure-respecting (tombstoned payloads never travel), with pull-missing
+/// (rsync-class incremental): every transferable unit — plain blob OR
+/// individual chunk — whose id is in `have` travels as structure only
+/// (`omitted: true`, no body). Chunk roots always carry their chunk lists
+/// (structure is cheap; the receiver re-links without re-chunking) and
+/// never a body.
 pub fn collect_blobs_delta(
     manifest: &BTreeMap<String, String>,
     content: &dyn ContentBlobs,

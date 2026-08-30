@@ -33,9 +33,6 @@ zeroize = "1"
 ureq = { version = "2", features = ["json", "native-certs"] }
 url = "2"
 
-[lib]
-path = "src/lib.rs"
-
 [[bin]]
 name = "whip-custodian"
 path = "src/bin/whip_custodian.rs"

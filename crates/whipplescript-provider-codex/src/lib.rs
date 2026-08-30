@@ -281,17 +281,7 @@ impl<T: CodexAppServerTransport> CodexAppServerClient<T> {
         self.transport
     }
 
-    pub fn read_message(&mut self) -> Result<Value, CodexAppServerError> {
-        loop {
-            let line = self.transport.read_line()?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            return serde_json::from_str(&line).map_err(CodexAppServerError::Json);
-        }
-    }
-
-    /// `read_message` bounded by the inactivity clock: `Ok(None)` means the
+    /// Read one frame, bounded by the inactivity clock: `Ok(None)` means the
     /// window elapsed without a frame (the peer is alive but silent).
     pub fn read_message_timeout(
         &mut self,

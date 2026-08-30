@@ -2303,44 +2303,14 @@ impl SqliteStore {
     ) -> StoreResult<Option<WorkflowInvocationView>> {
         self.connection
             .query_row(
-                r#"
-                SELECT
-                    invocation_id,
-                    parent_instance_id,
-                    parent_effect_id,
-                    parent_program_version_id,
-                    parent_revision_epoch,
-                    parent_instance.version_id,
-                    parent_instance.revision_epoch,
-                    child_instance_id,
-                    child_program_version_id,
-                    child_revision_epoch,
-                    child_instance.version_id,
-                    child_instance.revision_epoch,
-                    workflow_invocations.target_workflow,
-                    workflow_invocations.input_json,
-                    CASE
-                        WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
-                        THEN parent_effect.status
-                        ELSE workflow_invocations.status
-                    END,
-                    workflow_invocations.terminal_event_id,
-                    workflow_invocations.source_span_json,
-                    workflow_invocations.created_at,
-                    COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
-                FROM workflow_invocations
-                LEFT JOIN instances AS parent_instance
-                  ON parent_instance.instance_id = workflow_invocations.parent_instance_id
-                LEFT JOIN instances AS child_instance
-                  ON child_instance.instance_id = workflow_invocations.child_instance_id
-                LEFT JOIN effects AS parent_effect
-                  ON parent_effect.instance_id = workflow_invocations.parent_instance_id
-                 AND parent_effect.effect_id = workflow_invocations.parent_effect_id
-                WHERE workflow_invocations.parent_instance_id = ?1
-                  AND workflow_invocations.parent_effect_id = ?2
-                ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
-                LIMIT 1
-                "#,
+                &format!(
+                    r#"{WORKFLOW_INVOCATION_SELECT}
+    WHERE workflow_invocations.parent_instance_id = ?1
+      AND workflow_invocations.parent_effect_id = ?2
+    ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
+    LIMIT 1
+    "#
+                ),
                 params![parent_instance_id, parent_effect_id],
                 workflow_invocation_from_row,
             )
@@ -2352,44 +2322,12 @@ impl SqliteStore {
         &self,
         parent_instance_id: &str,
     ) -> StoreResult<Vec<WorkflowInvocationView>> {
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT
-                invocation_id,
-                parent_instance_id,
-                parent_effect_id,
-                parent_program_version_id,
-                parent_revision_epoch,
-                parent_instance.version_id,
-                parent_instance.revision_epoch,
-                child_instance_id,
-                child_program_version_id,
-                child_revision_epoch,
-                child_instance.version_id,
-                child_instance.revision_epoch,
-                workflow_invocations.target_workflow,
-                workflow_invocations.input_json,
-                CASE
-                    WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
-                    THEN parent_effect.status
-                    ELSE workflow_invocations.status
-                END,
-                workflow_invocations.terminal_event_id,
-                workflow_invocations.source_span_json,
-                workflow_invocations.created_at,
-                COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
-            FROM workflow_invocations
-            LEFT JOIN instances AS parent_instance
-              ON parent_instance.instance_id = workflow_invocations.parent_instance_id
-            LEFT JOIN instances AS child_instance
-              ON child_instance.instance_id = workflow_invocations.child_instance_id
-            LEFT JOIN effects AS parent_effect
-              ON parent_effect.instance_id = workflow_invocations.parent_instance_id
-             AND parent_effect.effect_id = workflow_invocations.parent_effect_id
-            WHERE workflow_invocations.parent_instance_id = ?1
-            ORDER BY workflow_invocations.created_at, invocation_id
-            "#,
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            r#"{WORKFLOW_INVOCATION_SELECT}
+    WHERE workflow_invocations.parent_instance_id = ?1
+    ORDER BY workflow_invocations.created_at, invocation_id
+    "#
+        ))?;
         let rows = statement
             .query_map([parent_instance_id], workflow_invocation_from_row)?
             .collect::<result::Result<Vec<_>, _>>()?;
@@ -2402,43 +2340,13 @@ impl SqliteStore {
     ) -> StoreResult<Option<WorkflowInvocationView>> {
         self.connection
             .query_row(
-                r#"
-                SELECT
-                    invocation_id,
-                    parent_instance_id,
-                    parent_effect_id,
-                    parent_program_version_id,
-                    parent_revision_epoch,
-                    parent_instance.version_id,
-                    parent_instance.revision_epoch,
-                    child_instance_id,
-                    child_program_version_id,
-                    child_revision_epoch,
-                    child_instance.version_id,
-                    child_instance.revision_epoch,
-                    workflow_invocations.target_workflow,
-                    workflow_invocations.input_json,
-                    CASE
-                        WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
-                        THEN parent_effect.status
-                        ELSE workflow_invocations.status
-                    END,
-                    workflow_invocations.terminal_event_id,
-                    workflow_invocations.source_span_json,
-                    workflow_invocations.created_at,
-                    COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
-                FROM workflow_invocations
-                LEFT JOIN instances AS parent_instance
-                  ON parent_instance.instance_id = workflow_invocations.parent_instance_id
-                LEFT JOIN instances AS child_instance
-                  ON child_instance.instance_id = workflow_invocations.child_instance_id
-                LEFT JOIN effects AS parent_effect
-                  ON parent_effect.instance_id = workflow_invocations.parent_instance_id
-                 AND parent_effect.effect_id = workflow_invocations.parent_effect_id
-                WHERE workflow_invocations.child_instance_id = ?1
-                ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
-                LIMIT 1
-                "#,
+                &format!(
+                    r#"{WORKFLOW_INVOCATION_SELECT}
+    WHERE workflow_invocations.child_instance_id = ?1
+    ORDER BY workflow_invocations.created_at DESC, invocation_id DESC
+    LIMIT 1
+    "#
+                ),
                 [child_instance_id],
                 workflow_invocation_from_row,
             )
@@ -5020,42 +4928,29 @@ impl SqliteStore {
     }
 
     pub fn list_facts(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
-        let mut statement = self.connection.prepare(
-            r#"
-            SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json, source_event_id
-            FROM facts
-            WHERE instance_id = ?1
-              AND consumed_at IS NULL
-            ORDER BY name, key
-            "#,
-        )?;
-        let rows = statement
-            .query_map([instance_id], |row| {
-                Ok(FactView {
-                    fact_id: row.get(0)?,
-                    program_version_id: row.get(1)?,
-                    revision_epoch: row.get(2)?,
-                    name: row.get(3)?,
-                    key: row.get(4)?,
-                    value_json: row.get(5)?,
-                    provenance_class: row.get(6)?,
-                    source_span_json: row.get(7)?,
-                    source_event_id: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-                })
-            })?
-            .collect::<result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.list_facts_on(instance_id, "\n              AND consumed_at IS NULL")
     }
 
     pub fn list_facts_including_consumed(&self, instance_id: &str) -> StoreResult<Vec<FactView>> {
-        let mut statement = self.connection.prepare(
+        self.list_facts_on(instance_id, "")
+    }
+
+    /// The facts plane for an instance, ordered by `(name, key)`.
+    /// `consumed_clause` is the extra WHERE fragment that hides consumed
+    /// facts — the sole difference between the two readers above.
+    fn list_facts_on(
+        &self,
+        instance_id: &str,
+        consumed_clause: &str,
+    ) -> StoreResult<Vec<FactView>> {
+        let mut statement = self.connection.prepare(&format!(
             r#"
             SELECT fact_id, program_version_id, revision_epoch, name, key, value_json, provenance_class, source_span_json, source_event_id
             FROM facts
-            WHERE instance_id = ?1
+            WHERE instance_id = ?1{consumed_clause}
             ORDER BY name, key
-            "#,
-        )?;
+            "#
+        ))?;
         let rows = statement
             .query_map([instance_id], |row| {
                 Ok(FactView {
@@ -6578,7 +6473,7 @@ impl SqliteStore {
         // RC-4c: fold the manifest from the LIVE fact.derived payloads (the
         // restore-marker fold applied), so a checkpoint taken after a restore
         // reflects the reconciled file plane, never an abandoned-branch write.
-        let fact_payloads = live_fact_payloads_on(&tx, capture.instance_id, None)?;
+        let fact_payloads = live_fact_payloads_on(&tx, capture.instance_id)?;
         let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
         let manifest_hash = stable_hash_hex(&manifest_json);
         tx.execute(
@@ -6701,7 +6596,7 @@ impl SqliteStore {
         }
         // Full reconcile: mediated paths live now but absent from the cut are
         // removed so the file plane equals exactly the cut manifest.
-        let current_payloads = live_fact_payloads_on(&self.connection, instance_id, None)?;
+        let current_payloads = live_fact_payloads_on(&self.connection, instance_id)?;
         let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         let removes: Vec<String> = current_manifest
             .keys()
@@ -7807,26 +7702,17 @@ fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap
 /// with the restore-marker fold already applied (RC-4b) so abandoned-branch
 /// facts are excluded. Used to fold the file manifest at a cut (`capture_checkpoint`)
 /// and the current file plane (`plan_restore`) so both see the same
-/// marker-aware file state. `up_to_sequence` bounds the read (INCLUSIVE) for a
-/// point-in-time fold; `None` reads to the current head.
+/// marker-aware file state. Reads to the current head.
 #[cfg(feature = "native")]
-fn live_fact_payloads_on(
-    connection: &Connection,
-    instance_id: &str,
-    up_to_sequence: Option<i64>,
-) -> StoreResult<Vec<String>> {
-    let bound_clause = match up_to_sequence {
-        Some(n) => format!("  AND sequence <= {n}\n"),
-        None => String::new(),
-    };
-    let mut statement = connection.prepare(&format!(
+fn live_fact_payloads_on(connection: &Connection, instance_id: &str) -> StoreResult<Vec<String>> {
+    let mut statement = connection.prepare(
         r#"
         SELECT event_type, payload_json, sequence
         FROM events
         WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored')
-        {bound_clause}ORDER BY sequence
-        "#
-    ))?;
+        ORDER BY sequence
+        "#,
+    )?;
     let rows: Vec<(String, String, i64)> = {
         let mapped = statement
             .query_map([instance_id], |row| {
@@ -10664,6 +10550,45 @@ fn count_where(
         .query_row(&sql, [instance_id], |row| row.get(0))
         .map_err(Into::into)
 }
+
+/// The projection every `workflow_invocations` reader shares: the 19 columns
+/// `workflow_invocation_from_row` decodes, joined to both instances for their
+/// active version and to the parent effect so a terminal effect status folds
+/// over the invocation's own. Each reader appends its own WHERE/ORDER BY tail.
+#[cfg(feature = "native")]
+const WORKFLOW_INVOCATION_SELECT: &str = r#"
+    SELECT
+        invocation_id,
+        parent_instance_id,
+        parent_effect_id,
+        parent_program_version_id,
+        parent_revision_epoch,
+        parent_instance.version_id,
+        parent_instance.revision_epoch,
+        child_instance_id,
+        child_program_version_id,
+        child_revision_epoch,
+        child_instance.version_id,
+        child_instance.revision_epoch,
+        workflow_invocations.target_workflow,
+        workflow_invocations.input_json,
+        CASE
+            WHEN parent_effect.status IN ('completed', 'failed', 'timed_out', 'cancelled')
+            THEN parent_effect.status
+            ELSE workflow_invocations.status
+        END,
+        workflow_invocations.terminal_event_id,
+        workflow_invocations.source_span_json,
+        workflow_invocations.created_at,
+        COALESCE(workflow_invocations.updated_at, workflow_invocations.created_at)
+    FROM workflow_invocations
+    LEFT JOIN instances AS parent_instance
+      ON parent_instance.instance_id = workflow_invocations.parent_instance_id
+    LEFT JOIN instances AS child_instance
+      ON child_instance.instance_id = workflow_invocations.child_instance_id
+    LEFT JOIN effects AS parent_effect
+      ON parent_effect.instance_id = workflow_invocations.parent_instance_id
+     AND parent_effect.effect_id = workflow_invocations.parent_effect_id"#;
 
 #[cfg(feature = "native")]
 fn workflow_invocation_from_row(

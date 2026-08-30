@@ -55,8 +55,5 @@ native = ["whipplescript-store/native"]
 # targets. Production embeddings must use an external governance signature.
 test-support = []
 
-[lib]
-path = "src/lib.rs"
-
 [lints]
 workspace = true

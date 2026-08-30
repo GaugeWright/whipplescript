@@ -362,6 +362,50 @@ pub fn effect_allow_globs(input: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The failure terminal + `.failed` fact every std.files effect settles on; the
+/// four handlers differ only in the effect kind (`file.read`, `file.write`, …).
+/// One copy is what keeps their failure paths from drifting apart.
+#[allow(clippy::too_many_arguments)]
+fn settle_failed_file_effect<S: RuntimeStore>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+    effect: &ClaimableEffect,
+    kind: &str,
+    reason: &str,
+    run_id: &str,
+    terminal_key: &str,
+    fact_key: &str,
+) -> Result<StoredEvent, StoreError> {
+    let terminal = kernel.fail_run(EffectCompletion {
+        instance_id,
+        effect_id: &effect.effect_id,
+        run_id,
+        provider: "files",
+        worker_id: "whip-files",
+        status: "failed",
+        exit_code: None,
+        summary: Some(reason),
+        metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
+        idempotency_key: Some(terminal_key),
+    })?;
+    kernel.derive_fact(
+        instance_id,
+        &format!("{kind}.failed"),
+        &effect.effect_id,
+        &json!({
+            "effect_id": effect.effect_id,
+            "run_id": run_id,
+            "status": "failed",
+            "value": effect_failure_base(kind, reason, reason, &effect.effect_id, run_id),
+            "error": { "message": reason },
+        })
+        .to_string(),
+        Some(&terminal.event_id),
+        Some(fact_key),
+    )?;
+    Ok(terminal)
+}
+
 /// Host-agnostic core (DR-0033 chunk 3): read a file through the `FileStore` seam
 /// and record the terminal/fact over a held `RuntimeKernel<S>`. Native passes
 /// `NativeFileStore`; the DO passes `DoFileStore`.
@@ -459,36 +503,16 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
             )?;
             Ok(terminal)
         }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.read.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.read", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
+        Err(reason) => settle_failed_file_effect(
+            kernel,
+            instance_id,
+            effect,
+            "file.read",
+            &reason,
+            &run_id,
+            &terminal_key,
+            &fact_key,
+        ),
     }
 }
 
@@ -629,36 +653,16 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
             )?;
             Ok(terminal)
         }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.write.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.write", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
+        Err(reason) => settle_failed_file_effect(
+            kernel,
+            instance_id,
+            effect,
+            "file.write",
+            &reason,
+            &run_id,
+            &terminal_key,
+            &fact_key,
+        ),
     }
 }
 
@@ -924,36 +928,16 @@ pub fn run_file_import_effect_generic<S: RuntimeStore>(
             )?;
             Ok(terminal)
         }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.import.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.import", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
+        Err(reason) => settle_failed_file_effect(
+            kernel,
+            instance_id,
+            effect,
+            "file.import",
+            &reason,
+            &run_id,
+            &terminal_key,
+            &fact_key,
+        ),
     }
 }
 
@@ -1215,36 +1199,16 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
             )?;
             Ok(terminal)
         }
-        Err(reason) => {
-            let terminal = kernel.fail_run(EffectCompletion {
-                instance_id,
-                effect_id: &effect.effect_id,
-                run_id: &run_id,
-                provider: "files",
-                worker_id: "whip-files",
-                status: "failed",
-                exit_code: None,
-                summary: Some(&reason),
-                metadata_json: &json!({ "failure": { "message": reason } }).to_string(),
-                idempotency_key: Some(&terminal_key),
-            })?;
-            kernel.derive_fact(
-                instance_id,
-                "file.export.failed",
-                &effect.effect_id,
-                &json!({
-                    "effect_id": effect.effect_id,
-                    "run_id": run_id,
-                    "status": "failed",
-                    "value": effect_failure_base("file.export", &reason, &reason, &effect.effect_id, &run_id),
-                    "error": { "message": reason },
-                })
-                .to_string(),
-                Some(&terminal.event_id),
-                Some(&fact_key),
-            )?;
-            Ok(terminal)
-        }
+        Err(reason) => settle_failed_file_effect(
+            kernel,
+            instance_id,
+            effect,
+            "file.export",
+            &reason,
+            &run_id,
+            &terminal_key,
+            &fact_key,
+        ),
     }
 }
 
@@ -1984,7 +1948,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
 /// under its `value` key, so a downstream `after <effect> fails as f` binds a
 /// uniform `f` with `{reason, summary, effect_id, run_id, kind}`. Per-kind extras
 /// (exit_code, stderr, …) stay elsewhere on the fact and are not read by `f` until a
-/// variant exposes them. Mirrors the kernel-side `effect_failure_base`.
+/// variant exposes them.
 pub fn effect_failure_base(
     kind: &str,
     reason: &str,

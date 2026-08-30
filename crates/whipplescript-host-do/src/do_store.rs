@@ -1817,23 +1817,12 @@ fn do_fold_file_manifest(
 
 /// RC-4c: the LIVE `fact.derived` payloads for an instance with the
 /// restore-marker fold applied (RC-4b), mirroring native `live_fact_payloads_on`.
-/// `up_to_sequence` bounds the read INCLUSIVE; `None` reads to the head.
-fn do_live_fact_payloads<Sql: DoSql>(
-    sql: &Sql,
-    instance_id: &str,
-    up_to_sequence: Option<i64>,
-) -> StoreResult<Vec<String>> {
-    let bound_clause = match up_to_sequence {
-        Some(n) => format!(" AND sequence <= {n}"),
-        None => String::new(),
-    };
+fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<Vec<String>> {
     let rows = sql
         .query(
-            &format!(
-                "SELECT event_type, payload_json, sequence FROM events \
-                 WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored'){bound_clause} \
-                 ORDER BY sequence"
-            ),
+            "SELECT event_type, payload_json, sequence FROM events \
+             WHERE instance_id = ?1 AND event_type IN ('fact.derived', 'context.restored') \
+             ORDER BY sequence",
             &[text(instance_id)],
         )
         .map_err(sql_err)?;
@@ -4563,6 +4552,53 @@ fn do_insert_package_row<Sql: DoSql>(
     Ok(())
 }
 
+/// The `program_versions` row write and its read-back, shared by
+/// `create_program_version` and `reattest_instance_program`. Both write the
+/// identical twelve-column row and then recover the id through the conflict
+/// key, because the insert is a no-op when the version already exists.
+fn do_insert_program_version<Sql: DoSql>(
+    sql: &Sql,
+    program_id: &str,
+    version: NewProgramVersion<'_>,
+) -> StoreResult<String> {
+    sql.execute(
+        "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
+         compiler_version, declared_capabilities, declared_profiles, declared_skills, \
+         declared_schemas, analysis_summary, generated_artifacts, artifact_root) VALUES \
+         ('ver_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+         ?11) ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING",
+        &[
+            text(program_id),
+            text(version.source_hash),
+            text(version.ir_hash),
+            text(version.compiler_version),
+            text(version.declared_capabilities_json),
+            text(version.declared_profiles_json),
+            text(version.declared_skills_json),
+            text(version.declared_schemas_json),
+            text(version.analysis_summary_json),
+            text(version.generated_artifacts_json),
+            opt_text(version.artifact_root),
+        ],
+    )
+    .map_err(sql_err)?;
+    let version_rows = sql
+        .query(
+            "SELECT version_id FROM program_versions \
+             WHERE program_id = ?1 AND source_hash = ?2 AND ir_hash = ?3",
+            &[
+                text(program_id),
+                text(version.source_hash),
+                text(version.ir_hash),
+            ],
+        )
+        .map_err(sql_err)?;
+    version_rows
+        .first()
+        .map(|r| as_text(&r[0]))
+        .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))
+}
+
 impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
     fn schema_version(&self) -> StoreResult<i64> {
         let rows = self
@@ -4605,44 +4641,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .first()
             .map(|r| as_text(&r[0]))
             .ok_or_else(|| sql_err("program row missing after insert".to_string()))?;
-        self.sql
-            .execute(
-                "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
-                 compiler_version, declared_capabilities, declared_profiles, declared_skills, \
-                 declared_schemas, analysis_summary, generated_artifacts, artifact_root) VALUES \
-                 ('ver_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-                 ?11) ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING",
-                &[
-                    text(&program_id),
-                    text(version.source_hash),
-                    text(version.ir_hash),
-                    text(version.compiler_version),
-                    text(version.declared_capabilities_json),
-                    text(version.declared_profiles_json),
-                    text(version.declared_skills_json),
-                    text(version.declared_schemas_json),
-                    text(version.analysis_summary_json),
-                    text(version.generated_artifacts_json),
-                    opt_text(version.artifact_root),
-                ],
-            )
-            .map_err(sql_err)?;
-        let version_rows = self
-            .sql
-            .query(
-                "SELECT version_id FROM program_versions \
-                 WHERE program_id = ?1 AND source_hash = ?2 AND ir_hash = ?3",
-                &[
-                    text(&program_id),
-                    text(version.source_hash),
-                    text(version.ir_hash),
-                ],
-            )
-            .map_err(sql_err)?;
-        let version_id = version_rows
-            .first()
-            .map(|r| as_text(&r[0]))
-            .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))?;
+        let version_id = do_insert_program_version(&self.sql, &program_id, version)?;
         Ok(ProgramVersionRecord {
             program_id,
             version_id,
@@ -4687,44 +4686,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
                 version_id: from_version_id,
             });
         }
-        self.sql
-            .execute(
-                "INSERT INTO program_versions (version_id, program_id, source_hash, ir_hash, \
-                 compiler_version, declared_capabilities, declared_profiles, declared_skills, \
-                 declared_schemas, analysis_summary, generated_artifacts, artifact_root) VALUES \
-                 ('ver_' || lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-                 ?11) ON CONFLICT(program_id, source_hash, ir_hash) DO NOTHING",
-                &[
-                    text(&program_id),
-                    text(version.source_hash),
-                    text(version.ir_hash),
-                    text(version.compiler_version),
-                    text(version.declared_capabilities_json),
-                    text(version.declared_profiles_json),
-                    text(version.declared_skills_json),
-                    text(version.declared_schemas_json),
-                    text(version.analysis_summary_json),
-                    text(version.generated_artifacts_json),
-                    opt_text(version.artifact_root),
-                ],
-            )
-            .map_err(sql_err)?;
-        let version_rows = self
-            .sql
-            .query(
-                "SELECT version_id FROM program_versions \
-                 WHERE program_id = ?1 AND source_hash = ?2 AND ir_hash = ?3",
-                &[
-                    text(&program_id),
-                    text(version.source_hash),
-                    text(version.ir_hash),
-                ],
-            )
-            .map_err(sql_err)?;
-        let to_version_id = version_rows
-            .first()
-            .map(|r| as_text(&r[0]))
-            .ok_or_else(|| sql_err("program_version row missing after insert".to_string()))?;
+        let to_version_id = do_insert_program_version(&self.sql, &program_id, version)?;
         let payload = serde_json::json!({
             "from_version_id": &from_version_id,
             "to_version_id": &to_version_id,
@@ -6140,7 +6102,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         // the reconciled file plane, never an abandoned-branch write. The
         // checkpoint event appended below is not a file write, so folding over
         // the current head equals folding <= the checkpoint's own sequence.
-        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id, None)?;
+        let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id)?;
         let (manifest_json, manifest) = do_fold_file_manifest(&fact_payloads)?;
         // INV-4 coherence: store the manifest content-addressed BEFORE the cut
         // references its hash (same DO SQLite), so no committed cut names a
@@ -6238,7 +6200,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             }
         }
         // Full reconcile: mediated paths live now but absent from the cut.
-        let current_payloads = do_live_fact_payloads(&self.sql, instance_id, None)?;
+        let current_payloads = do_live_fact_payloads(&self.sql, instance_id)?;
         let (_, current_manifest) = do_fold_file_manifest(&current_payloads)?;
         let removes: Vec<String> = current_manifest
             .keys()

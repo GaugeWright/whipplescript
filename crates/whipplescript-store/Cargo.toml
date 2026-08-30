@@ -29,8 +29,5 @@ sha2 = "0.11"
 default = ["native"]
 native = ["dep:rusqlite"]
 
-[lib]
-path = "src/lib.rs"
-
 [lints]
 workspace = true

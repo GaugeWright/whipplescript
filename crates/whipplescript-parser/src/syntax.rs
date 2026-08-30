@@ -3520,24 +3520,15 @@ impl Parser<'_> {
         })
     }
 
+    /// A rule header terminates at `=>`.
     fn parse_when_clause_after_keyword(&mut self, when: SourceSpan) -> Option<WhenClause> {
-        self.parse_when_clause_with_stop(when, false)
-    }
-
-    /// Flow headers terminate at the body `{`; rule headers at `=>`.
-    fn parse_when_clause_with_stop(
-        &mut self,
-        when: SourceSpan,
-        stop_at_brace: bool,
-    ) -> Option<WhenClause> {
         let text_start = when.end;
         let mut text_end = text_start;
 
         while !(self.is_at_end()
             || self.at_arrow()
             || self.at_ident("when")
-            || self.at_ident("rule")
-            || stop_at_brace && self.at_symbol('{'))
+            || self.at_ident("rule"))
         {
             text_end = self.peek()?.span.end;
             self.advance();

@@ -2095,26 +2095,7 @@ pub fn package_provider_contracts(
     Ok(providers)
 }
 
-pub fn package_manifest_registry(
-    path: &Path,
-    value: &Value,
-    name: &str,
-    version: &str,
-    capabilities: &BTreeMap<String, PackageCapabilityContract>,
-    providers: &[PackageProviderContract],
-) -> Result<ContractRegistry, String> {
-    package_manifest_registry_with_privilege(
-        path,
-        value,
-        name,
-        version,
-        capabilities,
-        providers,
-        false,
-    )
-}
-
-/// [`package_manifest_registry`] with the embedded-copy privilege flag: a
+/// The manifest's contract registry, with the embedded-copy privilege flag: a
 /// platform-embedded std manifest may declare an effect contract whose
 /// input/output schemas are the parser's contract LABELS (e.g. std.coercion's
 /// `schema.coerce.input` / `typed-provider-output`) rather than package schema
