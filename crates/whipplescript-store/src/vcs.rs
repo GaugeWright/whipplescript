@@ -478,6 +478,36 @@ pub struct WorkspaceVcs<B: Branches, C: ContentBlobs> {
 #[cfg(feature = "native")]
 pub type NativeWorkspaceVcs = WorkspaceVcs<BranchStore, ContentStore>;
 
+/// A stored manifest as it lies: a tree root to descend, or the flat map cuts
+/// carried before DR-0070 §1.
+///
+/// Host-agnostic, like everything it serves — placed with the branch impl below
+/// rather than beside `NativeWorkspaceVcs`, where an earlier edit put it BETWEEN
+/// that alias's `#[cfg(feature = "native")]` and the item the attribute
+/// annotates. Native builds were unaffected and every native test passed; the
+/// wasm build lost the gate on `impl NativeWorkspaceVcs` and stopped compiling.
+enum RawManifest {
+    Tree(String),
+    Flat(BTreeMap<String, String>),
+}
+
+/// Fold a change set into a flat manifest.
+fn fold_changes(
+    manifest: &mut BTreeMap<String, String>,
+    changes: &BTreeMap<String, Option<String>>,
+) {
+    for (path, value) in changes {
+        match value {
+            Some(id) => {
+                manifest.insert(path.clone(), id.clone());
+            }
+            None => {
+                manifest.remove(path);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "native")]
 impl NativeWorkspaceVcs {
     pub fn open(
@@ -858,8 +888,74 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     /// DR-0070 §1: manifests are written as prolly trees, so a cut writes new
     /// bytes proportional to the change rather than to the workspace.
+    ///
+    /// Takes the WHOLE manifest, so it costs the workspace whatever moved.
+    /// Where the caller knows what changed, [`Self::advance_manifest`] is the
+    /// one to use.
     fn store_manifest(&self, manifest: &BTreeMap<String, String>) -> StoreResult<String> {
         crate::manifest_tree::build(&self.content, manifest)
+    }
+
+    /// Write the next cut's manifest from a BASE and the paths that changed.
+    ///
+    /// DR-0066 §8 refusal 2: nothing O(workspace) where its effect is
+    /// O(change). Every write here loaded the whole manifest, folded a handful
+    /// of paths into it, and rebuilt every node — so editing one file in a
+    /// ten-thousand-file workspace cost ten thousand entries twice.
+    ///
+    /// A base written before the tree shipped is a flat map and has no spine to
+    /// descend, so it is folded and rebuilt once; the cut it produces is a tree,
+    /// and the next write to that branch is incremental.
+    fn advance_manifest(
+        &self,
+        base_hash: Option<&str>,
+        changes: &BTreeMap<String, Option<String>>,
+    ) -> StoreResult<String> {
+        let base = match base_hash {
+            Some(hash) => self.load_manifest_opt_raw(hash)?,
+            None => None,
+        };
+        match base {
+            Some(RawManifest::Tree(root)) => {
+                crate::manifest_tree::apply(&self.content, &root, changes)
+            }
+            Some(RawManifest::Flat(mut manifest)) => {
+                fold_changes(&mut manifest, changes);
+                self.store_manifest(&manifest)
+            }
+            None => {
+                let mut manifest = BTreeMap::new();
+                fold_changes(&mut manifest, changes);
+                self.store_manifest(&manifest)
+            }
+        }
+    }
+
+    /// One path's content id on a branch, WITHOUT materializing the manifest.
+    ///
+    /// A keyed descent through the tree is O(depth); folding the whole manifest
+    /// to look up one entry is O(workspace), which is the read half of the same
+    /// refusal.
+    fn manifest_entry(&self, base_hash: Option<&str>, path: &str) -> StoreResult<Option<String>> {
+        let Some(hash) = base_hash else {
+            return Ok(None);
+        };
+        match self.load_manifest_opt_raw(hash)? {
+            Some(RawManifest::Tree(root)) => crate::manifest_tree::get(&self.content, &root, path),
+            Some(RawManifest::Flat(manifest)) => Ok(manifest.get(path).cloned()),
+            None => Ok(None),
+        }
+    }
+
+    /// Recognize a stored manifest without materializing a tree one.
+    fn load_manifest_opt_raw(&self, hash: &str) -> StoreResult<Option<RawManifest>> {
+        let Some(body) = self.content.get(hash)? else {
+            return Ok(None);
+        };
+        if crate::manifest_tree::is_node(&body) {
+            return Ok(Some(RawManifest::Tree(hash.to_owned())));
+        }
+        Ok(Some(RawManifest::Flat(serde_json::from_str(&body)?)))
     }
 
     /// The branch's current file listing (path → content id).
@@ -871,14 +967,18 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
     }
 
     /// Read a file's body on a branch. `Ok(None)` = no such file there.
+    ///
+    /// A keyed descent, not a fold: this materialized the branch's whole
+    /// manifest to look up one path until 2026-08-26, so reading one file cost
+    /// the workspace (DR-0066 §8 refusal 2).
     pub fn read(&self, branch_id: &str, path: &str) -> StoreResult<Option<String>> {
-        let Some(manifest) = self.manifest(branch_id)? else {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
             return Ok(None);
         };
-        let Some(id) = manifest.get(path) else {
+        let Some(id) = self.manifest_entry(row.head_manifest_hash.as_deref(), path)? else {
             return Ok(None);
         };
-        self.content.get(id)
+        self.content.get(&id)
     }
 
     /// Cut references normalize the empty-string sentinel (a rebase onto
@@ -918,8 +1018,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if row.status != BranchStatus::Active {
             return Ok(VcsWriteOutcome::BranchNotActive);
         }
-        let base = self.load_manifest(row.head_manifest_hash.as_deref())?;
-        let working_set = VirtualWorkingSet::new(&self.content, base);
+        // Detached: a write records ONE path, and neither `write` nor `remove`
+        // consults the base. Materializing the branch's manifest here to change
+        // one entry was the read half of refusal 2 — a one-file edit paid for
+        // the whole workspace before it paid for the whole workspace again on
+        // the way out.
+        let working_set = VirtualWorkingSet::detached(&self.content);
         match body {
             Some(body) => working_set
                 .write(Path::new(path), body.as_bytes())
@@ -928,7 +1032,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                 .remove(Path::new(path))
                 .map_err(|error| StoreError::Conflict(error.to_string()))?,
         }
-        let manifest_hash = self.store_manifest(&working_set.manifest())?;
+        let manifest_hash =
+            self.advance_manifest(row.head_manifest_hash.as_deref(), &working_set.changes())?;
         match self.branches.advance_head(
             branch_id,
             row.head_cut_id.as_deref(),
@@ -2716,18 +2821,12 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if row.status != BranchStatus::Active {
             return Ok(UndoSelectionOutcome::BranchNotActive);
         }
-        let mut manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
-        for (path, before) in &plan.reverts {
-            match before {
-                Some(hash) => {
-                    manifest.insert(path.clone(), hash.clone());
-                }
-                None => {
-                    manifest.remove(path);
-                }
-            }
-        }
-        let manifest_hash = self.store_manifest(&manifest)?;
+        // A revert set is already a change set: `(path, what it was)`, with
+        // `None` for a path that was not there. Folding it into a materialized
+        // manifest to rebuild every node was O(workspace) for an effect the
+        // plan already states the size of (DR-0066 §8 refusal 2).
+        let manifest_hash =
+            self.advance_manifest(row.head_manifest_hash.as_deref(), &plan.reverts)?;
         match self.branches.advance_head(
             branch_id,
             row.head_cut_id.as_deref(),
@@ -2875,13 +2974,17 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
                     newest: unit,
                 });
         }
-        let mut manifest = self.load_manifest(target.head_manifest_hash.as_deref())?;
+        // Read per path rather than materializing the target's manifest: the
+        // preconditions below ask about the paths being transported, and there
+        // are as many of those as there are units, not as there are files.
+        let target_manifest_hash = target.head_manifest_hash.as_deref();
         let mut conflicts = Vec::new();
         let mut moved = Vec::new();
         for (path, net_unit) in &net {
             let precondition = net_unit.oldest.before.as_ref();
             let result = net_unit.newest.after.as_ref();
-            let current = manifest.get(path);
+            let current = self.manifest_entry(target_manifest_hash, path)?;
+            let current = current.as_ref();
             if current == result {
                 continue; // already there: the idempotent skip
             }
@@ -2921,16 +3024,7 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         if moved.is_empty() {
             return Ok(TransportOutcome::UpToDate);
         }
-        for (path, after) in &moved {
-            match after {
-                Some(hash) => {
-                    manifest.insert(path.clone(), hash.clone());
-                }
-                None => {
-                    manifest.remove(path);
-                }
-            }
-        }
+
         // Identity preservation: a single-change selection carries its
         // change id; a mixed selection is honestly a new intent.
         let changes: std::collections::BTreeSet<&str> = selected
@@ -2942,7 +3036,8 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         } else {
             cut_id.to_owned()
         };
-        let manifest_hash = self.store_manifest(&manifest)?;
+        let moved_changes: BTreeMap<String, Option<String>> = moved.iter().cloned().collect();
+        let manifest_hash = self.advance_manifest(target_manifest_hash, &moved_changes)?;
         match self.branches.advance_head(
             onto,
             target.head_cut_id.as_deref(),
@@ -3224,16 +3319,24 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         let branch_id = bundle.branch.branch_id.clone();
         self.branches.ensure_mainline(at)?;
         if let Some(existing) = self.branches.get_branch(&branch_id)? {
-            return Ok(
-                if existing.head_manifest_hash.as_deref() == Some(manifest_hash.as_str()) {
-                    BundleImportOutcome::AlreadyPresent { branch_id }
-                } else {
-                    BundleImportOutcome::DivergentBranch {
-                        branch_id,
-                        local_head_manifest_hash: existing.head_manifest_hash,
-                    }
-                },
-            );
+            // Compared by CONTENT, not by manifest root id. `AlreadyPresent`
+            // means "the branch already carries this state", which is a claim
+            // about what the branch holds — and comparing roots made it a claim
+            // about tree LAYOUT as well, so any change to how manifests are
+            // shaped would have made an identical branch import as divergent
+            // and refused an idempotent import as a conflict. That is the one
+            // place tree layout was a cross-machine agreement; it is not one
+            // now, which is what lets the shape be corrected at all.
+            let already_present = existing.head_manifest_hash.as_deref() == Some(&manifest_hash)
+                || self.load_manifest(existing.head_manifest_hash.as_deref())? == bundle.manifest;
+            return Ok(if already_present {
+                BundleImportOutcome::AlreadyPresent { branch_id }
+            } else {
+                BundleImportOutcome::DivergentBranch {
+                    branch_id,
+                    local_head_manifest_hash: existing.head_manifest_hash,
+                }
+            });
         }
         let created = self.branches.create_branch(CreateBranch {
             branch_id: &branch_id,

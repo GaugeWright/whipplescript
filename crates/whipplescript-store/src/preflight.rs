@@ -105,8 +105,27 @@ pub fn preflight_manifest<B: ContentBlobs + ?Sized>(
     // manifest silently redefines the whole run's inputs, and every per-input
     // check that follows would then be checking the wrong things and passing.
     crate::content::verify_body(manifest_hash, &manifest_body, "manifest")?;
-    let manifest: std::collections::BTreeMap<String, String> =
-        serde_json::from_str(&manifest_body)?;
+    // A manifest is a `manifest_tree` root (DR-0070 §1) or, for cuts written
+    // before it, a flat map. This read parsed ONLY the flat map until
+    // 2026-08-26, so against every manifest production has written since the
+    // tree shipped it returned a serde error rather than an outcome: `invalid
+    // type: integer 0, expected a string`, from the node's `level` field. The
+    // one function whose job is to distinguish absent from erased could not
+    // report either. Nothing caught it because nothing calls preflight yet, and
+    // its own tests built flat fixtures by hand — a shape production stopped
+    // writing.
+    let manifest = match crate::manifest_tree::parse_node(&manifest_body) {
+        Some(root) => match resolve_tree(blobs, root)? {
+            TreeResolution::Resolved(manifest) => manifest,
+            TreeResolution::Unreadable { blob_id, reason } => {
+                return Ok(PreflightOutcome::ManifestUnavailable {
+                    manifest_hash: blob_id,
+                    reason,
+                })
+            }
+        },
+        None => serde_json::from_str(&manifest_body)?,
+    };
 
     let mut missing = Vec::new();
     let checked = manifest.len();
@@ -129,6 +148,92 @@ pub fn preflight_manifest<B: ContentBlobs + ?Sized>(
         Ok(PreflightOutcome::Ready { checked })
     } else {
         Ok(PreflightOutcome::Incomplete { checked, missing })
+    }
+}
+
+/// What resolving a manifest tree found.
+///
+/// A named outcome rather than a nested `Result`, for the reason this whole
+/// module exists: a blob that cannot be served **is not an error here, it is
+/// the answer**. Written as `Result<_, (String, MissingReason)>` it read as a
+/// failure to every reader, human and mechanical alike —
+/// `scripts/check-new-refusals.sh` classified the three reporting sites as
+/// refusals it could not measure, which was a fair reading of what the type
+/// said.
+enum TreeResolution {
+    Resolved(std::collections::BTreeMap<String, String>),
+    /// The closure is UNKNOWN, and this is the blob that made it so.
+    Unreadable {
+        blob_id: String,
+        reason: MissingReason,
+    },
+}
+
+/// Resolve a manifest tree to the flat map preflight checks, reporting an
+/// unreadable node rather than failing on one.
+///
+/// Deliberately not [`crate::manifest_tree::load_from`], for two reasons that
+/// are the whole point of this module. It answers an absent node with an
+/// error, and an unreadable interior node is not an error here — it is the
+/// outcome, "the closure is unknown", and the caller needs to know whether the
+/// node was absent (retry) or erased (degrade honestly). And it does not tell
+/// the caller WHICH node it could not read, which is the one thing an operator
+/// needs to act.
+///
+/// # Errors
+/// Propagates store failures, and refuses a node whose bytes do not hash to the
+/// id they were fetched by.
+fn resolve_tree<B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    root: crate::manifest_tree::Node,
+) -> StoreResult<TreeResolution> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut node = root;
+    loop {
+        if node.level == 0 {
+            out.extend(node.entries);
+        } else {
+            pending.extend(node.entries.into_iter().map(|(_, child)| child));
+        }
+        let Some(id) = pending.pop() else {
+            return Ok(TreeResolution::Resolved(out));
+        };
+        let body = match blobs.status(&id)? {
+            BlobStatus::Live { .. } => blobs.get(&id)?,
+            BlobStatus::Erased { byte_len } => {
+                return Ok(TreeResolution::Unreadable {
+                    blob_id: id,
+                    reason: MissingReason::Erased { byte_len },
+                })
+            }
+            BlobStatus::Unknown => {
+                return Ok(TreeResolution::Unreadable {
+                    blob_id: id,
+                    reason: MissingReason::Absent,
+                })
+            }
+        };
+        // Live with no body is a store contradicting itself, exactly as at the
+        // root above: absent, not an empty node, which would read as a smaller
+        // closure than the run actually has.
+        let Some(body) = body else {
+            return Ok(TreeResolution::Unreadable {
+                blob_id: id,
+                reason: MissingReason::Absent,
+            });
+        };
+        // Every interior node is part of the manifest, so the argument the root
+        // check makes applies to all of them: a substituted node redefines a
+        // whole subtree of the run's inputs, and every per-input check below
+        // would then check the wrong things and pass.
+        crate::content::verify_body(&id, &body, "manifest tree node")?;
+        node = crate::manifest_tree::parse_node(&body).ok_or_else(|| {
+            crate::StoreError::Conflict(format!(
+                "manifest tree node `{id}` is not a node; the manifest is not the shape its \
+                 root says it is"
+            ))
+        })?;
     }
 }
 
@@ -208,6 +313,9 @@ mod tests {
         crate::content::conformance::run_suite(FakeBlobs::default).expect("suite runs");
     }
 
+    /// The LEGACY flat manifest body — the shape cuts written before DR-0070
+    /// §1 carry. Kept because those cuts are still readable, and used only by
+    /// the test that says so.
     fn manifest_of(pairs: &[(&str, &str)]) -> String {
         let map: BTreeMap<String, String> = pairs
             .iter()
@@ -216,12 +324,27 @@ mod tests {
         serde_json::to_string(&map).expect("manifest encodes")
     }
 
+    /// Store a manifest in the shape production actually writes — a
+    /// `manifest_tree` root — and hand back its id.
+    ///
+    /// Every fixture here built the flat body by hand until 2026-08-26, which
+    /// is why nothing noticed that `preflight_manifest` could not parse a tree.
+    /// A fixture that constructs a format by hand can outlive the writer's
+    /// agreement with it; one that goes through the writer cannot.
+    fn put_tree_manifest<B: ContentBlobs + ?Sized>(blobs: &B, pairs: &[(&str, &str)]) -> String {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(path, id)| ((*path).to_owned(), (*id).to_owned()))
+            .collect();
+        crate::manifest_tree::build(blobs, &map).expect("manifest tree builds")
+    }
+
     #[test]
     fn a_complete_closure_is_ready() {
         let blobs = FakeBlobs::default();
         blobs.put_at("b1", "one");
         blobs.put_at("b2", "two");
-        let m = blobs.put_manifest(&manifest_of(&[("a.txt", "b1"), ("b.txt", "b2")]));
+        let m = put_tree_manifest(&blobs, &[("a.txt", "b1"), ("b.txt", "b2")]);
 
         assert_eq!(
             preflight_manifest(&blobs, &m).expect("preflight runs"),
@@ -236,11 +359,7 @@ mod tests {
         let blobs = FakeBlobs::default();
         blobs.put_at("b1", "one");
         blobs.erase_at("b2", 3);
-        let m = blobs.put_manifest(&manifest_of(&[
-            ("a.txt", "b1"),
-            ("b.txt", "b2"),
-            ("c.txt", "b3"),
-        ]));
+        let m = put_tree_manifest(&blobs, &[("a.txt", "b1"), ("b.txt", "b2"), ("c.txt", "b3")]);
 
         let outcome = preflight_manifest(&blobs, &m).expect("preflight runs");
         let PreflightOutcome::Incomplete { checked, missing } = outcome else {
@@ -271,7 +390,7 @@ mod tests {
     #[test]
     fn every_missing_input_is_named_not_only_the_first() {
         let blobs = FakeBlobs::default();
-        let m = blobs.put_manifest(&manifest_of(&[("a", "x"), ("b", "y"), ("c", "z")]));
+        let m = put_tree_manifest(&blobs, &[("a", "x"), ("b", "y"), ("c", "z")]);
         let outcome = preflight_manifest(&blobs, &m).expect("preflight runs");
         let PreflightOutcome::Incomplete { missing, .. } = outcome else {
             panic!("expected an incomplete closure");
@@ -330,16 +449,18 @@ mod tests {
 
         let live = store.put("kept").expect("live blob stores");
         let doomed = store.put("erased later").expect("doomed blob stores");
-        let manifest = serde_json::to_string(&BTreeMap::from([
-            ("kept.txt".to_owned(), live),
-            ("gone.txt".to_owned(), doomed.clone()),
-            (
-                "never.txt".to_owned(),
-                "sha-that-was-never-stored".to_owned(),
-            ),
-        ]))
-        .expect("manifest encodes");
-        let manifest_id = store.put(&manifest).expect("manifest stores");
+        let manifest_id = crate::manifest_tree::build(
+            &store,
+            &BTreeMap::from([
+                ("kept.txt".to_owned(), live),
+                ("gone.txt".to_owned(), doomed.clone()),
+                (
+                    "never.txt".to_owned(),
+                    "sha-that-was-never-stored".to_owned(),
+                ),
+            ]),
+        )
+        .expect("manifest tree builds");
 
         assert_eq!(
             preflight_manifest(&store, &manifest_id).expect("preflight runs"),
@@ -380,10 +501,153 @@ mod tests {
     #[test]
     fn a_genuinely_empty_manifest_is_ready() {
         let blobs = FakeBlobs::default();
-        let m = blobs.put_manifest(&manifest_of(&[]));
+        let m = put_tree_manifest(&blobs, &[]);
         assert_eq!(
             preflight_manifest(&blobs, &m).expect("preflight runs"),
             PreflightOutcome::Ready { checked: 0 }
+        );
+    }
+
+    /// The remaining refusal in the tree walk: a child that is honest bytes but
+    /// is not a node at all.
+    ///
+    /// It has to be its own test rather than a corollary of the substitution
+    /// one, because verification fires FIRST — a smuggled body is caught by its
+    /// hash long before anything asks whether it parses. Reaching this branch
+    /// means a node that legitimately hashes to the id its parent names and is
+    /// still not a node, which is a store that has been written to by something
+    /// that does not share this format.
+    ///
+    /// Asserts on the message, because the sweep mutates a refusal by its text
+    /// and a test that only checked "some error" would not notice it going
+    /// quiet.
+    #[test]
+    fn a_child_that_is_not_a_node_is_refused_by_name() {
+        let blobs = FakeBlobs::default();
+        blobs.put_at("b1", "one");
+        let leaf_root = put_tree_manifest(&blobs, &[("a.txt", "b1")]);
+        let leaf_body = blobs.get(&leaf_root).expect("reads").expect("live");
+        let leaf = crate::manifest_tree::parse_node(&leaf_body).expect("parses");
+
+        // Honest bytes at an honest id — and not a node.
+        let impostor = blobs.put("plainly not a manifest node").expect("stores");
+        let parent = crate::manifest_tree::Node {
+            tag: leaf.tag,
+            level: 1,
+            entries: vec![("zzz".to_owned(), impostor.clone())],
+        };
+        let parent_id = blobs
+            .put(&serde_json::to_string(&parent).expect("encodes"))
+            .expect("stores");
+
+        let error =
+            preflight_manifest(&blobs, &parent_id).expect_err("a non-node child is refused");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains(&impostor) && rendered.contains("is not a node"),
+            "the refusal must name the blob and say what is wrong with it, got {rendered}"
+        );
+    }
+
+    /// Cuts written before DR-0070 §1 carry a flat manifest body, and they are
+    /// still readable — so the compatibility path is a claim this module makes
+    /// and therefore a claim it has to hold to.
+    #[test]
+    fn a_legacy_flat_manifest_still_preflights() {
+        let blobs = FakeBlobs::default();
+        blobs.put_at("b1", "one");
+        let m = blobs.put_manifest(&manifest_of(&[("a.txt", "b1")]));
+        assert_eq!(
+            preflight_manifest(&blobs, &m).expect("preflight runs"),
+            PreflightOutcome::Ready { checked: 1 }
+        );
+    }
+
+    /// Build a manifest big enough that its root has children, and hand back
+    /// the root's child ids alongside it.
+    ///
+    /// The assertion is load-bearing: with too few entries `build` returns a
+    /// single level-0 node, every test below would walk nothing, and they would
+    /// pass while checking the interior-node path not at all.
+    fn tree_with_interior_nodes(blobs: &FakeBlobs) -> (String, Vec<String>) {
+        let pairs: Vec<(String, String)> = (0..240)
+            .map(|index| (format!("file-{index:04}.txt"), format!("blob-{index:04}")))
+            .collect();
+        for (_, blob) in &pairs {
+            blobs.put_at(blob, "body");
+        }
+        let map: BTreeMap<String, String> = pairs.into_iter().collect();
+        let root_id = crate::manifest_tree::build(blobs, &map).expect("manifest tree builds");
+        let root_body = blobs
+            .get(&root_id)
+            .expect("root reads")
+            .expect("root is live");
+        let root = crate::manifest_tree::parse_node(&root_body).expect("root parses as a node");
+        assert!(
+            root.level > 0,
+            "the fixture must produce a root ABOVE level 0, or these tests walk no interior node"
+        );
+        let children = root.entries.into_iter().map(|(_, id)| id).collect();
+        (root_id, children)
+    }
+
+    /// An unreadable interior node means the closure is UNKNOWN, which is the
+    /// distinction this module exists to keep. It must not read as a smaller
+    /// closure that happens to check out.
+    #[test]
+    fn an_erased_interior_node_is_an_unavailable_manifest_naming_that_node() {
+        let blobs = FakeBlobs::default();
+        let (root_id, children) = tree_with_interior_nodes(&blobs);
+        let victim = children.first().expect("the root has children").clone();
+        blobs.erase_at(&victim, 4096);
+
+        assert_eq!(
+            preflight_manifest(&blobs, &root_id).expect("preflight runs"),
+            PreflightOutcome::ManifestUnavailable {
+                manifest_hash: victim,
+                reason: MissingReason::Erased { byte_len: 4096 },
+            },
+            "the outcome must name the node that could not be served, not the root — an \
+             operator cannot act on `the manifest is unavailable`"
+        );
+    }
+
+    #[test]
+    fn an_absent_interior_node_reads_as_absent_not_as_a_shorter_closure() {
+        let blobs = FakeBlobs::default();
+        let (root_id, children) = tree_with_interior_nodes(&blobs);
+        let victim = children.first().expect("the root has children").clone();
+        blobs.live.borrow_mut().remove(&victim);
+
+        assert_eq!(
+            preflight_manifest(&blobs, &root_id).expect("preflight runs"),
+            PreflightOutcome::ManifestUnavailable {
+                manifest_hash: victim,
+                reason: MissingReason::Absent,
+            }
+        );
+    }
+
+    /// DR-0066 §3 at every node, not only at the root. A substituted interior
+    /// node redefines a whole subtree of the run's inputs, and every per-input
+    /// check that followed would then be checking the wrong things and passing.
+    #[test]
+    fn a_substituted_interior_node_is_refused() {
+        let blobs = FakeBlobs::default();
+        let (root_id, children) = tree_with_interior_nodes(&blobs);
+        let victim = children.first().expect("the root has children").clone();
+        let honest = crate::manifest_tree::build(
+            &blobs,
+            &BTreeMap::from([("smuggled.txt".to_owned(), "blob-0000".to_owned())]),
+        )
+        .expect("the substitute builds");
+        let substitute = blobs.get(&honest).expect("reads").expect("is live");
+        blobs.put_at(&victim, &substitute);
+
+        let error = preflight_manifest(&blobs, &root_id).expect_err("a lying node is refused");
+        assert!(
+            matches!(error, crate::StoreError::ContentMismatch { .. }),
+            "expected a content mismatch, got {error:?}"
         );
     }
 }

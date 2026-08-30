@@ -34,9 +34,23 @@ use std::collections::BTreeMap;
 use crate::content::ContentBlobs;
 use crate::{StoreError, StoreResult};
 
-/// Encoding tag. A future layout change is a different tag rather than a silent
+/// Encoding tag. A layout change is a different tag rather than a silent
 /// re-identification of every stored tree.
-const NODE_TAG: &str = "whipplescript.manifest-tree.v1";
+///
+/// v2 (2026-08-26) corrects the boundary rate — see [`is_boundary`]. The node
+/// ENCODING is unchanged, so v1 trees stay readable exactly as they are; what
+/// differs is where a build cuts, and therefore what a rebuilt manifest is
+/// called. A v1 tree that gets written through migrates to v2 by being rebuilt.
+const NODE_TAG: &str = "whipplescript.manifest-tree.v2";
+
+/// Tags this reader still accepts. Nothing rewrites a stored tree, so every
+/// manifest written before the boundary correction is read where it lies.
+const LEGACY_NODE_TAGS: [&str; 1] = ["whipplescript.manifest-tree.v1"];
+
+/// Is this a manifest tree node of any version this reader understands?
+fn is_known_tag(tag: &str) -> bool {
+    tag == NODE_TAG || LEGACY_NODE_TAGS.contains(&tag)
+}
 
 /// Target entries per node. Nodes average this size; the boundary is
 /// probabilistic, so real nodes vary around it.
@@ -70,7 +84,27 @@ fn is_boundary(key: &str) -> bool {
     let digest = hasher.finalize();
     // First 16 bits of the digest, as a value in [0, 65536).
     let window = (u64::from(digest[0]) << 8) | u64::from(digest[1]);
-    window.is_multiple_of(65536 / TARGET_FANOUT)
+    // One key in `TARGET_FANOUT` is a boundary.
+    //
+    // This read `is_multiple_of(65536 / TARGET_FANOUT)` until 2026-08-26, which
+    // is the same arithmetic upside down: it made one key in 4096 a boundary,
+    // not one in 16. Measured, the rate was 1 in 3,922 and the mean leaf held
+    // 63.3 entries against a `MAX_ENTRIES` of 64 — so every cut in every stored
+    // manifest was the SIZE CAP, and the content-defined boundary this
+    // structure is chosen for decided nothing.
+    //
+    // What that cost, beyond node size: `MAX_ENTRIES` cuts at a running count,
+    // so inserting or removing one path re-cut every node after it. The tree
+    // was not incrementally updatable (DR-0066 §8 refusal 2) and two trees
+    // differing by one added file shared almost no subtrees, which is the
+    // short-circuit DR-0070 §1 calls "what makes continuous reconciliation
+    // affordable at all".
+    //
+    // Both existing checks passed throughout: `node_sizes_respect_their_bounds`
+    // asks only that sizes fall between the floor and the cap, and 64 does; and
+    // `a_one_entry_change_writes_only_its_spine` edits a VALUE, which cannot
+    // move a boundary under either rate.
+    window.is_multiple_of(TARGET_FANOUT)
 }
 
 /// Does this blob body look like a tree node?
@@ -82,7 +116,7 @@ fn is_boundary(key: &str) -> bool {
 /// cuts that already exist and are already referenced.
 #[must_use]
 pub fn is_node(body: &str) -> bool {
-    serde_json::from_str::<Node>(body).is_ok_and(|node| node.tag == NODE_TAG)
+    serde_json::from_str::<Node>(body).is_ok_and(|node| is_known_tag(&node.tag))
 }
 
 /// One node: a level and its ordered entries.
@@ -106,7 +140,7 @@ pub struct Node {
 pub fn parse_node(body: &str) -> Option<Node> {
     serde_json::from_str::<Node>(body)
         .ok()
-        .filter(|node| node.tag == NODE_TAG)
+        .filter(|node| is_known_tag(&node.tag))
 }
 
 fn store_node<B: ContentBlobs + ?Sized>(
@@ -134,8 +168,14 @@ fn load_node<B: ContentBlobs + ?Sized>(blobs: &B, id: &str) -> StoreResult<Node>
             "manifest tree node `{id}` is absent from the content store"
         )));
     };
+    // DR-0066 §3, at every node rather than only at the root. An interior node
+    // names a whole subtree, so a substituted one silently redefines that much
+    // of the manifest — and this walker cannot know whether the `blobs` it was
+    // handed verifies (the read-through cache does; a bare store does not).
+    // Cheap relative to the parse that follows: a node holds ~16 entries.
+    crate::content::verify_body(id, &body, "manifest tree node")?;
     let node: Node = serde_json::from_str(&body)?;
-    if node.tag != NODE_TAG {
+    if !is_known_tag(&node.tag) {
         return Err(StoreError::Conflict(format!(
             "manifest tree node `{id}` carries tag `{}`, not `{NODE_TAG}`",
             node.tag
@@ -144,8 +184,24 @@ fn load_node<B: ContentBlobs + ?Sized>(blobs: &B, id: &str) -> StoreResult<Node>
     Ok(node)
 }
 
-/// Split an ordered entry list into nodes at key-derived boundaries.
-fn split(entries: Vec<(String, String)>) -> Vec<Vec<(String, String)>> {
+/// An ordered run of `(key, id)` entries: a node's contents, or a run of them
+/// on its way to becoming one.
+///
+/// At level 0 a key is a path and an id is a blob; above, a key is a child's
+/// greatest key and an id is that child.
+type Group = Vec<(String, String)>;
+
+/// Split an ordered entry list into nodes at key-derived boundaries, keeping
+/// the trailing run that never reached a cut separate.
+///
+/// The separation is what makes an incremental update possible. Cutting is a
+/// left-to-right scan whose state resets to empty at every cut, so a node's
+/// range always *starts* from empty state — which means re-splitting one node's
+/// entries in isolation reproduces exactly the cuts a whole-tree rebuild would
+/// make, PROVIDED the range still ends at a cut. A non-empty carry says it does
+/// not: the boundary moved past this node's end and the change ripples into its
+/// right sibling. [`apply`] treats that as the signal to fall back.
+fn split_with_carry(entries: Group) -> (Vec<Group>, Group) {
     let mut nodes = Vec::new();
     let mut current: Vec<(String, String)> = Vec::new();
     for entry in entries {
@@ -157,8 +213,18 @@ fn split(entries: Vec<(String, String)>) -> Vec<Vec<(String, String)>> {
             nodes.push(std::mem::take(&mut current));
         }
     }
-    if !current.is_empty() {
-        nodes.push(current);
+    (nodes, current)
+}
+
+/// Split an ordered entry list into nodes at key-derived boundaries.
+///
+/// Defined in terms of [`split_with_carry`] rather than beside it, so the two
+/// cannot drift: a whole rebuild is exactly the incremental scan with its
+/// trailing run kept as the final node.
+fn split(entries: Group) -> Vec<Group> {
+    let (mut nodes, carry) = split_with_carry(entries);
+    if !carry.is_empty() {
+        nodes.push(carry);
     }
     nodes
 }
@@ -198,6 +264,209 @@ pub fn build<B: ContentBlobs + ?Sized>(
         }
         level += 1;
         current = parents;
+    }
+}
+
+/// Apply a batch of path changes to a tree, re-minting only the spine they
+/// touch. `Some(id)` sets a path, `None` removes it.
+///
+/// **DR-0066 §8 refusal 2**: nothing O(workspace) where its effect is O(change).
+/// [`build`] takes the whole entry map, so every write through it cost the
+/// workspace no matter how little moved — a one-file edit rebuilt every node.
+/// This descends to the paths that changed and re-mints their nodes and the
+/// spine above them.
+///
+/// **The result is byte-identical to [`build`] over the resulting entry set.**
+/// That is not a nicety: the manifest root is what an import compares to decide
+/// `AlreadyPresent` from `DivergentBranch`, so two stores that disagreed about
+/// the tree for identical content would refuse each other's idempotent imports
+/// as conflicts. `apply_agrees_with_a_full_rebuild` asserts the root ids match,
+/// not merely the entries.
+///
+/// Why a fallback exists. Cut positions depend on a running count since the
+/// last cut (`MIN_ENTRIES`), not on keys alone, so adding or removing a key can
+/// push a boundary past the end of the node that holds it. Where that happens
+/// the update is not local and this rebuilds instead — correct either way, and
+/// the rare case rather than the common one, because a value-only edit cannot
+/// move a boundary at all and an insert usually meets the same boundary key
+/// with the count still above the floor.
+///
+/// # Errors
+/// Propagates store failures; refuses a node that is absent or foreign.
+pub fn apply<B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    root: &str,
+    changes: &BTreeMap<String, Option<String>>,
+) -> StoreResult<String> {
+    if changes.is_empty() {
+        return Ok(root.to_owned());
+    }
+    let ordered: Vec<(String, Option<String>)> = changes
+        .iter()
+        .map(|(path, value)| (path.clone(), value.clone()))
+        .collect();
+
+    if let Some(id) = apply_locally(blobs, root, &ordered)? {
+        return Ok(id);
+    }
+
+    // Not locally updatable here. Rebuilding is the same answer, paid for.
+    let mut manifest = load(blobs, root)?;
+    for (path, value) in changes {
+        match value {
+            Some(id) => {
+                manifest.insert(path.clone(), id.clone());
+            }
+            None => {
+                manifest.remove(path);
+            }
+        }
+    }
+    build(blobs, &manifest)
+}
+
+/// The incremental half of [`apply`], separated so a test can ask how often it
+/// carries the work — a fallback that quietly took every call would leave the
+/// refusal violated with every test still green.
+///
+/// `None` means the change ripples past a node's end and only a whole rebuild
+/// is correct.
+///
+/// # Errors
+/// Propagates store failures; refuses a node that is absent or foreign.
+fn apply_locally<B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    root: &str,
+    ordered: &[(String, Option<String>)],
+) -> StoreResult<Option<String>> {
+    let root_node = load_node(blobs, root)?;
+    let root_level = root_node.level;
+    if let Some(entries) = rebuild_range(blobs, root_node, ordered, true)? {
+        if entries.is_empty() {
+            // Everything was removed. An empty manifest still gets a root, so
+            // "empty" and "missing" stay distinguishable — same as `build`.
+            let (_, id) = store_node(blobs, 0, Vec::new())?;
+            return Ok(Some(id));
+        }
+        // Grow levels above exactly as `build` does: entries already stored at
+        // `root_level` are the input to the level above it.
+        let mut current = entries;
+        let mut level = root_level;
+        loop {
+            if current.len() == 1 {
+                return Ok(Some(current.remove(0).1));
+            }
+            level += 1;
+            let groups = split(current);
+            let mut parents = Vec::with_capacity(groups.len());
+            for group in groups {
+                parents.push(store_node(blobs, level, group)?);
+            }
+            current = parents;
+        }
+    }
+    Ok(None)
+}
+
+/// Rebuild one node's key range under `changes`, returning the entries that
+/// range now contributes to its parent — or `None` if the rebuild would ripple
+/// past the range's end, where only a whole rebuild is correct.
+///
+/// `is_rightmost` marks the range that runs to the end of the manifest. Only
+/// there may a trailing uncut run stand as a node, because only there does
+/// `build` end without a cut.
+fn rebuild_range<B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    node: Node,
+    changes: &[(String, Option<String>)],
+    is_rightmost: bool,
+) -> StoreResult<Option<Vec<(String, String)>>> {
+    let level = node.level;
+    let entries = if level == 0 {
+        merge_into_leaf(node.entries, changes)
+    } else {
+        let child_count = node.entries.len();
+        let mut merged = Vec::with_capacity(child_count);
+        let mut rest = changes;
+        for (index, (last_key, child_id)) in node.entries.into_iter().enumerate() {
+            let is_last = index + 1 == child_count;
+            // Each child holds the keys up to its greatest, and the last child
+            // takes whatever remains — including keys beyond the current
+            // greatest, which is where an appended path lands.
+            let take = if is_last {
+                rest.len()
+            } else {
+                rest.partition_point(|(path, _)| path.as_str() <= last_key.as_str())
+            };
+            let (mine, tail) = rest.split_at(take);
+            rest = tail;
+            if mine.is_empty() {
+                merged.push((last_key, child_id));
+                continue;
+            }
+            let child = load_node(blobs, &child_id)?;
+            let Some(replacement) = rebuild_range(blobs, child, mine, is_rightmost && is_last)?
+            else {
+                return Ok(None);
+            };
+            merged.extend(replacement);
+        }
+        merged
+    };
+
+    let (mut groups, carry) = split_with_carry(entries);
+    if !carry.is_empty() {
+        if !is_rightmost {
+            // The boundary moved past this range's end, so the entries after it
+            // would re-cut differently and this is no longer a local update.
+            return Ok(None);
+        }
+        groups.push(carry);
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups {
+        out.push(store_node(blobs, level, group)?);
+    }
+    Ok(Some(out))
+}
+
+/// Merge a sorted change list into a leaf's sorted entries.
+fn merge_into_leaf(
+    entries: Vec<(String, String)>,
+    changes: &[(String, Option<String>)],
+) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(entries.len() + changes.len());
+    let mut entries = entries.into_iter().peekable();
+    let mut changes = changes.iter().peekable();
+    loop {
+        match (entries.peek(), changes.peek()) {
+            (Some((entry_key, _)), Some((change_key, _))) => {
+                match entry_key.as_str().cmp(change_key.as_str()) {
+                    std::cmp::Ordering::Less => out.push(entries.next().expect("peeked")),
+                    std::cmp::Ordering::Greater => {
+                        let (path, value) = changes.next().expect("peeked");
+                        if let Some(id) = value {
+                            out.push((path.clone(), id.clone()));
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        entries.next();
+                        let (path, value) = changes.next().expect("peeked");
+                        if let Some(id) = value {
+                            out.push((path.clone(), id.clone()));
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => out.push(entries.next().expect("peeked")),
+            (None, Some(_)) => {
+                let (path, value) = changes.next().expect("peeked");
+                if let Some(id) = value {
+                    out.push((path.clone(), id.clone()));
+                }
+            }
+            (None, None) => return out,
+        }
     }
 }
 
@@ -528,12 +797,210 @@ mod tests {
     /// hex digits: the byte read and the hex round-trip it replaced must agree
     /// on EVERY key, because a boundary that moved would re-identify every node
     /// built afterwards and silently end sharing with the trees already stored.
+    /// A deterministic stream, so a failure is reproducible from the seed
+    /// alone rather than "it went red once in CI".
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() as usize) % bound
+        }
+    }
+
+    /// **The property the whole incremental path rests on.**
+    ///
+    /// `apply` must produce the same ROOT ID as a full rebuild, not merely the
+    /// same entries. The manifest root is what bundle import compares to decide
+    /// `AlreadyPresent` from `DivergentBranch`, so a tree that differed only in
+    /// shape would make two stores holding identical content refuse each
+    /// other's idempotent imports as conflicts. It is also what
+    /// history-independence means: two branches that converged on the same
+    /// content have literally the same tree.
+    #[test]
+    fn apply_agrees_with_a_full_rebuild() {
+        let mut rng = Lcg(0x2026_0826);
+        let mut local = 0usize;
+        let mut fell_back = 0usize;
+
+        for round in 0..300 {
+            let size = 1 + rng.below(400);
+            let base: BTreeMap<String, String> = (0..size)
+                .map(|index| {
+                    (
+                        format!("dir{}/file-{index:05}.txt", index % 7),
+                        format!("blob-{index:05}"),
+                    )
+                })
+                .collect();
+            let keys: Vec<String> = base.keys().cloned().collect();
+
+            let mut changes: BTreeMap<String, Option<String>> = BTreeMap::new();
+            for step in 0..(1 + rng.below(6)) {
+                match rng.below(3) {
+                    // Edit a path that is there: cannot move a boundary.
+                    0 => {
+                        let key = keys[rng.below(keys.len())].clone();
+                        changes.insert(key, Some(format!("edited-{round}-{step}")));
+                    }
+                    // Add one that is not: can.
+                    1 => {
+                        let key = format!("dir{}/new-{round}-{step}.txt", rng.below(9));
+                        changes.insert(key, Some(format!("added-{round}-{step}")));
+                    }
+                    // Take one away: can.
+                    _ => {
+                        let key = keys[rng.below(keys.len())].clone();
+                        changes.insert(key, None);
+                    }
+                }
+            }
+
+            let blobs = CountingBlobs::default();
+            let root = build(&blobs, &base).expect("base builds");
+
+            let ordered: Vec<(String, Option<String>)> = changes
+                .iter()
+                .map(|(path, value)| (path.clone(), value.clone()))
+                .collect();
+            if apply_locally(&blobs, &root, &ordered)
+                .expect("local path runs")
+                .is_some()
+            {
+                local += 1;
+            } else {
+                fell_back += 1;
+            }
+
+            let incremental = apply(&blobs, &root, &changes).expect("apply runs");
+
+            let mut expected_entries = base.clone();
+            for (path, value) in &changes {
+                match value {
+                    Some(id) => {
+                        expected_entries.insert(path.clone(), id.clone());
+                    }
+                    None => {
+                        expected_entries.remove(path);
+                    }
+                }
+            }
+            let rebuilt = build(&blobs, &expected_entries).expect("rebuild runs");
+
+            assert_eq!(
+                incremental,
+                rebuilt,
+                "round {round}: incremental and rebuilt trees disagree for {} entries and {} \
+                 changes — a tree that differs in shape breaks history independence, and makes \
+                 an identical branch import as divergent",
+                size,
+                changes.len()
+            );
+            assert_eq!(
+                load(&blobs, &incremental).expect("reads back"),
+                expected_entries,
+                "round {round}: the incremental tree does not hold the expected entries"
+            );
+        }
+
+        // A fallback that quietly took every call would leave refusal 2
+        // violated with this test still green, so the split is asserted rather
+        // than assumed.
+        assert!(
+            local > fell_back * 2,
+            "the incremental path must carry the work: {local} local, {fell_back} rebuilt"
+        );
+    }
+
+    /// DR-0066 §8 refusal 2, measured rather than asserted: a one-path edit
+    /// must cost the DEPTH of the tree, not its width.
+    ///
+    /// `build` writes every node; `apply` writes the spine. If this test starts
+    /// failing upward, an operation whose effect is O(change) has gone back to
+    /// costing O(workspace).
+    #[test]
+    fn a_one_path_edit_writes_only_its_depth() {
+        let blobs = CountingBlobs::default();
+        let base = manifest(2_000);
+        let root = build(&blobs, &base).expect("base builds");
+        let full_rebuild = blobs.novel_writes(&BTreeMap::new());
+        assert!(
+            full_rebuild > 100,
+            "the fixture must be wide enough for depth and width to differ, got {full_rebuild} \
+             nodes"
+        );
+
+        let before = blobs.snapshot();
+        blobs.reset_writes();
+        let path = base
+            .keys()
+            .nth(1_000)
+            .expect("a path in the middle")
+            .clone();
+        let changes = BTreeMap::from([(path, Some("edited".to_owned()))]);
+        apply(&blobs, &root, &changes).expect("apply runs");
+
+        let spine = blobs.novel_writes(&before);
+        assert!(
+            spine <= 6,
+            "a one-path edit wrote {spine} new nodes where the whole tree is {full_rebuild}; the \
+             incremental path is not being taken"
+        );
+    }
+
+    /// Reads are bounded too: resolving one path must not materialize the
+    /// workspace. `vcs::read` loaded the whole manifest to fetch one file until
+    /// 2026-08-26, which is the same refusal on the other side.
+    #[test]
+    fn a_one_path_read_costs_the_depth_not_the_width() {
+        let blobs = CountingBlobs::default();
+        let base = manifest(2_000);
+        let root = build(&blobs, &base).expect("base builds");
+        let path = base
+            .keys()
+            .nth(1_000)
+            .expect("a path in the middle")
+            .clone();
+
+        let reads = std::cell::Cell::new(0usize);
+        struct Counting<'a> {
+            inner: &'a CountingBlobs,
+            reads: &'a std::cell::Cell<usize>,
+        }
+        impl ContentBlobs for Counting<'_> {
+            fn put(&self, body: &str) -> StoreResult<String> {
+                self.inner.put(body)
+            }
+            fn get(&self, id: &str) -> StoreResult<Option<String>> {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.get(id)
+            }
+        }
+        let counting = Counting {
+            inner: &blobs,
+            reads: &reads,
+        };
+
+        let found = get(&counting, &root, &path).expect("get runs");
+        assert_eq!(found.as_deref(), base.get(&path).map(String::as_str));
+        assert!(
+            reads.get() <= 6,
+            "resolving one path read {} nodes; a keyed descent is O(depth)",
+            reads.get()
+        );
+    }
+
     #[test]
     fn the_boundary_predicate_matches_the_hex_round_trip() {
         fn via_hex(key: &str) -> bool {
             let digest = sha256_hex(&format!("{NODE_TAG}\u{1e}boundary\u{1e}{key}"));
             let window = u64::from_str_radix(&digest[..4], 16).unwrap_or(0);
-            window.is_multiple_of(65536 / TARGET_FANOUT)
+            window.is_multiple_of(TARGET_FANOUT)
         }
 
         let mut keys: Vec<String> = vec![
@@ -566,6 +1033,24 @@ mod tests {
         assert!(
             boundaries > 0 && boundaries < keys.len(),
             "the case must exercise both outcomes, saw {boundaries} of {}",
+            keys.len()
+        );
+
+        // **The rate, not just the agreement.**
+        //
+        // This test mirrored the implementation's arithmetic and therefore
+        // agreed with it while it was wrong: both sides read
+        // `is_multiple_of(65536 / TARGET_FANOUT)`, which makes one key in 4096
+        // a boundary rather than one in 16, and a differential test cannot see
+        // a defect it reproduces. Measured, every cut in every stored manifest
+        // was `MAX_ENTRIES` instead. So the rate is asserted against the
+        // CONSTANT that names it, which is a claim neither side can satisfy by
+        // agreeing with the other.
+        let expected = keys.len() / (TARGET_FANOUT as usize);
+        assert!(
+            boundaries * 2 > expected && boundaries < expected * 2,
+            "one key in {TARGET_FANOUT} should be a boundary — expected about {expected} of {}, \
+             saw {boundaries}",
             keys.len()
         );
     }
@@ -626,6 +1111,41 @@ mod tests {
 
     /// A foreign or corrupt node refuses rather than being read as an empty
     /// subtree, which would silently under-report a diff.
+    /// DR-0066 §3 inside the walk, not only at whatever the caller verified.
+    ///
+    /// `load_node` verifies every node it fetches, because an interior node
+    /// names a whole subtree and this walker cannot know whether the `blobs` it
+    /// was handed verifies — the read-through cache does, a bare store does
+    /// not. Without this, a substituted node silently redefines that much of
+    /// the manifest and every reader downstream believes it.
+    #[test]
+    fn a_node_whose_bytes_do_not_match_its_id_is_refused_on_load() {
+        let blobs = CountingBlobs::default();
+        let root = build(&blobs, &manifest(240)).expect("tree builds");
+        let parsed =
+            parse_node(&blobs.get(&root).expect("reads").expect("live")).expect("root parses");
+        assert!(
+            parsed.level > 0,
+            "the fixture must produce interior nodes, or this substitutes nothing"
+        );
+        let victim = parsed.entries[0].1.clone();
+
+        // Honest bytes, wrong place: a real node from a different tree, stored
+        // under the id the root points at.
+        let other = build(&blobs, &manifest(8)).expect("second tree builds");
+        let smuggled = blobs.get(&other).expect("reads").expect("live");
+        blobs
+            .stored
+            .borrow_mut()
+            .insert(victim.clone(), smuggled.clone());
+
+        let error = load(&blobs, &root).expect_err("a lying node is refused");
+        assert!(
+            matches!(error, StoreError::ContentMismatch { .. }),
+            "expected a content mismatch, got {error:?}"
+        );
+    }
+
     #[test]
     fn a_foreign_node_refuses() {
         let blobs = CountingBlobs::default();

@@ -41,6 +41,34 @@ PUSH_CALL = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*(?:diagnostics|errors)\.pu
 # `Err(...)` are refusals; `Err(e) =>` and `if let Err(e)` are patterns.
 ERR_CALL = re.compile(r"\bErr\(")
 
+# A refusal that never writes `Err`: `opt.ok_or_else(|| StoreError::Conflict(…))`
+# turns an absent value into one. The tree carries 78 of these outside tests,
+# and until 2026-08-26 the sweep counted none of them — so a whole refusal
+# idiom was exempt from the one instrument that asks whether a refusal is
+# exercised. Found because a change ADDED one and `check-new-refusals.sh`
+# reported "no refusal sites were added or edited".
+#
+# Deliberately narrow: an explicit error constructor, not any `ok_or_else`.
+# `ok_or_else(|| 0)` and `ok_or_else(Vec::new)` supply defaults, and a gate that
+# swept those would report unexercised "refusals" that are not refusals, which
+# is how an instrument gets ignored.
+OK_OR_REFUSAL = re.compile(
+    r"\.ok_or(?:_else)?\(\s*(?:\|\|\s*)?\{?\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*Error::"
+)
+
+# The same call, before we know what it constructs. `rustfmt` puts the closure
+# body on its own line as soon as the expression is long — which is most of
+# them — so the constructor that identifies a refusal is usually NOT on the line
+# that opens the call. A rule that reads one line at a time therefore matches
+# the shape nobody writes and misses the shape the formatter produces, which is
+# how the first version of this rule found nothing in the very file that
+# prompted it.
+OK_OR_OPEN = re.compile(r"\.ok_or(?:_else)?\(")
+
+# How far to look for the constructor. Three lines covers the closure-body form
+# `rustfmt` emits; more would start joining unrelated statements.
+OK_OR_WINDOW = 3
+
 # A pattern binds a name or wildcard and closes immediately: `Err(e)`, `Err(_)`,
 # `Err(ref error)`. An expression opens a call or a literal instead.
 ERR_BINDING = re.compile(r"^(?:ref\s+|mut\s+)*(?:_|[a-z][a-z0-9_]*)\s*[),]")
@@ -73,9 +101,11 @@ class Site:
 
 
 def err_is_refusal(line: str) -> bool:
-    """True when the line constructs an `Err`, rather than matching one."""
+    """True when the line constructs a refusal, rather than matching one."""
     if ERR_NOT_A_REFUSAL.search(line):
         return False
+    if OK_OR_REFUSAL.search(line):
+        return True
     for found in ERR_CALL.finditer(line):
         rest = line[found.end() :]
         # `Err(e) => …` and `Ok(_) | Err(_) => …` are match arms, not refusals.
@@ -148,7 +178,15 @@ def find_sites(lines: list[str]) -> list[Site]:
             continue
         if stripped.startswith("//"):
             continue
-        if not any(pattern in line for pattern in PUSH_PATTERNS) and not err_is_refusal(line):
+        is_site = any(pattern in line for pattern in PUSH_PATTERNS) or err_is_refusal(line)
+        if not is_site and OK_OR_OPEN.search(line):
+            # Joined only for THIS rule. Running the `Err(` rule over a joined
+            # window would read a match arm on the next line as a construction.
+            window = " ".join(
+                text.strip() for text in lines[index : index + OK_OR_WINDOW]
+            )
+            is_site = bool(OK_OR_REFUSAL.search(window))
+        if not is_site:
             continue
         label = None
         for offset in range(0, 6):
@@ -199,6 +237,58 @@ def mutate_message(line: str) -> str | None:
     return line[: found.start()] + '"' + mutated + '"' + line[found.end() :]
 
 
+# A `"` that actually opens or closes a literal, rather than one escaped inside
+# one. An odd count on a line means the literal continues onto the next.
+UNESCAPED_QUOTE = re.compile(r'(?<!\\)"')
+
+# Raw strings do not follow the escape rules above, and a refusal message is
+# never one. Skipped rather than mis-parsed.
+RAW_STRING = re.compile(r'r#*"')
+
+
+def mutate_wrapped_message(lines: list[str], index: int) -> list[str] | None:
+    r"""Replace a message whose literal is `\`-continued across lines.
+
+    [`mutate_message`] needs a complete `"…"` on one line, and this repository
+    writes its long refusals wrapped:
+
+        Conflict(format!(
+            "manifest tree node `{id}` is not a node; the manifest is not \
+             the shape its root says it is"
+        ))
+
+    so the opening line has no closing quote and the closing line has no opener.
+    Neither matched, no mutation was applied, and the sweep reported the site
+    UNMEASURED — honest, but it means a whole class of refusal, the ones long
+    enough to need explaining, could never be pinned.
+    """
+    if RAW_STRING.search(lines[index]):
+        return None
+    quotes = [found.start() for found in UNESCAPED_QUOTE.finditer(lines[index])]
+    if not quotes or len(quotes) % 2 == 0:
+        return None
+    open_at = quotes[-1]
+    for end in range(index + 1, min(index + 12, len(lines))):
+        if RAW_STRING.search(lines[end]):
+            return None
+        closing = [found.start() for found in UNESCAPED_QUOTE.finditer(lines[end])]
+        if len(closing) % 2 == 0:
+            continue
+        close_at = closing[0]
+        body = "".join(
+            [lines[index][open_at + 1 :]] + lines[index + 1 : end] + [lines[end][:close_at]]
+        )
+        if len(body) < 4:
+            return None
+        placeholders = PLACEHOLDER.findall(BRACE_ESCAPE.sub("", body))
+        replacement = " ".join(["MUTATED-BY-SWEEP", *placeholders])
+        merged = (
+            lines[index][:open_at] + '"' + replacement + '"' + lines[end][close_at + 1 :]
+        )
+        return lines[:index] + [merged] + lines[end + 1 :]
+    return None
+
+
 def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     mutated = list(lines)
     index = site.line - 1
@@ -213,6 +303,9 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
         if replaced is not None:
             mutated[index + offset] = replaced
             return mutated
+        wrapped = mutate_wrapped_message(mutated, index + offset)
+        if wrapped is not None:
+            return wrapped
     return None
 
 
@@ -268,10 +361,16 @@ def sweep(
     return survivors, unmeasured
 
 
-# Two plants, one per mutation strategy: a pushed diagnostic that neutralises to
-# `drop`, and a tail-position error whose message carries a positional
-# placeholder, so a mutation that drops placeholders stops compiling and the self
-# test fails instead of the sweep silently reporting false catches.
+# Four plants, one per refusal SHAPE the scanner claims to see: a pushed
+# diagnostic that neutralises to `drop`, a tail-position error whose message
+# carries a positional placeholder (so a mutation that drops placeholders stops
+# compiling and the self test fails instead of the sweep reporting false
+# catches), and an `ok_or_else` that turns an absent value into an error.
+#
+# The third was added 2026-08-26 with the scanner rule that finds it. A
+# detection rule with nothing planted against it is the same defect this script
+# exists to catch, one level up: the rule could stop matching and every sweep
+# would still come back clean.
 PLANT = """
 // `unused_variables` is allowed because the mutation this plant exists to test
 // rewrites the push to `drop`, which leaves `diagnostics` unused. A crate that
@@ -293,6 +392,37 @@ fn mutation_sweep_self_test_tail_refusal(reached: bool, detail: &str) -> Result<
         detail
     ))
 }
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum MutationSweepSelfTestError {
+    Missing(String),
+}
+
+// TWO plants, because the two shapes are found by different code and only one
+// of them is what real code looks like. `rustfmt` moves the closure body to its
+// own line as soon as the expression is long, so the constructor that marks
+// this a refusal is usually not on the line that opens the call — and a rule
+// that reads one line at a time misses every formatted site while a one-line
+// plant reports it working.
+#[allow(dead_code)]
+fn mutation_sweep_self_test_ok_or_refusal(value: Option<u8>, detail: &str) -> Result<u8, MutationSweepSelfTestError> {
+    value.ok_or_else(|| MutationSweepSelfTestError::Missing(format!("mutation sweep self test ok_or refusal at {}", detail)))
+}
+
+#[allow(dead_code)]
+fn mutation_sweep_self_test_wrapped_ok_or_refusal(
+    value: Option<u8>,
+    detail: &str,
+) -> Result<u8, MutationSweepSelfTestError> {
+    value.ok_or_else(|| {
+        MutationSweepSelfTestError::Missing(format!(
+            "mutation sweep self test wrapped ok_or refusal, whose message is itself \
+             continued across lines, at {}",
+            detail
+        ))
+    })
+}
 """
 
 PLANT_MARKER = "mutation sweep self test"
@@ -309,9 +439,9 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
     open(target, "w").write(source + PLANT)
     planted = find_sites(open(target).read().split("\n"))
     matching = [site for site in planted if PLANT_MARKER in site.label]
-    if len(matching) != 2:
+    if len(matching) != 4:
         print(
-            f"SELF TEST FAILED: the site scanner found {len(matching)} of the 2 "
+            f"SELF TEST FAILED: the site scanner found {len(matching)} of the 4 "
             f"planted refusals",
             file=sys.stderr,
         )
@@ -324,7 +454,7 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
             file=sys.stderr,
         )
         return False
-    if len(survivors) != 2:
+    if len(survivors) != 4:
         print(
             "SELF TEST FAILED: the sweep reported an unreachable planted refusal "
             "as exercised, so its mutations are not landing",

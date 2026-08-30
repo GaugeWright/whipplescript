@@ -74,6 +74,30 @@ impl<'a> VirtualWorkingSet<'a> {
         manifest
     }
 
+    /// A working set with NO base, for a caller that only needs to record what
+    /// it changed.
+    ///
+    /// `write` and `remove` never consult the base — they put a blob and record
+    /// an overlay entry — so a caller producing a change set for
+    /// `manifest_tree::apply` does not need the branch's manifest materialized,
+    /// which is the whole point (DR-0066 §8 refusal 2). Reads DO consult it, so
+    /// on a detached set every path resolves to nothing: `read_to_string` and
+    /// `append` are not usable here, and that is deliberate rather than an
+    /// oversight to be patched later.
+    pub fn detached(content: &'a dyn ContentBlobs) -> Self {
+        Self::new(content, BTreeMap::new())
+    }
+
+    /// The overlay itself: path to `Some(id)` written or `None` removed.
+    ///
+    /// What [`Self::manifest`] folds into the base. A caller that is about to
+    /// write a manifest tree wants the CHANGES rather than the fold, because
+    /// applying them costs the change and folding costs the workspace
+    /// (DR-0066 §8 refusal 2).
+    pub fn changes(&self) -> BTreeMap<String, Option<String>> {
+        self.overlay.borrow().clone()
+    }
+
     /// How many paths this branch has diverged on (writes + deletes) —
     /// the actual cost of the branch beyond its pointers.
     pub fn divergence(&self) -> usize {
