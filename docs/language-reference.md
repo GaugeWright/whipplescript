@@ -1536,7 +1536,7 @@ that is a union of string literals. Then use a `case` statement on that field:
 decide "Is this plan safe to ship? Explain." -> { fixed bool, reason string } as verdict
 after verdict succeeds as v {
   case v.fixed {
-    true => { complete result { decision "ship" } }
+    true => { complete result { ok true } }
     false => { tell reviewer "Held: {{ v.reason }}" }
   }
 }

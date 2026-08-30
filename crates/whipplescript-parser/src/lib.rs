@@ -9162,16 +9162,19 @@ fn validate_workflow_terminal_actions(
     contracts: &WorkflowContractNames,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for line in rule.body.text.lines().map(str::trim) {
-        let terminal = line
-            .strip_prefix("complete ")
-            .map(|rest| ("complete", rest, &contracts.outputs))
-            .or_else(|| {
-                line.strip_prefix("fail ")
-                    .map(|rest| ("fail", rest, &contracts.failures))
-            });
-        let Some((action, rest, declared)) = terminal else {
-            continue;
+    // Statement boundaries, not line starts: a terminal written inside the block
+    // that opens on its own line escaped every check below. See
+    // `terminal_actions_in_line`.
+    for (line, action, start) in rule.body.text.lines().map(str::trim).flat_map(|line| {
+        terminal_actions_in_line(line)
+            .into_iter()
+            .map(move |(action, start)| (line, action, start))
+    }) {
+        let rest = &line[start..];
+        let declared = if action == "complete" {
+            &contracts.outputs
+        } else {
+            &contracts.failures
         };
         // Scalar terminal form: `complete result 0.9` / `fail error "msg"` — a bare
         // value after the name, with no `{ }` block and no `from` projection.
@@ -19770,46 +19773,102 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, String)> {
     blocks
 }
 
+/// Every terminal action that starts at a STATEMENT boundary in one body line,
+/// paired with the text that follows it.
+///
+/// A statement does not have to begin its line. Written inline,
+/// `after t completes { complete result { note "x" } }` puts the terminal inside
+/// the block it opens, and a scan anchored on `line.strip_prefix("complete ")`
+/// cannot see it at all. That blind spot let FOUR terminal-contract refusals be
+/// escaped by a line break — a missing required field, an unknown field, an
+/// unknown terminal name, and a bad failure payload — and left the rule carrying
+/// no terminal in its IR, so the instance completed at run time with a payload
+/// nothing had checked against the declared output contract.
+///
+/// A boundary is the start of the trimmed line, or the first non-space after an
+/// opening brace. A keyword anywhere else belongs to something else, and the
+/// space in the pattern already separates the action from the `after … completes`
+/// predicate that shares its prefix.
+fn terminal_actions_in_line(trimmed: &str) -> Vec<(&'static str, usize)> {
+    let mut found = Vec::new();
+    let bytes = trimmed.as_bytes();
+    for (offset, _) in trimmed.char_indices() {
+        let at_boundary = offset == 0
+            || bytes[..offset]
+                .iter()
+                .rev()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| *byte == b'{');
+        if !at_boundary {
+            continue;
+        }
+        let rest = &trimmed[offset..];
+        if rest.starts_with("complete ") {
+            found.push(("complete", offset + "complete ".len()));
+        } else if rest.starts_with("fail ") {
+            found.push(("fail", offset + "fail ".len()));
+        }
+    }
+    found
+}
+
+/// The payload block of a terminal that begins at `rest`, when it opens AND
+/// closes within the same line. `None` when the block continues onto later lines
+/// (the caller consumes those) or when there is no block at all.
+fn inline_terminal_block(rest: &str) -> Option<&str> {
+    let open = rest.find('{')?;
+    let mut depth = 0i32;
+    for (offset, character) in rest.char_indices().skip(open) {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[open + 1..offset].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, String)> {
     let mut blocks = Vec::new();
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
         let trimmed = lines[index].trim();
-        let terminal = trimmed
-            .strip_prefix("complete ")
-            .map(|rest| ("complete", rest))
-            .or_else(|| trimmed.strip_prefix("fail ").map(|rest| ("fail", rest)));
-        let Some((action, rest)) = terminal else {
-            index += 1;
-            continue;
-        };
-        let Some(name) = rest.split('{').next().and_then(|header| {
-            let mut parts = header.split_whitespace();
-            match (parts.next(), parts.next()) {
-                (Some(name), None) => Some(name.to_owned()),
-                _ => None,
-            }
-        }) else {
-            index += 1;
-            continue;
-        };
-        let mut depth = brace_delta(trimmed);
-        let mut terminal_lines = Vec::new();
-        if depth == 0 && trimmed.contains('{') {
-            // Single-line block: `complete <name> { <fields> }` opens and closes
-            // on this line, so its inner content never reaches the multi-line loop
-            // below. Capture the content between the braces as the block body.
-            if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
-                if close > open {
-                    let inner = trimmed[open + 1..close].trim();
-                    if !inner.is_empty() {
-                        terminal_lines.push(inner.to_owned());
-                    }
+        let mut consumed_following_lines = false;
+        for (action, start) in terminal_actions_in_line(trimmed) {
+            let rest = &trimmed[start..];
+            let Some(name) = rest.split('{').next().and_then(|header| {
+                let mut parts = header.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(name), None) => Some(name.to_owned()),
+                    _ => None,
                 }
+            }) else {
+                continue;
+            };
+            // A block that opens and closes here — which now includes a terminal
+            // nested inside a block that opened on the same line, so the braces
+            // are counted from the TERMINAL's own opening brace rather than from
+            // the whole line's balance.
+            if let Some(inner) = inline_terminal_block(rest) {
+                let terminal_lines = if inner.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![inner.to_owned()]
+                };
+                blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
+                continue;
             }
-            index += 1;
-        } else {
+            // Otherwise the block continues onto the lines below; a terminal
+            // whose payload spans lines is the only statement on its line, so
+            // consuming them here cannot skip a sibling.
+            let mut depth = brace_delta(rest);
+            let mut terminal_lines = Vec::new();
             index += 1;
             while index < lines.len() && depth > 0 {
                 let line = lines[index];
@@ -19820,8 +19879,13 @@ fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, String)> {
                 }
                 index += 1;
             }
+            blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
+            consumed_following_lines = true;
+            break;
         }
-        blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
+        if !consumed_following_lines {
+            index += 1;
+        }
     }
     blocks
 }

@@ -9914,6 +9914,98 @@ fn rejects_effectful_self_trigger_loop() {
         .contains("preserves trigger fact `schema:WorkItem`"));
 }
 
+/// A terminal written inside the block that opens on its own line escaped every
+/// check the workflow contract has. `validate_workflow_terminal_actions` scanned
+/// for `complete `/`fail ` at the start of a TRIMMED LINE, so
+/// `after t completes { complete result { … } }` was not a terminal as far as it
+/// could tell — and the instance completed at run time with a payload nothing had
+/// checked against the declared output class.
+///
+/// Four refusals rode on it. Each is asserted in both spellings, because the
+/// multi-line form always worked and the point is that they now agree.
+#[test]
+fn a_terminal_inside_an_inline_block_is_still_checked() {
+    let program = |terminal: &str| {
+        format!(
+            r#"
+workflow TermProbe
+
+output result Done
+failure error Bad
+class Done {{ note string  count int }}
+class Bad {{ reason string }}
+class Job {{ id string }}
+
+agent worker {{
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}}
+
+table seed as Job [ {{ id "J1" }} ]
+
+rule go
+  when Job as j
+=> {{
+  tell worker "do" as t
+{terminal}
+}}
+"#
+        )
+    };
+    let refuses = |terminal: &str, expected: &str| {
+        let compiled = compile_program(&program(terminal));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "expected `{expected}` for terminal `{terminal}`, got {:?}",
+            compiled
+                .diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
+        );
+    };
+
+    for spelling in [
+        "  after t completes { complete result { note \"x\" } }",
+        "  after t completes {\n    complete result { note \"x\" }\n  }",
+    ] {
+        refuses(spelling, "is missing required field `Done.count`");
+    }
+    for spelling in [
+        "  after t completes { complete result { note \"x\"  count 1  extra \"y\" } }",
+        "  after t completes {\n    complete result { note \"x\"  count 1  extra \"y\" }\n  }",
+    ] {
+        refuses(spelling, "class `Done` has no field `extra`");
+    }
+    for spelling in [
+        "  after t completes { complete nosuch { note \"x\"  count 1 } }",
+        "  after t completes {\n    complete nosuch { note \"x\"  count 1 }\n  }",
+    ] {
+        refuses(spelling, "completes unknown workflow terminal `nosuch`");
+    }
+    for spelling in [
+        "  after t completes { fail error { nope \"x\" } }",
+        "  after t completes {\n    fail error { nope \"x\" }\n  }",
+    ] {
+        refuses(spelling, "class `Bad` has no field `nope`");
+    }
+
+    // And the well-formed inline terminal still compiles: the boundary scan must
+    // find terminals, not refuse the syntax.
+    let compiled = compile_program(&program(
+        "  after t completes { complete result { note \"x\"  count 1 } }",
+    ));
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "a valid inline terminal must compile: {:?}",
+        compiled.diagnostics
+    );
+}
+
 /// A statement that shares a line with the block enclosing it was invisible to
 /// the line scanner in `analyze_rule`, which requires `record` or `done` to
 /// begin a trimmed line. `metadata.effects` had already moved to an AST walk, so
