@@ -1,0 +1,48 @@
+# An effect-bearing cycle in the rule dependency graph (spec/static-analysis.md,
+# "effectful internal recursion: rejected unless explicitly proven bounded").
+# `validate_effectful_self_trigger` catches the ONE-rule version of this; passed
+# between two rules it escaped, and every turn of the cycle enqueues a fresh
+# `tell` under a new idempotency key, so exactly-once dedup never brakes it.
+workflow EffectfulRuleCycle
+
+output result Report
+class Report { seen int }
+
+class Ping { n int }
+class Pong { n int }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seeds as Ping [
+  { n 0 }
+]
+
+rule ping_step
+  when Ping as p
+=> {
+  tell worker "ping {{ p.n }}" as t
+
+  after t completes {
+    done p -> record Pong { n p.n }
+  }
+}
+
+rule pong_step
+  when Pong as q
+=> {
+  tell worker "pong {{ q.n }}" as t
+
+  after t completes {
+    done q -> record Ping { n q.n + 1 }
+  }
+}
+
+rule finish
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}

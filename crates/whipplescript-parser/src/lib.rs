@@ -2467,6 +2467,28 @@ pub fn compile_program(source: &str) -> CompileOutput {
 
 /// Parses and lowers a source bundle into deterministic typed IR with an
 /// optional explicit root workflow selection.
+/// Every workflow this bundle declares, in declaration order.
+///
+/// A caller that must apply a per-workflow check to the WHOLE bundle needs the
+/// name list before it can select roots, and `compile_program_with_root` hands
+/// back exactly one workflow — `select_root_workflow` drops the rest. Returns an
+/// empty vec for a source that does not parse; the caller's own compile reports
+/// that.
+pub fn workflow_names(source: &str) -> Vec<String> {
+    let parsed = parse_program(source);
+    if !parsed.diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    if let Some(root) = &parsed.program.workflow {
+        names.push(root.name.clone());
+    }
+    for workflow in &parsed.program.workflows {
+        names.push(workflow.name.name.clone());
+    }
+    names
+}
+
 pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOutput {
     let parsed = parse_program(source);
     if !parsed.diagnostics.is_empty() {
@@ -2484,6 +2506,11 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
     let mut invoke_recursion_diagnostics = Vec::new();
     detect_workflow_invoke_recursion(&parsed.program, &mut invoke_recursion_diagnostics);
     detect_private_workflow_invocations(&parsed.program, &mut invoke_recursion_diagnostics);
+    // The same "no compile-time convergence proof" argument at the two seams the
+    // invoke-recursion check does not reach: the agent `tools [...]` grant graph
+    // (DR-0025), and awaiting a callee that declares it never terminates.
+    detect_agent_tool_grant_recursion(&parsed.program, &mut invoke_recursion_diagnostics);
+    detect_service_workflow_invocations(&parsed.program, &mut invoke_recursion_diagnostics);
     if !invoke_recursion_diagnostics.is_empty() {
         return CompileOutput {
             ir: None,
@@ -5079,12 +5106,7 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
 }
 
 fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
-    let private_workflows = program
-        .workflows
-        .iter()
-        .filter(|workflow| workflow.tags.iter().any(|tag| tag.name == "private"))
-        .map(|workflow| workflow.name.name.as_str())
-        .collect::<BTreeSet<_>>();
+    let private_workflows = workflows_tagged(program, "private");
     if private_workflows.is_empty() {
         return;
     }
@@ -5122,6 +5144,314 @@ fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<
     }
     for workflow in &program.workflows {
         record_private_invokes(&workflow.name.name, &workflow.items);
+    }
+}
+
+/// Every workflow in the bundle carrying `<tag>`, in BOTH declaration forms.
+///
+/// The two forms store their tags in different places — a header-form workflow
+/// (`@service` / `workflow Name` at the top level, with the file's items as its
+/// body) on `Program::workflow_tags`, a block-form workflow on
+/// `WorkflowDecl::tags` — and a callee-side check that reads only
+/// `program.workflows` silently never fires on the header form. That blind spot
+/// was live in `detect_private_workflow_invocations`, which is why this is a
+/// shared helper rather than a line copied into each caller.
+fn workflows_tagged<'a>(program: &'a Program, tag: &str) -> BTreeSet<&'a str> {
+    let mut tagged = BTreeSet::new();
+    if let Some(root) = &program.workflow {
+        if program.workflow_tags.iter().any(|decl| decl.name == tag) {
+            tagged.insert(root.name.as_str());
+        }
+    }
+    for workflow in &program.workflows {
+        if workflow.tags.iter().any(|decl| decl.name == tag) {
+            tagged.insert(workflow.name.name.as_str());
+        }
+    }
+    tagged
+}
+
+/// Reject a synchronous `invoke` of a `@service` workflow: the parent awaits a
+/// terminal the callee does not promise to reach.
+///
+/// `spec/execution-contract.md` states the seam — "the parent observes typed
+/// terminal output". `@service` is the source-level declaration that a workflow
+/// is NOT required to terminate: it is precisely the escape from the liveness
+/// check that otherwise demands a rule reaching `complete` or `fail`.
+///
+/// Note what the tag does NOT mean. It is not a proof of non-termination, and a
+/// `@service` workflow with a completing rule reaches a terminal perfectly well
+/// at run time — the kernel's `workflow_is_service` governs only the auto-fail
+/// net, never the author's own `complete`. So the refusal rests on the missing
+/// PROMISE, not on a claim about what the callee will do. A caller that blocks
+/// on a terminal has nothing to hold the callee to, and if the terminal does not
+/// come, the instance stalls non-terminal with nothing to catch it: the
+/// unhandled-failure net observes an effect that reached a FAILURE terminal, and
+/// here nothing fails — nothing settles at all.
+///
+/// This is the rule the agent-tool seam already applies, on the tag alone and
+/// for the same reason: `lint_workflow_liveness` rejects a granted `@tool` that
+/// is also `@service` with "a `@tool` workflow must terminate", whether or not
+/// it happens to carry a completing rule. The argument is about awaiting a
+/// callee that declines to promise termination, not about tools, so it holds
+/// identically at the `invoke` seam — where, until now, nothing applied it.
+/// Non-termination stays a privilege of the ROOT: this refuses being *awaited*,
+/// never being tagged.
+fn detect_service_workflow_invocations(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    let service_workflows = workflows_tagged(program, "service");
+    if service_workflows.is_empty() {
+        return;
+    }
+
+    let mut record_service_invokes = |caller: &str, items: &[Item]| {
+        for item in items {
+            let Item::Rule(rule) = item else {
+                continue;
+            };
+            for statement in workflow_invoke_statements(&rule.body.text) {
+                let Some((target, _)) = invoke_statement_parts(&statement) else {
+                    continue;
+                };
+                // Direct self-invocation is refused per-rule already; leaving it
+                // here would double-report the same line.
+                if caller == target || !service_workflows.contains(target) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: rule.body.span,
+                    message: format!(
+                        "rule `{}` invokes `{target}`, which is tagged `@service` (graph.invoke_awaits_service_workflow): `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "remove `@service` from the target if it does terminate — non-termination is a root-only privilege, not for an awaited sub-workflow; to hand work to a genuinely long-running service, emit a signal or event it observes instead of awaiting it"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    };
+
+    if let Some(root) = &program.workflow {
+        record_service_invokes(&root.name, &program.items);
+    }
+    for workflow in &program.workflows {
+        record_service_invokes(&workflow.name.name, &workflow.items);
+    }
+}
+
+/// Whether `text` names `identifier` at a word boundary.
+///
+/// Used to ask whether a rule body references an agent at all. A substring test
+/// would let `worker` match `worker_pool`; the boundary check keeps the question
+/// honest without needing to parse the body, which at this stage is still text.
+fn mentions_identifier(text: &str, identifier: &str) -> bool {
+    if identifier.is_empty() {
+        return false;
+    }
+    let boundary = |candidate: Option<char>| {
+        candidate.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+    };
+    let mut rest = text;
+    let mut consumed = 0usize;
+    while let Some(offset) = rest.find(identifier) {
+        let start = consumed + offset;
+        let end = start + identifier.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        let step = offset + identifier.len();
+        consumed += step;
+        rest = &rest[step..];
+    }
+    false
+}
+
+/// The invoke-tool graph must be acyclic (DR-0025).
+///
+/// An agent's `tools [...]` grant lets the model call that workflow
+/// synchronously inside a turn, and the called workflow's own agents may call
+/// on in turn. A cycle in that graph is unbounded recursion depth with no
+/// compile-time convergence proof — the same condition, for the same reason,
+/// that `detect_workflow_invoke_recursion` rejects at the `invoke` seam.
+///
+/// `models/maude/subworkflow-convergence.maude` has modeled the invariant since
+/// DR-0025 (rule `cycle`, over the `invokes` edge) and `docs/guarantees.md`
+/// states it, but nothing built the graph: `resolve_same_bundle_tool_grant`
+/// checks one granted target in ISOLATION — is it `@tool`, is it locally
+/// convergent — and never reads that target's own grants. So a `@tool` workflow
+/// whose own agent granted it back, or granted itself, compiled clean.
+///
+/// SCOPE — same-bundle edges only, deliberately. A granted name that resolves to
+/// no workflow in this bundle contributes no edge and no diagnostic here: it may
+/// name a package export (whose convergence is checked when the manifest is
+/// attested), or nothing at all, and an unresolvable grant is
+/// `lint_agent_tool_grants`'s refusal to make, with the package lock in hand.
+/// This pass answers only the question the bundle can answer alone.
+///
+/// AGENT SCOPE mirrors `select_root_workflow`: an item declared at the top level
+/// is global — that function splices `program.items` into whichever workflow is
+/// selected — so a top-level agent is in scope for EVERY workflow in the bundle,
+/// not just for the header-form root.
+///
+/// Being in scope is not enough to make an EDGE, though, and treating it as
+/// enough reports a cycle that cannot happen. An agent that a workflow never
+/// tells anything runs no turn there, and a turn is the only thing that can call
+/// a granted tool. A shared top-level agent granted `tools [Alpha]`, in a bundle
+/// that also declares `Alpha`, therefore produced a phantom `Alpha -> Alpha`
+/// even when `Alpha` never touches that agent. So an agent contributes its
+/// grants to `W` only when some rule in `W`'s scope names it.
+///
+/// The name test is deliberately loose — any word-boundary mention in a rule
+/// body, not just a `tell` target — because the safe direction here is to keep
+/// an edge, not to drop one. Its one real limit is a purely dynamic route
+/// (`tell incident.assignee`, where the agent is named by a table row rather
+/// than by the rule): the rule body never spells the agent, so no edge forms.
+/// Routing a tool-granting agent that way is exotic, and the alternative — every
+/// in-scope agent for every workflow — trades that narrow miss for false
+/// refusals of ordinary programs.
+fn detect_agent_tool_grant_recursion(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    let mut workflow_names: BTreeSet<&str> = BTreeSet::new();
+    if let Some(root) = &program.workflow {
+        workflow_names.insert(root.name.as_str());
+    }
+    for workflow in &program.workflows {
+        workflow_names.insert(workflow.name.name.as_str());
+    }
+    if workflow_names.is_empty() {
+        return;
+    }
+
+    // The grants of every agent in `items`, each paired with the agent's name so
+    // the caller can ask whether the workflow actually uses it.
+    let granted_tools = |items: &[Item]| -> Vec<(String, String, SourceSpan)> {
+        let mut granted = Vec::new();
+        for item in items {
+            let Item::Agent(agent) = item else {
+                continue;
+            };
+            for field in &agent.fields {
+                if let AgentField::Tools(tools, span) = field {
+                    for tool in tools {
+                        granted.push((agent.name.name.clone(), tool.name.clone(), *span));
+                    }
+                }
+            }
+        }
+        granted
+    };
+    fn rule_bodies(items: &[Item]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Rule(rule) => Some(rule.body.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Global grants first, then the workflow's own block-local agents. A grant
+    // that names nothing in this bundle is dropped here, per SCOPE above.
+    let global = granted_tools(&program.items);
+    let global_bodies = rule_bodies(&program.items);
+    let mut edges: BTreeMap<&str, Vec<(&str, SourceSpan)>> = BTreeMap::new();
+    for name in &workflow_names {
+        let mut outgoing = global.clone();
+        // Top-level rules are global for the same reason top-level agents are.
+        let mut bodies = global_bodies.clone();
+        if let Some(workflow) = program
+            .workflows
+            .iter()
+            .find(|workflow| workflow.name.name == *name)
+        {
+            outgoing.extend(granted_tools(&workflow.items));
+            bodies.extend(rule_bodies(&workflow.items));
+        }
+        let outgoing = outgoing
+            .into_iter()
+            .filter(|(agent, _, _)| bodies.iter().any(|body| mentions_identifier(body, agent)))
+            .map(|(_, target, span)| (target, span))
+            .collect::<Vec<_>>();
+        let resolved = outgoing
+            .into_iter()
+            .filter_map(|(target, span)| {
+                workflow_names
+                    .get(target.as_str())
+                    .map(|resolved| (*resolved, span))
+            })
+            .collect::<Vec<_>>();
+        edges.insert(name, resolved);
+    }
+
+    // BFS back to `start`, mirroring `detect_workflow_invoke_recursion`. Unlike
+    // that one, a SELF edge is a cycle here and must be reported: a workflow
+    // granting itself as a tool is caught by no other check, whereas direct
+    // self-`invoke` is already refused per-rule.
+    let find_cycle = |start: &str| -> Option<(Vec<String>, SourceSpan)> {
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        let mut predecessor: BTreeMap<&str, (&str, SourceSpan)> = BTreeMap::new();
+        for (target, span) in edges.get(start).into_iter().flatten() {
+            if *target == start {
+                return Some((vec![start.to_owned(), start.to_owned()], *span));
+            }
+            if predecessor.insert(target, (start, *span)).is_none() {
+                queue.push_back(target);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            for (target, span) in edges.get(node).into_iter().flatten() {
+                if *target == start {
+                    let mut path = vec![node.to_owned()];
+                    let mut cursor = node;
+                    while cursor != start {
+                        let (from, _) = predecessor[cursor];
+                        path.push(from.to_owned());
+                        cursor = from;
+                    }
+                    path.reverse();
+                    path.push(start.to_owned());
+                    let entry_span = edges
+                        .get(start)
+                        .into_iter()
+                        .flatten()
+                        .find(|(target, _)| *target == path[1])
+                        .map(|(_, span)| *span)
+                        .unwrap_or(*span);
+                    return Some((path, entry_span));
+                }
+                if predecessor.insert(target, (node, *span)).is_none() {
+                    queue.push_back(target);
+                }
+            }
+        }
+        None
+    };
+
+    let mut flagged: BTreeSet<String> = BTreeSet::new();
+    for name in edges.keys() {
+        if flagged.contains(*name) {
+            continue;
+        }
+        if let Some((cycle, span)) = find_cycle(name) {
+            for member in &cycle {
+                flagged.insert(member.clone());
+            }
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion): invoke-tool cycle {}",
+                    cycle.join(" -> ")
+                ),
+                suggestion: Some(
+                    "break the cycle: an agent may call a granted `@tool` workflow synchronously, so a cycle in the grant graph has unbounded recursion depth and no compile-time convergence proof"
+                        .to_owned(),
+                ),
+            });
+        }
     }
 }
 
@@ -7775,12 +8105,234 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
     }
 }
 
+/// Reject an effect-bearing cycle in the rule dependency graph
+/// (`graph.unbounded_effect_recursion`).
+///
+/// `spec/static-analysis.md` ("Rule Dependency Graph") classifies the strongly
+/// connected components of this graph and calls for exactly one of them to be
+/// refused: *effectful internal recursion: rejected unless explicitly proven
+/// bounded*. Nothing implemented the classification. `validate_effectful_self_trigger`
+/// answers the ONE-rule case — a rule that preserves its own trigger — and a
+/// cycle passed between TWO rules escaped it entirely, while the compiler went
+/// on to print that same cycle in its own `rule_dependencies` snapshot. Each
+/// turn of such a cycle enqueues real external effects, under a fresh
+/// idempotency key each time, so exactly-once dedup never brakes it.
+///
+/// WHAT IS REFUSED, precisely: a component of two or more rules that are
+/// mutually reachable over produce/consume edges, at least one of which runs an
+/// effect. The other three SCC classes the spec names are left alone — a
+/// component with no effects is pure monotonic recursion (allowed), and
+/// recursion through an external event or clock is invisible to this graph in
+/// the first place, because such a trigger is a `pattern:` read that no
+/// `schema:` write can match.
+///
+/// SELF-EDGES ARE NOT THIS CHECK'S. A one-rule cycle stays with
+/// `validate_effectful_self_trigger` and its `consume`-or-advance escape, which
+/// is the shape `docs/manual/13-agent-patterns.md` teaches as the retry idiom.
+/// Reporting it twice would say nothing new and would break that rule's
+/// established diagnostic.
+///
+/// THE ESCAPE is `@external` on any rule in the component: the tag declares that
+/// this rule's facts arrive from outside the workflow, which is the author
+/// saying the recurrence is not internal. It is the same tag, with the same
+/// meaning, that `lint_workflow_liveness` already honours. There is no
+/// bounded-recursion escape yet, exactly as there is none for recursive
+/// `apply`: until a statically-decreasing measure exists to prove a bound with,
+/// the spec's "unless explicitly proven bounded" has no way to be satisfied and
+/// every such cycle is refused.
+fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    let rules = &ir.rules;
+    if rules.len() < 2 {
+        return;
+    }
+    let index_of = rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| (rule.name.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+
+    // Adjacency, self-edges dropped: they belong to the per-rule check above.
+    let mut reaches = vec![vec![false; rules.len()]; rules.len()];
+    for dependency in &ir.rule_dependencies {
+        let (Some(&producer), Some(&consumer)) = (
+            index_of.get(dependency.producer.as_str()),
+            index_of.get(dependency.consumer.as_str()),
+        ) else {
+            continue;
+        };
+        if producer != consumer {
+            reaches[producer][consumer] = true;
+        }
+    }
+    // Transitive closure. A rule set is small enough that the plain cubic form
+    // is both fast enough and the version a reader can check by eye.
+    for via in 0..rules.len() {
+        for from in 0..rules.len() {
+            if !reaches[from][via] {
+                continue;
+            }
+            let through = reaches[via].clone();
+            for (to, reachable) in through.into_iter().enumerate() {
+                if reachable {
+                    reaches[from][to] = true;
+                }
+            }
+        }
+    }
+
+    let external = |name: &str| {
+        ir.source_tags
+            .iter()
+            .any(|tag| tag.target_kind == "rule" && tag.name == "external" && tag.target == name)
+    };
+
+    let mut reported = vec![false; rules.len()];
+    for start in 0..rules.len() {
+        if reported[start] {
+            continue;
+        }
+        // The component: every rule mutually reachable with `start`.
+        let component = (0..rules.len())
+            .filter(|&other| other == start || (reaches[start][other] && reaches[other][start]))
+            .collect::<Vec<_>>();
+        if component.len() < 2 {
+            continue;
+        }
+        for &member in &component {
+            reported[member] = true;
+        }
+        if component
+            .iter()
+            .any(|&member| external(&rules[member].name))
+        {
+            continue;
+        }
+        let Some(&effectful) = component
+            .iter()
+            .find(|&&member| !rules[member].metadata.effects.is_empty())
+        else {
+            continue;
+        };
+
+        // Name a concrete round trip rather than an unordered set: BFS from the
+        // effectful rule back to itself over the direct edges of the component.
+        let cycle = shortest_rule_cycle(ir, rules, &index_of, effectful, &component)
+            .unwrap_or_else(|| vec![rules[effectful].name.clone()]);
+        // The span of the effect that the cycle re-runs: the most useful line to
+        // stand on, and the only span an `IrRule` carries.
+        let span = rules[effectful]
+            .metadata
+            .effects
+            .first()
+            .map(|effect| effect.span)
+            .unwrap_or(SourceSpan { start: 0, end: 0 });
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span,
+            message: format!(
+                "effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle {}, and rule `{}` runs effects on every turn of it",
+                cycle.join(" -> "),
+                rules[effectful].name
+            ),
+            suggestion: Some(
+                "break the cycle: an effect-bearing cycle in the rule dependency graph has no compile-time bound, so each turn enqueues fresh effects forever — consume the triggering fact without recording one the cycle reads back, route the recurrence through an external event or clock, or tag a rule `@external` when its facts genuinely arrive from outside the workflow"
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
+/// The shortest produce/consume round trip from `start` back to `start`, staying
+/// inside `component`, rendered as rule names. Used only to make the diagnostic
+/// name a path a reader can follow.
+fn shortest_rule_cycle(
+    ir: &IrProgram,
+    rules: &[IrRule],
+    index_of: &BTreeMap<&str, usize>,
+    start: usize,
+    component: &[usize],
+) -> Option<Vec<String>> {
+    let mut adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for dependency in &ir.rule_dependencies {
+        let (Some(&producer), Some(&consumer)) = (
+            index_of.get(dependency.producer.as_str()),
+            index_of.get(dependency.consumer.as_str()),
+        ) else {
+            continue;
+        };
+        if producer != consumer && component.contains(&producer) && component.contains(&consumer) {
+            adjacency.entry(producer).or_default().insert(consumer);
+        }
+    }
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut predecessor: BTreeMap<usize, usize> = BTreeMap::new();
+    for &next in adjacency.get(&start).into_iter().flatten() {
+        if predecessor.insert(next, start).is_none() {
+            queue.push_back(next);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        for &next in adjacency.get(&node).into_iter().flatten() {
+            if next == start {
+                let mut path = vec![rules[node].name.clone()];
+                let mut cursor = node;
+                while cursor != start {
+                    cursor = predecessor[&cursor];
+                    path.push(rules[cursor].name.clone());
+                }
+                path.reverse();
+                path.push(rules[start].name.clone());
+                return Some(path);
+            }
+            if predecessor.insert(next, node).is_none() {
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
+/// The fact identifiers one rule reads, as the dependency graph must see them.
+///
+/// `fact_read_from_when` keys a `when` clause on its FIRST token, so the
+/// explicit `when fact <Class> as x` form is recorded as `pattern:fact <Class>
+/// as x` — lowercase `fact` is not a class name — while a write is always
+/// `schema:<Class>`. The two could therefore never meet, and a rule that
+/// triggers through the explicit form contributed no incoming edge at all: a
+/// real producer/consumer pair was simply invisible to every analysis built on
+/// this graph. `lint_workflow_liveness` already special-cases the same form for
+/// the same reason; this is that special case, at the graph.
+///
+/// Normalising only when the name is capitalised keeps the built-in observer
+/// triggers (`when fact agent.turn.completed as ev`) out of it — they name no
+/// class, so they can match no write, and passing them through unchanged is
+/// both cheaper and truthful.
+fn dependency_read_facts(metadata: &IrRuleMetadata) -> Vec<String> {
+    metadata
+        .fact_reads
+        .iter()
+        .map(|read| {
+            let Some(pattern) = read.strip_prefix("pattern:fact ") else {
+                return read.clone();
+            };
+            match pattern.split_whitespace().next() {
+                Some(name) if name.starts_with(char::is_uppercase) => format!("schema:{name}"),
+                _ => read.clone(),
+            }
+        })
+        .collect()
+}
+
 fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
+    let reads_by_rule = rules
+        .iter()
+        .map(|rule| dependency_read_facts(&rule.metadata))
+        .collect::<Vec<_>>();
     let mut dependencies = Vec::new();
     for producer in rules {
         for produced_fact in &producer.metadata.fact_writes {
-            for consumer in rules {
-                if consumer.metadata.fact_reads.contains(produced_fact) {
+            for (consumer, reads) in rules.iter().zip(&reads_by_rule) {
+                if reads.contains(produced_fact) {
                     dependencies.push(IrRuleDependency {
                         producer: producer.name.clone(),
                         consumer: consumer.name.clone(),

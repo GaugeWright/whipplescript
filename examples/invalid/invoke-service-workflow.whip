@@ -1,0 +1,39 @@
+# Awaiting a workflow that does not promise to terminate. `invoke` is a durable
+# child invocation whose parent "observes typed terminal output"
+# (spec/execution-contract.md), and `@service` is the declaration that a workflow
+# is not required to reach one — the escape from the liveness check, no more. It
+# is not a proof of non-termination, so the refusal rests on the missing promise:
+# a caller that blocks has nothing to hold the callee to. This `Forever` has no
+# completing rule at all, so nothing settles and the unhandled-failure net does
+# not catch it — that net observes an effect that FAILED, and nothing fails here.
+# The agent-tool seam already refuses this pairing on the tag alone; the `invoke`
+# seam did not.
+class R { ok bool }
+class Q { id string  n int }
+
+workflow Parent {
+  output result R
+  class Ticket { id string }
+  table seed as Ticket [ { id "T1" } ]
+
+  rule relay
+    when Ticket as ticket
+  => {
+    invoke Forever { ask { id ticket.id  n 0 } } as sub
+    after sub completes {
+      complete result { ok true }
+    }
+  }
+}
+
+@service
+workflow Forever {
+  input ask Q
+  output result R
+
+  rule spin
+    when Q as a
+  => {
+    done a -> record Q { id a.id  n a.n + 1 }
+  }
+}

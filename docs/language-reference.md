@@ -2396,6 +2396,30 @@ suggestion.
   matched class. The source can be a table, a different rule, or an input of
   the workflow. Add the `@external` tag to a rule when its facts come from
   outside the workflow. Packages, fixtures, and external systems are examples.
+- **Each check applies to every workflow of a bundle.** A file that declares
+  more than one workflow gets each check on each workflow, not only on the one
+  that `--root` names. A workflow that an `invoke` statement reaches is
+  therefore under the same rules as the entry point, and no refusal is escapable
+  by a move of the code into a second workflow.
+- **An effectful cycle of rules is refused.** The compiler classifies the
+  strongly connected components of the rule dependency graph. A component of two
+  rules or more in which a rule runs an effect has no bound at compile time and
+  is a check error (`graph.unbounded_effect_recursion`). A component with no
+  effect is monotonic recursion and is allowed. A recurrence through an external
+  event or a clock never enters this graph, because such a trigger matches no
+  recorded class. A cycle of one rule belongs to the separate check on a rule
+  that preserves its own trigger, which the `done` statement escapes.
+- **The invoke-tool graph must be acyclic.** An agent may call a granted `@tool`
+  workflow synchronously, so a cycle of `tools` grants is an unbounded depth of
+  recursion (`graph.unbounded_tool_grant_recursion`).
+- **An `invoke` statement may not target a `@service` workflow.** The parent of
+  an invocation observes the typed terminal output of the child, and `@service`
+  is the declaration that a workflow is not required to reach one
+  (`graph.invoke_awaits_service_workflow`). The refusal rests on that missing
+  promise, not on a claim about the run: a `@service` workflow with a completing
+  rule does terminate. The agent-tool seam applies the same rule on the tag
+  alone. The tag stays legitimate: the refusal is of the await, never of the
+  declaration.
 
 ```whip
 @service

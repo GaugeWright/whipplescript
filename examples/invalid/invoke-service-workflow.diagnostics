@@ -1,0 +1,6 @@
+error: rule `relay` invokes `Forever`, which is tagged `@service` (graph.invoke_awaits_service_workflow): `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output
+   --> examples/invalid/invoke-service-workflow.whip:21:6
+   |
+21 |   => {
+   |      ^
+   = help: remove `@service` from the target if it does terminate — non-termination is a root-only privilege, not for an awaited sub-workflow; to hand work to a genuinely long-running service, emit a signal or event it observes instead of awaiting it

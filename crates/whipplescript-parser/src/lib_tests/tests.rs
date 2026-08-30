@@ -8936,6 +8936,18 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             "headerless-library",
             include_str!("../../../../examples/invalid/headerless-library.whip"),
         ),
+        (
+            "effectful-rule-cycle",
+            include_str!("../../../../examples/invalid/effectful-rule-cycle.whip"),
+        ),
+        (
+            "tool-grant-cycle",
+            include_str!("../../../../examples/invalid/tool-grant-cycle.whip"),
+        ),
+        (
+            "invoke-service-workflow",
+            include_str!("../../../../examples/invalid/invoke-service-workflow.whip"),
+        ),
     ];
 
     for (name, source) in fixtures {
@@ -9896,6 +9908,364 @@ fn rejects_effectful_self_trigger_loop() {
     assert!(compiled.diagnostics[0]
         .message
         .contains("preserves trigger fact `schema:WorkItem`"));
+}
+
+/// The TWO-rule version of the loop above. `validate_effectful_self_trigger`
+/// answers one rule preserving its own trigger; a cycle handed between two rules
+/// escaped it entirely while the compiler printed that same cycle in its own
+/// `rule_dependencies` snapshot. Each turn enqueues a fresh `tell` under a new
+/// idempotency key, so exactly-once dedup never brakes it
+/// (spec/static-analysis.md: "effectful internal recursion: rejected unless
+/// explicitly proven bounded").
+#[test]
+fn rejects_effectful_rule_cycle_across_two_rules() {
+    let source = include_str!("../../../../examples/invalid/effectful-rule-cycle.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("effectful rule cycle is not allowed (graph.unbounded_effect_recursion)")
+                && diagnostic
+                    .message
+                    .contains("rule cycle ping_step -> pong_step -> ping_step")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The same cycle written with the explicit `when fact <Class> as x` trigger.
+/// `fact_read_from_when` keys a clause on its first token, so this form was
+/// recorded as `pattern:fact Pong as q` and could never match the `schema:Pong`
+/// write — one edge of the cycle was simply missing from the graph, and the
+/// refusal above was one keyword away from being evaded.
+#[test]
+fn effectful_rule_cycle_is_caught_through_the_explicit_fact_trigger() {
+    let source = r#"
+workflow FactTriggerCycle
+
+output result Report
+class Report { seen int }
+
+class Ping { n int }
+class Pong { n int }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seeds as Ping [
+  { n 0 }
+]
+
+rule ping_step
+  when fact Ping as p
+=> {
+  tell worker "ping" as t
+
+  after t completes {
+    done p -> record Pong { n p.n }
+  }
+}
+
+rule pong_step
+  when fact Pong as q
+=> {
+  tell worker "pong" as t
+
+  after t completes {
+    done q -> record Ping { n q.n + 1 }
+  }
+}
+
+rule finish
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.unbounded_effect_recursion")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A one-rule self-loop stays with `validate_effectful_self_trigger` and its
+/// consume-or-advance escape — the shape `docs/manual/13-agent-patterns.md`
+/// teaches as the retry idiom. The cycle check must not also fire on it, or the
+/// manual's blessed pattern stops compiling.
+#[test]
+fn the_effect_cycle_check_leaves_the_consume_and_advance_self_loop_alone() {
+    let source = r#"
+workflow Resilient
+
+output result Done
+failure error Failed
+class Done { ok bool }
+class Failed { reason string }
+class Attempt { count int }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Attempt [ { count 0 } ]
+
+rule attempt
+  when Attempt as a where a.count < 3
+=> {
+  tell worker "try" as turn
+
+  after turn fails {
+    done a -> record Attempt { count a.count + 1 }
+  }
+
+  after turn succeeds {
+    complete result { ok true }
+  }
+}
+
+rule give_up
+  when Attempt as a where a.count >= 3
+=> {
+  fail error { reason "exhausted" }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(
+        !compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.unbounded_effect_recursion")),
+        "the retry idiom must keep compiling: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// DR-0025's invoke-tool graph, which
+/// `models/maude/subworkflow-convergence.maude` has modeled since the start and
+/// nothing built: `resolve_same_bundle_tool_grant` checks one granted target in
+/// isolation and never reads that target's own grants.
+#[test]
+fn rejects_agent_tool_grant_cycle() {
+    let source = include_str!("../../../../examples/invalid/tool-grant-cycle.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains(
+                "recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion)",
+            ) && diagnostic
+                .message
+                .contains("invoke-tool cycle Alpha -> Beta -> Alpha")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The length-1 case: an agent granting its OWN workflow as a tool. Unlike
+/// direct self-`invoke`, which the per-rule check already refuses, nothing
+/// caught this — so the seed edge has to be tested for a self target, not only
+/// the BFS.
+#[test]
+fn rejects_agent_tool_self_grant() {
+    let source = r#"
+class R { ok bool }
+
+@tool
+workflow Alpha {
+  output result R
+  agent a {
+    provider owned
+    profile "code"
+    capacity 1
+    tools [Alpha]
+  }
+  rule h
+    when started
+  => {
+    tell a "alpha" as t
+    after t completes {
+      complete result { ok true }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("invoke-tool cycle Alpha -> Alpha")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// Being in SCOPE is not being used. A top-level agent is spliced into every
+/// workflow by `select_root_workflow`, but an agent a workflow never tells runs
+/// no turn there, and a turn is the only thing that can call a granted tool.
+/// Counting scope alone reported `Alpha -> Alpha` for a shared agent that
+/// `Alpha` does not touch — a cycle that cannot happen.
+#[test]
+fn an_agent_a_workflow_never_uses_is_not_an_edge() {
+    let source = r#"
+class R { ok bool }
+
+agent lead {
+  provider owned
+  profile "code"
+  capacity 1
+  tools [Alpha]
+}
+
+workflow Top {
+  output result R
+  rule go
+    when started
+  => {
+    tell lead "start" as t
+    after t completes { complete result { ok true } }
+  }
+}
+
+@tool
+workflow Alpha {
+  output outcome R
+  rule h
+    when started
+  => { complete outcome { ok true } }
+}
+"#;
+    for root in ["Top", "Alpha"] {
+        let compiled = compile_program_with_root(source, Some(root));
+        assert!(
+            !compiled.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("graph.unbounded_tool_grant_recursion")),
+            "root {root}: {:?}",
+            compiled.diagnostics
+        );
+    }
+}
+
+/// A grant that names no workflow in this bundle is NOT this pass's refusal: it
+/// may resolve to a package export, whose convergence is checked at attestation,
+/// and an unresolvable name belongs to `lint_agent_tool_grants` with the package
+/// lock in hand. Contributing an edge for it here would break the fmt round-trip
+/// and the LSP fixtures that grant names deliberately absent from the program.
+#[test]
+fn an_unresolvable_tool_grant_is_not_a_cycle() {
+    let source = r#"
+class R { ok bool }
+
+workflow Grants {
+  output result R
+  agent worker {
+    provider owned
+    profile "code"
+    capacity 1
+    tools [WordCount, OpenPr]
+  }
+  rule r
+    when started
+  => { complete result { ok true } }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(
+        !compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.unbounded_tool_grant_recursion")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// `invoke` awaits the child's typed terminal output
+/// (spec/execution-contract.md); a `@service` workflow declares it reaches none,
+/// so the parent's `after` block is unreachable and the instance stalls with no
+/// auto-fail to catch it. The agent-tool seam already refuses the same pairing.
+#[test]
+fn rejects_invoke_of_a_service_workflow() {
+    let source = include_str!("../../../../examples/invalid/invoke-service-workflow.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("graph.invoke_awaits_service_workflow")
+                && diagnostic
+                    .message
+                    .contains("rule `relay` invokes `Forever`")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The two workflow declaration forms keep their tags in different places — a
+/// header-form workflow's on `Program::workflow_tags`, a block-form workflow's
+/// on `WorkflowDecl::tags` — so a callee-side check reading only
+/// `program.workflows` never fires on the header form. That blind spot was live:
+/// this program compiled clean before `workflows_tagged` was shared between the
+/// `@private` and `@service` invoke checks.
+#[test]
+fn a_header_form_private_workflow_may_not_be_invoked() {
+    let source = r#"
+@private
+workflow Hidden
+
+output hidden_result HR
+class HR { ok bool }
+input ask Q
+class Q { id string }
+
+rule h
+  when Q as q
+=> { complete hidden_result { ok true } }
+
+workflow Caller {
+  input task T
+  output outcome R2
+  class T { id string }
+  class R2 { ok bool }
+  rule go
+    when T as t
+  => {
+    invoke Hidden { ask { id t.id } } as sub
+    after sub completes { complete outcome { ok true } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(source, Some("Caller"));
+
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("invokes private workflow `Hidden`")),
+        "{:?}",
+        compiled.diagnostics
+    );
 }
 
 #[test]

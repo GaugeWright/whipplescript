@@ -1,0 +1,63 @@
+# A cycle in the invoke-tool graph (DR-0025;
+# models/maude/subworkflow-convergence.maude rule `cycle`). An agent may call a
+# granted `@tool` workflow synchronously inside a turn, so `Alpha`'s agent
+# calling `Beta` while `Beta`'s agent calls `Alpha` is unbounded recursion depth
+# with no compile-time convergence proof. The model carried this invariant from
+# the start; nothing built the graph until now.
+class R { ok bool }
+
+workflow Top {
+  output result R
+  agent lead {
+    provider owned
+    profile "code"
+    capacity 1
+    tools [Alpha]
+  }
+  rule go
+    when started
+  => {
+    tell lead "start" as t
+    after t completes {
+      complete result { ok true }
+    }
+  }
+}
+
+@tool
+workflow Alpha {
+  output result R
+  agent a {
+    provider owned
+    profile "code"
+    capacity 1
+    tools [Beta]
+  }
+  rule h
+    when started
+  => {
+    tell a "alpha" as t
+    after t completes {
+      complete result { ok true }
+    }
+  }
+}
+
+@tool
+workflow Beta {
+  output result R
+  agent b {
+    provider owned
+    profile "code"
+    capacity 1
+    tools [Alpha]
+  }
+  rule h
+    when started
+  => {
+    tell b "beta" as t
+    after t completes {
+      complete result { ok true }
+    }
+  }
+}

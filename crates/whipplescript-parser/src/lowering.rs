@@ -392,6 +392,7 @@ pub(crate) fn lower_program(
 
     validate_streams(&ir, &mut diagnostics);
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
+    validate_effectful_rule_recursion(&ir, &mut diagnostics);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_credential_kinds(&ir, &mut diagnostics);

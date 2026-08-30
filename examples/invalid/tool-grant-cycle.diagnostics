@@ -1,0 +1,6 @@
+error: recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion): invoke-tool cycle Alpha -> Beta -> Alpha
+   --> examples/invalid/tool-grant-cycle.whip:34:11
+   |
+34 |     tools [Beta]
+   |           ^^^^^^
+   = help: break the cycle: an agent may call a granted `@tool` workflow synchronously, so a cycle in the grant graph has unbounded recursion depth and no compile-time convergence proof

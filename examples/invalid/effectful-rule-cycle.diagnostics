@@ -1,0 +1,6 @@
+error: effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle ping_step -> pong_step -> ping_step, and rule `ping_step` runs effects on every turn of it
+   --> examples/invalid/effectful-rule-cycle.whip:26:4
+   |
+26 | => {
+   |    ^
+   = help: break the cycle: an effect-bearing cycle in the rule dependency graph has no compile-time bound, so each turn enqueues fresh effects forever — consume the triggering fact without recording one the cycle reads back, route the recurrence through an external event or clock, or tag a rule `@external` when its facts genuinely arrive from outside the workflow

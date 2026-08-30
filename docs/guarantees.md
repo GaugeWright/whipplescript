@@ -83,6 +83,27 @@ the source. Thus a program that does not stop is a declaration, not an accident.
 *Carried by:* the static liveness checks of the compiler. Refer to
 [liveness checks](language-reference.md#liveness-checks).
 
+**A cycle of rules that runs effects is refused.**
+The compiler classifies the strongly connected components of the rule
+dependency graph. A component of two rules or more in which a rule runs an
+effect is a check error: each turn of it requests fresh external effects, under
+a new idempotency key each time, so the exactly-once guarantee is no brake on
+it. A component with no effect is monotonic recursion and is allowed. A
+recurrence through an external event or a clock never enters this graph, because
+such a trigger matches no recorded class. There is no bounded-recursion escape
+yet, for the same reason there is none for a recursive pattern: no
+statically-decreasing measure exists to prove a bound with.
+*Carried by:* the strongly-connected-component classification of the compiler
+over the rule dependency graph. The fixture is
+`examples/invalid/effectful-rule-cycle.whip`.
+
+**A whole-program refusal holds for every workflow of a file.**
+A file may declare more than one workflow, and `--root` names the entry point.
+Each check applies to each workflow, not only to that entry point. Thus a
+refusal is never escapable by a move of the offending code into a second
+workflow that an `invoke` statement reaches.
+*Carried by:* the per-workflow check battery of `whip check`.
+
 **A tree of recursive agent tools converges.**
 An agent can invoke a curated set of `@tool` workflows synchronously. The whole
 invoke tree must converge. Thus a turn never blocks for an unlimited time. Two
@@ -92,9 +113,20 @@ locally convergent: a `@tool` node that reads external signals, and a `@tool`
 node with the `@service` tag, cannot be shown to terminate. The same property on
 a node that is not a tool is permitted. Non-termination is a privilege of the
 root only.
+A workflow that an `invoke` statement awaits must also promise to terminate.
+The parent of an invocation observes the typed terminal output of the child, and
+`@service` is the declaration that a workflow is not required to reach one, so
+the compiler refuses the invocation. The refusal rests on the missing promise,
+not on a claim about the run: a `@service` workflow with a completing rule does
+reach a terminal. This is the rule the agent-tool seam already applies on the
+tag alone. The tag stays legitimate: what is refused is the await, never the
+declaration, and non-termination remains a privilege of the root.
 *Carried by:* `models/maude/subworkflow-convergence.maude`. The model records
 each reason that the system is not provably convergent. A valid system never
-gets to that marker.
+gets to that marker. The acyclicity of the grant graph and the refusal at the
+`invoke` seam are checks of the compiler; the fixtures are
+`examples/invalid/tool-grant-cycle.whip` and
+`examples/invalid/invoke-service-workflow.whip`.
 
 **A spend cap parks work. A spend cap never truncates work.**
 A campaign that gets to its cap parks. Its state, its candidates, and its

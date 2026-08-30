@@ -3176,6 +3176,40 @@ fn check(options: &CliOptions) -> ExitCode {
     for path in check_options.paths {
         match compile_source_path_for_validation(&path, check_options.root.as_deref()) {
             Ok((source, ir)) => {
+                // Every OTHER workflow in the bundle gets the same battery the
+                // root does. Without this, each refusal below holds only for the
+                // workflow named by `--root`, and `invoke` reaches the rest.
+                let sibling_diagnostics = check_sibling_workflows(
+                    &path,
+                    &ir.workflow,
+                    package_lock.as_ref(),
+                    check_options.package_lock_path.as_deref(),
+                    check_options.exec_profile,
+                    script_manifest.as_ref(),
+                    &source,
+                );
+                if !sibling_diagnostics.is_empty() {
+                    failed = true;
+                    if options.json {
+                        reports.push(json!({
+                            "schema": "whipplescript.check_report.v0",
+                            "path": display_path(&path),
+                            "status": "error",
+                            "error": {
+                                "kind": "diagnostics",
+                                "diagnostics": sibling_diagnostics
+                                    .iter()
+                                    .map(parser_diagnostic_to_json)
+                                    .collect::<Vec<_>>(),
+                            },
+                        }));
+                    } else {
+                        for diagnostic in sibling_diagnostics {
+                            eprint!("{}", render_diagnostic(&path, &source, &diagnostic));
+                        }
+                    }
+                    continue;
+                }
                 let contract_registry = match contract_registry_for_ir(package_lock.as_ref(), &ir) {
                     Ok(registry) => registry,
                     Err(message) => {
@@ -38469,6 +38503,83 @@ fn compile_source_path_with_root(
 
 /// Compile for static validation (`check`/`compile`): on top of ordinary
 /// compilation this enforces the workflow liveness lints.
+/// Apply `whip check`'s per-workflow battery to every workflow in the bundle
+/// that is NOT the selected root, and return their diagnostics.
+///
+/// The parser already validates every workflow: `compile_program_with_root`
+/// lowers each one and aggregates the diagnostics, so a sibling's lowering
+/// errors surface under any `--root`. Everything AFTER lowering did not.
+/// `select_root_workflow` returns a `Program` with `workflows` emptied, so the
+/// `IrProgram` every post-lowering check consumes contains exactly one
+/// workflow — and the liveness lint, the script hard-off, the authority-import
+/// gate, the provider checks, the tool-grant resolution and the whole
+/// information-flow checker therefore only ever saw the root.
+///
+/// The consequence was not a missing warning. It was that any refusal in that
+/// set could be evaded by moving the offending code one workflow down and
+/// invoking it: the same file that `whip check --root Child` rejected for
+/// writing confidential data to a public channel passed `--root Parent`, whose
+/// only statement was `invoke Child`. A whole-program property that holds only
+/// for whichever workflow you happen to name is not a property.
+///
+/// Each sibling is compiled under its own root — the same scoped program
+/// `select_root_workflow` would build for it — and its diagnostics are prefixed
+/// with the workflow they belong to, because a rule name is unique within a
+/// workflow but not across a bundle.
+fn check_sibling_workflows(
+    path: &str,
+    root: &str,
+    package_lock: Option<&LoadedPackageLock>,
+    package_lock_path: Option<&Path>,
+    exec_profile: ExecProfile,
+    script_manifest: Option<&ScriptManifest>,
+    source: &str,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let imported_irs = imported_tool_irs(package_lock);
+    for name in whipplescript_parser::workflow_names(source) {
+        if name == root {
+            continue;
+        }
+        let found = match compile_source_path_for_validation(path, Some(&name)) {
+            Ok((_, ir)) => {
+                let mut found = lint_hosted_exec(&ir, exec_profile, script_manifest);
+                found.extend(agent_provider_kind_diagnostics(&ir, package_lock));
+                found.extend(agent_requires_diagnostics(&ir));
+                found.extend(lint_agent_tool_grants(
+                    Path::new(path),
+                    &ir,
+                    package_lock_path,
+                ));
+                found.extend(ifc::check_ifc_program_with_imports(&ir, &imported_irs));
+                found
+            }
+            // A sibling that does not compile at all reports through its own
+            // diagnostics; the bundle-wide lowering pass has usually said so
+            // already, and a duplicate is filtered below.
+            //
+            // The error is bound and matched INSIDE the arm rather than
+            // destructured in the arm pattern. `scripts/mutation_sweep.py`
+            // classifies an `Err(` in pattern position by the shape that
+            // follows: it knows `Err(e)` and `Err(_)` are patterns, but a path
+            // pattern reads to it as a call, so `Err(CompileFailure::… {` here
+            // scanned as a refusal site it then could not mutate — an
+            // unmeasurable site fails the `new-refusals` gate. Its error is in
+            // the safe direction (a false site can only fail a run, never pass
+            // one), so the shape moves rather than the shared heuristic.
+            Err(failure) => match failure {
+                CompileFailure::Diagnostics { diagnostics, .. } => diagnostics,
+                _ => Vec::new(),
+            },
+        };
+        for mut diagnostic in found {
+            diagnostic.message = format!("in workflow `{name}`: {}", diagnostic.message);
+            diagnostics.push(diagnostic);
+        }
+    }
+    diagnostics
+}
+
 fn compile_source_path_for_validation(
     path: &str,
     root: Option<&str>,
@@ -38664,8 +38775,10 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
     // or the turn could block forever. v1 admits the conservative leaf class:
     // terminates (no `@service` escape), depends on no external input (no
     // `@external` rules, no inbound messages), no human gate, and no nested
-    // `invoke`. Nested `@tool` composition — which needs the acyclic invoke-graph
-    // check the convergence model also covers — is a later refinement.
+    // `invoke`. Nested `@tool` composition is still a later refinement, but the
+    // acyclicity half it was waiting on now exists: `detect_agent_tool_grant_recursion`
+    // builds the invoke-tool graph from the bundle's `tools [...]` grants and
+    // refuses a cycle, which is the check this comment used to defer.
     let tool_tagged = ir
         .source_tags
         .iter()
@@ -42679,6 +42792,10 @@ mod package_shape_refusal_tests;
 #[cfg(test)]
 #[path = "main_tests/lint_refusal.rs"]
 mod lint_refusal_tests;
+
+#[cfg(test)]
+#[path = "main_tests/sibling_workflow_refusal.rs"]
+mod sibling_workflow_refusal_tests;
 
 #[cfg(test)]
 #[path = "main_tests/tests.rs"]

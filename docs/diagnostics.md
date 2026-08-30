@@ -287,6 +287,92 @@ a durable boundary. Do not use a direct cycle of `invoke` statements.
 
 The invalid fixture is `examples/invalid/recursive-workflow-invocation.whip`.
 
+### Effectful rule cycle
+
+This is the diagnostic:
+
+```text
+error: effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle ping_step -> pong_step -> ping_step, and rule `ping_step` runs effects on every turn of it
+```
+
+The cause is a cycle in the rule dependency graph in which one rule or more runs
+an effect. Each rule of the cycle records a fact that a later rule of the cycle
+matches, and the last one records the fact that the first one matches. Such a
+cycle has no bound at compile time. Each turn of it requests fresh external
+effects, under a new idempotency key each time, so the exactly-once guarantee
+never stops it.
+
+A cycle of ONE rule is a different diagnostic. The check for a rule that
+preserves its own trigger owns it, and that check has the escape of a `done`
+statement that consumes or advances the fact. The retry pattern of
+[Agent patterns](manual/13-agent-patterns.md) uses that escape.
+
+The correction is to break the cycle. Consume the triggering fact without
+recording a fact that the cycle reads back, or route the recurrence through an
+external event or a clock. A rule whose facts genuinely arrive from outside the
+workflow carries the `@external` tag, and a cycle through such a rule is not
+internal recursion.
+
+The invalid fixture is `examples/invalid/effectful-rule-cycle.whip`.
+
+### Recursive agent tool grant
+
+This is the diagnostic:
+
+```text
+error: recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion): invoke-tool cycle Alpha -> Beta -> Alpha
+```
+
+The cause is a cycle in the invoke-tool graph. An agent may call a granted
+`@tool` workflow synchronously inside a turn, and that workflow's own agents may
+call further tools. A cycle in the grant graph therefore has an unbounded depth
+of recursion and no proof of convergence at compile time. A grant of a workflow
+to its own agent is a cycle of length one.
+
+The check reads the grants of the bundle. A grant of a name that no workflow of
+the bundle declares gives no edge: such a name is a package export, and the
+manifest checks the convergence of a package export when it attests it.
+
+The correction is to break the cycle.
+
+The invalid fixture is `examples/invalid/tool-grant-cycle.whip`.
+
+### Invocation of a `@service` workflow
+
+This is the diagnostic:
+
+```text
+error: rule `relay` invokes `Forever`, which is tagged `@service` (graph.invoke_awaits_service_workflow): `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output
+```
+
+The cause is an `invoke` statement whose target carries the `@service` tag. The
+parent of an invocation observes the typed terminal output of the child. The
+`@service` tag is the declaration that a workflow is not required to terminate:
+it is the escape from the check that otherwise demands a rule that reaches
+`complete` or `fail`.
+
+Note what the tag does not mean. It is not a proof that the workflow runs
+forever. A `@service` workflow that carries a completing rule reaches a terminal
+at run time in the usual way. The refusal rests on the missing PROMISE. A caller
+that blocks on a terminal has nothing to hold the callee to, and if no terminal
+comes, the instance stays in the running state with no terminal. The automatic
+failure does not catch that condition, because that mechanism observes an effect
+that FAILED, and here nothing fails.
+
+This is the same rule that the agent-tool seam applies. A granted `@tool`
+workflow that also carries `@service` is refused on the tag alone, with the same
+reasoning and whether or not it carries a completing rule.
+
+The tag itself stays legitimate. This diagnostic refuses the AWAIT of a
+`@service` workflow, never the declaration of one. Non-termination is a
+privilege of the root.
+
+The correction is to remove `@service` from the target when the target does
+terminate, or to hand the work to a genuinely long-running service through a
+signal or an event that it observes.
+
+The invalid fixture is `examples/invalid/invoke-service-workflow.whip`.
+
 ### Evidence-only fact matched as a fact
 
 This is the diagnostic:
@@ -383,3 +469,6 @@ usual diagnostics:
 | `evidence-fact-match.whip` | A match of a fact that is evidence only, as a fact that a rule can match. |
 | `recursive-pattern.whip` | A recursive application of a pattern, which is a cycle in the expansion. |
 | `recursive-workflow-invocation.whip` | A cycle of `invoke` statements between workflows. |
+| `effectful-rule-cycle.whip` | A cycle of two rules or more in the rule dependency graph, in which a rule runs an effect. |
+| `tool-grant-cycle.whip` | A cycle in the invoke-tool graph of the agent `tools` grants. |
+| `invoke-service-workflow.whip` | An `invoke` statement whose target is a `@service` workflow and therefore reaches no terminal. |
