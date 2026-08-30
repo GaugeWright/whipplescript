@@ -149,21 +149,44 @@ pub fn materialize_manifest_subset(
     now_unix_nanos: i128,
     limits: &MaterializeLimits,
 ) -> StoreResult<MaterializedScratch> {
-    let mut bodies = Vec::with_capacity(manifest.len());
+    let selected: Vec<(&str, &str)> = manifest
+        .iter()
+        .filter(|(key, _)| include.is_none_or(|include| include.contains(*key)))
+        .map(|(key, hash)| (key.as_str(), hash.as_str()))
+        .collect();
+
+    // DR-0068 §4: check the WHOLE closure before doing any work. This loop used
+    // to check coherence itself, one blob at a time, and got both halves of
+    // that wrong: it returned on the FIRST missing blob, so an operator fixing
+    // them learned the extent one round trip at a time, and it reported every
+    // failure as "the blob is absent" — including an ERASED one, which is the
+    // absent-for-erased substitution DR-0066 §5 refuses. Being told "absent"
+    // about bytes that are gone by policy means retrying forever.
+    //
+    // `preflight_manifest` answered both correctly and had no production
+    // caller, which is how a hand-rolled second answer came to live here.
+    if let Some(refusal) =
+        crate::preflight::preflight_entries(content, selected.iter().copied())?.refusal()
+    {
+        return Err(StoreError::Conflict(format!(
+            "materialization refuses before writing anything: {refusal}"
+        )));
+    }
+
+    let mut bodies = Vec::with_capacity(selected.len());
     let mut total_bytes = 0u64;
-    for (key, hash) in manifest {
-        if let Some(include) = include {
-            if !include.contains(key) {
-                continue;
-            }
-        }
+    for (key, hash) in selected {
         let Some(body) = content.get(hash)? else {
+            // Preflight said this resolves, so a miss here is the store
+            // contradicting itself between one call and the next, not a missing
+            // input. Reported as the disagreement it is.
             return Err(StoreError::Conflict(format!(
-                "manifest names content {hash} for {key} but the blob is absent"
+                "content {hash} for {key} preflighted as servable and then did not serve; \
+                 the store disagrees with itself"
             )));
         };
         total_bytes += body.len() as u64;
-        bodies.push((key.clone(), hash.clone(), body));
+        bodies.push((key.to_owned(), hash.to_owned(), body));
     }
     if let Some(max_bytes) = limits.max_bytes {
         if total_bytes > max_bytes {
@@ -310,6 +333,106 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos() as i128
+    }
+
+    /// **An erased input must not read as an absent one.**
+    ///
+    /// DR-0066 §5 distinguishes *absent* (not replicated here — retry) from
+    /// *erased* (dropped by policy — degrade honestly), and this path collapsed
+    /// them: every failure said "the blob is absent", so an operator was told to
+    /// retry forever for bytes that are gone.
+    #[test]
+    fn an_erased_input_refuses_as_erased_not_as_absent() {
+        let store = content("erased-input");
+        let kept = store.put("kept").expect("stores");
+        let doomed = store.put("dropped by policy").expect("stores");
+        store
+            .erase(&doomed, "2026-08-30T00:00:00Z")
+            .expect("erasure records");
+
+        let manifest = BTreeMap::from([
+            ("/ws/kept.txt".to_owned(), kept),
+            ("/ws/gone.txt".to_owned(), doomed.clone()),
+        ]);
+        let root = scratch_root("erased-input").join("scratch");
+        let error = materialize_manifest(&manifest, &store, &root, now_nanos())
+            .expect_err("an erased input refuses");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("erased") && rendered.contains(&doomed),
+            "the refusal must name the blob and say it was erased, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("is absent"),
+            "erased bytes reported as absent send an operator into an endless retry: {rendered}"
+        );
+        assert!(
+            !root.exists() || std::fs::read_dir(&root).into_iter().flatten().count() == 0,
+            "nothing may be written when the closure does not resolve"
+        );
+        // The refusal SAYS what the line above checks. Asserted because it is
+        // an operational claim — an operator deciding whether to clean up a
+        // half-written scratch reads this sentence, not the source — and
+        // because the sweep found the wrapper's own text pinned by nothing: the
+        // assertions above all match the inner rendering, which a mutation of
+        // this message leaves untouched.
+        assert!(
+            rendered.contains("before writing anything"),
+            "the refusal must say that nothing was written, got {rendered}"
+        );
+    }
+
+    /// Every missing input, not the first.
+    ///
+    /// The whole reason `preflight_manifest` reports a list: an operator fixing
+    /// them one at a time learns the extent one round trip at a time. This path
+    /// returned on the first miss.
+    #[test]
+    fn every_unservable_input_is_named_not_only_the_first() {
+        let store = content("missing-inputs");
+        let kept = store.put("kept").expect("stores");
+        let manifest = BTreeMap::from([
+            ("/ws/a.txt".to_owned(), "never-stored-a".to_owned()),
+            ("/ws/b.txt".to_owned(), kept),
+            ("/ws/c.txt".to_owned(), "never-stored-c".to_owned()),
+        ]);
+        let root = scratch_root("missing-inputs").join("scratch");
+        let error = materialize_manifest(&manifest, &store, &root, now_nanos())
+            .expect_err("missing inputs refuse");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("never-stored-a") && rendered.contains("never-stored-c"),
+            "both missing inputs must be named, got {rendered}"
+        );
+        assert!(
+            rendered.contains("2 of 3"),
+            "the refusal must say how much of the closure it checked, got {rendered}"
+        );
+    }
+
+    /// A subset materialization preflights the SUBSET.
+    ///
+    /// Checking the whole manifest would refuse runs over inputs they never
+    /// touch, which is how a correct check becomes one someone routes around.
+    #[test]
+    fn a_subset_preflights_only_what_it_will_project() {
+        let store = content("subset-preflight");
+        let kept = store.put("kept").expect("stores");
+        let manifest = BTreeMap::from([
+            ("/ws/needed.txt".to_owned(), kept),
+            ("/ws/untouched.txt".to_owned(), "never-stored".to_owned()),
+        ]);
+        let root = scratch_root("subset-preflight").join("scratch");
+        let include = std::collections::BTreeSet::from(["/ws/needed.txt".to_owned()]);
+        materialize_manifest_subset(
+            &manifest,
+            Some(&include),
+            &store,
+            &root,
+            now_nanos(),
+            &MaterializeLimits::default(),
+        )
+        .expect("a subset whose own inputs resolve materializes");
     }
 
     /// The projection round-trip: absolute-keyed manifest materializes to

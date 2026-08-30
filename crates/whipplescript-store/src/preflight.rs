@@ -64,6 +64,90 @@ impl PreflightOutcome {
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
     }
+
+    /// The refusal an operator reads, naming **every** missing input and
+    /// whether each was absent or erased.
+    ///
+    /// `None` when the closure is ready. The whole list rather than the first
+    /// failure is the point: fixing them one at a time means learning the
+    /// extent one round trip at a time, and *absent* versus *erased* is the
+    /// difference between retrying and degrading honestly (DR-0066 §5).
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Ready { .. } => None,
+            Self::ManifestUnavailable {
+                manifest_hash,
+                reason,
+            } => Some(format!(
+                "the closure is unknown: manifest {manifest_hash} is {}",
+                describe(reason)
+            )),
+            Self::Incomplete { checked, missing } => {
+                let mut rendered =
+                    format!("{} of {checked} input(s) cannot be served:", missing.len());
+                for input in missing {
+                    rendered.push_str(&format!(
+                        "\n  {} ({}) is {}",
+                        input.path,
+                        input.blob_id,
+                        describe(&input.reason)
+                    ));
+                }
+                Some(rendered)
+            }
+        }
+    }
+}
+
+fn describe(reason: &MissingReason) -> String {
+    match reason {
+        MissingReason::Absent => {
+            "absent (not replicated here, or lost) — retry or escalate".to_owned()
+        }
+        MissingReason::Erased { byte_len } => {
+            format!("erased ({byte_len} bytes dropped by policy) — retrying will never produce it")
+        }
+    }
+}
+
+/// Check that every blob in an already-resolved entry set can be served.
+///
+/// The per-input half of [`preflight_manifest`], for a caller that holds the
+/// entries rather than the hash — materialization, which projects a subset it
+/// has already chosen, and would otherwise have to re-read the manifest to ask
+/// this question about the paths it is not going to use.
+///
+/// # Errors
+/// Propagates store failures. A *missing* input is not an error — it is a
+/// reported outcome.
+pub fn preflight_entries<'a, B: ContentBlobs + ?Sized>(
+    blobs: &B,
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> StoreResult<PreflightOutcome> {
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+    for (path, blob_id) in entries {
+        checked += 1;
+        match blobs.status(blob_id)? {
+            BlobStatus::Live { .. } => {}
+            BlobStatus::Erased { byte_len } => missing.push(MissingInput {
+                path: path.to_owned(),
+                blob_id: blob_id.to_owned(),
+                reason: MissingReason::Erased { byte_len },
+            }),
+            BlobStatus::Unknown => missing.push(MissingInput {
+                path: path.to_owned(),
+                blob_id: blob_id.to_owned(),
+                reason: MissingReason::Absent,
+            }),
+        }
+    }
+    if missing.is_empty() {
+        Ok(PreflightOutcome::Ready { checked })
+    } else {
+        Ok(PreflightOutcome::Incomplete { checked, missing })
+    }
 }
 
 /// Check that every blob a manifest names can actually be served.
@@ -127,28 +211,12 @@ pub fn preflight_manifest<B: ContentBlobs + ?Sized>(
         None => serde_json::from_str(&manifest_body)?,
     };
 
-    let mut missing = Vec::new();
-    let checked = manifest.len();
-    for (path, blob_id) in manifest {
-        match blobs.status(&blob_id)? {
-            BlobStatus::Live { .. } => {}
-            BlobStatus::Erased { byte_len } => missing.push(MissingInput {
-                path,
-                blob_id,
-                reason: MissingReason::Erased { byte_len },
-            }),
-            BlobStatus::Unknown => missing.push(MissingInput {
-                path,
-                blob_id,
-                reason: MissingReason::Absent,
-            }),
-        }
-    }
-    if missing.is_empty() {
-        Ok(PreflightOutcome::Ready { checked })
-    } else {
-        Ok(PreflightOutcome::Incomplete { checked, missing })
-    }
+    preflight_entries(
+        blobs,
+        manifest
+            .iter()
+            .map(|(path, blob_id)| (path.as_str(), blob_id.as_str())),
+    )
 }
 
 /// What resolving a manifest tree found.
