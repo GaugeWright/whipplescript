@@ -293,6 +293,15 @@ error: effectful rule `attempt` preserves trigger fact `schema:Attempt`
 That condition is the retry loop with no limit. The `whip check` command
 refuses the loop. Advance the trigger, and the budget becomes structural.
 
+Note where the `record` of this pattern sits. It sits inside an `after` block,
+so the fact of the next attempt arrives only with the terminal of the turn, and
+each pass of the loop waits on the world. That placement is what the compiler
+reads. The same rule with the `record` at the top level advances its trigger
+just as well, and it is a check error
+(`graph.unbounded_effect_recursion`): nothing paces it, so it would enqueue a
+turn for every commit. A ring of two rules or more is read the same way. See
+[Diagnostics](../diagnostics.md).
+
 Two properties come with this pattern at no cost:
 
 - **Each attempt is a true and different effect.** The identity of an effect

@@ -10354,6 +10354,161 @@ rule ship
     assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
 }
 
+/// A loop spelled in ONE rule is the loop of two rules with fewer names, so the
+/// same-commit refusal reaches it too. Left alone until this was fixed: 804
+/// effects in fifteen seconds from a program `whip check` called clean.
+#[test]
+fn same_commit_self_loop_that_advances_is_refused() {
+    let source = r#"
+@service
+workflow OneRuleSameCommit
+
+class Task { n int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t
+=> {
+  tell worker "{{ t.n }}"
+
+  done t -> record Task { n t.n + 1 }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.unbounded_effect_recursion")
+            && diagnostic.message.contains("turn -> turn")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The retry idiom keeps compiling, and this is why: it advances its trigger
+/// behind an `after`, so its self-edge is paced and never counted by default.
+#[test]
+fn paced_self_loop_still_compiles() {
+    let source = r#"
+@service
+workflow OneRulePaced
+
+class Task { n int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t
+=> {
+  tell worker "{{ t.n }}" as x
+
+  after x succeeds as ok {
+    done t -> record Task { n t.n + 1 }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+}
+
+/// The declaration has to cover the one-rule spelling too, or it promises what
+/// it does not deliver: a `@tool` whose single rule loops with the world blocks
+/// the agent turn that invoked it for as long as the model keeps answering,
+/// which is the exact thing DR-0025 convergence exists to prevent.
+#[test]
+fn a_bounded_workflow_refuses_a_one_rule_paced_loop() {
+    let program = |tag: &str| {
+        format!(
+            r#"
+{tag}
+workflow OneRuleBounded
+output result Report
+
+class Task {{ n int }}
+class Report {{ seen int }}
+
+agent worker {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+table seeds as Task [ {{ n 0 }} ]
+
+rule turn
+  when Task as t
+=> {{
+  tell worker "{{{{ t.n }}}}" as x
+
+  after x succeeds as ok {{
+    done t -> record Task {{ n t.n + 1 }}
+  }}
+
+  after x fails as bad {{
+    complete result {{ seen t.n }}
+  }}
+}}
+"#
+        )
+    };
+
+    for tag in ["@bounded", "@tool"] {
+        let compiled = compile_program(&program(tag));
+        assert!(
+            compiled.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("graph.bounded_workflow_effect_cycle")),
+            "{tag}: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    // Without either declaration the same loop is paced and compiles.
+    let compiled = compile_program(&program("@service"));
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+}
+
+/// Tags are free-form, so an unknown one cannot be an error — which is exactly
+/// why a misspelled semantic tag is invisible, silently dropping the behaviour
+/// it was declaring. A near miss earns a warning.
+#[test]
+fn a_near_miss_of_a_semantic_tag_warns() {
+    let source = r#"
+@bounde
+workflow NearMiss
+output result R
+class R { ok bool }
+
+rule r
+  when started
+=> { complete result { ok true } }
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+    assert!(
+        compiled.warnings.iter().any(|warning| warning
+            .message
+            .contains("tag `@bounde` is not a semantic tag, and looks like `@bounded`")),
+        "{:?}",
+        compiled.warnings
+    );
+
+    // A filtering tag of the author's own is not a near miss of anything.
+    let clean = compile_program(&source.replace("@bounde", "@release-gate"));
+    assert!(
+        !clean
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("is not a semantic tag")),
+        "{:?}",
+        clean.warnings
+    );
+}
+
 /// `@bounded` is the opposite declaration to a paced loop: the workflow settles
 /// instead of turning, so it may not loop with the world either. The same cycle
 /// that compiles above is refused under the tag.

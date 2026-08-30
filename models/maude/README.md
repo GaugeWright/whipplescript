@@ -142,11 +142,13 @@ pattern-recursion.maude          pattern-application reachability: recursive
                                  apply rejection (graph.unbounded_pattern_recursion)
                                  with non-recursive nesting not flagged
 effect-cycle-pacing.maude        effect-bearing rule cycles: a same-commit ring
-                                 is refused (graph.unbounded_effect_recursion), a
-                                 ring that waits on an effect terminal is legal
-                                 with no declaration, and a @bounded workflow
-                                 refuses even the paced ring
-                                 (graph.bounded_workflow_effect_cycle)
+                                 is refused (graph.unbounded_effect_recursion),
+                                 including the one-rule form; a ring that waits
+                                 on an effect terminal is legal with no
+                                 declaration; @bounded and @tool refuse even the
+                                 paced ring (graph.bounded_workflow_effect_cycle);
+                                 a preserved self-trigger stays with the per-rule
+                                 refusal so one defect earns one diagnostic
 rule-autofail.maude              rule-level unhandled-failure auto-fail (R1): in a
                                  self-terminating workflow an unhandled effect
                                  failure auto-fails the instance; handled failures,

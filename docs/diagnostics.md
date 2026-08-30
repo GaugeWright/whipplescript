@@ -309,10 +309,12 @@ long-running agent loop of the language, and it needs no tag. The rules of
 liveness still govern it: the workflow needs a rule that reaches `complete` or
 `fail`, or the `@service` tag.
 
-A cycle of ONE rule is a different diagnostic. The check for a rule that
-preserves its own trigger owns it, and that check has the escape of a `done`
-statement that consumes or advances the fact. The retry pattern of
-[Agent patterns](manual/13-agent-patterns.md) uses that escape.
+A cycle of ONE rule gets this same diagnostic, because a loop in one rule is the
+loop of two rules with fewer names. The retry pattern of
+[Agent patterns](manual/13-agent-patterns.md) keeps compiling: it records inside
+an `after` block, so it waits on the world each turn. A rule that preserves its
+own trigger, rather than advancing it, has a diagnostic of its own and keeps
+it.
 
 The correction is to move the `record` of the recurrence into an `after` block,
 so each turn of the cycle waits for the terminal of an effect. As an

@@ -2412,9 +2412,12 @@ suggestion.
   the long-running agent loop, and the rules of liveness above still govern it.
   A component with no effect is monotonic recursion and is allowed. A recurrence
   through an external event or a clock never enters this graph, because such a
-  trigger matches no recorded class. A cycle of one rule belongs to the separate
-  check on a rule that preserves its own trigger, which the `done` statement
-  escapes.
+  trigger matches no recorded class. A cycle of one rule is judged on the same
+  terms, because a loop in one rule is the loop of two rules with fewer names:
+  a rule that records its own trigger class in its own commit while it runs an
+  effect is a check error. The retry pattern keeps compiling, because it records
+  inside an `after` block. The one case that stays with the separate check is a
+  rule that preserves its own trigger, which the `done` statement escapes.
 - **A `@bounded` workflow may not loop with the world at all.** The `@bounded`
   tag is the opposite of the `@service` tag: it declares that the workflow
   reaches a terminal after a number of steps that the program fixes and the data

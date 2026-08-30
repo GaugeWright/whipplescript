@@ -16,9 +16,15 @@
 --- By default only sameCommit edges are counted, so a loop that waits on the
 --- world is not a cycle in the counted graph at all -- it is the long-running
 --- agent loop the language is for, legal with no declaration. The token bounded
---- is the workflow's declaration that it settles instead of turning (@bounded,
---- and @tool by DR-0025); under it every edge counts, so even a paced loop is
---- refused.
+--- is the workflow's declaration that it settles instead of turning, and tool is
+--- the same promise reached through DR-0025; under either, every edge counts, so
+--- even a paced loop is refused.
+---
+--- An edge from a rule to ITSELF is an ordinary edge here: a loop spelled in one
+--- rule is the loop of two rules with fewer names. The single exception is
+--- preservedSelf, a rule that records its own trigger class without consuming
+--- it, which the per-rule refusal owns; it contributes no edge so that one
+--- defect is never reported twice.
 ---
 --- A counted cycle is rejected only when an effectful rule shares it: an
 --- effect-free component is monotonic recursion and stays allowed.
@@ -65,7 +71,9 @@ mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
 
   op sameCommit : Rule Rule -> Cfg [ctor] .  --- edge that lands in the reading commit
   op paced : Rule Rule -> Cfg [ctor] .       --- edge that waits on an effect terminal
+  op preservedSelf : Rule -> Cfg [ctor] .    --- self-edge the per-rule refusal owns
   op bounded : -> Cfg [ctor] .               --- the workflow declares that it settles
+  op tool : -> Cfg [ctor] .                  --- @tool, the same promise via DR-0025
   op effectful : Rule -> Cfg [ctor] .        --- rule runs at least one effect
   op reaches : PairSet -> Cfg [ctor] .       --- transitive reachability over counted edges
   op counted : PairSet -> Cfg [ctor] .       --- the direct counted edges
@@ -86,10 +94,17 @@ mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
       => sameCommit(P, C) counted(pair(P, C) ; PS)
       if memberPair(pair(P, C), PS) = false .
 
-  --- A paced edge counts ONLY under the bounded declaration. This single guard
-  --- is the whole policy: without it the paced loop is invisible to the refusal.
+  --- A paced edge counts ONLY under a declaration that the workflow settles.
+  --- This single guard is the whole policy: without it the paced loop is
+  --- invisible to the refusal.
   crl [count-paced-when-bounded] : bounded paced(P, C) counted(PS)
       => bounded paced(P, C) counted(pair(P, C) ; PS)
+      if memberPair(pair(P, C), PS) = false .
+
+  --- @tool carries that declaration without the tag (DR-0025): a tool is invoked
+  --- inside an agent turn and the turn must end.
+  crl [count-paced-when-tool] : tool paced(P, C) counted(PS)
+      => tool paced(P, C) counted(pair(P, C) ; PS)
       if memberPair(pair(P, C), PS) = false .
 
   --- Seed reachability from every counted edge.

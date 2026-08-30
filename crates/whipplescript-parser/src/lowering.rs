@@ -406,6 +406,7 @@ pub(crate) fn lower_program(
     validate_file_store_write_policy(&ir, &mut diagnostics);
     warn_inert_memory_grant_on_native_adapter(&ir, &mut warnings);
     warn_counter_without_timezone(&ir, &mut warnings);
+    warn_near_miss_semantic_tags(&ir, &mut warnings);
     warn_unhandled_effect_failures(&ir, &mut warnings);
     validate_improve_declarations(&ir, &mut diagnostics);
 

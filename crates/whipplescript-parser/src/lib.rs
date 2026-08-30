@@ -4834,6 +4834,44 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
     }
 }
 
+/// The tags that CHANGE WHAT THE COMPILER DOES, as opposed to the free-form
+/// filtering tags (`@fixture`, `@release-gate`, `@provider:codex`) the language
+/// deliberately leaves open.
+const SEMANTIC_TAGS: &[&str] = &["bounded", "external", "private", "service", "tool"];
+
+/// Warn on a tag that is one or two letters away from a semantic one.
+///
+/// Tags are free-form by design, so an unknown tag cannot be an error — but that
+/// same openness means a misspelled `@bounded` is accepted in silence, and the
+/// strictness it was meant to declare is simply absent. A near miss is the one
+/// case where silence is almost certainly wrong, so it is a warning: the
+/// analysis stays free of false refusals while the typo stops being invisible.
+fn warn_near_miss_semantic_tags(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
+    let semantic = SEMANTIC_TAGS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    for tag in &ir.source_tags {
+        if semantic.contains(&tag.name) {
+            continue;
+        }
+        let Some(candidate) = closest_name(&tag.name, semantic.iter()) else {
+            continue;
+        };
+        warnings.push(Diagnostic {
+            related: Vec::new(),
+            span: tag.span,
+            message: format!(
+                "tag `@{}` is not a semantic tag, and looks like `@{candidate}`",
+                tag.name
+            ),
+            suggestion: Some(format!(
+                "write `@{candidate}` if that is what you meant — a tag the language does not know is kept as metadata and changes nothing, so a misspelled one silently drops the behaviour it was declaring"
+            )),
+        });
+    }
+}
+
 fn warn_counter_without_timezone(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
     for counter in &ir.counters {
         if counter.timezone.is_none() {
@@ -8153,9 +8191,15 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
 /// the first place, because such a trigger is a `pattern:` read that no
 /// `schema:` write can match.
 ///
-/// SELF-EDGES ARE NOT THIS CHECK'S. A one-rule cycle stays with
-/// `validate_effectful_self_trigger` and its `consume`-or-advance escape, which
-/// is the shape `docs/manual/13-agent-patterns.md` teaches as the retry idiom.
+/// SELF-EDGES COUNT ON THE SAME TERMS. A loop spelled in one rule is the same
+/// loop spelled in two, so pacing decides it identically: a rule that records
+/// its own trigger class in its own commit while running an effect spins at
+/// commit speed and is refused, and under `@bounded` even a paced self-loop is.
+/// The retry idiom of `docs/manual/13-agent-patterns.md` is untouched, because
+/// it advances its trigger behind an `after` and is therefore paced. The ONE
+/// self-edge still dropped here is the one `validate_effectful_self_trigger`
+/// already owns — a trigger recorded without being consumed — so that defect is
+/// never reported twice under two names.
 ///
 /// THE ESCAPE is `@external` on any rule in the component: the tag declares that
 /// this rule's facts arrive from outside the workflow, which is the author
@@ -8184,10 +8228,24 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
     let bounded = workflow_tagged("bounded");
     let bounded_workflow = bounded || workflow_tagged("tool");
 
-    // Adjacency, self-edges dropped: they belong to the per-rule check above.
+    // A rule that records the class it matched WITHOUT consuming it is
+    // `validate_effectful_self_trigger`'s diagnostic. Its self-edge is dropped
+    // here so the same defect is not reported twice under two names.
+    let preserves_trigger = |index: usize, fact: &String| {
+        rules[index].metadata.fact_reads.contains(fact)
+            && !rules[index].metadata.fact_consumes.contains(fact)
+    };
+
     // Outside a `@bounded` workflow only an edge whose fact is recorded in the
     // producer's own commit counts — an edge that waits on an effect terminal
     // paces the cycle by the world and is not this refusal's business.
+    //
+    // Self-edges count on the same terms as any other. A loop spelled in one
+    // rule is the same loop spelled in two: it spins at commit speed by default,
+    // and under `@bounded` it turns with the world when the workflow promised to
+    // settle. The per-rule check's consume-or-advance escape survives exactly
+    // where it belongs — a rule that advances its trigger behind an `after` is
+    // paced, so its self-edge is not counted by default.
     let mut adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     let mut reaches = vec![vec![false; rules.len()]; rules.len()];
     for dependency in &ir.rule_dependencies {
@@ -8197,14 +8255,14 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
         ) else {
             continue;
         };
-        if producer == consumer {
-            continue;
-        }
         let same_commit = rules[producer]
             .metadata
             .immediate_fact_writes
             .contains(&dependency.fact);
         if !bounded_workflow && !same_commit {
+            continue;
+        }
+        if producer == consumer && preserves_trigger(producer, &dependency.fact) {
             continue;
         }
         adjacency.entry(producer).or_default().insert(consumer);
@@ -8241,7 +8299,9 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
         let component = (0..rules.len())
             .filter(|&other| other == start || (reaches[start][other] && reaches[other][start]))
             .collect::<Vec<_>>();
-        if component.len() < 2 {
+        // `component` always contains `start`, so a lone member is a cycle only
+        // when the rule reaches itself — a counted self-edge.
+        if component.len() < 2 && !reaches[start][start] {
             continue;
         }
         for &member in &component {

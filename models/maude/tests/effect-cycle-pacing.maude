@@ -7,6 +7,13 @@ search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
   counted(mtPairs) reaches(mtPairs) rejected(mtRules)
   =>* C:Cfg rejected(ra & RS:RuleSet) .
 
+--- Coverage: the SELF-edge form of that same shape is rejected too -- a loop
+--- spelled in one rule is the loop of two rules with fewer names.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  sameCommit(ra, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* C:Cfg rejected(ra & RS:RuleSet) .
+
 --- Coverage: the same ring, every edge waiting on an effect terminal, is
 --- rejected under the bounded declaration -- a workflow that promises to settle
 --- may not loop with the world either.
@@ -15,10 +22,33 @@ search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
   counted(mtPairs) reaches(mtPairs) rejected(mtRules)
   =>* C:Cfg rejected(ra & RS:RuleSet) .
 
---- Bite: that same paced ring WITHOUT the declaration is never rejected. This is
---- the long-running agent loop, legal with no tag at all.
+--- Coverage: @tool reaches that refusal without the tag, and it reaches the
+--- one-rule form of it -- the shape that blocks an agent turn for as long as the
+--- model keeps answering.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  tool paced(ra, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* C:Cfg rejected(ra & RS:RuleSet) .
+
+--- Bite: a paced ring WITHOUT either declaration is never rejected. This is the
+--- long-running agent loop, legal with no tag at all.
 search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
   paced(ra, rb) paced(rb, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: the paced SELF-loop is never rejected either, which is the retry idiom
+--- of docs/manual/13-agent-patterns.md: it advances its trigger behind an after.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  paced(ra, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: a rule that records its own trigger without consuming it is never
+--- rejected HERE. The per-rule refusal owns that defect, and one defect earns
+--- one diagnostic.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  preservedSelf(ra) effectful(ra)
   counted(mtPairs) reaches(mtPairs) rejected(mtRules)
   =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
 
