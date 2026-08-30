@@ -586,8 +586,23 @@ pub struct ManifestChange {
 /// Diff two trees, skipping identical subtrees by id.
 ///
 /// This is the operation the reconciliation daemon wants to run continuously,
-/// and the reason it can: equal subtrees cost one string comparison, so the
-/// work is proportional to what changed rather than to the workspace.
+/// and the reason it can: equal subtrees cost one id comparison, so the work is
+/// proportional to what changed rather than to the workspace.
+///
+/// **How it was O(size) until 2026-08-30.** The previous shape called
+/// `collect_changed_leaves` twice, and each call began by walking and parsing
+/// *every node of the other tree* to build the set of shared ids. The
+/// short-circuit skipped descending shared subtrees on one side only after the
+/// precomputation had already descended all of the other. Its own comment said
+/// "short-circuiting on equal subtree ids already removes the term that scaled
+/// with the workspace" — the precomputation WAS that term, twice.
+///
+/// The two sides descend together now. At each level the ids common to both
+/// frontiers name subtrees that cannot differ and are dropped unread; the rest
+/// expand one level. Note that correctness does not depend on the skipping: a
+/// shared subtree that the frontiers meet at different depths is simply
+/// descended on both sides, and its entries compare equal at the end. The
+/// skipping is the cost property, not the answer.
 ///
 /// # Errors
 /// Propagates store failures.
@@ -599,11 +614,30 @@ pub fn diff<B: ContentBlobs + ?Sized>(
     if before_root == after_root {
         return Ok(Vec::new());
     }
-    // Collect only the leaves that differ. Descending both sides in lockstep is
-    // a later refinement; short-circuiting on equal subtree ids already removes
-    // the term that scaled with the workspace.
-    let before = collect_changed_leaves(blobs, before_root, after_root)?;
-    let after = collect_changed_leaves(blobs, after_root, before_root)?;
+    let mut before = BTreeMap::new();
+    let mut after = BTreeMap::new();
+    let mut before_frontier = vec![before_root.to_owned()];
+    let mut after_frontier = vec![after_root.to_owned()];
+
+    while !before_frontier.is_empty() || !after_frontier.is_empty() {
+        // An id names its whole content, so an id on both sides is a subtree
+        // that cannot differ. Dropped without a read — this is the whole
+        // short-circuit, and it happens BEFORE either side is loaded.
+        let shared: std::collections::BTreeSet<String> = {
+            let on_the_other_side: std::collections::BTreeSet<&str> =
+                after_frontier.iter().map(String::as_str).collect();
+            before_frontier
+                .iter()
+                .filter(|id| on_the_other_side.contains(id.as_str()))
+                .cloned()
+                .collect()
+        };
+        before_frontier.retain(|id| !shared.contains(id));
+        after_frontier.retain(|id| !shared.contains(id));
+
+        before_frontier = expand_frontier(blobs, before_frontier, &mut before)?;
+        after_frontier = expand_frontier(blobs, after_frontier, &mut after)?;
+    }
 
     let mut changes = Vec::new();
     for (path, after_hash) in &after {
@@ -629,45 +663,23 @@ pub fn diff<B: ContentBlobs + ?Sized>(
     Ok(changes)
 }
 
-/// Entries under `root` that live in subtrees `other` does not share.
-fn collect_changed_leaves<B: ContentBlobs + ?Sized>(
+/// Load one frontier's nodes, draining level-0 entries into `leaves` and
+/// returning the children of everything above.
+fn expand_frontier<B: ContentBlobs + ?Sized>(
     blobs: &B,
-    root: &str,
-    other: &str,
-) -> StoreResult<BTreeMap<String, String>> {
-    let shared = subtree_ids(blobs, other)?;
-    let mut out = BTreeMap::new();
-    let mut stack = vec![root.to_owned()];
-    while let Some(id) = stack.pop() {
-        if shared.contains(&id) {
-            continue; // THE SHORT-CIRCUIT: an identical subtree cannot differ.
-        }
+    frontier: Vec<String>,
+    leaves: &mut BTreeMap<String, String>,
+) -> StoreResult<Vec<String>> {
+    let mut next = Vec::new();
+    for id in frontier {
         let node = load_node(blobs, &id)?;
         if node.level == 0 {
-            out.extend(node.entries);
+            leaves.extend(node.entries);
         } else {
-            stack.extend(node.entries.into_iter().map(|(_, child)| child));
+            next.extend(node.entries.into_iter().map(|(_, child)| child));
         }
     }
-    Ok(out)
-}
-
-fn subtree_ids<B: ContentBlobs + ?Sized>(
-    blobs: &B,
-    root: &str,
-) -> StoreResult<std::collections::BTreeSet<String>> {
-    let mut ids = std::collections::BTreeSet::new();
-    let mut stack = vec![root.to_owned()];
-    while let Some(id) = stack.pop() {
-        if !ids.insert(id.clone()) {
-            continue;
-        }
-        let node = load_node(blobs, &id)?;
-        if node.level > 0 {
-            stack.extend(node.entries.into_iter().map(|(_, child)| child));
-        }
-    }
-    Ok(ids)
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -721,6 +733,23 @@ mod tests {
         }
         fn snapshot(&self) -> BTreeMap<String, String> {
             self.stored.borrow().clone()
+        }
+    }
+
+    /// Counts node READS, as `CountingBlobs` counts writes. A cost claim about
+    /// diff is a claim about how much of the tree it had to look at.
+    struct ReadCounting<'a> {
+        inner: &'a CountingBlobs,
+        reads: &'a std::cell::Cell<usize>,
+    }
+
+    impl ContentBlobs for ReadCounting<'_> {
+        fn put(&self, body: &str) -> StoreResult<String> {
+            self.inner.put(body)
+        }
+        fn get(&self, id: &str) -> StoreResult<Option<String>> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.get(id)
         }
     }
 
@@ -1099,6 +1128,143 @@ mod tests {
             .find(|c| c.path == "src/added.txt")
             .expect("the addition is reported");
         assert_eq!(added.before, None);
+    }
+
+    /// **DR-0070 §1's diff claim, measured.**
+    ///
+    /// "Equal subtrees compare in one comparison, so diff is O(changed) rather
+    /// than O(size)" — the property the record calls "what makes continuous
+    /// reconciliation affordable at all". It was never measured, and it was
+    /// false: the implementation walked and parsed every node of the other tree
+    /// to build a shared-id set, twice, before its short-circuit did anything.
+    ///
+    /// The two correctness tests could not have caught it.
+    /// `diff_reports_adds_edits_and_removals` uses a handful of entries, and
+    /// `an_unchanged_tree_diffs_to_nothing` returns at the `before_root ==
+    /// after_root` early exit without entering the walk at all.
+    #[test]
+    fn a_one_path_diff_reads_the_depth_not_the_width() {
+        let blobs = CountingBlobs::default();
+        let base = manifest(2_000);
+        let before = build(&blobs, &base).expect("base builds");
+        let whole_tree = blobs.novel_writes(&BTreeMap::new());
+        assert!(
+            whole_tree > 100,
+            "the fixture must be wide enough for depth and width to differ, got {whole_tree} nodes"
+        );
+
+        let path = base
+            .keys()
+            .nth(1_000)
+            .expect("a path in the middle")
+            .clone();
+        let after = apply(
+            &blobs,
+            &before,
+            &BTreeMap::from([(path.clone(), Some("edited".to_owned()))]),
+        )
+        .expect("apply runs");
+
+        let reads = std::cell::Cell::new(0usize);
+        let counting = ReadCounting {
+            inner: &blobs,
+            reads: &reads,
+        };
+        let changes = diff(&counting, &before, &after).expect("diff runs");
+
+        assert_eq!(changes.len(), 1, "one path changed");
+        assert_eq!(changes[0].path, path);
+        assert!(
+            reads.get() <= 16,
+            "diffing a one-path change read {} of {whole_tree} nodes; equal subtrees are \
+             supposed to cost one id comparison",
+            reads.get()
+        );
+    }
+
+    /// The answer has to be right whatever the skipping does. Randomised
+    /// against the naive comparison of the two entry maps, because the tandem
+    /// descent drops subtrees UNREAD and a bug there would silently report
+    /// fewer changes than happened — which reads exactly like an efficient
+    /// diff.
+    #[test]
+    fn diff_agrees_with_comparing_the_two_manifests() {
+        let mut rng = Lcg(0x2026_0830);
+        for round in 0..200 {
+            let size = 1 + rng.below(300);
+            let base: BTreeMap<String, String> = (0..size)
+                .map(|index| {
+                    (
+                        format!("dir{}/file-{index:05}.txt", index % 5),
+                        format!("blob-{index:05}"),
+                    )
+                })
+                .collect();
+            let mut changes: BTreeMap<String, Option<String>> = BTreeMap::new();
+            let keys: Vec<String> = base.keys().cloned().collect();
+            for step in 0..(1 + rng.below(8)) {
+                match rng.below(3) {
+                    0 => {
+                        changes.insert(
+                            keys[rng.below(keys.len())].clone(),
+                            Some(format!("edited-{round}-{step}")),
+                        );
+                    }
+                    1 => {
+                        changes.insert(
+                            format!("dir{}/new-{round}-{step}.txt", rng.below(7)),
+                            Some(format!("added-{round}-{step}")),
+                        );
+                    }
+                    _ => {
+                        changes.insert(keys[rng.below(keys.len())].clone(), None);
+                    }
+                }
+            }
+
+            let blobs = CountingBlobs::default();
+            let before_root = build(&blobs, &base).expect("base builds");
+            let after_root = apply(&blobs, &before_root, &changes).expect("apply runs");
+
+            let mut expected_entries = base.clone();
+            for (path, value) in &changes {
+                match value {
+                    Some(id) => {
+                        expected_entries.insert(path.clone(), id.clone());
+                    }
+                    None => {
+                        expected_entries.remove(path);
+                    }
+                }
+            }
+
+            let mut expected: Vec<ManifestChange> = Vec::new();
+            for (path, after_hash) in &expected_entries {
+                if base.get(path) != Some(after_hash) {
+                    expected.push(ManifestChange {
+                        path: path.clone(),
+                        before: base.get(path).cloned(),
+                        after: Some(after_hash.clone()),
+                    });
+                }
+            }
+            for (path, before_hash) in &base {
+                if !expected_entries.contains_key(path) {
+                    expected.push(ManifestChange {
+                        path: path.clone(),
+                        before: Some(before_hash.clone()),
+                        after: None,
+                    });
+                }
+            }
+            expected.sort_by(|a, b| a.path.cmp(&b.path));
+
+            assert_eq!(
+                diff(&blobs, &before_root, &after_root).expect("diff runs"),
+                expected,
+                "round {round}: the tree diff and the map comparison disagree"
+            );
+        }
     }
 
     #[test]

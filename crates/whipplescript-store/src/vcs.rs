@@ -2582,27 +2582,75 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
 
     /// Compute one cut's per-path units (manifest diff against its
     /// parent) and append them, seq-continuing.
+    /// The paths a cut changed against its parent.
+    ///
+    /// Both sides are trees for every cut written since DR-0070 §1, so this is
+    /// `manifest_tree::diff` — equal subtrees cost one id comparison and are
+    /// never read. A cut whose parent predates the tree, or which has no parent,
+    /// falls back to comparing the materialized maps, which is what the whole
+    /// path did before.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn cut_changes(
+        &self,
+        cut: &crate::branches::CutRow,
+    ) -> StoreResult<Vec<crate::manifest_tree::ManifestChange>> {
+        let parent_hash = match cut.parent_cut_id.as_deref() {
+            None => None,
+            Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
+                None => None,
+                Some(parent) => Some(parent.manifest_hash),
+            },
+        };
+
+        if let Some(parent_hash) = parent_hash.as_deref() {
+            let both_are_trees = matches!(
+                self.load_manifest_opt_raw(&cut.manifest_hash)?,
+                Some(RawManifest::Tree(_))
+            ) && matches!(
+                self.load_manifest_opt_raw(parent_hash)?,
+                Some(RawManifest::Tree(_))
+            );
+            if both_are_trees {
+                return crate::manifest_tree::diff(&self.content, parent_hash, &cut.manifest_hash);
+            }
+        }
+
+        let Some(after) = self.load_manifest_opt(&cut.manifest_hash)? else {
+            return Ok(Vec::new());
+        };
+        let before = match parent_hash.as_deref() {
+            None => BTreeMap::new(),
+            Some(hash) => match self.load_manifest_opt(hash)? {
+                Some(manifest) => manifest,
+                None => return Ok(Vec::new()),
+            },
+        };
+        Ok(Self::diff_paths(&before, &after)
+            .into_iter()
+            .map(|path| crate::manifest_tree::ManifestChange {
+                before: before.get(&path).cloned(),
+                after: after.get(&path).cloned(),
+                path,
+            })
+            .collect())
+    }
+
     fn push_units_for_cut(
         &self,
         cut: &crate::branches::CutRow,
         units: &mut Vec<crate::selection::ChangeUnit>,
     ) -> StoreResult<()> {
-        let Some(after) = self.load_manifest_opt(&cut.manifest_hash)? else {
-            return Ok(());
-        };
-        let before = match cut.parent_cut_id.as_deref() {
-            None => BTreeMap::new(),
-            Some(parent_cut) => match self.branches.get_cut(parent_cut)? {
-                None => BTreeMap::new(),
-                Some(parent) => match self.load_manifest_opt(&parent.manifest_hash)? {
-                    Some(manifest) => manifest,
-                    None => return Ok(()),
-                },
-            },
-        };
-        for path in Self::diff_paths(&before, &after) {
-            let before_hash = before.get(&path).cloned();
-            let after_hash = after.get(&path).cloned();
+        // DR-0070 §1's diff, on its first production caller. This materialized
+        // BOTH manifests and compared them entry by entry, so listing a cut's
+        // changed paths cost the workspace twice over however little the cut
+        // touched — and a change-unit index walks every cut on a branch.
+        let changes = self.cut_changes(cut)?;
+        for change in changes {
+            let path = change.path;
+            let before_hash = change.before;
+            let after_hash = change.after;
             let decls =
                 self.decl_units_for(&path, before_hash.as_deref(), after_hash.as_deref())?;
             units.push(crate::selection::ChangeUnit {
