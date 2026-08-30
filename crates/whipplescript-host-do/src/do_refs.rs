@@ -163,6 +163,45 @@ mod tests {
         .expect("suite runs");
     }
 
+    /// **DR-0071 §5 across the seam.** Both hosts must record the same erasure
+    /// as the same chained entry, or the ledger is two ledgers.
+    ///
+    /// The digests are computed by `whipplescript_store::erasure_ledger` on
+    /// both sides, so this asserts the two hosts *use* it identically — same
+    /// order, same fields, same genesis — rather than each having its own
+    /// almost-compatible encoding, which is how parity claims usually fail.
+    #[test]
+    fn an_erasure_chains_identically_on_both_hosts() {
+        use whipplescript_store::content::{ContentBlobs, EraseOutcome};
+
+        let hosted = crate::do_branches::DoContentBlobs::new(RusqliteDoSql::in_memory())
+            .expect("content blobs open");
+        let id = hosted.put("bytes to drop").expect("stores");
+        assert!(matches!(
+            hosted.erase(&id, "2026-08-30T00:00:00Z").expect("erases"),
+            EraseOutcome::Erased { .. }
+        ));
+
+        // What the shared chain says the ledger head must be after exactly this
+        // one erasure.
+        let expected = whipplescript_store::erasure_ledger::fold(&[
+            whipplescript_store::erasure_ledger::LedgerEntry {
+                sequence: 1,
+                id: &id,
+                kind: whipplescript_store::erasure_ledger::ErasedKind::Blob,
+                byte_len: "bytes to drop".len() as i64,
+                erased_at: "2026-08-30T00:00:00Z",
+            },
+        ]);
+
+        let digests = hosted.erasure_ledger_digests().expect("ledger reads");
+        assert_eq!(digests.len(), 1, "the erasure must be recorded once");
+        assert_eq!(
+            digests[0], expected,
+            "the hosted ledger head must be the digest the shared chain computes"
+        );
+    }
+
     fn head(
         instance: &str,
         sequence: i64,

@@ -6,6 +6,7 @@ pub mod chunking;
 pub mod content;
 pub mod coordination;
 pub mod diff;
+pub mod erasure_ledger;
 pub mod event_chain;
 pub mod files;
 pub mod improve;

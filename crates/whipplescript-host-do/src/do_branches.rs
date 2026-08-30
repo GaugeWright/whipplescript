@@ -1130,7 +1130,128 @@ impl<S: DoSql> DoContentBlobs<S> {
             &[],
         )
         .map_err(sql_err)?;
-        Ok(Self { sql })
+        // DR-0071 §5: the authority of record, chained. Native parity —
+        // `whipplescript_store::erasure_ledger` computes the digests for both
+        // hosts, so an erasure recorded here and one recorded natively are the
+        // same entry.
+        sql.execute(
+            "CREATE TABLE IF NOT EXISTS content_erasure_ledger (
+                sequence INTEGER PRIMARY KEY,
+                id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                byte_len INTEGER NOT NULL,
+                erased_at TEXT NOT NULL,
+                prev_digest TEXT NOT NULL,
+                entry_digest TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(sql_err)?;
+        sql.execute(
+            "CREATE INDEX IF NOT EXISTS content_erasure_ledger_id_idx \
+             ON content_erasure_ledger(id)",
+            &[],
+        )
+        .map_err(sql_err)?;
+        let store = Self { sql };
+        store.backfill_erasure_ledger()?;
+        Ok(store)
+    }
+}
+
+impl<S: DoSql> DoContentBlobs<S> {
+    /// Carry pre-ledger tombstones forward (DR-0071 §5).
+    ///
+    /// Idempotent and deterministic, ordered by `(erased_at, id)` because the
+    /// chain commits to the order and the old table records no sequence. This
+    /// host has no chunk tier, so unlike native there is only one old shape to
+    /// reconcile.
+    fn backfill_erasure_ledger(&self) -> StoreResult<()> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT id, byte_len, erased_at FROM content_erasures \
+                 WHERE id NOT IN (SELECT id FROM content_erasure_ledger) \
+                 ORDER BY erased_at, id",
+                &[],
+            )
+            .map_err(sql_err)?;
+        for row in rows {
+            self.append_erasure(
+                &as_text(&row[0]),
+                whipplescript_store::erasure_ledger::ErasedKind::Blob,
+                as_i64(&row[1]),
+                &as_text(&row[2]),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The ledger's entry digests in order, for verification.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn erasure_ledger_digests(&self) -> StoreResult<Vec<String>> {
+        Ok(self
+            .sql
+            .query(
+                "SELECT entry_digest FROM content_erasure_ledger ORDER BY sequence",
+                &[],
+            )
+            .map_err(sql_err)?
+            .iter()
+            .map(|row| as_text(&row[0]))
+            .collect())
+    }
+
+    /// Append one entry, chained to the current head.
+    fn append_erasure(
+        &self,
+        id: &str,
+        kind: whipplescript_store::erasure_ledger::ErasedKind,
+        byte_len: i64,
+        erased_at: &str,
+    ) -> StoreResult<()> {
+        let head = self
+            .sql
+            .query(
+                "SELECT sequence, entry_digest FROM content_erasure_ledger \
+                 ORDER BY sequence DESC LIMIT 1",
+                &[],
+            )
+            .map_err(sql_err)?;
+        let (sequence, prev_digest) = match head.first() {
+            Some(row) => (as_i64(&row[0]) + 1, as_text(&row[1])),
+            None => (1, whipplescript_store::erasure_ledger::genesis_digest()),
+        };
+        // Takes the KIND, not a string to be parsed back — see the native
+        // side. The parse was a refusal guarding against this crate's own
+        // callers, all of which pass a literal.
+        let entry = whipplescript_store::erasure_ledger::LedgerEntry {
+            sequence,
+            id,
+            kind,
+            byte_len,
+            erased_at,
+        };
+        let digest = whipplescript_store::erasure_ledger::entry_digest(&prev_digest, &entry);
+        self.sql
+            .execute(
+                "INSERT INTO content_erasure_ledger \
+                 (sequence, id, kind, byte_len, erased_at, prev_digest, entry_digest) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    SqlValue::Int(sequence),
+                    text(id),
+                    text(kind.as_str()),
+                    SqlValue::Int(byte_len),
+                    text(erased_at),
+                    text(&prev_digest),
+                    text(&digest),
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
     }
 }
 
@@ -1176,7 +1297,8 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         let erased = self
             .sql
             .query(
-                "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                "SELECT byte_len FROM content_erasure_ledger WHERE id = ?1 \
+                 ORDER BY sequence LIMIT 1",
                 &[text(id)],
             )
             .map_err(sql_err)?;
@@ -1216,7 +1338,8 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
             let tombstoned = self
                 .sql
                 .query(
-                    "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                    "SELECT byte_len FROM content_erasure_ledger WHERE id = ?1 \
+                     ORDER BY sequence LIMIT 1",
                     &[text(id)],
                 )
                 .map_err(sql_err)?;
@@ -1231,13 +1354,12 @@ impl<S: DoSql> ContentBlobs for DoContentBlobs<S> {
         // and it is the same bottom-up discipline DR-0066 §4 applies to
         // publication: the record that makes an absence honest must be durable
         // before the bytes stop being there.
-        self.sql
-            .execute(
-                "INSERT OR IGNORE INTO content_erasures (id, byte_len, erased_at) \
-                 VALUES (?1, ?2, ?3)",
-                &[text(id), SqlValue::Int(byte_len), text(at)],
-            )
-            .map_err(sql_err)?;
+        self.append_erasure(
+            id,
+            whipplescript_store::erasure_ledger::ErasedKind::Blob,
+            byte_len,
+            at,
+        )?;
         self.sql
             .execute("DELETE FROM content_blobs WHERE id = ?1", &[text(id)])
             .map_err(sql_err)?;

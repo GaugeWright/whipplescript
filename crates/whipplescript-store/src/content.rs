@@ -386,17 +386,11 @@ impl ContentBlobs for ContentStore {
         if let Some(body) = self.read_packed(id)? {
             return Ok(Some(body));
         }
-        // Erasure honesty: an id tombstoned in `content_erasures` is gone
-        // by decision. `status` short-circuits on this table, so `get`
-        // must too — otherwise a (forged) chunk root sharing the id would
+        // Erasure honesty: an id the LEDGER records as erased is gone by
+        // decision (DR-0071 §5). `status` short-circuits on the ledger, so
+        // `get` must too — otherwise a (forged) chunk root sharing the id would
         // resurrect erased bytes here while `status` still reports Erased.
-        let tombstoned: Option<i64> = {
-            let mut erased = self
-                .connection
-                .prepare_cached("SELECT byte_len FROM content_erasures WHERE id = ?1")?;
-            erased.query_row(params![id], |row| row.get(0)).optional()?
-        };
-        if tombstoned.is_some() {
+        if self.erased_byte_len(id)?.is_some() {
             return Ok(None);
         }
         // Chunk-root reassembly (each piece resolves through rows or
@@ -431,11 +425,7 @@ impl ContentBlobs for ContentStore {
                 byte_len: byte_len as u64,
             });
         }
-        let erased: Option<i64> = self
-            .connection
-            .prepare_cached("SELECT byte_len FROM content_erasures WHERE id = ?1")?
-            .query_row(params![id], |row| row.get(0))
-            .optional()?;
+        let erased = self.erased_byte_len(id)?;
         if let Some(byte_len) = erased {
             return Ok(BlobStatus::Erased {
                 byte_len: byte_len as u64,
@@ -495,7 +485,7 @@ impl ContentBlobs for ContentStore {
             let tombstoned: Option<i64> = self
                 .connection
                 .query_row(
-                    "SELECT byte_len FROM content_erasures WHERE id = ?1",
+                    "SELECT byte_len FROM content_erasure_ledger WHERE id = ?1",
                     params![id],
                     |row| row.get(0),
                 )
@@ -505,10 +495,20 @@ impl ContentBlobs for ContentStore {
                 None => EraseOutcome::Unknown,
             });
         };
-        self.connection.execute(
-            "INSERT OR IGNORE INTO content_erasures (id, byte_len, erased_at) \
-             VALUES (?1, ?2, ?3)",
-            params![id, byte_len, at],
+        // Record BEFORE the delete. The other order has a crash window that
+        // produces exactly the *absent*-for-*erased* substitution DR-0066 §5
+        // refuses: the record that makes an absence honest must be durable
+        // before the bytes stop being there.
+        //
+        // The record is the ledger now, not `content_erasures` (DR-0071 §5).
+        // That table is still READ once, by the backfill on open, so a store
+        // written by an older build carries its history forward.
+        append_erasure_entry(
+            &self.connection,
+            id,
+            crate::erasure_ledger::ErasedKind::Blob,
+            byte_len,
+            at,
         )?;
         self.connection
             .execute("DELETE FROM content_blobs WHERE id = ?1", params![id])?;
@@ -557,6 +557,22 @@ fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
             byte_len  INTEGER NOT NULL,
             erased_at TEXT NOT NULL
         );
+        -- DR-0071 §5: the authority of record for "was this erased". Ordered,
+        -- append-only, hash-chained. `content_erasures` above and
+        -- `content_chunk_roots.erased_at` below are the two representations it
+        -- replaces; both are backfilled into it on open and neither is read
+        -- afterwards.
+        CREATE TABLE IF NOT EXISTS content_erasure_ledger (
+            sequence     INTEGER PRIMARY KEY,
+            id           TEXT NOT NULL,
+            kind         TEXT NOT NULL,
+            byte_len     INTEGER NOT NULL,
+            erased_at    TEXT NOT NULL,
+            prev_digest  TEXT NOT NULL,
+            entry_digest TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS content_erasure_ledger_id_idx
+            ON content_erasure_ledger(id);
         CREATE TABLE IF NOT EXISTS content_chunk_roots (
             root_id    TEXT PRIMARY KEY,
             byte_len   INTEGER NOT NULL,
@@ -580,7 +596,130 @@ fn ensure_content_schema(connection: &Connection) -> StoreResult<()> {
             ON content_pack_entries(pack_id);
         "#,
     )?;
+    backfill_erasure_ledger(connection)?;
     Ok(())
+}
+
+/// Carry the two pre-ledger representations into the ledger (DR-0071 §5).
+///
+/// Idempotent and deterministic: it takes every old row whose id the ledger
+/// does not already carry, in `(erased_at, id)` order, and appends. Running it
+/// on every open is what makes a store that was written by an older build
+/// answer correctly the first time a newer one reads it, without a migration
+/// step anybody has to remember to run.
+///
+/// Order matters because the chain commits to it. `(erased_at, id)` rather than
+/// rowid so two stores that erased the same things reach the same head — the
+/// old tables record no sequence, so the recorded timestamp is the only
+/// ordering they carry, and the id breaks ties.
+#[cfg(feature = "native")]
+fn backfill_erasure_ledger(connection: &Connection) -> StoreResult<()> {
+    let mut pending: Vec<(String, crate::erasure_ledger::ErasedKind, i64, String)> = Vec::new();
+    {
+        let mut blobs = connection.prepare(
+            "SELECT id, byte_len, erased_at FROM content_erasures
+             WHERE id NOT IN (SELECT id FROM content_erasure_ledger)",
+        )?;
+        for row in blobs.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::erasure_ledger::ErasedKind::Blob,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            pending.push(row?);
+        }
+    }
+    {
+        let mut roots = connection.prepare(
+            "SELECT root_id, byte_len, erased_at FROM content_chunk_roots
+             WHERE erased_at IS NOT NULL
+               AND root_id NOT IN (SELECT id FROM content_erasure_ledger)",
+        )?;
+        for row in roots.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::erasure_ledger::ErasedKind::ChunkRoot,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            pending.push(row?);
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    pending.sort_by(|left, right| (&left.3, &left.0).cmp(&(&right.3, &right.0)));
+    for (id, kind, byte_len, erased_at) in pending {
+        append_erasure_entry(connection, &id, kind, byte_len, &erased_at)?;
+    }
+    Ok(())
+}
+
+/// Append one entry, chained to the current head.
+#[cfg(feature = "native")]
+fn append_erasure_entry(
+    connection: &Connection,
+    id: &str,
+    kind: crate::erasure_ledger::ErasedKind,
+    byte_len: i64,
+    erased_at: &str,
+) -> StoreResult<()> {
+    let head: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT sequence, entry_digest FROM content_erasure_ledger
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (sequence, prev_digest) = match head {
+        Some((sequence, digest)) => (sequence + 1, digest),
+        None => (1, crate::erasure_ledger::genesis_digest()),
+    };
+    // Takes the KIND, not a string to be parsed back. The parse was a refusal
+    // guarding against this crate's own callers, all of which pass a literal —
+    // a runtime check standing where a type belongs, and one nothing could
+    // exercise without a caller written wrong on purpose.
+    let entry = crate::erasure_ledger::LedgerEntry {
+        sequence,
+        id,
+        kind,
+        byte_len,
+        erased_at,
+    };
+    let digest = crate::erasure_ledger::entry_digest(&prev_digest, &entry);
+    connection.execute(
+        "INSERT INTO content_erasure_ledger
+             (sequence, id, kind, byte_len, erased_at, prev_digest, entry_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            sequence,
+            id,
+            kind.as_str(),
+            byte_len,
+            erased_at,
+            prev_digest,
+            digest
+        ],
+    )?;
+    Ok(())
+}
+
+/// One recorded erasure, as the ledger holds it (DR-0071 §5).
+#[cfg(feature = "native")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedErasure {
+    pub sequence: i64,
+    pub id: String,
+    /// `blob` or `chunk-root`. Kept as the stored text so a row this build does
+    /// not understand can be reported rather than silently reinterpreted.
+    pub kind: String,
+    pub byte_len: i64,
+    pub erased_at: String,
+    pub entry_digest: String,
 }
 
 /// A chunked root's surviving identity after erasure: the retained
@@ -670,14 +809,17 @@ impl ContentStore {
 
     /// The retained identity of a chunk root, before or after erasure.
     pub fn chunk_root_info(&self, root_id: &str) -> StoreResult<Option<ChunkRootInfo>> {
-        let root: Option<(i64, Option<String>)> = self
+        let root: Option<i64> = self
             .connection
             .prepare_cached(
-                "SELECT byte_len, erased_at FROM content_chunk_roots WHERE root_id = ?1",
+                // `erased_at` is deliberately NOT selected: the ledger answers
+                // that now (DR-0071 §5), and reading the column here is what
+                // let two representations drift apart.
+                "SELECT byte_len FROM content_chunk_roots WHERE root_id = ?1",
             )?
-            .query_row(params![root_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(params![root_id], |row| row.get::<_, i64>(0))
             .optional()?;
-        let Some((byte_len, erased_at)) = root else {
+        let Some(byte_len) = root else {
             return Ok(None);
         };
         let mut stmt = self.connection.prepare_cached(
@@ -692,7 +834,10 @@ impl ContentStore {
             root_id: root_id.to_owned(),
             byte_len: byte_len as u64,
             chunk_ids,
-            erased: erased_at.is_some(),
+            // DR-0071 §5: the LEDGER says whether this root was erased, not
+            // the column beside it. Two representations that could disagree
+            // were the reason to move it.
+            erased: self.erased_byte_len(root_id)?.is_some(),
         }))
     }
 
@@ -880,6 +1025,51 @@ impl ContentStore {
         Ok(())
     }
 
+    /// Was this id erased, and how big was it?
+    ///
+    /// **The** erasure question, asked in one place (DR-0071 §5). It was asked
+    /// in two before — `content_erasures` for blobs and
+    /// `content_chunk_roots.erased_at` for chunked roots — so a caller had to
+    /// know which tier an id belonged to before it could ask, and the two could
+    /// disagree.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn erased_byte_len(&self, id: &str) -> StoreResult<Option<i64>> {
+        Ok(self
+            .connection
+            .prepare_cached(
+                "SELECT byte_len FROM content_erasure_ledger WHERE id = ?1
+                 ORDER BY sequence LIMIT 1",
+            )?
+            .query_row(params![id], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// The ledger's entries in order, for verification.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    pub fn erasure_ledger(&self) -> StoreResult<Vec<RecordedErasure>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, id, kind, byte_len, erased_at, entry_digest
+             FROM content_erasure_ledger ORDER BY sequence",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RecordedErasure {
+                    sequence: row.get(0)?,
+                    id: row.get(1)?,
+                    kind: row.get(2)?,
+                    byte_len: row.get(3)?,
+                    erased_at: row.get(4)?,
+                    entry_digest: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Chunk-level erasure with the retained root (vw note §10.1 item 1):
     /// drop this root's chunk BODIES — except chunks still referenced by
     /// another live root (dedup sharing survives, fail-closed) — and mark
@@ -897,18 +1087,34 @@ impl ContentStore {
                  WHERE refs.root_id = ?1
                    AND NOT EXISTS (
                      SELECT 1 FROM content_chunk_refs AS other
-                     JOIN content_chunk_roots AS other_root
-                       ON other_root.root_id = other.root_id
                      WHERE other.chunk_id = refs.chunk_id
                        AND other.root_id != ?1
-                       AND other_root.erased_at IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM content_erasure_ledger AS ledger
+                         WHERE ledger.id = other.root_id
+                       )
                    )
              )",
             params![root_id],
         )?;
-        self.connection.execute(
-            "UPDATE content_chunk_roots SET erased_at = ?2              WHERE root_id = ?1 AND erased_at IS NULL",
-            params![root_id, at],
+        // The root's own byte length is retained identity, so it is recorded
+        // with the erasure rather than looked up afterwards from a table this
+        // no longer trusts.
+        let byte_len: i64 = self
+            .connection
+            .query_row(
+                "SELECT byte_len FROM content_chunk_roots WHERE root_id = ?1",
+                params![root_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        append_erasure_entry(
+            &self.connection,
+            root_id,
+            crate::erasure_ledger::ErasedKind::ChunkRoot,
+            byte_len,
+            at,
         )?;
         Ok(erased)
     }
@@ -917,6 +1123,164 @@ impl ContentStore {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    /// Borrow the stored rows as chain entries, so a test folds exactly what
+    /// the store recorded rather than what it meant to record.
+    fn as_entries(rows: &[RecordedErasure]) -> Vec<crate::erasure_ledger::LedgerEntry<'_>> {
+        rows.iter()
+            .map(|row| crate::erasure_ledger::LedgerEntry {
+                sequence: row.sequence,
+                id: &row.id,
+                kind: crate::erasure_ledger::ErasedKind::parse(&row.kind).expect("known kind"),
+                byte_len: row.byte_len,
+                erased_at: &row.erased_at,
+            })
+            .collect()
+    }
+
+    fn ledger_store(label: &str) -> (std::path::PathBuf, ContentStore) {
+        let path = std::env::temp_dir().join(format!(
+            "whip-erasure-ledger-{label}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = ContentStore::open(&path).expect("open");
+        (path, store)
+    }
+
+    /// DR-0071 §5: the erasure is a chained entry in the ledger, and the ledger
+    /// is what `status` answers from.
+    #[test]
+    fn an_erasure_is_recorded_in_the_ledger_and_the_ledger_is_what_status_reads() {
+        let (_path, store) = ledger_store("records");
+        let id = store.put("bytes to drop").expect("stores");
+        assert!(matches!(
+            store.status(&id).expect("status"),
+            BlobStatus::Live { .. }
+        ));
+
+        store.erase(&id, "2026-08-30T00:00:00Z").expect("erases");
+
+        let entries = store.erasure_ledger().expect("ledger reads");
+        assert_eq!(entries.len(), 1, "the erasure must be recorded");
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].kind, "blob");
+
+        assert!(
+            matches!(
+                store.status(&id).expect("status"),
+                BlobStatus::Erased { .. }
+            ),
+            "status must read the ledger"
+        );
+
+        // Remove the ledger row and the store must forget the erasure — which
+        // is what "authority of record" means, and is the assertion that fails
+        // if `status` ever consults something else.
+        store
+            .connection
+            .execute("DELETE FROM content_erasure_ledger", [])
+            .expect("row removed");
+        assert!(
+            matches!(store.status(&id).expect("status"), BlobStatus::Unknown),
+            "with the ledger emptied the store must not still claim the erasure from elsewhere"
+        );
+    }
+
+    /// The chain is what makes an erasure impossible to un-record quietly.
+    #[test]
+    fn the_ledger_folds_to_its_stored_head_and_notices_a_rewrite() {
+        let (_path, store) = ledger_store("chain");
+        for index in 0..3 {
+            let id = store.put(&format!("body {index}")).expect("stores");
+            store
+                .erase(&id, &format!("2026-08-30T00:00:0{index}Z"))
+                .expect("erases");
+        }
+
+        let entries = store.erasure_ledger().expect("ledger reads");
+        assert_eq!(entries.len(), 3);
+        let folded = crate::erasure_ledger::fold(&as_entries(&entries));
+        assert_eq!(
+            folded, entries[2].entry_digest,
+            "the stored head must be the fold of the whole prefix"
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE content_erasure_ledger SET erased_at = '1999-01-01T00:00:00Z' \
+                 WHERE sequence = 2",
+                [],
+            )
+            .expect("tampered");
+        let tampered = store.erasure_ledger().expect("ledger reads");
+        let refolded = crate::erasure_ledger::fold(&as_entries(&tampered));
+        assert_ne!(
+            refolded, tampered[2].entry_digest,
+            "a rewritten entry must not still fold to the recorded head"
+        );
+    }
+
+    /// A store written before the ledger existed carries BOTH old
+    /// representations forward on open — the blob tombstones and the chunk-root
+    /// column — which is the reconciliation DR-0071 §5 asks for.
+    #[test]
+    fn a_store_written_before_the_ledger_carries_both_representations_forward() {
+        let (path, store) = ledger_store("backfill");
+        // Write the old shapes directly, as an older build would have.
+        store
+            .connection
+            .execute(
+                "INSERT INTO content_erasures (id, byte_len, erased_at) \
+                 VALUES ('blob-a', 10, '2026-08-01T00:00:00Z')",
+                [],
+            )
+            .expect("old tombstone");
+        store
+            .connection
+            .execute(
+                "INSERT INTO content_chunk_roots (root_id, byte_len, erased_at) \
+                 VALUES ('root-b', 99, '2026-08-02T00:00:00Z')",
+                [],
+            )
+            .expect("old chunk-root column");
+        drop(store);
+
+        let reopened = ContentStore::open(&path).expect("reopen runs the backfill");
+        let entries = reopened.erasure_ledger().expect("ledger reads");
+        assert_eq!(entries.len(), 2, "both representations must be carried");
+        // Ordered by the recorded timestamp, because the old tables record no
+        // sequence and the chain commits to the order.
+        assert_eq!(
+            (entries[0].id.as_str(), entries[0].kind.as_str()),
+            ("blob-a", "blob")
+        );
+        assert_eq!(
+            (entries[1].id.as_str(), entries[1].kind.as_str()),
+            ("root-b", "chunk-root")
+        );
+        assert!(
+            matches!(
+                reopened.status("blob-a").expect("status"),
+                BlobStatus::Erased { byte_len: 10 }
+            ),
+            "the carried-forward erasure must answer from the ledger"
+        );
+
+        // Idempotent: opening again must not append the same history twice.
+        drop(reopened);
+        let again = ContentStore::open(&path).expect("reopen");
+        assert_eq!(
+            again.erasure_ledger().expect("ledger reads").len(),
+            2,
+            "the backfill must not re-append what it already carried"
+        );
+    }
 
     #[test]
     fn chunk_root_reassembly_refuses_beyond_cap() {
