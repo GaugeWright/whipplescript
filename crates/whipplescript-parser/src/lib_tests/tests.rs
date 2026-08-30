@@ -14527,6 +14527,105 @@ fn a_request_lowers_with_its_credential_slot_and_binding() {
     assert_eq!(request.credential_handles(), vec!["stripe_api"]);
 }
 
+/// A raw `Authorization` header beside a presented credential is the divergence
+/// §5 refuses when it declines a `with credential` modifier: the checker reads
+/// the presentation, `authenticates nothing` is satisfied, and the wire carries
+/// whatever the raw value interpolates.
+///
+/// Three cases, because the refusal has to be about THIS header rather than
+/// about interpolation. `REQUEST_PROGRAM` already carries an ordinary
+/// `Idempotency-Key` expression header, so the clean case is the real fixture
+/// and not a contrived one. And a lowercase spelling must fire too: HTTP header
+/// names are case-insensitive, so matching `Authorization` exactly would leave
+/// a one-keystroke way around the check.
+#[test]
+fn a_raw_authorization_header_is_refused_beside_a_presented_credential() {
+    let fired = |program: &str| -> bool {
+        compile_program(program)
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("raw `Authorization` header"))
+    };
+
+    assert!(
+        !fired(REQUEST_PROGRAM),
+        "an ordinary expression header must not be flagged"
+    );
+
+    let smuggled = REQUEST_PROGRAM.replace(
+        "    header \"Idempotency-Key\" ticket.id\n",
+        "    header \"Authorization\" \"Bearer {{ ticket.id }}\"\n",
+    );
+    assert_ne!(smuggled, REQUEST_PROGRAM, "the fixture must have changed");
+    assert!(
+        fired(&smuggled),
+        "a raw `Authorization` header beside a presented credential must be refused"
+    );
+
+    let lowercased = smuggled.replace(
+        "header \"Authorization\" \"Bearer",
+        "header \"authorization\" \"Bearer",
+    );
+    assert_ne!(lowercased, smuggled, "the casing must have changed");
+    assert!(
+        fired(&lowercased),
+        "header names are case-insensitive; `authorization` must be refused too"
+    );
+}
+
+/// The same refusal on `mint`, which carries headers of its own and whose
+/// validation reads only the CREDENTIAL-valued ones — so an expression-valued
+/// `Authorization` passed every one of its checks. A mint's exchange is where
+/// this matters most: the response is parsed for a token, so authenticating the
+/// exchange as some other principal mints a child from an authority the parent
+/// never held.
+#[test]
+fn a_raw_authorization_header_is_refused_in_a_mint_exchange() {
+    let mint = |extra_header: &str| -> bool {
+        compile_program(&format!(
+            r#"@service
+workflow MintRawAuth
+
+use std.custody
+
+credential stripe_api {{ kind bearer }}
+
+output result R
+class R {{ v string }}
+class Ticket {{ id string  status "open" }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule scoped
+  when Ticket as ticket where ticket.status == "open"
+=> {{
+  mint credential from stripe_api {{
+    at POST "https://connect.stripe.com/oauth/token"
+    header "Authorization" basic stripe_api
+{extra_header}    body "grant_type=client_credentials"
+    token at "access_token"
+  }} as token
+
+  after token succeeds {{
+    complete result {{ v "minted" }}
+  }}
+}}
+"#
+        ))
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("raw `Authorization` header"))
+    };
+
+    // Non-vacuity first: the exchange without the smuggled header is clean, so
+    // the refusal below is about that header and not about `mint` at all.
+    assert!(!mint(""), "a plain mint exchange must not be flagged");
+    assert!(
+        mint("    header \"Authorization\" \"Bearer {{ ticket.id }}\"\n"),
+        "a raw `Authorization` header in a mint exchange must be refused"
+    );
+}
+
 /// A handle that was never declared reaches the custodian as an unknown
 /// credential at egress; the checker refuses it at build time instead.
 #[test]

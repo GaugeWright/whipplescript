@@ -12021,6 +12021,7 @@ fn validate_http_requests(
                 validate_http_request(rule, effect, declared_credentials, diagnostics);
                 validate_obtain_credential(rule, effect, declared_credentials, diagnostics);
                 validate_mint_credential(rule, effect, declared_credentials, diagnostics);
+                validate_no_raw_authorization_header(rule, effect, diagnostics);
             }
             body::BodyStmt::After(after) => {
                 validate_http_requests(rule, &after.body, declared_credentials, diagnostics)
@@ -12071,6 +12072,72 @@ fn validate_obtain_credential(
 /// with what it finds; this is the same property decided statically, so a
 /// program that could never authenticate fails to build rather than failing on
 /// the wire. DR-0042 checks the runtime half at the Worker.
+/// A raw `Authorization` header value is refused, however the request
+/// authenticates (DR-0053 §5 Amendment 2026-08-29).
+///
+/// §5 declines a separate `with credential` modifier because *the handle
+/// appearing in the slot **is** the declaration of use* — a declaration beside a
+/// use can diverge from it. That argument was applied to a modifier and never to
+/// the header list, and the divergence it describes was reachable:
+///
+/// ```text
+/// header "Authorization" bearer real_api
+/// header "Authorization" "Bearer {{ item.body }}"
+/// ```
+///
+/// Both were accepted. The `authenticates nothing` refusal is satisfied by the
+/// first line, so the checker reads a presented credential while the wire
+/// carries whatever the second interpolates — which is the shape
+/// credential-shaped input (§15 Amendment) takes when it reaches egress.
+///
+/// Zero-false-positive because the sanctioned forms sit in the same block:
+/// `bearer`/`basic`/`raw <handle>` cover presentation and `signed with <handle>`
+/// covers the signed request, so a program has no reason to write this one.
+/// An error rather than a lint for the same reason.
+///
+/// Scoped to `Authorization` alone. A program may still interpolate into
+/// `X-Vendor-Key`, and whether that data belongs there is the flow checker's
+/// question, answered by the labels — what is refused here is only the shape
+/// where the wire's authentication diverges from the declaration.
+///
+/// Case-insensitive, because HTTP header names are: matching `Authorization`
+/// exactly would leave `authorization` as a one-keystroke way around it.
+fn validate_no_raw_authorization_header(
+    rule: &RuleDecl,
+    effect: &body::EffectStmt,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // The two header-carrying effect kinds. A third must be added here — a
+    // wildcard is how `request` once escaped the flow checker entirely.
+    let (headers, construct) = match &effect.kind {
+        body::BodyEffectKind::HttpRequest { headers, .. } => (headers, "request"),
+        body::BodyEffectKind::MintCredential { headers, .. } => (headers, "mint credential"),
+        _ => return,
+    };
+    for header in headers {
+        if !header.name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        if !matches!(header.value, body::RequestHeaderValue::Expr { .. }) {
+            continue;
+        }
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: header.span,
+            message: format!(
+                "rule `{}` writes a raw `Authorization` header in a `{construct}`",
+                rule.name.name
+            ),
+            suggestion: Some(
+                "present a declared credential instead — `header \"Authorization\" bearer \
+                 <handle>`, `basic`, or `raw` — or sign the request with `signed with <handle>`. \
+                 a raw value here puts authentication on the wire that the checker never read"
+                    .to_owned(),
+            ),
+        });
+    }
+}
+
 fn validate_http_request(
     rule: &RuleDecl,
     effect: &body::EffectStmt,
