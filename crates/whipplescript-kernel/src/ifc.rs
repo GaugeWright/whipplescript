@@ -5791,6 +5791,82 @@ rule work
         );
     }
 
+    /// `record` is a governed sink (`fact:<Schema>`), and until 2026-08-30 a
+    /// record could hide from the checker behind a line break.
+    ///
+    /// The parser collected fact writes with a LINE scan that required `record`
+    /// to begin a trimmed line, so a record sharing a line with the block that
+    /// encloses it produced no `fact_writes` entry, no `fact:<Schema>` sink, and
+    /// no violation. The identical program across three lines was denied. That
+    /// is a fail-OPEN information-flow hole with formatting as its key, which is
+    /// why it is pinned here and not only in the parser: this is the property
+    /// that was actually lost.
+    #[test]
+    fn an_inline_record_is_a_governed_sink_like_any_other() {
+        let program = |record: &str| {
+            format!(
+                r#"@service
+workflow InlineRecordSink
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+class Leaked {{ blob string }}
+
+file store ledger {{ root "./ledger"  allow read ["**"] }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule triage
+  when Ticket as ticket
+=> {{
+  read text from ledger at "customer.json" as rec
+{record}
+}}
+"#
+            )
+        };
+        let envelope = || {
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid envelope")
+        };
+        let denied = |source: &str, label: &str| {
+            let compiled = compile_program(source);
+            let ir = compiled.ir.unwrap_or_else(|| {
+                panic!(
+                    "{label} fixture should compile, diagnostics: {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| &d.message)
+                        .collect::<Vec<_>>()
+                )
+            });
+            let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope()));
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied flow in rule")
+                        && d.message.contains("fact:Leaked")),
+                "{label}: expected the record sink to be governed, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        };
+
+        denied(
+            &program(
+                "  after rec succeeds as customer {\n    record Leaked { blob customer.content }\n  }",
+            ),
+            "multi-line",
+        );
+        denied(
+            &program(
+                "  after rec succeeds as customer { record Leaked { blob customer.content } }",
+            ),
+            "inline",
+        );
+    }
+
     #[test]
     fn ungoverned_resources_are_unconstrained() {
         let ir = ir_with_grants(&format!("{READ_LEDGER}{WRITE_OUTBOX}"));

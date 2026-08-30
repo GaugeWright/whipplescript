@@ -9954,7 +9954,9 @@ fn analyze_rule(
 
         if let Some(binding) = parse_consume_line(line) {
             match binding_types.get(&binding) {
-                Some(schema) => metadata.fact_consumes.push(format!("schema:{schema}")),
+                // Collected from the parsed body below; this arm is here for the
+                // unknown-binding diagnostic only.
+                Some(_) => {}
                 None => diagnostics.push(Diagnostic {
                     related: Vec::new(),
                     span: rule.body.span,
@@ -10015,29 +10017,11 @@ fn analyze_rule(
             continue;
         }
 
-        if let Some((schema, _)) = parse_record_start(line) {
-            if is_observer_only_schema(&schema) {
-                diagnostics.push(Diagnostic {
-                    related: Vec::new(),
-                    span: rule.body.span,
-                    message: format!(
-                        "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
-                        rule.name.name
-                    ),
-                    suggestion: Some(
-                        "the terminal family (`TerminalFailed`/`TerminalTimedOut`/`TerminalCancelled`) is produced only by the kernel; to fail this workflow use `fail <failure> { ... }`, and to react to an effect terminal use `after <effect> fails/times out/cancels as f`"
-                            .to_owned(),
-                    ),
-                });
-            } else if !semantic.schemas.class_exists(&schema) {
-                diagnostics.push(Diagnostic {
-                    related: Vec::new(),
-                    span: rule.body.span,
-                    message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
-                    suggestion: Some(format!("declare `class {schema}` before recording it")),
-                });
-            }
-            metadata.fact_writes.push(format!("schema:{schema}"));
+        if parse_record_start(line).is_some() {
+            // Both the write and its diagnostics are taken from the parsed body
+            // (`validate_recorded_schemas`); this branch keeps only the brace
+            // bookkeeping that tells the scanner how far the record's field
+            // block runs.
             record_depth = brace_delta(line).max(1);
             continue;
         }
@@ -10114,6 +10098,16 @@ fn analyze_rule(
     // (spec/json-ingestion.md) — a fact write for liveness and effect-graph
     // analysis, like `record`.
     push_ingest_fact_writes(&body_ast.statements, &mut metadata.fact_writes);
+    // Records and consumes come from the parsed body, not from the line scanner
+    // above: the scanner cannot see a statement that shares a line with the
+    // block that encloses it. See `collect_record_and_consume_facts`.
+    collect_record_and_consume_facts(
+        &body_ast.statements,
+        &binding_types,
+        &mut metadata.fact_writes,
+        &mut metadata.fact_consumes,
+    );
+    validate_recorded_schemas(rule, &body_ast.statements, semantic, diagnostics);
 
     metadata.fact_reads.sort();
     metadata.fact_reads.dedup();
@@ -16882,6 +16876,138 @@ fn collect_open_payload_types(
 }
 
 /// Collects the schemas an `exec ... -> each` stream records as facts.
+/// The facts a rule body RECORDS and CONSUMES, walked over the parsed body.
+///
+/// `metadata.effects` moved to an AST walk (`collect_effects_from_ast`) and left
+/// records and consumes behind on the line scanner in `analyze_rule`, which
+/// requires `record` or `done` to begin a TRIMMED line. So a statement written
+/// inside its enclosing block on one line —
+/// `after t completes { done j -> record Finished { id j.id } }` — contributed
+/// neither a write nor a consume, while the identical program across three lines
+/// contributed both. The scanner sees the `after`, opens a block frame and moves
+/// to the next line; the rest of that line is never read.
+///
+/// That is not a formatting nicety, because the write set is load-bearing three
+/// times over. `record` is a governed information-flow sink (`fact:<Schema>`),
+/// and an inline record of confidential data passed the flow checker with ZERO
+/// violations while the multi-line form was denied — a fail-OPEN hole, opened by
+/// a line break. The write set is also what `build_rule_dependencies` turns into
+/// edges, so an inline record is invisible to `graph.unbounded_effect_recursion`
+/// and to the self-trigger check. And its absence raises a false
+/// "nothing produces `<X>`" against a rule that reads what it records.
+fn collect_record_and_consume_facts(
+    statements: &[body::BodyStmt],
+    binding_types: &BTreeMap<String, String>,
+    fact_writes: &mut Vec<String>,
+    fact_consumes: &mut Vec<String>,
+) {
+    let recurse = |statements: &[body::BodyStmt],
+                   fact_writes: &mut Vec<String>,
+                   fact_consumes: &mut Vec<String>| {
+        collect_record_and_consume_facts(statements, binding_types, fact_writes, fact_consumes);
+    };
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => {
+                fact_writes.push(format!("schema:{}", record.schema));
+            }
+            body::BodyStmt::Done {
+                binding,
+                replacement,
+                ..
+            } => {
+                // An unknown binding is the line scanner's diagnostic to make;
+                // silence here means "not a fact consume", not "unreported".
+                if let Some(schema) = binding_types.get(binding) {
+                    fact_consumes.push(format!("schema:{schema}"));
+                }
+                if let Some(record) = replacement {
+                    fact_writes.push(format!("schema:{}", record.schema));
+                }
+            }
+            body::BodyStmt::After(after) => recurse(&after.body, fact_writes, fact_consumes),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    recurse(&branch.body, fact_writes, fact_consumes);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                recurse(&region.body, fact_writes, fact_consumes);
+                recurse(&region.lapse_body, fact_writes, fact_consumes);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every `record <Schema>` in a rule body names a class the program declares and
+/// does not name a kernel-owned terminal schema.
+///
+/// Walked over the parsed body for the reason `collect_record_and_consume_facts`
+/// is: the line scanner in `analyze_rule` cannot see a record that shares a line
+/// with the block enclosing it, so `after t completes { record NoSuchClass { … } }`
+/// compiled clean while the same record on its own line was refused. A refusal a
+/// line break escapes is not a refusal.
+///
+/// The span is the record statement's own, which is better than the whole-body
+/// span the scanner could offer.
+fn validate_recorded_schemas(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        let recorded = match statement {
+            body::BodyStmt::Record(record) => Some(record),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => Some(record),
+            _ => None,
+        };
+        if let Some(record) = recorded {
+            let schema = &record.schema;
+            if is_observer_only_schema(schema) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: record.span,
+                    message: format!(
+                        "rule `{}` cannot record kernel-owned terminal schema `{schema}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "the terminal family (`TerminalFailed`/`TerminalTimedOut`/`TerminalCancelled`) is produced only by the kernel; to fail this workflow use `fail <failure> { ... }`, and to react to an effect terminal use `after <effect> fails/times out/cancels as f`"
+                            .to_owned(),
+                    ),
+                });
+            } else if !semantic.schemas.class_exists(schema) {
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: record.span,
+                    message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
+                    suggestion: Some(format!("declare `class {schema}` before recording it")),
+                });
+            }
+        }
+        match statement {
+            body::BodyStmt::After(after) => {
+                validate_recorded_schemas(rule, &after.body, semantic, diagnostics);
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_recorded_schemas(rule, &branch.body, semantic, diagnostics);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_recorded_schemas(rule, &region.body, semantic, diagnostics);
+                validate_recorded_schemas(rule, &region.lapse_body, semantic, diagnostics);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<String>) {
     for statement in statements {
         match statement {
@@ -16907,6 +17033,13 @@ fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<
                 for branch in &case.branches {
                     push_ingest_fact_writes(&branch.body, fact_writes);
                 }
+            }
+            // A region body is a container like the other two, and was missed
+            // for the same reason a container is always missed: nothing makes a
+            // walk enumerate them.
+            body::BodyStmt::Region(region) => {
+                push_ingest_fact_writes(&region.body, fact_writes);
+                push_ingest_fact_writes(&region.lapse_body, fact_writes);
             }
             _ => {}
         }

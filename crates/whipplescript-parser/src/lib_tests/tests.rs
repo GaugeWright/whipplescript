@@ -9910,6 +9910,198 @@ fn rejects_effectful_self_trigger_loop() {
         .contains("preserves trigger fact `schema:WorkItem`"));
 }
 
+/// A statement that shares a line with the block enclosing it was invisible to
+/// the line scanner in `analyze_rule`, which requires `record` or `done` to
+/// begin a trimmed line. `metadata.effects` had already moved to an AST walk, so
+/// an inline `tell` was seen while an inline `record` was not — the rule read a
+/// fact, ran an effect, and as far as every downstream analysis could tell, did
+/// nothing else.
+#[test]
+fn an_inline_record_contributes_its_write_and_its_consume() {
+    let source = r#"
+workflow Inline
+
+output result Done
+class Done { ok bool }
+class Job { id string }
+class Finished { id string }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Job [ { id "J1" } ]
+table seed2 as Finished [ { id "F1" } ]
+
+rule dispatch
+  when Job as j
+=> {
+  tell worker "do" as t
+  after t completes { done j -> record Finished { id j.id } }
+}
+
+rule wrap
+  when Finished as f
+=> {
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("fixture must lower");
+    let dispatch = ir
+        .rules
+        .iter()
+        .find(|rule| rule.name == "dispatch")
+        .expect("dispatch");
+
+    assert!(
+        dispatch
+            .metadata
+            .fact_writes
+            .contains(&"schema:Finished".to_owned()),
+        "inline record must contribute its write: {:?}",
+        dispatch.metadata.fact_writes
+    );
+    assert!(
+        dispatch
+            .metadata
+            .fact_consumes
+            .contains(&"schema:Job".to_owned()),
+        "inline done must contribute its consume: {:?}",
+        dispatch.metadata.fact_consumes
+    );
+}
+
+/// The write set carries the rule dependency graph, so the blindness above hid
+/// whole cycles from `graph.unbounded_effect_recursion`: the same program that
+/// is refused across three lines compiled clean written inline.
+#[test]
+fn an_effect_cycle_written_inline_is_caught() {
+    let source = r#"
+workflow InlineCycle
+
+output result Report
+class Report { seen int }
+class Ping { n int }
+class Pong { n int }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seeds as Ping [ { n 0 } ]
+
+rule ping_step
+  when Ping as p
+=> {
+  tell worker "ping" as t
+  after t completes { done p -> record Pong { n p.n } }
+}
+
+rule pong_step
+  when Pong as q
+=> {
+  tell worker "pong" as t
+  after t completes { done q -> record Ping { n q.n + 1 } }
+}
+
+rule finish
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.unbounded_effect_recursion")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The same blindness hid two refusals outright. A refusal a line break escapes
+/// is not a refusal, so both now walk the parsed body.
+#[test]
+fn an_inline_record_of_an_unknown_class_is_refused() {
+    let source = r#"
+workflow UnknownInline
+
+output result Done
+class Done { ok bool }
+class Job { id string }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Job [ { id "J1" } ]
+
+rule dispatch
+  when Job as j
+=> {
+  tell worker "do" as t
+  after t completes { record NoSuchClass { x "1" } }
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("records unknown class `NoSuchClass`")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+#[test]
+fn an_inline_record_of_a_kernel_terminal_schema_is_refused() {
+    let source = r#"
+workflow TerminalInline
+
+output result Done
+class Done { ok bool }
+class Job { id string }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Job [ { id "J1" } ]
+
+rule dispatch
+  when Job as j
+=> {
+  tell worker "do" as t
+  after t completes { record TerminalFailed { reason "x" } }
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("cannot record kernel-owned terminal schema `TerminalFailed`")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
 /// The TWO-rule version of the loop above. `validate_effectful_self_trigger`
 /// answers one rule preserving its own trigger; a cycle handed between two rules
 /// escaped it entirely while the compiler printed that same cycle in its own
