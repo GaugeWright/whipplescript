@@ -38,6 +38,7 @@ delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
+effect-cycle-pacing.maude	SSNNNN
 effect-key.maude	SSSNNSNN
 envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
 envelope-minting.maude	SSNNSNSNSNNSSS

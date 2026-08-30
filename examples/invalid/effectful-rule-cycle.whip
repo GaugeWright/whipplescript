@@ -1,8 +1,12 @@
-# An effect-bearing cycle in the rule dependency graph (spec/static-analysis.md,
-# "effectful internal recursion: rejected unless explicitly proven bounded").
-# `validate_effectful_self_trigger` catches the ONE-rule version of this; passed
-# between two rules it escaped, and every turn of the cycle enqueues a fresh
-# `tell` under a new idempotency key, so exactly-once dedup never brakes it.
+# An effect-bearing cycle that turns inside one commit (spec/static-analysis.md,
+# "effectful internal recursion", and spec/semantics.md, "External Recursion":
+# the harm is enqueueing effects "without waiting for the world to change").
+# `validate_effectful_self_trigger` catches the ONE-rule version; passed between
+# two rules it escaped, and every turn enqueues a fresh `tell` under a new
+# idempotency key, so exactly-once dedup never brakes it. Each `record` here
+# lands in the same commit as the trigger it read, so nothing paces the loop.
+# Moving either `record` behind an `after` block would make it a legal
+# world-paced loop.
 workflow EffectfulRuleCycle
 
 output result Report
@@ -24,21 +28,17 @@ table seeds as Ping [
 rule ping_step
   when Ping as p
 => {
-  tell worker "ping {{ p.n }}" as t
+  tell worker "ping {{ p.n }}"
 
-  after t completes {
-    done p -> record Pong { n p.n }
-  }
+  done p -> record Pong { n p.n }
 }
 
 rule pong_step
   when Pong as q
 => {
-  tell worker "pong {{ q.n }}" as t
+  tell worker "pong {{ q.n }}"
 
-  after t completes {
-    done q -> record Ping { n q.n + 1 }
-  }
+  done q -> record Ping { n q.n + 1 }
 }
 
 rule finish

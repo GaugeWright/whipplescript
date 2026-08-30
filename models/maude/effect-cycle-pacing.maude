@@ -1,0 +1,110 @@
+--- Effect-cycle pacing, per spec/static-analysis.md "Rule Dependency Graph" and
+--- spec/semantics.md "External Recursion". Companion to
+--- validate_effectful_rule_recursion in the parser, whose diagnostics are
+--- graph.unbounded_effect_recursion and graph.bounded_workflow_effect_cycle.
+---
+--- The harm the specification names is a cycle that enqueues effects "without
+--- waiting for the world to change". Pacing, not the mere existence of a cycle,
+--- is therefore the boundary:
+---
+---   sameCommit(P, C)  P records, in its OWN commit, a fact C matches. Nothing
+---                     stands between one turn of the cycle and the next.
+---   paced(P, C)       P records that fact inside an after block, so it does not
+---                     exist until an effect terminal arrives. The cycle turns at
+---                     the pace of whatever answered.
+---
+--- By default only sameCommit edges are counted, so a loop that waits on the
+--- world is not a cycle in the counted graph at all -- it is the long-running
+--- agent loop the language is for, legal with no declaration. The token bounded
+--- is the workflow's declaration that it settles instead of turning (@bounded,
+--- and @tool by DR-0025); under it every edge counts, so even a paced loop is
+--- refused.
+---
+--- A counted cycle is rejected only when an effectful rule shares it: an
+--- effect-free component is monotonic recursion and stays allowed.
+---
+--- The model checks by reachability search that:
+---   * a same-commit cycle carrying an effect is rejected;
+---   * a paced cycle in a bounded workflow is rejected;
+---   * a paced cycle in an ordinary workflow is NEVER rejected;
+---   * a cycle that closes only through a paced edge is NEVER rejected, so one
+---     wait on the world is enough to pace the whole ring;
+---   * an effect-free same-commit cycle is NEVER rejected;
+---   * an acyclic chain in a bounded workflow is NEVER rejected.
+mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
+  protecting BOOL .
+
+  sorts Rule Pair PairSet RuleSet Cfg .
+  subsort Pair < PairSet .
+  subsort Rule < RuleSet .
+
+  ops ra rb rc : -> Rule [ctor] .   --- rule names
+
+  --- A directed reachability pair P -> C over the COUNTED edges.
+  op pair : Rule Rule -> Pair [ctor] .
+  op mtPairs : -> PairSet [ctor] .
+  op _;_ : PairSet PairSet -> PairSet [ctor assoc comm id: mtPairs] .
+  eq [pair-idem] : PR:Pair ; PR:Pair = PR:Pair .
+
+  op memberPair : Pair PairSet -> Bool .
+  eq memberPair(PR:Pair, (PR:Pair ; PS:PairSet)) = true .
+  eq memberPair(PR:Pair, PS:PairSet) = false [owise] .
+
+  --- The set of rules rejected for an effect cycle.
+  op mtRules : -> RuleSet [ctor] .
+  op _&_ : RuleSet RuleSet -> RuleSet [ctor assoc comm id: mtRules] .
+  eq [rule-idem] : R:Rule & R:Rule = R:Rule .
+
+  op memberRule : Rule RuleSet -> Bool .
+  eq memberRule(R:Rule, (R:Rule & RS:RuleSet)) = true .
+  eq memberRule(R:Rule, RS:RuleSet) = false [owise] .
+
+  --- Configuration is an ACU soup of tokens.
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op sameCommit : Rule Rule -> Cfg [ctor] .  --- edge that lands in the reading commit
+  op paced : Rule Rule -> Cfg [ctor] .       --- edge that waits on an effect terminal
+  op bounded : -> Cfg [ctor] .               --- the workflow declares that it settles
+  op effectful : Rule -> Cfg [ctor] .        --- rule runs at least one effect
+  op reaches : PairSet -> Cfg [ctor] .       --- transitive reachability over counted edges
+  op counted : PairSet -> Cfg [ctor] .       --- the direct counted edges
+  op rejected : RuleSet -> Cfg [ctor] .      --- rules flagged for an effect cycle
+
+  vars P C E R : Rule .
+  vars PS QS : PairSet .
+  var RS : RuleSet .
+
+  --- Two rules share a cycle when each reaches the other; a rule shares one with
+  --- itself once it is on a cycle at all.
+  op onCycle : Rule Rule PairSet -> Bool .
+  eq onCycle(C, C, PS) = true .
+  eq onCycle(C, E, PS) = memberPair(pair(C, E), PS) and memberPair(pair(E, C), PS) [owise] .
+
+  --- A same-commit edge always counts.
+  crl [count-same-commit] : sameCommit(P, C) counted(PS)
+      => sameCommit(P, C) counted(pair(P, C) ; PS)
+      if memberPair(pair(P, C), PS) = false .
+
+  --- A paced edge counts ONLY under the bounded declaration. This single guard
+  --- is the whole policy: without it the paced loop is invisible to the refusal.
+  crl [count-paced-when-bounded] : bounded paced(P, C) counted(PS)
+      => bounded paced(P, C) counted(pair(P, C) ; PS)
+      if memberPair(pair(P, C), PS) = false .
+
+  --- Seed reachability from every counted edge.
+  crl [seed] : counted(pair(P, C) ; PS) reaches(QS)
+      => counted(pair(P, C) ; PS) reaches(pair(P, C) ; QS)
+      if memberPair(pair(P, C), QS) = false .
+
+  --- Transitive closure over the counted edges.
+  crl [close] : counted(pair(C, R) ; PS) reaches(pair(P, C) ; QS)
+      => counted(pair(C, R) ; PS) reaches(pair(P, R) ; pair(P, C) ; QS)
+      if memberPair(pair(P, R), (pair(P, C) ; QS)) = false .
+
+  --- The refusal. C is on a counted cycle and an effectful rule shares it.
+  --- Guarded on the rejected set so each rule is flagged at most once.
+  crl [reject] : reaches(pair(C, C) ; PS) effectful(E) rejected(RS)
+      => reaches(pair(C, C) ; PS) effectful(E) rejected(C & RS)
+      if onCycle(C, E, (pair(C, C) ; PS)) /\ memberRule(C, RS) = false .
+endm

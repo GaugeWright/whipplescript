@@ -1,0 +1,45 @@
+load ../effect-cycle-pacing.maude
+
+--- Coverage: a same-commit cycle carrying an effect is rejected. Nothing paces
+--- it, so each turn enqueues fresh effects at the speed of the store.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  sameCommit(ra, rb) sameCommit(rb, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* C:Cfg rejected(ra & RS:RuleSet) .
+
+--- Coverage: the same ring, every edge waiting on an effect terminal, is
+--- rejected under the bounded declaration -- a workflow that promises to settle
+--- may not loop with the world either.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  bounded paced(ra, rb) paced(rb, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* C:Cfg rejected(ra & RS:RuleSet) .
+
+--- Bite: that same paced ring WITHOUT the declaration is never rejected. This is
+--- the long-running agent loop, legal with no tag at all.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  paced(ra, rb) paced(rb, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: a ring that closes only through a paced edge is never rejected. One
+--- wait on the world paces the whole ring, so a same-commit edge elsewhere on it
+--- is not enough to refuse.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  sameCommit(ra, rb) paced(rb, ra) effectful(ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: an effect-free same-commit cycle is never rejected -- pure monotonic
+--- recursion stays allowed.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  sameCommit(ra, rb) sameCommit(rb, ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: a bounded workflow whose effects form a chain rather than a ring is
+--- never rejected. The declaration refuses a cycle, not effects.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  bounded paced(ra, rb) paced(rb, rc) effectful(ra) effectful(rb) effectful(rc)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .

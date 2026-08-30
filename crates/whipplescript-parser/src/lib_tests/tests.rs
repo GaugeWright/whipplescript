@@ -8941,6 +8941,10 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/effectful-rule-cycle.whip"),
         ),
         (
+            "bounded-workflow-effect-cycle",
+            include_str!("../../../../examples/invalid/bounded-workflow-effect-cycle.whip"),
+        ),
+        (
             "tool-grant-cycle",
             include_str!("../../../../examples/invalid/tool-grant-cycle.whip"),
         ),
@@ -9975,11 +9979,15 @@ rule wrap
 }
 
 /// The write set carries the rule dependency graph, so the blindness above hid
-/// whole cycles from `graph.unbounded_effect_recursion`: the same program that
-/// is refused across three lines compiled clean written inline.
+/// whole cycles from the cycle checks: the same program that is refused across
+/// three lines compiled clean written inline. The cycle here is world-paced —
+/// each `record` sits behind `after t completes` — so the workflow carries
+/// `@bounded`, under which every edge counts. The refusal still depends on the
+/// inline `record` reaching the dependency graph, which is what this pins.
 #[test]
 fn an_effect_cycle_written_inline_is_caught() {
     let source = r#"
+@bounded
 workflow InlineCycle
 
 output result Report
@@ -10020,10 +10028,16 @@ rule finish
     assert!(
         compiled.diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("graph.unbounded_effect_recursion")),
+            .contains("graph.bounded_workflow_effect_cycle")),
         "{:?}",
         compiled.diagnostics
     );
+
+    // And the other direction: without the declaration the same inline cycle is
+    // a paced loop and compiles, so the tag is what refuses it rather than the
+    // inline spelling being invisible again.
+    let paced = compile_program(&source.replace("@bounded\n", ""));
+    assert!(paced.ir.is_some(), "{:?}", paced.diagnostics);
 }
 
 /// The same blindness hid two refusals outright. A refusal a line break escapes
@@ -10102,15 +10116,15 @@ rule dispatch
     );
 }
 
-/// The TWO-rule version of the loop above. `validate_effectful_self_trigger`
-/// answers one rule preserving its own trigger; a cycle handed between two rules
-/// escaped it entirely while the compiler printed that same cycle in its own
-/// `rule_dependencies` snapshot. Each turn enqueues a fresh `tell` under a new
-/// idempotency key, so exactly-once dedup never brakes it
-/// (spec/static-analysis.md: "effectful internal recursion: rejected unless
-/// explicitly proven bounded").
+/// The TWO-rule version of the loop above, with every `record` landing in the
+/// same commit as the trigger it read. `validate_effectful_self_trigger` answers
+/// one rule preserving its own trigger; a cycle handed between two rules escaped
+/// it entirely while the compiler printed that same cycle in its own
+/// `rule_dependencies` snapshot. Nothing paces this one, so each turn enqueues a
+/// fresh `tell` under a new idempotency key at commit speed and exactly-once
+/// dedup never brakes it (spec/semantics.md, "External Recursion").
 #[test]
-fn rejects_effectful_rule_cycle_across_two_rules() {
+fn rejects_same_commit_effectful_rule_cycle_across_two_rules() {
     let source = include_str!("../../../../examples/invalid/effectful-rule-cycle.whip");
     let compiled = compile_program(source);
 
@@ -10120,9 +10134,9 @@ fn rejects_effectful_rule_cycle_across_two_rules() {
             diagnostic
                 .message
                 .contains("effectful rule cycle is not allowed (graph.unbounded_effect_recursion)")
-                && diagnostic
-                    .message
-                    .contains("rule cycle ping_step -> pong_step -> ping_step")
+                && diagnostic.message.contains(
+                    "rule cycle ping_step -> pong_step -> ping_step turns inside one commit",
+                )
         }),
         "{:?}",
         compiled.diagnostics
@@ -10158,21 +10172,17 @@ table seeds as Ping [
 rule ping_step
   when fact Ping as p
 => {
-  tell worker "ping" as t
+  tell worker "ping"
 
-  after t completes {
-    done p -> record Pong { n p.n }
-  }
+  done p -> record Pong { n p.n }
 }
 
 rule pong_step
   when fact Pong as q
 => {
-  tell worker "pong" as t
+  tell worker "pong"
 
-  after t completes {
-    done q -> record Ping { n q.n + 1 }
-  }
+  done q -> record Ping { n q.n + 1 }
 }
 
 rule finish
@@ -10191,6 +10201,143 @@ rule finish
         "{:?}",
         compiled.diagnostics
     );
+}
+
+/// PACING IS THE BOUNDARY. The same two-rule cycle with each recurring `record`
+/// behind an `after` block is the long-running agent loop the language is for:
+/// the fed-back fact cannot exist until a turn completes, so the loop turns at
+/// the pace of the world. It compiles with no declaration of any kind — this is
+/// the generator/critic shape, and refusing it refused the language's own
+/// product.
+#[test]
+fn world_paced_effect_cycle_compiles() {
+    let source = r#"
+workflow CriticLoop
+output result Draft
+
+class Task { brief string  round int }
+class Draft { text string  round int }
+
+agent writer { provider fixture  profile "repo-writer"  capacity 1 }
+agent critic { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { brief "write it" round 0 } ]
+
+rule write
+  when Task as t where t.round < 3
+=> {
+  tell writer "{{ t.brief }}" as turn
+
+  after turn succeeds as x {
+    done t -> record Draft {
+      text "draft"
+      round t.round + 1
+    }
+  }
+}
+
+rule review
+  when Draft as d where d.round < 3
+=> {
+  tell critic "review {{ d.text }}" as turn
+
+  after turn succeeds as x {
+    done d -> record Task {
+      brief "revise"
+      round d.round
+    }
+  }
+}
+
+rule ship
+  when Draft as d where d.round >= 3
+=> {
+  complete result {
+    text d.text
+    round d.round
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
+}
+
+/// `@bounded` is the opposite declaration to a paced loop: the workflow settles
+/// instead of turning, so it may not loop with the world either. The same cycle
+/// that compiles above is refused under the tag.
+#[test]
+fn bounded_workflow_refuses_a_world_paced_effect_cycle() {
+    let source = include_str!("../../../../examples/invalid/bounded-workflow-effect-cycle.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains(
+                "effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle)",
+            ) && diagnostic.message.contains("is `@bounded`")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// `@tool` carries the same promise without the tag. A tool is invoked
+/// synchronously inside an agent turn and DR-0025 requires that turn to
+/// converge (docs/guarantees.md), so a tool that loops with the world is the
+/// same refusal reached by a different declaration.
+#[test]
+fn tool_workflow_refuses_a_world_paced_effect_cycle() {
+    let bounded = include_str!("../../../../examples/invalid/bounded-workflow-effect-cycle.whip");
+    let source = bounded.replace("@bounded", "@tool");
+    let compiled = compile_program(&source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("graph.bounded_workflow_effect_cycle")
+            && diagnostic.message.contains("bounded by DR-0025")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The tag refuses a cycle, not effects. A `@bounded` workflow whose effects
+/// form a chain rather than a ring compiles.
+#[test]
+fn bounded_workflow_accepts_an_acyclic_effect_chain() {
+    let source = r#"
+@bounded
+workflow BoundedChain
+output result Report
+
+class Ticket { body string }
+class Triaged { body string }
+class Report { seen int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Ticket [ { body "help" } ]
+
+rule triage
+  when Ticket as t
+=> {
+  tell worker "triage {{ t.body }}" as turn
+
+  after turn succeeds as x {
+    done t -> record Triaged { body t.body }
+  }
+}
+
+rule report
+  when Triaged as t
+=> {
+  complete result { seen 1 }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
 }
 
 /// A one-rule self-loop stays with `validate_effectful_self_trigger` and its

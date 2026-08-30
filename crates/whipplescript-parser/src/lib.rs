@@ -1662,6 +1662,18 @@ pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
     pub projection_reads: Vec<IrProjectionRead>,
     pub fact_writes: Vec<String>,
+    /// The subset of `fact_writes` this rule records in its OWN commit: every
+    /// `record` (and `done … -> record`) that is not behind an `after` block.
+    ///
+    /// This is the pacing distinction `validate_effectful_rule_recursion` turns
+    /// on. A record behind an `after` waits on an effect terminal, so the fact
+    /// it produces cannot appear until the world has answered; one at the rule's
+    /// top level lands in the same commit as its trigger. A cycle built only
+    /// from the latter turns as fast as the store commits.
+    ///
+    /// Cycle-analysis-only, and deliberately NOT rendered in the `.ir` snapshot,
+    /// so it adds no golden/hash churn.
+    pub immediate_fact_writes: Vec<String>,
     pub record_sources: Vec<IrRecordSource>,
     pub fact_consumes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
@@ -8105,22 +8117,37 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
     }
 }
 
-/// Reject an effect-bearing cycle in the rule dependency graph
-/// (`graph.unbounded_effect_recursion`).
+/// Reject an effect-bearing rule cycle that turns without waiting on the world
+/// (`graph.unbounded_effect_recursion`), and any effect-bearing cycle at all in
+/// a workflow that declares itself `@bounded` (`graph.bounded_workflow_effect_cycle`).
 ///
 /// `spec/static-analysis.md` ("Rule Dependency Graph") classifies the strongly
-/// connected components of this graph and calls for exactly one of them to be
-/// refused: *effectful internal recursion: rejected unless explicitly proven
-/// bounded*. Nothing implemented the classification. `validate_effectful_self_trigger`
-/// answers the ONE-rule case — a rule that preserves its own trigger — and a
-/// cycle passed between TWO rules escaped it entirely, while the compiler went
-/// on to print that same cycle in its own `rule_dependencies` snapshot. Each
-/// turn of such a cycle enqueues real external effects, under a fresh
-/// idempotency key each time, so exactly-once dedup never brakes it.
+/// connected components of this graph and calls for one of them to be refused:
+/// *effectful internal recursion: rejected unless explicitly proven bounded*.
+/// `validate_effectful_self_trigger` answers the ONE-rule case; a cycle passed
+/// between TWO rules escaped it entirely, while the compiler went on to print
+/// that same cycle in its own `rule_dependencies` snapshot.
 ///
-/// WHAT IS REFUSED, precisely: a component of two or more rules that are
-/// mutually reachable over produce/consume edges, at least one of which runs an
-/// effect. The other three SCC classes the spec names are left alone — a
+/// PACING IS THE BOUNDARY. The harm is a cycle that enqueues fresh effects as
+/// fast as the store commits, "without waiting for the world to change"
+/// (spec/semantics.md, "External Recursion"). A cycle whose recurring `record`
+/// sits behind an `after` block cannot do that: the fact it feeds back does not
+/// exist until an effect terminal arrives, so the loop turns at the pace of the
+/// world it is talking to. That is the long-running agent loop the language is
+/// for, and it needs no declaration to be legal — it is the default. What is
+/// refused by default is the cycle every edge of which lands in the recording
+/// rule's own commit, which is why the graph here counts only
+/// `immediate_fact_writes`.
+///
+/// `@bounded` IS THE OPPOSITE DECLARATION. A workflow that promises to settle
+/// rather than to keep turning may not loop with the world either, so in a
+/// `@bounded` workflow every produce/consume edge counts and any effect-bearing
+/// component is refused. `@tool` implies it: a tool is invoked synchronously
+/// inside an agent turn, and DR-0025 requires that turn to converge
+/// (docs/guarantees.md, `models/maude/subworkflow-convergence.maude`).
+///
+/// WHAT IS REFUSED, precisely: a component of two or more rules mutually
+/// reachable over the counted edges, at least one of which runs an effect. A
 /// component with no effects is pure monotonic recursion (allowed), and
 /// recursion through an external event or clock is invisible to this graph in
 /// the first place, because such a trigger is a `pattern:` read that no
@@ -8129,17 +8156,13 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
 /// SELF-EDGES ARE NOT THIS CHECK'S. A one-rule cycle stays with
 /// `validate_effectful_self_trigger` and its `consume`-or-advance escape, which
 /// is the shape `docs/manual/13-agent-patterns.md` teaches as the retry idiom.
-/// Reporting it twice would say nothing new and would break that rule's
-/// established diagnostic.
 ///
 /// THE ESCAPE is `@external` on any rule in the component: the tag declares that
 /// this rule's facts arrive from outside the workflow, which is the author
 /// saying the recurrence is not internal. It is the same tag, with the same
-/// meaning, that `lint_workflow_liveness` already honours. There is no
-/// bounded-recursion escape yet, exactly as there is none for recursive
-/// `apply`: until a statically-decreasing measure exists to prove a bound with,
-/// the spec's "unless explicitly proven bounded" has no way to be satisfied and
-/// every such cycle is refused.
+/// meaning, that `lint_workflow_liveness` already honours.
+///
+/// Modeled in `models/maude/effect-cycle-pacing.maude`.
 fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     let rules = &ir.rules;
     if rules.len() < 2 {
@@ -8151,7 +8174,21 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
         .map(|(index, rule)| (rule.name.as_str(), index))
         .collect::<BTreeMap<_, _>>();
 
+    let workflow_tagged = |name: &str| {
+        ir.source_tags
+            .iter()
+            .any(|tag| tag.target_kind == "workflow" && tag.name == name)
+    };
+    // `@tool` carries the same promise DR-0025 already extracts from it, so it
+    // needs no second tag to mean it.
+    let bounded = workflow_tagged("bounded");
+    let bounded_workflow = bounded || workflow_tagged("tool");
+
     // Adjacency, self-edges dropped: they belong to the per-rule check above.
+    // Outside a `@bounded` workflow only an edge whose fact is recorded in the
+    // producer's own commit counts — an edge that waits on an effect terminal
+    // paces the cycle by the world and is not this refusal's business.
+    let mut adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     let mut reaches = vec![vec![false; rules.len()]; rules.len()];
     for dependency in &ir.rule_dependencies {
         let (Some(&producer), Some(&consumer)) = (
@@ -8160,9 +8197,18 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
         ) else {
             continue;
         };
-        if producer != consumer {
-            reaches[producer][consumer] = true;
+        if producer == consumer {
+            continue;
         }
+        let same_commit = rules[producer]
+            .metadata
+            .immediate_fact_writes
+            .contains(&dependency.fact);
+        if !bounded_workflow && !same_commit {
+            continue;
+        }
+        adjacency.entry(producer).or_default().insert(consumer);
+        reaches[producer][consumer] = true;
     }
     // Transitive closure. A rule set is small enough that the plain cubic form
     // is both fast enough and the version a reader can check by eye.
@@ -8216,7 +8262,7 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
 
         // Name a concrete round trip rather than an unordered set: BFS from the
         // effectful rule back to itself over the direct edges of the component.
-        let cycle = shortest_rule_cycle(ir, rules, &index_of, effectful, &component)
+        let cycle = shortest_rule_cycle(&adjacency, rules, effectful, &component)
             .unwrap_or_else(|| vec![rules[effectful].name.clone()]);
         // The span of the effect that the cycle re-runs: the most useful line to
         // stand on, and the only span an `IrRule` carries.
@@ -8226,19 +8272,44 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
             .first()
             .map(|effect| effect.span)
             .unwrap_or(SourceSpan { start: 0, end: 0 });
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span,
-            message: format!(
-                "effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle {}, and rule `{}` runs effects on every turn of it",
-                cycle.join(" -> "),
-                rules[effectful].name
-            ),
-            suggestion: Some(
-                "break the cycle: an effect-bearing cycle in the rule dependency graph has no compile-time bound, so each turn enqueues fresh effects forever — consume the triggering fact without recording one the cycle reads back, route the recurrence through an external event or clock, or tag a rule `@external` when its facts genuinely arrive from outside the workflow"
-                    .to_owned(),
-            ),
-        });
+        // One `push` per refusal, each carrying its own message literal:
+        // `scripts/mutation_sweep.py` finds a refusal BY that literal at the push
+        // site, so folding the two into a computed `message` variable would hide
+        // both from the sweep that proves a test pins them.
+        if bounded_workflow {
+            let declaration = if bounded {
+                format!("workflow `{}` is `@bounded`", ir.workflow)
+            } else {
+                format!("`@tool` workflow `{}` is bounded by DR-0025", ir.workflow)
+            };
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle): {declaration}, and rule cycle {} runs the effects of rule `{}` on every turn",
+                    cycle.join(" -> "),
+                    rules[effectful].name
+                ),
+                suggestion: Some(
+                    "a bounded workflow settles instead of turning, so it may not loop with the world at all: break the cycle, or drop `@bounded` if this workflow is meant to keep going (a `@tool` workflow has no such choice — it is invoked inside an agent turn and that turn must end)"
+                        .to_owned(),
+                ),
+            });
+        } else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span,
+                message: format!(
+                    "effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle {} turns inside one commit, and rule `{}` runs effects on every turn of it",
+                    cycle.join(" -> "),
+                    rules[effectful].name
+                ),
+                suggestion: Some(
+                    "every edge of this cycle records its fact in the same commit that read one, so nothing paces it and each turn enqueues fresh effects at commit speed — put the recurrence behind an effect terminal (`after <effect> succeeds { record ... }`) so each turn waits on the world, or tag a rule `@external` when its facts genuinely arrive from outside the workflow"
+                        .to_owned(),
+                ),
+            });
+        }
     }
 }
 
@@ -8246,22 +8317,22 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
 /// inside `component`, rendered as rule names. Used only to make the diagnostic
 /// name a path a reader can follow.
 fn shortest_rule_cycle(
-    ir: &IrProgram,
+    edges: &BTreeMap<usize, BTreeSet<usize>>,
     rules: &[IrRule],
-    index_of: &BTreeMap<&str, usize>,
     start: usize,
     component: &[usize],
 ) -> Option<Vec<String>> {
+    // The counted edges, restricted to the component: the path a reader is shown
+    // must be one the refusal was actually decided on.
     let mut adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    for dependency in &ir.rule_dependencies {
-        let (Some(&producer), Some(&consumer)) = (
-            index_of.get(dependency.producer.as_str()),
-            index_of.get(dependency.consumer.as_str()),
-        ) else {
+    for (&producer, consumers) in edges {
+        if !component.contains(&producer) {
             continue;
-        };
-        if producer != consumer && component.contains(&producer) && component.contains(&consumer) {
-            adjacency.entry(producer).or_default().insert(consumer);
+        }
+        for &consumer in consumers {
+            if component.contains(&consumer) {
+                adjacency.entry(producer).or_default().insert(consumer);
+            }
         }
     }
     let mut queue: VecDeque<usize> = VecDeque::new();
@@ -10104,6 +10175,7 @@ fn analyze_rule(
     collect_record_and_consume_facts(
         &body_ast.statements,
         &binding_types,
+        RecordScope::WholeBody,
         &mut metadata.fact_writes,
         &mut metadata.fact_consumes,
     );
@@ -10114,6 +10186,21 @@ fn analyze_rule(
     sort_projection_reads(&mut metadata.projection_reads);
     metadata.fact_writes.sort();
     metadata.fact_writes.dedup();
+    // The same walk stopped at every `after` block: what this rule records
+    // without waiting on the world. `exec … -> each` and `import` writes never
+    // appear here, which is right — they are effect results too.
+    let mut immediate_fact_writes = Vec::new();
+    let mut immediate_consumes = Vec::new();
+    collect_record_and_consume_facts(
+        &body_ast.statements,
+        &binding_types,
+        RecordScope::OwnCommit,
+        &mut immediate_fact_writes,
+        &mut immediate_consumes,
+    );
+    immediate_fact_writes.sort();
+    immediate_fact_writes.dedup();
+    metadata.immediate_fact_writes = immediate_fact_writes;
     metadata.fact_consumes.sort();
     metadata.fact_consumes.dedup();
     metadata.terminal_outputs = terminal_metadata.outputs;
@@ -16876,6 +16963,21 @@ fn collect_open_payload_types(
 }
 
 /// Collects the schemas an `exec ... -> each` stream records as facts.
+/// How much of a rule body `collect_record_and_consume_facts` counts.
+///
+/// One walk, two questions. `WholeBody` is what a rule records at all, which is
+/// what the dependency graph, the flow checker, and liveness read. `OwnCommit`
+/// stops at an `after` block, so it is what the rule records WITHOUT waiting on
+/// the world — the pacing distinction `validate_effectful_rule_recursion` turns
+/// on. Sharing the walk is deliberate: two copies would drift the first time a
+/// statement kind that can carry a `record` is added to one and not the other,
+/// and the copy that missed it would quietly stop refusing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordScope {
+    WholeBody,
+    OwnCommit,
+}
+
 /// The facts a rule body RECORDS and CONSUMES, walked over the parsed body.
 ///
 /// `metadata.effects` moved to an AST walk (`collect_effects_from_ast`) and left
@@ -16898,13 +17000,20 @@ fn collect_open_payload_types(
 fn collect_record_and_consume_facts(
     statements: &[body::BodyStmt],
     binding_types: &BTreeMap<String, String>,
+    scope: RecordScope,
     fact_writes: &mut Vec<String>,
     fact_consumes: &mut Vec<String>,
 ) {
     let recurse = |statements: &[body::BodyStmt],
                    fact_writes: &mut Vec<String>,
                    fact_consumes: &mut Vec<String>| {
-        collect_record_and_consume_facts(statements, binding_types, fact_writes, fact_consumes);
+        collect_record_and_consume_facts(
+            statements,
+            binding_types,
+            scope,
+            fact_writes,
+            fact_consumes,
+        );
     };
     for statement in statements {
         match statement {
@@ -16925,7 +17034,12 @@ fn collect_record_and_consume_facts(
                     fact_writes.push(format!("schema:{}", record.schema));
                 }
             }
-            body::BodyStmt::After(after) => recurse(&after.body, fact_writes, fact_consumes),
+            // The one branch the scope governs: under `OwnCommit` an `after`
+            // body belongs to another commit, so its records are not this one's
+            // and the arm falls through to the catch-all below.
+            body::BodyStmt::After(after) if scope == RecordScope::WholeBody => {
+                recurse(&after.body, fact_writes, fact_consumes)
+            }
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
                     recurse(&branch.body, fact_writes, fact_consumes);

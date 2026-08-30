@@ -639,10 +639,10 @@ workflow InternalProviderLanguageE2E
 
 The compiled IR keeps the two items for the reports. The
 `whip run --include-tag` flag and the `--exclude-tag` flag select the
-assertions that the command evaluates. The `@service` tag and the `@external`
-tag have a static meaning for the [liveness checks](#liveness-checks). The
-`@private` tag on a workflow has a semantic meaning and prevents an `invoke`
-statement from an adjacent workflow. Each other tag does not change the
+assertions that the command evaluates. The `@service` tag, the `@bounded` tag,
+and the `@external` tag have a static meaning for the
+[liveness checks](#liveness-checks). The `@private` tag on a workflow has a
+semantic meaning and prevents an `invoke` statement from an adjacent workflow. Each other tag does not change the
 readiness, the routing, the effects, or the behavior at run time.
 
 ### Signals and sources
@@ -2401,14 +2401,28 @@ suggestion.
   that `--root` names. A workflow that an `invoke` statement reaches is
   therefore under the same rules as the entry point, and no refusal is escapable
   by a move of the code into a second workflow.
-- **An effectful cycle of rules is refused.** The compiler classifies the
-  strongly connected components of the rule dependency graph. A component of two
-  rules or more in which a rule runs an effect has no bound at compile time and
-  is a check error (`graph.unbounded_effect_recursion`). A component with no
-  effect is monotonic recursion and is allowed. A recurrence through an external
-  event or a clock never enters this graph, because such a trigger matches no
-  recorded class. A cycle of one rule belongs to the separate check on a rule
-  that preserves its own trigger, which the `done` statement escapes.
+- **An effectful cycle of rules that does not wait on the world is refused.**
+  The compiler classifies the strongly connected components of the rule
+  dependency graph. A component of two rules or more in which a rule runs an
+  effect is a check error (`graph.unbounded_effect_recursion`) when each
+  `record` of the cycle lands in the same commit as the fact that the rule
+  matched. Nothing paces such a cycle, so it turns at the speed of the store. A
+  cycle whose recurrence sits inside an `after` block waits for the terminal of
+  an effect on every turn, and the compiler permits it with no tag: that loop is
+  the long-running agent loop, and the rules of liveness above still govern it.
+  A component with no effect is monotonic recursion and is allowed. A recurrence
+  through an external event or a clock never enters this graph, because such a
+  trigger matches no recorded class. A cycle of one rule belongs to the separate
+  check on a rule that preserves its own trigger, which the `done` statement
+  escapes.
+- **A `@bounded` workflow may not loop with the world at all.** The `@bounded`
+  tag is the opposite of the `@service` tag: it declares that the workflow
+  reaches a terminal after a number of steps that the program fixes and the data
+  does not. In such a workflow every produce and consume edge counts, so an
+  effect-bearing cycle of rules is a check error
+  (`graph.bounded_workflow_effect_cycle`) even when each turn waits on the
+  world. A `@tool` workflow carries the same promise with no tag, because an
+  agent invokes it inside a turn and DR-0025 requires the turn to end.
 - **The invoke-tool graph must be acyclic.** An agent may call a granted `@tool`
   workflow synchronously, so a cycle of `tools` grants is an unbounded depth of
   recursion (`graph.unbounded_tool_grant_recursion`).

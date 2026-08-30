@@ -94,6 +94,29 @@ rule r
     );
 }
 
+/// `@bounded` and `@service` answer the same question in opposite directions —
+/// does this workflow settle — and the effect-cycle check reads both, so a
+/// workflow carrying the pair is refused rather than silently resolved.
+#[test]
+fn a_bounded_workflow_cannot_also_be_a_service() {
+    asserts(
+        &ir_of(
+            r#"
+@bounded
+@service
+workflow BothWays
+output result R
+class R { ok bool }
+rule r
+  when started
+=> { complete result { ok true } }
+"#,
+        ),
+        "is both `@bounded` and `@service`",
+    );
+    is_clean(&ir_of(WELL_FORMED));
+}
+
 /// v1 `@tool` workflows must be leaves, must not be driven by an external
 /// event, and must not await a message: each would make a tool's completion
 /// depend on something its caller cannot see.

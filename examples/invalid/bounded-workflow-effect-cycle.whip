@@ -1,0 +1,51 @@
+# A world-paced effect cycle in a `@bounded` workflow. Each hop waits on an
+# agent turn, so this loop is legal in an ordinary workflow — that is the
+# long-running agent loop the language is for. `@bounded` is the author's
+# declaration that this workflow settles instead of turning, and a loop with the
+# world is exactly what the declaration rules out. `@tool` carries the same
+# promise without the tag: DR-0025 requires the agent turn that invokes it to
+# converge.
+@bounded
+workflow BoundedWorkflowEffectCycle
+
+output result Report
+class Report { seen int }
+
+class Ping { n int }
+class Pong { n int }
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seeds as Ping [
+  { n 0 }
+]
+
+rule ping_step
+  when Ping as p
+=> {
+  tell worker "ping {{ p.n }}" as t
+
+  after t completes {
+    done p -> record Pong { n p.n }
+  }
+}
+
+rule pong_step
+  when Pong as q
+=> {
+  tell worker "pong {{ q.n }}" as t
+
+  after t completes {
+    done q -> record Ping { n q.n + 1 }
+  }
+}
+
+rule finish
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}

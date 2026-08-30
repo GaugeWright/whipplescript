@@ -83,19 +83,33 @@ the source. Thus a program that does not stop is a declaration, not an accident.
 *Carried by:* the static liveness checks of the compiler. Refer to
 [liveness checks](language-reference.md#liveness-checks).
 
-**A cycle of rules that runs effects is refused.**
+**A cycle of rules that runs effects without waiting on the world is refused.**
 The compiler classifies the strongly connected components of the rule
 dependency graph. A component of two rules or more in which a rule runs an
-effect is a check error: each turn of it requests fresh external effects, under
-a new idempotency key each time, so the exactly-once guarantee is no brake on
-it. A component with no effect is monotonic recursion and is allowed. A
-recurrence through an external event or a clock never enters this graph, because
-such a trigger matches no recorded class. There is no bounded-recursion escape
-yet, for the same reason there is none for a recursive pattern: no
-statically-decreasing measure exists to prove a bound with.
+effect is a check error when each `record` of it lands in the same commit as the
+fact that the rule matched: each turn of such a cycle requests fresh external
+effects at the speed of the store, under a new idempotency key each time, so the
+exactly-once guarantee is no brake on it. A component with no effect is
+monotonic recursion and is allowed. A recurrence through an external event or a
+clock never enters this graph, because such a trigger matches no recorded class.
+
+A cycle that waits on the world is allowed, and it needs no declaration. When
+the recurring `record` sits inside an `after` block, the fact of the next turn
+arrives only with the terminal of an effect, so the loop turns at the pace of
+the agent or the service that it talks to. That is the long-running agent loop
+of the language. Whether it may run forever is the question of liveness above,
+which the `@service` tag answers.
+
+A workflow tagged `@bounded` gives up the paced loop as well. The tag is the
+opposite of `@service`: it declares that the workflow reaches a terminal after a
+number of steps that the program fixes and the data does not, so any
+effect-bearing cycle in it is a check error. A `@tool` workflow carries that
+promise with no tag, because an agent invokes it inside a turn and the turn must
+end.
 *Carried by:* the strongly-connected-component classification of the compiler
-over the rule dependency graph. The fixture is
-`examples/invalid/effectful-rule-cycle.whip`.
+over the rule dependency graph, `models/maude/effect-cycle-pacing.maude`. The
+fixtures are `examples/invalid/effectful-rule-cycle.whip` and
+`examples/invalid/bounded-workflow-effect-cycle.whip`.
 
 **A whole-program refusal holds for every workflow of a file.**
 A file may declare more than one workflow, and `--root` names the entry point.

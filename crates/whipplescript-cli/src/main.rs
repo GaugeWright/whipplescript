@@ -38779,6 +38779,28 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
     // acyclicity half it was waiting on now exists: `detect_agent_tool_grant_recursion`
     // builds the invoke-tool graph from the bundle's `tools [...]` grants and
     // refuses a cycle, which is the check this comment used to defer.
+    // `@bounded` and `@service` are opposite declarations about the same
+    // question — whether this workflow settles — so carrying both says nothing
+    // and quietly gives the effect-cycle check contradictory instructions.
+    let bounded_tagged = ir
+        .source_tags
+        .iter()
+        .any(|tag| tag.target_kind == "workflow" && tag.name == "bounded");
+    if bounded_tagged && service_tagged {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: SourceSpan { start: 0, end: 0 },
+            message: format!(
+                "workflow `{}` is both `@bounded` and `@service`; the two tags make opposite promises about termination",
+                ir.workflow
+            ),
+            suggestion: Some(
+                "keep `@service` for a workflow that runs for as long as the world gives it work, or `@bounded` for one that settles in a number of steps the program fixes — never both"
+                    .to_owned(),
+            ),
+        });
+    }
+
     let tool_tagged = ir
         .source_tags
         .iter()

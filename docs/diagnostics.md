@@ -292,28 +292,61 @@ The invalid fixture is `examples/invalid/recursive-workflow-invocation.whip`.
 This is the diagnostic:
 
 ```text
-error: effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle ping_step -> pong_step -> ping_step, and rule `ping_step` runs effects on every turn of it
+error: effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle ping_step -> pong_step -> ping_step turns inside one commit, and rule `ping_step` runs effects on every turn of it
 ```
 
 The cause is a cycle in the rule dependency graph in which one rule or more runs
-an effect. Each rule of the cycle records a fact that a later rule of the cycle
-matches, and the last one records the fact that the first one matches. Such a
-cycle has no bound at compile time. Each turn of it requests fresh external
-effects, under a new idempotency key each time, so the exactly-once guarantee
-never stops it.
+an effect, and in which each `record` lands in the same commit as the fact that
+the rule matched. Nothing paces such a cycle. It turns as fast as the store
+commits, and each turn requests fresh external effects under a new idempotency
+key, so the exactly-once guarantee never stops it.
+
+A cycle that waits on the world is a different thing, and the compiler permits
+it. When the `record` of a rule sits inside an `after` block, the fact of the
+next turn does not exist until the terminal of an effect arrives. Such a loop
+turns at the pace of the agent or the service that it talks to. That loop is the
+long-running agent loop of the language, and it needs no tag. The rules of
+liveness still govern it: the workflow needs a rule that reaches `complete` or
+`fail`, or the `@service` tag.
 
 A cycle of ONE rule is a different diagnostic. The check for a rule that
 preserves its own trigger owns it, and that check has the escape of a `done`
 statement that consumes or advances the fact. The retry pattern of
 [Agent patterns](manual/13-agent-patterns.md) uses that escape.
 
-The correction is to break the cycle. Consume the triggering fact without
-recording a fact that the cycle reads back, or route the recurrence through an
-external event or a clock. A rule whose facts genuinely arrive from outside the
-workflow carries the `@external` tag, and a cycle through such a rule is not
+The correction is to move the `record` of the recurrence into an `after` block,
+so each turn of the cycle waits for the terminal of an effect. As an
+alternative, break the cycle. A rule whose facts genuinely arrive from outside
+the workflow carries the `@external` tag, and a cycle through such a rule is not
 internal recursion.
 
 The invalid fixture is `examples/invalid/effectful-rule-cycle.whip`.
+
+### Effect cycle in a bounded workflow
+
+This is the diagnostic:
+
+```text
+error: effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle): workflow `BoundedWorkflowEffectCycle` is `@bounded`, and rule cycle ping_step -> pong_step -> ping_step runs the effects of rule `ping_step` on every turn
+```
+
+The cause is an effect-bearing cycle in a workflow that declares that it
+settles. The `@bounded` tag is the opposite of the `@service` tag. The
+`@service` tag declares that a workflow runs for as long as the world gives it
+work. The `@bounded` tag declares that the workflow reaches a terminal after a
+number of steps that the program fixes, not the data. A loop with the world
+breaks that promise, so a `@bounded` workflow may not carry a cycle of rules
+that runs an effect, even one that waits on a terminal.
+
+A `@tool` workflow carries the same promise with no tag. An agent invokes a tool
+inside a turn, and DR-0025 requires the turn to end, so the check reads a `@tool`
+workflow as a bounded one. The message names DR-0025 in that case.
+
+The correction is to break the cycle. As an alternative, remove the `@bounded`
+tag when the workflow is meant to keep turning. A `@tool` workflow has no such
+alternative.
+
+The invalid fixture is `examples/invalid/bounded-workflow-effect-cycle.whip`.
 
 ### Recursive agent tool grant
 
@@ -469,6 +502,7 @@ usual diagnostics:
 | `evidence-fact-match.whip` | A match of a fact that is evidence only, as a fact that a rule can match. |
 | `recursive-pattern.whip` | A recursive application of a pattern, which is a cycle in the expansion. |
 | `recursive-workflow-invocation.whip` | A cycle of `invoke` statements between workflows. |
-| `effectful-rule-cycle.whip` | A cycle of two rules or more in the rule dependency graph, in which a rule runs an effect. |
+| `effectful-rule-cycle.whip` | A cycle of two rules or more that turns inside one commit, in which a rule runs an effect. |
+| `bounded-workflow-effect-cycle.whip` | A cycle of rules that waits on the world, in a workflow that declares that it settles. |
 | `tool-grant-cycle.whip` | A cycle in the invoke-tool graph of the agent `tools` grants. |
 | `invoke-service-workflow.whip` | An `invoke` statement whose target is a `@service` workflow and therefore reaches no terminal. |
