@@ -1284,6 +1284,33 @@ mod tests {
     /// was handed verifies — the read-through cache does, a bare store does
     /// not. Without this, a substituted node silently redefines that much of
     /// the manifest and every reader downstream believes it.
+    /// A node the store does not have is refused by name.
+    ///
+    /// Found by the capped sweep probe rather than by reading: pointing
+    /// `check-new-refusals.sh` at this file reported the refusal UNEXERCISED.
+    /// It is the plainest failure in the walk — the tree names a node the store
+    /// cannot serve — and nothing distinguished it from any other `Conflict`.
+    #[test]
+    fn a_node_absent_from_the_store_is_refused_by_name() {
+        let blobs = CountingBlobs::default();
+        let root = build(&blobs, &manifest(240)).expect("tree builds");
+        let parsed =
+            parse_node(&blobs.get(&root).expect("reads").expect("live")).expect("root parses");
+        assert!(
+            parsed.level > 0,
+            "the fixture must have interior nodes, or removing one removes the root"
+        );
+        let victim = parsed.entries[0].1.clone();
+        blobs.stored.borrow_mut().remove(&victim);
+
+        let error = load(&blobs, &root).expect_err("an absent node is refused");
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains(&victim) && rendered.contains("absent from the content store"),
+            "the refusal must name the node it could not read, got {rendered}"
+        );
+    }
+
     #[test]
     fn a_node_whose_bytes_do_not_match_its_id_is_refused_on_load() {
         let blobs = CountingBlobs::default();
