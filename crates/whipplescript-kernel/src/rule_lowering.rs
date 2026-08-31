@@ -4326,7 +4326,7 @@ pub fn parsed_effect_input_json(
     let mut input = match effect.kind.as_str() {
         "agent.tell" => json!({
             "prompt": effect.prompt.as_deref().unwrap_or_default(),
-            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell, &ir.file_stores),
+            "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::AgentTell, &ir.file_stores, &ir.vaults),
             "turn_skills": effect_turn_skills_json(rule, effect, IrEffectKind::AgentTell),
             "on_stream": effect_on_stream_json(rule, effect, IrEffectKind::AgentTell),
             "rule": rule.name,
@@ -4607,7 +4607,7 @@ pub fn parsed_effect_input_json(
                     rule,
                     effect,
                     IrEffectKind::SchemaCoerce,
-                    &ir.file_stores,
+                    &ir.file_stores, &ir.vaults,
                 ),
             });
             // Sum-type output (spec/sum-types.md): embed deterministic
@@ -4904,7 +4904,13 @@ pub fn parsed_effect_input_json(
             insert_json_field(
                 &mut input,
                 "access_grants",
-                effect_access_grants_json(rule, effect, IrEffectKind::ExecCommand, &ir.file_stores),
+                effect_access_grants_json(
+                    rule,
+                    effect,
+                    IrEffectKind::ExecCommand,
+                    &ir.file_stores,
+                    &ir.vaults,
+                ),
             );
             let parse_spec_index = 1;
             if let Some(spec) = effect.args.get(parse_spec_index) {
@@ -5239,7 +5245,7 @@ pub fn parsed_effect_input_json(
             json!({
                 "target_workflow": effect.target,
                 "input": Value::Object(parse_record_fields(body, context, errors)),
-                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke, &ir.file_stores),
+                "access_grants": effect_access_grants_json(rule, effect, IrEffectKind::WorkflowInvoke, &ir.file_stores, &ir.vaults),
                 "bindings": context_bindings_json(context),
                 "rule": rule.name,
             })
@@ -5278,6 +5284,7 @@ pub fn effect_access_grants_json(
     effect: &ParsedEffect,
     kind: IrEffectKind,
     file_stores: &[IrFileStore],
+    vaults: &[whipplescript_parser::IrVault],
 ) -> Value {
     let Some(node) = rule.metadata.effects.iter().find(|node| {
         if node.kind != kind {
@@ -5332,6 +5339,27 @@ pub fn effect_access_grants_json(
                                 "allow_write": store.write_globs,
                             }),
                         );
+                    }
+                }
+                // The same shape for a vault grant (DR-0053 §5 Amendment): the
+                // container's DECLARATION carries the kind every member is
+                // created as, and the harness needs it to generate. Projected
+                // here rather than written on the grant, so the declaration
+                // stays the single source and the two cannot diverge — a grant
+                // stating its own kind would be the "declaration beside a use"
+                // §5 refuses.
+                if let Some(name) = grant.resource.strip_prefix("vault ") {
+                    if let Some(vault) = vaults.iter().find(|vault| vault.name == name) {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(
+                                "vault_policy".to_owned(),
+                                json!({
+                                    "kind": vault.kind,
+                                    "allow": vault.allow,
+                                    "retain": vault.retain,
+                                }),
+                            );
+                        }
                     }
                 }
                 value

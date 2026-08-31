@@ -2107,6 +2107,16 @@ impl<'a> BodyParser<'a> {
             };
             resource = format!("credential {name}");
         }
+        // A vault grant qualifies the same way (DR-0053 §14 Amendment
+        // 2026-08-29). It is a CONTAINER grant — what may be done to the vault,
+        // not what its members may do — so its operations are the container
+        // set, and the member operations keep naming a credential.
+        if resource == "vault" && !self.at_sym('{') {
+            let Some(name) = self.ident_text("vault name after `with access to vault`") else {
+                return false;
+            };
+            resource = format!("vault {name}");
+        }
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(

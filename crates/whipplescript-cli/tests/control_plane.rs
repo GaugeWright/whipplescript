@@ -12875,6 +12875,94 @@ fn lint_flags_an_envelope_field_read_off_an_untyped_payload() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `lint.broad_vault_grant` — the sibling of `lint.broad_file_grant`, and it
+/// matters more: a vault hands an agent unbounded generated members, so every
+/// one of them carries whatever the container allows.
+///
+/// A vault has no globs, so "broad" is two shapes rather than one `**`, and the
+/// cases below pin both AND the narrow declarations that must stay silent.
+#[test]
+fn lint_flags_a_broad_vault_grant() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let stores = temp_store_path();
+    let dir = unique_temp_dir("lint-vault");
+
+    let findings = |declaration: &str| -> Vec<String> {
+        let wf = dir.join("vault.whip");
+        fs::write(
+            &wf,
+            format!(
+                r#"use std.custody
+
+@service
+workflow V
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+vault v {declaration}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule j
+  when Ticket as t where t.status == "open"
+=> {{
+  complete result {{ ok true }}
+}}
+"#
+            ),
+        )
+        .expect("write workflow");
+        let output = whip(bin, &stores)
+            .args(["--json", "lint", wf.to_str().expect("present")])
+            .output()
+            .expect("lint runs");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("lint JSON");
+        report
+            .get("findings")
+            .and_then(Value::as_array)
+            .expect("findings")
+            .iter()
+            .filter(|f| f.get("code").and_then(Value::as_str) == Some("lint.broad_vault_grant"))
+            .filter_map(|f| f.get("message").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+
+    // Narrow: one operation of the two `ed25519` supports. Nothing to say.
+    assert!(
+        findings("{ kind ed25519  allow [sign] }").is_empty(),
+        "a narrowed vault must be silent"
+    );
+
+    // The `**` analogue: every operation the kind can perform.
+    let maxed = findings("{ kind ed25519  allow [sign, verify] }");
+    assert!(
+        maxed.iter().any(|m| m.contains("allows every operation")),
+        "{maxed:?}"
+    );
+
+    // A genuine wrapping vault is TWO operations and still one duty, so the
+    // duty check must not fire on it — this is what keeps the sharper signal
+    // from collapsing into "more than one operation".
+    assert!(
+        findings("{ kind raw  allow [wrap, unwrap] }").is_empty(),
+        "a single-duty wrapping vault must be silent"
+    );
+
+    // Two duties in one container: a wrapping key that can also reach the
+    // network, which is the shape ruling 2 turned on.
+    let mixed = findings("{ kind raw  allow [wrap, request] }");
+    assert!(
+        mixed
+            .iter()
+            .any(|m| m.contains("allows both egress and non-egress")),
+        "{mixed:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn lint_flags_deep_after_nesting() {
     // A rule nesting `after` blocks ≥4 levels deep is flagged (suggest a `flow`); a

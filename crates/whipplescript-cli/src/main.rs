@@ -2281,6 +2281,80 @@ fn lint_broad_file_grants(ir: &IrProgram) -> Vec<LintFinding> {
     findings
 }
 
+/// A `vault` declaration whose `allow` list is wider than a container of
+/// dynamically-named credentials should be (DR-0053 §14 Amendment 2026-08-29).
+///
+/// The sibling of `lint.broad_file_grant`, and it matters more: a broad grant
+/// over a credential container is worth more to an attacker than one over
+/// files, because a vault hands an agent unbounded generated members and every
+/// one of them carries whatever the container allows.
+///
+/// A vault has no globs, so "broad" is two shapes rather than one `**`.
+///
+/// **Everything the kind can do.** The direct `**` analogue: an `allow` that
+/// names every operation its kind supports is the maximum, and a container that
+/// took the maximum is one where nobody chose. Silent when the kind supports
+/// exactly one operation, because there the maximum IS the minimum and there is
+/// nothing to narrow.
+///
+/// **Two duties in one container.** The sharper signal, and the one ruling 2
+/// turned on: an `allow` spanning an egress operation and a non-egress one is a
+/// wrapping key that can also reach the network. `raw` reaches four of the five
+/// operation classes precisely because it is not a purpose, so this is the
+/// shape a `kind raw` vault falls into by default.
+fn lint_broad_vault_grants(ir: &IrProgram) -> Vec<LintFinding> {
+    use whipplescript_custody::{CredentialKind, Operation};
+
+    let egress = |name: &str| matches!(name, "request" | "mint");
+    let mut findings = Vec::new();
+    for vault in &ir.vaults {
+        let Ok(kind) = CredentialKind::parse(&vault.kind) else {
+            continue;
+        };
+        let supported: Vec<&str> = Operation::ALL
+            .into_iter()
+            .filter(|operation| kind.supports(*operation))
+            .map(|operation| operation.as_str())
+            .collect();
+        if supported.len() > 1
+            && supported
+                .iter()
+                .all(|op| vault.allow.iter().any(|a| a == op))
+        {
+            findings.push(LintFinding {
+                code: "lint.broad_vault_grant",
+                severity: Severity::Warning,
+                message: format!(
+                    "vault `{}` allows every operation `{}` can perform ({}) — narrow it to the \
+                     operations its members are actually for",
+                    vault.name,
+                    vault.kind,
+                    supported.join(", ")
+                ),
+                name: Some(vault.name.clone()),
+                span: None,
+            });
+        }
+        let reaches_network = vault.allow.iter().any(|op| egress(op));
+        let stays_local = vault.allow.iter().any(|op| !egress(op));
+        if reaches_network && stays_local {
+            findings.push(LintFinding {
+                code: "lint.broad_vault_grant",
+                severity: Severity::Warning,
+                message: format!(
+                    "vault `{}` allows both egress and non-egress operations ({}) — one container \
+                     holding keys for two duties means every member carries both",
+                    vault.name,
+                    vault.allow.join(", ")
+                ),
+                name: Some(vault.name.clone()),
+                span: None,
+            });
+        }
+    }
+    findings
+}
+
 /// Rules whose `after` blocks nest deeply (≥ `DEEP_AFTER_THRESHOLD` levels). A long
 /// `after`-chain is what `then` sugar expresses more clearly, so this is a
 /// maintainability hint (severity `info`), not a correctness issue. The depth is
@@ -2614,6 +2688,7 @@ fn lint_program(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     findings.extend(lint_noop_rules(ir));
     findings.extend(lint_unused_types(source, ir));
     findings.extend(lint_broad_file_grants(ir));
+    findings.extend(lint_broad_vault_grants(ir));
     findings.extend(lint_deep_after_nesting(ir));
     findings.extend(lint_tool_grant_requires_owned_harness(ir));
     findings.extend(lint_mark_consumption_boundaries(ir));

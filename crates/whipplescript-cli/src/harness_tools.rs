@@ -192,6 +192,15 @@ fn file_tool_specs_for_turn(
 /// time, fetch is structurally GET-only behind the central guard.
 pub const TOOL_CREDENTIAL_REQUEST: &str = "credential_request";
 
+/// The agent-facing CREATION surface (DR-0053 §5 Amendment 2026-08-29).
+///
+/// `generate` is a tool rather than a language statement because its value is
+/// concentrated exactly where the author does not know what is needed: whether
+/// a credential is needed at all, and of what kind, is discovered while doing
+/// the work. A statement form would be usable only by the programs that did not
+/// need it.
+pub const TOOL_CREDENTIAL_GENERATE: &str = "credential_generate";
+
 /// The agent-facing custody surface (DR-0053 §14). Offered only to a turn whose
 /// grant lists `request` on at least one credential, and the credentials it may
 /// name are exactly those — so a turn granted nothing sees no tool at all,
@@ -201,11 +210,13 @@ pub const TOOL_CREDENTIAL_REQUEST: &str = "credential_request";
 /// no way to reach `CustodyOp::Request`, so the narrowing clause parsed, passed
 /// its class check, and bound nothing.
 fn credential_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    specs.extend(vault_tool_specs_for_turn(access));
     if access.credentials.is_empty() {
-        return Vec::new();
+        return specs;
     }
     let handles: Vec<String> = access.credentials.scopes.keys().cloned().collect();
-    vec![ToolSpec {
+    specs.push(ToolSpec {
         name: TOOL_CREDENTIAL_REQUEST.into(),
         description: format!(
             "Send an authenticated HTTP request under a credential this turn was granted \
@@ -227,6 +238,87 @@ fn credential_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
                 "body": { "type": "string" }
             },
             "required": ["credential", "method", "url"],
+            "additionalProperties": false
+        }),
+    });
+    specs
+}
+
+/// The creation surface, offered only to a turn granted `create` on at least
+/// one vault — and naming exactly those, so a turn granted nothing sees no tool
+/// rather than a tool that always refuses.
+///
+/// No `kind` parameter. The vault declares the kind for every member
+/// (DR-0053 §5 Amendment), which is what keeps the static kind refusal
+/// reachable for a member the compiler cannot name; letting the model choose
+/// one would put that back in the model's hands at the moment it matters least.
+/// The governance ceiling, as a pure function of the envelope's status.
+///
+/// A REJECTED policy is an error rather than a silent "no scope": a tampered
+/// policy must not read as a permissive one, which is the whole reason the
+/// three-way status exists instead of an `Option`.
+///
+/// Extracted because the rejected arm is otherwise reachable only by pointing
+/// `WHIPPLESCRIPT_IFC_ENVELOPE` at a tampered policy from inside a test — an
+/// environment mutation that races every other test in the binary. As a
+/// function it is testable directly, and the custody handlers stop carrying two
+/// copies of the same three arms.
+fn governance_envelope(
+    status: crate::ifc::EnvelopeStatus,
+) -> Result<Option<Box<crate::ifc::VerifiedEnvelope>>, String> {
+    match status {
+        crate::ifc::EnvelopeStatus::Ungoverned => Ok(None),
+        crate::ifc::EnvelopeStatus::Verified(verified) => Ok(Some(verified)),
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            Err(format!("governance envelope rejected: {message}"))
+        }
+    }
+}
+
+/// What a `generate` reply means, as a pure function.
+///
+/// Extracted from the handler because its two refusal arms are otherwise
+/// reachable only through a live custodian socket — and a refusal reachable
+/// only from an environment the test suite does not have is a refusal nothing
+/// gates. The same move `vault_encode` needed for the same reason.
+fn generated_reply(
+    outcome: Result<whipplescript_custody::CustodyOk, whipplescript_custody::CustodyError>,
+) -> Result<String, String> {
+    match outcome {
+        Ok(whipplescript_custody::CustodyOk::Generated { credential, kind }) => Ok(json!({
+            "credential": credential.as_str(),
+            "kind": kind.as_str(),
+        })
+        .to_string()),
+        Ok(other) => Err(format!("custodian answered a generate with {other:?}")),
+        Err(refusal) => Err(format!("custodian refused: {refusal:?}")),
+    }
+}
+
+fn vault_tool_specs_for_turn(access: &TurnToolAccess) -> Vec<ToolSpec> {
+    if access.vaults.is_empty() {
+        return Vec::new();
+    }
+    let vaults: Vec<String> = access.vaults.creatable.keys().cloned().collect();
+    vec![ToolSpec {
+        name: TOOL_CREDENTIAL_GENERATE.into(),
+        description: format!(
+            "Create a credential in a vault this turn was granted ({}). The vault's declaration \
+             fixes the kind. Creation and registration are one act: the reply is a HANDLE, never \
+             material, and the material is generated inside the custodian and never enters this \
+             process. Use the returned name wherever a credential name is expected.",
+            vaults.join(", ")
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "vault": { "type": "string", "enum": vaults },
+                "name": {
+                    "type": "string",
+                    "description": "member name within the vault; the full credential is `<vault>/<name>`"
+                }
+            },
+            "required": ["vault", "name"],
             "additionalProperties": false
         }),
     }]
@@ -394,6 +486,7 @@ pub struct FileToolExecutor {
     /// no grant, so the tool is not offered and any call refuses — direct and
     /// test executors never expose it.
     credential_access: Option<TurnCredentialAccess>,
+    vault_access: Option<TurnVaultAccess>,
     /// Per-pool memory authority (MEM-5). `None` = deny (direct/test
     /// executors never expose the memory tools).
     memory_access: Option<TurnMemoryAccess>,
@@ -510,6 +603,7 @@ struct TurnToolAccess {
     /// governance ceiling, never beside it: the envelope says where a
     /// credential may reach at all, and this says where this turn may take it.
     credentials: TurnCredentialAccess,
+    vaults: TurnVaultAccess,
 }
 
 /// Per-credential egress narrowing for one turn, keyed by the handle as the
@@ -517,6 +611,40 @@ struct TurnToolAccess {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TurnCredentialAccess {
     scopes: BTreeMap<String, Vec<String>>,
+}
+
+/// The vaults this turn may create into (DR-0053 §5/§14 Amendments).
+///
+/// A separate axis from `TurnCredentialAccess`, which carries per-credential
+/// `request` scopes. A vault grant is a CONTAINER grant — what may be done to
+/// the container — so it narrows by vault name rather than by URL, and there is
+/// nothing to glob.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct TurnVaultAccess {
+    /// Vault name to the KIND its declaration fixes for every member. The kind
+    /// is projected into the grant by the lowering rather than written on the
+    /// grant, so the declaration stays the single source.
+    creatable: BTreeMap<String, String>,
+}
+
+impl TurnVaultAccess {
+    fn grant_create(&mut self, vault: &str, kind: String) {
+        self.creatable.insert(vault.to_owned(), kind);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.creatable.is_empty()
+    }
+
+    /// Whether this turn may create into `vault`, and why not when it may not.
+    /// Governance is a separate ceiling asked after this one — a turn grant can
+    /// only narrow.
+    fn admits_create(&self, vault: &str) -> Result<&str, String> {
+        self.creatable
+            .get(vault)
+            .map(String::as_str)
+            .ok_or_else(|| format!("this turn was granted no `create` on vault `{vault}`"))
+    }
 }
 
 impl TurnCredentialAccess {
@@ -567,6 +695,7 @@ impl TurnToolAccess {
             command_run: false,
             tracker: TurnTrackerAccess::deny_all(),
             credentials: TurnCredentialAccess::default(),
+            vaults: TurnVaultAccess::default(),
             memory: TurnMemoryAccess::deny_all(),
             web_search: false,
             web_fetch: false,
@@ -949,6 +1078,7 @@ impl FileToolExecutor {
             web_fetch_granted: false,
             tracker_access: None,
             credential_access: None,
+            vault_access: None,
             memory_access: None,
             mcp: None,
             workflow_tools: Vec::new(),
@@ -1174,6 +1304,7 @@ impl FileToolExecutor {
         self.tracker_access = Some(access.tracker);
         self.memory_access = Some(access.memory);
         self.credential_access = Some(access.credentials);
+        self.vault_access = Some(access.vaults);
         self
     }
 
@@ -1295,6 +1426,7 @@ impl FileToolExecutor {
             TOOL_WEB_SEARCH => self.web_search(args),
             TOOL_WEB_FETCH => self.web_fetch(args),
             TOOL_CREDENTIAL_REQUEST => self.credential_request(args),
+            TOOL_CREDENTIAL_GENERATE => self.credential_generate(args),
             TOOL_RECALL_MEMORY => self.recall_memory(args),
             TOOL_LEARN_MEMORY => self.learn_memory(args),
             TOOL_READ => self.read(args),
@@ -2198,6 +2330,77 @@ impl FileToolExecutor {
         Ok(json!({ "id": item.id }).to_string())
     }
 
+    /// DR-0053 §5 Amendment: create a credential in a granted vault.
+    ///
+    /// Creation and registration are ONE act. An agent that could create
+    /// without registering could produce an authority nobody knows about; one
+    /// that can only create-and-register cannot, and the reply is a handle so
+    /// the material never enters this process.
+    ///
+    /// Two ceilings, intersected in the order that makes the diagnostic useful,
+    /// exactly as `credential_request` does: this turn's grant first (what the
+    /// author asked for), then governance (what the envelope allows at all).
+    /// A turn grant can only narrow.
+    fn credential_generate(&self, args: &Value) -> Result<String, String> {
+        let vault = args
+            .get("vault")
+            .and_then(Value::as_str)
+            .ok_or("credential_generate needs a `vault`")?;
+        let member = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("credential_generate needs a `name`")?;
+
+        // Ceiling 1: this turn's grant.
+        let Some(access) = self.vault_access.as_ref() else {
+            return Err("this turn was granted no vault".to_owned());
+        };
+        let kind = access.admits_create(vault)?;
+
+        // Ceiling 2: the signed envelope. A REJECTED policy is an error rather
+        // than a silent "no scope" — a tampered policy must not read as a
+        // permissive one.
+        governance_envelope(crate::ifc::VerifiedEnvelope::load_from_env())?;
+
+        // A vault is a `/`-PREFIX in `CredentialName`, so the member's own name
+        // must not carry one: `deploy_keys/a/b` would nest a container the
+        // grant never named, and §14's ancestor walk would bind it to the wrong
+        // prefix.
+        if member.contains('/') {
+            return Err(format!(
+                "member name `{member}` carries a `/`: a vault is a prefix, so a member that \
+                 nests another one would be governed by a container the grant never named"
+            ));
+        }
+        let kind = whipplescript_custody::CredentialKind::parse(kind)
+            .map_err(|error| format!("vault `{vault}` kind: {error}"))?;
+        let name = whipplescript_custody::CredentialName::new(&format!("{vault}/{member}"))
+            .map_err(|error| format!("credential name: {error}"))?;
+
+        let Some(transport) = crate::custody_egress_transport()? else {
+            return Err(
+                "no custodian socket (WHIPPLESCRIPT_CUSTODIAN_SOCKET): a credential cannot be \
+                 created without one"
+                    .to_owned(),
+            );
+        };
+        let call = whipplescript_custody::CustodyCall::new(
+            whipplescript_custody::UseAttribution {
+                run_id: self.work_unit.clone(),
+                actor: Some(self.holder.clone()),
+                effect_key: None,
+            },
+            whipplescript_custody::CustodyOp::Generate {
+                credential: name.clone(),
+                kind,
+            },
+        );
+        let reply = transport
+            .call(call)
+            .map_err(|error| format!("custodian unreachable: {error:?}"))?;
+        generated_reply(reply.outcome)
+    }
+
     /// DR-0053 §14: an authenticated request from inside a turn.
     ///
     /// Two ceilings, intersected, in the order that makes the diagnostic
@@ -2229,14 +2432,9 @@ impl FileToolExecutor {
         // Ceiling 2: the signed envelope. A REJECTED policy is an error rather
         // than a silent "no scope" — a tampered policy must not read as a
         // permissive one.
-        match crate::ifc::VerifiedEnvelope::load_from_env() {
-            crate::ifc::EnvelopeStatus::Ungoverned => {}
-            crate::ifc::EnvelopeStatus::Rejected(message) => {
-                return Err(format!("governance envelope rejected: {message}"))
-            }
-            crate::ifc::EnvelopeStatus::Verified(verified) => {
-                verified.admits_request(credential, method, url)?;
-            }
+        if let Some(verified) = governance_envelope(crate::ifc::VerifiedEnvelope::load_from_env())?
+        {
+            verified.admits_request(credential, method, url)?;
         }
 
         let name = whipplescript_custody::CredentialName::new(credential)
@@ -3988,6 +4186,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     let mut file_resources = Vec::<String>::new();
     let mut command_run = false;
     let mut credentials = TurnCredentialAccess::default();
+    let mut vaults = TurnVaultAccess::default();
     let mut tracker = TurnTrackerAccess::deny_all();
     let mut memory = TurnMemoryAccess::deny_all();
     let mut web_search = false;
@@ -4030,6 +4229,11 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
         // unregistered server, because `request` is not a built-in file or
         // tracker verb.
         let declared_credential = resource.starts_with("credential ");
+        // Same shape recognition as a credential grant, and for the same
+        // reason: `create` is not a built-in file or tracker verb, so without
+        // this a vault grant reaches the MCP arm and is reported as an
+        // unregistered server.
+        let declared_vault = resource.starts_with("vault ");
         let declared_memory_pool = !operations.is_empty()
             && operations.iter().all(|operation| {
                 operation
@@ -4043,6 +4247,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
             && !declared_file_store
             && !declared_memory_pool
             && !declared_credential
+            && !declared_vault
         {
             let registry = match mcp_registry {
                 Some(ref registry) => registry,
@@ -4128,6 +4333,32 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                         credentials.grant(handle, globs);
                     }
                 }
+                // A vault grant is container-scoped: `create` names what may be
+                // done TO the container, and the vault's own `allow` list says
+                // what its members may do. No globs — there is no URL to
+                // narrow, and §14 makes a glob on a non-narrowable operation a
+                // check error rather than a no-op.
+                // Spelled `generate`, not `create`. §14's amendment wrote the
+                // container grants as create/list/rotate/revoke, but the
+                // protocol operation, the enum variant and the tool are all
+                // `generate` — an author writing `create` while the custodian
+                // records `generate` is a translation layer bought for nothing,
+                // and the record now says `generate` too.
+                "generate" if resource.starts_with("vault ") => {
+                    let vault = resource.trim_start_matches("vault ").trim();
+                    // The kind comes from `vault_policy`, which the lowering
+                    // projects from the declaration. A grant that carries none
+                    // names a vault the program does not declare, and the
+                    // parser already refuses that — so this is belt and braces
+                    // rather than a second policy.
+                    let kind = grant
+                        .get("vault_policy")
+                        .and_then(|policy| policy.get("kind"))
+                        .and_then(Value::as_str);
+                    if let (false, Some(kind)) = (vault.is_empty(), kind) {
+                        vaults.grant_create(vault, kind.to_owned());
+                    }
+                }
                 "run" if resource == "command" => command_run = true,
                 "search" if resource == WEB_RESOURCE => web_search = true,
                 "fetch" if resource == WEB_RESOURCE => web_fetch = true,
@@ -4193,6 +4424,7 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
     }
     Ok(TurnToolAccess {
         credentials,
+        vaults,
         file: TurnFileAccess { scopes },
         file_resources,
         command_run,
@@ -5199,6 +5431,144 @@ mod tests {
         assert!(!no_read.system_prompt.contains("<available_skills>"));
     }
 
+    /// The `credential_generate` handler's refusals. Each is a way the tool can
+    /// fail before a custodian is ever reached, and they were unpinned until
+    /// the sweep asked — the tool's SURFACE was tested and its handler was not.
+    #[test]
+    fn generate_refuses_before_it_reaches_a_custodian() {
+        let root = temp_root();
+
+        // No vault access at all: the turn granted none, so the tool should not
+        // have been offered — reaching the handler means something is wrong.
+        let ungranted = FileToolExecutor::new(&root);
+        let err = ungranted
+            .credential_generate(&json!({ "vault": "v", "name": "m" }))
+            .expect_err("a turn with no vault must refuse");
+        assert!(err.contains("granted no vault"), "{err}");
+
+        let mut granted = FileToolExecutor::new(&root);
+        let mut access = TurnVaultAccess::default();
+        access.grant_create("deploy_keys", "ed25519".to_owned());
+        granted.vault_access = Some(access);
+
+        // A vault the turn does not hold.
+        let other = granted
+            .credential_generate(&json!({ "vault": "other", "name": "m" }))
+            .expect_err("an ungranted vault must refuse");
+        assert!(
+            other.contains("granted no `create` on vault `other`"),
+            "{other}"
+        );
+
+        // A member name carrying a `/` would nest a container the grant never
+        // named, and §14's ancestor walk would bind it to the wrong prefix.
+        let nested = granted
+            .credential_generate(&json!({ "vault": "deploy_keys", "name": "a/b" }))
+            .expect_err("a nested member name must refuse");
+        assert!(nested.contains("carries a `/`"), "{nested}");
+
+        // Past every check and into the transport, which is absent here. This
+        // is what proves the checks above are refusing for their own reasons
+        // rather than because nothing works.
+        let socket = granted
+            .credential_generate(&json!({ "vault": "deploy_keys", "name": "ci" }))
+            .expect_err("no custodian socket must refuse");
+        assert!(socket.contains("no custodian socket"), "{socket}");
+    }
+
+    /// `credential_request`'s own pre-flight refusals, the twins of the
+    /// generate handler's. A turn granted no credential should never have been
+    /// offered the tool, so reaching the handler means something is wrong —
+    /// and the refusal says so rather than failing further in.
+    #[test]
+    fn request_refuses_before_it_reaches_a_custodian() {
+        let root = temp_root();
+
+        let ungranted = FileToolExecutor::new(&root);
+        let err = ungranted
+            .credential_request(&json!({
+                "credential": "stripe_api",
+                "method": "POST",
+                "url": "https://api.stripe.com/v1/refunds"
+            }))
+            .expect_err("a turn with no credential must refuse");
+        assert!(err.contains("granted no credential"), "{err}");
+
+        let mut granted = FileToolExecutor::new(&root);
+        let mut access = TurnCredentialAccess::default();
+        access.grant("stripe_api", vec!["https://api.stripe.com/v1/*".to_owned()]);
+        granted.credential_access = Some(access);
+
+        // Granted, but aimed outside the turn's own narrowing.
+        let outside = granted
+            .credential_request(&json!({
+                "credential": "stripe_api",
+                "method": "POST",
+                "url": "https://evil.example/v1/refunds"
+            }))
+            .expect_err("a URL outside the turn grant must refuse");
+        assert!(outside.contains("stripe_api"), "{outside}");
+    }
+
+    /// The governance ceiling's three arms. The rejected one is the reason the
+    /// status is three-way rather than an `Option`: a tampered policy must not
+    /// read as a permissive one, and it was unreachable from a test until the
+    /// gate became a function — pointing `WHIPPLESCRIPT_IFC_ENVELOPE` at a
+    /// tampered policy races every other test in the binary.
+    #[test]
+    fn a_rejected_governance_envelope_is_an_error_not_an_absent_scope() {
+        assert!(matches!(
+            governance_envelope(crate::ifc::EnvelopeStatus::Ungoverned),
+            Ok(None)
+        ));
+
+        let err = governance_envelope(crate::ifc::EnvelopeStatus::Rejected(
+            "attestation does not verify".to_owned(),
+        ))
+        .err()
+        .expect("a rejected policy must be an error");
+        assert!(err.contains("governance envelope rejected"), "{err}");
+        // The reason travels with it: an operator holding a tampered policy
+        // needs to know WHY it was rejected, not only that it was.
+        assert!(err.contains("attestation does not verify"), "{err}");
+    }
+
+    /// The reply mapping, as a pure function. Its two refusal arms are
+    /// otherwise reachable only through a live custodian socket, and a refusal
+    /// reachable only from an environment the suite does not have is one
+    /// nothing gates.
+    #[test]
+    fn a_generate_reply_is_a_handle_or_a_named_refusal() {
+        let name = whipplescript_custody::CredentialName::new("deploy_keys/ci").expect("name");
+        let ok = generated_reply(Ok(whipplescript_custody::CustodyOk::Generated {
+            credential: name.clone(),
+            kind: whipplescript_custody::CredentialKind::Ed25519,
+        }))
+        .expect("a generated reply maps to a handle");
+        assert!(
+            ok.contains("deploy_keys/ci") && ok.contains("ed25519"),
+            "{ok}"
+        );
+        // The handle and nothing else: a reply carrying material would be the
+        // one thing this operation must never do.
+        assert!(!ok.contains("material"), "{ok}");
+
+        let wrong_shape = generated_reply(Ok(whipplescript_custody::CustodyOk::Revoked {
+            existed: true,
+        }))
+        .expect_err("another success shape is not a generate reply");
+        assert!(
+            wrong_shape.contains("answered a generate with"),
+            "{wrong_shape}"
+        );
+
+        let refused = generated_reply(Err(
+            whipplescript_custody::CustodyError::UnknownCredential { credential: name },
+        ))
+        .expect_err("a custodian refusal must surface");
+        assert!(refused.contains("custodian refused"), "{refused}");
+    }
+
     #[test]
     fn write_then_read_round_trip() {
         let root = temp_root();
@@ -5800,6 +6170,75 @@ mod tests {
             .expect("enum");
         assert_eq!(enumerated.len(), 1);
         assert_eq!(enumerated[0].as_str(), Some("stripe_api"));
+    }
+
+    #[test]
+    fn the_generate_tool_is_offered_only_for_granted_vaults() {
+        // Same shape as the request tool: a turn granted nothing sees no tool
+        // at all, rather than one that always refuses.
+        let none = turn_tool_access_from_input(&json!({ "access_grants": [] }).to_string())
+            .expect("grants parse");
+        assert!(vault_tool_specs_for_turn(&none).is_empty());
+
+        let granted = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "vault deploy_keys",
+                        "operations": [
+                            { "operation": "generate", "target": null, "globs": [] }
+                        ],
+                        "vault_policy": { "kind": "ed25519", "allow": ["sign"], "retain": "instance" }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+        let specs = vault_tool_specs_for_turn(&granted);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, TOOL_CREDENTIAL_GENERATE);
+
+        // The vault enum is exactly what was granted, and there is NO `kind`
+        // parameter: the declaration fixes it, which is what keeps the static
+        // kind refusal reachable for a member the compiler cannot name.
+        let enumerated = specs[0].input_schema["properties"]["vault"]["enum"]
+            .as_array()
+            .expect("enum");
+        assert_eq!(enumerated.len(), 1);
+        assert_eq!(enumerated[0].as_str(), Some("deploy_keys"));
+        assert!(
+            specs[0].input_schema["properties"].get("kind").is_none(),
+            "the model must not choose the kind: {:?}",
+            specs[0].input_schema
+        );
+
+        // And the kind the lowering projected is what the turn will generate as.
+        assert_eq!(granted.vaults.admits_create("deploy_keys"), Ok("ed25519"));
+        assert!(granted.vaults.admits_create("other").is_err());
+    }
+
+    /// A grant carrying no `vault_policy` names a vault the program does not
+    /// declare — the parser refuses that, so reaching here means the two
+    /// disagree. Granting nothing is the safe reading: a tool offered without a
+    /// kind would have to invent one.
+    #[test]
+    fn a_vault_grant_without_a_declared_policy_grants_nothing() {
+        let access = turn_tool_access_from_input(
+            &json!({
+                "access_grants": [
+                    {
+                        "resource": "vault deploy_keys",
+                        "operations": [
+                            { "operation": "generate", "target": null, "globs": [] }
+                        ]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("grants parse");
+        assert!(vault_tool_specs_for_turn(&access).is_empty());
     }
 
     #[test]

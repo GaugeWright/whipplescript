@@ -4645,6 +4645,86 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
 /// An unparseable kind is left alone too: the credential declaration's own
 /// check owns that error, and reporting it twice from here would say nothing
 /// new.
+/// A `with access to vault <name> { … }` grant names a declared vault and lists
+/// CONTAINER operations (DR-0053 §14 Amendment 2026-08-29).
+///
+/// The two refusals are the two ways the grant can mean nothing. A vault the
+/// program does not declare would reach the custodian as an unknown container
+/// at generate time; a MEMBER operation named here — `sign`, `wrap` — reads as
+/// narrowed while granting nothing, because the container grants decide what
+/// may be done TO the vault and a declaration's `allow` decides what its
+/// members may do.
+fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    use whipplescript_custody::Operation;
+
+    let declared: BTreeSet<&str> = ir.vaults.iter().map(|vault| vault.name.as_str()).collect();
+    for rule in &ir.rules {
+        for effect in &rule.metadata.effects {
+            for grant in &effect.access_grants {
+                let Some(name) = grant.resource.strip_prefix("vault ") else {
+                    continue;
+                };
+                if !declared.contains(name) {
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: effect.span,
+                        message: format!(
+                            "rule `{}` grants access to undeclared vault `{name}`",
+                            rule.name
+                        ),
+                        suggestion: Some(format!(
+                            "declare it with `vault {name} {{ kind <kind>  allow [<op>, ...] }}`"
+                        )),
+                    });
+                    continue;
+                }
+                for op in &grant.operations {
+                    let Ok(operation) = Operation::parse(&op.operation) else {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` grants unknown operation `{}` on vault `{name}`",
+                                rule.name, op.operation
+                            ),
+                            suggestion: Some(format!(
+                                "a vault grant names container operations: {}",
+                                Operation::CONTAINER
+                                    .iter()
+                                    .map(|op| op.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                        });
+                        continue;
+                    };
+                    if !operation.is_container() {
+                        diagnostics.push(Diagnostic {
+                            related: Vec::new(),
+                            span: effect.span,
+                            message: format!(
+                                "rule `{}` grants member operation `{}` on vault `{name}`, which \
+                                 is a container grant",
+                                rule.name,
+                                operation.as_str()
+                            ),
+                            suggestion: Some(format!(
+                                "a vault grant names what may be done TO the container ({}); what \
+                                 its members may do is the vault's own `allow` list",
+                                Operation::CONTAINER
+                                    .iter()
+                                    .map(|op| op.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     use whipplescript_custody::{CredentialKind, Operation};
 

@@ -398,6 +398,7 @@ pub(crate) fn lower_program(
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_credential_kinds(&ir, &mut diagnostics);
+    validate_turn_access_grant_vaults(&ir, &mut diagnostics);
     // DR-0043 Decision 5: attach extracted regions onto their lowered rules.
     for rule in &mut ir.rules {
         if let Some(region) = pending_regions.get(&rule.name) {

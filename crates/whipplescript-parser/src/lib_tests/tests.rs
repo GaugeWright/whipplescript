@@ -13799,6 +13799,112 @@ rule j
     assert_eq!(durable.vaults[0].provider.as_deref(), Some("openbao"));
 }
 
+/// `with access to vault <name> { generate }` (DR-0053 §5/§14 Amendments): the
+/// turn grant that makes `credential_generate` reachable.
+///
+/// A CONTAINER grant — what may be done TO the vault. What its members may do
+/// is the vault's own `allow` list, and naming a member operation here would
+/// read as narrowed while granting nothing.
+#[test]
+fn a_vault_turn_grant_names_a_declared_vault_and_container_operations() {
+    let program = |grant: &str| -> String {
+        format!(
+            r#"use std.agent
+use std.custody
+
+@service
+workflow Provision
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+vault deploy_keys {{
+  kind ed25519
+  allow [sign]
+}}
+
+agent provisioner {{
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule provision
+  when Ticket as t where t.status == "open"
+  when provisioner is available
+=> {{
+  tell provisioner
+    {grant}
+  as turn """markdown
+  Provision a key for {{{{ t.id }}}}.
+  """
+  after turn succeeds {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |grant: &str| -> Vec<String> {
+        compile_program(&program(grant))
+            .diagnostics
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+
+    assert_eq!(
+        messages("with access to vault deploy_keys { generate }"),
+        Vec::<String>::new()
+    );
+
+    let undeclared = messages("with access to vault ghost_keys { generate }");
+    assert!(
+        undeclared
+            .iter()
+            .any(|m| m.contains("grants access to undeclared vault `ghost_keys`")),
+        "{undeclared:?}"
+    );
+
+    // `sign` is a real operation and `deploy_keys` really is `ed25519`, so this
+    // is not the kind check firing — the refusal is that a MEMBER operation
+    // says nothing about the container.
+    let member_op = messages("with access to vault deploy_keys { sign }");
+    assert!(
+        member_op
+            .iter()
+            .any(|m| m.contains("grants member operation `sign` on vault `deploy_keys`")),
+        "{member_op:?}"
+    );
+
+    let unknown = messages("with access to vault deploy_keys { elevate }");
+    assert!(
+        unknown
+            .iter()
+            .any(|m| m.contains("grants unknown operation `elevate` on vault `deploy_keys`")),
+        "{unknown:?}"
+    );
+
+    // The declaration's kind reaches the grant, projected by the lowering, so
+    // the harness can generate without the grant restating it — a grant that
+    // stated its own kind could diverge from the declaration.
+    let ir = compile_program(&program("with access to vault deploy_keys { generate }"))
+        .ir
+        .expect("compiles");
+    let grant = ir
+        .rules
+        .iter()
+        .flat_map(|rule| rule.metadata.effects.iter())
+        .flat_map(|effect| effect.access_grants.iter())
+        .find(|grant| grant.resource == "vault deploy_keys")
+        .expect("the vault grant lowers");
+    assert_eq!(grant.operations.len(), 1);
+    assert_eq!(grant.operations[0].operation, "generate");
+}
+
 /// A vault must survive `whip fmt` whole. It carries four clauses and a
 /// formatter that rebuilds from the AST drops what it does not print — losing
 /// `allow` would silently widen the container's ceiling, and losing `retain

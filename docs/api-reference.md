@@ -395,6 +395,18 @@ These are the other analyses:
   `provider owned` or a harness of the `owned` kind. The grant is dead, because
   the system resolves and offers a sub-workflow tool only in the brokered loop
   of the owned harness.
+- **`lint.broad_vault_grant`** — a `vault` declaration whose `allow` list is
+  wider than a container of dynamically-named credentials should be. This is the
+  sibling of `lint.broad_file_grant`, and it matters more, because a vault hands
+  an agent members without bound and each of them carries whatever the container
+  allows. A vault holds no globs, so the finding covers two shapes. The first is
+  the analogue of a `**` glob: an `allow` that names each operation of its kind
+  is the maximum, and a container of the maximum is one where nobody chose. This
+  stays silent when the kind performs one operation, since there the maximum is
+  the minimum. The second is a list that spans an egress operation and a
+  non-egress one, which is a wrapping key that also reaches the network. A vault
+  of the `raw` kind falls into that shape by default, because `raw` performs
+  four of the five classes of operation.
 - **`lint.envelope_field_on_payload`** — a read of a terminal envelope field
   off a `Completed` payload whose shape is not statically known. The statement
   `after x completes as o` binds the envelope, which carries `tag`, `status`,
