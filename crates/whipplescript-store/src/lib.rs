@@ -38,20 +38,16 @@ pub mod working_set;
 pub mod workspace_api;
 pub mod workstreams;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::result;
 #[cfg(feature = "native")]
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-};
+use std::{fs, path::Path};
 // Re-exported so store-trait hosts built without the native backend (the DO
 // host) can construct `DiagnosticRecord`s without a direct core dependency.
 pub use whipplescript_core::Severity;
 
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
-#[cfg(feature = "native")]
 use serde_json::{json, Value};
 
 pub type StoreResult<T> = result::Result<T, StoreError>;
@@ -1152,6 +1148,26 @@ pub struct InstanceTransition<'a> {
     pub status: &'a str,
     pub reason: Option<&'a str>,
     pub idempotency_key: Option<&'a str>,
+}
+
+/// The instance status transitions the runtime admits. One table, so the native
+/// store and a store-trait host (the DO) cannot disagree about what a legal
+/// instance transition is.
+pub fn instance_transition_allowed(current: &str, next: &str) -> bool {
+    matches!(
+        (current, next),
+        ("running", "paused")
+            | ("paused", "running")
+            | ("running", "cancelled")
+            | ("paused", "cancelled")
+            | ("blocked", "cancelled")
+            // Generic internal failure terminal (flow auto-fail): an unhandled
+            // effect failure fails the instance directly, without an
+            // author-typed `failure` payload.
+            | ("running", "failed")
+            | ("paused", "failed")
+            | ("blocked", "failed")
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5537,23 +5553,6 @@ impl SqliteStore {
         &mut self,
         transition: InstanceTransition<'_>,
     ) -> StoreResult<StoredEvent> {
-        fn transition_allowed(current: &str, next: &str) -> bool {
-            matches!(
-                (current, next),
-                ("running", "paused")
-                    | ("paused", "running")
-                    | ("running", "cancelled")
-                    | ("paused", "cancelled")
-                    | ("blocked", "cancelled")
-                    // Generic internal failure terminal (flow auto-fail): an
-                    // unhandled effect failure fails the instance directly,
-                    // without an author-typed `failure` payload.
-                    | ("running", "failed")
-                    | ("paused", "failed")
-                    | ("blocked", "failed")
-            )
-        }
-
         let payload = json!({
             "instance_id": transition.instance_id,
             "status": transition.status,
@@ -5565,7 +5564,7 @@ impl SqliteStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current_status = instance_status_on(&tx, transition.instance_id)?
             .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
-        if !transition_allowed(&current_status, transition.status) {
+        if !instance_transition_allowed(&current_status, transition.status) {
             return Err(StoreError::Conflict(format!(
                 "cannot transition instance from {current_status} to {}",
                 transition.status
@@ -7600,8 +7599,7 @@ fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
         .map_err(Into::into)
 }
 
-#[cfg(feature = "native")]
-fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
+pub fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
     match policy {
         "shared"
         | "read_only"
@@ -7614,8 +7612,7 @@ fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
     }
 }
 
-#[cfg(feature = "native")]
-fn validate_workspace_status(status: &str) -> StoreResult<()> {
+pub fn validate_workspace_status(status: &str) -> StoreResult<()> {
     match status {
         "prepared" | "active" | "released" | "failed" => Ok(()),
         _ => Err(StoreError::Conflict(format!(
@@ -7663,7 +7660,6 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
     })
 }
 
-#[cfg(feature = "native")]
 /// Restorable-context RC-3: fold the file-store manifest at a cut from the
 /// sequence-ordered `fact.derived` event payloads of an instance. Only
 /// `file.write.completed` facts contribute; the RC-1 write value they carry
@@ -7674,7 +7670,9 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceView
 /// by path) and its deterministic JSON serialization, so two cuts over the same
 /// file state hash identically. Backend-agnostic — native and DO both fold the
 /// same way after their own ordered SELECT.
-fn fold_file_manifest(fact_payloads: &[String]) -> StoreResult<(String, BTreeMap<String, String>)> {
+pub fn fold_file_manifest(
+    fact_payloads: &[String],
+) -> StoreResult<(String, BTreeMap<String, String>)> {
     let mut manifest: BTreeMap<String, String> = BTreeMap::new();
     for payload_json in fact_payloads {
         let payload: Value = serde_json::from_str(payload_json)?;
@@ -7819,8 +7817,10 @@ fn live_event_ids_on(
     ))
 }
 
-#[cfg(feature = "native")]
-fn restore_marker_target(payload_json: &str) -> Option<i64> {
+/// RC-4b: the target sequence a `context.restored` marker rewinds replay to.
+/// `None` for a malformed marker, so the fold applies no rewind rather than
+/// corrupting the projection.
+pub fn restore_marker_target(payload_json: &str) -> Option<i64> {
     serde_json::from_str::<Value>(payload_json)
         .ok()?
         .get("restored_to_sequence")
@@ -8562,15 +8562,15 @@ struct PolicyBlock {
     reason: String,
 }
 
-#[cfg(feature = "native")]
-struct PolicyEffect {
-    kind: String,
-    target: Option<String>,
-    status: String,
-    required_capabilities_json: String,
-    profile: Option<String>,
-    program_id: String,
-    declared_profiles_json: String,
+/// The scheduling-relevant projection of an effect used by the policy engine.
+pub struct PolicyEffect {
+    pub kind: String,
+    pub target: Option<String>,
+    pub status: String,
+    pub required_capabilities_json: String,
+    pub profile: Option<String>,
+    pub program_id: String,
+    pub declared_profiles_json: String,
 }
 
 #[cfg(feature = "native")]
@@ -8931,8 +8931,7 @@ fn declared_agent_profile(
     Ok(agent_profile_in_value(&parsed, agent))
 }
 
-#[cfg(feature = "native")]
-fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
+pub fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
     let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
     Ok(match &parsed {
         Value::Array(items) => !items.is_empty(),
@@ -8958,8 +8957,7 @@ fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
     })
 }
 
-#[cfg(feature = "native")]
-fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
+pub fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
     match value {
         Value::Array(items) => items
             .iter()
@@ -9015,8 +9013,7 @@ fn declared_agent_capabilities(
     Ok(agent_capabilities_in_value(&parsed, agent).unwrap_or_default())
 }
 
-#[cfg(feature = "native")]
-fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
+pub fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
     match value {
         Value::Array(items) => items
             .iter()
@@ -9047,7 +9044,6 @@ fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<St
     }
 }
 
-#[cfg(feature = "native")]
 fn capabilities_value(value: &Value) -> BTreeSet<String> {
     value
         .as_array()
@@ -9061,8 +9057,7 @@ fn capabilities_value(value: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "native")]
-fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
+pub fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
     match value {
         Value::Array(items) => items
             .iter()
@@ -9100,7 +9095,6 @@ fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
     }
 }
 
-#[cfg(feature = "native")]
 fn capacity_value(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value
@@ -9109,8 +9103,7 @@ fn capacity_value(value: &Value) -> Option<i64> {
     })
 }
 
-#[cfg(feature = "native")]
-fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
+pub fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     let mut capabilities = explicit_required_capabilities(effect)?;
     if capabilities.is_empty() {
         capabilities.push(effect.kind.clone());
@@ -9120,8 +9113,7 @@ fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     Ok(capabilities)
 }
 
-#[cfg(feature = "native")]
-fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
+pub fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
     let parsed = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
     let mut capabilities = parsed
         .as_array()
@@ -9273,12 +9265,11 @@ fn active_revision_on(
         .map_err(Into::into)
 }
 
-#[cfg(feature = "native")]
-struct RevisionInstanceContext {
-    program_id: String,
-    program_name: String,
-    active_version_id: String,
-    status: String,
+pub struct RevisionInstanceContext {
+    pub program_id: String,
+    pub program_name: String,
+    pub active_version_id: String,
+    pub status: String,
 }
 
 #[cfg(feature = "native")]
@@ -9308,8 +9299,7 @@ fn revision_instance_context_on(
         .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))
 }
 
-#[cfg(feature = "native")]
-fn add_instance_revision_diagnostics(
+pub fn add_instance_revision_diagnostics(
     context: &RevisionInstanceContext,
     diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
 ) {
@@ -9349,8 +9339,7 @@ fn program_version_analysis_on(
     Ok((program_id, analysis_summary))
 }
 
-#[cfg(feature = "native")]
-fn compare_revision_summaries(
+pub fn compare_revision_summaries(
     active: &Value,
     candidate: &Value,
     diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
@@ -9387,7 +9376,6 @@ fn compare_revision_summaries(
     compare_contracts("failure", false, active, candidate, diagnostics);
 }
 
-#[cfg(feature = "native")]
 fn compare_contracts(
     kind: &str,
     reject_candidate_additions: bool,
@@ -9434,14 +9422,12 @@ fn compare_contracts(
     }
 }
 
-#[cfg(feature = "native")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ContractSummary {
     ty: String,
     source_span_json: Option<String>,
 }
 
-#[cfg(feature = "native")]
 fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSummary> {
     summary
         .get("workflow_contracts")
@@ -9543,8 +9529,7 @@ fn add_active_fact_schema_diagnostics(
     Ok(())
 }
 
-#[cfg(feature = "native")]
-fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
+pub fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
     summary
         .get("schemas")
         .and_then(Value::as_array)
@@ -9554,13 +9539,11 @@ fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
         .collect()
 }
 
-#[cfg(feature = "native")]
-fn summary_source_span_json(summary: &Value) -> Option<String> {
+pub fn summary_source_span_json(summary: &Value) -> Option<String> {
     summary.get("source_span").map(Value::to_string)
 }
 
-#[cfg(feature = "native")]
-fn fact_schema_name<'a>(
+pub fn fact_schema_name<'a>(
     fact_name: &'a str,
     schema_id: Option<&'a str>,
     active_schemas: &BTreeMap<String, Value>,
@@ -9577,8 +9560,7 @@ fn fact_schema_name<'a>(
     None
 }
 
-#[cfg(feature = "native")]
-fn validate_fact_value_against_schema(
+pub fn validate_fact_value_against_schema(
     value: &Value,
     schema: &Value,
     schemas: &BTreeMap<String, Value>,
@@ -9620,7 +9602,6 @@ fn validate_fact_value_against_schema(
     }
 }
 
-#[cfg(feature = "native")]
 fn validate_value_against_fields(
     value: &Value,
     fields: Option<&Vec<Value>>,
@@ -9662,7 +9643,6 @@ fn validate_value_against_fields(
     }
 }
 
-#[cfg(feature = "native")]
 fn validate_value_against_type_signature(
     value: &Value,
     signature: &str,
@@ -9803,7 +9783,6 @@ fn validate_value_against_type_signature(
     }
 }
 
-#[cfg(feature = "native")]
 fn validate_value_against_object_signature(
     value: &Value,
     inner: &str,
@@ -9829,12 +9808,10 @@ fn validate_value_against_object_signature(
     validate_value_against_fields(value, Some(&fields), schemas, path, errors, depth + 1);
 }
 
-#[cfg(feature = "native")]
 fn is_optional_signature(signature: &str) -> bool {
     signature_envelope(signature, "optional").is_some()
 }
 
-#[cfg(feature = "native")]
 fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("{name}<");
     signature
@@ -9842,7 +9819,6 @@ fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_suffix('>'))
 }
 
-#[cfg(feature = "native")]
 fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
@@ -9872,8 +9848,7 @@ fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     parts
 }
 
-#[cfg(feature = "native")]
-fn revision_compatibility_diagnostic(
+pub fn revision_compatibility_diagnostic(
     code: &str,
     message: String,
     subject: Option<&str>,
@@ -9881,8 +9856,7 @@ fn revision_compatibility_diagnostic(
     revision_compatibility_diagnostic_with_span(code, message, subject, None)
 }
 
-#[cfg(feature = "native")]
-fn revision_compatibility_diagnostic_with_span(
+pub fn revision_compatibility_diagnostic_with_span(
     code: &str,
     message: String,
     subject: Option<&str>,
@@ -9896,8 +9870,7 @@ fn revision_compatibility_diagnostic_with_span(
     }
 }
 
-#[cfg(feature = "native")]
-fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
+pub fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
     match policy {
         "keep" => Ok("keep"),
         "cancel_queued" | "cancel queued" | "queued" => Ok("cancel_queued"),
@@ -10007,13 +9980,11 @@ fn revision_by_idempotency_on(
 /// Compare two recorded carry lists by value, not by spelling: an absent or
 /// unparseable record and an explicitly empty one both mean "no carries", and
 /// must not read as a conflicting activation.
-#[cfg(feature = "native")]
 fn json_or_empty_array(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::Array(Vec::new()))
 }
 
-#[cfg(feature = "native")]
-fn ensure_revision_idempotency_matches(
+pub fn ensure_revision_idempotency_matches(
     existing: &WorkflowRevisionView,
     activation: &RevisionActivation<'_>,
     activation_policy: &Value,
@@ -10363,8 +10334,8 @@ fn capability_allowed(allowed: &[String], capability: &str) -> bool {
     allowed.iter().any(|item| item == "*" || item == capability)
 }
 
-#[cfg(feature = "native")]
-fn required_string(value: &Value, field: &str) -> String {
+/// A string field, or the empty string when it is absent or not a string.
+pub fn required_string(value: &Value, field: &str) -> String {
     value
         .get(field)
         .and_then(Value::as_str)
@@ -10372,8 +10343,7 @@ fn required_string(value: &Value, field: &str) -> String {
         .to_owned()
 }
 
-#[cfg(feature = "native")]
-fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
+pub fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
     fields
         .iter()
         .find_map(|field| {
@@ -10395,8 +10365,7 @@ fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<Strin
         })
 }
 
-#[cfg(feature = "native")]
-fn manifest_effect_kind(provider: &Value) -> String {
+pub fn manifest_effect_kind(provider: &Value) -> String {
     provider
         .get("effect_kind")
         .or_else(|| provider.get("core_effect_kind"))
@@ -11871,23 +11840,22 @@ impl crate::log_append::LogAppend for SqliteStore {
     }
 }
 
-#[cfg(feature = "native")]
-struct StoredChainRow {
-    event_id: String,
-    sequence: i64,
-    event_type: String,
-    payload_json: String,
-    occurred_at: String,
-    source: Option<String>,
-    causation_id: Option<String>,
-    correlation_id: Option<String>,
-    idempotency_key: Option<String>,
-    format_version: Option<i64>,
+/// One `events` row in the shape [`event_chain`] reads it.
+pub struct StoredChainRow {
+    pub event_id: String,
+    pub sequence: i64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub occurred_at: String,
+    pub source: Option<String>,
+    pub causation_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub format_version: Option<i64>,
 }
 
-#[cfg(feature = "native")]
 impl StoredChainRow {
-    fn as_entry<'a>(&'a self, instance_id: &'a str) -> event_chain::ChainEntry<'a> {
+    pub fn as_entry<'a>(&'a self, instance_id: &'a str) -> event_chain::ChainEntry<'a> {
         event_chain::ChainEntry {
             event_id: &self.event_id,
             instance_id,
@@ -16038,6 +16006,66 @@ mod tests {
             Some(revised_child_version.version_id.as_str())
         );
         assert_eq!(after_child_revision.child_active_revision_epoch, Some(1));
+    }
+
+    /// The three "does not exist" refusals on the revision and transition paths.
+    /// A mutation sweep found none of them exercised: every test that reached
+    /// them handed them an id that resolved, so deleting any one changed nothing
+    /// observable in the suite. Each of these fails when its refusal is removed.
+    #[test]
+    fn transitioning_an_instance_that_does_not_exist_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let error = store
+            .transition_instance(InstanceTransition {
+                instance_id: "inst_missing",
+                status: "paused",
+                reason: None,
+                idempotency_key: Some("pause-missing"),
+            })
+            .expect_err("a transition on a missing instance is refused");
+        assert!(
+            matches!(&error, StoreError::Conflict(message) if message == "instance does not exist"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn revision_compatibility_for_an_instance_that_does_not_exist_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let version = store
+            .create_program_version(test_program_version("Compat", "source-1", "ir-1"))
+            .expect("version creates");
+        let error = store
+            .analyze_revision_compatibility("inst_missing", &version.version_id)
+            .expect_err("compatibility against a missing instance is refused");
+        assert!(
+            matches!(&error, StoreError::Conflict(message) if message == "instance does not exist"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn revision_compatibility_against_a_program_version_that_does_not_exist_is_refused() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let active_version = store
+            .create_program_version(test_program_version("Compat", "source-1", "ir-1"))
+            .expect("active version creates");
+        let instance = store
+            .create_instance(NewInstance {
+                program_id: &active_version.program_id,
+                version_id: &active_version.version_id,
+                input_json: "{}",
+            })
+            .expect("instance creates");
+        // The instance resolves; only the candidate version is absent, so this
+        // reaches the second refusal rather than the first.
+        let error = store
+            .analyze_revision_compatibility(&instance.instance_id, "ver_missing")
+            .expect_err("compatibility against a missing version is refused");
+        assert!(
+            matches!(&error, StoreError::Conflict(message) if message == "program version does not exist"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

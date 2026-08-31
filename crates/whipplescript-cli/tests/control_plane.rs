@@ -170,21 +170,7 @@ fn action_expanded_chain_runs_end_to_end() {
     let store = temp_store_path();
     let example = example_path("reusable-action-chain.whip");
 
-    let dev = run_json_isolated(
-        bin,
-        &store,
-        &[
-            "--store",
-            store.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store, &store, &example);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -367,21 +353,7 @@ table tasks as Task [
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -2475,21 +2447,7 @@ rule observe
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -2574,21 +2532,7 @@ rule run_task
 
     let mut instance_ids = Vec::new();
     for _ in 0..2 {
-        let dev = run_json_isolated(
-            bin,
-            &store_path,
-            &[
-                "--store",
-                store_path.to_str().expect("utf-8 temp path"),
-                "--json",
-                "run",
-                source_path.to_str().expect("utf-8 source path"),
-                "--provider",
-                "fixture",
-                "--until",
-                "idle",
-            ],
-        );
+        let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
         let instance_id = dev
             .get("instance_id")
             .and_then(Value::as_str)
@@ -5559,21 +5503,7 @@ fn dev_openclaw_lite_observes_heartbeat_and_files_work() {
     let example = example_path("openclaw-lite.whip");
     // openclaw-lite imports `std.memory`, which ships as an embedded std
     // manifest — no lock is needed.
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &example);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -5966,21 +5896,7 @@ workflow SkillPinSmoke {
     )
     .expect("write workflow");
 
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            workflow.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store_path, &workflow);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -9568,21 +9484,7 @@ rule route
     )
     .expect("workflow writes");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     assert!(
         dev.get("assertions")
             .and_then(Value::as_array)
@@ -9664,21 +9566,7 @@ rule route
     )
     .expect("workflow writes");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     assert!(
         dev.get("assertions")
             .and_then(Value::as_array)
@@ -9772,21 +9660,7 @@ rule j
     )
     .expect("workflow writes");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -9864,21 +9738,7 @@ rule d
     )
     .expect("workflow writes");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -9965,21 +9825,7 @@ rule classify_request
     )
     .expect("workflow writes");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     let workers = dev
         .get("workers")
         .and_then(Value::as_array)
@@ -10077,21 +9923,7 @@ rule recall_before_work
     )
     .expect("workflow writes");
     // `std.memory` ships embedded — no lock, no `--package-lock`.
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &workflow_path);
     let workers = dev
         .get("workers")
         .and_then(Value::as_array)
@@ -10149,21 +9981,7 @@ fn memory_roundtrip_recalls_the_learned_item() {
     fs::copy(&workflow_src, &workflow_path).expect("copy roundtrip example");
 
     // `std.memory` ships embedded, so the round-trip runs with no lock at all.
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -10260,21 +10078,7 @@ fn memory_roundtrip_without_a_lock_uses_the_embedded_manifest() {
 
     // `dev` runs with no `--package-lock`: the embedded manifest seeds the store's
     // `memory.query`/`memory.write` providers + bindings, so the round-trip runs.
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -10373,21 +10177,7 @@ fn memory_pool_declaration_demo_checks_and_recalls() {
     );
 
     // `dev` runs the `learn`/`recall` against the declared pool to completion.
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -10460,21 +10250,7 @@ fn memory_curate_dedupes_the_pool_without_a_lock() {
         String::from_utf8_lossy(&checked.stderr)
     );
 
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 store"),
-            "--json",
-            "run",
-            workflow_path.to_str().expect("utf-8 workflow"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store_path, &workflow_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -13524,7 +13300,6 @@ fn lsp_publishes_lint_findings_as_diagnostics() {
     // severity 2), each pointing at the offending declaration.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     // A valid program whose `Orphan` class is never referenced.
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nclass Orphan {\\n  x string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
@@ -13534,21 +13309,7 @@ fn lsp_publishes_lint_findings_as_diagnostics() {
     ));
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     assert!(
         stdout.contains(r#""source":"whip lint""#),
@@ -13846,7 +13607,6 @@ fn lsp_publishes_diagnostics_on_did_open() {
     // compile error (live error squiggles reuse the `whip check` compiler).
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
     input += &frame(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
@@ -13856,21 +13616,7 @@ fn lsp_publishes_diagnostics_on_did_open() {
     input += &frame(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}"#);
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     assert!(
         stdout.contains("\"id\":1"),
@@ -13892,7 +13638,6 @@ fn lsp_returns_document_symbols() {
     // declarations (the editor outline), reusing the parser's `document_symbols`.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule handle\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -13904,21 +13649,7 @@ fn lsp_returns_document_symbols() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // The documentSymbol response (id 2) lists the workflow, class, and rule.
     for symbol in [
@@ -13941,7 +13672,6 @@ fn lsp_go_to_definition_resolves_top_level_name() {
     // name match is the definition.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -13953,21 +13683,7 @@ fn lsp_go_to_definition_resolves_top_level_name() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // The class Ticket declaration starts at line 1, column 0. (serde_json sorts
     // object keys alphabetically, so `character` precedes `line`.)
@@ -13984,7 +13700,6 @@ fn lsp_cross_file_definition_and_workspace_symbol() {
     // documents). Here `b.whip` references `class Ticket` declared in `a.whip`.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let dir =
         std::env::temp_dir().join(format!("whip-lsp-xfile-{}-{}", std::process::id(), line!()));
     let _ = fs::remove_dir_all(&dir);
@@ -14016,21 +13731,7 @@ fn lsp_cross_file_definition_and_workspace_symbol() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // Cross-file definition resolves to a.whip's URI (the declaring file).
     assert!(
@@ -14052,7 +13753,6 @@ fn lsp_hover_shows_declaration_source() {
     // hovering the `Ticket` reference reveals `class Ticket { ... }`.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -14064,21 +13764,7 @@ fn lsp_hover_shows_declaration_source() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     assert!(
         stdout.contains("class Ticket {"),
@@ -14092,7 +13778,6 @@ fn lsp_completion_offers_keywords_and_declared_symbols() {
     // plus the document's declared top-level names (editors filter by prefix).
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -14104,21 +13789,7 @@ fn lsp_completion_offers_keywords_and_declared_symbols() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // A keyword and the declared class both appear as completion labels.
     assert!(
@@ -14138,7 +13809,6 @@ fn lsp_find_references_lists_all_occurrences() {
     // and the `when Ticket` reference on line 5).
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -14150,21 +13820,7 @@ fn lsp_find_references_lists_all_occurrences() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // The references response (id 2) carries both occurrences (lines 1 and 5).
     assert!(
@@ -14185,7 +13841,6 @@ fn lsp_rename_edits_code_occurrences_but_not_strings() {
     // only the two code occurrences are renamed.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nagent a {\\n  provider fixture\\n  capacity 1\\n}\\nrule r\\n  when Ticket as t\\n  when a is available\\n=> {\\n  tell a \\\"\\\"\\\"Look at this Ticket now.\\\"\\\"\\\"\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -14197,21 +13852,7 @@ fn lsp_rename_edits_code_occurrences_but_not_strings() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // Exactly two edits (declaration + the `when` reference) — the occurrence inside
     // the prompt string is excluded.
@@ -14228,7 +13869,6 @@ fn lsp_formatting_returns_whole_document_edit() {
     // returns a whole-document edit when the source is not already canonical.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     // Six-space field indent — non-canonical, so formatting yields an edit.
     let text = "workflow Demo\\nclass Ticket {\\n      id string\\n}\\n";
     let mut input = String::new();
@@ -14241,21 +13881,7 @@ fn lsp_formatting_returns_whole_document_edit() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // The formatting edit normalizes the field to a 2-space indent.
     assert!(
@@ -14270,7 +13896,6 @@ fn lsp_document_highlight_marks_all_occurrences() {
     // the cursor (here `Ticket`: its declaration and the `when` reference).
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text = "workflow Demo\\nclass Ticket {\\n  id string\\n}\\nrule r\\n  when Ticket as t\\n=> {\\n  done t\\n}\\n";
     let mut input = String::new();
     input += &frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
@@ -14282,21 +13907,7 @@ fn lsp_document_highlight_marks_all_occurrences() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // Two highlights (declaration line 1 and use line 5), as Text highlights.
     let highlight_count = stdout.matches(r#""kind":1"#).count();
@@ -14313,7 +13924,6 @@ fn lsp_workspace_symbol_indexes_open_documents() {
     // index spans documents rather than a single file.
     let bin = env!("CARGO_BIN_EXE_whip");
     let stores = temp_store_path();
-    let frame = |body: &str| format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     let text_a = "workflow A\\nclass Ticket {\\n  id string\\n}\\n";
     let text_b = "workflow B\\nclass Order {\\n  id string\\n}\\n";
     let mut input = String::new();
@@ -14333,21 +13943,7 @@ fn lsp_workspace_symbol_indexes_open_documents() {
     );
     input += &frame(r#"{"jsonrpc":"2.0","method":"exit","params":{}}"#);
 
-    let mut child = whip(bin, &stores)
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn whip lsp");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input.as_bytes())
-        .expect("write LSP input");
-    let output = child.wait_with_output().expect("lsp exits");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = lsp_stdout(bin, &stores, &input);
 
     // Empty query surfaces symbols from BOTH documents.
     assert!(
@@ -16645,14 +16241,11 @@ workflow PatternApplication {
     let _ = fs::remove_file(workflow_path);
 }
 
-#[test]
-fn dev_creates_workflow_invoke_effect() {
-    let bin = env!("CARGO_BIN_EXE_whip");
-    let store_path = temp_store_path();
-    let workflow_path = temp_workflow_path("workflow-invoke");
-    fs::write(
-        &workflow_path,
-        r#"
+/// A Parent workflow that invokes Child and records `ParentDone` from the
+/// child result, beside the Child that completes it. Four tests share this
+/// exact program; every other `workflow Parent` literal in this file is a
+/// deliberately different program.
+const PARENT_INVOKES_CHILD_WHIP: &str = r#"
 workflow Parent {
   input task Task
 
@@ -16697,9 +16290,14 @@ workflow Child {
     }
   }
 }
-"#,
-    )
-    .expect("workflow writes");
+"#;
+
+#[test]
+fn dev_creates_workflow_invoke_effect() {
+    let bin = env!("CARGO_BIN_EXE_whip");
+    let store_path = temp_store_path();
+    let workflow_path = temp_workflow_path("workflow-invoke");
+    fs::write(&workflow_path, PARENT_INVOKES_CHILD_WHIP).expect("workflow writes");
 
     let dev = run_json_isolated(
         bin,
@@ -16939,56 +16537,7 @@ fn worker_resumes_running_workflow_invocation() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let workflow_path = temp_workflow_path("workflow-invoke-resume");
-    fs::write(
-        &workflow_path,
-        r#"
-workflow Parent {
-  input task Task
-
-  class Task {
-    title string
-  }
-
-  class ParentDone {
-    title string
-  }
-
-  rule dispatch
-    when Task as task
-  => {
-    invoke Child { task { title task.title } } as child
-
-    after child succeeds as result {
-      record ParentDone {
-        title result.title
-      }
-    }
-  }
-}
-
-workflow Child {
-  input task Task
-  output result ChildResult
-
-  class Task {
-    title string
-  }
-
-  class ChildResult {
-    title string
-  }
-
-  rule complete_child
-    when Task as task
-  => {
-    complete result {
-      title task.title
-    }
-  }
-}
-"#,
-    )
-    .expect("workflow writes");
+    fs::write(&workflow_path, PARENT_INVOKES_CHILD_WHIP).expect("workflow writes");
 
     let started = run_json_isolated(
         bin,
@@ -17217,56 +16766,7 @@ fn worker_preserves_child_invocation_links_after_parent_revision() {
     let store_path = temp_store_path();
     let v1 = temp_workflow_path("workflow-invoke-parent-revision-v1");
     let v2 = temp_workflow_path("workflow-invoke-parent-revision-v2");
-    fs::write(
-        &v1,
-        r#"
-workflow Parent {
-  input task Task
-
-  class Task {
-    title string
-  }
-
-  class ParentDone {
-    title string
-  }
-
-  rule dispatch
-    when Task as task
-  => {
-    invoke Child { task { title task.title } } as child
-
-    after child succeeds as result {
-      record ParentDone {
-        title result.title
-      }
-    }
-  }
-}
-
-workflow Child {
-  input task Task
-  output result ChildResult
-
-  class Task {
-    title string
-  }
-
-  class ChildResult {
-    title string
-  }
-
-  rule complete_child
-    when Task as task
-  => {
-    complete result {
-      title task.title
-    }
-  }
-}
-"#,
-    )
-    .expect("v1 workflow writes");
+    fs::write(&v1, PARENT_INVOKES_CHILD_WHIP).expect("v1 workflow writes");
     fs::write(
         &v2,
         r#"
@@ -18111,21 +17611,7 @@ fn dev_provider_language_rehydrates_after_bound_coerce_arguments() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &example);
     let workers = dev
         .get("workers")
         .and_then(Value::as_array)
@@ -18210,21 +17696,7 @@ fn dev_provider_language_e2e_runs_agent_table_and_coerce_reviews() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("provider-language-e2e.whip");
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &example);
     let workers = dev
         .get("workers")
         .and_then(Value::as_array)
@@ -18573,21 +18045,7 @@ fn dev_incident_router_routes_with_agentref_metadata() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let example = example_path("incident-router.whip");
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            example.to_str().expect("utf-8 example path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &example);
     let assertions = dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -18772,21 +18230,7 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -18875,21 +18319,7 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -19110,21 +18540,7 @@ rule accept_task
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -19217,21 +18633,7 @@ rule seed
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -19527,21 +18929,7 @@ rule accept
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     let guards = dev
         .get("steps")
         .and_then(Value::as_array)
@@ -19698,21 +19086,7 @@ rule route
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -19758,21 +19132,7 @@ rule seed
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     assert!(dev
         .get("assertions")
         .and_then(Value::as_array)
@@ -19861,21 +19221,7 @@ rule review
     )
     .expect("write source");
 
-    let dev = run_json_isolated(
-        bin,
-        &store_path,
-        &[
-            "--store",
-            store_path.to_str().expect("utf-8 temp path"),
-            "--json",
-            "run",
-            source_path.to_str().expect("utf-8 source path"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &store_path, &store_path, &source_path);
     let instance_id = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -22058,6 +21404,60 @@ fn run_text_isolated(bin: &str, store: &TempStorePath, args: &[&str]) -> String 
     String::from_utf8(output.stdout).expect("stdout is utf-8")
 }
 
+/// `whip --store <store> --json run <program> --provider fixture --until idle`
+/// -- the fixture-provider drive-to-idle every runtime test starts with.
+/// `side_stores` supplies the non-run store overrides; `store` is the run store
+/// `--store` pins (usually the same path, occasionally a per-test one). The
+/// call sites this replaces spelled the two `to_str` failures five different
+/// ways; the two messages here stand for all of them.
+fn run_fixture_to_idle(
+    bin: &str,
+    side_stores: &TempStorePath,
+    store: &Path,
+    program: &Path,
+) -> Value {
+    run_json_isolated(
+        bin,
+        side_stores,
+        &[
+            "--store",
+            store.to_str().expect("utf-8 store path"),
+            "--json",
+            "run",
+            program.to_str().expect("utf-8 program path"),
+            "--provider",
+            "fixture",
+            "--until",
+            "idle",
+        ],
+    )
+}
+
+/// A JSON-RPC body wrapped in the LSP `Content-Length` header framing.
+fn frame(body: &str) -> String {
+    format!("Content-Length: {}\r\n\r\n{}", body.len(), body)
+}
+
+/// Drive `whip lsp` over stdio with the already-framed `input` and return the
+/// server's stdout.
+fn lsp_stdout(bin: &str, stores: &TempStorePath, input: &str) -> String {
+    let mut child = whip(bin, stores)
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn whip lsp");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(input.as_bytes())
+        .expect("write LSP input");
+    let output = child.wait_with_output().expect("lsp exits");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn ticket(status: &Value) -> Option<&str> {
     status
         .get("instance")?
@@ -22360,56 +21760,7 @@ fn log_json_stamps_invocation_and_workflow_provenance() {
     let bin = env!("CARGO_BIN_EXE_whip");
     let store_path = temp_store_path();
     let workflow_path = temp_workflow_path("observability-log-provenance");
-    fs::write(
-        &workflow_path,
-        r#"
-workflow Parent {
-  input task Task
-
-  class Task {
-    title string
-  }
-
-  class ParentDone {
-    title string
-  }
-
-  rule dispatch
-    when Task as task
-  => {
-    invoke Child { task { title task.title } } as child
-
-    after child succeeds as result {
-      record ParentDone {
-        title result.title
-      }
-    }
-  }
-}
-
-workflow Child {
-  input task Task
-  output result ChildResult
-
-  class Task {
-    title string
-  }
-
-  class ChildResult {
-    title string
-  }
-
-  rule complete_child
-    when Task as task
-  => {
-    complete result {
-      title task.title
-    }
-  }
-}
-"#,
-    )
-    .expect("workflow writes");
+    fs::write(&workflow_path, PARENT_INVOKES_CHILD_WHIP).expect("workflow writes");
 
     let dev = run_json_isolated(
         bin,
@@ -24694,21 +24045,7 @@ rule two
     .expect("write source");
     let store = dir.join("dup.sqlite");
 
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store.to_str().expect("utf-8"),
-            "--json",
-            "run",
-            source.to_str().expect("utf-8"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store, &source);
     let instance = dev
         .get("instance_id")
         .and_then(Value::as_str)
@@ -24820,21 +24157,7 @@ rule finish
     .expect("write source");
     let store = dir.join("from.sqlite");
 
-    let dev = run_json_isolated(
-        bin,
-        &stores,
-        &[
-            "--store",
-            store.to_str().expect("utf-8"),
-            "--json",
-            "run",
-            source.to_str().expect("utf-8"),
-            "--provider",
-            "fixture",
-            "--until",
-            "idle",
-        ],
-    );
+    let dev = run_fixture_to_idle(bin, &stores, &store, &source);
     let instance = dev
         .get("instance_id")
         .and_then(Value::as_str)

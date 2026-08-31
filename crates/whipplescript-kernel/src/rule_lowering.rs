@@ -15,6 +15,12 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 use whipplescript_parser::{DependencyPredicate as IrDependencyPredicate, *};
+// Shared source-line parsing: the parser owns these and the kernel re-exports
+// them so lowering and the front end read one definition.
+pub use whipplescript_parser::{
+    binding_after_as, is_prompt_content_type_token, is_supported_prompt_content_type,
+    parse_required_capabilities,
+};
 use whipplescript_store::{EffectView, FactView, WorkflowTerminalKind};
 
 use crate::idempotency_key;
@@ -4291,28 +4297,6 @@ pub fn resolve_tell_target(target_expr: &str, context: &RuleContext) -> String {
         .to_owned()
 }
 
-pub fn parse_required_capabilities(line: &str) -> Vec<String> {
-    let Some(rest) = line.split_once(" requires ") else {
-        return Vec::new();
-    };
-    let Some(list) = rest.1.trim_start().strip_prefix('[') else {
-        return Vec::new();
-    };
-    let Some((items, _)) = list.split_once(']') else {
-        return Vec::new();
-    };
-    let mut capabilities = items
-        .split(',')
-        .filter_map(|item| {
-            let value = item.trim().trim_matches('"');
-            (!value.is_empty()).then(|| value.to_owned())
-        })
-        .collect::<Vec<_>>();
-    capabilities.sort();
-    capabilities.dedup();
-    capabilities
-}
-
 pub fn parsed_effect_input_json(
     ir: &IrProgram,
     rule: &IrRule,
@@ -5510,20 +5494,6 @@ pub fn parse_after_scope(trimmed: &str) -> Option<AfterScope> {
     Some(AfterScope { binding, predicate })
 }
 
-pub fn binding_after_as(line: &str) -> Option<String> {
-    let mut tokens = line.split_whitespace();
-    while let Some(token) = tokens.next() {
-        if token == "as" {
-            return tokens
-                .next()
-                .map(|binding| binding.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
-                .filter(|binding| !binding.is_empty())
-                .map(str::to_owned);
-        }
-    }
-    None
-}
-
 pub fn prompt_provider_after_using(line: &str) -> Option<String> {
     let mut tokens = line.split_whitespace();
     while let Some(token) = tokens.next() {
@@ -5622,27 +5592,6 @@ pub fn prompt_content_type_from_opening_tail(after_open: &str) -> Option<String>
         return None;
     }
     is_supported_prompt_content_type(candidate).then(|| candidate.to_ascii_lowercase())
-}
-
-pub fn is_supported_prompt_content_type(candidate: &str) -> bool {
-    if !is_prompt_content_type_token(candidate) {
-        return false;
-    }
-    let normalized = candidate.to_ascii_lowercase();
-    normalized.contains('/')
-        || matches!(
-            normalized.as_str(),
-            "markdown" | "json" | "text" | "plain" | "html" | "xml" | "yaml" | "yml"
-        )
-}
-
-pub fn is_prompt_content_type_token(candidate: &str) -> bool {
-    let mut chars = candidate.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_alphanumeric()
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
 }
 
 pub fn dependency_predicate_str(predicate: &IrDependencyPredicate) -> &'static str {

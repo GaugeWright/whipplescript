@@ -891,7 +891,7 @@ def write_model_search_stale_ir_obligations_report(report, output_path):
     output_path.write_text(json.dumps(mutated))
 
 
-def write_model_search_missing_ir_obligation_report(report, output_path):
+def unpack_ir_model_search(report):
     mutated = copy.deepcopy(report)
     if not isinstance(mutated, dict):
         raise SystemExit("model-search report fixture must be a compile report object")
@@ -907,6 +907,11 @@ def write_model_search_missing_ir_obligation_report(report, output_path):
     artifact_obligations = artifact.get("obligations")
     if not isinstance(artifact_obligations, list):
         raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    return mutated, model_search, ledger_obligations, artifact_obligations
+
+
+def write_model_search_missing_ir_obligation_report(report, output_path):
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     removed = None
     for index, obligation in enumerate(ledger_obligations):
@@ -953,21 +958,7 @@ def write_model_search_missing_ir_obligation_report(report, output_path):
 
 
 def write_model_search_wrong_ir_predicate_counts_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     ir_ledger = [
         (position, obligation)
@@ -1011,21 +1002,7 @@ def write_model_search_wrong_ir_predicate_counts_report(report, output_path):
 
 
 def write_model_search_wrong_ir_endpoint_counts_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     ir_ledger = [
         (position, obligation)
@@ -1098,21 +1075,7 @@ def write_model_search_wrong_ir_endpoint_counts_report(report, output_path):
 
 
 def write_model_search_wrong_ir_outcome_counts_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
     outcome_fields = {
         "solution": "solutions",
         "no_solution": "no_solutions",
@@ -1151,21 +1114,7 @@ def write_model_search_wrong_ir_outcome_counts_report(report, output_path):
 
 
 def write_model_search_wrong_ir_sequence_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     ir_ledger = [
         (position, obligation)
@@ -1206,21 +1155,7 @@ def write_model_search_wrong_ir_sequence_report(report, output_path):
 
 
 def write_model_search_wrong_ir_description_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     for ledger_obligation in ledger_obligations:
         if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
@@ -1239,27 +1174,13 @@ def write_model_search_wrong_ir_description_report(report, output_path):
     raise SystemExit("model-search report fixture did not contain an IR obligation")
 
 
-def write_model_search_wrong_dependency_source_span_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+def write_model_search_wrong_ir_source_span_report(report, output_path, predicates, noun):
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     for ledger_obligation in ledger_obligations:
         if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
             continue
-        if ledger_obligation.get("predicate") not in {"succeeds", "fails", "completes"}:
+        if ledger_obligation.get("predicate") not in predicates:
             continue
         obligation_index = ledger_obligation.get("index")
         old_span = ledger_obligation.get("source_span")
@@ -1276,7 +1197,16 @@ def write_model_search_wrong_dependency_source_span_report(report, output_path):
                 output_path.write_text(json.dumps(mutated))
                 return
         raise SystemExit("IR obligation artifact row did not match ledger index")
-    raise SystemExit("model-search report fixture did not contain a dependency IR obligation")
+    raise SystemExit(f"model-search report fixture did not contain {noun} IR obligation")
+
+
+def write_model_search_wrong_dependency_source_span_report(report, output_path):
+    write_model_search_wrong_ir_source_span_report(
+        report,
+        output_path,
+        {"succeeds", "fails", "completes"},
+        "a dependency",
+    )
 
 
 def write_model_search_wrong_handoff_source_span_report(report, output_path):
@@ -1469,145 +1399,34 @@ def write_model_search_wrong_dependency_source_span_with_graph_report(report, ou
 
 
 def write_model_search_wrong_assertion_source_span_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
-
-    for ledger_obligation in ledger_obligations:
-        if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
-            continue
-        if ledger_obligation.get("predicate") != "assertion-read-only":
-            continue
-        obligation_index = ledger_obligation.get("index")
-        old_span = ledger_obligation.get("source_span")
-        stale_span = {"start": 0, "end": 0}
-        if isinstance(old_span, dict) and old_span.get("start") == 0 and old_span.get("end") == 0:
-            stale_span = {"start": 1, "end": 1}
-        ledger_obligation["source_span"] = stale_span
-        for artifact_obligation in artifact_obligations:
-            if (
-                isinstance(artifact_obligation, dict)
-                and artifact_obligation.get("index") == obligation_index
-            ):
-                artifact_obligation["source_span"] = stale_span
-                output_path.write_text(json.dumps(mutated))
-                return
-        raise SystemExit("IR obligation artifact row did not match ledger index")
-    raise SystemExit("model-search report fixture did not contain an assertion IR obligation")
+    write_model_search_wrong_ir_source_span_report(
+        report,
+        output_path,
+        {"assertion-read-only"},
+        "an assertion",
+    )
 
 
 def write_model_search_wrong_revision_source_span_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
-
-    for ledger_obligation in ledger_obligations:
-        if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
-            continue
-        if ledger_obligation.get("predicate") not in {
-            "revision-active-rule",
-            "revision-stale-rule",
-            "revision-effect-attribution",
-        }:
-            continue
-        obligation_index = ledger_obligation.get("index")
-        old_span = ledger_obligation.get("source_span")
-        stale_span = {"start": 0, "end": 0}
-        if isinstance(old_span, dict) and old_span.get("start") == 0 and old_span.get("end") == 0:
-            stale_span = {"start": 1, "end": 1}
-        ledger_obligation["source_span"] = stale_span
-        for artifact_obligation in artifact_obligations:
-            if (
-                isinstance(artifact_obligation, dict)
-                and artifact_obligation.get("index") == obligation_index
-            ):
-                artifact_obligation["source_span"] = stale_span
-                output_path.write_text(json.dumps(mutated))
-                return
-        raise SystemExit("IR obligation artifact row did not match ledger index")
-    raise SystemExit("model-search report fixture did not contain a revision IR obligation")
+    write_model_search_wrong_ir_source_span_report(
+        report,
+        output_path,
+        {"revision-active-rule", "revision-stale-rule", "revision-effect-attribution"},
+        "a revision",
+    )
 
 
 def write_model_search_wrong_guard_source_span_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
-
-    for ledger_obligation in ledger_obligations:
-        if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
-            continue
-        if ledger_obligation.get("predicate") not in {"guard-true", "guard-false", "guard-error"}:
-            continue
-        obligation_index = ledger_obligation.get("index")
-        old_span = ledger_obligation.get("source_span")
-        stale_span = {"start": 0, "end": 0}
-        if isinstance(old_span, dict) and old_span.get("start") == 0 and old_span.get("end") == 0:
-            stale_span = {"start": 1, "end": 1}
-        ledger_obligation["source_span"] = stale_span
-        for artifact_obligation in artifact_obligations:
-            if (
-                isinstance(artifact_obligation, dict)
-                and artifact_obligation.get("index") == obligation_index
-            ):
-                artifact_obligation["source_span"] = stale_span
-                output_path.write_text(json.dumps(mutated))
-                return
-        raise SystemExit("IR obligation artifact row did not match ledger index")
-    raise SystemExit("model-search report fixture did not contain a guard IR obligation")
+    write_model_search_wrong_ir_source_span_report(
+        report,
+        output_path,
+        {"guard-true", "guard-false", "guard-error"},
+        "a guard",
+    )
 
 
 def write_model_search_wrong_guard_source_span_with_anchor_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
     construct_graph = mutated.get("construct_graph")
     if not isinstance(construct_graph, dict):
         raise SystemExit("model-search report fixture missing construct_graph")
@@ -1681,66 +1500,21 @@ def write_model_search_wrong_guard_source_span_with_anchor_report(report, output
 
 
 def write_model_search_wrong_terminal_source_span_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
-
-    for ledger_obligation in ledger_obligations:
-        if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":
-            continue
-        if ledger_obligation.get("predicate") not in {
+    write_model_search_wrong_ir_source_span_report(
+        report,
+        output_path,
+        {
             "terminal-branch-match",
             "terminal-branch-miss",
             "terminal-branch-guard-false",
             "terminal-exhaustive-miss",
-        }:
-            continue
-        obligation_index = ledger_obligation.get("index")
-        old_span = ledger_obligation.get("source_span")
-        stale_span = {"start": 0, "end": 0}
-        if isinstance(old_span, dict) and old_span.get("start") == 0 and old_span.get("end") == 0:
-            stale_span = {"start": 1, "end": 1}
-        ledger_obligation["source_span"] = stale_span
-        for artifact_obligation in artifact_obligations:
-            if (
-                isinstance(artifact_obligation, dict)
-                and artifact_obligation.get("index") == obligation_index
-            ):
-                artifact_obligation["source_span"] = stale_span
-                output_path.write_text(json.dumps(mutated))
-                return
-        raise SystemExit("IR obligation artifact row did not match ledger index")
-    raise SystemExit("model-search report fixture did not contain a terminal branch IR obligation")
+        },
+        "a terminal branch",
+    )
 
 
 def write_model_search_unsupported_ir_obligation_report(report, output_path):
-    mutated = copy.deepcopy(report)
-    if not isinstance(mutated, dict):
-        raise SystemExit("model-search report fixture must be a compile report object")
-    model_search = mutated.get("model_search")
-    if not isinstance(model_search, dict):
-        raise SystemExit("model-search report fixture missing model_search object")
-    ledger_obligations = model_search.get("obligations")
-    if not isinstance(ledger_obligations, list):
-        raise SystemExit("model-search report fixture missing obligations array")
-    artifact = mutated.get("ir_model_search_obligations")
-    if not isinstance(artifact, dict):
-        raise SystemExit("model-search report fixture missing ir_model_search_obligations")
-    artifact_obligations = artifact.get("obligations")
-    if not isinstance(artifact_obligations, list):
-        raise SystemExit("model-search report fixture missing IR obligation artifact rows")
+    mutated, model_search, ledger_obligations, artifact_obligations = unpack_ir_model_search(report)
 
     for ledger_obligation in ledger_obligations:
         if not isinstance(ledger_obligation, dict) or ledger_obligation.get("category") != "ir":

@@ -15,7 +15,7 @@ use std::{
 use serde_json::{json, Value};
 
 use whipplescript_kernel::{
-    native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation},
+    native_lifecycle::{native_event_kind, AgentTurnLifecycleKind, NativeAgentTurnObservation},
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
@@ -947,19 +947,6 @@ fn claude_prompt(prompt: &Value) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| prompt.to_string())
-}
-
-fn native_event_kind(kind: AgentTurnLifecycleKind) -> NativeProviderEventKind {
-    match kind {
-        AgentTurnLifecycleKind::Started => NativeProviderEventKind::Started,
-        AgentTurnLifecycleKind::Streamed => NativeProviderEventKind::Streamed,
-        AgentTurnLifecycleKind::ToolRequested => NativeProviderEventKind::ToolRequested,
-        AgentTurnLifecycleKind::ArtifactCaptured => NativeProviderEventKind::ArtifactCaptured,
-        AgentTurnLifecycleKind::Completed => NativeProviderEventKind::Completed,
-        AgentTurnLifecycleKind::Failed => NativeProviderEventKind::Failed,
-        AgentTurnLifecycleKind::TimedOut => NativeProviderEventKind::TimedOut,
-        AgentTurnLifecycleKind::Cancelled => NativeProviderEventKind::Cancelled,
-    }
 }
 
 fn artifact_refs_from_claude_event(event: &ClaudeSidecarEvent) -> Vec<NativeProviderArtifactRef> {

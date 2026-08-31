@@ -295,7 +295,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .map_err(sql_err)?;
         let stored = rows
             .iter()
-            .map(|row| DoChainRow {
+            .map(|row| StoredChainRow {
                 event_id: as_text(&row[0]),
                 sequence: as_i64(&row[1]),
                 event_type: as_text(&row[2]),
@@ -1113,52 +1113,6 @@ fn do_revision_by_idempotency<Sql: DoSql>(
     Ok(rows.first().map(|r| workflow_revision_from_row(r)))
 }
 
-/// Compares two recorded carry lists by value, mirroring the native
-/// `json_or_empty_array`: an absent, empty, or unparseable record all mean "no
-/// carries" and must not read as a conflicting activation.
-fn json_or_empty_array(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::Array(Vec::new()))
-}
-
-/// Guards that a reused revision idempotency key carries identical activation
-/// input, mirroring `ensure_revision_idempotency_matches`.
-fn ensure_revision_idempotency_matches(
-    existing: &WorkflowRevisionView,
-    activation: &RevisionActivation<'_>,
-    activation_policy: &Value,
-    cancellation_policy: &str,
-) -> StoreResult<()> {
-    let existing_activation_policy: Value = serde_json::from_str(&existing.activation_policy_json)?;
-    if existing.instance_id.as_str() == activation.instance_id
-        && existing.from_version_id.as_str() == activation.from_version_id
-        && existing.to_version_id.as_str() == activation.to_version_id
-        && existing.cancellation_policy.as_str() == cancellation_policy
-        && &existing_activation_policy == activation_policy
-        // The carry is operator input; the derived correspondence is not
-        // compared. Mirrors `ensure_revision_idempotency_matches` (DR-0077).
-        && json_or_empty_array(&existing.rule_carries_json)
-            == json_or_empty_array(activation.rule_carries_json)
-    {
-        return Ok(());
-    }
-    Err(StoreError::Conflict(
-        "revision idempotency key was reused with different activation input".to_owned(),
-    ))
-}
-
-/// Normalizes a revision cancellation-policy token, mirroring
-/// `normalize_cancellation_policy`.
-fn normalize_cancellation_policy(policy: &str) -> StoreResult<&'static str> {
-    match policy {
-        "keep" => Ok("keep"),
-        "cancel_queued" | "cancel queued" | "queued" => Ok("cancel_queued"),
-        "request_running" | "request running" | "running" => Ok("request_running"),
-        _ => Err(StoreError::Conflict(format!(
-            "unsupported revision cancellation policy `{policy}`"
-        ))),
-    }
-}
-
 /// Effect ids a revision policy would act on: running effects (`running=true`) or
 /// pending/blocked effects (`running=false`). Mirrors `revision_policy_effects_on`.
 fn do_revision_policy_effects<Sql: DoSql>(
@@ -1364,81 +1318,9 @@ fn workspace_select_sql(predicate: &str) -> String {
     )
 }
 
-/// Workspace-policy allow-list, mirroring the native validator.
-fn validate_workspace_policy(policy: &str) -> StoreResult<()> {
-    match policy {
-        "shared"
-        | "read_only"
-        | "per_effect_worktree"
-        | "per_issue_worktree"
-        | "remote_sandbox" => Ok(()),
-        _ => Err(StoreError::Conflict(format!(
-            "unsupported workspace policy `{policy}`"
-        ))),
-    }
-}
-
-/// Workspace-status allow-list, mirroring the native validator.
-fn validate_workspace_status(status: &str) -> StoreResult<()> {
-    match status {
-        "prepared" | "active" | "released" | "failed" => Ok(()),
-        _ => Err(StoreError::Conflict(format!(
-            "unsupported workspace status `{status}`"
-        ))),
-    }
-}
-
 /// JSON string value or `None`, mirroring the native `optional_string`.
 fn optional_string(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(str::to_owned)
-}
-
-/// The first non-empty string among `fields`, or a `Conflict` error naming them.
-/// Mirrors `required_manifest_string`.
-fn required_manifest_string(value: &Value, fields: &[&str]) -> StoreResult<String> {
-    fields
-        .iter()
-        .find_map(|field| {
-            value
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| {
-            StoreError::Conflict(format!(
-                "manifest entry must have one of these non-empty string fields: {}",
-                fields
-                    .iter()
-                    .map(|field| format!("`{field}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })
-}
-
-/// A string field or the empty string, mirroring `required_string`.
-fn required_string(value: &Value, field: &str) -> String {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned()
-}
-
-/// Resolves a provider entry's effect kind from its aliases, mirroring
-/// `manifest_effect_kind`.
-fn manifest_effect_kind(provider: &Value) -> String {
-    provider
-        .get("effect_kind")
-        .or_else(|| provider.get("core_effect_kind"))
-        .or_else(|| provider.get("capability"))
-        .or_else(|| provider.get("effect_contract"))
-        .or_else(|| provider.get("effect_contract_id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("capability.call")
-        .to_owned()
 }
 
 /// Validates that `json` parses to a JSON array, mirroring `parse_json_array`.
@@ -1502,50 +1384,18 @@ fn do_append_event_idempotent<Sql: DoSql>(
     do_append_event(sql, event)
 }
 
-/// One `events` row in the shape [`event_chain`] reads it.
-struct DoChainRow {
-    event_id: String,
-    sequence: i64,
-    event_type: String,
-    payload_json: String,
-    occurred_at: String,
-    source: Option<String>,
-    causation_id: Option<String>,
-    correlation_id: Option<String>,
-    idempotency_key: Option<String>,
-    format_version: Option<i64>,
-}
-
-impl DoChainRow {
-    fn as_entry<'a>(&'a self, instance_id: &'a str) -> event_chain::ChainEntry<'a> {
-        event_chain::ChainEntry {
-            event_id: &self.event_id,
-            instance_id,
-            sequence: self.sequence,
-            event_type: &self.event_type,
-            payload_json: &self.payload_json,
-            occurred_at: &self.occurred_at,
-            source: self.source.as_deref().unwrap_or(""),
-            causation_id: self.causation_id.as_deref(),
-            correlation_id: self.correlation_id.as_deref(),
-            idempotency_key: self.idempotency_key.as_deref(),
-            format_version: self.format_version,
-        }
-    }
-}
-
 const DO_CHAIN_PREFIX_QUERY: &str =
     "SELECT event_id, sequence, event_type, payload_json, occurred_at, source, \
      causation_id, correlation_id, idempotency_key, format_version \
      FROM events WHERE instance_id = ?1 ORDER BY sequence ASC";
 
-fn do_chain_prefix<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<Vec<DoChainRow>> {
+fn do_chain_prefix<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<Vec<StoredChainRow>> {
     let rows = sql
         .query(DO_CHAIN_PREFIX_QUERY, &[text(instance_id)])
         .map_err(sql_err)?;
     Ok(rows
         .iter()
-        .map(|row| DoChainRow {
+        .map(|row| StoredChainRow {
             event_id: as_text(&row[0]),
             sequence: as_i64(&row[1]),
             event_type: as_text(&row[2]),
@@ -1786,37 +1636,6 @@ fn do_append_event_chained<Sql: DoSql>(
     })
 }
 
-/// Restorable-context RC-3: fold the file-store manifest at a cut from the
-/// sequence-ordered `fact.derived` event payloads. Mirrors the native
-/// `fold_file_manifest` verbatim (pure serde_json + `BTreeMap`): only
-/// `file.write.completed` facts contribute, the RC-1 write descriptor lives at
-/// `payload.value.value`, latest-write-wins per path, and the map serializes
-/// deterministically (sorted by path) so identical file states hash identically.
-fn do_fold_file_manifest(
-    fact_payloads: &[String],
-) -> StoreResult<(String, BTreeMap<String, String>)> {
-    let mut manifest: BTreeMap<String, String> = BTreeMap::new();
-    for payload_json in fact_payloads {
-        let payload: Value = serde_json::from_str(payload_json)?;
-        if payload.get("name").and_then(Value::as_str) != Some("file.write.completed") {
-            continue;
-        }
-        let descriptor = payload.get("value").and_then(|fact| fact.get("value"));
-        // Prefer the full resolved path (RC-5); fall back to relative `path`.
-        let path = descriptor
-            .and_then(|value| value.get("full_path").or_else(|| value.get("path")))
-            .and_then(Value::as_str);
-        let content_hash = descriptor
-            .and_then(|value| value.get("content_hash"))
-            .and_then(Value::as_str);
-        if let (Some(path), Some(content_hash)) = (path, content_hash) {
-            manifest.insert(path.to_owned(), content_hash.to_owned());
-        }
-    }
-    let manifest_json = serde_json::to_string(&manifest)?;
-    Ok((manifest_json, manifest))
-}
-
 /// RC-4c: the LIVE `fact.derived` payloads for an instance with the
 /// restore-marker fold applied (RC-4b), mirroring native `live_fact_payloads_on`.
 fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResult<Vec<String>> {
@@ -1831,7 +1650,7 @@ fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResul
     let mut live: Vec<(String, i64)> = Vec::new();
     for row in &rows {
         if as_text(&row[0]) == "context.restored" {
-            if let Some(target) = do_restore_marker_target(&as_text(&row[1])) {
+            if let Some(target) = restore_marker_target(&as_text(&row[1])) {
                 live.retain(|(_, seq)| *seq <= target);
             }
         } else {
@@ -1839,16 +1658,6 @@ fn do_live_fact_payloads<Sql: DoSql>(sql: &Sql, instance_id: &str) -> StoreResul
         }
     }
     Ok(live.into_iter().map(|(payload, _)| payload).collect())
-}
-
-/// RC-4b: the target sequence a `context.restored` marker rewinds replay to.
-/// Mirrors the native `restore_marker_target`: `None` for a malformed marker so
-/// the fold applies no rewind rather than corrupting the projection.
-fn do_restore_marker_target(payload_json: &str) -> Option<i64> {
-    serde_json::from_str::<Value>(payload_json)
-        .ok()?
-        .get("restored_to_sequence")
-        .and_then(Value::as_i64)
 }
 
 /// The `effect.terminal` event payload, mirroring `effect_completion_payload`.
@@ -3078,483 +2887,10 @@ fn do_insert_diagnostic<Sql: DoSql>(
 // Revision compatibility-analysis suite — the structural diff + fact-typecheck
 // the revision commands run to decide whether a candidate version is safe to
 // activate against a live instance. The `validate_*` / `compare_*` / signature
-// helpers are pure (serde_json + BTreeMap), copied verbatim from the native store;
-// the three `do_*` helpers touch `DoSql`.
+// helpers are pure (serde_json + BTreeMap) and are the native store's own, used
+// from `whipplescript_store` so the two planes cannot diverge; the three `do_*`
+// helpers here touch `DoSql`.
 // ---------------------------------------------------------------------------
-
-struct RevisionInstanceContext {
-    program_id: String,
-    program_name: String,
-    active_version_id: String,
-    status: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ContractSummary {
-    ty: String,
-    source_span_json: Option<String>,
-}
-
-fn revision_compatibility_diagnostic(
-    code: &str,
-    message: String,
-    subject: Option<&str>,
-) -> RevisionCompatibilityDiagnostic {
-    revision_compatibility_diagnostic_with_span(code, message, subject, None)
-}
-
-fn revision_compatibility_diagnostic_with_span(
-    code: &str,
-    message: String,
-    subject: Option<&str>,
-    source_span_json: Option<String>,
-) -> RevisionCompatibilityDiagnostic {
-    RevisionCompatibilityDiagnostic {
-        code: code.to_owned(),
-        message,
-        subject: subject.map(str::to_owned),
-        source_span_json,
-    }
-}
-
-fn add_instance_revision_diagnostics(
-    context: &RevisionInstanceContext,
-    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
-) {
-    if matches!(
-        context.status.as_str(),
-        "completed" | "failed" | "cancelled"
-    ) {
-        diagnostics.push(revision_compatibility_diagnostic(
-            "revision.terminal_instance",
-            format!(
-                "instance is {}; revisions require a non-terminal instance",
-                context.status
-            ),
-            None,
-        ));
-    }
-}
-
-fn contracts_by_name(summary: &Value, kind: &str) -> BTreeMap<String, ContractSummary> {
-    summary
-        .get("workflow_contracts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|contract| contract.get("kind").and_then(Value::as_str) == Some(kind))
-        .filter_map(|contract| {
-            Some((
-                contract.get("name")?.as_str()?.to_owned(),
-                ContractSummary {
-                    ty: contract.get("type")?.as_str()?.to_owned(),
-                    source_span_json: summary_source_span_json(contract),
-                },
-            ))
-        })
-        .collect()
-}
-
-fn compare_contracts(
-    kind: &str,
-    reject_candidate_additions: bool,
-    active: &Value,
-    candidate: &Value,
-    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
-) {
-    let active_contracts = contracts_by_name(active, kind);
-    let candidate_contracts = contracts_by_name(candidate, kind);
-    for (name, active_ty) in &active_contracts {
-        match candidate_contracts.get(name) {
-            Some(candidate_ty) if candidate_ty.ty == active_ty.ty => {}
-            Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.contract_changed",
-                format!(
-                    "{kind} contract `{name}` changed from `{}` to `{}`",
-                    active_ty.ty, candidate_ty.ty
-                ),
-                Some(name.as_str()),
-                candidate_ty.source_span_json.clone(),
-            )),
-            None => diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.contract_removed",
-                format!("{kind} contract `{name}` is missing from the candidate version"),
-                Some(name.as_str()),
-                active_ty.source_span_json.clone(),
-            )),
-        }
-    }
-    if reject_candidate_additions {
-        for (name, candidate_ty) in candidate_contracts {
-            if !active_contracts.contains_key(&name) {
-                diagnostics.push(revision_compatibility_diagnostic_with_span(
-                    "revision.input_contract_added",
-                    format!(
-                        "candidate adds input contract `{name}` with type `{}` to an already-started instance",
-                        candidate_ty.ty
-                    ),
-                    Some(name.as_str()),
-                    candidate_ty.source_span_json,
-                ));
-            }
-        }
-    }
-}
-
-fn compare_revision_summaries(
-    active: &Value,
-    candidate: &Value,
-    diagnostics: &mut Vec<RevisionCompatibilityDiagnostic>,
-) {
-    let active_workflow = active.get("workflow").and_then(Value::as_str);
-    let candidate_workflow = candidate.get("workflow").and_then(Value::as_str);
-    match (active_workflow, candidate_workflow) {
-        (Some(active_workflow), Some(candidate_workflow))
-            if active_workflow != candidate_workflow =>
-        {
-            diagnostics.push(revision_compatibility_diagnostic(
-                "revision.root_workflow_changed",
-                format!(
-                    "candidate root workflow `{candidate_workflow}` does not match active root `{active_workflow}`"
-                ),
-                Some(candidate_workflow),
-            ));
-        }
-        (None, _) => diagnostics.push(revision_compatibility_diagnostic(
-            "revision.active_analysis_missing",
-            "active version does not include revision analysis metadata".to_owned(),
-            None,
-        )),
-        (_, None) => diagnostics.push(revision_compatibility_diagnostic(
-            "revision.candidate_analysis_missing",
-            "candidate version does not include revision analysis metadata".to_owned(),
-            None,
-        )),
-        _ => {}
-    }
-    compare_contracts("input", true, active, candidate, diagnostics);
-    compare_contracts("output", false, active, candidate, diagnostics);
-    compare_contracts("failure", false, active, candidate, diagnostics);
-}
-
-fn schemas_by_name(summary: &Value) -> BTreeMap<String, Value> {
-    summary
-        .get("schemas")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|schema| Some((schema.get("name")?.as_str()?.to_owned(), schema.clone())))
-        .collect()
-}
-
-fn summary_source_span_json(summary: &Value) -> Option<String> {
-    summary.get("source_span").map(Value::to_string)
-}
-
-fn fact_schema_name<'a>(
-    fact_name: &'a str,
-    schema_id: Option<&'a str>,
-    active_schemas: &BTreeMap<String, Value>,
-    candidate_schemas: &BTreeMap<String, Value>,
-) -> Option<&'a str> {
-    if let Some(schema_id) = schema_id {
-        if active_schemas.contains_key(schema_id) || candidate_schemas.contains_key(schema_id) {
-            return Some(schema_id);
-        }
-    }
-    if active_schemas.contains_key(fact_name) || candidate_schemas.contains_key(fact_name) {
-        return Some(fact_name);
-    }
-    None
-}
-
-fn is_optional_signature(signature: &str) -> bool {
-    signature_envelope(signature, "optional").is_some()
-}
-
-fn signature_envelope<'a>(signature: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}<");
-    signature
-        .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_suffix('>'))
-}
-
-fn split_top_level(input: &str, separator: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut index = 0usize;
-    while index < input.len() {
-        let rest = &input[index..];
-        if depth == 0 && rest.starts_with(separator) {
-            parts.push(input[start..index].trim().to_owned());
-            index += separator.len();
-            start = index;
-            continue;
-        }
-        if let Some(ch) = rest.chars().next() {
-            match ch {
-                '<' => depth += 1,
-                '>' => depth -= 1,
-                _ => {}
-            }
-            index += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    parts.push(input[start..].trim().to_owned());
-    parts.retain(|part| !part.is_empty());
-    parts
-}
-
-fn validate_value_against_object_signature(
-    value: &Value,
-    inner: &str,
-    schemas: &BTreeMap<String, Value>,
-    path: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    let Some(fields) = inner
-        .strip_prefix('{')
-        .and_then(|value| value.strip_suffix('}'))
-    else {
-        errors.push(format!("{path} uses malformed object type"));
-        return;
-    };
-    let fields = split_top_level(fields, ", ")
-        .into_iter()
-        .filter_map(|field| {
-            let (name, signature) = field.split_once(' ')?;
-            Some(serde_json::json!({ "name": name, "type": signature }))
-        })
-        .collect::<Vec<_>>();
-    validate_value_against_fields(value, Some(&fields), schemas, path, errors, depth + 1);
-}
-
-fn validate_value_against_type_signature(
-    value: &Value,
-    signature: &str,
-    schemas: &BTreeMap<String, Value>,
-    path: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    if depth > 32 {
-        errors.push(format!("{path} exceeded schema recursion limit"));
-        return;
-    }
-    match signature {
-        "string" | "duration" | "time" | "image" | "audio" | "pdf" | "video" => {
-            if !value.is_string() {
-                errors.push(format!("{path} must be {signature}"));
-            }
-        }
-        "int" => {
-            if value.as_i64().is_none() {
-                errors.push(format!("{path} must be int"));
-            }
-        }
-        "float" => {
-            if value.as_f64().is_none() {
-                errors.push(format!("{path} must be float"));
-            }
-        }
-        "bool" => {
-            if !value.is_boolean() {
-                errors.push(format!("{path} must be bool"));
-            }
-        }
-        "null" => {
-            if !value.is_null() {
-                errors.push(format!("{path} must be null"));
-            }
-        }
-        _ => {
-            if let Some(expected) = signature_envelope(signature, "literal") {
-                let expected = serde_json::from_str::<String>(expected)
-                    .unwrap_or_else(|_| expected.to_owned());
-                if value.as_str() != Some(expected.as_str()) {
-                    errors.push(format!("{path} must be literal {expected:?}"));
-                }
-            } else if let Some(schema_name) = signature_envelope(signature, "ref") {
-                match schemas.get(schema_name) {
-                    Some(schema) => validate_fact_value_against_schema(
-                        value,
-                        schema,
-                        schemas,
-                        path,
-                        errors,
-                        depth + 1,
-                    ),
-                    None => errors.push(format!(
-                        "{path} references schema `{schema_name}` missing from candidate"
-                    )),
-                }
-            } else if let Some(inner) = signature_envelope(signature, "optional") {
-                if !value.is_null() {
-                    validate_value_against_type_signature(
-                        value,
-                        inner,
-                        schemas,
-                        path,
-                        errors,
-                        depth + 1,
-                    );
-                }
-            } else if let Some(inner) = signature_envelope(signature, "array") {
-                match value.as_array() {
-                    Some(items) => {
-                        for (index, item) in items.iter().enumerate() {
-                            validate_value_against_type_signature(
-                                item,
-                                inner,
-                                schemas,
-                                &format!("{path}[{index}]"),
-                                errors,
-                                depth + 1,
-                            );
-                        }
-                    }
-                    None => errors.push(format!("{path} must be an array")),
-                }
-            } else if let Some(inner) = signature_envelope(signature, "map") {
-                match value.as_object() {
-                    Some(map) => {
-                        for (key, item) in map {
-                            validate_value_against_type_signature(
-                                item,
-                                inner,
-                                schemas,
-                                &format!("{path}.{key}"),
-                                errors,
-                                depth + 1,
-                            );
-                        }
-                    }
-                    None => errors.push(format!("{path} must be an object map")),
-                }
-            } else if let Some(inner) = signature_envelope(signature, "union") {
-                let variants = split_top_level(inner, " | ");
-                if !variants.iter().any(|variant| {
-                    let mut candidate_errors = Vec::new();
-                    validate_value_against_type_signature(
-                        value,
-                        variant,
-                        schemas,
-                        path,
-                        &mut candidate_errors,
-                        depth + 1,
-                    );
-                    candidate_errors.is_empty()
-                }) {
-                    errors.push(format!(
-                        "{path} must match one of: {}",
-                        variants.join(" | ")
-                    ));
-                }
-            } else if let Some(inner) = signature_envelope(signature, "object") {
-                validate_value_against_object_signature(value, inner, schemas, path, errors, depth);
-            } else if let Some(inner) = signature_envelope(signature, "agentref") {
-                let agents = split_top_level(inner, " | ");
-                match value.as_str() {
-                    Some(agent) if agents.iter().any(|candidate| candidate == agent) => {}
-                    Some(_) => errors.push(format!(
-                        "{path} must name one of these agents: {}",
-                        agents.join(", ")
-                    )),
-                    None => errors.push(format!("{path} must be an agent name string")),
-                }
-            } else {
-                errors.push(format!("{path} uses unsupported type `{signature}`"));
-            }
-        }
-    }
-}
-
-fn validate_value_against_fields(
-    value: &Value,
-    fields: Option<&Vec<Value>>,
-    schemas: &BTreeMap<String, Value>,
-    path: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    let Some(object) = value.as_object() else {
-        errors.push(format!("{path} must be an object"));
-        return;
-    };
-    let fields = fields.map(Vec::as_slice).unwrap_or(&[]);
-    let declared = fields
-        .iter()
-        .filter_map(|field| Some((field.get("name")?.as_str()?, field.get("type")?.as_str()?)))
-        .collect::<BTreeMap<_, _>>();
-    for key in object.keys() {
-        if !declared.contains_key(key.as_str()) {
-            errors.push(format!("{path}.{key} is not declared by candidate"));
-        }
-    }
-    for (name, signature) in declared {
-        let field_path = format!("{path}.{name}");
-        match object.get(name) {
-            Some(value) => {
-                validate_value_against_type_signature(
-                    value,
-                    signature,
-                    schemas,
-                    &field_path,
-                    errors,
-                    depth + 1,
-                );
-            }
-            None if is_optional_signature(signature) => {}
-            None => errors.push(format!("{field_path} is required by candidate")),
-        }
-    }
-}
-
-fn validate_fact_value_against_schema(
-    value: &Value,
-    schema: &Value,
-    schemas: &BTreeMap<String, Value>,
-    path: &str,
-    errors: &mut Vec<String>,
-    depth: usize,
-) {
-    if depth > 32 {
-        errors.push(format!("{path} exceeded schema recursion limit"));
-        return;
-    }
-    match schema.get("kind").and_then(Value::as_str) {
-        Some("class") => validate_value_against_fields(
-            value,
-            schema.get("fields").and_then(Value::as_array),
-            schemas,
-            path,
-            errors,
-            depth,
-        ),
-        Some("enum") => {
-            let variants = schema
-                .get("variants")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>();
-            match value.as_str() {
-                Some(variant) if variants.contains(&variant) => {}
-                Some(variant) => errors.push(format!(
-                    "{path} has enum variant `{variant}` not declared by candidate"
-                )),
-                None => errors.push(format!("{path} must be a string enum variant")),
-            }
-        }
-        Some(kind) => errors.push(format!("{path} uses unsupported schema kind `{kind}`")),
-        None => errors.push(format!("{path} uses schema without a kind")),
-    }
-}
 
 /// The active revision context (program + version + status) for an instance,
 /// mirroring `revision_instance_context_on`.
@@ -3675,21 +3011,10 @@ fn do_add_active_fact_schema_diagnostics<Sql: DoSql>(
 
 // ---------------------------------------------------------------------------
 // Policy / capacity block engine — the capability + profile enforcement the
-// scheduler applies when deciding whether an effect is claimable. Ported from the
-// native store's policy helpers; the pure-JSON helpers are backend-agnostic, the
-// SQL ones run over `DoSql`.
+// scheduler applies when deciding whether an effect is claimable. The pure-JSON
+// helpers are backend-agnostic and come from `whipplescript_store` itself, so the
+// two planes cannot diverge; the SQL ones here run over `DoSql`.
 // ---------------------------------------------------------------------------
-
-/// The scheduling-relevant projection of an effect used by the policy engine.
-struct PolicyEffect {
-    kind: String,
-    target: Option<String>,
-    status: String,
-    required_capabilities_json: String,
-    profile: Option<String>,
-    program_id: String,
-    declared_profiles_json: String,
-}
 
 /// A scheduling block: the `blocked_by_*` status the effect should take and why
 /// (`start_run` records both; `claimable_effects` only checks presence).
@@ -3702,137 +3027,6 @@ fn capability_allowed(allowed: &[String], capability: &str) -> bool {
     allowed.iter().any(|item| item == "*" || item == capability)
 }
 
-fn capabilities_value(value: &Value) -> BTreeSet<String> {
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn capacity_value(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        value
-            .as_u64()
-            .and_then(|capacity| i64::try_from(capacity).ok())
-    })
-}
-
-fn agent_profile_in_value(value: &Value, agent: &str) -> Option<Option<String>> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| agent_profile_in_value(item, agent)),
-        Value::Object(object) => {
-            if let Some(entry) = object.get(agent) {
-                return Some(
-                    entry
-                        .get("profile")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                );
-            }
-            if let Some(profile) = object
-                .get("agents")
-                .and_then(|agents| agent_profile_in_value(agents, agent))
-            {
-                return Some(profile);
-            }
-            let declared_agent = object
-                .get("name")
-                .or_else(|| object.get("agent"))
-                .or_else(|| object.get("agent_name"))
-                .or_else(|| object.get("target"))
-                .and_then(Value::as_str);
-            if declared_agent == Some(agent) {
-                Some(
-                    object
-                        .get("profile")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                )
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn agent_capabilities_in_value(value: &Value, agent: &str) -> Option<BTreeSet<String>> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| agent_capabilities_in_value(item, agent)),
-        Value::Object(object) => {
-            if let Some(entry) = object.get(agent) {
-                return Some(capabilities_value(entry.get("capabilities")?));
-            }
-            if let Some(capabilities) = object
-                .get("agents")
-                .and_then(|agents| agent_capabilities_in_value(agents, agent))
-            {
-                return Some(capabilities);
-            }
-            let declared_agent = object
-                .get("name")
-                .or_else(|| object.get("agent"))
-                .or_else(|| object.get("agent_name"))
-                .or_else(|| object.get("target"))
-                .and_then(Value::as_str);
-            if declared_agent == Some(agent) {
-                object.get("capabilities").map(capabilities_value)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn agent_capacity_in_value(value: &Value, agent: &str) -> Option<i64> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| agent_capacity_in_value(item, agent)),
-        Value::Object(object) => {
-            if let Some(capacity) = object.get(agent).and_then(capacity_value) {
-                return Some(capacity);
-            }
-            if let Some(capacity) = object
-                .get(agent)
-                .and_then(|entry| entry.get("capacity"))
-                .and_then(capacity_value)
-            {
-                return Some(capacity);
-            }
-            if let Some(capacity) = object
-                .get("agents")
-                .and_then(|agents| agent_capacity_in_value(agents, agent))
-            {
-                return Some(capacity);
-            }
-            let declared_agent = object
-                .get("name")
-                .or_else(|| object.get("agent"))
-                .or_else(|| object.get("agent_name"))
-                .or_else(|| object.get("target"))
-                .and_then(Value::as_str);
-            if declared_agent == Some(agent) {
-                object.get("capacity").and_then(capacity_value)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 fn declared_agent_profile(
     declared_profiles_json: &str,
     agent: &str,
@@ -3841,32 +3035,6 @@ fn declared_agent_profile(
         &serde_json::from_str::<Value>(declared_profiles_json)?,
         agent,
     ))
-}
-
-fn declared_agents_present(declared_profiles_json: &str) -> StoreResult<bool> {
-    let parsed = serde_json::from_str::<Value>(declared_profiles_json)?;
-    Ok(match &parsed {
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(object) => {
-            object
-                .get("agents")
-                .and_then(Value::as_array)
-                .is_some_and(|agents| !agents.is_empty())
-                || object.iter().any(|(key, value)| {
-                    if matches!(key.as_str(), "harnesses" | "workflow" | "schemas") {
-                        return false;
-                    }
-                    value.as_object().is_some_and(|entry| {
-                        entry.contains_key("profile")
-                            || entry.contains_key("capacity")
-                            || entry.contains_key("capabilities")
-                            || entry.contains_key("harness")
-                            || entry.contains_key("provider")
-                    })
-                })
-        }
-        _ => false,
-    })
 }
 
 fn declared_agent_capabilities(
@@ -3885,33 +3053,6 @@ fn declared_agent_capacity(declared_profiles_json: &str, agent: &str) -> StoreRe
         &serde_json::from_str::<Value>(declared_profiles_json)?,
         agent,
     ))
-}
-
-fn explicit_required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
-    let parsed = serde_json::from_str::<Value>(&effect.required_capabilities_json)?;
-    let mut capabilities = parsed
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    capabilities.sort();
-    capabilities.dedup();
-    Ok(capabilities)
-}
-
-fn required_capabilities(effect: &PolicyEffect) -> StoreResult<Vec<String>> {
-    let mut capabilities = explicit_required_capabilities(effect)?;
-    if capabilities.is_empty() {
-        capabilities.push(effect.kind.clone());
-    }
-    capabilities.sort();
-    capabilities.dedup();
-    Ok(capabilities)
 }
 
 fn do_effect_provider_exists<Sql: DoSql>(sql: &Sql, effect_kind: &str) -> StoreResult<bool> {
@@ -4420,7 +3561,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
         let mut live: Vec<usize> = Vec::new();
         for (idx, row) in events.iter().enumerate() {
             if as_text(&row[1]) == "context.restored" {
-                if let Some(target) = do_restore_marker_target(&as_text(&row[2])) {
+                if let Some(target) = restore_marker_target(&as_text(&row[2])) {
                     live.retain(|&i| as_i64(&events[i][6]) <= target);
                 }
             } else {
@@ -6105,7 +5246,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         // checkpoint event appended below is not a file write, so folding over
         // the current head equals folding <= the checkpoint's own sequence.
         let fact_payloads = do_live_fact_payloads(&self.sql, capture.instance_id)?;
-        let (manifest_json, manifest) = do_fold_file_manifest(&fact_payloads)?;
+        let (manifest_json, manifest) = fold_file_manifest(&fact_payloads)?;
         // INV-4 coherence: store the manifest content-addressed BEFORE the cut
         // references its hash (same DO SQLite), so no committed cut names a
         // manifest hash absent from the blob store.
@@ -6203,7 +5344,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         }
         // Full reconcile: mediated paths live now but absent from the cut.
         let current_payloads = do_live_fact_payloads(&self.sql, instance_id)?;
-        let (_, current_manifest) = do_fold_file_manifest(&current_payloads)?;
+        let (_, current_manifest) = fold_file_manifest(&current_payloads)?;
         let removes: Vec<String> = current_manifest
             .keys()
             .filter(|path| !cut_manifest.contains_key(*path))
@@ -7389,20 +6530,6 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         &mut self,
         transition: InstanceTransition<'_>,
     ) -> StoreResult<StoredEvent> {
-        fn transition_allowed(current: &str, next: &str) -> bool {
-            matches!(
-                (current, next),
-                ("running", "paused")
-                    | ("paused", "running")
-                    | ("running", "cancelled")
-                    | ("paused", "cancelled")
-                    | ("blocked", "cancelled")
-                    | ("running", "failed")
-                    | ("paused", "failed")
-                    | ("blocked", "failed")
-            )
-        }
-
         let current_rows = self
             .sql
             .query(
@@ -7414,7 +6541,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
             .first()
             .map(|r| as_text(&r[0]))
             .ok_or_else(|| StoreError::Conflict("instance does not exist".to_owned()))?;
-        if !transition_allowed(&current_status, transition.status) {
+        if !instance_transition_allowed(&current_status, transition.status) {
             return Err(StoreError::Conflict(format!(
                 "cannot transition instance from {current_status} to {}",
                 transition.status
@@ -12006,6 +11133,20 @@ pub(crate) mod tests {
                 idempotency_key: None,
             })
             .is_err());
+        // An instance that was never seeded is refused before the transition is
+        // judged at all -- the native mirror pins the same refusal.
+        let missing = store
+            .transition_instance(InstanceTransition {
+                instance_id: "i_missing",
+                status: "paused",
+                reason: None,
+                idempotency_key: None,
+            })
+            .expect_err("a transition on a missing instance is refused");
+        assert!(
+            matches!(&missing, StoreError::Conflict(message) if message == "instance does not exist"),
+            "unexpected error: {missing:?}"
+        );
 
         // block_effect_binding: first call records; a second call with the same
         // category returns the SAME event (idempotent) without a new row.

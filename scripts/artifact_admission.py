@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -845,3 +846,231 @@ def validate_package_contract_platform(
         f"{label}.contract_registry",
         verifier_catalog,
     )
+
+
+class SymbolTable:
+    def __init__(self) -> None:
+        self.by_sort: dict[str, dict[str, str]] = {}
+
+    def symbol(self, sort: str, prefix: str, value: str) -> str:
+        values = self.by_sort.setdefault(sort, {})
+        if value not in values:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            values[value] = f"{prefix}{digest}"
+        return values[value]
+
+    def emit_ops(self) -> list[str]:
+        lines: list[str] = []
+        for sort, values in sorted(self.by_sort.items()):
+            symbols = sorted(values.values())
+            if symbols:
+                lines.append(f"  ops {' '.join(symbols)} : -> {sort} .")
+        return lines
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def stable_hash_hex(value: str) -> str:
+    # Mirrors the Rust stable_hash: SHA-256 truncated to 128 bits (the
+    # FNV-collision hardening swap). Extend every mirror together.
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def is_stable_digest(value: str) -> bool:
+    return len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def required_string(value: dict[str, Any], field: str, label: str) -> str:
+    result = value.get(field)
+    if not isinstance(result, str):
+        raise SystemExit(f"{label}.{field} must be a string")
+    return result
+
+
+def require_string(value: dict[str, Any], key: str, label: str) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or not item:
+        raise SystemExit(f"{label}.{key} must be a non-empty string")
+    return item
+
+
+def derived_fact_predicates(
+    artifact: dict[str, Any],
+    artifact_name: str,
+    owner_subsystem: str,
+) -> dict[str, list[set[str]]]:
+    facts = artifact.get("derived_facts")
+    if not isinstance(facts, list):
+        raise SystemExit(f"{artifact_name} is missing derived_facts")
+    predicates: dict[str, list[set[str]]] = {}
+    for index, fact in enumerate(facts):
+        if not isinstance(fact, dict):
+            raise SystemExit(f"{artifact_name} derived_facts[{index}] is not an object")
+        if fact.get("owner_subsystem") != owner_subsystem:
+            continue
+        predicate = fact.get("predicate")
+        if isinstance(predicate, str) and predicate:
+            input_refs = fact.get("input_refs")
+            if not isinstance(input_refs, list):
+                raise SystemExit(
+                    f"{artifact_name} derived_facts[{index}] is missing input_refs"
+                )
+            string_refs = [ref for ref in input_refs if isinstance(ref, str)]
+            if len(string_refs) != len(set(string_refs)):
+                raise SystemExit(
+                    f"{artifact_name} derived_facts[{index}] has duplicate input_refs"
+                )
+            predicates.setdefault(predicate, []).append(set(string_refs))
+    return predicates
+
+
+def require_predicate(
+    required: dict[str, set[str]],
+    predicate: str,
+    input_refs: list[str] | None = None,
+) -> None:
+    refs = required.setdefault(predicate, set())
+    if input_refs:
+        refs.update(ref for ref in input_refs if isinstance(ref, str))
+
+
+def validate_required_predicates(
+    predicates: dict[str, list[set[str]]],
+    required: dict[str, set[str]],
+    artifact_name: str,
+) -> None:
+    extra_predicates = sorted(predicate for predicate in predicates if predicate not in required)
+    if extra_predicates:
+        preview = ", ".join(extra_predicates[:8])
+        if len(extra_predicates) > 8:
+            preview = f"{preview}, ... ({len(extra_predicates)} total)"
+        raise SystemExit(
+            f"{artifact_name} derived_facts unexpected validator predicate(s): {preview}"
+        )
+
+    missing = sorted(predicate for predicate in required if predicate not in predicates)
+    if missing:
+        preview = ", ".join(missing[:8])
+        if len(missing) > 8:
+            preview = f"{preview}, ... ({len(missing)} total)"
+        raise SystemExit(
+            f"{artifact_name} derived_facts missing validator predicate(s): {preview}"
+        )
+
+    duplicate = sorted(
+        predicate for predicate in required if len(predicates[predicate]) != 1
+    )
+    if duplicate:
+        preview = ", ".join(duplicate[:8])
+        if len(duplicate) > 8:
+            preview = f"{preview}, ... ({len(duplicate)} total)"
+        raise SystemExit(
+            f"{artifact_name} derived_facts duplicate validator predicate(s): {preview}"
+        )
+
+    incomplete: list[str] = []
+    unexpected: list[str] = []
+    for predicate, expected_refs in sorted(required.items()):
+        if not expected_refs:
+            continue
+        input_refs = predicates[predicate][0]
+        if expected_refs == input_refs:
+            continue
+        missing_refs = sorted(expected_refs - input_refs)
+        extra_refs = sorted(input_refs - expected_refs)
+        if missing_refs:
+            preview = ", ".join(missing_refs[:4])
+            if len(missing_refs) > 4:
+                preview = f"{preview}, ... ({len(missing_refs)} total)"
+            incomplete.append(f"{predicate} missing {preview}")
+        if extra_refs:
+            preview = ", ".join(extra_refs[:4])
+            if len(extra_refs) > 4:
+                preview = f"{preview}, ... ({len(extra_refs)} total)"
+            unexpected.append(f"{predicate} includes unexpected {preview}")
+    if incomplete:
+        preview = "; ".join(incomplete[:4])
+        if len(incomplete) > 4:
+            preview = f"{preview}; ... ({len(incomplete)} total)"
+        raise SystemExit(
+            f"{artifact_name} derived_facts validator predicate input_refs incomplete: {preview}"
+        )
+    if unexpected:
+        preview = "; ".join(unexpected[:4])
+        if len(unexpected) > 4:
+            preview = f"{preview}; ... ({len(unexpected)} total)"
+        raise SystemExit(
+            f"{artifact_name} derived_facts validator predicate input_refs unexpected: {preview}"
+        )
+
+
+def maude_graph_node_list(node_symbols: list[str]) -> str:
+    result = "noGraphNodes"
+    for node_symbol in reversed(node_symbols):
+        result = f"graphNodeCons({node_symbol}, {result})"
+    return result
+
+
+def maude_port_list(port_symbols: list[str]) -> str:
+    result = "noPorts"
+    for port_symbol in reversed(port_symbols):
+        result = f"portCons({port_symbol}, {result})"
+    return result
+
+
+LOWERING_CLASS = {
+    "metadata": "metadataLowering",
+    "metadata_only": "metadataLowering",
+    "capability_call": "capabilityCall",
+    "typed_effect_call": "typedEffectCall",
+    "resource_effect": "resourceEffectLowering",
+    "core_effect": "coreEffectLowering",
+    "signal_emit": "eventEmitLowering",
+    "signal_source": "eventSourceLowering",
+    "schedule_emitter": "scheduleEmitterLowering",
+    "projection_view": "projectionViewLowering",
+    "assertion_check": "assertionCheckLowering",
+    "rule_template": "ruleTemplateLowering",
+}
+
+
+STATIC_GUARANTEE_FACTS = {
+    "deterministic": "classDeterministic",
+    "contract_pinned": "classContractPinned",
+    "no_runtime_inputs": "classNoRuntimeInputs",
+    "no_hidden_authority": "classNoHiddenAuthority",
+    "no_package_scheduler": "classNoPackageScheduler",
+    "no_package_lifecycle": "classNoPackageLifecycle",
+    "no_direct_fact_write": "classNoDirectFactWrite",
+    "no_direct_rule_fire": "classNoDirectRuleFire",
+}
+
+
+CURRENT_SUPPORTED_CORE_OBJECT_KINDS = {
+    "fact",
+    "event",
+    "effect",
+    "signal_source",
+    "schedule",
+    "rule",
+    "dependency",
+    "projection",
+    "assertion",
+    "diagnostic",
+}
+
+
+CURRENT_SUPPORTED_RUNTIME_ENTRYPOINTS = {
+    "fact_record",
+    "event_record",
+    "effect_graph_template",
+    "signal_source_template",
+    "schedule_template",
+    "rule_template",
+    "effect_dependency_template",
+    "event_projection",
+    "assertion_check",
+    "diagnostic_record",
+}

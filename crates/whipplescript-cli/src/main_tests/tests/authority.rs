@@ -381,6 +381,84 @@ workflow Child {
     let _ = fs::remove_file(&store_path);
 }
 
+/// Commit the queued `workflow.invoke` effect the delegated-invoke tests share,
+/// and hand back the claim and the worker options a worker would run it with.
+/// Takes the kernel by value because the commit reopens the store: the kernel's
+/// own connection has to be gone first, which the `drop` below makes the
+/// compiler's business rather than each caller's.
+fn queued_invoke_child(
+    kernel: RuntimeKernel<SqliteStore>,
+    store_path: &Path,
+    program_path: &Path,
+    parent_instance_id: &str,
+) -> (ClaimableEffect, WorkerOptions) {
+    let effect_input = json!({
+        "target_workflow": "Child",
+        "input": {}
+    })
+    .to_string();
+    let effects = [NewEffect {
+        effect_id: "invoke-child",
+        kind: "workflow.invoke",
+        target: Some("Child"),
+        input_json: &effect_input,
+        status: "queued",
+        idempotency_key: "rule=start;effect=invoke-child",
+        required_capabilities_json: r#"["workflow.invoke"]"#,
+        profile: None,
+        correlation_id: None,
+        source_span_json: None,
+        timeout_seconds: None,
+    }];
+    drop(kernel);
+    SqliteStore::open(store_path)
+        .expect("reopen store for commit")
+        .commit_rule(RuleCommit {
+            instance_id: parent_instance_id,
+            rule: "start",
+            trigger_event_id: None,
+            facts: &[],
+            consumed_fact_ids: &[],
+            effects: &effects,
+            dependencies: &[],
+            terminal: None,
+            idempotency_key: Some("commit-start"),
+            marks: &[],
+            context_json: None,
+        })
+        .expect("commit invoke effect");
+
+    let claimable = ClaimableEffect {
+        effect_id: "invoke-child".to_owned(),
+        kind: "workflow.invoke".to_owned(),
+        target: Some("Child".to_owned()),
+        profile: None,
+        input_json: effect_input,
+        required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    let options = WorkerOptions {
+        instance_id: parent_instance_id.to_owned(),
+        provider: "fixture".to_owned(),
+        exec_profile: ExecProfile::from_env(),
+        script_manifest_path: None,
+        package_lock_path: None,
+        outcome: FixtureOutcome::Completed,
+        variant: None,
+        program_path: Some(program_path.to_path_buf()),
+        root: Some("Parent".to_owned()),
+        provider_config_paths: Vec::new(),
+        max_child_iterations: 0,
+        agent_outcomes: BTreeMap::new(),
+        coerce_outputs: BTreeMap::new(),
+        virtual_now: None,
+        work_unit_root: None,
+        side_stores: None,
+    };
+
+    (claimable, options)
+}
+
 #[test]
 fn workflow_invoke_without_grant_starts_child_under_automatic_cap() {
     let store_path = unique_test_path("invoke-automatic-cap-authority", "sqlite");
@@ -436,69 +514,8 @@ workflow Child {
             },
         )
         .expect("parent instance");
-    let effect_input = json!({
-        "target_workflow": "Child",
-        "input": {}
-    })
-    .to_string();
-    let effects = [NewEffect {
-        effect_id: "invoke-child",
-        kind: "workflow.invoke",
-        target: Some("Child"),
-        input_json: &effect_input,
-        status: "queued",
-        idempotency_key: "rule=start;effect=invoke-child",
-        required_capabilities_json: r#"["workflow.invoke"]"#,
-        profile: None,
-        correlation_id: None,
-        source_span_json: None,
-        timeout_seconds: None,
-    }];
-    drop(kernel);
-    SqliteStore::open(&store_path)
-        .expect("reopen store for commit")
-        .commit_rule(RuleCommit {
-            instance_id: &parent_instance_id,
-            rule: "start",
-            trigger_event_id: None,
-            facts: &[],
-            consumed_fact_ids: &[],
-            effects: &effects,
-            dependencies: &[],
-            terminal: None,
-            idempotency_key: Some("commit-start"),
-            marks: &[],
-            context_json: None,
-        })
-        .expect("commit invoke effect");
-
-    let claimable = ClaimableEffect {
-        effect_id: "invoke-child".to_owned(),
-        kind: "workflow.invoke".to_owned(),
-        target: Some("Child".to_owned()),
-        profile: None,
-        input_json: effect_input,
-        required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
-        declared_profiles_json: "[]".to_owned(),
-    };
-    let options = WorkerOptions {
-        instance_id: parent_instance_id.clone(),
-        provider: "fixture".to_owned(),
-        exec_profile: ExecProfile::from_env(),
-        script_manifest_path: None,
-        package_lock_path: None,
-        outcome: FixtureOutcome::Completed,
-        variant: None,
-        program_path: Some(program_path.to_path_buf()),
-        root: Some("Parent".to_owned()),
-        provider_config_paths: Vec::new(),
-        max_child_iterations: 0,
-        agent_outcomes: BTreeMap::new(),
-        coerce_outputs: BTreeMap::new(),
-        virtual_now: None,
-        work_unit_root: None,
-        side_stores: None,
-    };
+    let (claimable, options) =
+        queued_invoke_child(kernel, &store_path, &program_path, &parent_instance_id);
 
     run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
         .expect("invoke effect starts child");
@@ -579,69 +596,8 @@ workflow Child {
             },
         )
         .expect("parent instance");
-    let effect_input = json!({
-        "target_workflow": "Child",
-        "input": {}
-    })
-    .to_string();
-    let effects = [NewEffect {
-        effect_id: "invoke-child",
-        kind: "workflow.invoke",
-        target: Some("Child"),
-        input_json: &effect_input,
-        status: "queued",
-        idempotency_key: "rule=start;effect=invoke-child",
-        required_capabilities_json: r#"["workflow.invoke"]"#,
-        profile: None,
-        correlation_id: None,
-        source_span_json: None,
-        timeout_seconds: None,
-    }];
-    drop(kernel);
-    SqliteStore::open(&store_path)
-        .expect("reopen store for commit")
-        .commit_rule(RuleCommit {
-            instance_id: &parent_instance_id,
-            rule: "start",
-            trigger_event_id: None,
-            facts: &[],
-            consumed_fact_ids: &[],
-            effects: &effects,
-            dependencies: &[],
-            terminal: None,
-            idempotency_key: Some("commit-start"),
-            marks: &[],
-            context_json: None,
-        })
-        .expect("commit invoke effect");
-
-    let claimable = ClaimableEffect {
-        effect_id: "invoke-child".to_owned(),
-        kind: "workflow.invoke".to_owned(),
-        target: Some("Child".to_owned()),
-        profile: None,
-        input_json: effect_input,
-        required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
-        declared_profiles_json: "[]".to_owned(),
-    };
-    let options = WorkerOptions {
-        instance_id: parent_instance_id.clone(),
-        provider: "fixture".to_owned(),
-        exec_profile: ExecProfile::from_env(),
-        script_manifest_path: None,
-        package_lock_path: None,
-        outcome: FixtureOutcome::Completed,
-        variant: None,
-        program_path: Some(program_path.to_path_buf()),
-        root: Some("Parent".to_owned()),
-        provider_config_paths: Vec::new(),
-        max_child_iterations: 0,
-        agent_outcomes: BTreeMap::new(),
-        coerce_outputs: BTreeMap::new(),
-        virtual_now: None,
-        work_unit_root: None,
-        side_stores: None,
-    };
+    let (claimable, options) =
+        queued_invoke_child(kernel, &store_path, &program_path, &parent_instance_id);
 
     run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)
         .expect("invoke effect starts child");
@@ -751,69 +707,8 @@ workflow Child {
             },
         )
         .expect("parent instance");
-    let effect_input = json!({
-        "target_workflow": "Child",
-        "input": {}
-    })
-    .to_string();
-    let effects = [NewEffect {
-        effect_id: "invoke-child",
-        kind: "workflow.invoke",
-        target: Some("Child"),
-        input_json: &effect_input,
-        status: "queued",
-        idempotency_key: "rule=start;effect=invoke-child",
-        required_capabilities_json: r#"["workflow.invoke"]"#,
-        profile: None,
-        correlation_id: None,
-        source_span_json: None,
-        timeout_seconds: None,
-    }];
-    drop(kernel);
-    SqliteStore::open(&store_path)
-        .expect("reopen store for commit")
-        .commit_rule(RuleCommit {
-            instance_id: &parent_instance_id,
-            rule: "start",
-            trigger_event_id: None,
-            facts: &[],
-            consumed_fact_ids: &[],
-            effects: &effects,
-            dependencies: &[],
-            terminal: None,
-            idempotency_key: Some("commit-start"),
-            marks: &[],
-            context_json: None,
-        })
-        .expect("commit invoke effect");
-
-    let claimable = ClaimableEffect {
-        effect_id: "invoke-child".to_owned(),
-        kind: "workflow.invoke".to_owned(),
-        target: Some("Child".to_owned()),
-        profile: None,
-        input_json: effect_input,
-        required_capabilities_json: r#"["workflow.invoke"]"#.to_owned(),
-        declared_profiles_json: "[]".to_owned(),
-    };
-    let options = WorkerOptions {
-        instance_id: parent_instance_id.clone(),
-        provider: "fixture".to_owned(),
-        exec_profile: ExecProfile::from_env(),
-        script_manifest_path: None,
-        package_lock_path: None,
-        outcome: FixtureOutcome::Completed,
-        variant: None,
-        program_path: Some(program_path.to_path_buf()),
-        root: Some("Parent".to_owned()),
-        provider_config_paths: Vec::new(),
-        max_child_iterations: 0,
-        agent_outcomes: BTreeMap::new(),
-        coerce_outputs: BTreeMap::new(),
-        virtual_now: None,
-        work_unit_root: None,
-        side_stores: None,
-    };
+    let (claimable, options) =
+        queued_invoke_child(kernel, &store_path, &program_path, &parent_instance_id);
 
     let _terminal =
         run_workflow_invoke_effect(&store_path, &parent_instance_id, &claimable, &options)

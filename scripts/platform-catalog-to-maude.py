@@ -4,27 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
 from typing import Any
 
-from artifact_admission import load_platform_construct_catalog
+from artifact_admission import (
+    LOWERING_CLASS,
+    STATIC_GUARANTEE_FACTS,
+    SymbolTable,
+    load_platform_construct_catalog,
+    require_string,
+)
 
-
-LOWERING_CLASS = {
-    "metadata": "metadataLowering",
-    "metadata_only": "metadataLowering",
-    "capability_call": "capabilityCall",
-    "typed_effect_call": "typedEffectCall",
-    "resource_effect": "resourceEffectLowering",
-    "core_effect": "coreEffectLowering",
-    "signal_emit": "eventEmitLowering",
-    "signal_source": "eventSourceLowering",
-    "schedule_emitter": "scheduleEmitterLowering",
-    "projection_view": "projectionViewLowering",
-    "assertion_check": "assertionCheckLowering",
-    "rule_template": "ruleTemplateLowering",
-}
 
 CONSTRUCT_FAMILY = {
     "effect_operation": "effectOperation",
@@ -35,37 +25,6 @@ CONSTRUCT_FAMILY = {
     "signal_source": "eventSourceConstruct",
     "projection_read": "projectionReadConstruct",
 }
-
-STATIC_GUARANTEE_FACTS = {
-    "deterministic": "classDeterministic",
-    "contract_pinned": "classContractPinned",
-    "no_runtime_inputs": "classNoRuntimeInputs",
-    "no_hidden_authority": "classNoHiddenAuthority",
-    "no_package_scheduler": "classNoPackageScheduler",
-    "no_package_lifecycle": "classNoPackageLifecycle",
-    "no_direct_fact_write": "classNoDirectFactWrite",
-    "no_direct_rule_fire": "classNoDirectRuleFire",
-}
-
-
-class SymbolTable:
-    def __init__(self) -> None:
-        self.by_sort: dict[str, dict[str, str]] = {}
-
-    def symbol(self, sort: str, prefix: str, value: str) -> str:
-        values = self.by_sort.setdefault(sort, {})
-        if value not in values:
-            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-            values[value] = f"{prefix}{digest}"
-        return values[value]
-
-    def emit_ops(self) -> list[str]:
-        lines: list[str] = []
-        for sort, values in sorted(self.by_sort.items()):
-            symbols = sorted(values.values())
-            if symbols:
-                lines.append(f"  ops {' '.join(symbols)} : -> {sort} .")
-        return lines
 
 
 def string_array(value: dict[str, Any], key: str, label: str) -> list[str]:
@@ -78,13 +37,6 @@ def string_array(value: dict[str, Any], key: str, label: str) -> list[str]:
             raise SystemExit(f"{label}.{key}[{index}] must be a non-empty string")
         result.append(element)
     return result
-
-
-def require_string(value: dict[str, Any], key: str, label: str) -> str:
-    item = value.get(key)
-    if not isinstance(item, str) or not item:
-        raise SystemExit(f"{label}.{key} must be a non-empty string")
-    return item
 
 
 def maude_lowering_class(symbols: SymbolTable, lowering_class: str) -> str:

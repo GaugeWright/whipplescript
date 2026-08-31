@@ -419,6 +419,97 @@ pub fn workspace_tool_specs_from_registry(
     tools
 }
 
+/// Default `read` window when the caller names no limit (pi-conformance §1:
+/// line-based head truncation with continuation notices).
+pub const DEFAULT_READ_LINE_LIMIT: usize = 2_000;
+
+/// Resolve the `edits` argument with pi's tolerance (pi-conformance §1): a real
+/// array, an array double-encoded as a JSON string (some models serialize the
+/// nested value), or the legacy single-edit shape with top-level
+/// `oldText`/`newText` strings.
+pub fn edits_argument(args: &Value) -> Result<Value, String> {
+    match args.get("edits") {
+        Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
+        Some(Value::String(raw)) => {
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|e| format!("`edits` is a string but not valid JSON: {e}"))?;
+            if parsed.is_array() {
+                Ok(parsed)
+            } else {
+                Err("`edits` must be an array".to_string())
+            }
+        }
+        Some(_) => Err("`edits` must be an array".to_string()),
+        None => match (
+            args.get("oldText").and_then(Value::as_str),
+            args.get("newText").and_then(Value::as_str),
+        ) {
+            (Some(old), Some(new)) => Ok(json!([{ "oldText": old, "newText": new }])),
+            _ => Err("`edits` must be an array".to_string()),
+        },
+    }
+}
+
+/// Apply the `read` line window (pi-conformance §1): a 1-based `offset`, an
+/// explicit `limit`, or the default [`DEFAULT_READ_LINE_LIMIT`]-line window.
+/// Head truncation appends a continuation notice carrying the next offset; an
+/// offset past the end of the file is an error.
+pub fn read_line_window(
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if let Some(requested) = offset {
+        if requested > total {
+            return Err(format!(
+                "Offset {requested} is beyond end of file ({total} lines total)"
+            ));
+        }
+    }
+    let start = offset.unwrap_or(1).max(1) - 1;
+    let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    let end = (start + window).min(total);
+    let mut out = lines[start..end].join("\n");
+    let remaining = total - end;
+    if remaining > 0 {
+        if limit.is_some() {
+            // The caller's explicit limit stopped early.
+            out.push_str(&format!(
+                "\n[{remaining} more lines in file. Use offset={} to continue.]",
+                end + 1
+            ));
+        } else {
+            // The default window head-truncated the file.
+            out.push_str(&format!(
+                "\n[Showing lines {}-{end} of {total}. Use offset={} to continue.]",
+                start + 1,
+                end + 1
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Apply a 1-based line offset and a line limit to file or recalled blob
+/// content.
+pub fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.is_none() && limit.is_none() {
+        return content.to_string();
+    }
+    let start = offset.unwrap_or(1).saturating_sub(1);
+    let lines: Vec<&str> = content.lines().collect();
+    let end = match limit {
+        Some(limit) => (start + limit).min(lines.len()),
+        None => lines.len(),
+    };
+    if start >= lines.len() {
+        return String::new();
+    }
+    lines[start..end].join("\n")
+}
+
 fn tool_spec(name: &str, description: &str, input_schema: Value) -> ToolSpec {
     ToolSpec {
         name: name.to_owned(),
@@ -445,6 +536,58 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `edits_argument` and `read_line_window` moved here from the two host tool
+    /// surfaces that each carried a copy. Their refusals came with them but
+    /// their tests did not: the sweep runs per crate, so every refusal in this
+    /// pair read as unexercised by `-p whipplescript-kernel`. These pin all four.
+    #[test]
+    fn edits_argument_refuses_everything_that_is_not_an_array() {
+        // A JSON string that parses, but not to an array.
+        assert_eq!(
+            edits_argument(&json!({ "edits": "{\"oldText\":\"a\"}" })),
+            Err("`edits` must be an array".to_string())
+        );
+        // A value of the wrong type entirely.
+        assert_eq!(
+            edits_argument(&json!({ "edits": 7 })),
+            Err("`edits` must be an array".to_string())
+        );
+        // Absent, with no legacy single-edit pair to fall back on.
+        assert_eq!(
+            edits_argument(&json!({ "oldText": "a" })),
+            Err("`edits` must be an array".to_string())
+        );
+    }
+
+    /// The accepting half, so a function that refused everything could not pass
+    /// the three cases above.
+    #[test]
+    fn edits_argument_admits_the_three_shapes_pi_sends() {
+        let edit = json!([{ "oldText": "a", "newText": "b" }]);
+        assert_eq!(
+            edits_argument(&json!({ "edits": [{ "oldText": "a", "newText": "b" }] })),
+            Ok(edit.clone())
+        );
+        assert_eq!(
+            edits_argument(&json!({ "edits": "[{\"oldText\":\"a\",\"newText\":\"b\"}]" })),
+            Ok(edit.clone())
+        );
+        assert_eq!(
+            edits_argument(&json!({ "oldText": "a", "newText": "b" })),
+            Ok(edit)
+        );
+    }
+
+    #[test]
+    fn read_line_window_refuses_an_offset_past_the_end_of_the_file() {
+        assert_eq!(
+            read_line_window("one\ntwo\nthree\n", Some(9), None),
+            Err("Offset 9 is beyond end of file (3 lines total)".to_string())
+        );
+        // The boundary is inclusive: an offset equal to the line count is fine.
+        assert!(read_line_window("one\ntwo\nthree\n", Some(3), None).is_ok());
+    }
 
     #[test]
     fn authored_package_is_placement_neutral_and_bash_is_virtual() {

@@ -15080,7 +15080,7 @@ fn parse_tell_target(line: &str) -> Option<&str> {
         .filter(|target| !target.is_empty())
 }
 
-fn parse_required_capabilities(line: &str) -> Vec<String> {
+pub fn parse_required_capabilities(line: &str) -> Vec<String> {
     let Some(rest) = line.split_once(" requires ") else {
         return Vec::new();
     };
@@ -21914,7 +21914,7 @@ fn malformed_prompt_content_type_annotation(line: &str) -> Option<String> {
     None
 }
 
-fn is_supported_prompt_content_type(candidate: &str) -> bool {
+pub fn is_supported_prompt_content_type(candidate: &str) -> bool {
     if !is_prompt_content_type_token(candidate) {
         return false;
     }
@@ -21926,7 +21926,7 @@ fn is_supported_prompt_content_type(candidate: &str) -> bool {
         )
 }
 
-fn is_prompt_content_type_token(candidate: &str) -> bool {
+pub fn is_prompt_content_type_token(candidate: &str) -> bool {
     let mut chars = candidate.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -21935,7 +21935,7 @@ fn is_prompt_content_type_token(candidate: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-' | '_'))
 }
 
-pub(crate) fn binding_after_as(line: &str) -> Option<String> {
+pub fn binding_after_as(line: &str) -> Option<String> {
     let mut tokens = line.split_whitespace();
     while let Some(token) = tokens.next() {
         if token == "as" {

@@ -16,7 +16,7 @@ use std::{
 use serde_json::{json, Value};
 
 use whipplescript_kernel::{
-    native_lifecycle::{AgentTurnLifecycleKind, NativeAgentTurnObservation},
+    native_lifecycle::{native_event_kind, AgentTurnLifecycleKind, NativeAgentTurnObservation},
     provider::{
         CancellationDepth, NativeProviderAdapter, NativeProviderArtifactRef,
         NativeProviderBoundaryError, NativeProviderCancellation, NativeProviderEvent,
@@ -1122,19 +1122,6 @@ fn codex_input_from_prompt(prompt: &Value) -> Value {
         return json!([{ "type": "text", "text": text }]);
     }
     json!([{ "type": "text", "text": prompt.to_string() }])
-}
-
-fn native_event_kind(kind: AgentTurnLifecycleKind) -> NativeProviderEventKind {
-    match kind {
-        AgentTurnLifecycleKind::Started => NativeProviderEventKind::Started,
-        AgentTurnLifecycleKind::Streamed => NativeProviderEventKind::Streamed,
-        AgentTurnLifecycleKind::ToolRequested => NativeProviderEventKind::ToolRequested,
-        AgentTurnLifecycleKind::ArtifactCaptured => NativeProviderEventKind::ArtifactCaptured,
-        AgentTurnLifecycleKind::Completed => NativeProviderEventKind::Completed,
-        AgentTurnLifecycleKind::Failed => NativeProviderEventKind::Failed,
-        AgentTurnLifecycleKind::TimedOut => NativeProviderEventKind::TimedOut,
-        AgentTurnLifecycleKind::Cancelled => NativeProviderEventKind::Cancelled,
-    }
 }
 
 fn artifact_refs_from_codex_message(message: &Value) -> Vec<NativeProviderArtifactRef> {

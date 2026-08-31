@@ -34,7 +34,9 @@ use whipplescript_kernel::effect_handlers::glob_match;
 use whipplescript_kernel::harness_loop::{
     ToolCall, ToolExecutor, ToolOutcome, ToolSpec, ToolStatus,
 };
-use whipplescript_kernel::host_package::workspace_tool_specs_from_registry;
+use whipplescript_kernel::host_package::{
+    edits_argument, read_line_window, slice_lines, workspace_tool_specs_from_registry,
+};
 use whipplescript_kernel::host_protocol::ResourceRef;
 use whipplescript_kernel::whip_shell::{ShellFile, ShellRequest, WhipShell};
 use whipplescript_store::items::{ClaimOutcome, FinishOutcome, ReleaseOutcome, WorkItems};
@@ -60,8 +62,6 @@ const DEFAULT_MAX_BYTES: usize = 50_000;
 /// Bound on `files` rows visited by `find`/`grep` so a huge workspace cannot
 /// stall a turn (mirrors native's tree-walk bound, applied to the flat table).
 const MAX_FILES_WALKED: usize = 5_000;
-/// Default line window for `read` when no explicit `limit` is given.
-const DEFAULT_READ_LINE_LIMIT: usize = 2_000;
 /// Cap on a single emitted `grep` line.
 const GREP_MAX_LINE_CHARS: usize = 500;
 /// Leading bytes sniffed for a NUL byte to refuse reading binary content as text.
@@ -889,31 +889,6 @@ impl GrepMatcher {
     }
 }
 
-/// Resolve the `edits` argument with pi's tolerance: a real array, an array
-/// double-encoded as a JSON string, or the legacy single-edit top-level shape.
-fn edits_argument(args: &Value) -> Result<Value, String> {
-    match args.get("edits") {
-        Some(Value::Array(items)) => Ok(Value::Array(items.clone())),
-        Some(Value::String(raw)) => {
-            let parsed: Value = serde_json::from_str(raw)
-                .map_err(|e| format!("`edits` is a string but not valid JSON: {e}"))?;
-            if parsed.is_array() {
-                Ok(parsed)
-            } else {
-                Err("`edits` must be an array".to_string())
-            }
-        }
-        Some(_) => Err("`edits` must be an array".to_string()),
-        None => match (
-            optional_str_arg(args, "oldText"),
-            optional_str_arg(args, "newText"),
-        ) {
-            (Some(old), Some(new)) => Ok(json!([{ "oldText": old, "newText": new }])),
-            _ => Err("`edits` must be an array".to_string()),
-        },
-    }
-}
-
 /// Cap a single grep output line at [`GREP_MAX_LINE_CHARS`] characters
 /// (char-boundary safe), marking the cut.
 fn cap_grep_line(line: &str) -> String {
@@ -921,62 +896,6 @@ fn cap_grep_line(line: &str) -> String {
         Some((byte_index, _)) => format!("{}... [truncated]", &line[..byte_index]),
         None => line.to_string(),
     }
-}
-
-/// Apply the `read` line window: a 1-based `offset`, an explicit `limit`, or the
-/// default [`DEFAULT_READ_LINE_LIMIT`]-line window. Head truncation appends a
-/// continuation notice; an offset past the end of the file is an error.
-fn read_line_window(
-    content: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Result<String, String> {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    if let Some(requested) = offset {
-        if requested > total {
-            return Err(format!(
-                "Offset {requested} is beyond end of file ({total} lines total)"
-            ));
-        }
-    }
-    let start = offset.unwrap_or(1).max(1) - 1;
-    let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
-    let end = (start + window).min(total);
-    let mut out = lines[start..end].join("\n");
-    let remaining = total - end;
-    if remaining > 0 {
-        if limit.is_some() {
-            out.push_str(&format!(
-                "\n[{remaining} more lines in file. Use offset={} to continue.]",
-                end + 1
-            ));
-        } else {
-            out.push_str(&format!(
-                "\n[Showing lines {}-{end} of {total}. Use offset={} to continue.]",
-                start + 1,
-                end + 1
-            ));
-        }
-    }
-    Ok(out)
-}
-
-/// Apply a 1-based line offset and a line limit to blob content (for `recall`).
-fn slice_lines(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
-    if offset.is_none() && limit.is_none() {
-        return content.to_string();
-    }
-    let start = offset.unwrap_or(1).saturating_sub(1);
-    let lines: Vec<&str> = content.lines().collect();
-    let end = match limit {
-        Some(limit) => (start + limit).min(lines.len()),
-        None => lines.len(),
-    };
-    if start >= lines.len() {
-        return String::new();
-    }
-    lines[start..end].join("\n")
 }
 
 /// Map a TodoWrite-style status to the builtin tracker's item status.

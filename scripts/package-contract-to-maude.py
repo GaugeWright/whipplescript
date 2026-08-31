@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from artifact_admission import (
+    SymbolTable,
+    canonical_json,
     is_sha256_digest,
     load_platform_construct_catalog,
+    require_string,
     validate_empty_diagnostics,
     validate_package_contract_platform,
     validate_package_contract_spine,
@@ -25,30 +28,6 @@ except Exception as exc:
         "python jsonschema package is required; run under `nix develop` or "
         f"install `requirements-dev.txt`: {exc}"
     )
-
-
-class SymbolTable:
-    def __init__(self) -> None:
-        self.by_sort: dict[str, dict[str, str]] = {}
-
-    def symbol(self, sort: str, prefix: str, value: str) -> str:
-        values = self.by_sort.setdefault(sort, {})
-        if value not in values:
-            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-            values[value] = f"{prefix}{digest}"
-        return values[value]
-
-    def emit_ops(self) -> list[str]:
-        lines: list[str] = []
-        for sort, values in sorted(self.by_sort.items()):
-            symbols = sorted(values.values())
-            if symbols:
-                lines.append(f"  ops {' '.join(symbols)} : -> {sort} .")
-        return lines
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
 def validate_json_schema(root: Path, schema_name: str, value: Any, label: str) -> None:
@@ -135,13 +114,6 @@ def string_array(value: dict[str, Any], key: str) -> list[str]:
     if not isinstance(array, list):
         return []
     return [item for item in array if isinstance(item, str) and item]
-
-
-def require_string(value: dict[str, Any], key: str, label: str) -> str:
-    item = value.get(key)
-    if not isinstance(item, str) or not item:
-        raise SystemExit(f"{label}.{key} must be a non-empty string")
-    return item
 
 
 def first_source_keyword(contract: dict[str, Any]) -> str:

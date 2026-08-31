@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use crate::provider::NativeProviderEventKind;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentTurnLifecycleKind {
     Started,
@@ -60,6 +62,21 @@ impl AgentTurnLifecycleKind {
             self,
             Self::Streamed | Self::ToolRequested | Self::ArtifactCaptured
         )
+    }
+}
+
+/// Project a normalized lifecycle kind onto the provider event kind an adapter
+/// emits. Provider-agnostic, so every adapter crate shares one mapping.
+pub fn native_event_kind(kind: AgentTurnLifecycleKind) -> NativeProviderEventKind {
+    match kind {
+        AgentTurnLifecycleKind::Started => NativeProviderEventKind::Started,
+        AgentTurnLifecycleKind::Streamed => NativeProviderEventKind::Streamed,
+        AgentTurnLifecycleKind::ToolRequested => NativeProviderEventKind::ToolRequested,
+        AgentTurnLifecycleKind::ArtifactCaptured => NativeProviderEventKind::ArtifactCaptured,
+        AgentTurnLifecycleKind::Completed => NativeProviderEventKind::Completed,
+        AgentTurnLifecycleKind::Failed => NativeProviderEventKind::Failed,
+        AgentTurnLifecycleKind::TimedOut => NativeProviderEventKind::TimedOut,
+        AgentTurnLifecycleKind::Cancelled => NativeProviderEventKind::Cancelled,
     }
 }
 
