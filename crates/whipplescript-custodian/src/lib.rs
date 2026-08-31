@@ -238,6 +238,36 @@ impl Custodian {
         let name = op.credential().clone();
         let operation = op.operation();
 
+        // Container operations act on a vault rather than on an existing
+        // credential, so they run BEFORE the admission block below: a
+        // `Generate` has no entry to look up, and a `Revoke` ends an entry
+        // whatever kind it holds. Running them through the member path would
+        // fail `UnknownCredential` on the one operation whose whole purpose is
+        // that the credential does not exist yet.
+        // Matched STRUCTURALLY rather than through `is_container()`, so the
+        // compiler enforces the split instead of a runtime arm asserting it. A
+        // classifier here would need an impossible-state branch, which is a
+        // refusal no test can reach and so a refusal nothing gates.
+        match op {
+            CustodyOp::Generate {
+                credential: _,
+                kind,
+            } => return self.op_generate(&name, *kind),
+            CustodyOp::Revoke { .. } => return self.op_revoke(&name),
+            // `Rotate` deliberately does NOT return here. It needs an entry
+            // that exists and is not revoked — exactly the two admissions
+            // below — so routing it through them means one implementation of
+            // those refusals rather than a second copy inside a handler.
+            CustodyOp::Rotate { .. }
+            | CustodyOp::Request { .. }
+            | CustodyOp::Sign { .. }
+            | CustodyOp::Verify { .. }
+            | CustodyOp::Derive { .. }
+            | CustodyOp::Wrap { .. }
+            | CustodyOp::Unwrap { .. }
+            | CustodyOp::Mint { .. } => {}
+        }
+
         // Admission: existence, revocation, kind support, budget — checked
         // under the store lock, then material is cloned out (zeroizing) so
         // crypto work does not hold the lock.
@@ -251,7 +281,10 @@ impl Custodian {
             if entry.revoked {
                 return Err(CustodyError::Revoked { credential: name });
             }
-            if !entry.kind.supports(operation) {
+            // A container operation acts on the entry's identity rather than
+            // exercising its key, so no kind performs it and asking would
+            // refuse every rotation. Existence and revocation still apply.
+            if !operation.is_container() && !entry.kind.supports(operation) {
                 return Err(CustodyError::KindMismatch {
                     credential: name,
                     kind: entry.kind,
@@ -304,6 +337,29 @@ impl Custodian {
             CustodyOp::Unwrap {
                 envelope, context, ..
             } => op_unwrap(&name, &material, envelope, context),
+            // Returned above, before admission — a container operation has no
+            // entry to load material from. Listed rather than wildcarded so a
+            // future container op is a compile error here rather than a silent
+            // fall-through, and `unreachable!` rather than an `Err` because an
+            // error nothing can produce is a refusal nothing gates.
+            // A local entry holds exactly one material, so a successor would
+            // REPLACE its predecessor and break every outstanding signature —
+            // the opposite of the dual validity §12 asks for. Refused by name
+            // rather than silently replacing.
+            CustodyOp::Rotate { .. } => Err(CustodyError::Backend {
+                detail: format!(
+                    "credential {name} is sealed locally and cannot rotate: a local entry holds \
+                     one material, so a successor would replace its predecessor rather than sit \
+                     beside it. rotation needs the r3 remote rung"
+                ),
+            }),
+            // Returned above, before admission. Listed rather than wildcarded
+            // so a future container op is a compile error here, and
+            // `unreachable!` rather than an `Err` because an error nothing can
+            // produce is a refusal nothing gates.
+            CustodyOp::Generate { .. } | CustodyOp::Revoke { .. } => {
+                unreachable!("generate and revoke return before member admission")
+            }
             CustodyOp::Mint {
                 exchange,
                 extraction,
@@ -330,6 +386,18 @@ impl Custodian {
             detail: "no OpenBao connection configured (BAO_ADDR/BAO_TOKEN)".into(),
         })?;
         match op {
+            // Transit keeps every prior key version, so a rotation here IS the
+            // dual validity §12 asks for — which holds only because a
+            // signature now carries the version it was made under.
+            CustodyOp::Rotate { .. } => {
+                let version = client
+                    .transit_rotate(key_name)
+                    .map_err(|detail| CustodyError::Backend { detail })?;
+                Ok(CustodyOk::Rotated {
+                    credential: name.clone(),
+                    version,
+                })
+            }
             CustodyOp::Sign {
                 alg,
                 derivation,
@@ -345,24 +413,38 @@ impl Custodian {
                     });
                 }
                 let payload = decode_b64(payload_b64)?;
-                let signature = client
+                let (key_version, signature) = client
                     .transit_sign(key_name, &payload, kind)
                     .map_err(|detail| CustodyError::Backend { detail })?;
                 Ok(CustodyOk::Signed {
                     signature_b64: B64.encode(signature),
+                    // Reported so the verifier can name the same version. A
+                    // signature that does not say which key made it can only be
+                    // checked against a guess.
+                    key_version: Some(key_version),
                 })
             }
             CustodyOp::Verify {
                 alg,
                 payload_b64,
                 signature_b64,
+                key_version,
                 ..
             } => {
                 remote_alg_admitted(name, kind, *alg, op.operation())?;
                 let payload = decode_b64(payload_b64)?;
                 let signature = decode_b64(signature_b64)?;
                 let valid = client
-                    .transit_verify(key_name, &payload, &signature, kind)
+                    .transit_verify(
+                        key_name,
+                        &payload,
+                        &signature,
+                        kind,
+                        // Absent means "the version this key started at",
+                        // which is the pre-rotation behaviour made explicit
+                        // rather than hard-coded a layer down.
+                        key_version.unwrap_or(1),
+                    )
                     .map_err(|detail| CustodyError::Backend { detail })?;
                 Ok(CustodyOk::Verified { valid })
             }
@@ -430,6 +512,69 @@ impl Custodian {
         Ok(CustodyOk::Derived {
             credential: derived_name,
         })
+    }
+
+    // -- container operations -------------------------------------------------
+
+    /// Create sealed material and register it in one act (DR-0053 §2/§5
+    /// Amendments). Returns the handle, never the material.
+    ///
+    /// **Refuses an existing name.** `Store::register` is an upsert, which is
+    /// right for the admin surface an operator drives deliberately — and wrong
+    /// here, where a generated name arrives from a running program. A silent
+    /// overwrite would destroy a live credential and hand back a handle that
+    /// looks identical, so the collision is an error.
+    fn op_generate(
+        &self,
+        name: &CredentialName,
+        kind: CredentialKind,
+    ) -> Result<CustodyOk, CustodyError> {
+        // Not `KindMismatch`: that variant says a CREDENTIAL's kind cannot
+        // perform an operation, and here the credential does not exist yet —
+        // naming one that is not there would be a misuse of the shape. The
+        // refusal is about the kind alone, and saying so in words also makes it
+        // measurable: the mutation sweep perturbs a refusal's message, so a
+        // message-less typed variant is a refusal no sweep can reach.
+        let Some(bytes) = generatable_key_len(kind) else {
+            return Err(CustodyError::Backend {
+                detail: format!(
+                    "credential kind {kind} cannot be generated: its material is issued by a \
+                     third party, so `obtain credential` is its path rather than `generate`"
+                ),
+            });
+        };
+        let mut material = Zeroizing::new(vec![0u8; bytes]);
+        self.rng
+            .fill(material.as_mut_slice())
+            .map_err(|_| CustodyError::Backend {
+                detail: "rng failure".into(),
+            })?;
+        let mut store = lock(&self.store);
+        if store.get(name).is_some() {
+            return Err(CustodyError::Backend {
+                detail: format!("credential {name} already exists"),
+            });
+        }
+        store
+            .register(name.clone(), kind, material, None)
+            .map_err(|e| CustodyError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(CustodyOk::Generated {
+            credential: name.clone(),
+            kind,
+        })
+    }
+
+    /// End a credential. `existed: false` is a successful call whose answer is
+    /// "there was nothing to revoke".
+    fn op_revoke(&self, name: &CredentialName) -> Result<CustodyOk, CustodyError> {
+        let existed = lock(&self.store)
+            .revoke(name)
+            .map_err(|e| CustodyError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(CustodyOk::Revoked { existed })
     }
 
     // -- wrap ---------------------------------------------------------------
@@ -857,6 +1002,10 @@ fn op_sign(
         };
     Ok(CustodyOk::Signed {
         signature_b64: B64.encode(signature),
+        // A local key has one version and no way to name others, so there is
+        // nothing honest to report. `None` says exactly that, rather than
+        // claiming a version number the backend does not have.
+        key_version: None,
     })
 }
 
@@ -920,6 +1069,32 @@ fn hkdf_expand(material: &[u8], info: &[u8]) -> Result<Zeroizing<Vec<u8>>, Custo
 
 /// The wrapping key is an HKDF subkey of the credential, so wrap/unwrap
 /// never uses raw material directly as an AEAD key.
+/// How many random bytes a kind's material is, or `None` if the kind cannot be
+/// generated at all (DR-0053 §5 Amendment 2026-08-29).
+///
+/// The split is not a judgement call — it follows from who issues the material.
+/// `bearer` is an opaque token a third party issues TO us and `aws-sigv4`'s
+/// secret comes from IAM, so neither can be conjured here; §11's
+/// `obtain credential` is the path for those.
+///
+/// `basic` is deliberately absent from v1. We could generate the password half,
+/// but a `basic` credential is a PAIR and the username is not ours to invent,
+/// so generating one would produce a credential that authenticates to nothing.
+fn generatable_key_len(kind: CredentialKind) -> Option<usize> {
+    match kind {
+        // Random bytes, self-contained: both ends are ours.
+        CredentialKind::Raw => Some(32),
+        CredentialKind::HmacSha256 => Some(32),
+        // Ed25519 seeds are 32 bytes; the public half is derived from them and
+        // is what gets handed to a relying party.
+        CredentialKind::Ed25519 => Some(32),
+        CredentialKind::Bearer
+        | CredentialKind::Basic
+        | CredentialKind::AwsSigv4
+        | CredentialKind::JwtRs256 => None,
+    }
+}
+
 fn wrapping_key(material: &[u8]) -> Result<LessSafeKey, CustodyError> {
     let sub = hkdf_expand(material, b"whipplescript-custody-wrap-v1")?;
     let unbound = UnboundKey::new(&CHACHA20_POLY1305, &sub).map_err(|_| CustodyError::Backend {

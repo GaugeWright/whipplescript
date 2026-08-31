@@ -82,7 +82,7 @@ fn hmac_sha256_matches_rfc4231() {
         derivation: vec![],
         payload_b64: B64.encode(b"what do ya want for nothing?"),
     }));
-    let CustodyOk::Signed { signature_b64 } = expect_ok(&reply) else {
+    let CustodyOk::Signed { signature_b64, .. } = expect_ok(&reply) else {
         panic!("wrong variant")
     };
     assert_eq!(
@@ -102,7 +102,7 @@ fn ed25519_matches_rfc8032() {
         derivation: vec![],
         payload_b64: B64.encode(b""),
     }));
-    let CustodyOk::Signed { signature_b64 } = expect_ok(&reply) else {
+    let CustodyOk::Signed { signature_b64, .. } = expect_ok(&reply) else {
         panic!("wrong variant")
     };
     assert_eq!(
@@ -142,7 +142,7 @@ fn aws_sigv4_derivation_chain_matches_aws_example() {
         ],
         payload_b64: B64.encode(string_to_sign.as_bytes()),
     }));
-    let CustodyOk::Signed { signature_b64 } = expect_ok(&reply) else {
+    let CustodyOk::Signed { signature_b64, .. } = expect_ok(&reply) else {
         panic!("wrong variant")
     };
     assert_eq!(
@@ -172,7 +172,7 @@ fn verify_accepts_valid_and_rejects_forged() {
         derivation: vec![],
         payload_b64: B64.encode(payload),
     }));
-    let CustodyOk::Signed { signature_b64 } = expect_ok(&signed) else {
+    let CustodyOk::Signed { signature_b64, .. } = expect_ok(&signed) else {
         panic!("wrong variant")
     };
 
@@ -181,6 +181,7 @@ fn verify_accepts_valid_and_rejects_forged() {
         alg: SignatureAlg::HmacSha256,
         payload_b64: B64.encode(payload),
         signature_b64: signature_b64.clone(),
+        key_version: None,
     }));
     assert!(matches!(
         expect_ok(&valid),
@@ -192,6 +193,7 @@ fn verify_accepts_valid_and_rejects_forged() {
         alg: SignatureAlg::HmacSha256,
         payload_b64: B64.encode(b"different payload"),
         signature_b64: signature_b64.clone(),
+        key_version: None,
     }));
     assert!(matches!(
         expect_ok(&forged),
@@ -752,4 +754,234 @@ fn use_records_cover_all_operations() {
         Operation::Mint,
     ];
     assert_eq!(ops.len(), Operation::ALL.len());
+}
+
+// ---------------------------------------------------------------------------
+// Container operations (DR-0053 §2 Amendment 2026-08-29)
+// ---------------------------------------------------------------------------
+
+/// `Generate` creates sealed material in one act with its registration, and
+/// returns a HANDLE. The material never crosses the protocol — that is what
+/// keeps §2's claim true of the one operation that could plausibly break it.
+#[test]
+fn generate_creates_a_usable_credential_and_returns_only_a_handle() {
+    let custodian = custodian_with(&[]);
+    let target = name("deploy_keys/ci-2026-08");
+
+    let reply = custodian.handle(&call(CustodyOp::Generate {
+        credential: target.clone(),
+        kind: CredentialKind::Ed25519,
+    }));
+    let CustodyReply {
+        outcome: Ok(CustodyOk::Generated { credential, kind }),
+        ..
+    } = reply
+    else {
+        panic!("generate must succeed: {reply:?}");
+    };
+    assert_eq!(credential, target);
+    assert_eq!(kind, CredentialKind::Ed25519);
+
+    // The reply carries a handle and nothing else, so the only way to show the
+    // material exists is to USE it — which is also the property worth proving.
+    let signed = custodian.handle(&call(CustodyOp::Sign {
+        credential: target.clone(),
+        alg: SignatureAlg::Ed25519,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"release-manifest"),
+    }));
+    assert!(
+        matches!(signed.outcome, Ok(CustodyOk::Signed { .. })),
+        "generated material must be usable: {signed:?}"
+    );
+}
+
+/// A kind whose material a third party issues cannot be conjured. `bearer` is a
+/// token issued TO us and `aws-sigv4`'s secret comes from IAM, so §11's
+/// `obtain credential` is their path, not this one.
+#[test]
+fn generate_refuses_a_kind_nobody_here_can_issue() {
+    let custodian = custodian_with(&[]);
+    for kind in [CredentialKind::Bearer, CredentialKind::AwsSigv4] {
+        let reply = custodian.handle(&call(CustodyOp::Generate {
+            credential: name("v/member"),
+            kind,
+        }));
+        let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+            panic!("{kind:?} must not be generatable: {reply:?}");
+        };
+        assert!(
+            detail.contains("cannot be generated") && detail.contains(kind.as_str()),
+            "the refusal must name the kind it refuses: {detail}"
+        );
+    }
+}
+
+/// `Store::register` is an upsert, which is right for an operator driving the
+/// admin surface deliberately and wrong for a name arriving from a running
+/// program. A silent overwrite would destroy a live credential and hand back a
+/// handle that looks identical.
+#[test]
+fn generate_refuses_to_overwrite_an_existing_credential() {
+    let custodian = custodian_with(&[("vault/live", CredentialKind::HmacSha256, b"existing-key")]);
+    let reply = custodian.handle(&call(CustodyOp::Generate {
+        credential: name("vault/live"),
+        kind: CredentialKind::HmacSha256,
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("an existing name must not be overwritten: {reply:?}");
+    };
+    // Asserting the MESSAGE, not just the variant. `Backend` carries every
+    // other internal failure too, so a variant-only assertion passes for
+    // reasons that have nothing to do with the collision — which is exactly
+    // what the mutation sweep reported about the first version of this test.
+    assert!(
+        detail.contains("already exists"),
+        "the refusal must name the collision: {detail}"
+    );
+
+    // And the original material survives: the refusal is not a partial write.
+    let signed = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("vault/live"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"probe"),
+    }));
+    assert!(matches!(signed.outcome, Ok(CustodyOk::Signed { .. })));
+}
+
+/// `Revoke` ends a credential whatever its kind, and reports whether it
+/// changed anything. `existed: false` is a SUCCESSFUL call — the same shape
+/// `Verified` uses for an invalid signature, so a caller does not have to read
+/// an error to learn there was nothing there.
+#[test]
+fn revoke_ends_a_credential_and_reports_whether_one_existed() {
+    let custodian = custodian_with(&[("vault/doomed", CredentialKind::HmacSha256, b"key")]);
+
+    let reply = custodian.handle(&call(CustodyOp::Revoke {
+        credential: name("vault/doomed"),
+    }));
+    assert!(
+        matches!(reply.outcome, Ok(CustodyOk::Revoked { existed: true })),
+        "{reply:?}"
+    );
+
+    // Revocation bites: the credential no longer signs.
+    let after = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("vault/doomed"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"probe"),
+    }));
+    assert!(
+        matches!(after.outcome, Err(CustodyError::Revoked { .. })),
+        "a revoked credential must refuse use: {after:?}"
+    );
+
+    let absent = custodian.handle(&call(CustodyOp::Revoke {
+        credential: name("vault/never-existed"),
+    }));
+    assert!(
+        matches!(absent.outcome, Ok(CustodyOk::Revoked { existed: false })),
+        "revoking nothing is a successful call, not an error: {absent:?}"
+    );
+}
+
+/// Container operations are attributable like any other use. §1 claims every
+/// use is, and a creation nobody recorded would be the worst one to miss.
+#[test]
+fn a_generate_is_recorded_as_a_use() {
+    let custodian = custodian_with(&[]);
+    custodian.handle(&call(CustodyOp::Generate {
+        credential: name("v/m"),
+        kind: CredentialKind::Raw,
+    }));
+    let uses = custodian.uses();
+    assert_eq!(uses.len(), 1);
+    assert_eq!(uses[0].operation, Operation::Generate);
+    assert_eq!(uses[0].credential, "v/m");
+}
+
+/// Rotation is remote-only, and the refusal names why rather than failing
+/// obscurely. A local entry holds exactly one material, so a successor would
+/// REPLACE its predecessor and break every outstanding signature — the one
+/// thing a one-material store could do, and the opposite of the dual validity
+/// §12 asks for.
+#[test]
+fn rotate_refuses_a_locally_sealed_credential_by_name() {
+    let custodian = custodian_with(&[("vault/local", CredentialKind::HmacSha256, b"key")]);
+    let reply = custodian.handle(&call(CustodyOp::Rotate {
+        credential: name("vault/local"),
+    }));
+    let Err(CustodyError::Backend { detail }) = reply.outcome else {
+        panic!("a local rotation must refuse: {reply:?}");
+    };
+    assert!(
+        detail.contains("cannot rotate") && detail.contains("r3 remote rung"),
+        "the refusal must say why and where rotation lives: {detail}"
+    );
+
+    // The predecessor is untouched: the refusal is not a partial rotation.
+    let signed = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("vault/local"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"probe"),
+    }));
+    assert!(matches!(signed.outcome, Ok(CustodyOk::Signed { .. })));
+}
+
+/// Rotation is a container operation, so it reaches the credential's identity
+/// rather than its key — but an unknown or revoked entry still has no identity
+/// to rotate.
+#[test]
+fn rotate_refuses_an_unknown_or_revoked_credential() {
+    let custodian = custodian_with(&[("vault/dead", CredentialKind::HmacSha256, b"key")]);
+
+    let unknown = custodian.handle(&call(CustodyOp::Rotate {
+        credential: name("vault/absent"),
+    }));
+    assert!(
+        matches!(unknown.outcome, Err(CustodyError::UnknownCredential { .. })),
+        "{unknown:?}"
+    );
+
+    custodian.handle(&call(CustodyOp::Revoke {
+        credential: name("vault/dead"),
+    }));
+    let revoked = custodian.handle(&call(CustodyOp::Rotate {
+        credential: name("vault/dead"),
+    }));
+    assert!(
+        matches!(revoked.outcome, Err(CustodyError::Revoked { .. })),
+        "a revoked credential has nothing to rotate: {revoked:?}"
+    );
+}
+
+/// A remote entry with no client configured is a refusal worth naming: the
+/// credential exists and its material lives elsewhere, so failing silently
+/// would look like a rotation that did nothing.
+#[test]
+fn rotate_refuses_a_remote_credential_with_no_openbao_connection() {
+    let mut store = SealedStore::create(None, "test-passphrase").expect("create");
+    store
+        .register_remote(
+            name("vault/remote"),
+            CredentialKind::Ed25519,
+            "k".into(),
+            None,
+        )
+        .expect("register remote");
+    let custodian = Custodian::new(store, Box::new(DeniedEgress));
+
+    let reply = custodian.handle(&call(CustodyOp::Rotate {
+        credential: name("vault/remote"),
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("a remote rotation with no client must refuse: {reply:?}");
+    };
+    assert!(
+        detail.contains("no OpenBao connection configured"),
+        "the refusal must name what is missing: {detail}"
+    );
 }

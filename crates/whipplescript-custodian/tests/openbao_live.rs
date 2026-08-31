@@ -172,16 +172,23 @@ fn openbao_live_smoke() {
         ("hmac-sha256", hmac_key.as_str(), CredentialKind::HmacSha256),
         ("ed25519", ed25519_key.as_str(), CredentialKind::Ed25519),
     ] {
-        let signature = client
+        // The version travels with the bytes now: transit resolves which key
+        // version to check from it, so dropping it is how the wrong key gets
+        // verified against.
+        let (key_version, signature) = client
             .transit_sign(key, payload, kind)
             .unwrap_or_else(|e| panic!("{label} transit sign: {e}"));
         assert!(
             !signature.is_empty(),
-            "{label} produced an empty signature — the vault:v1: framing did not parse"
+            "{label} produced an empty signature — the vault:vN: framing did not parse"
+        );
+        assert!(
+            key_version >= 1,
+            "{label} reported no usable key version: {key_version}"
         );
         assert!(
             client
-                .transit_verify(key, payload, &signature, kind)
+                .transit_verify(key, payload, &signature, kind, key_version)
                 .unwrap_or_else(|e| panic!("{label} transit verify: {e}")),
             "{label} did not verify its own signature"
         );
@@ -189,13 +196,13 @@ fn openbao_live_smoke() {
         // distinction the custodian's `Verified { valid }` reply rests on.
         assert!(
             !client
-                .transit_verify(key, payload, &corrupt(&signature), kind)
+                .transit_verify(key, payload, &corrupt(&signature), kind, key_version)
                 .unwrap_or_else(|e| panic!("{label} transit verify (corrupt): {e}")),
             "{label} accepted a corrupted signature"
         );
         assert!(
             !client
-                .transit_verify(key, b"a different payload", &signature, kind)
+                .transit_verify(key, b"a different payload", &signature, kind, key_version)
                 .unwrap_or_else(|e| panic!("{label} transit verify (wrong payload): {e}")),
             "{label} accepted a signature over a different payload"
         );
@@ -297,7 +304,7 @@ fn openbao_live_smoke() {
     // custodian reports for local entries.
     assert_eq!(signed.rung, Rung::Remote);
     assert!(!signed.degraded, "an r3 entry must not report degraded");
-    let CustodyOk::Signed { signature_b64 } = expect_ok(&signed) else {
+    let CustodyOk::Signed { signature_b64, .. } = expect_ok(&signed) else {
         panic!("expected a signature, got {:?}", signed.outcome);
     };
 
@@ -306,6 +313,7 @@ fn openbao_live_smoke() {
         alg: SignatureAlg::HmacSha256,
         payload_b64: B64.encode(payload),
         signature_b64: signature_b64.clone(),
+        key_version: None,
     }));
     assert_eq!(verified.rung, Rung::Remote);
     assert_eq!(

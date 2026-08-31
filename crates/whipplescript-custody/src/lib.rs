@@ -316,6 +316,12 @@ impl CredentialKind {
                 self,
                 CredentialKind::Bearer | CredentialKind::Basic | CredentialKind::Raw
             ),
+            // Container operations consult no kind. `Generate` acts on a vault
+            // and there is no entry yet; `Revoke` ends an entry whatever it
+            // holds. Returning false is what keeps them out of `allow` lists,
+            // where they would be a category error — the vault grants are where
+            // they belong (DR-0053 §14 Amendment).
+            Operation::Generate | Operation::Rotate | Operation::Revoke => false,
         }
     }
 }
@@ -406,9 +412,30 @@ pub enum Operation {
     Wrap,
     Unwrap,
     Mint,
+    /// Create sealed material in a declared vault (DR-0053 §2 Amendment
+    /// 2026-08-29). A CONTAINER operation: it acts on a vault rather than on an
+    /// existing credential, so no kind is consulted and `supports` is false for
+    /// every kind. Kept in this enum rather than a parallel one so that every
+    /// use stays attributable through the one `UseRecord.operation` field —
+    /// §1 claims attribution for every use, and a second vocabulary would have
+    /// needed a second record.
+    Generate,
+    /// End a credential — the act that closes an overlap or a lifetime. Also a
+    /// container operation, and also not kind-conditioned: revoking an ed25519
+    /// key is the same act as revoking a bearer token.
+    /// Produce a successor under the same entry, both valid. A container
+    /// operation like `Generate` and `Revoke`: it acts on the entry's identity
+    /// rather than exercising the key, so no kind is consulted.
+    Rotate,
+    Revoke,
 }
 
 impl Operation {
+    /// The MEMBER operations — what a credential's kind can perform and what a
+    /// declaration's `allow` list may name. Deliberately not the whole enum:
+    /// `Generate` and `Revoke` act on a container and belong to vault grants,
+    /// so listing them here would offer them as `allow` entries that every kind
+    /// then refuses.
     pub const ALL: [Operation; 7] = [
         Operation::Request,
         Operation::Sign,
@@ -419,6 +446,18 @@ impl Operation {
         Operation::Mint,
     ];
 
+    /// The CONTAINER operations, which act on a vault rather than a member.
+    pub const CONTAINER: [Operation; 3] =
+        [Operation::Generate, Operation::Rotate, Operation::Revoke];
+
+    /// Whether this operation acts on a container rather than an existing
+    /// credential. Container operations skip kind admission entirely: there is
+    /// no entry to consult for a `Generate`, and a `Revoke` ends an entry
+    /// whatever its kind.
+    pub fn is_container(&self) -> bool {
+        Self::CONTAINER.contains(self)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Operation::Request => "request",
@@ -428,6 +467,9 @@ impl Operation {
             Operation::Wrap => "wrap",
             Operation::Unwrap => "unwrap",
             Operation::Mint => "mint",
+            Operation::Generate => "generate",
+            Operation::Rotate => "rotate",
+            Operation::Revoke => "revoke",
         }
     }
 
@@ -440,6 +482,9 @@ impl Operation {
             "wrap" => Ok(Operation::Wrap),
             "unwrap" => Ok(Operation::Unwrap),
             "mint" => Ok(Operation::Mint),
+            "generate" => Ok(Operation::Generate),
+            "rotate" => Ok(Operation::Rotate),
+            "revoke" => Ok(Operation::Revoke),
             other => Err(format!("unknown custody operation {other:?}")),
         }
     }
@@ -454,6 +499,11 @@ impl Operation {
             Operation::Request | Operation::Mint => GrantClass::Narrowable,
             Operation::Unwrap => GrantClass::TypeNarrowed,
             Operation::Sign | Operation::Verify | Operation::Derive | Operation::Wrap => {
+                GrantClass::NonNarrowable
+            }
+            // Container grants are named bare on the vault; a glob on one is a
+            // check error, exactly as for the non-narrowable member class.
+            Operation::Generate | Operation::Rotate | Operation::Revoke => {
                 GrantClass::NonNarrowable
             }
         }
@@ -720,6 +770,37 @@ pub struct MintExtraction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum CustodyOp {
+    /// Create sealed material in a declared vault and register it, returning a
+    /// handle (DR-0053 §2 Amendment 2026-08-29). `credential` is the full
+    /// `{vault}/{member}` name — a vault is a `/`-prefix, so governance binding
+    /// the prefix binds every member this creates, including ones that do not
+    /// exist yet.
+    ///
+    /// Creation and registration are ONE act. An agent that could create
+    /// without registering could produce an authority nobody knows about;
+    /// one that can only create-and-register cannot.
+    ///
+    /// The material never leaves the custodian, so this is not an exception to
+    /// §2 — a compromised whip can create only into vaults governance declared,
+    /// of the kind that vault declares, and cannot see what it creates.
+    Generate {
+        credential: CredentialName,
+        kind: CredentialKind,
+    },
+    /// Produce a SUCCESSOR under the same entry, both valid (DR-0053 §12
+    /// Amendment 2026-08-29).
+    ///
+    /// The indivisible step of a rotation, and the only part that is not a
+    /// workflow. Generating a successor and binding it are two acts with a
+    /// window between them, during which the entry has a successor nobody can
+    /// reach while every consumer still uses the predecessor. Everything after
+    /// — deliver, verify consumers, cut over, revoke the predecessor — stays
+    /// the workflow's, which is what makes rotation resumable and dry-runnable.
+    Rotate { credential: CredentialName },
+    /// End a credential. Not new capability — `register`/`revoke` have been on
+    /// the custodian's admin surface since the split, gated by the store
+    /// passphrase. What this moves is the gate: from passphrase to governance.
+    Revoke { credential: CredentialName },
     /// Substitute at marked slots, egress, return the response.
     Request {
         credential: CredentialName,
@@ -755,6 +836,11 @@ pub enum CustodyOp {
         alg: SignatureAlg,
         payload_b64: String,
         signature_b64: String,
+        /// The key version the signature was made under, as `Signed` reported
+        /// it. `None` asks the backend for its own default, which is right for
+        /// a local key and is the pre-rotation behaviour for a remote one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_version: Option<u32>,
     },
     /// HKDF subkey; returns a handle, never material.
     Derive {
@@ -808,6 +894,9 @@ pub enum CustodyOp {
 impl CustodyOp {
     pub fn operation(&self) -> Operation {
         match self {
+            CustodyOp::Generate { .. } => Operation::Generate,
+            CustodyOp::Rotate { .. } => Operation::Rotate,
+            CustodyOp::Revoke { .. } => Operation::Revoke,
             CustodyOp::Request { .. } => Operation::Request,
             CustodyOp::Sign { .. } => Operation::Sign,
             CustodyOp::Verify { .. } => Operation::Verify,
@@ -826,7 +915,10 @@ impl CustodyOp {
             | CustodyOp::Derive { credential, .. }
             | CustodyOp::Wrap { credential, .. }
             | CustodyOp::Unwrap { credential, .. }
-            | CustodyOp::Mint { credential, .. } => credential,
+            | CustodyOp::Mint { credential, .. }
+            | CustodyOp::Generate { credential, .. }
+            | CustodyOp::Rotate { credential }
+            | CustodyOp::Revoke { credential } => credential,
         }
     }
 }
@@ -876,11 +968,45 @@ impl CustodyCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "lowercase")]
 pub enum CustodyOk {
+    /// A generated credential's HANDLE and the kind it was created as. No
+    /// material: `Generate` is the one operation that could plausibly return
+    /// some, and returning a handle is what keeps §2's claim true of it.
+    Generated {
+        credential: CredentialName,
+        kind: CredentialKind,
+    },
+    /// The key version the entry is at after a rotation. Prior versions stay
+    /// valid — that IS the dual validity, and it holds only because a
+    /// signature carries the version it was made under.
+    Rotated {
+        credential: CredentialName,
+        version: u32,
+    },
+    /// Whether the revocation changed anything. `false` is a SUCCESSFUL call
+    /// whose answer is "there was nothing to revoke" — the same shape
+    /// `Verified` uses for an invalid signature, so a caller distinguishes it
+    /// from an error rather than inferring one.
+    Revoked {
+        existed: bool,
+    },
     Requested {
         response: EgressResponse,
     },
     Signed {
         signature_b64: String,
+        /// The backend key VERSION this signature was made under, when the
+        /// backend has versions (r3 transit does; a local key does not).
+        ///
+        /// It has to survive the round trip through whip, because verification
+        /// resolves which version to check from it and whip is what holds the
+        /// signature in between. Without it, r3 could only ever verify against
+        /// version 1 — which is exactly why key rotation was scoped out of r3
+        /// v1, and carrying it is what unpins that.
+        ///
+        /// `None` for rungs whose keys have no versions; a verifier treats that
+        /// as "the backend decides", which for a local key is the only key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_version: Option<u32>,
     },
     Verified {
         /// Constant-time comparison result. `false` is a *successful* call
@@ -1040,6 +1166,26 @@ pub trait CustodyTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vocabulary is closed on BOTH sides. `as_str` and `parse` are each
+    /// other's inverse over the whole enum, and a spelling outside it is
+    /// refused by name rather than silently becoming a default — governance
+    /// grants name operations as text, so a typo that parsed to something
+    /// would grant the wrong operation.
+    #[test]
+    fn every_operation_round_trips_and_an_unknown_one_is_refused() {
+        for operation in Operation::ALL.into_iter().chain(Operation::CONTAINER) {
+            assert_eq!(
+                Operation::parse(operation.as_str()).expect("round trips"),
+                operation
+            );
+        }
+        let err = Operation::parse("elevate").expect_err("must refuse");
+        assert!(
+            err.contains("unknown custody operation") && err.contains("elevate"),
+            "the refusal must name what it did not recognise: {err}"
+        );
+    }
 
     fn name(s: &str) -> CredentialName {
         CredentialName::new(s).expect("valid name")

@@ -302,7 +302,14 @@ impl SignedEnvelope {
             .call(call)
             .map_err(|err| format!("custodian unreachable: {err}"))?;
         let signature_b64 = match reply.outcome {
-            Ok(whipplescript_custody::CustodyOk::Signed { signature_b64 }) => signature_b64,
+            // `key_version` is deliberately dropped rather than stored.
+            // `ExternalAttestation` is canonicalized and signed, so adding a
+            // field to it changes the signing domain of every existing
+            // envelope. Governance keys therefore stay pinned to their first
+            // version until that envelope change is made deliberately — the
+            // same limitation r3 had everywhere before this commit, now scoped
+            // to one place and written down.
+            Ok(whipplescript_custody::CustodyOk::Signed { signature_b64, .. }) => signature_b64,
             Ok(other) => return Err(format!("custodian returned a non-signature: {other:?}")),
             Err(refusal) => {
                 return Err(format!(
@@ -470,6 +477,10 @@ impl GovernanceAttestationVerifier for CustodianEnvelopeVerifier<'_> {
                 alg: whipplescript_custody::SignatureAlg::Ed25519,
                 payload_b64: crate::exec_http::base64_encode(signing_bytes),
                 signature_b64: attestation.signature.clone(),
+                // See the sign site: the attestation envelope carries no
+                // version, so this asks for the key's first version, which is
+                // what governance signed under.
+                key_version: None,
             },
         );
         let reply = self
@@ -742,6 +753,82 @@ fn list_escalations_with_privilege(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport that answers every call with one canned outcome, so the two
+    /// ways `sign_with_custodian` can be told "no" are reachable without a
+    /// custodian process.
+    struct CannedTransport(
+        std::sync::Mutex<
+            Option<Result<whipplescript_custody::CustodyOk, whipplescript_custody::CustodyError>>,
+        >,
+    );
+
+    impl whipplescript_custody::CustodyTransport for CannedTransport {
+        fn call(
+            &self,
+            _call: whipplescript_custody::CustodyCall,
+        ) -> Result<whipplescript_custody::CustodyReply, whipplescript_custody::TransportError>
+        {
+            Ok(whipplescript_custody::CustodyReply {
+                use_id: "use-test".to_owned(),
+                rung: whipplescript_custody::Rung::Process,
+                degraded: false,
+                outcome: self
+                    .0
+                    .lock()
+                    .expect("lock")
+                    .take()
+                    .expect("one call per canned transport"),
+            })
+        }
+    }
+
+    /// Governance signing reads exactly one reply shape. The other two are
+    /// refusals, and both were unpinned: a custodian that answers with some
+    /// other success, and one that refuses outright.
+    ///
+    /// The second message carries the key id on purpose — an operator reading
+    /// "governance sign refused" needs to know WHICH credential the `sign`
+    /// capability is missing on.
+    #[test]
+    fn governance_signing_refuses_a_non_signature_and_reports_a_custodian_refusal() {
+        let credential =
+            whipplescript_custody::CredentialName::new("gov/root").expect("valid name");
+
+        let wrong_shape = CannedTransport(std::sync::Mutex::new(Some(Ok(
+            whipplescript_custody::CustodyOk::Verified { valid: true },
+        ))));
+        let err = SignedEnvelope::sign_with_custodian(
+            "authority acme\n",
+            "acme",
+            &wrong_shape,
+            &credential,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a non-signature reply must refuse"));
+        assert!(
+            err.contains("custodian returned a non-signature"),
+            "the refusal must name the shape mismatch: {err}"
+        );
+
+        let refused = CannedTransport(std::sync::Mutex::new(Some(Err(
+            whipplescript_custody::CustodyError::UnknownCredential {
+                credential: credential.clone(),
+            },
+        ))));
+        let err =
+            SignedEnvelope::sign_with_custodian("authority acme\n", "acme", &refused, &credential)
+                .err()
+                .unwrap_or_else(|| panic!("a custodian refusal must surface"));
+        assert!(
+            err.contains("governance sign refused by the custodian"),
+            "the refusal must say the custodian refused: {err}"
+        );
+        assert!(
+            err.contains(&credential.resource_id()),
+            "the refusal must name the credential the `sign` capability is missing on: {err}"
+        );
+    }
 
     struct ExactVerifier {
         expected: Vec<u8>,

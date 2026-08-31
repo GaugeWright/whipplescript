@@ -79,14 +79,18 @@ impl Client {
 
     /// Sign (or MAC) `input` under the transit key. HMAC-SHA-256 kinds go
     /// through `/v1/transit/hmac/{key}` with `sha2-256`; Ed25519 kinds
-    /// through `/v1/transit/sign/{key}`. Returns the raw signature/MAC bytes
-    /// parsed out of OpenBao's `vault:v1:<base64>` format.
+    /// through `/v1/transit/sign/{key}`. Returns the KEY VERSION and the raw
+    /// signature/MAC bytes, parsed out of OpenBao's `vault:vN:<base64>` format.
+    ///
+    /// The version is returned rather than dropped because verification needs
+    /// it: transit resolves which key version to check from the prefix, so a
+    /// caller that forgets it can only guess.
     pub fn transit_sign(
         &self,
         key: &str,
         input: &[u8],
         kind: CredentialKind,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(u32, Vec<u8>), String> {
         let value = match kind {
             CredentialKind::HmacSha256 => self.post_json(
                 &format!("/v1/transit/hmac/{key}"),
@@ -114,15 +118,19 @@ impl Client {
 
     /// Verify `sig_or_mac` (raw bytes) over `input` under the transit key via
     /// `/v1/transit/verify/{key}`. `Ok(false)` is a *successful* call whose
-    /// answer is "invalid". The raw bytes are re-encoded as `vault:v1:…`, so
-    /// verification is pinned to key version 1 — key rotation support is not
-    /// part of r3 v1.
+    /// answer is "invalid".
+    ///
+    /// `key_version` is the version the signature was MADE under, carried back
+    /// from `transit_sign`. It used to be hard-coded to 1, which pinned r3 to a
+    /// key that had never rotated; a caller that does not know the version
+    /// passes 1 and gets the old behaviour explicitly rather than silently.
     pub fn transit_verify(
         &self,
         key: &str,
         input: &[u8],
         sig_or_mac: &[u8],
         kind: CredentialKind,
+        key_version: u32,
     ) -> Result<bool, String> {
         let field = match kind {
             CredentialKind::HmacSha256 => "hmac",
@@ -133,12 +141,33 @@ impl Client {
             &format!("/v1/transit/verify/{key}"),
             &serde_json::json!({
                 "input": B64.encode(input),
-                field: format!("vault:v1:{}", B64.encode(sig_or_mac)),
+                field: vault_encode(key_version, sig_or_mac),
             }),
         )?;
         value["data"]["valid"]
             .as_bool()
             .ok_or_else(|| "openbao response carries no data.valid".to_string())
+    }
+
+    /// `POST /v1/transit/keys/{key}/rotate` — mint a new key version.
+    ///
+    /// Transit keeps every prior version, so this IS the dual validity §12
+    /// asks for: signatures made before the rotation keep verifying under the
+    /// version they carry, and new ones are made under the latest. That only
+    /// holds because the version now travels with the signature — before the
+    /// unpin, rotating would have broken every outstanding signature at once.
+    ///
+    /// Returns the version the key is at afterwards.
+    pub fn transit_rotate(&self, key: &str) -> Result<u32, String> {
+        self.post_json(
+            &format!("/v1/transit/keys/{key}/rotate"),
+            &serde_json::json!({}),
+        )?;
+        let value = self.get_json(&format!("/v1/transit/keys/{key}"))?;
+        value["data"]["latest_version"]
+            .as_u64()
+            .map(|v| v as u32)
+            .ok_or_else(|| "openbao response carries no data.latest_version".to_string())
     }
 
     // -- token lifecycle ----------------------------------------------------
@@ -329,15 +358,40 @@ fn read_response(result: Result<ureq::Response, ureq::Error>) -> Result<serde_js
 }
 
 /// Parse OpenBao's `vault:v<N>:<base64>` result format into raw bytes.
-fn parse_vault_encoded(s: &str) -> Result<Vec<u8>, String> {
+/// Render raw bytes back into transit's `vault:vN:<base64>` framing.
+///
+/// A one-line format, extracted because the line matters more than its size:
+/// this is where the version reaches the wire, and it was a hard-coded `v1`
+/// until 2026-08-30. Inlined, the only thing that could catch a regression is
+/// the live smoke, which needs a real server and so runs on its own schedule —
+/// a mutation sweep found exactly that hole. As a function it is unit-testable
+/// against `parse_vault_encoded`, its own inverse.
+fn vault_encode(version: u32, bytes: &[u8]) -> String {
+    format!("vault:v{version}:{}", B64.encode(bytes))
+}
+
+/// Split `vault:vN:<base64>` into its KEY VERSION and raw bytes.
+///
+/// The version used to be discarded here while `transit_verify` re-added a
+/// hard-coded `v1`, which is why r3 v1 scoped rotation out: a signature made
+/// under key version 2 would have been verified against version 1 — a rotation
+/// that succeeds and a verification that silently checks the wrong key. Keeping
+/// the version is what unpins it.
+fn parse_vault_encoded(s: &str) -> Result<(u32, Vec<u8>), String> {
     let rest = s
         .strip_prefix("vault:")
         .ok_or_else(|| format!("not a vault-encoded value: {s:?}"))?;
-    let (_version, b64) = rest
+    let (version, b64) = rest
         .split_once(':')
         .ok_or_else(|| format!("malformed vault-encoded value: {s:?}"))?;
-    B64.decode(b64)
-        .map_err(|e| format!("bad base64 in vault-encoded value: {e}"))
+    let version = version
+        .strip_prefix('v')
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .ok_or_else(|| format!("malformed key version in vault-encoded value: {s:?}"))?;
+    let bytes = B64
+        .decode(b64)
+        .map_err(|e| format!("bad base64 in vault-encoded value: {e}"))?;
+    Ok((version, bytes))
 }
 
 #[cfg(test)]
@@ -360,25 +414,93 @@ mod tests {
     #[test]
     fn parses_a_vault_encoded_value() {
         // The HMAC an OpenBao dev server actually returns for `hello`.
-        let raw = parse_vault_encoded("vault:v1:aGVsbG8gd29ybGQ=").expect("parse");
+        let (version, raw) = parse_vault_encoded("vault:v1:aGVsbG8gd29ybGQ=").expect("parse");
+        assert_eq!(version, 1);
         assert_eq!(raw, b"hello world");
     }
 
+    /// The version is now RETURNED rather than discarded, which is what unpins
+    /// r3 from key version 1. `transit_verify` used to re-add a hard-coded
+    /// `vault:v1:` on the way out, so a v2 signature parsed on the way in and
+    /// then verified against the wrong key.
     #[test]
-    fn parses_any_key_version_even_though_verify_pins_v1() {
-        // The parser is version-agnostic on purpose: it is `transit_verify`
-        // that pins `vault:v1:` on the way *out* (r3 v1 does not do rotation),
-        // not this function on the way in. A v2 signature parses; what it
-        // cannot do is round-trip through verify.
-        assert_eq!(
-            parse_vault_encoded("vault:v2:aGVsbG8=").expect("parse"),
-            b"hello"
+    fn a_rotated_key_version_survives_the_parse() {
+        let (version, raw) = parse_vault_encoded("vault:v2:aGVsbG8=").expect("parse");
+        assert_eq!(version, 2, "the version must reach the verifier");
+        assert_eq!(raw, b"hello");
+    }
+
+    /// `vault_encode` is `parse_vault_encoded`'s inverse, and the version has to
+    /// survive BOTH directions. Verification resolves which key version to
+    /// check from the framing this produces, so an encoder that dropped the
+    /// version — as the inlined `format!` did with its hard-coded `v1` — sends
+    /// a v2 signature to be checked against v1.
+    #[test]
+    fn the_encoder_carries_the_version_its_parser_reads() {
+        for version in [1u32, 2, 17] {
+            let framed = vault_encode(version, b"payload");
+            assert_eq!(framed, format!("vault:v{version}:cGF5bG9hZA=="));
+            let (parsed, bytes) = parse_vault_encoded(&framed).expect("round trips");
+            assert_eq!(parsed, version, "the version must survive the round trip");
+            assert_eq!(bytes, b"payload");
+        }
+    }
+
+    /// Transit signs and verifies for two kinds. A third reaching this client
+    /// is a mistake worth naming rather than sending to OpenBao to reject,
+    /// and the refusal happens before any request — so it is testable without
+    /// a server.
+    #[test]
+    fn transit_refuses_a_kind_it_cannot_verify() {
+        let client = Client::new("http://127.0.0.1:1", "token");
+        for kind in [
+            CredentialKind::Bearer,
+            CredentialKind::Raw,
+            CredentialKind::AwsSigv4,
+            CredentialKind::JwtRs256,
+        ] {
+            let err = client
+                .transit_verify("k", b"payload", b"sig", kind, 1)
+                .expect_err("must refuse before reaching the network");
+            assert!(
+                err.contains("does not verify for kind"),
+                "{kind:?} must be refused by name: {err}"
+            );
+        }
+    }
+
+    /// An unreachable server is a transport failure, and the message says so
+    /// rather than surfacing as a parse error about a body that never arrived.
+    /// Port 1 is reserved and refuses immediately, so this needs no fixture.
+    #[test]
+    fn an_unreachable_server_is_reported_as_a_failed_request() {
+        let client = Client::new("http://127.0.0.1:1", "token");
+        let err = client
+            .transit_sign("k", b"payload", CredentialKind::HmacSha256)
+            .expect_err("an unreachable server must fail");
+        assert!(
+            err.contains("openbao request failed"),
+            "a transport failure must say so: {err}"
         );
     }
 
     #[test]
+    fn rejects_a_malformed_key_version() {
+        // `vN` is the only shape transit emits; anything else would have to be
+        // guessed at, and guessing a version is how the wrong key gets checked.
+        for bad in ["vault:1:aGVsbG8=", "vault:vx:aGVsbG8=", "vault::aGVsbG8="] {
+            assert!(
+                parse_vault_encoded(bad).is_err(),
+                "`{bad}` must not parse to a version"
+            );
+        }
+    }
+
+    #[test]
     fn empty_payload_parses_to_empty_bytes() {
-        assert!(parse_vault_encoded("vault:v1:").expect("parse").is_empty());
+        let (version, raw) = parse_vault_encoded("vault:v1:").expect("parse");
+        assert_eq!(version, 1);
+        assert!(raw.is_empty());
     }
 
     #[test]

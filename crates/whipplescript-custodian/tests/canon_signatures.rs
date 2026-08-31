@@ -50,7 +50,7 @@ fn sign_hex(custodian: &Custodian, name: &str, derivation: Vec<String>, payload:
         },
     ));
     match reply.outcome {
-        Ok(CustodyOk::Signed { signature_b64 }) => B64
+        Ok(CustodyOk::Signed { signature_b64, .. }) => B64
             .decode(signature_b64)
             .expect("b64")
             .iter()
@@ -242,7 +242,7 @@ fn jwt_rs256_matches_rfc7515_a2() {
         },
     ));
     let signature = match reply.outcome {
-        Ok(CustodyOk::Signed { signature_b64 }) => B64.decode(signature_b64).expect("b64"),
+        Ok(CustodyOk::Signed { signature_b64, .. }) => B64.decode(signature_b64).expect("b64"),
         other => panic!("sign failed: {other:?}"),
     };
     assert_eq!(URL_SAFE_NO_PAD.encode(&signature), expected_sig_b64u.trim());
