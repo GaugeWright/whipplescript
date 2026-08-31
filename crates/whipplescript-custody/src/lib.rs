@@ -246,6 +246,19 @@ pub enum CredentialKind {
     AwsSigv4,
     /// An RS256 private key (GitHub App JWTs, service accounts).
     JwtRs256,
+    /// An mTLS client certificate and its private key (DR-0053 §9 Amendment
+    /// 2026-08-29).
+    ///
+    /// The one kind used TWO ways, and which is live depends on the egress
+    /// locus rather than the program. Under `egress through custodian` the
+    /// custodian holds cert and key and performs the handshake, so the
+    /// operation is `request`. Under `egress from workflow` whip performs the
+    /// handshake and the custodian signs the one `CertificateVerify`, so the
+    /// operation is `sign`.
+    ///
+    /// It reaches nothing else — in particular not `mint` or `derive` — so the
+    /// certificate's key cannot become a parent for anything.
+    MtlsClient,
 }
 
 impl CredentialKind {
@@ -253,7 +266,7 @@ impl CredentialKind {
     /// since the protocol landed; the kinds did not, so every site needing to
     /// enumerate them hand-listed all seven — a second table that would drift
     /// the first time a kind was added.
-    pub const ALL: [CredentialKind; 7] = [
+    pub const ALL: [CredentialKind; 8] = [
         CredentialKind::Bearer,
         CredentialKind::Basic,
         CredentialKind::Raw,
@@ -261,6 +274,7 @@ impl CredentialKind {
         CredentialKind::Ed25519,
         CredentialKind::AwsSigv4,
         CredentialKind::JwtRs256,
+        CredentialKind::MtlsClient,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -272,6 +286,7 @@ impl CredentialKind {
             CredentialKind::Ed25519 => "ed25519",
             CredentialKind::AwsSigv4 => "aws-sigv4",
             CredentialKind::JwtRs256 => "jwt-rs256",
+            CredentialKind::MtlsClient => "mtls-client",
         }
     }
 
@@ -284,6 +299,7 @@ impl CredentialKind {
             "ed25519" => Ok(CredentialKind::Ed25519),
             "aws-sigv4" => Ok(CredentialKind::AwsSigv4),
             "jwt-rs256" => Ok(CredentialKind::JwtRs256),
+            "mtls-client" => Ok(CredentialKind::MtlsClient),
             other => Err(format!("unknown credential kind {other:?}")),
         }
     }
@@ -298,8 +314,22 @@ impl CredentialKind {
                     | CredentialKind::Basic
                     | CredentialKind::Raw
                     | CredentialKind::AwsSigv4
+                    // Under `egress through custodian`, which is the default.
+                    | CredentialKind::MtlsClient
             ),
-            Operation::Sign | Operation::Verify => matches!(
+            Operation::Sign => matches!(
+                self,
+                CredentialKind::HmacSha256
+                    | CredentialKind::Ed25519
+                    | CredentialKind::AwsSigv4
+                    | CredentialKind::JwtRs256
+                    // The single `CertificateVerify` of `egress from workflow`.
+                    | CredentialKind::MtlsClient
+            ),
+            // NOT verify: an mTLS client key proves our identity to a server
+            // and never checks someone else's, so admitting it here would be a
+            // capability nothing asks for.
+            Operation::Verify => matches!(
                 self,
                 CredentialKind::HmacSha256
                     | CredentialKind::Ed25519
@@ -1167,6 +1197,28 @@ pub trait CustodyTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kind vocabulary is closed on both sides too, and the round trip is
+    /// over `ALL` so adding a variant without a spelling fails here rather than
+    /// printing as something else.
+    ///
+    /// An unknown spelling is refused by name: governance and declarations name
+    /// kinds as text, and a typo that parsed to something would silently give a
+    /// credential capabilities its author never wrote.
+    #[test]
+    fn every_credential_kind_round_trips_and_an_unknown_one_is_refused() {
+        for kind in CredentialKind::ALL {
+            assert_eq!(
+                CredentialKind::parse(kind.as_str()).expect("round trips"),
+                kind
+            );
+        }
+        let err = CredentialKind::parse("ed25519-ish").expect_err("must refuse");
+        assert!(
+            err.contains("unknown credential kind") && err.contains("ed25519-ish"),
+            "the refusal must name what it did not recognise: {err}"
+        );
+    }
 
     /// The vocabulary is closed on BOTH sides. `as_str` and `parse` are each
     /// other's inverse over the whole enum, and a spelling outside it is

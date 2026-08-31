@@ -180,6 +180,14 @@ pub struct Envelope {
     /// without one a compromised whip obtains a signature over bytes of its
     /// choosing under any credential the grant names.
     sign_prefixes: BTreeMap<String, Vec<Vec<u8>>>,
+    /// Credential ADDRESSES whose egress is confined to the workflow — the
+    /// custodian signs the handshake and never sees the payload (DR-0053 §9
+    /// Amendment 2026-08-29).
+    confined_egress: BTreeSet<String>,
+    /// The role the custodian acts as, when a policy names one. Naming it is
+    /// what lets the flow checker see the disclosure crossing that routing a
+    /// payload through the custodian actually is.
+    custodian_role: Option<String>,
     /// signal resources (`signal:<name>`) governance marks INTERNAL (H8 stage b): an
     /// internal signal is an internal channel, NOT an external entry point, so its
     /// integrity at a receiver is DERIVED from its emitters (carriage) rather than
@@ -358,6 +366,8 @@ impl Envelope {
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        let confined_egress: BTreeSet<String> = BTreeSet::new();
+        let custodian_role: Option<String> = None;
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -676,6 +686,8 @@ impl Envelope {
             declassify,
             request_scopes,
             sign_prefixes,
+            confined_egress,
+            custodian_role,
             integrity,
             endorse,
             unwrap_grants,
@@ -714,6 +726,9 @@ impl Envelope {
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        let mut confined_egress: BTreeSet<String> = BTreeSet::new();
+        let mut custodian_role: Option<String> = None;
+        let mut require_confined_egress = false;
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -907,6 +922,27 @@ impl Envelope {
             // §6). This is the admin's enforcement lever, and it lives here —
             // in the signed policy — rather than beside the per-server evidence
             // it judges, so attesting a server cannot also lower the bar.
+            // `custodian <Role>` (DR-0053 §9 Amendment 2026-08-29). The
+            // custodian is a separate principal, so handing it a payload to
+            // egress is a disclosure crossing — naming it is what lets the flow
+            // checker see one. A policy that names none behaves exactly as
+            // before, so the modelling is opt-in.
+            if tokens.first().copied() == Some("custodian") {
+                let Some(role) = tokens.get(1) else {
+                    return Err(format!(
+                        "line {}: custodian needs `custodian <Role>`",
+                        index + 1
+                    ));
+                };
+                if custodian_role.is_some() {
+                    return Err(format!(
+                        "line {}: an envelope names exactly one custodian",
+                        index + 1
+                    ));
+                }
+                custodian_role = Some((*role).to_owned());
+                continue;
+            }
             if tokens.first().copied() == Some("require") {
                 match (tokens.get(1).copied(), tokens.get(2).copied()) {
                     (Some("mcp"), Some(rung)) => {
@@ -923,6 +959,21 @@ impl Envelope {
                     // `require credential <rung>` (DR-0053 §4): the minimum
                     // sealing rung, judged against the rung the custodian
                     // DERIVES from evidence — configuration is not evidence.
+                    // `require egress from workflow` (DR-0053 §9 Amendment):
+                    // the regulated-boundary statement. Under it a grant that
+                    // omits the clause is refused, so the boundary cannot be
+                    // forgotten on one credential out of forty.
+                    (Some("egress"), Some("from")) => {
+                        if tokens.get(3).copied() != Some("workflow") {
+                            return Err(format!(
+                                "line {}: the only egress floor is \
+                                 `require egress from workflow`",
+                                index + 1
+                            ));
+                        }
+                        require_confined_egress = true;
+                        continue;
+                    }
                     (Some("credential"), Some(rung)) => {
                         let parsed = whipplescript_custody::Rung::parse(rung).map_err(|_| {
                             format!(
@@ -1142,6 +1193,26 @@ impl Envelope {
                     readers.insert(address.clone(), DualLabel::both(roles));
                 }
             }
+            // `egress from workflow` (DR-0053 §9 Amendment 2026-08-29): the
+            // custodian signs the handshake and never sees the connection or
+            // the payload. `egress through custodian` is the default and needs
+            // no clause; naming it explicitly is accepted so a policy can say
+            // what it means.
+            if let Some(at) = label.iter().position(|tok| *tok == "egress") {
+                match (label.get(at + 1).copied(), label.get(at + 2).copied()) {
+                    (Some("from"), Some("workflow")) => {
+                        confined_egress.insert(address.clone());
+                    }
+                    (Some("through"), Some("custodian")) => {}
+                    _ => {
+                        return Err(format!(
+                            "line {}: egress needs `egress from workflow` or \
+                             `egress through custodian`",
+                            index + 1
+                        ));
+                    }
+                }
+            }
             // `internal` marks a signal an internal channel (H8 stage b): its
             // integrity is derived from its emitters, not the external-entry low.
             if label.contains(&"internal") {
@@ -1164,6 +1235,27 @@ impl Envelope {
         // already in the shape `to_canonical_json` would put it in. That is what
         // lets `canonicalize` compare a reparse against the original exactly,
         // and so what lets it prove itself lossless rather than assume it.
+        // The floor is checked AFTER the whole policy is read, so a `require`
+        // written below the grants binds them too — clause order must not
+        // decide whether a boundary holds.
+        if require_confined_egress {
+            let mut missing: Vec<&str> = governed
+                .iter()
+                .map(String::as_str)
+                .filter(|address| address.starts_with("credential:"))
+                .filter(|address| !confined_egress.contains(*address))
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            if let Some(address) = missing.first() {
+                return Err(format!(
+                    "`require egress from workflow` is in force but `{address}` does not declare \
+                     it: a payload routed through the custodian is a disclosure to a second \
+                     principal, and the floor exists so that cannot be forgotten on one \
+                     credential out of forty"
+                ));
+            }
+        }
         deleg.sort();
         deleg.dedup();
         declassify.sort();
@@ -1187,6 +1279,8 @@ impl Envelope {
             declassify,
             request_scopes,
             sign_prefixes,
+            confined_egress,
+            custodian_role,
             integrity,
             endorse,
             unwrap_grants,
@@ -1480,11 +1574,31 @@ impl Envelope {
 
     /// The compartments a WRITE to this resource must be covered by — the
     /// `provider` side of a confidentiality crossing.
+    ///
+    /// A credential sink gains the CUSTODIAN's role unless its grant confines
+    /// egress to the workflow (DR-0053 §9 Amendment 2026-08-29). The custodian
+    /// is a separate principal, so routing a payload through it to egress is a
+    /// disclosure to a second party — and a credential's `readable by` set
+    /// describes the ENDPOINT's clearance, saying nothing about the party in
+    /// between. Without this, a policy reading "PHI may reach the clinical API"
+    /// silently also permits "PHI may enter the custodian".
+    ///
+    /// Adding to the SINK makes the check strictly harder to satisfy, which is
+    /// the direction that refuses: the leak check denies a flow whose sink
+    /// readers are not all within the value's readers.
     fn reader_sink(&self, resource: &str) -> BTreeSet<String> {
-        self.readers
-            .get(self.resolve(resource))
+        let address = self.resolve(resource);
+        let mut sink = self
+            .readers
+            .get(address)
             .map(|label| label.sink.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(role) = &self.custodian_role {
+            if address.starts_with("credential:") && !self.confined_egress.contains(address) {
+                sink.insert(role.clone());
+            }
+        }
+        sink
     }
 
     /// A reader label rendered for diagnostics: `public` for the empty set, else the
@@ -12757,6 +12871,132 @@ rule refund
             messages.iter().any(|m| m.contains("stripe_api")),
             "an external response must not silently vouch for a guarded sink: {messages:#?}"
         );
+    }
+
+    /// The custodian is a READER of anything routed through it (DR-0053 §9
+    /// Amendment 2026-08-29).
+    ///
+    /// A credential's `readable by` set describes the ENDPOINT's clearance and
+    /// says nothing about the party in between. Without this, a policy reading
+    /// "PHI may reach the clinical API" silently also permits "PHI may enter
+    /// the custodian" — which is the one thing a regulated boundary forbids,
+    /// and invisible because the crossing was never modelled.
+    #[test]
+    fn the_custodian_is_a_reader_unless_egress_is_confined() {
+        let routed = Envelope::from_dsl(
+            "authority acme\n\
+             custodian CustodyHost\n\
+             grant credential ClinicalApi -> credential:clinical/api readable by Clinician\n",
+        )
+        .expect("valid envelope");
+        let sink = routed.reader_sink("ClinicalApi");
+        assert!(
+            sink.contains("acme/CustodyHost") || sink.contains("CustodyHost"),
+            "a custodian-routed credential must require the custodian's clearance: {sink:?}"
+        );
+
+        let confined = Envelope::from_dsl(
+            "authority acme\n\
+             custodian CustodyHost\n\
+             grant credential ClinicalApi -> credential:clinical/api \
+                 readable by Clinician  egress from workflow\n",
+        )
+        .expect("valid envelope");
+        let sink = confined.reader_sink("ClinicalApi");
+        assert!(
+            !sink.iter().any(|role| role.contains("CustodyHost")),
+            "a confined credential must NOT require the custodian: {sink:?}"
+        );
+
+        // A policy naming no custodian behaves exactly as before, so the
+        // modelling is opt-in rather than a change every deployment absorbs.
+        let unnamed = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential ClinicalApi -> credential:clinical/api readable by Clinician\n",
+        )
+        .expect("valid envelope");
+        assert!(!unnamed
+            .reader_sink("ClinicalApi")
+            .iter()
+            .any(|role| role.contains("CustodyHost")));
+    }
+
+    /// `require egress from workflow` is the regulated-boundary statement: a
+    /// grant that omits the clause is refused, so the boundary cannot be
+    /// forgotten on one credential out of forty.
+    ///
+    /// Checked after the whole policy is read, so a `require` written BELOW the
+    /// grants binds them too — clause order must not decide whether a boundary
+    /// holds.
+    #[test]
+    fn the_egress_floor_refuses_a_credential_that_does_not_declare_it() {
+        let refused = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential ClinicalApi -> credential:clinical/api egress from workflow\n\
+             grant credential Billing -> credential:billing/api\n\
+             require egress from workflow\n",
+        )
+        .err()
+        .expect("a credential missing the clause must refuse");
+        assert!(refused.contains("billing/api"), "{refused}");
+        assert!(
+            refused.contains("require egress from workflow"),
+            "{refused}"
+        );
+
+        // Every credential declaring it is admitted, which is what shows the
+        // refusal is about the missing clause rather than about the floor.
+        assert!(Envelope::from_dsl(
+            "authority acme\n\
+             grant credential ClinicalApi -> credential:clinical/api egress from workflow\n\
+             require egress from workflow\n",
+        )
+        .is_ok());
+    }
+
+    /// A malformed locus is refused where it is written rather than read as the
+    /// default — silently routing a regulated payload through the custodian
+    /// because a clause was misspelled is the failure this exists to prevent.
+    #[test]
+    fn a_malformed_egress_locus_is_refused() {
+        // Each case asserts the TEXT it should be refused BY, not merely that
+        // something failed: any refusal satisfies `is_err`, including ones with
+        // nothing to do with the clause under test.
+        for (bad, expected) in [
+            (
+                "grant credential A -> credential:a egress\n",
+                "egress needs",
+            ),
+            (
+                "grant credential A -> credential:a egress from custodian\n",
+                "egress needs",
+            ),
+            (
+                "grant credential A -> credential:a egress through workflow\n",
+                "egress needs",
+            ),
+            ("custodian\n", "custodian needs"),
+            // One envelope, one custodian. Two would make "which principal saw
+            // this payload" ambiguous at exactly the boundary the locus exists
+            // to make answerable.
+            (
+                "custodian CustodyHost\ncustodian OtherHost\n",
+                "exactly one custodian",
+            ),
+            // The floor has one spelling. A near-miss must not silently fail to
+            // apply, because a boundary that quietly does not hold is worse
+            // than one that was never claimed.
+            ("require egress from custodian\n", "the only egress floor"),
+        ] {
+            let text = format!("authority acme\n{bad}");
+            let refused = Envelope::from_dsl(&text)
+                .err()
+                .unwrap_or_else(|| panic!("`{bad}` must not be admitted"));
+            assert!(
+                refused.contains(expected),
+                "`{bad}` must be refused by `{expected}`: {refused}"
+            );
+        }
     }
 
     /// `grant sign <C> for prefix <entry>` bounds the signing oracle

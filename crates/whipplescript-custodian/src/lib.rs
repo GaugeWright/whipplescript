@@ -1144,7 +1144,13 @@ fn generatable_key_len(kind: CredentialKind) -> Option<usize> {
         CredentialKind::Bearer
         | CredentialKind::Basic
         | CredentialKind::AwsSigv4
-        | CredentialKind::JwtRs256 => None,
+        | CredentialKind::JwtRs256
+        // An mTLS client credential is a keypair AND a certificate, and the
+        // certificate is issued by a CA. Generating the keypair alone would
+        // produce something no server accepts, which is the same reason
+        // `bearer` and `aws-sigv4` refuse: the material that makes it mean
+        // anything is a third party's to issue.
+        | CredentialKind::MtlsClient => None,
     }
 }
 

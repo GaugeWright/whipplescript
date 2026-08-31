@@ -4543,6 +4543,7 @@ impl IrPrimitiveType {
                 whipplescript_custody::CredentialKind::Ed25519 => "secret<ed25519>",
                 whipplescript_custody::CredentialKind::AwsSigv4 => "secret<aws_sigv4>",
                 whipplescript_custody::CredentialKind::JwtRs256 => "secret<jwt_rs256>",
+                whipplescript_custody::CredentialKind::MtlsClient => "secret<mtls_client>",
             },
         }
     }
