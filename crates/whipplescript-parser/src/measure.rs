@@ -30,7 +30,7 @@ pub(crate) enum MeasureBound {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Measure {
+pub(crate) struct CounterMeasure {
     pub field: String,
     /// Positive when the field rises toward an upper bound, negative when it
     /// falls toward a lower one. The smallest step around the ring.
@@ -43,50 +43,121 @@ pub(crate) struct Measure {
     pub step_bounded: bool,
 }
 
+/// A ring that terminates by advancing a FINITE DOMAIN rather than a counter.
+///
+/// The manual teaches this one first and DR-0081 §2 could not express it: a
+/// `status` that a rule matches at `"queued"` and records as `"routed"` ends the
+/// ring, not because a number descends but because the field moved to a value it
+/// will not hold again. Each hop contributes one edge `matched -> recorded` over
+/// the field's declared values, and the ring is well-founded exactly when that
+/// graph is ACYCLIC: a finite set with no cycle admits no infinite walk.
+///
+/// It is always step-bounded, and by a number the source fixes — the longest
+/// path through the domain, which is at most one turn per value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DomainMeasure {
+    pub field: String,
+    /// The `matched -> recorded` edges, in ring order.
+    pub transitions: Vec<(String, String)>,
+    pub domain: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Measure {
+    Counter(CounterMeasure),
+    Domain(DomainMeasure),
+}
+
 impl Measure {
+    /// Whether the number of turns follows from the source. A finite domain
+    /// always does: the walk cannot be longer than the domain.
+    pub fn step_bounded(&self) -> bool {
+        match self {
+            Self::Counter(counter) => counter.step_bounded,
+            Self::Domain(_) => true,
+        }
+    }
+
     /// The measure alone, for prose: ``t.n rises by 1 toward 10``.
     pub fn describe(&self, binding: &str) -> String {
-        let direction = if self.step > 0 { "rises" } else { "falls" };
-        let bound = match &self.bound {
-            MeasureBound::Literal(value) => value.to_string(),
-            MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
-        };
-        format!(
-            "`{binding}.{}` {direction} by {} toward {bound}",
-            self.field,
-            self.step.abs()
-        )
+        match self {
+            Self::Counter(counter) => {
+                let direction = if counter.step > 0 { "rises" } else { "falls" };
+                let bound = match &counter.bound {
+                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
+                };
+                format!(
+                    "`{binding}.{}` {direction} by {} toward {bound}",
+                    counter.field,
+                    counter.step.abs()
+                )
+            }
+            Self::Domain(domain) => format!(
+                "`{binding}.{}` advances through {}",
+                domain.field,
+                domain.render_transitions()
+            ),
+        }
     }
 
     /// The measure without a binding, for a message that compares it against a
     /// declaration: `rises by 1 toward 10`.
     pub fn describe_bare(&self) -> String {
-        let direction = if self.step > 0 { "rises" } else { "falls" };
-        let bound = match &self.bound {
-            MeasureBound::Literal(value) => value.to_string(),
-            MeasureBound::InvariantField(field) => field.clone(),
-        };
-        format!("{direction} by {} toward {bound}", self.step.abs())
+        match self {
+            Self::Counter(counter) => {
+                let direction = if counter.step > 0 { "rises" } else { "falls" };
+                let bound = match &counter.bound {
+                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::InvariantField(field) => field.clone(),
+                };
+                format!("{direction} by {} toward {bound}", counter.step.abs())
+            }
+            Self::Domain(domain) => {
+                format!("advances through {}", domain.render_transitions())
+            }
+        }
     }
 
     /// The snapshot rendering, which adds what the measure proves and where.
     pub fn to_snapshot(&self, binding: &str) -> String {
-        let direction = if self.step > 0 { "rises" } else { "falls" };
-        let bound = match &self.bound {
-            MeasureBound::Literal(value) => value.to_string(),
-            MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
-        };
-        let kind = if self.step_bounded {
-            "step-bounded"
-        } else {
-            "well-founded"
-        };
-        format!(
-            "{binding}.{} {direction} by {} toward {bound} ({kind}, bounded by rule `{}`)",
-            self.field,
-            self.step.abs(),
-            self.bounding_rule
-        )
+        match self {
+            Self::Counter(counter) => {
+                let direction = if counter.step > 0 { "rises" } else { "falls" };
+                let bound = match &counter.bound {
+                    MeasureBound::Literal(value) => value.to_string(),
+                    MeasureBound::InvariantField(field) => format!("{binding}.{field}"),
+                };
+                let kind = if counter.step_bounded {
+                    "step-bounded"
+                } else {
+                    "well-founded"
+                };
+                format!(
+                    "{binding}.{} {direction} by {} toward {bound} ({kind}, bounded by rule `{}`)",
+                    counter.field,
+                    counter.step.abs(),
+                    counter.bounding_rule
+                )
+            }
+            Self::Domain(domain) => format!(
+                "{binding}.{} advances through {} (step-bounded, {} step(s) over a domain of {})",
+                domain.field,
+                domain.render_transitions(),
+                domain.transitions.len(),
+                domain.domain
+            ),
+        }
+    }
+}
+
+impl DomainMeasure {
+    fn render_transitions(&self) -> String {
+        self.transitions
+            .iter()
+            .map(|(from, to)| format!("{from} -> {to}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -173,17 +244,26 @@ pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> Measur
         }
         return match prove_field(ir, &hops, &declared.field, component) {
             MeasureOutcome::Proven(measure) => {
-                let honoured = (measure.step > 0) == declared.rising
-                    && match (&measure.bound, &declared.bound) {
-                        (MeasureBound::Literal(found), MeasureDeclBound::Literal(stated)) => {
-                            found == stated
-                        }
-                        (
-                            MeasureBound::InvariantField(found),
-                            MeasureDeclBound::Field(stated),
-                        ) => found == stated,
-                        _ => false,
-                    };
+                // A declaration states a counter; a ring proven by its finite
+                // domain does not answer that claim, and says so rather than
+                // silently passing.
+                let honoured = match measure.as_ref() {
+                    Measure::Counter(counter) => {
+                        (counter.step > 0) == declared.rising
+                            && match (&counter.bound, &declared.bound) {
+                                (
+                                    MeasureBound::Literal(found),
+                                    MeasureDeclBound::Literal(stated),
+                                ) => found == stated,
+                                (
+                                    MeasureBound::InvariantField(found),
+                                    MeasureDeclBound::Field(stated),
+                                ) => found == stated,
+                                _ => false,
+                            }
+                    }
+                    Measure::Domain(_) => false,
+                };
                 if honoured {
                     MeasureOutcome::Proven(measure)
                 } else {
@@ -217,6 +297,13 @@ pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> Measur
                 ),
             }),
         };
+    }
+
+    // A finite domain is tried after the counters, and only because a counter is
+    // the narrower claim: where both could be read, the arithmetic one says more
+    // about how far the ring runs.
+    if let Some(measure) = prove_domain(ir, &hops) {
+        return MeasureOutcome::Proven(Box::new(Measure::Domain(measure)));
     }
 
     let mut missed = None;
@@ -303,13 +390,169 @@ fn prove_field(
     let step_bounded = matches!(bound, MeasureBound::Literal(_))
         && outside_producers_seed_literally(ir, hops, field, component);
 
-    MeasureOutcome::Proven(Box::new(Measure {
+    MeasureOutcome::Proven(Box::new(Measure::Counter(CounterMeasure {
         field: field.to_owned(),
         step,
         bound,
         bounding_rule,
         step_bounded,
-    }))
+    })))
+}
+
+/// A ring that terminates by advancing a finite domain (DR-0081 §2, finite
+/// domains).
+///
+/// Each hop must match one value of the field and record another: the guard
+/// carries `binding.f == "A"` and the record writes `f "B"`. Those are the edges
+/// of a walk over the field's declared values, and the ring is well-founded
+/// exactly when the walk cannot return to a value it has left — an acyclic graph
+/// over a finite set admits no infinite walk.
+///
+/// This is the argument `docs/manual/04-rules.md` teaches before it teaches a
+/// counter: a ticket goes `"queued" -> "routed"` and the ring stops, not because
+/// a number descends but because the status will not be `"queued"` again.
+fn prove_domain(ir: &IrProgram, hops: &[Hop<'_>]) -> Option<DomainMeasure> {
+    let classes = class_index(ir);
+    let enums = ir
+        .schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            IrSchema::Enum(declared) => Some((declared.name.clone(), declared.variants.len())),
+            IrSchema::Class(_) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    // The field must be a finite domain on every class the ring carries: a union
+    // of string literals, or a reference to a declared enum.
+    let domain_size = |ty: &IrType| -> Option<usize> {
+        match ty {
+            IrType::Union(members)
+                if members
+                    .iter()
+                    .all(|member| matches!(member, IrType::LiteralString(_))) =>
+            {
+                Some(members.len())
+            }
+            IrType::Ref(name) => enums.get(name).copied(),
+            _ => None,
+        }
+    };
+
+    let mut candidates: Option<BTreeSet<String>> = None;
+    let mut domain = 0usize;
+    for hop in hops {
+        let fields = classes.get(hop.in_schema.as_str())?;
+        let mut finite = BTreeSet::new();
+        for (name, ty) in fields {
+            if let Some(size) = domain_size(ty) {
+                domain = domain.max(size);
+                finite.insert(name.clone());
+            }
+        }
+        candidates = Some(match candidates {
+            Some(previous) => previous.intersection(&finite).cloned().collect(),
+            None => finite,
+        });
+    }
+
+    for field in candidates.unwrap_or_default() {
+        let mut transitions = Vec::new();
+        let mut readable = true;
+        for hop in hops {
+            let Some(matched) = hop
+                .guard
+                .iter()
+                .find_map(|conjunct| equality_value(conjunct, &hop.binding, &field))
+            else {
+                readable = false;
+                break;
+            };
+            let mut records = hop
+                .records
+                .iter()
+                .filter(|shape| shape.schema == hop.out_schema);
+            let (Some(record), None) = (records.next(), records.next()) else {
+                readable = false;
+                break;
+            };
+            let Some(recorded) = record.fields.iter().find_map(|(name, expr)| {
+                if name != &field {
+                    return None;
+                }
+                match expr {
+                    Expr::Literal(ExprLiteral::String(value)) => Some(value.clone()),
+                    // A bare identifier is how an enum variant is written.
+                    Expr::Literal(ExprLiteral::Ident(value)) => Some(value.clone()),
+                    _ => None,
+                }
+            }) else {
+                readable = false;
+                break;
+            };
+            transitions.push((matched, recorded));
+        }
+        if !readable || transitions.is_empty() {
+            continue;
+        }
+        if walk_is_acyclic(&transitions) {
+            return Some(DomainMeasure {
+                field,
+                transitions,
+                domain,
+            });
+        }
+    }
+    None
+}
+
+/// `<binding>.<field> == "value"` in a guard conjunct, as the value.
+fn equality_value(expr: &Expr, binding: &str, field: &str) -> Option<String> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    if !is_field_path(left, binding, field) {
+        return None;
+    }
+    match right.as_ref() {
+        Expr::Literal(ExprLiteral::String(value)) => Some(value.clone()),
+        Expr::Literal(ExprLiteral::Ident(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Whether the walk these edges describe can return to a value it has left. A
+/// finite set with no cycle admits no infinite walk, which is the whole of the
+/// termination argument.
+fn walk_is_acyclic(transitions: &[(String, String)]) -> bool {
+    let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (from, to) in transitions {
+        edges.entry(from.as_str()).or_default().insert(to.as_str());
+    }
+    let mut reach: BTreeMap<&str, BTreeSet<&str>> = edges
+        .iter()
+        .map(|(node, targets)| (*node, targets.clone()))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in reach.keys().copied().collect::<Vec<_>>() {
+            let onward = reach[node]
+                .iter()
+                .flat_map(|step| edges.get(step).into_iter().flatten().copied())
+                .collect::<Vec<_>>();
+            for target in onward {
+                if reach.get_mut(node).map(|set| set.insert(target)) == Some(true) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    !reach.iter().any(|(node, targets)| targets.contains(node))
 }
 
 /// How one hop moves the field: `<binding>.<field> + k`, `- k`, or the bare

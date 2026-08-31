@@ -2488,6 +2488,13 @@ suggestion.
   effect is a check error. The retry pattern keeps compiling, because it records
   inside an `after` block. The one case that stays with the separate check is a
   rule that preserves its own trigger, which the `done` statement escapes.
+- **A ring that advances a finite domain also ends.** A field whose type is a
+  set of literals or an `enum` has a finite number of values. When each rule of
+  the ring matches one value and records another, the compiler follows the walk
+  those rules describe. The ring ends when the walk never returns to a value that
+  it left, because a finite set with no return admits no endless walk. The number
+  of turns is the length of the walk, so such a ring is bounded by the program.
+  The ticket that goes from `"queued"` to `"routed"` is this shape.
 - **A `measure` declaration states a bound, and the compiler verifies it.**
   Write `measure Task.n up to 3` beside the class, or `measure Review.spent up
   to Review.budget` when the ceiling travels in the data. The compiler proves

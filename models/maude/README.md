@@ -149,11 +149,14 @@ effect-cycle-pacing.maude        effect-bearing rule cycles: a same-commit ring
                                  paced ring (graph.bounded_workflow_effect_cycle);
                                  a preserved self-trigger stays with the per-rule
                                  refusal so one defect earns one diagnostic
-termination-measure.maude        DR-0081 §2: a ring that advances in one
-                                 direction, is bounded somewhere, and consumes
-                                 its token is admitted; unbounded, preserving,
-                                 carry-through-only, and direction-disagreeing
-                                 rings are never admitted
+termination-measure.maude        DR-0081 §2, both measures: a ring that
+                                 advances in one direction, is bounded
+                                 somewhere, and consumes its token is admitted
+                                 (unbounded, preserving, carry-through-only and
+                                 direction-disagreeing rings are not); and a walk
+                                 over a finite domain derives a RETURN exactly
+                                 when it revisits a value, which is what
+                                 admitting it rests on
 view-derivation.maude            views vs one-shot rules: a `rule` evaluates its
                                  body once and closes, a `view` re-derives when
                                  the set it queries moves, and its derived fact

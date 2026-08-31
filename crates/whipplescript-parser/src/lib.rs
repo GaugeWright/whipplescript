@@ -9628,7 +9628,7 @@ fn validate_effectful_rule_recursion(
         let mut nearest_miss = None;
         match measure::prove_cycle_measure(ir, &component) {
             measure::MeasureOutcome::Proven(proven) => {
-                if !tool_workflow || proven.step_bounded {
+                if !tool_workflow || proven.step_bounded() {
                     // Published by the report pass above, which sees every cycle.
                     continue;
                 }

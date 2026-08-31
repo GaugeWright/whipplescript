@@ -70,3 +70,57 @@ mod WHIPPLESCRIPT-TERMINATION-MEASURE is
   crl [admit] : analysis(U, D, B, C) => admitted
       if ((U > 0 and D == 0) or (U == 0 and D < 0)) /\ B = true /\ C = true .
 endm
+
+--- The FINITE-DOMAIN measure (DR-0081 §2, finite domains). A ring may terminate
+--- without any number descending: a `status` matched at "queued" and recorded as
+--- "routed" ends the ring because the field moved to a value it will not hold
+--- again. Each hop is one edge over the field's declared values, and the ring is
+--- well-founded exactly when that walk cannot return to a value it has left --
+--- an acyclic graph over a finite set admits no infinite walk.
+---
+--- This is the argument docs/manual/04-rules.md teaches before it teaches a
+--- counter, and the corpus report found it was the one cycle in the repository
+--- that nobody wrote for this feature and nothing could prove.
+mod WHIPPLESCRIPT-DOMAIN-MEASURE is
+  protecting BOOL .
+
+  sorts Value Edge EdgeSet Cfg .
+  subsort Edge < EdgeSet .
+
+  ops queued routed shipped : -> Value [ctor] .
+
+  op step : Value Value -> Edge [ctor] .      --- one hop: matched -> recorded
+  op mtEdges : -> EdgeSet [ctor] .
+  op _;_ : EdgeSet EdgeSet -> EdgeSet [ctor assoc comm id: mtEdges] .
+  eq [edge-idem] : E:Edge ; E:Edge = E:Edge .
+
+  op memberEdge : Edge EdgeSet -> Bool .
+  eq memberEdge(E:Edge, (E:Edge ; ES:EdgeSet)) = true .
+  eq memberEdge(E:Edge, ES:EdgeSet) = false [owise] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op walk : Value Value -> Cfg [ctor] .   --- a hop the analysis read
+  op reaches : EdgeSet -> Cfg [ctor] .    --- transitive closure of the walk
+  op returns : -> Cfg [ctor] .            --- some value reaches itself
+
+  vars A B C : Value .
+  var ES : EdgeSet .
+
+  crl [seed] : walk(A, B) reaches(ES) => walk(A, B) reaches(step(A, B) ; ES)
+      if memberEdge(step(A, B), ES) = false .
+
+  crl [close] : walk(B, C) reaches(step(A, B) ; ES)
+      => walk(B, C) reaches(step(A, C) ; step(A, B) ; ES)
+      if memberEdge(step(A, C), (step(A, B) ; ES)) = false .
+
+  --- A value that reaches itself is a walk that can go round again, and the
+  --- domain being finite says nothing about a walk that repeats. The model
+  --- derives the RETURN rather than the admission, because a walk keeps its hop
+  --- tokens: asking for admission as a whole configuration could never match,
+  --- and asking for it beside a residual would match a state that carries the
+  --- return too. Admission is the absence of `returns`, which a search for it
+  --- reports as No solution.
+  rl [returns] : reaches(step(A, A) ; ES) => reaches(step(A, A) ; ES) returns .
+endm

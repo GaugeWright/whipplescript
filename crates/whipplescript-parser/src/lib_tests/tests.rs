@@ -11472,6 +11472,83 @@ rule finish
 }
 "#;
 
+/// The termination argument `docs/manual/04-rules.md` teaches before it teaches
+/// a counter: a ticket goes `"queued" -> "routed"` and the ring stops, not
+/// because a number descends but because the status will not be `"queued"`
+/// again. DR-0081 §2 could not express it; a finite domain can.
+#[test]
+fn a_finite_domain_ring_is_proven() {
+    let compiled = compile_program(&DOMAIN_RING.replace("REQUEUE", ""));
+    let ir = compiled.ir.expect("an acyclic value walk compiles");
+    assert!(
+        ir.to_snapshot()
+            .contains("t.status advances through queued -> routed (step-bounded"),
+        "{}",
+        ir.to_snapshot()
+    );
+}
+
+/// And the bite, on the same ring: a walk that returns to a value it has left is
+/// not well-founded, so the cycle keeps its refusal. Same program, one extra
+/// rule — which is what makes the acyclicity check the thing being tested rather
+/// than some other property of the shape.
+#[test]
+fn a_domain_walk_that_returns_is_not_proven() {
+    let requeue = r#"
+rule requeue
+  when Ticket as t where t.status == "routed"
+=> {
+  tell worker "requeue"
+  done t -> record Ticket { status "queued" }
+}
+"#;
+    let compiled = compile_program(&DOMAIN_RING.replace("REQUEUE", requeue));
+    assert!(compiled.ir.is_none(), "a closed walk must not be proven");
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.unbounded_effect_recursion"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A hop the analysis cannot read one value off is not a walk. Without an
+/// equality guard the rule matches every value including the one it writes, so
+/// there is no edge to follow and nothing to prove.
+#[test]
+fn a_domain_hop_without_an_equality_guard_is_not_proven() {
+    let compiled = compile_program(&DOMAIN_RING.replace("REQUEUE", "").replace(
+        r#"when Ticket as t where t.status == "queued""#,
+        "when Ticket as t",
+    ));
+    assert!(
+        compiled.ir.is_none(),
+        "an unguarded hop states no transition: {:?}",
+        compiled.diagnostics
+    );
+}
+
+const DOMAIN_RING: &str = r#"
+@service
+workflow DomainRing
+
+class Ticket { status "queued" | "routed" }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Ticket [ { status "queued" } ]
+
+rule route
+  when Ticket as t where t.status == "queued"
+=> {
+  tell worker "route"
+  done t -> record Ticket { status "routed" }
+}
+REQUEUE
+"#;
+
 /// DR-0081: a same-commit loop whose field advances toward a literal ceiling
 /// cannot turn forever, so the refusal has nothing to refuse. Ten turns, and the
 /// number follows from the source — the one program in this area whose length is

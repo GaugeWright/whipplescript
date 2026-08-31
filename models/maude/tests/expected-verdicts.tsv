@@ -113,7 +113,7 @@ subworkflow-convergence.maude	SSSSNNN
 subworkflow-lease.maude	SSSN
 telemetry-cursor.maude	SSSNSS
 terminal-payload-shape.maude	SSSSSSNN
-termination-measure.maude	SSNNNN
+termination-measure.maude	SSNNNNNNSS
 text-merge-compose.maude	SSSSSNNNSSN
 trace-lifecycle-conformance.maude	SSSNNSSSSSNSS
 tracker-claim-turn.maude	NSNS

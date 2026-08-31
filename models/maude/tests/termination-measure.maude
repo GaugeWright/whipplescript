@@ -30,3 +30,24 @@ search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
 --- field that can move back as easily as forward descends nowhere.
 search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
   hop(ra, 1) hop(rb, -1) bounds(ra) analysis(0, 0, false, true) =>! admitted .
+
+--- Bite: a walk that never returns to a value it has left never derives a
+--- return, which is what admitting it rests on. This is the triage ring:
+--- "queued" -> "routed", and the ticket is done.
+search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
+  walk(queued, routed) reaches(mtEdges) =>* returns RESIDUAL:Cfg .
+
+--- Bite: a longer walk over the same finite domain still never returns, so the
+--- closure is not an artefact of the two-value case.
+search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
+  walk(queued, routed) walk(routed, shipped) reaches(mtEdges) =>* returns RESIDUAL:Cfg .
+
+--- Coverage: a walk that returns IS found, so the check has teeth. The domain
+--- being finite is not the argument; not revisiting a value is.
+search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
+  walk(queued, routed) walk(routed, queued) reaches(mtEdges) =>* returns RESIDUAL:Cfg .
+
+--- Coverage: an indirect return is a return.
+search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
+  walk(queued, routed) walk(routed, shipped) walk(shipped, queued) reaches(mtEdges)
+  =>* returns RESIDUAL:Cfg .
