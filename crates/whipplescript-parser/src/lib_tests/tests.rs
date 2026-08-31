@@ -12249,6 +12249,90 @@ rule finish
 }
 "#;
 
+/// A guard was type-checked and a value position was not, and the difference
+/// was not a missing diagnostic — it was a durable one. `record Task { n k.flag
+/// + k.flag }` compiled, and the runtime committed
+/// `{"internal":"Error","message":"arithmetic requires numeric operands"}` into
+/// the fact log: an error object presented as data, with no diagnostic, no
+/// auto-fail, and no terminal. The check existed the whole time and was wired
+/// only to `where`.
+#[test]
+fn arithmetic_in_a_value_position_is_type_checked() {
+    let program = |field: &str, expr: &str| {
+        format!(
+            r#"
+@service
+workflow ValuePosition
+
+output result Report
+class Report {{ n int }}
+class Task {{ s string  b bool  d duration  n int }}
+
+table seeds as Task [ {{ s "x"  b true  d "PT10S"  n 0 }} ]
+
+rule step
+  when Task as k
+=> {{
+  done k -> record Task {{ s k.s  b k.b  d k.d  {field} {expr} }}
+}}
+"#
+        )
+    };
+
+    // Every operand type the runtime cannot add, refused where it is written.
+    for (field, expr) in [
+        ("s", "k.s + k.s"),
+        ("b", "k.b + k.b"),
+        ("d", "k.d + k.d"),
+        ("n", "k.n + k.d"),
+    ] {
+        let compiled = compile_program(&program(field, expr));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "expr.non_numeric_operand"),
+            "{expr} was admitted into a value position: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    // And arithmetic that the runtime CAN do is untouched.
+    let numeric = compile_program(&program("n", "k.n + 1"));
+    assert!(numeric.ir.is_some(), "{:?}", numeric.diagnostics);
+}
+
+/// The same check reaches a terminal payload and a milestone, because each
+/// carries a value out of the rule — to an invoker, or to a watching parent —
+/// and an error object is no better there than in a fact.
+#[test]
+fn a_terminal_payload_is_type_checked_too() {
+    let source = r#"
+workflow TerminalPayload
+
+output result Report
+class Report { n int }
+class Task { s string }
+
+table seeds as Task [ { s "x" } ]
+
+rule finish
+  when Task as k
+=> {
+  complete result { n k.s + k.s }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "expr.non_numeric_operand"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
 /// The termination argument `docs/manual/04-rules.md` teaches before it teaches
 /// a counter: a ticket goes `"queued" -> "routed"` and the ring stops, not
 /// because a number descends but because the status will not be `"queued"`

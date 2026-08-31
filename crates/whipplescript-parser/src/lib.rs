@@ -12226,6 +12226,13 @@ fn analyze_rule(
         &mut metadata.fact_consumes,
     );
     validate_recorded_schemas(rule, &body_ast.statements, semantic, diagnostics);
+    validate_value_expressions(
+        rule,
+        &body_ast.statements,
+        semantic,
+        &binding_types,
+        diagnostics,
+    );
     // After the scan, because the misplaced-binding set it consults is built
     // during it: the suggestion changes when a binding was written after a
     // multiline string delimiter.
@@ -15738,6 +15745,122 @@ impl ExprValidationContext {
         Self {
             subject: "assertion".to_owned(),
             span,
+        }
+    }
+}
+
+/// Type-check an expression written in a VALUE position — a `record` field, a
+/// terminal payload field, a milestone field.
+///
+/// Guards were type-checked and these were not, which is not a gap in coverage
+/// so much as a broken promise: `record Task { n t.flag + t.flag }` compiled, and
+/// the runtime then committed
+/// `{"internal":"Error","message":"arithmetic requires numeric operands"}` into a
+/// durable fact. No diagnostic, no auto-fail, no terminal — an error object in
+/// the log, presented as data. The same expression in a `where` clause has always
+/// been refused as `expr.non_numeric_operand`.
+///
+/// Only the inference runs, not `validate_expr_node`: the structural checks it
+/// carries (unknown roots, field paths) are already applied to these positions by
+/// `validate_known_field_paths_scoped`, and running them twice would report one
+/// mistake at two carets.
+fn validate_value_expression(
+    rule: &RuleDecl,
+    expr: &Expr,
+    at: SourceSpan,
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    infer_expr_type(
+        expr,
+        semantic,
+        &ExprScope::from_bindings(binding_types),
+        &ExprValidationContext::rule(rule, at),
+        diagnostics,
+    );
+}
+
+/// Every value-position expression in a body, so the check above reaches all of
+/// them: a `record`, the `record` a `done` replaces with, a `complete`/`fail`
+/// payload, and a milestone. Each carries a payload out of the rule — into the
+/// fact log, to an invoker, or to a watching parent — and an error object is no
+/// better in any of them.
+fn validate_value_expressions(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    binding_types: &BTreeMap<String, String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let fields = |assignments: &[body::FieldAssign], diagnostics: &mut Vec<Diagnostic>| {
+        for field in assignments {
+            if let body::FieldValue::Expr { expr, .. } = &field.value {
+                validate_value_expression(
+                    rule,
+                    expr,
+                    field.span,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+        }
+    };
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => fields(&record.fields, diagnostics),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => fields(&record.fields, diagnostics),
+            body::BodyStmt::Terminal(terminal) => {
+                fields(&terminal.fields, diagnostics);
+                if let Some(body::FieldValue::Expr { expr, .. }) = &terminal.scalar {
+                    validate_value_expression(
+                        rule,
+                        expr,
+                        terminal.span,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Milestone {
+                fields: payload, ..
+            } => fields(payload, diagnostics),
+            body::BodyStmt::After(after) => {
+                validate_value_expressions(rule, &after.body, semantic, binding_types, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_value_expressions(
+                        rule,
+                        &branch.body,
+                        semantic,
+                        binding_types,
+                        diagnostics,
+                    );
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_value_expressions(
+                    rule,
+                    &region.body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+                validate_value_expressions(
+                    rule,
+                    &region.lapse_body,
+                    semantic,
+                    binding_types,
+                    diagnostics,
+                );
+            }
+            _ => {}
         }
     }
 }
