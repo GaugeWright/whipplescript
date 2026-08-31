@@ -31,7 +31,7 @@ use whipplescript_custody::{CredentialKind, CredentialName};
 
 const USAGE: &str = "usage:
   whip-custodian init   --store <path>
-  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name>]
+  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name> | --tpm-pcr <0,7>]
   whip-custodian list   --store <path>
   whip-custodian revoke --store <path> --name <credential>
   whip-custodian serve  --store <path> --socket <path> [--egress-allow <host,host,*.suffix>]
@@ -90,6 +90,80 @@ fn passphrase(args: &Args) -> Result<Zeroizing<String>, String> {
                 .to_string(),
         ),
     }
+}
+
+/// Parse `--tpm-pcr 0,7` into slot numbers.
+///
+/// Ascending and de-duplicated, because the binding hashes values in slot
+/// order: `7,0` and `0,7` would otherwise be two different bindings over the
+/// same platform, and an operator who typed them in the other order would find
+/// their credential stale for no reason they could see.
+fn parse_pcr_slots(text: &str) -> Result<Vec<u32>, String> {
+    let mut slots = Vec::new();
+    for piece in text.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            return Err("--tpm-pcr takes a comma-separated list of PCR slots, e.g. 0,7".to_owned());
+        }
+        let slot: u32 = piece
+            .parse()
+            .map_err(|_| format!("--tpm-pcr: `{piece}` is not a PCR slot number"))?;
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
+    // No emptiness check here, and deliberately: `split(',')` yields at least
+    // one piece for every input including "", and an empty piece is already
+    // refused above. A guard for it read like a second safety net and was in
+    // fact unreachable — a refusal that cannot fire is one nobody can test, and
+    // the sweep said so.
+    slots.sort_unstable();
+    Ok(slots)
+}
+
+#[cfg(feature = "tpm")]
+fn import_tpm(
+    store_path: &std::path::Path,
+    pass: &str,
+    name: CredentialName,
+    kind: CredentialKind,
+    slots: &[u32],
+    budget: Option<u64>,
+    lease_expires_at: Option<u64>,
+) -> Result<(), String> {
+    let mut context = whipplescript_custodian::tpm_device::context()?;
+    // Read at registration so the binding records the platform as it IS, not as
+    // an operator believes it to be. Every later use compares against this.
+    let binding = whipplescript_custodian::tpm_device::read_binding(&mut context, slots)?;
+    let mut store = SealedStore::open(store_path, pass).map_err(|e| e.to_string())?;
+    let digest = binding.digest_hex.clone();
+    store
+        .register_tpm(name.clone(), kind, binding, budget, lease_expires_at)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "imported {} (kind {kind}, r2 hardware, bound to PCRs {slots:?} at {digest})",
+        name.resource_id()
+    );
+    Ok(())
+}
+
+/// The same command in a custodian built without the `tpm` feature.
+///
+/// Refused rather than recorded: writing the entry would leave a credential
+/// nothing on this host can ever use, and the operator would find out at the
+/// first signature instead of here.
+#[cfg(not(feature = "tpm"))]
+fn import_tpm(
+    _store_path: &std::path::Path,
+    _pass: &str,
+    _name: CredentialName,
+    _kind: CredentialKind,
+    _slots: &[u32],
+    _budget: Option<u64>,
+    _lease_expires_at: Option<u64>,
+) -> Result<(), String> {
+    Err("this custodian was built without the `tpm` feature, so it cannot bind a credential to a TPM: rebuild with `--features tpm` on a host that has the tss2 stack"
+        .to_owned())
 }
 
 /// `--remote-transit` names a key that stays in OpenBao; the three local
@@ -157,6 +231,21 @@ fn run() -> Result<(), String> {
                         .map(|seconds| now_epoch_s() + seconds)
                 })
                 .transpose()?;
+            // An r2 hardware entry: nothing is recorded but the platform state
+            // the credential is bound to. The key is derived inside the TPM and
+            // never existed on this box to begin with.
+            if let Some(slots) = args.flags.get("tpm-pcr") {
+                let slots = parse_pcr_slots(slots)?;
+                return import_tpm(
+                    &store_path,
+                    &pass,
+                    name,
+                    kind,
+                    &slots,
+                    budget,
+                    lease_expires_at,
+                );
+            }
             // An r3 remote entry: only a key name is recorded; the material
             // lives in the OpenBao transit engine and never touches this box.
             if let Some(key_name) = args.flags.get("remote-transit") {
@@ -375,6 +464,78 @@ mod tests {
     fn parsed(argv: &[&str]) -> Args {
         let owned: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
         Args::parse(&owned).expect("arguments parse")
+    }
+
+    /// A custodian built without the `tpm` feature says so, rather than writing
+    /// an entry nothing on this host can ever use.
+    ///
+    /// Compiled only in that configuration, because that is the only one where
+    /// the refusal exists — and it is the configuration the default build and
+    /// the green bar are in, so this is the path most likely to be hit.
+    #[cfg(not(feature = "tpm"))]
+    #[test]
+    fn a_custodian_without_the_tpm_feature_refuses_to_bind_rather_than_recording() {
+        let refused = import_tpm(
+            std::path::Path::new("/nonexistent/store.json"),
+            "pass",
+            CredentialName::new("release/signing").expect("name"),
+            CredentialKind::HmacSha256,
+            &[0, 7],
+            None,
+            None,
+        )
+        .expect_err("this build cannot reach a TPM");
+        assert!(
+            refused.contains("built without the `tpm` feature"),
+            "the refusal must name the cause: {refused}"
+        );
+        assert!(
+            refused.contains("--features tpm"),
+            "and the way forward: {refused}"
+        );
+        // It refuses BEFORE touching the store: the path above does not exist,
+        // and a run that got as far as opening it would have failed differently.
+    }
+
+    #[test]
+    fn pcr_slots_parse_into_an_ordered_deduplicated_binding() {
+        // Ascending and de-duplicated because the binding hashes values in slot
+        // order: `7,0` and `0,7` must be the same platform claim, or an
+        // operator who typed them the other way round would find the credential
+        // stale for a reason they could not see.
+        assert_eq!(parse_pcr_slots("0,7").expect("parsed"), vec![0, 7]);
+        assert_eq!(parse_pcr_slots("7,0").expect("parsed"), vec![0, 7]);
+        assert_eq!(parse_pcr_slots("7, 0 ,7").expect("parsed"), vec![0, 7]);
+        assert_eq!(parse_pcr_slots(" 4 ").expect("parsed"), vec![4]);
+    }
+
+    #[test]
+    fn a_pcr_selection_that_names_nothing_usable_is_refused() {
+        // An empty selection would bind to nothing and report fresh forever —
+        // the exact failure freshness exists to prevent — so it is refused
+        // where it is typed rather than at the first signature.
+        //
+        // Asserting the TEXT rather than `is_err()`: the two refusals here say
+        // different things — a missing slot and an unparseable one — and an
+        // operator needs to know which they hit. An `is_err()` assertion also
+        // passes through a mutation of the message, so it measures nothing.
+        for bad in ["", " ", "0,", ",7"] {
+            assert_eq!(
+                parse_pcr_slots(bad).expect_err("not a selection"),
+                "--tpm-pcr takes a comma-separated list of PCR slots, e.g. 0,7",
+                "`{bad}` names no slot"
+            );
+        }
+        for bad in ["seven", "0,seven", "-1"] {
+            assert_eq!(
+                parse_pcr_slots(bad).expect_err("not a slot number"),
+                format!(
+                    "--tpm-pcr: `{}` is not a PCR slot number",
+                    bad.rsplit(',').next().expect("piece")
+                ),
+                "`{bad}` names something that is not a slot"
+            );
+        }
     }
 
     #[test]

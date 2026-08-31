@@ -21,6 +21,17 @@ readme.workspace = true
 [package.metadata.dist]
 dist = false
 
+[features]
+default = []
+# r2 `hardware` over a TPM 2.0. OFF by default and deliberately: it links the
+# native tss2 stack, which is not present on every box and does not exist on
+# Windows, and the DR puts r2/r3 backends at the enterprise-readiness seam.
+#
+# Only the DEVICE half is behind it. `tpm.rs` — the freshness rule the rung
+# turns on — compiles and tests unconditionally, so the ordinary green bar
+# checks the property on a machine with no TPM.
+tpm = ["dep:tss-esapi"]
+
 [dependencies]
 whipplescript-custody = { version = "0.5.5", path = "../whipplescript-custody" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +43,8 @@ zeroize = "1"
 # repo's threads-not-async execution model.
 ureq = { version = "2", features = ["json", "native-certs"] }
 url = "2"
+# The stable line; 8.x is an alpha. Optional — see [features].
+tss-esapi = { version = "7.7", optional = true }
 
 [[bin]]
 name = "whip-custodian"

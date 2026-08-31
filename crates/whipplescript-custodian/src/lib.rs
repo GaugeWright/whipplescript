@@ -23,6 +23,9 @@ pub mod openbao;
 #[cfg(target_family = "unix")]
 pub mod serve;
 pub mod store;
+pub mod tpm;
+#[cfg(feature = "tpm")]
+pub mod tpm_device;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -177,8 +180,90 @@ impl Custodian {
     fn entry_rung(&self, name: &CredentialName) -> (Rung, bool) {
         match lock(&self.store).get(name).map(|e| &e.material) {
             Some(Material::OpenBaoTransit { .. }) => (Rung::Remote, false),
+            // r2, and NOT degraded: the key was generated inside the chip and
+            // cannot leave it. Freshness is judged at the use rather than here,
+            // because this answers "what rung is this entry" and a moved
+            // platform makes the operation refuse, not the rung shrink.
+            Some(Material::TpmHmac { .. }) => (Rung::Hardware, false),
             _ => self.rung(),
         }
+    }
+
+    /// r2: route a keyed operation to the TPM, after checking the rung still
+    /// holds.
+    ///
+    /// **Freshness is checked HERE, at the use**, not at registration. A
+    /// binding taken at registration says what the platform was then; the
+    /// question every signature asks is what it is NOW. Checking once at
+    /// registration would make r2 a claim about the past.
+    ///
+    /// A stale binding REFUSES rather than falling back to a lower rung. The
+    /// key is unreachable anyway — the material for this credential exists only
+    /// inside the chip — so a "downgrade" would be inventing a credential that
+    /// does not exist, and silence about a moved platform is exactly what §4
+    /// says a rung must not do.
+    fn dispatch_tpm(
+        &self,
+        name: &CredentialName,
+        kind: CredentialKind,
+        binding: &crate::tpm::PcrBinding,
+        op: &CustodyOp,
+    ) -> Result<CustodyOk, CustodyError> {
+        let _ = (kind, binding);
+        match op {
+            CustodyOp::Sign { payload_b64, .. } => {
+                self.admits_sign(name, payload_b64)?;
+                self.tpm_sign(name, binding, payload_b64)
+            }
+            other => Err(CustodyError::Backend {
+                detail: format!(
+                    "credential {name} is held in a TPM, which performs `sign` and nothing else here: `{}` needs material this box does not have",
+                    other.operation().as_str()
+                ),
+            }),
+        }
+    }
+
+    #[cfg(feature = "tpm")]
+    fn tpm_sign(
+        &self,
+        name: &CredentialName,
+        binding: &crate::tpm::PcrBinding,
+        payload_b64: &str,
+    ) -> Result<CustodyOk, CustodyError> {
+        let payload = decode_b64(payload_b64)?;
+        let mut context =
+            crate::tpm_device::context().map_err(|detail| CustodyError::Backend { detail })?;
+        let current = crate::tpm_device::read_binding(&mut context, &binding.slots)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        crate::tpm::ensure_fresh(name.as_str(), binding, &current)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        let signature = crate::tpm_device::hmac_sha256(&mut context, name.as_str(), &payload)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        Ok(CustodyOk::Signed {
+            signature_b64: B64.encode(signature),
+            key_version: None,
+        })
+    }
+
+    /// The same entry point in a custodian built without the `tpm` feature.
+    ///
+    /// A store is portable: an entry registered by a TPM-enabled custodian can
+    /// be opened by one built without it. Refusing by name beats a panic or a
+    /// "no such credential" — the credential exists, this binary simply cannot
+    /// reach the chip that holds it.
+    #[cfg(not(feature = "tpm"))]
+    fn tpm_sign(
+        &self,
+        name: &CredentialName,
+        _binding: &crate::tpm::PcrBinding,
+        _payload_b64: &str,
+    ) -> Result<CustodyOk, CustodyError> {
+        Err(CustodyError::Backend {
+            detail: format!(
+                "credential {name} is held in a TPM, and this custodian was built without the `tpm` feature: rebuild with `--features tpm` on a host that has the tss2 stack"
+            ),
+        })
     }
 
     /// Admin surface, reachable only in-process by the principal holding the
@@ -346,6 +431,10 @@ impl Custodian {
             Material::OpenBaoTransit { key_name } => {
                 return self.dispatch_remote(&name, kind, key_name, op)
             }
+            // r2: the key is in the TPM and signs there. Routed before the
+            // local path for the same reason r3 is — there is no material in
+            // this process to hand the local operations.
+            Material::TpmHmac { binding } => return self.dispatch_tpm(&name, kind, binding, op),
             Material::Local(material) => Zeroizing::new(material.to_vec()),
         };
 

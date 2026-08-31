@@ -86,6 +86,12 @@ struct SealedEntry {
     /// a secret, and sealing it would only pretend otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<RemoteRef>,
+    /// r2 TPM binding: `{"tpm": {"slots": [0, 7], "digest_hex": "..."}}`.
+    /// Plaintext metadata by design, for the same reason the remote key name
+    /// is: a PCR digest is a measurement of the platform, not a secret, and
+    /// sealing it would only pretend otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tpm: Option<crate::tpm::PcrBinding>,
     #[serde(default)]
     revoked: bool,
     /// Optional per-credential use budget (DR-0053 §9), enforced per
@@ -121,6 +127,12 @@ pub enum Material {
     /// on this box.
     OpenBaoTransit {
         key_name: String,
+    },
+    /// r2: the key is derived inside a TPM 2.0 and signs there, bound to a
+    /// platform state. Like the remote variant, this holds no material — only
+    /// the binding the rung's freshness half is judged against.
+    TpmHmac {
+        binding: crate::tpm::PcrBinding,
     },
 }
 
@@ -223,6 +235,25 @@ impl SealedStore {
         let mut entries = BTreeMap::new();
         for (name, sealed) in &file.entries {
             let name = CredentialName::new(name).map_err(StoreError::Format)?;
+            // An r2 entry is recognised BEFORE the local/remote split: it has
+            // neither ciphertext nor a remote name, so leaving it to the
+            // catch-all below would read a perfectly good hardware credential
+            // as a malformed one.
+            if let Some(binding) = &sealed.tpm {
+                entries.insert(
+                    name,
+                    Entry {
+                        kind: sealed.kind,
+                        material: Material::TpmHmac {
+                            binding: binding.clone(),
+                        },
+                        revoked: sealed.revoked,
+                        budget: sealed.budget,
+                        lease_expires_at: sealed.lease_expires_at,
+                    },
+                );
+                continue;
+            }
             let material = match (&sealed.remote, &sealed.nonce_b64, &sealed.sealed_b64) {
                 (Some(remote), None, None) => Material::OpenBaoTransit {
                     key_name: remote.openbao_transit.clone(),
@@ -250,7 +281,7 @@ impl SealedStore {
                 }
                 _ => {
                     return Err(StoreError::Format(format!(
-                        "entry {} must carry either sealed material or a remote reference",
+                        "entry {} must carry sealed material, a remote reference, or a TPM binding",
                         name.resource_id()
                     )))
                 }
@@ -331,6 +362,30 @@ impl SealedStore {
         self.persist()
     }
 
+    /// Register an r2 credential: no material crosses, because there is none to
+    /// cross. The TPM derives the key from a seed it will not disclose, and
+    /// this records only which platform state the credential is bound to.
+    pub fn register_tpm(
+        &mut self,
+        name: CredentialName,
+        kind: CredentialKind,
+        binding: crate::tpm::PcrBinding,
+        budget: Option<u64>,
+        lease_expires_at: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.entries.insert(
+            name,
+            Entry {
+                kind,
+                material: Material::TpmHmac { binding },
+                revoked: false,
+                budget,
+                lease_expires_at,
+            },
+        );
+        self.persist()
+    }
+
     pub fn revoke(&mut self, name: &CredentialName) -> Result<bool, StoreError> {
         match self.entries.get_mut(name) {
             Some(e) => {
@@ -368,6 +423,7 @@ impl SealedStore {
                         nonce_b64: Some(B64.encode(nonce_bytes)),
                         sealed_b64: Some(B64.encode(&buf)),
                         remote: None,
+                        tpm: None,
                         revoked: entry.revoked,
                         budget: entry.budget,
                         lease_expires_at: entry.lease_expires_at,
@@ -382,6 +438,20 @@ impl SealedStore {
                     remote: Some(RemoteRef {
                         openbao_transit: key_name.clone(),
                     }),
+                    tpm: None,
+                    revoked: entry.revoked,
+                    budget: entry.budget,
+                    lease_expires_at: entry.lease_expires_at,
+                },
+                // Same shape as remote, and for the same reason: an r2 entry
+                // has no secret on this box to seal, only the platform state it
+                // is bound to.
+                Material::TpmHmac { binding } => SealedEntry {
+                    kind: entry.kind,
+                    nonce_b64: None,
+                    sealed_b64: None,
+                    remote: None,
+                    tpm: Some(binding.clone()),
                     revoked: entry.revoked,
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,
