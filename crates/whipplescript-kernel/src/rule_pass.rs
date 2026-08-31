@@ -49,6 +49,37 @@ pub struct StepReport {
     pub branch_reports: Vec<BranchReport>,
 }
 
+/// A runaway backstop on the pure-rule fixpoint, far above any real program.
+///
+/// `spec/semantics.md` used to argue this loop needs no bound: "a fact with a
+/// given id can never be re-recorded, so the round loop reaches quiescence".
+/// That argument is Datalog's, where it holds because there are no function
+/// symbols and the derivable set is finite. WhippleScript has arithmetic in a
+/// record body, so `record Item { n i.n + 1 }` mints a value no earlier fact
+/// carried: content-id dedup bounds RE-recording and does not bound
+/// production, and the inference does not carry.
+///
+/// Measured: a three-rule program with no effects, recursive through its own
+/// aggregate, committed 1197 times inside ONE pass and was still going —
+/// `--max-iterations` cannot help, because it bounds passes and this never
+/// leaves the first one. Every example in the repository settles in at most
+/// SIX rounds.
+///
+/// Hitting the bound stops the pass and records `rule.fixpoint.unbounded`; the
+/// instance stays running, which is the same shape as the pass-level
+/// `--max-iterations`. It is a backstop against a hang, not a semantic bound:
+/// a round commits at most one rule, so a large program legitimately needs as
+/// many rounds as it has firings. `WHIPPLESCRIPT_MAX_ROUNDS` raises it.
+pub const DEFAULT_MAX_FIXPOINT_ROUNDS: u64 = 10_000;
+
+fn max_fixpoint_rounds() -> u64 {
+    std::env::var("WHIPPLESCRIPT_MAX_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_FIXPOINT_ROUNDS)
+}
+
 /// The host-agnostic rule pass (DR-0033 instance-scheduler lift): the fixpoint of
 /// `project_tracker_issues` + rule matching/lowering/commit, run over ONE held store
 /// handle instead of re-opening per operation. `S` unifies the runtime,
@@ -80,8 +111,49 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
     let mut committed_firings: std::collections::HashMap<String, Option<RecordedFiring>> =
         std::collections::HashMap::new();
     let mut made_progress = true;
+    let mut rounds: u64 = 0;
+    let round_bound = max_fixpoint_rounds();
+    let mut last_committed_rule: Option<String> = None;
     while made_progress {
         made_progress = false;
+        rounds += 1;
+        if rounds > round_bound {
+            let looping = last_committed_rule.as_deref().unwrap_or("<unknown>");
+            let message = format!(
+                "rule fixpoint did not settle within {round_bound} rounds in one pass \
+                 (last rule committed: `{looping}`); the pass was stopped so it could \
+                 not hang. A rule that records a value derived from its own trigger \
+                 (`n x.n + 1`) makes progress forever: content-id dedup stops a fact \
+                 being re-recorded, it does not stop new ones being produced. Bound \
+                 the recursion with a guard, or raise WHIPPLESCRIPT_MAX_ROUNDS if this \
+                 program genuinely needs more rounds than that."
+            );
+            kernel.store().record_diagnostic(DiagnosticRecord {
+                instance_id: Some(instance_id),
+                program_id: None,
+                program_version_id: None,
+                severity: Severity::Error,
+                code: Some("rule.fixpoint.unbounded"),
+                message: &message,
+                source_span_json: None,
+                subject_type: Some("rule"),
+                subject_id: last_committed_rule.as_deref(),
+                event_id: None,
+                effect_id: None,
+                run_id: None,
+                assertion_id: None,
+                evidence_ids_json: "[]",
+                artifact_ids_json: "[]",
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: Some(&idempotency_key(&[
+                    instance_id,
+                    "fixpoint-unbounded",
+                    looping,
+                ])),
+            })?;
+            break;
+        }
         let status = kernel
             .store()
             .status(instance_id)?
@@ -734,6 +806,7 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     release_holder_resources_on_terminal(kernel.store_mut(), instance_id);
                 }
                 made_progress = true;
+                last_committed_rule = Some(rule.name.clone());
                 break 'rules;
             }
         }
