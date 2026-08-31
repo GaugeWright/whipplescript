@@ -32,6 +32,14 @@ pdf-extract = "0.12.0"
 office_oxide = { version = "0.1.8", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# Mirrors bashkit's own `time_compat` shim, whose `SystemTime` is `web_time`'s on
+# wasm32 and `std`'s everywhere else. That module is private, so the
+# `FileSystem::set_modified_time` signature cannot be spelled without naming the
+# same type on the same cfg. `target_arch`, not `target_family`, because that is
+# the cfg bashkit switches on.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["rt", "time"] }
 
@@ -40,6 +48,12 @@ tokio = { version = "1", features = ["rt", "time"] }
 # (DR-0053 §10) — dev-only, so the kernel's wasm build stays custodian-free.
 whipplescript-custodian = { version = "0.5.5", path = "../whipplescript-custodian" }
 zeroize = "1"
+# Test-only SQL, so a kernel test can construct the inconsistent tracker state
+# that makes a store call FAIL — the only way to reach the queue dispatch's
+# store-error arm, which is otherwise unreachable through any supported API.
+# Dev-only for the same reason as the custodian above: the kernel's wasm build
+# stays free of rusqlite.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [features]
 # `native` pulls in the rusqlite-backed store (whipplescript-store/native); the

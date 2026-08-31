@@ -265,6 +265,31 @@ fn brokered_observation_evidence(
                 "recall_id": recall_id,
             }),
         ),
+        // Shape, not content, so this stays inside the I2/DR-0024 line the
+        // docstring above draws: a path, a digest, and a length say WHICH bytes
+        // reached the model without recording any of them. It is the same class
+        // of identifier as `RecallRequested`'s `content_id`, and the digest is
+        // the one a `file.write.completed` fact carries, so a recorded read
+        // joins the write that produced what it read.
+        LoopObservation::WorkspaceRead {
+            call_id,
+            tool_name,
+            reads,
+        } => (
+            "agent.turn.workspace_read",
+            json!({
+                "call_id": call_id,
+                "tool": tool_name,
+                "reads": reads
+                    .iter()
+                    .map(|read| json!({
+                        "path": read.path,
+                        "content_hash": read.content_hash,
+                        "bytes": read.bytes,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        ),
         LoopObservation::RecallRequested {
             call_id,
             content_id,

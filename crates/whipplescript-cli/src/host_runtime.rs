@@ -232,6 +232,13 @@ pub enum TurnWitness {
 pub trait ResourceResolver {
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String>;
 
+    /// Files the governed virtual bash read since the last drain (G2 of the
+    /// output-attribution note). Defaulted, so a resolver with no virtual
+    /// workspace is unaffected.
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        Vec::new()
+    }
+
     fn execute_tool(
         &self,
         admitted_resources: &[ResourceRef],
@@ -370,6 +377,10 @@ fn hosted_model_visible_world<R: ResourceResolver + ?Sized>(
 /// read-only subtrees; WhippleScript parses tool arguments, confines paths,
 /// rejects symlink traversal, and performs the operation.
 pub struct NativeWorkspaceResolver {
+    /// Files the governed virtual bash read, accumulated per tool call and
+    /// drained by the harness loop. Behind a lock because the resolver surface
+    /// takes `&self`.
+    workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
     root: PathBuf,
     read_only: Vec<PathBuf>,
     max_output_bytes: usize,
@@ -448,6 +459,7 @@ impl NativeWorkspaceResolver {
             return Err("workspace capability root is not a directory".to_owned());
         }
         Ok(Self {
+            workspace_reads: std::sync::Mutex::new(Vec::new()),
             root,
             read_only: Vec::new(),
             max_output_bytes: 50_000,
@@ -762,11 +774,15 @@ impl NativeWorkspaceResolver {
             })
             .collect();
 
-        let output = WhipShell::default().execute(ShellRequest {
+        let mut output = WhipShell::default().execute(ShellRequest {
             command: command.to_owned(),
             timeout: requested,
             files,
         })?;
+        self.workspace_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(&mut output.reads);
         // Validate every result path and mutation before changing the real
         // workspace. This preserves the same capability and read-only ceilings
         // as the first-class file tools.
@@ -812,6 +828,15 @@ impl NativeWorkspaceResolver {
 }
 
 impl ResourceResolver for NativeWorkspaceResolver {
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        std::mem::take(
+            &mut *self
+                .workspace_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
     fn model_visible_environment(&self) -> EnvironmentState {
         let root = self.root.display().to_string();
         EnvironmentState {
@@ -3047,6 +3072,10 @@ struct ResolverToolExecutor<'a, R: ResourceResolver + ?Sized> {
 }
 
 impl<R: ResourceResolver + ?Sized> ToolExecutor for ResolverToolExecutor<'_, R> {
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        self.resolver.take_workspace_reads()
+    }
+
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         if !self.offered.iter().any(|tool| tool.name == call.name) {
             return ToolOutcome {
@@ -3486,6 +3515,67 @@ fn refuse_inadmissible_provider_delegations(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod refusal_pin_tests {
+    //! Refusals the workspace resolver carries that nothing exercised until the
+    //! sweep's widened site matching (#309) attributed them to a change that
+    //! threaded a parameter past them. True of the refusals, not of the change.
+
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "whip-refusal-pin-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("scratch dir");
+        path
+    }
+
+    #[test]
+    fn a_workspace_capability_root_that_is_a_file_is_refused() {
+        // `canonicalize` succeeds on a file, so without this check the resolver
+        // would hold a "root" that can never contain anything and would fail
+        // later, somewhere less obvious.
+        let base = scratch("root-is-file");
+        let file = base.join("not-a-directory");
+        fs::write(&file, "").expect("write");
+
+        let error = match NativeWorkspaceResolver::new(&file) {
+            Err(error) => error,
+            Ok(_) => panic!("a file is not a workspace root"),
+        };
+        assert!(
+            error.contains("workspace capability root is not a directory"),
+            "got: {error}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_command_that_exits_nonzero_is_an_error_carrying_its_status() {
+        // The status has to reach the caller: a nonzero exit returned as `Ok`
+        // would read to the model as a command that worked and said nothing.
+        let root = scratch("nonzero-exit");
+        let resolver = NativeWorkspaceResolver::new(&root).expect("resolver");
+        let error = resolver
+            .bash(&serde_json::json!({ "command": "echo out; exit 3" }), &[])
+            .expect_err("a nonzero exit is an error");
+        assert!(
+            error.contains("command exited with status 3"),
+            "names the status: {error}"
+        );
+        assert!(error.contains("out"), "carries the output: {error}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

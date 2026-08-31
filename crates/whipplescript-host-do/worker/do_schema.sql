@@ -101,8 +101,8 @@
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE effect_dependencies (
-                instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
-                upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL
+                dependency_id TEXT, instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
+                upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL, created_by_rule TEXT
             );
             CREATE TABLE leases (
                 lease_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -260,6 +260,7 @@
                 event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
                 issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
+                effect_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE tracker_subscriptions (

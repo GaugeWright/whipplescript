@@ -41531,6 +41531,23 @@ fn store_error(error: StoreError) -> String {
              condition and retrying the same read will not fix it; the {source}'s copy is \
              corrupt or has been tampered with"
         ),
+        // A cycle is a deadlock, not a race: every effect on it would wait on
+        // another forever, so the instance would neither complete nor fail —
+        // and would report the same "blocked" a healthy instance waiting on a
+        // slow provider reports. Never say "try again"; the next pass asks for
+        // the same graph. The ordering is the program's, so name the rule.
+        StoreError::DependencyCycle {
+            instance_id,
+            upstream_effect_id,
+            downstream_effect_id,
+            rule,
+        } => format!(
+            "rule `{rule}` asked for effect `{downstream_effect_id}` to wait on \
+             `{upstream_effect_id}` in instance `{instance_id}`, which closes a cycle in the \
+             dependency graph. Every effect on the cycle would stay blocked forever and the \
+             instance would neither complete nor fail, so the edge was refused instead. \
+             Retrying makes the same request; the ordering is the program's to fix"
+        ),
         // DR-0054 Phase B: a store written by a newer whip fails closed with
         // both versions named. The store is intact; deleting it is never the
         // remediation.

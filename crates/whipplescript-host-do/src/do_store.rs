@@ -33,6 +33,7 @@ use serde_json::Value;
 use whipplescript_store::coordination::{
     AcquireOutcome, ConsumeOutcome, Coordination, CounterRow, LeaseRow, LedgerEntry,
 };
+use whipplescript_store::dependency_graph;
 use whipplescript_store::event_chain;
 use whipplescript_store::items::{
     apply_overlay, ClaimOutcome, FinishOutcome, ReleaseOutcome, RenewOutcome, SubscribedEvent,
@@ -194,11 +195,17 @@ impl<S: DoSql> crate::DoStorage for DoSqlStorage<S> {
 /// `RuntimeStore` over a `DoSql` backend — the durable-object store impl.
 pub struct DoSqliteStore<Sql: DoSql> {
     pub sql: Sql,
+    /// The effect currently writing tracker events, scoped by the queue-effect
+    /// dispatch (G3). Mirrors `WorkItemStore::event_effect_id`.
+    event_effect_id: Option<String>,
 }
 
 impl<Sql: DoSql> DoSqliteStore<Sql> {
     pub fn new(sql: Sql) -> Self {
-        Self { sql }
+        Self {
+            sql,
+            event_effect_id: None,
+        }
     }
 
     /// DR-0067 §2: this instance's high-water mark, `(sequence, head_digest)`.
@@ -1954,6 +1961,20 @@ fn do_insert_effect_dependency<Sql: DoSql>(
     rule: &str,
     dependency: &NewEffectDependency<'_>,
 ) -> StoreResult<()> {
+    let existing = do_instance_dependency_edges(sql, instance_id)?;
+    let closes_cycle = dependency_graph::edge_closes_cycle(
+        &existing,
+        dependency.upstream_effect_id,
+        dependency.downstream_effect_id,
+    );
+    if closes_cycle {
+        return Err(StoreError::DependencyCycle {
+            instance_id: instance_id.to_owned(),
+            upstream_effect_id: dependency.upstream_effect_id.to_owned(),
+            downstream_effect_id: dependency.downstream_effect_id.to_owned(),
+            rule: rule.to_owned(),
+        });
+    }
     sql.execute(
         "INSERT INTO effect_dependencies (dependency_id, instance_id, upstream_effect_id, \
          downstream_effect_id, predicate, created_by_rule) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1968,6 +1989,25 @@ fn do_insert_effect_dependency<Sql: DoSql>(
     )
     .map_err(sql_err)?;
     Ok(())
+}
+
+/// Every recorded edge of one instance as `(upstream, downstream)` pairs,
+/// mirroring `instance_dependency_edges`.
+fn do_instance_dependency_edges<Sql: DoSql>(
+    sql: &Sql,
+    instance_id: &str,
+) -> StoreResult<Vec<(String, String)>> {
+    let rows = sql
+        .query(
+            "SELECT upstream_effect_id, downstream_effect_id FROM effect_dependencies \
+             WHERE instance_id = ?1",
+            &[text(instance_id)],
+        )
+        .map_err(sql_err)?;
+    Ok(rows
+        .iter()
+        .map(|row| (as_text(&row[0]), as_text(&row[1])))
+        .collect())
 }
 
 /// Re-queues `blocked_by_dependency` effects whose dependencies are now satisfied,
@@ -7022,6 +7062,8 @@ fn do_issue_heads(sql: &impl DoSql, content_id: &str) -> StoreResult<Vec<String>
 /// Append one immutable content-addressed tracker event (INSERT only), keyed by
 /// the issue's opaque content_id. `event_id_override` is used only for the
 /// `issue.created` root (whose id IS the content_id). Deduped by `event_id`.
+// Mirrors `tx_append_raw`, including its argument count and the reason for it.
+#[allow(clippy::too_many_arguments)]
 fn do_tracker_append_raw(
     sql: &impl DoSql,
     content_id: Option<&str>,
@@ -7029,6 +7071,7 @@ fn do_tracker_append_raw(
     kind: &str,
     payload_json: &str,
     actor: Option<&str>,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<String> {
     let parents = match content_id {
@@ -7050,8 +7093,8 @@ fn do_tracker_append_raw(
         serde_json::to_string(&parents).map_err(|error| sql_err(error.to_string()))?;
     sql.execute(
         "INSERT OR IGNORE INTO tracker_events \
-         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (event_id, parents_json, issue_id, kind, payload_json, actor, effect_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         &[
             text(&event_id),
             text(&parents_json),
@@ -7059,6 +7102,7 @@ fn do_tracker_append_raw(
             text(kind),
             text(payload_json),
             opt_text(actor),
+            opt_text(effect_id),
             text(now),
         ],
     )
@@ -7074,6 +7118,7 @@ fn do_tracker_append(
     kind: &str,
     payload: &serde_json::Value,
     actor: Option<&str>,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
     let content_id = match alias {
@@ -7090,6 +7135,7 @@ fn do_tracker_append(
         kind,
         &payload.to_string(),
         actor,
+        effect_id,
         now,
     )?;
     Ok(())
@@ -7161,7 +7207,15 @@ fn do_expire_stale_leases(sql: &impl DoSql, item_id: &str, now: &str) -> StoreRe
         .map_err(sql_err)?;
     for row in &stale {
         let lease_id = as_text(&row[0]);
-        do_mark_lease_released(sql, &lease_id, item_id, "claim.expired", "system", now)?;
+        do_mark_lease_released(
+            sql,
+            &lease_id,
+            item_id,
+            "claim.expired",
+            "system",
+            None,
+            now,
+        )?;
     }
     Ok(())
 }
@@ -7201,7 +7255,12 @@ fn do_holder_conflict(
     }
 }
 
-fn do_release_active_lease(sql: &impl DoSql, item_id: &str, now: &str) -> StoreResult<bool> {
+fn do_release_active_lease(
+    sql: &impl DoSql,
+    item_id: &str,
+    effect_id: Option<&str>,
+    now: &str,
+) -> StoreResult<bool> {
     let rows = sql
         .query(
             &format!(
@@ -7216,7 +7275,15 @@ fn do_release_active_lease(sql: &impl DoSql, item_id: &str, now: &str) -> StoreR
         Some(row) => {
             let lease_id = as_text(&row[0]);
             let actor = as_text(&row[1]);
-            do_mark_lease_released(sql, &lease_id, item_id, "claim.released", &actor, now)?;
+            do_mark_lease_released(
+                sql,
+                &lease_id,
+                item_id,
+                "claim.released",
+                &actor,
+                effect_id,
+                now,
+            )?;
             Ok(true)
         }
     }
@@ -7229,10 +7296,19 @@ fn do_mark_lease_released(
     item_id: &str,
     kind: &str,
     actor: &str,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
     let payload = serde_json::json!({"lease_id": lease_id, "actor": actor, "released_at": now});
-    do_tracker_append(sql, Some(item_id), kind, &payload, Some(actor), now)?;
+    do_tracker_append(
+        sql,
+        Some(item_id),
+        kind,
+        &payload,
+        Some(actor),
+        effect_id,
+        now,
+    )?;
     sql.execute(
         "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
         &[text(lease_id), text(now)],
@@ -7294,6 +7370,10 @@ fn do_live_event_ids<S: DoSql>(
 }
 
 impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
+    fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
+        self.event_effect_id = effect_id.map(str::to_owned);
+    }
+
     fn subscribe_events(&mut self, subscriber: &str, queue: &str) -> StoreResult<bool> {
         let head = self.event_position()?;
         // INSERT OR IGNORE, as natively: re-subscribing keeps the cursor.
@@ -7460,6 +7540,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "issue.created",
             &payload_json,
             filed_by,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         self.sql
@@ -7607,6 +7688,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "claim.acquired",
             &payload.to_string(),
             Some(claimed_by),
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         self.sql
@@ -7664,6 +7746,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "claim.renewed",
             &payload,
             Some(actor),
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         if expires.is_some() {
@@ -7688,11 +7771,13 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
         if let Some(holder) = do_holder_conflict(&self.sql, item_id, &now, expect_holder)? {
             return Ok(ReleaseOutcome::HeldByOther { holder });
         }
-        Ok(if do_release_active_lease(&self.sql, item_id, &now)? {
-            ReleaseOutcome::Released
-        } else {
-            ReleaseOutcome::NotHeld
-        })
+        Ok(
+            if do_release_active_lease(&self.sql, item_id, self.event_effect_id.as_deref(), &now)? {
+                ReleaseOutcome::Released
+            } else {
+                ReleaseOutcome::NotHeld
+            },
+        )
     }
 
     fn release_claims_for_holder(&mut self, holder: &str) -> StoreResult<usize> {
@@ -7719,6 +7804,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 issue_id,
                 "claim.released",
                 holder,
+                self.event_effect_id.as_deref(),
                 &now,
             )?;
         }
@@ -7754,6 +7840,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
             "issue.closed",
             &payload,
             None,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         self.sql
@@ -7763,7 +7850,7 @@ impl<Sql: DoSql> WorkItems for DoSqliteStore<Sql> {
                 &[text(item_id), opt_text(summary), text(&now)],
             )
             .map_err(sql_err)?;
-        do_release_active_lease(&self.sql, item_id, &now)?;
+        do_release_active_lease(&self.sql, item_id, self.event_effect_id.as_deref(), &now)?;
         Ok(FinishOutcome::Finished)
     }
 
@@ -7816,7 +7903,15 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
         let payload =
             serde_json::json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
-        do_tracker_append(&self.sql, Some(to), "relation.added", &payload, None, &now)?;
+        do_tracker_append(
+            &self.sql,
+            Some(to),
+            "relation.added",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         self.sql
             .execute(
                 "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
@@ -7842,6 +7937,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "issue.field_set",
             &payload.to_string(),
             None,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         if let Some(column) = whipplescript_store::items::projection_column(field) {
@@ -7889,6 +7985,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "comment.added",
             &payload.to_string(),
             author,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         self.sql
@@ -7924,6 +8021,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             "evidence.added",
             &payload.to_string(),
             added_by,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         self.sql
@@ -8928,8 +9026,8 @@ pub(crate) mod test_support {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE effect_dependencies (
-                instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
-                upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL
+                dependency_id TEXT, instance_id TEXT NOT NULL, downstream_effect_id TEXT NOT NULL,
+                upstream_effect_id TEXT NOT NULL, predicate TEXT NOT NULL, created_by_rule TEXT
             );
             CREATE TABLE leases (
                 lease_id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -9053,6 +9151,7 @@ pub(crate) mod test_support {
                 event_id TEXT, parents_json TEXT NOT NULL DEFAULT '[]',
                 issue_id TEXT, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}', actor TEXT,
+                effect_id TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE tracker_subscriptions (
@@ -13216,6 +13315,186 @@ pub(crate) mod tests {
     /// RC-4b DO mirror: an unbounded rebuild folds `context.restored` markers —
     /// an effect committed after the cut but before the marker is abandoned;
     /// post-restore work survives (models/maude/restore-replay.maude).
+    #[test]
+    fn do_store_relations_refuse_an_alias_that_names_no_issue() {
+        // Native parity for the same pair of refusals in `items.rs`, and
+        // unexercised on this side until the sweep attributed them to a change
+        // that threaded a parameter past them.
+        let mut store = store();
+        let real = store
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .expect("file");
+
+        let message = |error: StoreError| -> String {
+            match error {
+                StoreError::Conflict(message) => message,
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        };
+
+        let from_missing = message(
+            store
+                .add_relation("WS-404", &real.id, "blocks", None)
+                .expect_err("an unknown `from` is refused"),
+        );
+        assert!(
+            from_missing.contains("unknown issue alias"),
+            "got: {from_missing}"
+        );
+
+        let to_missing = message(
+            store
+                .add_relation(&real.id, "WS-404", "blocks", None)
+                .expect_err("an unknown `to` is refused"),
+        );
+        assert!(
+            to_missing.contains("unknown issue alias"),
+            "got: {to_missing}"
+        );
+    }
+
+    #[test]
+    fn do_store_records_the_scoped_effect_on_tracker_events() {
+        // Native parity for G3. Both hosts scope tracker writes to the effect
+        // performing them; this pins that the DO write path consults the scope.
+        let mut store = store();
+        let filed = store
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .expect("file");
+        store.set_event_effect_id(Some("eff-claim"));
+        store
+            .claim_item(&filed.id, "instance-a", None)
+            .expect("claim");
+        store.set_event_effect_id(None);
+
+        let rows = store
+            .sql
+            .query(
+                "SELECT kind, effect_id FROM tracker_events ORDER BY event_seq",
+                &[],
+            )
+            .expect("events");
+        let attributed = |kind: &str| -> Option<String> {
+            rows.iter()
+                .find(|row| as_text(&row[0]) == kind)
+                .and_then(|row| match &row[1] {
+                    SqlValue::Null => None,
+                    other => Some(as_text(other)),
+                })
+        };
+        assert_eq!(attributed("claim.acquired").as_deref(), Some("eff-claim"));
+        assert_eq!(
+            attributed("issue.created"),
+            None,
+            "a write before the scope opened is not attributed to it"
+        );
+    }
+
+    #[test]
+    fn do_store_refuses_a_dependency_edge_that_closes_a_cycle() {
+        // Native parity for G1 of spec/output-attribution-research-note.md.
+        // Both hosts share `dependency_graph::edge_closes_cycle`, so this pins
+        // that the DO write path actually consults it.
+        let mut store = store();
+        store
+            .sql
+            .execute(
+                "INSERT INTO instances (instance_id, program_id, version_id, revision_epoch, \
+                 workflow_principal, effective_authority, status, input_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                &[
+                    text("i1"),
+                    text("p"),
+                    text("ver_1"),
+                    int(0),
+                    text("root"),
+                    text("{}"),
+                    text("running"),
+                    text("{}"),
+                ],
+            )
+            .expect("seed instance");
+
+        let effect = |effect_id: &'static str, key: &'static str| NewEffect {
+            effect_id,
+            kind: "tracker.push",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: key,
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        };
+
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[effect("eff_a", "c_a"), effect("eff_b", "c_b")],
+                dependencies: &[NewEffectDependency {
+                    dependency_id: "dep_a_b",
+                    upstream_effect_id: "eff_a",
+                    downstream_effect_id: "eff_b",
+                    predicate: "succeeds",
+                }],
+                terminal: None,
+                idempotency_key: Some("c_start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("the forward edge commits");
+
+        let error = store
+            .commit_rule(RuleCommit {
+                instance_id: "i1",
+                rule: "r.loop",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[NewEffectDependency {
+                    dependency_id: "dep_b_a",
+                    upstream_effect_id: "eff_b",
+                    downstream_effect_id: "eff_a",
+                    predicate: "succeeds",
+                }],
+                terminal: None,
+                idempotency_key: Some("c_loop"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect_err("the back edge closes a cycle and must be refused");
+        match error {
+            StoreError::DependencyCycle {
+                ref upstream_effect_id,
+                ref downstream_effect_id,
+                ref rule,
+                ..
+            } => {
+                assert_eq!(upstream_effect_id, "eff_b");
+                assert_eq!(downstream_effect_id, "eff_a");
+                assert_eq!(rule, "r.loop");
+            }
+            other => panic!("expected a dependency-cycle refusal, got {other:?}"),
+        }
+
+        let remaining = store
+            .sql
+            .query("SELECT COUNT(*) FROM effect_dependencies", &[])
+            .expect("count edges");
+        assert_eq!(
+            remaining[0][0],
+            SqlValue::Int(1),
+            "the refused edge did not land"
+        );
+    }
+
     #[test]
     fn do_store_rebuild_projections_honors_restore_marker() {
         let mut store = store();

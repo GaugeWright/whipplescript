@@ -79,6 +79,18 @@ pub trait ToolExecutor {
     fn poll_notices(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// The files this executor read inside the governed virtual workspace since
+    /// the last drain (G2 of spec/output-attribution-research-note.md). Drained
+    /// once per tool call by the loop, which turns a non-empty set into a
+    /// `WorkspaceRead` observation.
+    ///
+    /// Defaulted like `poll_notices` above, and for the same reason: an executor
+    /// with no virtual workspace — a test fake, a delegated harness — has no
+    /// reads to report and should not have to say so.
+    fn take_workspace_reads(&self) -> Vec<crate::whip_shell::ShellRead> {
+        Vec::new()
+    }
 }
 
 /// One inline image attached to a user message (pi-conformance §6, v1 scope:
@@ -262,6 +274,15 @@ pub enum LoopObservation {
         original_bytes: usize,
         retained_bytes: usize,
         recall_id: Option<String>,
+    },
+    /// The files one tool call read inside the governed virtual workspace.
+    /// Shape, not content: a path, a digest, and a length — the same class as
+    /// `RecallRequested`'s `content_id`, so the record says WHICH bytes reached
+    /// the model without being a copy of them.
+    WorkspaceRead {
+        call_id: String,
+        tool_name: String,
+        reads: Vec<crate::whip_shell::ShellRead>,
     },
     RecallRequested {
         call_id: String,
@@ -465,6 +486,24 @@ pub struct BrokeredTurnInput {
     pub pinned_skills: Vec<String>,
 }
 
+/// The governed-workspace files one tool call read, drained from the executor
+/// after the call. `None` when nothing was read, so a turn that opens no file
+/// records nothing.
+fn workspace_read_observation<E: ToolExecutor + ?Sized>(
+    executor: &E,
+    call: &ToolCall,
+) -> Option<LoopObservation> {
+    let reads = executor.take_workspace_reads();
+    if reads.is_empty() {
+        return None;
+    }
+    Some(LoopObservation::WorkspaceRead {
+        call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        reads,
+    })
+}
+
 fn execute_offered_tool<E: ToolExecutor + ?Sized>(
     executor: &E,
     offered: &[ToolSpec],
@@ -610,6 +649,9 @@ where
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if let Some(observation) = workspace_read_observation(executor, call) {
+                observations.push(observation);
+            }
             if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
                 observations.push(LoopObservation::ToolOutputTruncated {
                     call_id: call.id.clone(),
@@ -1345,6 +1387,9 @@ where
                 name: call.name.clone(),
                 status: outcome.status,
             });
+            if let Some(observation) = workspace_read_observation(self.executor, call) {
+                self.observations.push(observation);
+            }
             if let Some((original_bytes, recall_id)) = truncation_metadata(&outcome.content) {
                 self.observations
                     .push(LoopObservation::ToolOutputTruncated {
@@ -3203,6 +3248,75 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_records_the_workspace_files_it_read() {
+        struct ReadingExecutor {
+            reads: RefCell<Vec<crate::whip_shell::ShellRead>>,
+        }
+        impl ToolExecutor for ReadingExecutor {
+            fn execute(&self, _call: &ToolCall) -> ToolOutcome {
+                ToolOutcome {
+                    status: ToolStatus::Ok,
+                    content: "hi".to_owned(),
+                }
+            }
+            fn take_workspace_reads(&self) -> Vec<crate::whip_shell::ShellRead> {
+                std::mem::take(&mut self.reads.borrow_mut())
+            }
+        }
+
+        let read = crate::whip_shell::ShellRead {
+            path: "notes.txt".to_owned(),
+            content_hash: "abcd".to_owned(),
+            bytes: 4,
+        };
+        let client = ScriptedClient::new(vec![
+            Ok(tool_reply("call_1", "read")),
+            Ok(final_reply("done")),
+        ]);
+        let exec = ReadingExecutor {
+            reads: RefCell::new(vec![read.clone()]),
+        };
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
+
+        assert_eq!(outcome.status, TurnStatus::Completed);
+        assert!(
+            outcome
+                .observations
+                .contains(&LoopObservation::WorkspaceRead {
+                    call_id: "call_1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    reads: vec![read],
+                }),
+            "got: {:?}",
+            outcome.observations
+        );
+    }
+
+    #[test]
+    fn a_tool_call_that_read_nothing_records_no_workspace_observation() {
+        // The default `take_workspace_reads` returns empty, and an empty set
+        // must not become an observation — otherwise every turn on every
+        // executor without a virtual workspace records a row saying nothing.
+        let client = ScriptedClient::new(vec![
+            Ok(tool_reply("call_1", "read")),
+            Ok(final_reply("done")),
+        ]);
+        let exec = RecordingExecutor::new(ToolOutcome {
+            status: ToolStatus::Ok,
+            content: "hi".to_string(),
+        });
+        let outcome = run_brokered_loop(&client, &exec, &input(8), &mut no_checkpoint());
+        assert!(
+            !outcome
+                .observations
+                .iter()
+                .any(|obs| matches!(obs, LoopObservation::WorkspaceRead { .. })),
+            "got: {:?}",
+            outcome.observations
+        );
+    }
+
+    #[test]
     fn brokers_a_tool_then_completes() {
         let client = ScriptedClient::new(vec![
             Ok(tool_reply("call_1", "read")),
@@ -3293,6 +3407,7 @@ mod tests {
                     );
                 }
                 LoopObservation::ModelRequest { .. }
+                | LoopObservation::WorkspaceRead { .. }
                 | LoopObservation::Compacted { .. }
                 | LoopObservation::UserCommandApplied { .. }
                 | LoopObservation::WorldProjected { .. }

@@ -23,6 +23,7 @@ cd "$(dirname "$0")/.."
 
 # Modules that must stay pure. Add to this list; do not add exceptions to it.
 PURE_MODULES=(
+    crates/whipplescript-store/src/dependency_graph.rs
     crates/whipplescript-store/src/event_chain.rs
     crates/whipplescript-store/src/preflight.rs
     crates/whipplescript-kernel/src/sansio.rs

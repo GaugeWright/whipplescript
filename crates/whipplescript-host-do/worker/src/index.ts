@@ -438,6 +438,31 @@ function ensureSchema(sql: SqlStorage): void {
   if (hasSkillBody.length === 0) {
     sql.exec(`ALTER TABLE skills ADD COLUMN body TEXT NOT NULL DEFAULT ''`);
   }
+  // `do_insert_effect_dependency` writes `dependency_id` and `created_by_rule`
+  // and this side declared neither, so EVERY dependency edge failed to insert on
+  // a real object -- the same shape as `skills.body` above, and with a wider
+  // blast radius: a workflow whose steps depend on one another could not record
+  // the dependency at all. Fresh objects are fixed in `do_schema.sql`; existing
+  // ones here. Both are plain nullable TEXT because `ADD COLUMN` cannot add a
+  // primary key, and a migrated object must end up with the same layout a fresh
+  // one is provisioned with.
+  for (const column of ["dependency_id", "created_by_rule"] as const) {
+    const present = sql
+      .exec(`SELECT name FROM pragma_table_info('effect_dependencies') WHERE name = ?`, column)
+      .toArray();
+    if (present.length === 0) {
+      sql.exec(`ALTER TABLE effect_dependencies ADD COLUMN ${column} TEXT`);
+    }
+  }
+  // G3: which effect wrote a tracker event. Local attribution, never part of
+  // the event's content id and never exported — an imported event names an
+  // effect in a store this object cannot query.
+  const hasTrackerEffect = sql
+    .exec(`SELECT name FROM pragma_table_info('tracker_events') WHERE name = 'effect_id'`)
+    .toArray();
+  if (hasTrackerEffect.length === 0) {
+    sql.exec(`ALTER TABLE tracker_events ADD COLUMN effect_id TEXT`);
+  }
   const hasRuleCarries = sql
     .exec(
       `SELECT name FROM pragma_table_info('instance_revisions') WHERE name = 'rule_carries_json'`,

@@ -485,6 +485,14 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
                 "format": format,
                 "content": content,
                 "bytes": content.len(),
+                // G4 of spec/output-attribution-research-note.md: the identity
+                // of what this read OBSERVED. `file.write.completed` has always
+                // carried the same digest under the same key, and until now a
+                // read recorded only the bytes, so nothing could say which write
+                // produced what a reader saw. Same construction, so the two join
+                // — and it is the `FileContent` locator coordinate (§8.2), whose
+                // content half was otherwise unaddressable.
+                "content_hash": stable_hash_hex(&content),
             });
             let terminal = kernel.complete_run(EffectCompletion {
                 instance_id,
@@ -1719,6 +1727,14 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         metadata_json: &effect.input_json,
     })?;
 
+    // G3: scope every tracker event this effect writes to this effect. The
+    // window is exactly the dispatch below — no arm propagates with `?`, so the
+    // clear after the match is reached on every path, and a value can never
+    // outlive the effect that set it. That matters more than it looks: a stale
+    // attribution names the WRONG effect, which is worse than naming none.
+    kernel
+        .store_mut()
+        .set_event_effect_id(Some(&effect.effect_id));
     let outcome: Result<Value, String> = match effect.kind.as_str() {
         "tracker.file" => {
             let queue = effect.target.clone().unwrap_or_default();
@@ -1825,6 +1841,7 @@ pub fn run_queue_effect_generic<S: RuntimeStore + WorkItems>(
         }
         other => Err(format!("unknown queue effect kind `{other}`")),
     };
+    kernel.store_mut().set_event_effect_id(None);
 
     match outcome {
         Ok(value) => {
@@ -3540,5 +3557,185 @@ mod custody_capability_tests {
         };
         assert_eq!(error_kind, "custody");
         assert!(message.contains("custody wrap refused"), "got: {message}");
+    }
+}
+
+#[cfg(test)]
+mod queue_effect_refusal_tests {
+    //! The two refusals `run_queue_effect_generic` carries on its failure paths.
+    //! Neither was exercised until the sweep's widened site matching (#309)
+    //! attributed them to a change that scoped tracker writes to their effect.
+
+    use super::*;
+    use whipplescript_store::native_stores::NativeStores;
+    use whipplescript_store::{NewEffect, RuleCommit};
+
+    fn queued(kind: &'static str, input_json: &'static str) -> NewEffect<'static> {
+        NewEffect {
+            effect_id: "eff",
+            kind,
+            target: None,
+            input_json,
+            status: "queued",
+            idempotency_key: "rule=start;effect=eff",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }
+    }
+
+    /// Runs one queued effect through the queue handler and returns every event
+    /// payload it recorded, which is where a refusal's text lands.
+    fn run_and_collect(kind: &'static str, input_json: &'static str) -> String {
+        let store = NativeStores::open_in_memory().expect("stores open");
+        let mut kernel = RuntimeKernel::new(store);
+        let effects = [queued(kind, input_json)];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = kernel
+            .claimable_effects("instance-a")
+            .expect("claimable effects load");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-a",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("the handler settles the effect rather than erroring out");
+        kernel
+            .store()
+            .list_events("instance-a")
+            .expect("events load")
+            .iter()
+            .map(|event| event.payload_json.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_store_failure_finishing_an_item_surfaces_as_the_effect_s_failure() {
+        // The arm this pins cannot be DELETED — the match needs it — but it can
+        // be changed to answer `Ok`, which would report a store failure to the
+        // program as a finish that worked. That is the silent weakening the
+        // sweep exists to catch, so the arm earns a pin despite being
+        // unreachable by any ordinary path.
+        //
+        // Reaching it takes an issue that is open (so the status check passes)
+        // whose alias no longer resolves (so appending its `issue.closed` event
+        // fails). Nothing produces that, so the test constructs it, with SQL
+        // rather than by widening the store's API for a test's benefit.
+        let base = std::env::temp_dir().join(format!(
+            "whip-queue-store-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&base).expect("scratch dir");
+        let items = base.join("items.sqlite");
+        let stores = NativeStores::open(
+            base.join("runtime.sqlite"),
+            base.join("coord.sqlite"),
+            &items,
+        )
+        .expect("stores open");
+        let mut kernel = RuntimeKernel::new(stores);
+        let filed = kernel
+            .store_mut()
+            .file_item("q", "t", "", &[], &serde_json::json!({}), None)
+            .expect("file an item");
+
+        rusqlite::Connection::open(&items)
+            .expect("open the items store")
+            .execute(
+                "DELETE FROM tracker_aliases WHERE alias = ?1",
+                rusqlite::params![&filed.id],
+            )
+            .expect("drop the alias mapping");
+
+        let effects = [NewEffect {
+            effect_id: "eff",
+            kind: "tracker.finish",
+            target: None,
+            input_json: "{}",
+            status: "queued",
+            idempotency_key: "rule=start;effect=eff",
+            required_capabilities_json: "[]",
+            profile: None,
+            correlation_id: None,
+            source_span_json: None,
+            timeout_seconds: None,
+        }];
+        let input = format!(r#"{{"id":"{}"}}"#, filed.id);
+        let effects = [NewEffect {
+            input_json: &input,
+            ..effects[0]
+        }];
+        kernel
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &effects,
+                dependencies: &[],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("rule commits");
+        let claimable = kernel
+            .claimable_effects("instance-a")
+            .expect("claimable effects load");
+        run_queue_effect_generic(
+            &mut kernel,
+            "instance-a",
+            &claimable[0],
+            "2026-01-01T00:00:00Z",
+            &EffectConfig::default(),
+        )
+        .expect("the handler settles the effect rather than erroring out");
+        let recorded = kernel
+            .store()
+            .list_events("instance-a")
+            .expect("events load")
+            .iter()
+            .map(|event| event.payload_json.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            recorded.contains("finish failed"),
+            "a store failure reaches the effect's failure: {recorded}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unrecognised_queue_effect_kind_is_refused_by_name() {
+        // A defensive arm: lowering only ever routes the five `tracker.*` kinds
+        // here. It earns its place by naming what arrived — a kind that reached
+        // this dispatch without a branch is a wiring bug, and a silent success
+        // would settle the effect as though the work had happened.
+        let recorded = run_and_collect("tracker.bogus", "{}");
+        assert!(
+            recorded.contains("unknown queue effect kind"),
+            "the refusal names the kind it could not dispatch: {recorded}"
+        );
     }
 }

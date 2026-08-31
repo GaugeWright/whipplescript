@@ -132,6 +132,10 @@ fn tracker_tool_specs() -> Vec<ToolSpec> {
 /// same one the runtime store + file plane use), so every tool is an in-isolate
 /// SQLite round against the one DO SQLite.
 pub struct DoToolExecutor<Sql: DoSql> {
+    /// Files the governed virtual bash read, accumulated per tool call and
+    /// drained by the harness loop (G2 of the output-attribution note). Behind a
+    /// lock because the tool surface takes `&self`.
+    workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
     sql: Rc<Sql>,
     key_prefix: String,
     file_scopes: Option<Vec<DoFileScope>>,
@@ -146,6 +150,7 @@ struct DoFileScope {
 impl<Sql: DoSql> DoToolExecutor<Sql> {
     pub fn new(sql: Rc<Sql>) -> Self {
         Self {
+            workspace_reads: std::sync::Mutex::new(Vec::new()),
             sql,
             key_prefix: String::new(),
             file_scopes: None,
@@ -154,6 +159,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 
     pub fn for_instance(sql: Rc<Sql>, instance_id: &str) -> Self {
         Self {
+            workspace_reads: std::sync::Mutex::new(Vec::new()),
             sql,
             key_prefix: format!("{instance_id}/"),
             file_scopes: None,
@@ -358,11 +364,15 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
             });
         }
 
-        let output = WhipShell::default().execute(ShellRequest {
+        let mut output = WhipShell::default().execute(ShellRequest {
             command: command.to_owned(),
             files,
             timeout: Duration::from_secs(timeout),
         })?;
+        self.workspace_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(&mut output.reads);
 
         // Validate the complete result before importing any delta. The v1 DO
         // file plane is UTF-8 text; a binary result fails honestly instead of
@@ -759,6 +769,15 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
 }
 
 impl<Sql: DoSql> ToolExecutor for DoToolExecutor<Sql> {
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        std::mem::take(
+            &mut *self
+                .workspace_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
     fn execute(&self, call: &ToolCall) -> ToolOutcome {
         // The kernel runs tools without yielding to the shell, so this is the
         // only point at which "a tool is running, and it is this one" is true

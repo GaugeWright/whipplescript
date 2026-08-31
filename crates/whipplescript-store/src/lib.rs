@@ -5,6 +5,7 @@ pub mod bundle;
 pub mod chunking;
 pub mod content;
 pub mod coordination;
+pub mod dependency_graph;
 pub mod diff;
 pub mod erasure_ledger;
 pub mod event_chain;
@@ -151,6 +152,23 @@ pub enum StoreError {
         subject: String,
         found: i64,
         supported: i64,
+    },
+    /// The edge would close a cycle in an instance's effect-dependency graph
+    /// (`dependency_graph::edge_closes_cycle`).
+    ///
+    /// Distinct from [`StoreError::Conflict`] on purpose: a conflict means
+    /// someone got there first and looking again may let the caller proceed,
+    /// while a cycle is a property of the graph the caller is asking for, so a
+    /// retry reproduces it exactly. Landing the edge would leave every effect
+    /// on the cycle `blocked_by_dependency` forever — the instance would
+    /// neither complete nor fail — so the write is refused instead.
+    DependencyCycle {
+        instance_id: String,
+        upstream_effect_id: String,
+        downstream_effect_id: String,
+        /// The rule whose firing proposed the edge, so an operator has
+        /// somewhere to look that is not the graph.
+        rule: String,
     },
 }
 
@@ -8222,6 +8240,20 @@ fn insert_effect_dependency(
     rule: &str,
     dependency: &NewEffectDependency<'_>,
 ) -> StoreResult<()> {
+    let existing = instance_dependency_edges(connection, instance_id)?;
+    let closes_cycle = crate::dependency_graph::edge_closes_cycle(
+        &existing,
+        dependency.upstream_effect_id,
+        dependency.downstream_effect_id,
+    );
+    if closes_cycle {
+        return Err(StoreError::DependencyCycle {
+            instance_id: instance_id.to_owned(),
+            upstream_effect_id: dependency.upstream_effect_id.to_owned(),
+            downstream_effect_id: dependency.downstream_effect_id.to_owned(),
+            rule: rule.to_owned(),
+        });
+    }
     connection.execute(
         r#"
         INSERT INTO effect_dependencies (
@@ -8244,6 +8276,27 @@ fn insert_effect_dependency(
         ],
     )?;
     Ok(())
+}
+
+/// Every recorded edge of one instance as `(upstream, downstream)` pairs — the
+/// input `edge_closes_cycle` needs. Read on the caller's connection, which is
+/// the commit's transaction, so edges added earlier in the same commit are
+/// visible to the ones added after them.
+#[cfg(feature = "native")]
+fn instance_dependency_edges(
+    connection: &Connection,
+    instance_id: &str,
+) -> StoreResult<Vec<(String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT upstream_effect_id, downstream_effect_id FROM effect_dependencies \
+         WHERE instance_id = ?1",
+    )?;
+    let edges = statement
+        .query_map(params![instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(edges)
 }
 
 #[cfg(feature = "native")]
@@ -13845,6 +13898,120 @@ mod tests {
             vec!["eff-keep", "eff-resume"],
             "post-restore work is live alongside the pre-cut segment"
         );
+    }
+
+    #[test]
+    fn a_dependency_edge_that_closes_a_cycle_is_refused() {
+        // G1 of spec/output-attribution-research-note.md. Acyclicity was
+        // emergent from lowering and enforced nowhere, so a back edge could
+        // land and leave every effect on the cycle `blocked_by_dependency`
+        // forever — an instance that neither completes nor fails, reporting the
+        // same "blocked" a healthy instance waiting on a provider reports.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[
+                    test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
+                    test_effect("tell", "agent.tell", "rule=start;effect=tell"),
+                ],
+                dependencies: &[NewEffectDependency {
+                    dependency_id: "dep-claim-tell",
+                    upstream_effect_id: "claim",
+                    downstream_effect_id: "tell",
+                    predicate: "succeeds",
+                }],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("the forward edge commits");
+
+        let error = store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "loop",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[],
+                dependencies: &[NewEffectDependency {
+                    dependency_id: "dep-tell-claim",
+                    upstream_effect_id: "tell",
+                    downstream_effect_id: "claim",
+                    predicate: "succeeds",
+                }],
+                terminal: None,
+                idempotency_key: Some("commit-loop"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect_err("the back edge closes a cycle and must be refused");
+        match error {
+            StoreError::DependencyCycle {
+                ref upstream_effect_id,
+                ref downstream_effect_id,
+                ref rule,
+                ..
+            } => {
+                assert_eq!(upstream_effect_id, "tell");
+                assert_eq!(downstream_effect_id, "claim");
+                assert_eq!(rule, "loop", "the refusal names the rule that proposed it");
+            }
+            other => panic!("expected a dependency-cycle refusal, got {other:?}"),
+        }
+        assert_eq!(
+            row_count(&store, "effect_dependencies"),
+            1,
+            "the refused edge did not land, and its commit rolled back whole"
+        );
+    }
+
+    #[test]
+    fn fan_in_on_one_downstream_is_not_mistaken_for_a_cycle() {
+        // The negative fixture the refusal above needs: two upstreams feeding
+        // one downstream share a descendant without closing anything. A guard
+        // that refused this would refuse ordinary fan-in, which is most of what
+        // dependency edges are for.
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        store
+            .commit_rule(RuleCommit {
+                instance_id: "instance-a",
+                rule: "start",
+                trigger_event_id: None,
+                facts: &[],
+                consumed_fact_ids: &[],
+                effects: &[
+                    test_effect("claim", "tracker.claim", "rule=start;effect=claim"),
+                    test_effect("fetch", "tracker.claim", "rule=start;effect=fetch"),
+                    test_effect("tell", "agent.tell", "rule=start;effect=tell"),
+                ],
+                dependencies: &[
+                    NewEffectDependency {
+                        dependency_id: "dep-claim-tell",
+                        upstream_effect_id: "claim",
+                        downstream_effect_id: "tell",
+                        predicate: "succeeds",
+                    },
+                    NewEffectDependency {
+                        dependency_id: "dep-fetch-tell",
+                        upstream_effect_id: "fetch",
+                        downstream_effect_id: "tell",
+                        predicate: "succeeds",
+                    },
+                ],
+                terminal: None,
+                idempotency_key: Some("commit-start"),
+                marks: &[],
+                context_json: None,
+            })
+            .expect("fan-in commits");
+        assert_eq!(row_count(&store, "effect_dependencies"), 2);
     }
 
     #[test]

@@ -453,6 +453,10 @@ pub struct WorkflowToolEntry {
 /// Executes the slice-1 file tools against a single workspace root, enforcing the
 /// `file store` path policy (no absolute/`..` escape; optional read/write globs).
 pub struct FileToolExecutor {
+    /// Files the governed virtual bash read, accumulated per tool call and
+    /// drained by the harness loop (G2 of the output-attribution note). Behind a
+    /// lock because the tool surface takes `&self`.
+    workspace_reads: std::sync::Mutex<Vec<whipplescript_kernel::whip_shell::ShellRead>>,
     root: PathBuf,
     protected_write_paths: Vec<String>,
     native_processes: bool,
@@ -1062,6 +1066,7 @@ impl FileToolExecutor {
     /// (DR-0039), gated by the harness profile + `command { run }` grant.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            workspace_reads: std::sync::Mutex::new(Vec::new()),
             root: root.into(),
             protected_write_paths: Vec::new(),
             native_processes: false,
@@ -1973,11 +1978,15 @@ impl FileToolExecutor {
             }
         }
 
-        let output = WhipShell::default().execute(ShellRequest {
+        let mut output = WhipShell::default().execute(ShellRequest {
             command: command.to_owned(),
             files,
             timeout,
         })?;
+        self.workspace_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(&mut output.reads);
         // Validate the complete delta before importing it into the governed
         // native workspace.
         for (path, content) in &output.files {
@@ -2909,6 +2918,15 @@ pub(crate) fn raise_tool_spec() -> ToolSpec {
 }
 
 impl ToolExecutor for FileToolExecutor {
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        std::mem::take(
+            &mut *self
+                .workspace_reads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
     /// Deliver open `raise` items addressed to this turn's chain (DR-0052
     /// Decision 7): once each, formatted as an attributed workspace
     /// notice with the safe continuations spelled out. Requires both a
@@ -7934,6 +7952,37 @@ mod tests {
         let r = exec.execute(&call(TOOL_BASH, json!({ "command": "echo hi" })));
         assert_eq!(r.status, ToolStatus::Ok);
         assert_eq!(r.content, "hi\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn bash_records_the_workspace_files_it_read() {
+        // G2 end to end on the native owned harness: the interpreter's reads
+        // reach the executor, where the harness loop drains them.
+        let root = temp_root();
+        std::fs::write(root.join("notes.txt"), "remember\n").unwrap();
+        std::fs::write(root.join("other.txt"), "unread\n").unwrap();
+        let exec = FileToolExecutor::new(&root);
+
+        let ran = exec.execute(&call(TOOL_BASH, json!({ "command": "cat notes.txt" })));
+        assert_eq!(ran.status, ToolStatus::Ok);
+
+        let reads = exec.take_workspace_reads();
+        assert_eq!(
+            reads
+                .iter()
+                .map(|read| read.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.txt"],
+            "only the file the command opened, got: {reads:?}"
+        );
+        assert_eq!(
+            reads[0].content_hash,
+            whipplescript_store::chunking::content_hash_hex(b"remember\n")
+        );
+
+        // Draining is a drain: the next turn starts from nothing.
+        assert!(exec.take_workspace_reads().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

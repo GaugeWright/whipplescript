@@ -151,10 +151,10 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         ports: DurableEffectPorts,
     ) -> Result<Self, String> {
         let sql = Rc::new(sql);
-        let kernel = RuntimeKernel::new(DoSqliteStore {
-            sql: Rc::clone(&sql),
-        })
-        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
+        let kernel = RuntimeKernel::new(DoSqliteStore::new(Rc::clone(&sql)))
+            .with_coercion_config_fingerprint(do_coercion_config_fingerprint(
+                ports.coerce.as_ref(),
+            ));
         let exists = kernel
             .store()
             .list_instances()
@@ -249,10 +249,10 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
         // handle to be `Clone` (the test `RusqliteDoSql` wraps a non-`Clone`
         // `Connection`).
         let sql = Rc::new(sql);
-        let mut kernel = RuntimeKernel::new(DoSqliteStore {
-            sql: Rc::clone(&sql),
-        })
-        .with_coercion_config_fingerprint(do_coercion_config_fingerprint(ports.coerce.as_ref()));
+        let mut kernel = RuntimeKernel::new(DoSqliteStore::new(Rc::clone(&sql)))
+            .with_coercion_config_fingerprint(do_coercion_config_fingerprint(
+                ports.coerce.as_ref(),
+            ));
         // DR-0054 Phase B: real revision identity. The literal "do" stamps
         // meant every deployed wasm — whatever its lowering — reattached to old
         // instance state under one indistinguishable version, so a redeploy

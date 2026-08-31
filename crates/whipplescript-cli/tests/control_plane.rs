@@ -493,6 +493,19 @@ rule pick
         "the read binding carries the on-disk file content: {read_fact}"
     );
 
+    // G4: the read records the identity of what it OBSERVED, under the same key
+    // and the same construction `file.write.completed` uses — so a read joins
+    // the write that produced what it read, across instances and across time.
+    // Without it a chain of custody stops at "something read this path", which
+    // is true and useless.
+    assert_eq!(
+        read_fact
+            .pointer("/value/value/content_hash")
+            .and_then(Value::as_str),
+        Some(whipplescript_store::chunking::content_hash_hex(b"hello from disk").as_str()),
+        "the read records the digest of the bytes it saw: {read_fact}"
+    );
+
     let _ = fs::remove_file(store_path);
     let _ = fs::remove_file(source_path);
     let _ = fs::remove_dir_all(root);

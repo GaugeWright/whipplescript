@@ -203,6 +203,12 @@ pub struct ImportReport {
 #[cfg(feature = "native")]
 pub struct WorkItemStore {
     connection: Connection,
+    /// The effect currently writing, set by the queue-effect dispatch around the
+    /// whole of its work and cleared after (G3). Scoped rather than passed
+    /// through every mutation because the alternative is a parameter on a
+    /// dozen public methods with well over a hundred call sites, almost all of
+    /// them tests that have no effect to name.
+    event_effect_id: Option<String>,
 }
 
 #[cfg(feature = "native")]
@@ -240,10 +246,15 @@ impl WorkItemStore {
         )?;
         // Self-heal a pre-0.2.2 `tracker_issues`, which had no assignment.
         tx_ensure_column(&connection, "tracker_issues", "assigned_to", "TEXT")?;
+        // Self-heal a tracker written before write-attribution (G3).
+        tx_ensure_column(&connection, "tracker_events", "effect_id", "TEXT")?;
         connection.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);",
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            event_effect_id: None,
+        })
     }
 
     /// Files an item, minting a sequential human-speakable id (`WS-1`,
@@ -297,6 +308,7 @@ impl WorkItemStore {
             "issue.created",
             &payload_json,
             filed_by,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         tx.execute(
@@ -454,6 +466,7 @@ impl WorkItemStore {
             "claim.acquired",
             &payload.to_string(),
             Some(claimed_by),
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         tx.execute(
@@ -514,6 +527,7 @@ impl WorkItemStore {
             "claim.renewed",
             &payload,
             Some(actor),
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         if expires.is_some() {
@@ -548,7 +562,8 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(ReleaseOutcome::HeldByOther { holder });
         }
-        let released = tx_release_active_lease(&tx, item_id, &now)?;
+        let released =
+            tx_release_active_lease(&tx, item_id, self.event_effect_id.as_deref(), &now)?;
         tx.commit()?;
         Ok(if released {
             ReleaseOutcome::Released
@@ -677,7 +692,15 @@ impl WorkItemStore {
             .query_map(params![holder, now], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         for (lease_id, issue_id) in &leases {
-            tx_mark_lease_released(&tx, lease_id, issue_id, "claim.released", holder, &now)?;
+            tx_mark_lease_released(
+                &tx,
+                lease_id,
+                issue_id,
+                "claim.released",
+                holder,
+                self.event_effect_id.as_deref(),
+                &now,
+            )?;
         }
         tx.commit()?;
         Ok(leases.len())
@@ -716,13 +739,21 @@ impl WorkItemStore {
             return Ok(FinishOutcome::NotOpen);
         }
         let payload = json!({"status": "closed", "summary": summary});
-        tx_append_event(&tx, Some(item_id), "issue.closed", &payload, None, &now)?;
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.closed",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         tx.execute(
             "UPDATE tracker_issues SET status = 'closed', claim_summary = ?2, updated_at = ?3 \
              WHERE issue_id = ?1",
             params![item_id, summary, now],
         )?;
-        tx_release_active_lease(&tx, item_id, &now)?;
+        tx_release_active_lease(&tx, item_id, self.event_effect_id.as_deref(), &now)?;
         tx.commit()?;
         Ok(FinishOutcome::Finished)
     }
@@ -755,7 +786,15 @@ impl WorkItemStore {
             return Ok(false);
         }
         let payload = json!({ "assigned_to": assignee });
-        tx_append_event(&tx, Some(item_id), "issue.assigned", &payload, None, &now)?;
+        tx_append_event(
+            &tx,
+            Some(item_id),
+            "issue.assigned",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         tx.execute(
             "UPDATE tracker_issues SET assigned_to = ?2, updated_at = ?3 WHERE issue_id = ?1",
             params![item_id, assignee, now],
@@ -813,7 +852,15 @@ impl WorkItemStore {
         let to_cid = content_id_of(&tx, to)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
         let payload = json!({"from": from_cid, "to": to_cid, "kind": kind, "dep_kind": dep_kind});
-        tx_append_event(&tx, Some(to), "relation.added", &payload, None, &now)?;
+        tx_append_event(
+            &tx,
+            Some(to),
+            "relation.added",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         tx.execute(
             "INSERT OR IGNORE INTO tracker_relations (from_issue, to_issue, kind, dep_kind) \
              VALUES (?1, ?2, ?3, ?4)",
@@ -841,7 +888,15 @@ impl WorkItemStore {
         let to_cid = content_id_of(&tx, to)?
             .ok_or_else(|| StoreError::Conflict(format!("unknown issue alias {to}")))?;
         let payload = json!({"from": from_cid, "to": to_cid, "kind": kind});
-        tx_append_event(&tx, Some(to), "relation.removed", &payload, None, &now)?;
+        tx_append_event(
+            &tx,
+            Some(to),
+            "relation.removed",
+            &payload,
+            None,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         let removed = tx.execute(
             "DELETE FROM tracker_relations WHERE from_issue = ?1 AND to_issue = ?2 AND kind = ?3",
             params![from, to, kind],
@@ -896,6 +951,7 @@ impl WorkItemStore {
             "comment.added",
             &payload.to_string(),
             author,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         tx.execute(
@@ -955,6 +1011,7 @@ impl WorkItemStore {
             "evidence.added",
             &payload.to_string(),
             added_by,
+            self.event_effect_id.as_deref(),
             &now,
         )?;
         tx.execute(
@@ -1010,7 +1067,14 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(false);
         }
-        tx_apply_field_set(&tx, item_id, field, value, &now)?;
+        tx_apply_field_set(
+            &tx,
+            item_id,
+            field,
+            value,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -1050,7 +1114,14 @@ impl WorkItemStore {
             tx.commit()?;
             return Ok(SetFieldOutcome::StateChanged { actual: current });
         }
-        tx_apply_field_set(&tx, item_id, field, value, &now)?;
+        tx_apply_field_set(
+            &tx,
+            item_id,
+            field,
+            value,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
         let after = analyze_issue_dag(&load_issue_events(&tx, &content_id)?).state_token;
         tx.commit()?;
         Ok(SetFieldOutcome::Applied { state_token: after })
@@ -1148,6 +1219,27 @@ impl WorkItemStore {
 
     /// Export every event in transport form (ADR-0002 phase B1 slice iii) — the
     /// content-addressed log another clone unions in. Ordered by append seq.
+    /// The effect that wrote one event, if an effect did (G3).
+    ///
+    /// This is the join that replaces a search. Without it, "which effect wrote
+    /// this tracker value" is answered by scanning an instance's effects by
+    /// kind and target and guessing; `actor` names the instance, never the
+    /// effect within it. Local only, and absent for events that arrived by
+    /// import: a foreign clone's effect id names an effect in a store this one
+    /// cannot query, so claiming it here would be attribution dressed up as
+    /// observation.
+    pub fn event_effect_id(&self, event_id: &str) -> StoreResult<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT effect_id FROM tracker_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn export_events(&self) -> StoreResult<Vec<TrackerEvent>> {
         let mut statement = self.connection.prepare(
             "SELECT event_id, parents_json, issue_id, kind, payload_json, actor, created_at \
@@ -1462,6 +1554,13 @@ CREATE TABLE IF NOT EXISTS tracker_events (
     kind TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
     actor TEXT,
+    -- G3 of spec/output-attribution-research-note.md: the EFFECT that wrote
+    -- this event, when one did. `actor` answers "as whom" and is part of the
+    -- event's content id; this answers "by which effect", is deliberately NOT
+    -- in the content id (adding it would change every event id and break
+    -- import verification), and is deliberately NOT exported (a foreign clone's
+    -- effect id names an effect in a store you cannot query).
+    effect_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS tracker_issues (
@@ -1637,6 +1736,11 @@ fn content_id_of(conn: &Connection, alias: &str) -> StoreResult<Option<String>> 
 /// `event_id_override` only for the `issue.created` root, whose id IS the issue's
 /// `content_id` (identity = the creation event). Deduped by `event_id` on merge.
 #[cfg(feature = "native")]
+// Eight positional arguments, which is one past the lint's taste. Grouping them
+// into a struct would put the same fields behind one more name for a private
+// helper with nine call sites in this file and none outside it; the existing
+// `#[allow]`s in host_runtime.rs and improve.rs take the same view.
+#[allow(clippy::too_many_arguments)]
 fn tx_append_raw(
     tx: &Transaction<'_>,
     issue_content_id: Option<&str>,
@@ -1644,6 +1748,7 @@ fn tx_append_raw(
     kind: &str,
     payload_json: &str,
     actor: Option<&str>,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<String> {
     let parents = match issue_content_id {
@@ -1657,8 +1762,8 @@ fn tx_append_raw(
     let parents_json = serde_json::to_string(&parents)?;
     tx.execute(
         "INSERT OR IGNORE INTO tracker_events \
-         (event_id, parents_json, issue_id, kind, payload_json, actor, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (event_id, parents_json, issue_id, kind, payload_json, actor, effect_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             event_id,
             parents_json,
@@ -1666,6 +1771,7 @@ fn tx_append_raw(
             kind,
             payload_json,
             actor,
+            effect_id,
             now
         ],
     )?;
@@ -1683,6 +1789,7 @@ fn tx_append_event(
     kind: &str,
     payload: &Value,
     actor: Option<&str>,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
     let content_id = match alias {
@@ -1699,6 +1806,7 @@ fn tx_append_event(
         kind,
         &payload.to_string(),
         actor,
+        effect_id,
         now,
     )?;
     Ok(())
@@ -1732,7 +1840,7 @@ fn tx_expire_stale_leases(tx: &Transaction<'_>, item_id: &str, now: &str) -> Sto
         .query_map(params![item_id, now], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for lease_id in &stale {
-        tx_mark_lease_released(tx, lease_id, item_id, "claim.expired", "system", now)?;
+        tx_mark_lease_released(tx, lease_id, item_id, "claim.expired", "system", None, now)?;
     }
     Ok(())
 }
@@ -1787,7 +1895,12 @@ fn tx_holder_conflict(
 /// via `tx_holder_conflict`, so the terminal and expiry paths that legitimately
 /// strip another actor's lease keep working.
 #[cfg(feature = "native")]
-fn tx_release_active_lease(tx: &Transaction<'_>, item_id: &str, now: &str) -> StoreResult<bool> {
+fn tx_release_active_lease(
+    tx: &Transaction<'_>,
+    item_id: &str,
+    effect_id: Option<&str>,
+    now: &str,
+) -> StoreResult<bool> {
     let lease: Option<(String, String)> = tx
         .query_row(
             &format!(
@@ -1801,7 +1914,15 @@ fn tx_release_active_lease(tx: &Transaction<'_>, item_id: &str, now: &str) -> St
     match lease {
         None => Ok(false),
         Some((lease_id, actor)) => {
-            tx_mark_lease_released(tx, &lease_id, item_id, "claim.released", &actor, now)?;
+            tx_mark_lease_released(
+                tx,
+                &lease_id,
+                item_id,
+                "claim.released",
+                &actor,
+                effect_id,
+                now,
+            )?;
             Ok(true)
         }
     }
@@ -1815,10 +1936,19 @@ fn tx_mark_lease_released(
     item_id: &str,
     kind: &str,
     actor: &str,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
     let payload = json!({"lease_id": lease_id, "actor": actor, "released_at": now});
-    tx_append_event(tx, Some(item_id), kind, &payload, Some(actor), now)?;
+    tx_append_event(
+        tx,
+        Some(item_id),
+        kind,
+        &payload,
+        Some(actor),
+        effect_id,
+        now,
+    )?;
     tx.execute(
         "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
         params![lease_id, now],
@@ -1834,10 +1964,19 @@ fn tx_apply_field_set(
     item_id: &str,
     field: &str,
     value: &str,
+    effect_id: Option<&str>,
     now: &str,
 ) -> StoreResult<()> {
     let payload = json!({"field": field, "value": value});
-    tx_append_event(tx, Some(item_id), "issue.field_set", &payload, None, now)?;
+    tx_append_event(
+        tx,
+        Some(item_id),
+        "issue.field_set",
+        &payload,
+        None,
+        effect_id,
+        now,
+    )?;
     // The conflict view is computed on read from the DAG; the column is only
     // the last-writer display value.
     if let Some(column) = projection_column(field) {
@@ -2319,6 +2458,17 @@ pub trait WorkItems {
     /// The workspace-plane HIGH-WATER position of the tracker's monotone
     /// event log (max event_seq; 0 = empty). One half of the two-plane
     /// consistent cut (vw note §9.3).
+    /// Scope subsequent tracker writes to the effect performing them, or clear
+    /// it with `None` (G3 of spec/output-attribution-research-note.md).
+    ///
+    /// Scoped rather than a parameter on every mutation: the alternative is
+    /// widening a dozen public methods with well over a hundred call sites,
+    /// nearly all of them tests with no effect to name. The queue-effect
+    /// dispatch sets it around the whole of its work and clears it after, which
+    /// is the only window in which it is meaningful — a stale value would
+    /// MISATTRIBUTE a later write, which is worse than recording nothing.
+    fn set_event_effect_id(&mut self, _effect_id: Option<&str>) {}
+
     fn event_position(&self) -> StoreResult<i64>;
 
     /// Declare an interest in `queue`, starting from the CURRENT end of the log.
@@ -2427,6 +2577,10 @@ pub trait WorkItems {
 
 #[cfg(feature = "native")]
 impl WorkItems for WorkItemStore {
+    fn set_event_effect_id(&mut self, effect_id: Option<&str>) {
+        self.event_effect_id = effect_id.map(str::to_owned);
+    }
+
     // Forwards to the inherent methods of the same name; inherent methods win
     // `self.method()` resolution, so this delegates rather than recurses.
     fn event_position(&self) -> StoreResult<i64> {
@@ -2945,6 +3099,209 @@ mod tests {
     /// ADR-0002 phase B1 slice ii, realizing `tracker-merge.maude`. Single
     /// clone: a linear field history has one maximal setter, so it never
     /// conflicts and the issue stays ready.
+    /// An alias that names no issue is refused rather than silently resolving to
+    /// nothing. These refusals were unexercised until the sweep's widened site
+    /// matching (#309) attributed them to a change that threaded a parameter
+    /// past them — true of the refusals, not of the change, and pinning them is
+    /// the honest response.
+    fn conflict_message(error: StoreError) -> String {
+        match error {
+            StoreError::Conflict(message) => message,
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relation_refuses_an_alias_that_names_no_issue() {
+        let mut store = open_memory();
+        let real = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+
+        let from_missing = conflict_message(
+            store
+                .add_relation("WS-404", &real.id, "blocks", None)
+                .expect_err("an unknown `from` is refused"),
+        );
+        assert!(
+            from_missing.contains("unknown issue alias"),
+            "got: {from_missing}"
+        );
+
+        let to_missing = conflict_message(
+            store
+                .add_relation(&real.id, "WS-404", "blocks", None)
+                .expect_err("an unknown `to` is refused"),
+        );
+        assert!(
+            to_missing.contains("unknown issue alias"),
+            "got: {to_missing}"
+        );
+    }
+
+    #[test]
+    fn removing_a_relation_refuses_an_alias_that_names_no_issue() {
+        let mut store = open_memory();
+        let real = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+
+        let from_missing = conflict_message(
+            store
+                .remove_relation("WS-404", &real.id, "blocks")
+                .expect_err("an unknown `from` is refused"),
+        );
+        assert!(
+            from_missing.contains("unknown issue alias"),
+            "got: {from_missing}"
+        );
+
+        let to_missing = conflict_message(
+            store
+                .remove_relation(&real.id, "WS-404", "blocks")
+                .expect_err("an unknown `to` is refused"),
+        );
+        assert!(
+            to_missing.contains("unknown issue alias"),
+            "got: {to_missing}"
+        );
+    }
+
+    #[test]
+    fn a_guarded_field_set_refuses_an_issue_whose_alias_does_not_resolve() {
+        // Not the same as `NotFound`, which an absent issue returns from the
+        // existence check ABOVE this refusal. What this guards is the
+        // inconsistent state: a projection row whose alias resolves to nothing,
+        // which no ordinary path produces — so the state is constructed here,
+        // which is the only way a defensive refusal can be pinned at all.
+        let mut store = open_memory();
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+        assert_eq!(
+            store
+                .set_field_checked(&filed.id, "title", "x", "stale-token")
+                .expect("a resolvable alias reaches the token check"),
+            SetFieldOutcome::StateChanged {
+                actual: store
+                    .issue_conflicts(&filed.id)
+                    .unwrap()
+                    .unwrap()
+                    .state_token,
+            },
+            "the guard below is unreachable until the alias mapping is gone"
+        );
+
+        store
+            .connection
+            .execute("DELETE FROM tracker_aliases WHERE alias = ?1", [&filed.id])
+            .expect("drop the alias mapping");
+
+        let message = conflict_message(
+            store
+                .set_field_checked(&filed.id, "title", "x", "stale-token")
+                .expect_err("an alias that resolves to nothing is refused"),
+        );
+        assert!(message.contains("unknown issue alias"), "got: {message}");
+    }
+
+    #[test]
+    fn a_scoped_effect_is_recorded_on_the_events_it_writes() {
+        // G3: `actor` names the instance; this names the EFFECT within it, so
+        // "which effect wrote this tracker value" is a join and not a search.
+        let mut store = open_memory();
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+
+        store.set_event_effect_id(Some("eff-claim"));
+        store.claim_item(&filed.id, "instance-a", None).unwrap();
+        store.set_event_effect_id(None);
+
+        let events = store.export_events().unwrap();
+        let claim = events
+            .iter()
+            .find(|event| event.kind == "claim.acquired")
+            .expect("claim event");
+        assert_eq!(
+            store.event_effect_id(&claim.event_id).unwrap().as_deref(),
+            Some("eff-claim"),
+        );
+
+        // The write BEFORE the scope was opened is not attributed to it. The
+        // failure this pins is misattribution, which is worse than recording
+        // nothing: a stale scope would name an effect that did not write.
+        let created = events
+            .iter()
+            .find(|event| event.kind == "issue.created")
+            .expect("created event");
+        assert_eq!(store.event_effect_id(&created.event_id).unwrap(), None);
+    }
+
+    #[test]
+    fn clearing_the_scope_stops_attributing_later_writes() {
+        let mut store = open_memory();
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+        store.set_event_effect_id(Some("eff-claim"));
+        store.claim_item(&filed.id, "instance-a", None).unwrap();
+        store.set_event_effect_id(None);
+        store.assign_item(&filed.id, Some("someone")).unwrap();
+
+        let events = store.export_events().unwrap();
+        let assigned = events
+            .iter()
+            .find(|event| event.kind == "issue.assigned")
+            .expect("assigned event");
+        assert_eq!(
+            store.event_effect_id(&assigned.event_id).unwrap(),
+            None,
+            "a write after the scope closed must not inherit the last effect"
+        );
+    }
+
+    #[test]
+    fn the_effect_id_is_not_part_of_the_event_identity() {
+        // Adding it to `event_content_id` would change every event id, break
+        // import verification, and retire existing stores. Two events identical
+        // but for their writing effect must share an id.
+        // `issue.created` overrides its id with the issue's content id, so the
+        // check has to use an event that actually DERIVES one.
+        let mut store = open_memory();
+        store.set_event_effect_id(Some("eff-1"));
+        let filed = store
+            .file_item("q", "t", "", &[], &json!({}), None)
+            .unwrap();
+        store.claim_item(&filed.id, "instance-a", None).unwrap();
+
+        let events = store.export_events().unwrap();
+        let claim = events
+            .iter()
+            .find(|event| event.kind == "claim.acquired")
+            .expect("claim event");
+        let content_id = content_id_of(&store.connection, &filed.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim.event_id,
+            event_content_id(
+                "claim.acquired",
+                Some(&content_id),
+                &claim.payload_json,
+                claim.actor.as_deref(),
+                &claim.parents,
+                &claim.created_at,
+            ),
+            "the id is derived from content alone, with no effect in the material"
+        );
+        assert_eq!(
+            store.event_effect_id(&claim.event_id).unwrap().as_deref(),
+            Some("eff-1"),
+            "recorded alongside the identity, not inside it"
+        );
+    }
+
     #[test]
     fn linear_field_history_never_conflicts() {
         let mut store = open_memory();
