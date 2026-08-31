@@ -12902,11 +12902,11 @@ fn tool_workflow_refuses_a_world_paced_effect_cycle() {
     );
 }
 
-/// DR-0084: the same refusal, reached through a TRACKER instead of a schema
+/// DR-0085: the same refusal, reached through a TRACKER instead of a schema
 /// fact. `file` makes a ready issue, `release` hands a claimed one back, and the
 /// matching rule therefore re-presents its own work.
 ///
-/// Before DR-0084 `rule_dependencies` carried only schema-fact edges, so this
+/// Before DR-0085 `rule_dependencies` carried only schema-fact edges, so this
 /// ring was invisible to the very check that exists to refuse it: the graph
 /// showed two unrelated rules and a `@bounded` workflow that never settles
 /// compiled clean.

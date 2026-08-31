@@ -1,4 +1,4 @@
-# DR-0084: a produce/consume ring that runs through a TRACKER rather than
+# DR-0085: a produce/consume ring that runs through a TRACKER rather than
 # through a schema fact. `file` puts a ready issue into the queue, `spin`
 # matches it, and `release` returns the claimed item to ready — so `spin`
 # re-presents its own work and the loop turns forever.
@@ -8,7 +8,7 @@
 # for. `@bounded` is the author's declaration that this workflow settles, and
 # looping with the world is what that rules out.
 #
-# Before DR-0084 the compiler could not see this cycle at all. The coupling runs
+# Before DR-0085 the compiler could not see this cycle at all. The coupling runs
 # through `tracker.file`/`tracker.release` effects rather than a schema `record`,
 # and `rule_dependencies` carried only schema-fact edges, so the graph the
 # refusal reads showed two unrelated rules.

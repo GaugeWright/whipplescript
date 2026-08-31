@@ -2041,7 +2041,7 @@ pub struct IrRuleMetadata {
     /// Cycle-analysis-only, and deliberately NOT rendered in the `.ir` snapshot,
     /// so it adds no golden/hash churn.
     pub immediate_fact_writes: Vec<String>,
-    /// DR-0084: the declared resources this rule OBSERVES, as `tracker:<name>`.
+    /// DR-0085: the declared resources this rule OBSERVES, as `tracker:<name>`.
     ///
     /// A `when <tracker> has ready issue` is a produce/consume coupling exactly
     /// like a schema fact read, but it does not name a schema, so
@@ -2049,7 +2049,7 @@ pub struct IrRuleMetadata {
     /// `build_rule_dependencies` never matches it. These two fields are what let
     /// the rule-dependency graph carry the edge.
     pub resource_reads: Vec<String>,
-    /// DR-0084: the declared resources this rule makes work AVAILABLE in, as
+    /// DR-0085: the declared resources this rule makes work AVAILABLE in, as
     /// `tracker:<name>` — a `file` into a queue, or a `release` returning a
     /// claimed item to ready. `claim` and `finish` are not writes: they take
     /// work out of ready rather than putting it in, so counting them would
@@ -10027,7 +10027,7 @@ fn dependency_read_facts(metadata: &IrRuleMetadata) -> Vec<String> {
         .collect()
 }
 
-/// DR-0084: the trackers a rule observes, as `tracker:<name>`.
+/// DR-0085: the trackers a rule observes, as `tracker:<name>`.
 ///
 /// Mirrors the pattern `binding_resources` already matches for binding
 /// resolution, so the two cannot disagree about what a tracker observation
@@ -10047,7 +10047,7 @@ fn tracker_resource_reads(rule: &RuleDecl, semantic: &SemanticContext) -> Vec<St
     reads.into_iter().collect()
 }
 
-/// DR-0084: the trackers a rule puts ready work INTO, as `tracker:<name>`.
+/// DR-0085: the trackers a rule puts ready work INTO, as `tracker:<name>`.
 ///
 /// `file` creates a ready issue. `release` returns a claimed one to ready, which
 /// is the same availability from a consumer's side and is how a review loop
@@ -10086,7 +10086,7 @@ fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
         .collect::<Vec<_>>();
     let mut dependencies = Vec::new();
     for producer in rules {
-        // DR-0084: a resource coupling is a rule dependency on the same terms as
+        // DR-0085: a resource coupling is a rule dependency on the same terms as
         // a schema fact. It is never an `immediate_fact_writes` entry — a `file`
         // is an effect, so the issue does not exist until a terminal arrives —
         // which is why the default-pacing rule in
