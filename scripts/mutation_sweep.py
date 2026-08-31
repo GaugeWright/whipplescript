@@ -77,6 +77,44 @@ ERR_BINDING = re.compile(r"^(?:ref\s+|mut\s+)*(?:_|[a-z][a-z0-9_]*)\s*[),]")
 # than construct, whatever shape the bound pattern takes.
 LET_PATTERN = re.compile(r"\blet\s+$")
 
+# A match arm that hands back a value it was just given:
+#
+#     Err(message) => Err((None, message))
+#     Err(error) => Err(error)
+#
+# The refusal is wherever `message` was BUILT; this arm only carries it. Counted
+# as a refusal it is a site with no message to rewrite and no guard to falsify,
+# so it reports as unmeasured forever and drags whole files red whenever an edit
+# lands within its extent.
+#
+# Deliberately narrow: the payload must be identifiers and `None` only. Any
+# literal, call, macro or `Type::Variant` means something is being CONSTRUCTED
+# at this line and the site stands — `Err((None, format!("...")))` and
+# `Err(CustodyError::Revoked { .. })` are both still refusals.
+#
+# The tradeoff is stated rather than hidden: an arm forwarding a message built
+# on an earlier line stops being reported. Those sites are already unmeasurable
+# — the text is outside the window `mutate_message` rewrites — so this moves
+# them from "unmeasured" to "not a site", and the instrument stops asking for a
+# test that could not be written.
+FORWARDED_PAYLOAD = re.compile(
+    r"^[\s(]*(?:None|[a-z_][a-z0-9_]*)(?:\s*,\s*(?:None|[a-z_][a-z0-9_]*))*[\s)]*$"
+)
+
+
+def err_payload(line: str, open_paren: int) -> str | None:
+    """The text inside the `Err(` whose opening paren is at `open_paren`."""
+    depth = 0
+    for index in range(open_paren, len(line)):
+        if line[index] == "(":
+            depth += 1
+        elif line[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return line[open_paren + 1 : index]
+    return None
+
+
 # Lines where an `Err(...)` is being matched against rather than constructed.
 # Matched as calls, not substrings: a refusal's own message may well say
 # "assertion failed".
@@ -113,6 +151,11 @@ def err_is_refusal(line: str) -> bool:
             continue
         # `if let Err(error) = …` and `let Err((status, message)) = …` bind.
         if ERR_BINDING.match(rest) or LET_PATTERN.search(line[: found.start()]):
+            continue
+        # `Err(message) => Err((None, message))` and `return Err((None, reason))`
+        # carry a refusal rather than making one. See `FORWARDED_PAYLOAD`.
+        payload = err_payload(line, found.end() - 1)
+        if payload is not None and FORWARDED_PAYLOAD.match(payload):
             continue
         return True
     return False

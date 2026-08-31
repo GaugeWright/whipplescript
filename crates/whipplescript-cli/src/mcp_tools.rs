@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
+use crate::injected_secrets::InjectedSecrets;
 use whipplescript_kernel::harness_loop::ToolSpec;
 use whipplescript_kernel::mcp::{
     admit_tools, initialize_request, initialized_notification, jsonrpc_result, manifest_drift,
@@ -401,7 +402,7 @@ impl StdioConn {
         command: &str,
         args: &[String],
         env: &BTreeMap<String, String>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, InjectedSecrets), String> {
         let mut cmd = Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -417,8 +418,10 @@ impl StdioConn {
         if let Ok(home) = std::env::var("HOME") {
             cmd.env("HOME", home);
         }
+        let mut injected = InjectedSecrets::default();
         for (key, raw) in env {
             let value = resolve_secret(raw, &format!("MCP server `{server}` env `{key}`"))?;
+            injected.add(key, &value);
             cmd.env(key, value);
         }
         let mut child = cmd
@@ -468,12 +471,15 @@ impl StdioConn {
                 }
             }
         });
-        Ok(Self {
-            child,
-            stdin,
-            lines,
-            reader: Some(reader),
-        })
+        Ok((
+            Self {
+                child,
+                stdin,
+                lines,
+                reader: Some(reader),
+            },
+            injected,
+        ))
     }
 }
 
@@ -564,27 +570,36 @@ pub fn refuse_plaintext_endpoint(server: &str, url: &str) -> Result<(), String> 
 }
 
 impl HttpConn {
-    fn new(server: &str, url: &str, headers: &BTreeMap<String, String>) -> Result<Self, String> {
+    fn new(
+        server: &str,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<(Self, InjectedSecrets), String> {
         refuse_plaintext_endpoint(server, url)?;
         let mut resolved = Vec::new();
+        let mut injected = InjectedSecrets::default();
         for (key, raw) in headers {
             let value = resolve_secret(raw, &format!("MCP server `{server}` header `{key}`"))?;
+            injected.add(key, &value);
             resolved.push((key.clone(), value));
         }
-        Ok(Self {
-            // No redirects. Headers carry the server's bearer token, and ureq
-            // replays headers on redirect — a server (or a hijacked DNS answer)
-            // could bounce the request to another host and collect the
-            // credential. An MCP endpoint that redirects is a misconfiguration
-            // the operator should see, not something to follow silently.
-            agent: ureq::AgentBuilder::new()
-                .timeout(REQUEST_TIMEOUT)
-                .redirects(0)
-                .build(),
-            url: url.to_owned(),
-            headers: resolved,
-            session: None,
-        })
+        Ok((
+            Self {
+                // No redirects. Headers carry the server's bearer token, and ureq
+                // replays headers on redirect — a server (or a hijacked DNS answer)
+                // could bounce the request to another host and collect the
+                // credential. An MCP endpoint that redirects is a misconfiguration
+                // the operator should see, not something to follow silently.
+                agent: ureq::AgentBuilder::new()
+                    .timeout(REQUEST_TIMEOUT)
+                    .redirects(0)
+                    .build(),
+                url: url.to_owned(),
+                headers: resolved,
+                session: None,
+            },
+            injected,
+        ))
     }
 
     fn post(&mut self, message: &Value) -> Result<Option<Value>, String> {
@@ -660,24 +675,37 @@ pub struct McpClient {
     server: String,
     conn: Box<dyn McpTransportConn>,
     next_id: u64,
+    /// What whip resolved and handed this server, so it can be taken back out
+    /// of what the server returns. A tool result goes on to the model as the
+    /// next provider request body and into the run record — the two egress
+    /// points DR-0053 lists that this path feeds.
+    injected: InjectedSecrets,
 }
 
 impl McpClient {
     /// Connect and complete the handshake, refusing sub-protocols whip will not
     /// host before any tool is listed.
     pub fn connect(config: &McpServerConfig) -> Result<Self, String> {
-        let conn: Box<dyn McpTransportConn> = match &config.transport {
+        // The table comes back FROM the transport rather than being rebuilt
+        // here from the same config. It has to be what was actually injected:
+        // a second resolution could drift from the first and would then scrub
+        // for a value nobody sent, which reads as working and redacts nothing.
+        let (conn, injected): (Box<dyn McpTransportConn>, InjectedSecrets) = match &config.transport
+        {
             McpTransport::Stdio { command, args, env } => {
-                Box::new(StdioConn::spawn(&config.name, command, args, env)?)
+                let (conn, injected) = StdioConn::spawn(&config.name, command, args, env)?;
+                (Box::new(conn), injected)
             }
             McpTransport::Http { url, headers } => {
-                Box::new(HttpConn::new(&config.name, url, headers)?)
+                let (conn, injected) = HttpConn::new(&config.name, url, headers)?;
+                (Box::new(conn), injected)
             }
         };
         let mut client = Self {
             server: config.name.clone(),
             conn,
             next_id: 1,
+            injected,
         };
         let id = client.take_id();
         let response = client.conn.request(&initialize_request(id))?;
@@ -735,7 +763,11 @@ impl McpClient {
             .conn
             .request(&tools_call_request(id, tool, arguments))?;
         let result = jsonrpc_result(&response).map_err(|error| self.context(&error))?;
-        let (mut text, is_error) = parse_tool_call_result(&result);
+        let (text, is_error) = parse_tool_call_result(&result);
+        // Before truncation, so a redaction cannot be cut in half, and before
+        // the error branch, since a tool error goes to the model and into
+        // diagnostics just as a success does.
+        let mut text = self.injected.scrub(&text);
         if text.len() > MAX_RESULT_BYTES {
             // `String::truncate` PANICS when the byte index is not a char
             // boundary, and this text is server-supplied — a multi-byte
@@ -1203,6 +1235,7 @@ mod tests {
         };
         let script = format!(
             r#"
+import hashlib
 import json, sys, os
 
 def send(msg):
@@ -1232,10 +1265,16 @@ for line in sys.stdin:
         # Echo back what the child can see of the environment, so the test can
         # prove whip did not hand it every secret in its own process.
         leaked = [k for k in os.environ if k.startswith("WHIP_TEST_SECRET")]
+        declared = os.environ.get("DECLARED_TOKEN") or ""
         send({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"content": [
             {{"type": "text", "text": json.dumps({{
                 "called": name,
-                "declared": os.environ.get("DECLARED_TOKEN"),
+                # A HASH of the declared value, not the value: the test proves
+                # the exact variable crossed without carrying it back through a
+                # tool result. The raw echo below is deliberate, and is what the
+                # injected-secret scrub is asserted to remove.
+                "declared_sha": hashlib.sha256(declared.encode()).hexdigest()[:16],
+                "echo": declared,
                 "leaked": leaked}})}}]}}}})
 "#
         );
@@ -1331,7 +1370,20 @@ for line in sys.stdin:
             .expect("called");
         let parsed: Value = serde_json::from_str(&result).expect("json result");
         assert_eq!(parsed["called"], json!("get_issue"));
-        assert_eq!(parsed["declared"], json!("declared-value"));
+        let expected_sha = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(b"declared-value");
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()[..16]
+                .to_owned()
+        };
+        assert_eq!(parsed["declared_sha"], json!(expected_sha));
+        // The scrub, end to end through a real spawned server: the child echoed
+        // its own declared value straight back, and what reached the caller —
+        // and would have reached the model and the run record — is the marker.
+        assert_eq!(parsed["echo"], json!("[redacted env DECLARED_TOKEN]"));
         // ... and NOT whip's own secret. This is the `get-env` defense.
         assert_eq!(
             parsed["leaked"],
@@ -1595,5 +1647,90 @@ for line in sys.stdin:
             .expect("sse");
         assert_eq!(sse.get("id").and_then(Value::as_u64), Some(2));
         assert!(parse_http_body("not json at all").is_err());
+    }
+}
+
+/// A tool result is the MCP path's egress point: it goes to the model as the
+/// next provider request body and into the run record. These tests drive
+/// `call_tool` through a fake transport, because the property is about what
+/// `McpClient` returns rather than about any real server's behaviour.
+#[cfg(test)]
+mod injected_secret_tests {
+    use super::*;
+
+    const TOKEN: &str = "fixture-token-not-a-secret";
+
+    struct EchoConn {
+        text: String,
+        is_error: bool,
+    }
+
+    impl McpTransportConn for EchoConn {
+        fn request(&mut self, message: &Value) -> Result<Value, String> {
+            // The handshake and the tool call arrive on the same connection.
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            let result = match message.get("method").and_then(Value::as_str) {
+                Some("tools/call") => json!({
+                    "content": [{"type": "text", "text": self.text}],
+                    "isError": self.is_error,
+                }),
+                _ => json!({"protocolVersion": "2025-06-18", "capabilities": {}}),
+            };
+            Ok(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        }
+
+        fn notify(&mut self, _message: &Value) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn client_echoing(text: &str, is_error: bool, injected: InjectedSecrets) -> McpClient {
+        McpClient {
+            server: "fake".to_owned(),
+            conn: Box::new(EchoConn {
+                text: text.to_owned(),
+                is_error,
+            }),
+            next_id: 1,
+            injected,
+        }
+    }
+
+    fn table() -> InjectedSecrets {
+        let mut table = InjectedSecrets::default();
+        table.add("GITHUB_TOKEN", TOKEN);
+        table
+    }
+
+    #[test]
+    fn a_server_echoing_its_own_token_does_not_reach_the_model() {
+        let mut client = client_echoing(&format!("you sent {TOKEN}"), false, table());
+        let text = client
+            .call_tool("get_issue", &json!({}))
+            .expect("a non-error result");
+        assert_eq!(text, "you sent [redacted env GITHUB_TOKEN]");
+    }
+
+    #[test]
+    fn a_tool_error_is_scrubbed_too() {
+        // An error goes to the model and into diagnostics exactly as a success
+        // does, so scrubbing only the success path would leave the surface open
+        // through the branch a misbehaving server is most likely to take.
+        let mut client = client_echoing(&format!("bad credential {TOKEN}"), true, table());
+        let error = client
+            .call_tool("get_issue", &json!({}))
+            .expect_err("isError makes this the error branch");
+        assert_eq!(error, "bad credential [redacted env GITHUB_TOKEN]");
+    }
+
+    #[test]
+    fn a_result_with_no_secret_in_it_is_returned_verbatim() {
+        // The control: a scrub that mangled everything would satisfy the test
+        // above just as well.
+        let mut client = client_echoing("issue 42 is open", false, table());
+        assert_eq!(
+            client.call_tool("get_issue", &json!({})).expect("result"),
+            "issue 42 is open"
+        );
     }
 }

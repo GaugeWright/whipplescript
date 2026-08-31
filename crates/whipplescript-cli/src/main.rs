@@ -127,6 +127,7 @@ mod credential_proxy;
 mod exec_server;
 mod harness_tools;
 mod improve;
+mod injected_secrets;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;
@@ -24414,14 +24415,80 @@ fn truncate_exec_bytes(bytes: &[u8]) -> String {
     text.chars().take(8192).collect::<String>()
 }
 
+/// Whether failing to write a child's stdin ends the run, and what it says.
+///
+/// A script that never reads stdin can exit before the write lands, so EPIPE
+/// means "input not consumed" rather than a failed run — the child's own output
+/// and exit code decide that. Every other error is the run failing.
+///
+/// Separated from the write for the same reason as the two below: inline, the
+/// decision sat behind a broken pipe nothing in the suite can arrange, so
+/// nothing pinned which errors are survivable and the distinction was free to
+/// invert.
+fn exec_stdin_failure(error: &std::io::Error) -> Option<String> {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return None;
+    }
+    Some(format!("exec command failed to write stdin: {error}"))
+}
+
+/// Turn "the child did or did not start" into an outcome.
+///
+/// The I/O is the caller's and the DECISION is here, message included. That
+/// split matters twice over: a test can hand this an `Err` without arranging a
+/// spawn failure, and — because the message stays at the site rather than
+/// moving to a formatter — the mutation sweep can still rewrite it and find out
+/// whether anything notices. An earlier version of this passed the text through
+/// a helper, which left a refusal the sweep reported as UNMEASURED: not
+/// unexercised, simply beyond the instrument, which is the same hole wearing a
+/// different name.
+fn exec_spawn_outcome(
+    spawned: std::io::Result<std::process::Output>,
+    parse_contract: &Option<Value>,
+    secrets: &injected_secrets::InjectedSecrets,
+) -> ExecOutcome {
+    match spawned {
+        Ok(output) => exec_output_to_outcome(output, parse_contract, secrets),
+        Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+    }
+}
+
+/// The same for a child that started and then could not be waited on.
+///
+/// A separate message from the one above because the two send an operator to
+/// different places: "failed to start" is about the command, "failed" is about
+/// what it did.
+fn exec_wait_outcome(
+    waited: std::io::Result<std::process::Output>,
+    parse_contract: &Option<Value>,
+    secrets: &injected_secrets::InjectedSecrets,
+) -> ExecOutcome {
+    match waited {
+        Ok(output) => exec_output_to_outcome(output, parse_contract, secrets),
+        Err(error) => Err((None, format!("exec command failed: {error}"))),
+    }
+}
+
+/// `secrets` holds what whip injected into this child's environment, so it can
+/// be taken back out of what the child printed (DR-0053 per-run scrub table).
+///
+/// The scrub happens HERE, before truncation and before ingestion, rather than
+/// at each place a record is written. Every downstream surface the DR lists —
+/// the run record, the diagnostics built from a failure, and the fact payload
+/// `ingest_exec_stdout` parses out of stdout — is fed from these two strings,
+/// so one reduction at the source closes all of them and a new surface cannot
+/// be added that forgets to scrub.
 fn exec_output_to_outcome(
     output: std::process::Output,
     parse_contract: &Option<Value>,
+    secrets: &injected_secrets::InjectedSecrets,
 ) -> ExecOutcome {
     let exit_code = output.status.code().unwrap_or(-1);
-    let stdout_full = String::from_utf8_lossy(&output.stdout).to_string();
-    let stdout = truncate_exec_bytes(&output.stdout);
-    let stderr = truncate_exec_bytes(&output.stderr);
+    let scrubbed_stdout = secrets.scrub_bytes(&output.stdout);
+    let scrubbed_stderr = secrets.scrub_bytes(&output.stderr);
+    let stdout_full = String::from_utf8_lossy(&scrubbed_stdout).to_string();
+    let stdout = truncate_exec_bytes(&scrubbed_stdout);
+    let stderr = truncate_exec_bytes(&scrubbed_stderr);
     if output.status.success() {
         match parse_contract {
             Some(contract) => match ingest_exec_stdout(contract, &stdout_full) {
@@ -24556,30 +24623,27 @@ fn run_script_capability_exec(
         Ok(child) => child,
         Err(error) => {
             let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
-            return Err((None, format!("exec command failed to start: {error}")));
+            return exec_spawn_outcome(Err(error), parse_contract, &Default::default());
         }
     };
     if let Some(stdin) = child.stdin.as_mut() {
         if let Err(error) = stdin.write_all(stdin_json.as_bytes()) {
-            // A script that never reads stdin can exit before the write lands;
-            // EPIPE here just means "input not consumed", not a failed run —
-            // the child's own output and exit code decide the outcome.
-            if error.kind() != io::ErrorKind::BrokenPipe {
+            if let Some(reason) = exec_stdin_failure(&error) {
                 let _ = child.kill();
                 let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
-                return Err((None, format!("exec command failed to write stdin: {error}")));
+                return Err((None, reason));
             }
         }
     }
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
-            return Err((None, format!("exec command failed: {error}")));
-        }
-    };
+    let waited = child.wait_with_output();
+    // Unconditional now, because it already ran on both arms of the match this
+    // replaces — the staged copy goes whether the child was waited on or not.
     let _ = fs::remove_dir_all(verified_path.parent().unwrap_or(&verified_path));
-    exec_output_to_outcome(output, parse_contract)
+    exec_wait_outcome(
+        waited,
+        parse_contract,
+        &injected_secrets::InjectedSecrets::from_resolved_env(&resolved_env),
+    )
 }
 
 fn executable_basename(arg: &str) -> &str {
@@ -24884,14 +24948,18 @@ fn run_exec_effect(
         // instances keep the inherited working directory.
         match branch_exec_scratch(instance_id, &effect.effect_id) {
             Err(message) => Err((None, message)),
-            Ok(None) => match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .output()
-            {
-                Ok(output) => exec_output_to_outcome(output, &parse_contract),
-                Err(error) => Err((None, format!("exec command failed to start: {error}"))),
-            },
+            // Raw exec declares no env: whip injected nothing, so there is
+            // nothing of whip's to take back out. It inherits the parent
+            // environment wholesale, which is why it is gated behind
+            // WHIPPLESCRIPT_EXEC_ALLOW rather than scrubbed.
+            Ok(None) => exec_spawn_outcome(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .output(),
+                &parse_contract,
+                &Default::default(),
+            ),
             Ok(Some((branch_id, scratch_root, scratch))) => {
                 let spawned = std::process::Command::new("sh")
                     .arg("-c")
@@ -24899,25 +24967,29 @@ fn run_exec_effect(
                     .current_dir(&scratch_root)
                     .output();
                 match spawned {
-                    Ok(output) => match exec_output_to_outcome(output, &parse_contract) {
-                        Ok(ok) => {
-                            match import_branch_exec_scratch(
-                                &branch_id,
-                                &scratch_root,
-                                &scratch,
-                                &effect.effect_id,
-                            ) {
-                                Ok(import_meta) => {
-                                    branch_import_meta = Some(import_meta);
-                                    let _ = std::fs::remove_dir_all(&scratch_root);
-                                    Ok(ok)
+                    Ok(output) => {
+                        match exec_output_to_outcome(output, &parse_contract, &Default::default()) {
+                            Ok(ok) => {
+                                match import_branch_exec_scratch(
+                                    &branch_id,
+                                    &scratch_root,
+                                    &scratch,
+                                    &effect.effect_id,
+                                ) {
+                                    Ok(import_meta) => {
+                                        branch_import_meta = Some(import_meta);
+                                        let _ = std::fs::remove_dir_all(&scratch_root);
+                                        Ok(ok)
+                                    }
+                                    Err(message) => Err((None, message)),
                                 }
-                                Err(message) => Err((None, message)),
                             }
+                            Err(error) => Err(error),
                         }
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err((None, format!("exec command failed to start: {error}"))),
+                    }
+                    Err(error) => {
+                        exec_spawn_outcome(Err(error), &parse_contract, &Default::default())
+                    }
                 }
             }
         }

@@ -824,3 +824,157 @@ fn renders_provider_diagnostic_trace_json() {
         Some("tool")
     );
 }
+
+/// The scrub happens at the outcome boundary, so the run record, the failure
+/// diagnostic, and the ingested fact are all clean from one reduction.
+///
+/// Driven by a REAL child process rather than a synthesized `Output`: the
+/// property being tested is that what a script prints does not survive into a
+/// record, and a hand-built `Output` would test the function without testing
+/// the path.
+#[cfg(unix)]
+#[test]
+fn a_script_echoing_its_own_token_does_not_reach_the_record() {
+    use std::collections::BTreeMap;
+
+    let mut resolved = BTreeMap::new();
+    resolved.insert("TOKEN".to_owned(), "fixture-token-not-a-secret".to_owned());
+    let secrets = crate::injected_secrets::InjectedSecrets::from_resolved_env(&resolved);
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("echo \"leaked $TOKEN\"; echo \"also $TOKEN\" >&2; exit 3")
+        .env("TOKEN", "fixture-token-not-a-secret")
+        .output()
+        .expect("child runs");
+
+    let (code, stdout, stderr) = match exec_output_to_outcome(output, &None, &secrets) {
+        Err((Some(parts), _)) => parts,
+        other => panic!("a non-zero exit is a failure outcome, got {other:?}"),
+    };
+    assert_eq!(code, 3);
+    assert!(
+        !stdout.contains("fixture-token-not-a-secret"),
+        "stdout reached the record with the token in it: {stdout}"
+    );
+    assert!(
+        !stderr.contains("fixture-token-not-a-secret"),
+        "stderr reached the record with the token in it: {stderr}"
+    );
+    // The output is redacted, not discarded: an operator still sees what the
+    // script said and which declaration leaked.
+    assert!(stdout.contains("leaked [redacted env TOKEN]"), "{stdout}");
+    assert!(stderr.contains("also [redacted env TOKEN]"), "{stderr}");
+}
+
+/// The ingested FACT is built from stdout, so it is the surface that would
+/// carry a token into durable storage as structured data rather than as text.
+/// Text-level scrubbing is not obviously enough here — the value must survive
+/// as well-formed JSON — so the contract is really exercised.
+#[cfg(unix)]
+#[test]
+fn an_ingested_fact_payload_carries_the_redaction_not_the_token() {
+    use std::collections::BTreeMap;
+
+    let mut resolved = BTreeMap::new();
+    resolved.insert("TOKEN".to_owned(), "fixture-token-not-a-secret".to_owned());
+    let secrets = crate::injected_secrets::InjectedSecrets::from_resolved_env(&resolved);
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf '{\"seen\":\"%s\"}' \"$TOKEN\"")
+        .env("TOKEN", "fixture-token-not-a-secret")
+        .output()
+        .expect("child runs");
+
+    let contract = Some(serde_json::json!({"schema": "Seen", "shape": Value::Null}));
+    let ingested = match exec_output_to_outcome(output, &contract, &secrets) {
+        Ok((_, _, _, Some(ingested))) => ingested,
+        other => panic!("a conforming object ingests, got {other:?}"),
+    };
+    // Redacting inside the JSON string keeps the payload parseable: a scrub
+    // that broke ingestion would read to an operator as a broken script, and
+    // the effect would fail for the wrong stated reason.
+    match ingested {
+        whipplescript_kernel::exec_http::ExecIngest::Single(value) => {
+            assert_eq!(
+                value.get("seen").and_then(Value::as_str),
+                Some("[redacted env TOKEN]"),
+                "the ingested fact payload should carry the marker, got {value}"
+            );
+        }
+        other => panic!("expected a single ingested object, got {other:?}"),
+    }
+}
+
+/// The two child-process failures an operator has to tell apart.
+///
+/// Pinned because the sweep found them unexercised: inline at their call sites,
+/// each sat behind a spawn or wait failure nothing in the suite can arrange, so
+/// the text was free to stop saying which of the two had happened. The decision
+/// now takes the `io::Result` as a VALUE, which a test can supply, while the
+/// message stays at the decision so the sweep can still rewrite it.
+///
+/// The failing `io::Result` comes from a REAL failed read rather than an error
+/// this test builds. A synthesized `Err(...)` would be a construction the
+/// mutation sweep reads as a refusal site of its own — an unmeasurable one, in
+/// a test file — and a genuine failure is better evidence anyway.
+#[test]
+fn a_child_that_never_ran_reads_differently_from_one_that_died() {
+    fn a_real_io_failure() -> std::io::Result<std::process::Output> {
+        std::fs::read("/whipplescript/definitely/not/here")
+            .map(|_| unreachable!("that path must not exist"))
+    }
+
+    let failure = |outcome: ExecOutcome| match outcome {
+        Err((None, reason)) => reason,
+        other => panic!("expected a failure with no partial output, got {other:?}"),
+    };
+
+    let started = failure(exec_spawn_outcome(
+        a_real_io_failure(),
+        &None,
+        &Default::default(),
+    ));
+    let waited = failure(exec_wait_outcome(
+        a_real_io_failure(),
+        &None,
+        &Default::default(),
+    ));
+
+    assert!(
+        started.starts_with("exec command failed to start: "),
+        "a child that never ran must say so: {started}"
+    );
+    assert!(
+        waited.starts_with("exec command failed: "),
+        "a child that died must say so: {waited}"
+    );
+    // The distinction is the point: an operator reading "failed to start"
+    // checks the command, and one reading "failed" checks what it did. Both
+    // carry the underlying cause rather than swallowing it.
+    assert_ne!(started, waited);
+    assert!(started.contains("No such file") || started.contains("os error"));
+}
+
+/// A broken pipe is not a failed run; anything else is.
+///
+/// The sweep found this unexercised when an edit landed nearby, and the
+/// distinction is worth pinning: invert it and either every script that ignores
+/// stdin fails, or a genuinely broken write is swallowed.
+#[test]
+fn only_a_broken_pipe_survives_a_failed_stdin_write() {
+    let epipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+    assert_eq!(
+        exec_stdin_failure(&epipe),
+        None,
+        "a script that never read stdin has not failed"
+    );
+
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let reason = exec_stdin_failure(&denied).expect("any other error ends the run");
+    assert!(
+        reason.starts_with("exec command failed to write stdin: "),
+        "{reason}"
+    );
+}
