@@ -1,4 +1,4 @@
-error: recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion): invoke-tool cycle Alpha -> Beta -> Alpha
+error[graph.unbounded_tool_grant_recursion]: recursive agent tool grant is not allowed: invoke-tool cycle Alpha -> Beta -> Alpha
    --> examples/invalid/tool-grant-cycle.whip:34:11
    |
 34 |     tools [Beta]

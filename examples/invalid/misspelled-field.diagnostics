@@ -1,0 +1,14 @@
+error[type.unknown_field]: rule `triage` has invalid field path `issue.prioirty`: schema `Issue` has no field `prioirty`
+   --> examples/invalid/misspelled-field.whip:21:35
+   |
+21 |   tell triager "escalate {{ issue.prioirty }} for {{ issue.reportr }}"
+   |                                   ^^^^^^^^
+   = note: `Issue` is declared here (examples/invalid/misspelled-field.whip:6:7)
+   = help: did you mean `priority`? otherwise use a field declared on the bound schema or add it to the class declaration
+error[type.unknown_field]: rule `triage` has invalid field path `issue.reportr`: schema `Issue` has no field `reportr`
+   --> examples/invalid/misspelled-field.whip:21:60
+   |
+21 |   tell triager "escalate {{ issue.prioirty }} for {{ issue.reportr }}"
+   |                                                            ^^^^^^^
+   = note: `Issue` is declared here (examples/invalid/misspelled-field.whip:6:7)
+   = help: did you mean `reporter`? otherwise use a field declared on the bound schema or add it to the class declaration

@@ -1,0 +1,21 @@
+error[construct.duplicate_declaration]: schema `Ticket` is declared more than once
+   --> examples/invalid/duplicate-declaration.whip:10:7
+   |
+10 | class Ticket {
+   |       ^^^^^^
+   = note: first declared here (examples/invalid/duplicate-declaration.whip:6:7)
+   = help: rename one declaration or merge the schemas
+error[construct.duplicate_declaration]: agent `triager` is declared more than once
+   --> examples/invalid/duplicate-declaration.whip:18:7
+   |
+18 | agent triager {
+   |       ^^^^^^^
+   = note: first declared here (examples/invalid/duplicate-declaration.whip:14:7)
+   = help: rename one agent declaration or merge the settings
+error[construct.cardinality_conflict]: agent `triager` is already a member of stream `ops`
+   --> examples/invalid/duplicate-declaration.whip:27:12
+   |
+27 |   members [triager]
+   |            ^^^^^^^
+   = note: `ops` lists `triager` here (examples/invalid/duplicate-declaration.whip:23:12)
+   = help: membership is single-valued (the sync topology stays a tree): an agent homes to exactly one stream

@@ -907,7 +907,10 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     program_id: diagnostic.program_id.as_deref(),
                     program_version_id: diagnostic.program_version_id.as_deref(),
                     severity: diagnostic.severity,
-                    code: diagnostic.code.as_deref(),
+                    code: diagnostic
+                        .code
+                        .as_ref()
+                        .map(DurableDiagnosticCode::borrowed),
                     message: &diagnostic.message,
                     source_span_json: diagnostic.source_span_json.as_deref(),
                     subject_type: diagnostic.subject_type.as_deref(),
@@ -1709,7 +1712,7 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> StoreRe
         "program_id": diagnostic.program_id,
         "program_version_id": diagnostic.program_version_id,
         "severity": diagnostic.severity.as_str(),
-        "code": diagnostic.code,
+        "code": diagnostic.code.as_ref().map(DurableDiagnosticCode::as_str),
         "message": diagnostic.message,
         "source_span": diagnostic
             .source_span_json
@@ -2901,7 +2904,7 @@ fn do_insert_diagnostic<Sql: DoSql>(
                 opt_text(diagnostic.program_id),
                 opt_text(diagnostic.program_version_id),
                 text(diagnostic.severity.as_str()),
-                opt_text(diagnostic.code),
+                opt_text(diagnostic.code.map(DurableDiagnosticCode::text)),
                 text(diagnostic.message),
                 opt_text(diagnostic.source_span_json),
                 opt_text(diagnostic.subject_type),
@@ -3017,7 +3020,7 @@ fn do_add_active_fact_schema_diagnostics<Sql: DoSql>(
                 .get(schema_name)
                 .and_then(summary_source_span_json);
             diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.active_fact_schema_removed",
+                whipplescript_store::runtime_diagnostic_code!("revision.active_fact_schema_removed"),
                 format!("active fact `{fact_id}` uses schema `{schema_name}` missing from candidate version"),
                 Some(schema_name),
                 source_span_json,
@@ -3036,7 +3039,7 @@ fn do_add_active_fact_schema_diagnostics<Sql: DoSql>(
         );
         if !errors.is_empty() {
             diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.active_fact_incompatible",
+                whipplescript_store::runtime_diagnostic_code!("revision.active_fact_incompatible"),
                 format!(
                     "active fact `{fact_id}` no longer typechecks as `{schema_name}`: {}",
                     errors.join("; ")
@@ -4027,7 +4030,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         add_instance_revision_diagnostics(&context, &mut diagnostics);
         if active_program_id != context.program_id || candidate_program_id != context.program_id {
             diagnostics.push(revision_compatibility_diagnostic(
-                "revision.program_mismatch",
+                whipplescript_store::runtime_diagnostic_code!("revision.program_mismatch"),
                 "candidate version belongs to a different program".to_owned(),
                 Some(candidate_version_id),
             ));
@@ -4064,7 +4067,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
         add_instance_revision_diagnostics(&context, &mut diagnostics);
         if candidate.program_name != context.program_name {
             diagnostics.push(revision_compatibility_diagnostic(
-                "revision.program_mismatch",
+                whipplescript_store::runtime_diagnostic_code!("revision.program_mismatch"),
                 format!(
                     "candidate program `{}` does not match active program `{}`",
                     candidate.program_name, context.program_name
@@ -10972,7 +10975,7 @@ pub(crate) mod tests {
             program_id: None,
             program_version_id: None,
             severity: Severity::Error,
-            code: Some("E1"),
+            code: Some(DurableDiagnosticCode::ProviderKind("E1")),
             message: "boom",
             source_span_json: None,
             subject_type: None,
@@ -12286,7 +12289,7 @@ pub(crate) mod tests {
                     program_id: None,
                     program_version_id: None,
                     severity: Severity::Error,
-                    code: Some("E9".to_owned()),
+                    code: Some(DurableDiagnosticCode::ProviderKind("E9".to_owned())),
                     message: "kaboom".to_owned(),
                     source_span_json: None,
                     subject_type: None,

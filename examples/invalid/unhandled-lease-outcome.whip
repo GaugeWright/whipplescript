@@ -1,0 +1,55 @@
+// Two things go wrong when a lease is written as if it always succeeds. The
+// `contended` outcome is not handled at all — coordination outcomes are
+// exhaustive, so the instance would have nowhere to go when another holder has
+// the slot — and the `held` branch hands off to a second rule instead of
+// releasing, so the lease is held until its ttl expires.
+use std.coord
+
+class Ticket {
+  id string
+}
+
+class Deployed {
+  id string
+}
+
+class Done {
+  note string
+}
+
+class Busy {
+  reason string
+}
+
+lease deploy_slot {
+  shared
+  key Ticket
+  slots 1
+  ttl 10m
+}
+
+workflow Deployer {
+  input ticket Ticket
+  output result Done
+  failure error Busy
+
+  rule grab
+    when Ticket as ticket
+  => {
+    acquire deploy_slot for ticket.id as slot
+
+    after slot held {
+      record Deployed {
+        id ticket.id
+      }
+    }
+  }
+
+  rule finish
+    when Deployed as deployed
+  => {
+    complete result {
+      note "deployed"
+    }
+  }
+}

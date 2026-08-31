@@ -1,0 +1,41 @@
+// A rule whose trigger nothing can produce. `Escalation` is declared and matched
+// but no table seeds it, no rule records it, and the workflow does not take it
+// as an input — so `escalate` is dead code the compiler can see is dead. The
+// mistake is deleting the `record Escalation { ... }` that used to be in
+// `triage` and leaving the rule that consumed it behind.
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Ticket {
+  id string
+  severity "low" | "high"
+}
+
+class Escalation {
+  id string
+}
+
+table tickets as Ticket [
+  { id "T-1" severity "high" }
+]
+
+rule triage
+  when Ticket as ticket
+=> {
+  complete result {
+    note "triaged"
+  }
+}
+
+rule escalate
+  when Escalation as escalation
+=> {
+  complete result {
+    note "escalated"
+  }
+}

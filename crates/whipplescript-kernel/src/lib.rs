@@ -62,13 +62,13 @@ use whipplescript_parser::{
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::{
-    ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, EffectCancellation,
-    EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch, FactBatchOutcome,
-    InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact, NewInstance,
-    NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation, ProgramVersionRecord,
-    RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard, RunStart, RuntimeStore,
-    SkillEvidence, StoreError, StoreResult, StoredEvent, TerminalDiagnosticRecord,
-    WorkflowInvocationView, WorkflowRevisionView,
+    ArtifactRecord, ClaimableEffect, DerivedFact, DiagnosticRecord, DurableDiagnosticCode,
+    EffectCancellation, EffectCompletion, EventView, EvidenceRecord, ExpiredLease, FactBatch,
+    FactBatchOutcome, InstanceTransition, LeaseRenewal, NewEffectDependency, NewEvent, NewFact,
+    NewInstance, NewInstanceAuthority, NewProgramVersion, NewWorkflowInvocation,
+    ProgramVersionRecord, RetryEffect, RevisionActivation, RuleCommit, RuleCommitRevisionGuard,
+    RunStart, RuntimeStore, SkillEvidence, StoreError, StoreResult, StoredEvent,
+    TerminalDiagnosticRecord, WorkflowInvocationView, WorkflowRevisionView,
 };
 // `SqliteStore` (the rusqlite store) is the default backend for
 // `RuntimeKernel` under the `native` feature and is used by tests; the kernel's
@@ -1779,7 +1779,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             provider_effect_status(&result.status),
             &safe_summary,
-            provider_failure_code(result.failure.as_ref(), provider_status(&result.status)),
+            Some(DurableDiagnosticCode::ProviderKind(provider_failure_code(
+                result.failure.as_ref(),
+                provider_status(&result.status),
+            ))),
             &metadata_json,
             &evidence,
         );
@@ -2052,7 +2055,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             program_id: None,
             program_version_id: None,
             severity: Severity::Error,
-            code: Some(artifact_manifest::ARTIFACT_CAPTURE_FAILED_EVENT),
+            code: Some(DurableDiagnosticCode::Registered(
+                artifact_manifest::ARTIFACT_CAPTURE_FAILED_CODE,
+            )),
             message: &diagnostic_message,
             source_span_json: None,
             subject_type: Some("effect"),
@@ -2205,7 +2210,10 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             provider_effect_status(&result.status),
             &safe_summary,
-            provider_failure_code(result.failure.as_ref(), provider_status(&result.status)),
+            Some(DurableDiagnosticCode::ProviderKind(provider_failure_code(
+                result.failure.as_ref(),
+                provider_status(&result.status),
+            ))),
             &terminal_metadata,
             &provider_evidence,
         );
@@ -2324,7 +2332,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             provider_effect_status(&ProviderRunStatus::Failed),
             summary,
-            "runtime.recovery_uncertain",
+            Some(DurableDiagnosticCode::Registered(
+                whipplescript_core::runtime_diagnostic_code!("runtime.recovery_uncertain"),
+            )),
             &terminal_metadata,
             &provider_evidence,
         );
@@ -2401,11 +2411,17 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             coerce_effect_status(&result.status),
             &safe_summary,
-            match result.status {
-                CoerceStatus::Succeeded => "schema.coerce.succeeded",
-                CoerceStatus::Failed => "schema.coerce.failed",
-                CoerceStatus::TimedOut => "schema.coerce.timed_out",
-            },
+            Some(DurableDiagnosticCode::Registered(match result.status {
+                CoerceStatus::Succeeded => {
+                    whipplescript_core::runtime_diagnostic_code!("schema.coerce.succeeded")
+                }
+                CoerceStatus::Failed => {
+                    whipplescript_core::runtime_diagnostic_code!("schema.coerce.failed")
+                }
+                CoerceStatus::TimedOut => {
+                    whipplescript_core::runtime_diagnostic_code!("schema.coerce.timed_out")
+                }
+            })),
             &metadata_json,
             &evidence,
         );
@@ -2751,7 +2767,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     execution.provider,
                     EffectStatus::Failed,
                     &summary,
-                    "native_provider_failed",
+                    Some(DurableDiagnosticCode::ProviderKind(
+                        "native_provider_failed",
+                    )),
                     &metadata,
                     evidence,
                 );
@@ -2765,7 +2783,9 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     execution.provider,
                     EffectStatus::TimedOut,
                     &summary,
-                    "native_provider_timed_out",
+                    Some(DurableDiagnosticCode::ProviderKind(
+                        "native_provider_timed_out",
+                    )),
                     &metadata,
                     evidence,
                 );
@@ -3151,7 +3171,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         provider: &str,
         status: EffectStatus,
         summary: &str,
-        code: &str,
+        code: Option<DurableDiagnosticCode<&str>>,
         diagnostics_json: &str,
         evidence: &ProviderEvidence,
     ) -> Option<TerminalDiagnosticRecord> {
@@ -3176,7 +3196,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             program_id: None,
             program_version_id: None,
             severity: Severity::Error,
-            code: Some(code.to_owned()),
+            code: code.map(DurableDiagnosticCode::into_owned),
             message,
             source_span_json,
             subject_type: Some("effect".to_owned()),

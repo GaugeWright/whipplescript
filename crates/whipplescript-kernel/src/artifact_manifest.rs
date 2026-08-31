@@ -5,7 +5,14 @@ use serde_json::{json, Value};
 use crate::harness::ProviderArtifact;
 
 pub const ARTIFACT_MANIFEST_SCHEMA_VERSION: &str = "whipplescript.artifact_manifest.v1";
-pub const ARTIFACT_CAPTURE_FAILED_EVENT: &str = "artifact.capture.failed";
+/// The registered runtime code for a failed artifact capture.
+///
+/// The event type is DERIVED from it rather than written twice: the two are the
+/// same string by construction, so a rename cannot move one and leave the other
+/// naming a code the register no longer carries.
+pub const ARTIFACT_CAPTURE_FAILED_CODE: whipplescript_core::RuntimeDiagnosticCode =
+    whipplescript_core::runtime_diagnostic_code!("artifact.capture.failed");
+pub const ARTIFACT_CAPTURE_FAILED_EVENT: &str = ARTIFACT_CAPTURE_FAILED_CODE.as_str();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactCaptureFailure<'a> {

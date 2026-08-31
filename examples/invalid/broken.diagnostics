@@ -1,18 +1,18 @@
-error: expected profile string, found number literal
-  --> examples/invalid/broken.whip:4:11
+error[parse.unexpected_token]: expected profile string, found number literal
+  --> examples/invalid/broken.whip:5:11
   |
-4 |   profile 42
+5 |   profile 42
   |           ^^
   = help: write `profile "profile-name"`
-error: expected capacity value, found identifier `nope`
-  --> examples/invalid/broken.whip:5:12
+error[parse.unexpected_token]: expected capacity value, found identifier `nope`
+  --> examples/invalid/broken.whip:6:12
   |
-5 |   capacity nope
+6 |   capacity nope
   |            ^^^^
   = help: write `capacity 1`
-error: expected `{`, found end of file
-   --> examples/invalid/broken.whip:11:1
+error[parse.unexpected_token]: expected `{`, found end of file
+   --> examples/invalid/broken.whip:12:1
    |
-11 |
+12 | 
    | ^
    = help: add a `{ ... }` block

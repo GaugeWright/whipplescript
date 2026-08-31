@@ -1,0 +1,83 @@
+// Invalid: `case` branches. A `case` over a finite domain must account for every
+// value, must not repeat one, and must not carry a branch a previous branch has
+// already made unreachable. These are the mistakes made while EDITING a case —
+// adding a domain value and forgetting an arm, or pasting an arm twice — so the
+// codes belong in the corpus rather than in a reviewer's memory.
+workflow BadCaseBranches
+
+output result Outcome
+
+class Outcome {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+rule non_exhaustive
+  when Ticket as ticket
+=> {
+  case ticket.status {
+    "open" => {
+      complete result {
+        note "opened"
+      }
+    }
+  }
+}
+
+rule repeats_a_pattern
+  when Ticket as ticket
+=> {
+  case ticket.status {
+    "open" => {
+      complete result {
+        note "opened"
+      }
+    }
+    "open" => {
+      complete result {
+        note "again"
+      }
+    }
+    "triaged" => {
+      complete result {
+        note "triaged"
+      }
+    }
+    "done" => {
+      complete result {
+        note "done"
+      }
+    }
+  }
+}
+
+rule matches_a_value_outside_the_domain
+  when Ticket as ticket
+=> {
+  case ticket.status {
+    "open" => {
+      complete result {
+        note "opened"
+      }
+    }
+    "triaged" => {
+      complete result {
+        note "triaged"
+      }
+    }
+    "done" => {
+      complete result {
+        note "done"
+      }
+    }
+    "archived" => {
+      complete result {
+        note "archived"
+      }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+use std.files
+
+workflow Digest
+
+// Manual chapter 20, "A write operation is denied until you declare it": the
+// chapter's `Digest` program with the `allow write` list deleted from the store.
+// The mount is consent to read; a write needs its own grant, and the checker
+// refuses every `write` and `export` in the workflow until it has one.
+
+output result Done
+failure error Failed
+
+class Ticket {
+  id string @key
+  title string
+}
+
+class Done {
+  note string
+}
+
+class Failed {
+  reason string
+}
+
+file store project_files {
+  root "./data"
+  allow read ["docs/**"]
+}
+
+rule ingest
+  when started
+=> {
+  read text from project_files at "docs/notes.md" as notes
+
+  after notes succeeds as loaded {
+    write text to project_files at "out/summary.md" {
+      body loaded.content
+      mode create
+    } as written
+
+    after written succeeds {
+      complete result {
+        note "digested"
+      }
+    }
+
+    after written fails as f {
+      fail error {
+        reason f.reason
+      }
+    }
+  }
+
+  after notes fails as f {
+    fail error {
+      reason f.reason
+    }
+  }
+}

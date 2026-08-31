@@ -249,6 +249,46 @@ echo "== docs =="
 scripts/check-docs-snippets.sh
 scripts/check-docs-fences.sh
 
+# The OUTPUT printed in the pages, which is the other half of what a page claims
+# and had no gate at all: about two dozen `error[code]: …` blocks, with their
+# `-->` line, gutter, caret and help. They were hand-written, so when the
+# diagnostic rendering changed shape every one went stale at once and each was
+# corrected by hand — the same position `examples/invalid/*.diagnostics` was in
+# before it was gated. Each sample now names the program it renders from in a
+# `<!-- render: … -->` comment and is GENERATED from it, a block whose named code
+# the program stopped emitting is a failure rather than an empty sample, and a
+# block that looks like compiler output but names no source fails outright, so a
+# sample nobody can regenerate cannot be added.
+scripts/regen-docs-diagnostics.sh --check
+
+# The other half of the examples corpus: examples/invalid/, whose *.diagnostics
+# files are snapshots of what `whip check` actually prints. They were written by
+# hand and read by nothing — no test, no script, no gate — so seven of the
+# fifteen had rotted against the compiler (a renamed schema, a provider deleted
+# in 49e6041, a dropped warning block, line-number drift) and a diagnostic
+# regression was invisible. `--check` re-renders each one and fails on any that
+# moved, naming the file and the one command that blesses it. The fixture set is
+# a glob, so a new examples/invalid/*.whip cannot be forgotten; the script also
+# fails when one is absent from the corpus test's hand-maintained include_str!
+# list, which is the same self-flattering shape the coverage gate had.
+echo "== invalid-fixture diagnostics =="
+scripts/regen-invalid-diagnostics.sh --check
+
+# The diagnostic code registers, and the coverage column that makes the code set
+# answerable. A second audit of the codes kept finding one-fault-two-codes pairs
+# and would not converge, and the reason was measurable: 36 of 163 codes were
+# reached by a fixture and 127 by nothing at all, so a misclassification in the
+# other 127 was invisible to every gate and could only be found by reading. The
+# column turns that from an assumption into a number this gate prints, and the
+# governance rule in spec/error-handling.md hangs the append-only guarantee off
+# it — a PROVISIONAL code may still be corrected, a COVERED one may not.
+#
+# It also fails when a code is allocated without its register entry, which is
+# what keeps the macro the only door: `DiagnosticCode` has no constructor, so an
+# unregistered literal does not compile.
+echo "== diagnostic code registers =="
+scripts/regen-diagnostic-codes.sh --check
+
 # The vendored `std/` copies. `std/` is the source of truth and each crate
 # carries a build-time copy; `crates/whipplescript-parser/build.rs`,
 # `crates/whipplescript-cli/src/lib.rs` and `spec/distribution-tracker.md` all

@@ -12160,8 +12160,16 @@ rule done
 /// Open provider registry (spec/std-agent.md slice 3): agent provider kinds
 /// are registry-derived, not compiled in. A kind contributed by an embedded
 /// std manifest validates; a kind contributed by NO known manifest is a check
-/// error naming a missing package; a fixture third-party manifest contributing
-/// the kind via the package lock makes the same workflow validate.
+/// error; a fixture third-party manifest contributing the kind via the package
+/// lock makes the same workflow validate.
+///
+/// The refusal used to be asserted by the words "missing package", which the
+/// message no longer says because it was asserting a CAUSE rather than the fact
+/// that fired (tracker D7 (f)). What is asserted instead is what the diagnostic
+/// actually establishes: the kind it rejected, and the repair for the case this
+/// test is about — a kind no manifest contributes. `robo` is far from every
+/// known kind, so it also pins the quiet half of the closed-vocabulary policy:
+/// no did-you-mean when nothing is close.
 #[test]
 fn agent_provider_kinds_are_registry_derived() {
     let bin = env!("CARGO_BIN_EXE_whip");
@@ -12182,8 +12190,7 @@ fn agent_provider_kinds_are_registry_derived() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Unknown kind: contributed by no known manifest — error naming a missing
-    // package.
+    // Unknown kind: contributed by no known manifest.
     let unknown = dir.join("unknown.whip");
     fs::write(&unknown, agent_provider_workflow("", "robo")).expect("write workflow");
     let output = whip(bin, &stores)
@@ -12196,8 +12203,15 @@ fn agent_provider_kinds_are_registry_derived() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown provider kind `robo`") && stderr.contains("missing package"),
-        "the error names the unknown kind and the missing package: {stderr}"
+        stderr.contains("unknown provider kind `robo`")
+            && stderr.contains("no known package manifest contributes it")
+            && stderr.contains("add the providing package to the package lock"),
+        "the error names the unknown kind, what it measured, and the repair: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did you mean"),
+        "`robo` is close to no known kind, so the closed vocabulary must stay \
+         quiet rather than send the reader to an unrelated provider: {stderr}"
     );
 
     // Fixture third-party contribution: a locked manifest's operator-plane
@@ -13642,6 +13656,13 @@ fn lsp_publishes_diagnostics_on_did_open() {
     assert!(
         stdout.contains("\"severity\":1"),
         "server reported an error diagnostic: {stdout}"
+    );
+    // The severity is the diagnostic's own (`Severity::lsp_code`), not a number
+    // the publish loop chose from which vector the diagnostic sat in, and the
+    // stable code travels with it (spec/error-handling.md "Codes").
+    assert!(
+        stdout.contains("\"code\":\""),
+        "server published the diagnostic code: {stdout}"
     );
 }
 

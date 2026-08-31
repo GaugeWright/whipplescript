@@ -199,8 +199,10 @@
     },
     "diagnostic": {
       "type": "object",
-      "required": ["message", "source_span"],
+      "required": ["code", "severity", "message", "source_span"],
       "properties": {
+        "code": {"type": "string", "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$"},
+        "severity": {"enum": ["error", "warning", "info", "hint"]},
         "message": {"type": "string"},
         "suggestion": {"type": ["string", "null"]},
         "source_span": {"$ref": "#/$defs/span"}

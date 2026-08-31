@@ -243,7 +243,7 @@ pub(crate) const LSP_KEYWORDS: &[&str] = &[
 /// is the live error-squiggle path — it reuses the same compiler as `whip check`.
 fn lsp_publish_diagnostics<W: std::io::Write>(writer: &mut W, uri: &str, text: &str) {
     let compiled = whipplescript_parser::compile_program(text);
-    let to_lsp = |diagnostic: &Diagnostic, severity: i32| {
+    let to_lsp = |diagnostic: &Diagnostic| {
         let (start_line, start_char) = lsp_byte_to_position(text, diagnostic.span.start);
         let (end_line, end_char) = lsp_byte_to_position(text, diagnostic.span.end);
         let mut message = diagnostic.message.clone();
@@ -255,7 +255,11 @@ fn lsp_publish_diagnostics<W: std::io::Write>(writer: &mut W, uri: &str, text: &
                 "start": { "line": start_line, "character": start_char },
                 "end": { "line": end_line, "character": end_char },
             },
-            "severity": severity,
+            // Severity and code come from the diagnostic itself. `lsp_code`
+            // is the identity map the spec's 1:1 alignment promises, so an
+            // editor gets the same level `whip check` printed.
+            "severity": diagnostic.severity.lsp_code(),
+            "code": diagnostic.code.as_str(),
             "source": "whip",
             "message": message,
         });
@@ -287,12 +291,11 @@ fn lsp_publish_diagnostics<W: std::io::Write>(writer: &mut W, uri: &str, text: &
         }
         entry
     };
+    // One pass over both channels: each diagnostic now names its own severity,
+    // so the loop no longer decides it from which vector the diagnostic sat in.
     let mut diagnostics = Vec::new();
-    for diagnostic in &compiled.diagnostics {
-        diagnostics.push(to_lsp(diagnostic, Severity::Error.lsp_code()));
-    }
-    for warning in &compiled.warnings {
-        diagnostics.push(to_lsp(warning, Severity::Warning.lsp_code()));
+    for diagnostic in compiled.diagnostics.iter().chain(&compiled.warnings) {
+        diagnostics.push(to_lsp(diagnostic));
     }
     // Lint findings (only when the program compiles, since they need the IR) surface
     // as diagnostics tagged `whip lint` — distinct from `whip` correctness diagnostics

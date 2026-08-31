@@ -45,7 +45,9 @@ use std::result;
 use std::{fs, path::Path};
 // Re-exported so store-trait hosts built without the native backend (the DO
 // host) can construct `DiagnosticRecord`s without a direct core dependency.
-pub use whipplescript_core::Severity;
+// `RuntimeDiagnosticCode` is part of that surface now: a durable diagnostic
+// row's `code` is a REGISTERED code, not a string invented at the call site.
+pub use whipplescript_core::{runtime_diagnostic_code, RuntimeDiagnosticCode, Severity};
 
 #[cfg(feature = "native")]
 use rusqlite::{params, Connection, OptionalExtension};
@@ -827,13 +829,89 @@ pub struct WorkspaceView {
     pub updated_at: String,
 }
 
+/// What a durable diagnostic row's `code` column holds.
+///
+/// It used to be a bare `Option<&str>`, and an audit called that "a hole where
+/// any string is a code". Closing it turned up something worse than an
+/// unvalidated code: the column was never carrying one kind of thing at all.
+/// Flowing through it today are WhippleScript's own runtime codes
+/// (`workflow.unhandled_failure`), an event type reused as a code
+/// (`artifact.capture.failed`), a coerce status (`schema.coerce.timed_out`) —
+/// and, from the provider seam, a PROVIDER's own error kind (`auth_failed`) or
+/// a bare run status (`failed`, `native_provider_timed_out`), neither of which
+/// is dotted and neither of which WhippleScript names.
+///
+/// So the fix is not "validate the string", which would have to reject half of
+/// what legitimately flows here. It is to make the caller SAY which of the two
+/// it has. A [`Registered`](Self::Registered) value is a code: it comes from
+/// `runtime_diagnostic_code!`, it is in `spec/diagnostic-codes-runtime.txt`,
+/// and it cannot be invented at a call site. A
+/// [`ProviderKind`](Self::ProviderKind) value is explicitly NOT a code — it is
+/// a foreign string passed through verbatim, and nothing pretends otherwise.
+///
+/// Generic over the string so the borrowed row ([`DiagnosticRecord`]) and the
+/// owned one ([`TerminalDiagnosticRecord`]) share one type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableDiagnosticCode<S> {
+    /// A registered runtime-plane code.
+    Registered(RuntimeDiagnosticCode),
+    /// A provider's own error kind or run status, passed through verbatim.
+    /// Not a WhippleScript diagnostic code and never registered as one.
+    ProviderKind(S),
+}
+
+impl<S> From<RuntimeDiagnosticCode> for DurableDiagnosticCode<S> {
+    fn from(code: RuntimeDiagnosticCode) -> Self {
+        Self::Registered(code)
+    }
+}
+
+impl<S: AsRef<str>> DurableDiagnosticCode<S> {
+    /// The text stored in the row's `code` column.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Registered(code) => code.as_str(),
+            Self::ProviderKind(kind) => kind.as_ref(),
+        }
+    }
+}
+
+impl<'a> DurableDiagnosticCode<&'a str> {
+    /// The stored text, borrowed for as long as the row's source is — which
+    /// `as_str` cannot give, since it borrows from `self`.
+    pub const fn text(self) -> &'a str {
+        match self {
+            Self::Registered(code) => code.as_str(),
+            Self::ProviderKind(kind) => kind,
+        }
+    }
+
+    pub fn into_owned(self) -> DurableDiagnosticCode<String> {
+        match self {
+            Self::Registered(code) => DurableDiagnosticCode::Registered(code),
+            Self::ProviderKind(kind) => DurableDiagnosticCode::ProviderKind(kind.to_owned()),
+        }
+    }
+}
+
+impl DurableDiagnosticCode<String> {
+    pub fn borrowed(&self) -> DurableDiagnosticCode<&str> {
+        match self {
+            Self::Registered(code) => DurableDiagnosticCode::Registered(*code),
+            Self::ProviderKind(kind) => DurableDiagnosticCode::ProviderKind(kind.as_str()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiagnosticRecord<'a> {
     pub instance_id: Option<&'a str>,
     pub program_id: Option<&'a str>,
     pub program_version_id: Option<&'a str>,
     pub severity: Severity,
-    pub code: Option<&'a str>,
+    /// See [`DurableDiagnosticCode`]: a registered runtime code, or a
+    /// provider's own error kind said to be one. Never a bare string.
+    pub code: Option<DurableDiagnosticCode<&'a str>>,
     pub message: &'a str,
     pub source_span_json: Option<&'a str>,
     pub subject_type: Option<&'a str>,
@@ -854,7 +932,7 @@ pub struct TerminalDiagnosticRecord {
     pub program_id: Option<String>,
     pub program_version_id: Option<String>,
     pub severity: Severity,
-    pub code: Option<String>,
+    pub code: Option<DurableDiagnosticCode<String>>,
     pub message: String,
     pub source_span_json: Option<String>,
     pub subject_type: Option<String>,
@@ -1115,7 +1193,7 @@ pub struct RevisionCandidate<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionCompatibilityDiagnostic {
-    pub code: String,
+    pub code: RuntimeDiagnosticCode,
     pub message: String,
     pub subject: Option<String>,
     pub source_span_json: Option<String>,
@@ -1761,7 +1839,7 @@ impl SqliteStore {
         add_instance_revision_diagnostics(&context, &mut diagnostics);
         if active_program_id != context.program_id || candidate_program_id != context.program_id {
             diagnostics.push(revision_compatibility_diagnostic(
-                "revision.program_mismatch",
+                whipplescript_core::runtime_diagnostic_code!("revision.program_mismatch"),
                 "candidate version belongs to a different program".to_owned(),
                 Some(candidate_version_id),
             ));
@@ -1798,7 +1876,7 @@ impl SqliteStore {
         add_instance_revision_diagnostics(&context, &mut diagnostics);
         if candidate.program_name != context.program_name {
             diagnostics.push(revision_compatibility_diagnostic(
-                "revision.program_mismatch",
+                whipplescript_core::runtime_diagnostic_code!("revision.program_mismatch"),
                 format!(
                     "candidate program `{}` does not match active program `{}`",
                     candidate.program_name, context.program_name
@@ -2982,7 +3060,10 @@ impl SqliteStore {
                     program_id: diagnostic.program_id.as_deref(),
                     program_version_id: diagnostic.program_version_id.as_deref(),
                     severity: diagnostic.severity,
-                    code: diagnostic.code.as_deref(),
+                    code: diagnostic
+                        .code
+                        .as_ref()
+                        .map(DurableDiagnosticCode::borrowed),
                     message: &diagnostic.message,
                     source_span_json: diagnostic.source_span_json.as_deref(),
                     subject_type: diagnostic.subject_type.as_deref(),
@@ -8480,7 +8561,7 @@ fn insert_diagnostic_on(
                 diagnostic.program_id,
                 diagnostic.program_version_id,
                 diagnostic.severity.as_str(),
-                diagnostic.code,
+                diagnostic.code.map(DurableDiagnosticCode::text),
                 diagnostic.message,
                 diagnostic.source_span_json,
                 diagnostic.subject_type,
@@ -9361,7 +9442,7 @@ pub fn add_instance_revision_diagnostics(
         "completed" | "failed" | "cancelled"
     ) {
         diagnostics.push(revision_compatibility_diagnostic(
-            "revision.terminal_instance",
+            whipplescript_core::runtime_diagnostic_code!("revision.terminal_instance"),
             format!(
                 "instance is {}; revisions require a non-terminal instance",
                 context.status
@@ -9404,7 +9485,7 @@ pub fn compare_revision_summaries(
             if active_workflow != candidate_workflow =>
         {
             diagnostics.push(revision_compatibility_diagnostic(
-                "revision.root_workflow_changed",
+                whipplescript_core::runtime_diagnostic_code!("revision.root_workflow_changed"),
                 format!(
                     "candidate root workflow `{candidate_workflow}` does not match active root `{active_workflow}`"
                 ),
@@ -9412,12 +9493,12 @@ pub fn compare_revision_summaries(
             ));
         }
         (None, _) => diagnostics.push(revision_compatibility_diagnostic(
-            "revision.active_analysis_missing",
+            whipplescript_core::runtime_diagnostic_code!("revision.active_analysis_missing"),
             "active version does not include revision analysis metadata".to_owned(),
             None,
         )),
         (_, None) => diagnostics.push(revision_compatibility_diagnostic(
-            "revision.candidate_analysis_missing",
+            whipplescript_core::runtime_diagnostic_code!("revision.candidate_analysis_missing"),
             "candidate version does not include revision analysis metadata".to_owned(),
             None,
         )),
@@ -9442,7 +9523,7 @@ fn compare_contracts(
         match candidate_contracts.get(name) {
             Some(candidate_ty) if candidate_ty.ty == active_ty.ty => {}
             Some(candidate_ty) => diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.contract_changed",
+                whipplescript_core::runtime_diagnostic_code!("revision.contract_changed"),
                 format!(
                     "{kind} contract `{name}` changed from `{}` to `{}`",
                     active_ty.ty, candidate_ty.ty
@@ -9451,7 +9532,7 @@ fn compare_contracts(
                 candidate_ty.source_span_json.clone(),
             )),
             None => diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.contract_removed",
+                whipplescript_core::runtime_diagnostic_code!("revision.contract_removed"),
                 format!("{kind} contract `{name}` is missing from the candidate version"),
                 Some(name.as_str()),
                 active_ty.source_span_json.clone(),
@@ -9462,7 +9543,7 @@ fn compare_contracts(
         for (name, candidate_ty) in candidate_contracts {
             if !active_contracts.contains_key(&name) {
                 diagnostics.push(revision_compatibility_diagnostic_with_span(
-                    "revision.input_contract_added",
+                    whipplescript_core::runtime_diagnostic_code!("revision.input_contract_added"),
                     format!(
                         "candidate adds input contract `{name}` with type `{}` to an already-started instance",
                         candidate_ty.ty
@@ -9548,7 +9629,7 @@ fn add_active_fact_schema_diagnostics(
                 .get(schema_name)
                 .and_then(summary_source_span_json);
             diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.active_fact_schema_removed",
+                whipplescript_core::runtime_diagnostic_code!("revision.active_fact_schema_removed"),
                 format!("active fact `{fact_id}` uses schema `{schema_name}` missing from candidate version"),
                 Some(schema_name),
                 source_span_json,
@@ -9568,7 +9649,7 @@ fn add_active_fact_schema_diagnostics(
         );
         if !errors.is_empty() {
             diagnostics.push(revision_compatibility_diagnostic_with_span(
-                "revision.active_fact_incompatible",
+                whipplescript_core::runtime_diagnostic_code!("revision.active_fact_incompatible"),
                 format!(
                     "active fact `{fact_id}` no longer typechecks as `{schema_name}`: {}",
                     errors.join("; ")
@@ -9901,8 +9982,11 @@ fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     parts
 }
 
+// `pub` and ungated since #329 folded the DO store's re-typed copy of these
+// validators back into this one; the code is typed rather than a bare string
+// because the runtime plane now selects from a register.
 pub fn revision_compatibility_diagnostic(
-    code: &str,
+    code: RuntimeDiagnosticCode,
     message: String,
     subject: Option<&str>,
 ) -> RevisionCompatibilityDiagnostic {
@@ -9910,13 +9994,13 @@ pub fn revision_compatibility_diagnostic(
 }
 
 pub fn revision_compatibility_diagnostic_with_span(
-    code: &str,
+    code: RuntimeDiagnosticCode,
     message: String,
     subject: Option<&str>,
     source_span_json: Option<String>,
 ) -> RevisionCompatibilityDiagnostic {
     RevisionCompatibilityDiagnostic {
-        code: code.to_owned(),
+        code,
         message,
         subject: subject.map(str::to_owned),
         source_span_json,
@@ -10797,7 +10881,7 @@ fn terminal_diagnostic_payload(diagnostic: &TerminalDiagnosticRecord) -> StoreRe
         "program_id": diagnostic.program_id,
         "program_version_id": diagnostic.program_version_id,
         "severity": diagnostic.severity.as_str(),
-        "code": diagnostic.code,
+        "code": diagnostic.code.as_ref().map(DurableDiagnosticCode::as_str),
         "message": diagnostic.message,
         "source_span": diagnostic
             .source_span_json
@@ -16341,7 +16425,9 @@ mod tests {
         let changed = report
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "revision.contract_changed")
+            .find(|diagnostic| {
+                diagnostic.code == runtime_diagnostic_code!("revision.contract_changed")
+            })
             .expect("contract change diagnostic");
         assert_eq!(
             changed
@@ -16354,7 +16440,9 @@ mod tests {
         let removed = report
             .diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == "revision.contract_removed")
+            .find(|diagnostic| {
+                diagnostic.code == runtime_diagnostic_code!("revision.contract_removed")
+            })
             .expect("contract removed diagnostic");
         assert_eq!(
             removed
@@ -16545,7 +16633,7 @@ mod tests {
             .diagnostics
             .iter()
             .find(|diagnostic| {
-                diagnostic.code == "revision.active_fact_incompatible"
+                diagnostic.code == runtime_diagnostic_code!("revision.active_fact_incompatible")
                     && diagnostic.subject.as_deref() == Some("WorkItem")
             })
             .expect("active fact incompatibility diagnostic");
@@ -16553,7 +16641,7 @@ mod tests {
         assert!(changed.message.contains("$.title must be int"));
         assert!(changed.message.contains("$.status is required"));
         assert!(changed_report.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "revision.active_fact_incompatible"
+            diagnostic.code == runtime_diagnostic_code!("revision.active_fact_incompatible")
                 && diagnostic.subject.as_deref() == Some("State")
                 && diagnostic
                     .message
@@ -16565,7 +16653,7 @@ mod tests {
             .expect("removed compatibility report");
         assert!(!removed_report.compatible);
         assert!(removed_report.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "revision.active_fact_schema_removed"
+            diagnostic.code == runtime_diagnostic_code!("revision.active_fact_schema_removed")
                 && diagnostic.subject.as_deref() == Some("WorkItem")
         }));
     }
@@ -18390,7 +18478,7 @@ mod tests {
                 program_id: Some(&version.program_id),
                 program_version_id: Some(&version.version_id),
                 severity: Severity::Error,
-                code: Some("provider.transport"),
+                code: Some(DurableDiagnosticCode::ProviderKind("provider.transport")),
                 message: "provider transport failed",
                 source_span_json: Some(
                     r#"{"path":"workflow.whip","start":{"line":3,"column":5},"end":{"line":3,"column":18},"construct":"effect"}"#,
@@ -18416,7 +18504,7 @@ mod tests {
                     program_id: Some(&version.program_id),
                     program_version_id: Some(&version.version_id),
                     severity: Severity::Error,
-                    code: Some("provider.transport"),
+                    code: Some(DurableDiagnosticCode::ProviderKind("provider.transport")),
                     message: "provider transport failed",
                     source_span_json: None,
                     subject_type: Some("effect"),
@@ -18525,7 +18613,9 @@ mod tests {
                     program_id: Some(version.program_id.clone()),
                     program_version_id: Some(version.version_id.clone()),
                     severity: Severity::Error,
-                    code: Some("fixture.failed".to_owned()),
+                    code: Some(DurableDiagnosticCode::ProviderKind(
+                        "fixture.failed".to_owned(),
+                    )),
                     message: "fixture failed: boom".to_owned(),
                     source_span_json: Some(source_span_json.to_owned()),
                     subject_type: Some("effect".to_owned()),
@@ -18617,7 +18707,7 @@ mod tests {
                 program_id: Some("program-v1"),
                 program_version_id: Some("version-v1"),
                 severity: Severity::Warning,
-                code: Some("compile.unused"),
+                code: Some(DurableDiagnosticCode::ProviderKind("compile.unused")),
                 message: "unused binding",
                 source_span_json: None,
                 subject_type: Some("program_version"),

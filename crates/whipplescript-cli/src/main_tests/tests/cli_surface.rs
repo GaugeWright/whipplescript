@@ -623,6 +623,8 @@ fn decode_import_rows_handles_jsonl_json_and_quoted_csv() {
 fn renders_source_span_diagnostic() {
     let source = "agent worker {\n  profile 42\n}\n";
     let diagnostic = Diagnostic {
+        code: diagnostic_code!("parse.unexpected_token"),
+        severity: Severity::Error,
         related: Vec::new(),
         span: SourceSpan { start: 25, end: 27 },
         message: "expected profile string, found number literal".to_owned(),
@@ -630,7 +632,7 @@ fn renders_source_span_diagnostic() {
     };
 
     let expected = concat!(
-        "error: expected profile string, found number literal\n",
+        "error[parse.unexpected_token]: expected profile string, found number literal\n",
         "  --> example.whip:2:11\n",
         "  |\n",
         "2 |   profile 42\n",
@@ -641,6 +643,68 @@ fn renders_source_span_diagnostic() {
     assert_eq!(
         render_diagnostic("example.whip", source, &diagnostic),
         expected
+    );
+}
+
+#[test]
+fn a_span_inside_a_character_degrades_instead_of_panicking() {
+    // Spans are byte offsets and not every producer's arithmetic lands on a
+    // character boundary. The producer that first showed this — a whole-program
+    // check re-parsing a rule body at base `0`, so its offsets were essentially
+    // arbitrary positions in the file — now carries the body's origin (tracker
+    // D2c), but the rendering hazard is not the producer's to own: rendering
+    // used to slice `line_text` by raw offsets and panic outright, and a
+    // diagnostic that crashes the compiler is the worst possible diagnostic.
+    // Every multi-byte width has to survive, so this walks EVERY interior byte
+    // of a 2-, 3-, and 4-byte character and both ends of the span.
+    for filler in ["é", "日", "🚀"] {
+        let source = format!("# {filler}{filler}{filler} header\nworkflow Widths\n");
+        let header = source.lines().next().expect("header").len();
+        for start in 0..header {
+            for end in start..header {
+                let diagnostic = Diagnostic {
+                    code: diagnostic_code!("parse.unexpected_token"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: SourceSpan { start, end },
+                    message: "boundary probe".to_owned(),
+                    suggestion: None,
+                };
+                let rendered = render_diagnostic("example.whip", &source, &diagnostic);
+                assert!(
+                    rendered.contains('^'),
+                    "{filler} {start}..{end} rendered no caret:\n{rendered}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn renders_a_character_column_for_a_multibyte_rule_body() {
+    // Spans are byte offsets; the rendered column is a CHARACTER count. A body
+    // carrying multi-byte text before the fault must render the caret under the
+    // offending token, not shifted right by the extra bytes (tracker D2a).
+    let source = "workflow Multibyte\noutput result Done\n\nclass Order {\n  id string\n}\n\nclass Done {\n  id string\n}\n\nrule act\n  when Order as order\n=> {\n  record Done { id \"caf\u{e9} \u{65e5}\u{672c}\u{8a9e}\" }\n  frobnicate order\n}\n";
+    let compiled = whipplescript_parser::compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("`frobnicate`"))
+        .expect("statement diagnostic");
+
+    let expected = concat!(
+        "error[construct.unknown_clause]: unknown rule body statement `frobnicate`\n",
+        "   --> example.whip:16:3\n",
+        "   |\n",
+        "16 |   frobnicate order\n",
+        "   |   ^^^^^^^^^^\n",
+    );
+
+    let rendered = render_diagnostic("example.whip", source, diagnostic);
+    assert!(
+        rendered.starts_with(expected),
+        "unexpected rendering:\n{rendered}"
     );
 }
 
@@ -667,6 +731,8 @@ fn resolve_span_file_maps_offset_to_originating_file() {
     // in-file line/column.
     let lib_seven = combined.find("profile 7").expect("profile 7 present") + "profile ".len();
     let lib_diag = Diagnostic {
+        code: diagnostic_code!("parse.unexpected_token"),
+        severity: Severity::Error,
         span: SourceSpan {
             start: lib_seven,
             end: lib_seven + 1,
@@ -675,7 +741,7 @@ fn resolve_span_file_maps_offset_to_originating_file() {
         suggestion: None,
         related: Vec::new(),
     };
-    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &lib_diag, "error");
+    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &lib_diag);
     assert!(rendered.contains("--> lib.whip:2:11"), "{rendered}");
 
     // A span inside the root file resolves to root.whip using the ROOT's
@@ -683,6 +749,8 @@ fn resolve_span_file_maps_offset_to_originating_file() {
     let root_forty_two =
         combined.find("profile 42").expect("profile 42 present") + "profile ".len();
     let root_diag = Diagnostic {
+        code: diagnostic_code!("parse.unexpected_token"),
+        severity: Severity::Error,
         span: SourceSpan {
             start: root_forty_two,
             end: root_forty_two + 2,
@@ -691,8 +759,89 @@ fn resolve_span_file_maps_offset_to_originating_file() {
         suggestion: None,
         related: Vec::new(),
     };
-    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &root_diag, "error");
+    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &root_diag);
     assert!(rendered.contains("--> root.whip:3:11"), "{rendered}");
+}
+
+/// A `= note:` in a BUNDLE has to be rebased the same way the caret is.
+///
+/// The renderer used to rebase the primary span into the origin file's
+/// coordinates and hand the related spans through untouched, so one diagnostic
+/// carried a right caret and a wrong note, shifted by the length of the included
+/// prefix. And a related span that belongs to a DIFFERENT file of the bundle has
+/// to be resolved against THAT file: printing its line number under the primary
+/// file's path is a coordinate that looks authoritative and points nowhere.
+#[test]
+fn a_bundle_note_is_rebased_into_the_file_it_points_at() {
+    let lib = "class Widget {\n  id string\n}\n";
+    let root = "workflow Root\nclass Other {\n  id string\n}\n";
+    let combined = format!("{lib}\n{root}");
+    let root_base = lib.len() + 1;
+    let segments = vec![
+        SourceSegment {
+            start: 0,
+            path: "lib.whip".to_owned(),
+        },
+        SourceSegment {
+            start: root_base,
+            path: "root.whip".to_owned(),
+        },
+    ];
+
+    // Primary in the ROOT file, related in the INCLUDED one — the shape the
+    // `class … is declared here` note takes whenever the class came from an
+    // include.
+    let primary = combined.find("class Other").expect("root class present");
+    let related = combined.find("class Widget").expect("lib class present") + "class ".len();
+    let diagnostic = Diagnostic {
+        code: diagnostic_code!("type.unknown_field"),
+        severity: Severity::Error,
+        span: SourceSpan {
+            start: primary,
+            end: primary + "class".len(),
+        },
+        message: "class `Widget` has no field `nmae`".to_owned(),
+        suggestion: None,
+        related: vec![whipplescript_parser::RelatedInfo {
+            span: SourceSpan {
+                start: related,
+                end: related + "Widget".len(),
+            },
+            message: "`Widget` is declared here".to_owned(),
+        }],
+    };
+    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &diagnostic);
+    assert!(rendered.contains("--> root.whip:2:1"), "{rendered}");
+    assert!(
+        rendered.contains("= note: `Widget` is declared here (lib.whip:1:7)"),
+        "the note was not resolved to the file it points at:\n{rendered}"
+    );
+
+    // Same-file notes stay same-file, and are rebased with the caret rather than
+    // left in bundle coordinates.
+    let same_file = combined.rfind("id string").expect("root field present");
+    let diagnostic = Diagnostic {
+        code: diagnostic_code!("type.unknown_field"),
+        severity: Severity::Error,
+        span: SourceSpan {
+            start: primary,
+            end: primary + "class".len(),
+        },
+        message: "class `Other` has no field `nmae`".to_owned(),
+        suggestion: None,
+        related: vec![whipplescript_parser::RelatedInfo {
+            span: SourceSpan {
+                start: same_file,
+                end: same_file + 2,
+            },
+            message: "`id` is declared `string` here".to_owned(),
+        }],
+    };
+    let rendered = render_bundle_diagnostic("root.whip", &combined, &segments, &diagnostic);
+    assert!(
+        rendered.contains("= note: `id` is declared `string` here (root.whip:3:3)"),
+        "a same-file note was not rebased with its caret:\n{rendered}"
+    );
 }
 
 #[test]
@@ -724,9 +873,7 @@ fn included_file_diagnostic_names_the_included_file() {
     };
     let rendered: String = diagnostics
         .iter()
-        .map(|diagnostic| {
-            render_bundle_diagnostic(root_str, &source, &segments, diagnostic, "error")
-        })
+        .map(|diagnostic| render_bundle_diagnostic(root_str, &source, &segments, diagnostic))
         .collect();
     let _ = fs::remove_dir_all(&dir);
 

@@ -48,8 +48,8 @@ rules
     dependencies
       __then_plan --succeeds--> __then_signoff
     case_branches
-      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"approve" guard=- body_hash=66f7e5268ed0bc282d68fd7d13b7bb3e span=1409..1418
-      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"reject" guard=- body_hash=3a479b07acd8cfe3ac23b5c07b9061b3 span=1565..1573
+      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"approve" guard=- body_hash=66f7e5268ed0bc282d68fd7d13b7bb3e span=1419..1428
+      case signoff.choice type=union<literal<"approve"> | literal<"reject">> pattern=literal:"reject" guard=- body_hash=3a479b07acd8cfe3ac23b5c07b9061b3 span=1575..1583
     body_hash 8960ad3ef129bca50f28aa24e31bf126
 rule_dependencies
   table_tickets --schema:Ticket--> triage_ticket

@@ -1,0 +1,38 @@
+// A missing closing quote on a `tell` prompt. The string runs to the end of the
+// line, so the rule body loses its closing brace too: the interesting part is
+// that the second diagnostic points at the `{` that was left open on line 30
+// rather than at the end of the file.
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Issue {
+  id string
+  title string
+}
+
+table issues as Issue [
+  { id "ISS-1" title "the timer fires twice" }
+]
+
+agent triager {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  tell triager "summarize {{ issue.title }} for {{ issue.id }}
+
+  after triager completes as verdict {
+    complete result {
+      note verdict.text
+    }
+  }
+}

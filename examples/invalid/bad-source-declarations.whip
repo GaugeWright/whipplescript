@@ -1,0 +1,60 @@
+// Invalid: declaration-level requirements on sources and stores. A clock source
+// that recurs must say what happens to a missed occurrence — there is no silent
+// default — and a `file` source must say which of the two modes it is in. The
+// calendar source below omits its timezone, which is a WARNING rather than a
+// refusal: the anchor resolves to a documented default (UTC), so it is a
+// legibility risk and not the class of fault the compiler refuses. It is here
+// so that both halves of "a periodic construct declares no timezone" — this one
+// and a counter's reset period — are pinned against real output.
+workflow BadSourceDeclarations
+
+output result Reported
+
+class Reported {
+  note string
+}
+
+signal ops.tick {
+  scheduled_at time
+}
+
+signal ops.line {
+  text string
+}
+
+// Recurring, and says nothing about a missed occurrence.
+source clock as unguarded {
+  every 5m
+
+  observe as tick
+  emit ops.tick {
+    scheduled_at tick.scheduled_at
+  }
+}
+
+// Calendar recurrence with no timezone: warns, anchors to UTC.
+source clock as unanchored {
+  every weekday at 09:00
+  missed skip
+
+  observe as tick
+  emit ops.tick {
+    scheduled_at tick.scheduled_at
+  }
+}
+
+// A `file` source reads exactly one of `path` or `watch`; this declares neither.
+source file as modeless {
+  observe as line
+  emit ops.line {
+    text line.line
+  }
+}
+
+rule react
+  when ops.tick as tick
+=> {
+  complete result {
+    note "ticked"
+  }
+}

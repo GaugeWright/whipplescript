@@ -1,0 +1,21 @@
+error[parse.unexpected_token]: expected `is` after the discriminant field, found `=>`
+   --> examples/invalid/unclosed-brace.whip:19:5
+   |
+19 |     => {
+   |     ^^
+   = note: `workflow UnclosedBrace` is still open here (examples/invalid/unclosed-brace.whip:13:24)
+   = help: add the `}` that closes `workflow UnclosedBrace`
+error[parse.unexpected_token]: expected class field name, found `=>`
+   --> examples/invalid/unclosed-brace.whip:19:5
+   |
+19 |     => {
+   |     ^^
+   = note: `workflow UnclosedBrace` is still open here (examples/invalid/unclosed-brace.whip:13:24)
+   = help: add the `}` that closes `workflow UnclosedBrace`
+error[parse.unexpected_token]: expected top-level declaration, found `}`
+   --> examples/invalid/unclosed-brace.whip:22:1
+   |
+22 | }
+   | ^
+   = note: `workflow UnclosedBrace` is still open here (examples/invalid/unclosed-brace.whip:13:24)
+   = help: add the `}` that closes `workflow UnclosedBrace`

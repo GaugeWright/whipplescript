@@ -1,0 +1,18 @@
+warning[construct.missing_timezone]: calendar source `unanchored` should declare a `timezone`
+   --> examples/invalid/bad-source-declarations.whip:36:1
+   |
+36 | source clock as unanchored {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `timezone "America/New_York"`; a calendar schedule without one defaults to UTC
+error[construct.missing_requirement]: recurring source `unguarded` must declare a `missed` policy
+   --> examples/invalid/bad-source-declarations.whip:26:1
+   |
+26 | source clock as unguarded {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `missed skip`, `missed coalesce`, or `missed catch_up limit N`
+error[construct.missing_requirement]: `file` source `modeless` requires a `path` or `watch` clause
+   --> examples/invalid/bad-source-declarations.whip:47:1
+   |
+47 | source file as modeless {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `path "./inbox.txt"` (one signal per line) or `watch "./drops/*.json"` (one signal per new file-content occurrence)

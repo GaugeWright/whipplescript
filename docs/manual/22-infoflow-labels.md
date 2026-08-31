@@ -98,17 +98,20 @@ by email. The same program also writes inbound email into the CRM. The program
 does these operations in one rule. Without governance, the program checks
 clean. Under the envelope, the checker gives these errors:
 
+<!-- render: examples/infoflow/support-triage-unsafe.whip envelope examples/infoflow/governance.policy code security.confidentiality_leak code security.integrity_injection -->
 ```text
-error: denied flow in rule `triage`: `crm` may be read by Operator only —
-writing it to `public_reply` (readable by public) would expose it to parties
-outside its readers (the checker denies every flow from a value to a sink
-whose readers are not all within the value's reader set)
-
-error: denied influence in rule `triage`: `inbox` is untrusted (integrity
-public) — it can never influence `crm`, which only Operator-vouched data may
-shape (the checker denies every flow from lower-integrity data into a
-higher-integrity sink; the sanctioned crossing is a source-marked `endorsed`
-coerce)
+error[security.confidentiality_leak]: denied flow in rule `triage`: `crm` may be read by Operator only — writing it to `public_reply` (readable by public) would expose it to parties outside its readers (the checker denies every flow from a value to a sink whose readers are not all within the value's reader set)
+   --> examples/infoflow/support-triage-unsafe.whip:44:3
+   |
+44 |   read text from crm at "customer.json" as crm_record
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: self-serve (no grant needed): separate the contexts — read `crm` in a distinct turn and pass only a bounded result. escalate (needs governance): route the release through a `coerce … declassified` whose output is the egress's whole payload, under `grant declassify crm to <role cleared for public_reply>` (a grant alone never blesses a raw flow)
+error[security.integrity_injection]: denied influence in rule `triage`: `inbox` is untrusted (integrity public) — it can never influence `crm`, which only Operator-vouched data may shape (the checker denies every flow from lower-integrity data into a higher-integrity sink; the sanctioned crossing is a source-marked `endorsed` coerce)
+   --> examples/infoflow/support-triage-unsafe.whip:44:3
+   |
+44 |   read text from crm at "customer.json" as crm_record
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: self-serve (no grant needed): do not let `inbox` influence `crm` — gate the sink on trusted data. escalate (needs governance): route the influence through a `coerce … endorsed` whose output is the sink's whole payload, under `grant endorse inbox to <role>` (a grant alone never vouches a raw influence)
 ```
 
 Read the structure of the diagnostic. Each message about information flow has

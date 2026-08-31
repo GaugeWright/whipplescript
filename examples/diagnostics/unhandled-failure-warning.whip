@@ -1,0 +1,33 @@
+use std.script
+
+workflow Fragile
+
+// Manual chapter 6, "Automatic failure when no branch handles the failure": the
+// chapter's `Fragile` program with its `after attempt fails` branch deleted, so
+// only `succeeds` observes the effect. This is the state the chapter tells the
+// reader to produce, and the warning it prints is what the chapter shows.
+//
+// It is a WARNING, so `whip check` accepts this program and exits 0 — which is
+// why it lives here and not under examples/invalid/, whose fixtures must be
+// refused.
+
+output result Done
+failure error Broken
+
+class Done {
+  note string
+}
+
+class Broken {
+  reason string
+}
+
+rule begin
+  when started
+=> {
+  exec "false" as attempt
+
+  after attempt succeeds {
+    complete result { note "command passed" }
+  }
+}

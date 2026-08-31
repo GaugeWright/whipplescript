@@ -1,6 +1,12 @@
-error: rule `bad_scope` uses effect output `claim` outside a matching `after claim ...` block
-   --> examples/invalid/effect-output-scope.whip:10:4
+warning[effect.unhandled_failure]: effect `claim`'s failure is unhandled in rule `bad_scope`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/effect-output-scope.whip:16:3
    |
-10 | => {
-   |    ^
+16 |   claim item as claim
+   |   ^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after claim fails { … }` (typed failure or recovery) or observe every outcome with `after claim completes`
+error[effect.output_scope_leak]: rule `bad_scope` uses effect output `claim` outside a matching `after claim ...` block
+   --> examples/invalid/effect-output-scope.whip:18:3
+   |
+18 |   tell worker "{{ claim.value.id }}"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: move this use into `after claim succeeds { ... }` or another matching terminal branch

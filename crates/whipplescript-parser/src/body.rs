@@ -6,7 +6,184 @@
 //! into [`BodyAst`], unknown tokens are spanned errors, and lowering consumes
 //! structure instead of strings.
 
-use crate::{parse_expression, Diagnostic, Expr, SourceSpan};
+use crate::{
+    diagnostic_code, parse_expression, Diagnostic, DiagnosticCode, Expr, Severity, SourceSpan,
+};
+use std::ops::Range;
+
+/// What a byte offset into a body text means to the file the text came from.
+///
+/// Body text is not always a slice of the source: `then`/action expansion,
+/// region surgery and pattern substitution all rewrite it. A parser that adds a
+/// fixed base to every token offset therefore produces confident nonsense for a
+/// rewritten body. This type carries the distinction, so a diagnostic raised on
+/// generated text degrades to the enclosing block's span instead of pointing at
+/// an unrelated token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyBase<'a> {
+    /// The text is a verbatim slice of the file beginning at this byte offset,
+    /// so `base + offset` is a real source position.
+    Source(usize),
+    /// The text was assembled by a line-based rewriter that copied most of its
+    /// input verbatim: the map says, per output line, where those bytes live in
+    /// the file. An offset on a copied line is exact; anything else degrades to
+    /// the fallback span (the enclosing block).
+    Mapped {
+        map: &'a BodyLineMap,
+        fallback: SourceSpan,
+    },
+    /// The text was generated. No offset into it is a source position, so every
+    /// diagnostic raised on it points at this span (the enclosing block).
+    Generated(SourceSpan),
+}
+
+impl BodyBase<'_> {
+    /// The source span for the text range `start..end`, or the enclosing block's
+    /// span when the text has no source position for it.
+    pub(crate) fn span(self, start: usize, end: usize) -> SourceSpan {
+        match self {
+            BodyBase::Source(base) => SourceSpan {
+                start: base + start,
+                end: base + end,
+            },
+            BodyBase::Mapped { map, fallback } => map.span(start, end).unwrap_or(fallback),
+            BodyBase::Generated(fallback) => fallback,
+        }
+    }
+}
+
+impl From<usize> for BodyBase<'_> {
+    fn from(base: usize) -> Self {
+        BodyBase::Source(base)
+    }
+}
+
+/// One line of a rewritten body text, and where its bytes came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MappedLine {
+    /// Byte offset of the line within the text this map describes.
+    text_start: usize,
+    /// Byte offset in the FILE of the same bytes, or `None` when the rewriter
+    /// generated the line and there is no such position.
+    source_start: Option<usize>,
+}
+
+/// Where each line of a rewritten body text came from in the file.
+///
+/// The three rewriters that produce body text (`then` expansion, action
+/// inlining, region surgery) copy most of their input verbatim and generate the
+/// rest. Recording that per line is what keeps a diagnostic inside a copied
+/// line exact — the alternative, adding a fixed base to every offset, names a
+/// token from somewhere else entirely once a single line has been inserted.
+///
+/// INVARIANT: when a line's `source_start` is `Some(f)`, that line's content is
+/// byte-identical to the file at `f`, and its terminator is reproduced rather
+/// than re-spelled (which is why [`raw_body_lines`] keeps the `\r`). Every
+/// consumer below depends on it, so a rewriter that reindents, retabs, or
+/// re-serializes a line must report it as generated instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BodyLineMap {
+    lines: Vec<MappedLine>,
+    /// Length of the text the map describes. A map is only ever built together
+    /// with its text, and this is what makes an out-of-range offset degrade
+    /// rather than read a neighbouring line's origin.
+    text_len: usize,
+}
+
+impl BodyLineMap {
+    /// Builds the map for `text` from one entry per line, each holding that
+    /// line's origin in the FILE (`None` for a generated line). Returns `None`
+    /// — meaning "treat the whole text as generated" — when the entry count
+    /// does not match the line count, or when nothing is mapped at all.
+    pub(crate) fn new(text: &str, source_starts: Vec<Option<usize>>) -> Option<Self> {
+        let starts = raw_body_lines(text);
+        if starts.len() != source_starts.len() {
+            return None;
+        }
+        if source_starts.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(Self {
+            lines: starts
+                .iter()
+                .zip(source_starts)
+                .map(|((_, text_start), source_start)| MappedLine {
+                    text_start: *text_start,
+                    source_start,
+                })
+                .collect(),
+            text_len: text.len(),
+        })
+    }
+
+    /// Index of the line containing `offset`, or `None` past the end.
+    fn line_of(&self, offset: usize) -> Option<usize> {
+        if offset > self.text_len {
+            return None;
+        }
+        match self
+            .lines
+            .binary_search_by_key(&offset, |line| line.text_start)
+        {
+            Ok(index) => Some(index),
+            Err(0) => None,
+            Err(index) => Some(index - 1),
+        }
+    }
+
+    /// The file offset the text offset `offset` names, or `None` when it sits
+    /// on a generated line.
+    pub(crate) fn source_offset(&self, offset: usize) -> Option<usize> {
+        let index = self.line_of(offset)?;
+        let line = self.lines[index];
+        Some(line.source_start? + (offset - line.text_start))
+    }
+
+    /// The file span for the text range `start..end`, or `None` when the range
+    /// has no single origin: it touches a generated line, or it straddles two
+    /// copied runs that are not contiguous in the file. Degrading is the point
+    /// — a computed offset over generated text is the failure this replaces.
+    fn span(&self, start: usize, end: usize) -> Option<SourceSpan> {
+        if end < start || end > self.text_len {
+            return None;
+        }
+        let first = self.line_of(start)?;
+        // A range ending exactly on a line boundary ends on the PREVIOUS line.
+        let last = self.line_of(if end > start { end - 1 } else { start })?;
+        let delta = {
+            let line = self.lines[first];
+            line.source_start? as isize - line.text_start as isize
+        };
+        // Every line the range touches must be copied, and copied from the same
+        // contiguous run, or the bytes between them are not the file's bytes.
+        for line in &self.lines[first..=last] {
+            if line.source_start? as isize - line.text_start as isize != delta {
+                return None;
+            }
+        }
+        Some(SourceSpan {
+            start: (start as isize + delta) as usize,
+            end: (end as isize + delta) as usize,
+        })
+    }
+}
+
+/// A body text's lines, each paired with its byte offset within the text.
+///
+/// The content keeps any `\r` a CRLF file put there and drops only the `\n`,
+/// so `join("\n")` over untouched lines reproduces the original bytes. The
+/// rewriters used `str::lines`, which silently deleted every `\r` — enough to
+/// make a rewritten body differ from the file, which cost every rule in a CRLF
+/// file its source origin.
+pub(crate) fn raw_body_lines(text: &str) -> Vec<(&str, usize)> {
+    let mut lines = Vec::new();
+    let mut cursor = 0usize;
+    for raw in text.split_inclusive('\n') {
+        lines.push((raw.strip_suffix('\n').unwrap_or(raw), cursor));
+        cursor += raw.len();
+    }
+    lines
+}
 
 /// Parses short durations: `<integer><unit>` with unit `s`, `m`, `h`, or `d`.
 pub fn parse_short_duration_seconds(value: &str) -> Option<u64> {
@@ -670,11 +847,16 @@ pub struct RegionBlock {
     /// `on lapse as <binding>`: the synthesized optional progress view.
     pub lapse_binding: Option<String>,
     pub lapse_body: Vec<BodyStmt>,
-    /// Source extent of the region BODY content (inside its braces), for the
-    /// compile-path variant splices.
-    pub body_span: SourceSpan,
-    /// Source extent of the lapse-arm content (inside its braces).
-    pub lapse_span: SourceSpan,
+    /// Extent of the whole region within the BODY TEXT it was parsed from —
+    /// a text offset range, not a source position. The compile-path variant
+    /// splices cut the text with these three ranges, so they must stay relative
+    /// to the text even when the text is generated (see [`BodyBase`]).
+    pub text_range: std::ops::Range<usize>,
+    /// Extent of the region BODY content (inside its braces) within the body
+    /// text, for the compile-path variant splices.
+    pub body_text_range: std::ops::Range<usize>,
+    /// Extent of the lapse-arm content (inside its braces) within the body text.
+    pub lapse_text_range: std::ops::Range<usize>,
     pub span: SourceSpan,
 }
 
@@ -825,6 +1007,12 @@ pub enum TerminalKind {
 pub struct SplitFieldAssignment {
     pub name: String,
     pub value: Option<String>,
+    /// Byte offset of the field NAME within the scanned source, so a
+    /// diagnostic about the field can underline it.
+    pub name_at: usize,
+    /// Byte range of the VALUE within the scanned source. Absent for a
+    /// shorthand field, which has no value text.
+    pub value_at: Option<Range<usize>>,
 }
 
 /// Token-level field splitting for record/terminal/table-row bodies. The
@@ -853,7 +1041,7 @@ pub struct SplitFieldAssignment {
 /// This shares ONE scan with `split_field_assignments` rather than mirroring
 /// it. A second copy would drift, and two scans of the same text disagreeing is
 /// the defect this exists to report.
-pub fn stray_value_tokens(source: &str) -> Vec<String> {
+pub fn stray_value_tokens(source: &str) -> Vec<(String, Range<usize>)> {
     let mut stray = Vec::new();
     split_fields_inner(source, Some(&mut stray));
     stray
@@ -865,13 +1053,13 @@ pub fn split_field_assignments(source: &str) -> Vec<SplitFieldAssignment> {
 
 fn split_fields_inner(
     source: &str,
-    mut stray: Option<&mut Vec<String>>,
+    mut stray: Option<&mut Vec<(String, Range<usize>)>>,
 ) -> Vec<SplitFieldAssignment> {
     let mut diagnostics = Vec::new();
-    let tokens = lex_body(source, 0, &mut diagnostics);
+    let tokens = lex_body(source, BodyBase::Source(0), &mut diagnostics);
     let mut parser = BodyParser {
         source,
-        base: 0,
+        base: BodyBase::Source(0),
         tokens,
         pos: 0,
         diagnostics,
@@ -882,12 +1070,13 @@ fn split_fields_inner(
         let (stray_start, stray_end) = (token.start, token.end);
         let Tok::Ident(name) = token.tok.clone() else {
             if let Some(sink) = stray.as_deref_mut() {
-                sink.push(
+                sink.push((
                     source
                         .get(stray_start..stray_end)
                         .unwrap_or_default()
                         .to_owned(),
-                );
+                    stray_start..stray_end,
+                ));
             }
             parser.pos += 1;
             continue;
@@ -898,7 +1087,12 @@ fn split_fields_inner(
             Some(next) => next.line != name_line,
         };
         if is_shorthand {
-            assignments.push(SplitFieldAssignment { name, value: None });
+            assignments.push(SplitFieldAssignment {
+                name,
+                value: None,
+                name_at: stray_start,
+                value_at: None,
+            });
             continue;
         }
         let value_start = parser.pos;
@@ -940,6 +1134,8 @@ fn split_fields_inner(
         assignments.push(SplitFieldAssignment {
             name,
             value: Some(source[first.start..last.end].to_owned()),
+            name_at: stray_start,
+            value_at: Some(first.start..last.end),
         });
     }
     assignments
@@ -976,7 +1172,7 @@ fn line_of(source: &str, offset: usize) -> usize {
     source[..offset].bytes().filter(|b| *b == b'\n').count()
 }
 
-fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
+fn lex_body(source: &str, base: BodyBase<'_>, diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -997,11 +1193,10 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             let content_type = (!annotation.is_empty()).then(|| annotation.to_owned());
             let Some(close) = source[opener_end..].find("\"\"\"").map(|o| opener_end + o) else {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.unterminated_string"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: SourceSpan {
-                        start: base + start,
-                        end: base + source.len(),
-                    },
+                    span: base.span(start, source.len()),
                     message: "unterminated multiline string".to_owned(),
                     suggestion: Some("close the prompt with `\"\"\"`".to_owned()),
                 });
@@ -1041,11 +1236,10 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             }
             if !closed {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.unterminated_string"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: SourceSpan {
-                        start: base + start,
-                        end: base + j,
-                    },
+                    span: base.span(start, j),
                     message: "unterminated string".to_owned(),
                     suggestion: Some("close the string with `\"`".to_owned()),
                 });
@@ -1190,11 +1384,10 @@ fn lex_body(source: &str, base: usize, diagnostics: &mut Vec<Diagnostic>) -> Vec
             }
             _ => {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.unexpected_character"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: SourceSpan {
-                        start: base + i,
-                        end: base + i + 1,
-                    },
+                    span: base.span(i, i + 1),
                     message: format!("unexpected character `{c}` in rule body"),
                     suggestion: None,
                 });
@@ -1273,7 +1466,11 @@ fn dedent_prompt(raw: &str) -> String {
 /// expansion to consume the chained effect statement without parsing — and
 /// spuriously diagnosing — the remainder of the enclosing block). Returns the
 /// statement and only the diagnostics that single parse produced.
-pub fn parse_first_statement(source: &str, base: usize) -> (Option<BodyStmt>, Vec<Diagnostic>) {
+pub fn parse_first_statement<'a>(
+    source: &str,
+    base: impl Into<BodyBase<'a>>,
+) -> (Option<BodyStmt>, Vec<Diagnostic>) {
+    let base = base.into();
     let mut diagnostics = Vec::new();
     let tokens = lex_body(source, base, &mut diagnostics);
     let mut parser = BodyParser {
@@ -1287,7 +1484,11 @@ pub fn parse_first_statement(source: &str, base: usize) -> (Option<BodyStmt>, Ve
     (statement, parser.diagnostics)
 }
 
-pub fn parse_rule_body(source: &str, base: usize) -> (BodyAst, Vec<Diagnostic>) {
+pub fn parse_rule_body<'a>(
+    source: &str,
+    base: impl Into<BodyBase<'a>>,
+) -> (BodyAst, Vec<Diagnostic>) {
+    let base = base.into();
     let mut diagnostics = Vec::new();
     let tokens = lex_body(source, base, &mut diagnostics);
     let mut parser = BodyParser {
@@ -1297,13 +1498,13 @@ pub fn parse_rule_body(source: &str, base: usize) -> (BodyAst, Vec<Diagnostic>) 
         pos: 0,
         diagnostics,
     };
-    let statements = parser.parse_statements(false);
+    let statements = parser.parse_statements(None);
     (BodyAst { statements }, parser.diagnostics)
 }
 
 struct BodyParser<'a> {
     source: &'a str,
-    base: usize,
+    base: BodyBase<'a>,
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
@@ -1354,38 +1555,96 @@ impl<'a> BodyParser<'a> {
 
     fn span_here(&self) -> SourceSpan {
         match self.peek() {
-            Some(token) => SourceSpan {
-                start: self.base + token.start,
-                end: self.base + token.end,
-            },
-            None => SourceSpan {
-                start: self.base + self.source.len(),
-                end: self.base + self.source.len(),
-            },
+            Some(token) => self.base.span(token.start, token.end),
+            None => self.base.span(self.source.len(), self.source.len()),
         }
     }
 
     fn span_from(&self, start_token: usize) -> SourceSpan {
-        let start = self
-            .tokens
-            .get(start_token)
-            .map(|t| self.base + t.start)
-            .unwrap_or(self.base);
+        let (start, end) = self.range_from(start_token);
+        self.base.span(start, end)
+    }
+
+    /// The text range `start_token ..= self.pos - 1` covers, relative to the
+    /// body text (NOT a source position — see [`BodyBase`]).
+    fn range_from(&self, start_token: usize) -> (usize, usize) {
+        let start = self.tokens.get(start_token).map(|t| t.start).unwrap_or(0);
         let end = self
             .tokens
             .get(self.pos.saturating_sub(1))
-            .map(|t| self.base + t.end)
+            .map(|t| t.end)
             .unwrap_or(start);
-        SourceSpan { start, end }
+        (start, end)
     }
 
-    fn error(&mut self, span: SourceSpan, message: impl Into<String>, suggestion: Option<String>) {
+    /// Push a body-parser diagnostic under `code`.
+    ///
+    /// The code is a PARAMETER, with no default, because this funnel serves 131
+    /// callers and used to hardcode `parse.unexpected_token` for all of them.
+    /// Most of those callers do report an unexpected token — but a good many
+    /// report a missing required clause, a removed construct, a value outside a
+    /// closed set, or a cardinality fault, and for those the code contradicted
+    /// the message it shipped next to. A default would only let the next caller
+    /// fall into the same hole silently; requiring the code makes each new
+    /// caller say what it rejected.
+    fn error(
+        &mut self,
+        code: DiagnosticCode,
+        span: SourceSpan,
+        message: impl Into<String>,
+        suggestion: Option<String>,
+    ) {
         self.diagnostics.push(Diagnostic {
+            code,
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: message.into(),
             suggestion,
         });
+    }
+
+    /// The source span of the token at `index`, for a caller that noted where a
+    /// bracket was before consuming it. Unlike [`span_here`](Self::span_here)
+    /// this does not move with `pos`, which is the whole point: the opener has
+    /// to survive everything parsed between it and the failure.
+    fn span_of_token(&self, index: usize) -> SourceSpan {
+        match self.tokens.get(index) {
+            Some(token) => self.base.span(token.start, token.end),
+            None => self.base.span(self.source.len(), self.source.len()),
+        }
+    }
+
+    /// [`error`](Self::error) for a block whose closer was never found.
+    ///
+    /// Every such site reports where the search gave up, which is the end of the
+    /// rule body — the least useful location in the file, and never the one the
+    /// author has to edit. `opened_at` carries the bracket that is actually
+    /// missing its partner, so the reader gets a location instead of an
+    /// instruction to go and find one.
+    ///
+    /// The note is dropped when it would land on the primary span: a note
+    /// pointing at the caret the reader is already looking at says nothing.
+    fn unclosed(
+        &mut self,
+        span: SourceSpan,
+        opened_at: SourceSpan,
+        message: impl Into<String>,
+        suggestion: Option<String>,
+        label: &str,
+    ) {
+        let mut diagnostic = Diagnostic {
+            code: diagnostic_code!("parse.unclosed_delimiter"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span,
+            message: message.into(),
+            suggestion,
+        };
+        if opened_at.start != span.start {
+            diagnostic = diagnostic.with_related(opened_at, label);
+        }
+        self.diagnostics.push(diagnostic);
     }
 
     fn ident_text(&mut self, what: &str) -> Option<String> {
@@ -1396,7 +1655,12 @@ impl<'a> BodyParser<'a> {
             }
             _ => {
                 let span = self.span_here();
-                self.error(span, format!("expected {what}"), None);
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    span,
+                    format!("expected {what}"),
+                    None,
+                );
                 None
             }
         }
@@ -1424,22 +1688,30 @@ impl<'a> BodyParser<'a> {
         }
     }
 
-    fn parse_statements(&mut self, in_block: bool) -> Vec<BodyStmt> {
+    /// Parse statements until `}` or end of input. `opened_at` is `Some(span)`
+    /// for a nested block — the span of the `{` the caller consumed — and `None`
+    /// for the rule body itself, which has no opener inside this text. It
+    /// carries the two meanings the old `in_block: bool` did (consume the
+    /// closer, complain when there is none) plus the one it could not: WHERE the
+    /// block that never closed was opened.
+    fn parse_statements(&mut self, opened_at: Option<SourceSpan>) -> Vec<BodyStmt> {
         let mut statements = Vec::new();
         loop {
             if self.peek().is_none() {
-                if in_block {
+                if let Some(opened_at) = opened_at {
                     let span = self.span_here();
-                    self.error(
+                    self.unclosed(
                         span,
+                        opened_at,
                         "unclosed block in rule body",
                         Some("add `}`".to_owned()),
+                        "this block is opened here",
                     );
                 }
                 return statements;
             }
             if self.at_sym('}') {
-                if in_block {
+                if opened_at.is_some() {
                     self.pos += 1;
                 }
                 return statements;
@@ -1462,21 +1734,11 @@ impl<'a> BodyParser<'a> {
             Some(Tok::Ident(value)) => value,
             _ => {
                 let span = self.span_here();
-                let package_verbs = EFFECT_OPERATION_GRAMMAR
-                    .iter()
-                    .map(|spec| spec.keyword)
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected a rule body statement".to_owned(),
-                    Some(format!(
-                        "statements start with record, done, consume, during, until, tell, \
-                         coerce, prompt, decide, call, invoke, read, write, import, export, \
-                         after, case, complete, fail, timer, cancel, exec, file, claim, \
-                         release, finish, acquire, renew, append, emit, redact, or a package \
-                         effect verb ({package_verbs})"
-                    )),
+                    Some(format!("statements start with {}", statement_vocabulary())),
                 );
                 self.recover();
                 return None;
@@ -1487,6 +1749,8 @@ impl<'a> BodyParser<'a> {
         if let Some(spec) = effect_operation_spec(&keyword) {
             return self.parse_effect_operation(spec);
         }
+        // STATEMENT-ARMS-START — every arm here must appear in
+        // RULE_BODY_STATEMENT_KEYWORDS.
         match keyword.as_str() {
             "record" => self.parse_record_statement().map(BodyStmt::Record),
             // `consume <counter> for <key> ...` is the counter verb
@@ -1526,9 +1790,11 @@ impl<'a> BodyParser<'a> {
             "emit" => self.parse_emit_signal(),
             "redact" => self.parse_redact(),
             "declassify" => self.parse_declassify(),
+            // STATEMENT-ARMS-END
             "when" | "on" => {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("construct.unknown_clause"),
                     span,
                     format!("`{keyword}` blocks are not rule body statements"),
                     Some(
@@ -1544,14 +1810,14 @@ impl<'a> BodyParser<'a> {
             other => {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("construct.unknown_clause"),
                     span,
                     format!("unknown rule body statement `{other}`"),
-                    Some(
-                        "statements start with record, done, tell, coerce, claim, \
-                         release, finish, file, call, recall, invoke, emit, after, case, complete, \
-                         fail, timer, cancel, decide, prompt, or exec"
-                            .to_owned(),
-                    ),
+                    Some(crate::suggest_then_keyword(
+                        other,
+                        statement_keyword_vocabulary(),
+                        format!("statements start with {}", statement_vocabulary()),
+                    )),
                 );
                 self.pos += 1;
                 self.recover();
@@ -1591,7 +1857,12 @@ impl<'a> BodyParser<'a> {
             self.pos += 1;
             if !self.consume_ident("record") {
                 let span = self.span_here();
-                self.error(span, "expected `record` after `->`", None);
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    span,
+                    "expected `record` after `->`",
+                    None,
+                );
                 return None;
             }
             self.pos -= 1; // parse_record_statement expects to consume `record`
@@ -1614,6 +1885,7 @@ impl<'a> BodyParser<'a> {
     fn removed_consume_alias(&mut self) -> Option<BodyStmt> {
         let span = self.span_here();
         self.error(
+            diagnostic_code!("parse.unsupported_syntax"),
             span,
             "`consume` was removed; use `done`",
             Some("replace `consume` with `done`".to_owned()),
@@ -1630,9 +1902,15 @@ impl<'a> BodyParser<'a> {
     /// bare field name is shorthand-copy. Single-line and multi-line forms are
     /// equivalent: structure comes from tokens, never line breaks.
     fn parse_field_block(&mut self, allow_shorthand: bool) -> Option<Vec<FieldAssign>> {
+        let opened_at = self.span_here();
         if !self.consume_sym('{') {
             let span = self.span_here();
-            self.error(span, "expected `{` to open a field block", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `{` to open a field block",
+                None,
+            );
             return None;
         }
         let mut fields = Vec::new();
@@ -1642,7 +1920,13 @@ impl<'a> BodyParser<'a> {
             }
             if self.peek().is_none() {
                 let span = self.span_here();
-                self.error(span, "unclosed field block", Some("add `}`".to_owned()));
+                self.unclosed(
+                    span,
+                    opened_at,
+                    "unclosed field block",
+                    Some("add `}`".to_owned()),
+                    "this field block is opened here",
+                );
                 return Some(fields);
             }
             let field_start = self.pos;
@@ -1708,7 +1992,12 @@ impl<'a> BodyParser<'a> {
         let start_token = self.pos;
         if !self.consume_value_atom() {
             let span = self.span_here();
-            self.error(span, "expected a field value expression", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected a field value expression",
+                None,
+            );
             return None;
         }
         loop {
@@ -1719,7 +2008,12 @@ impl<'a> BodyParser<'a> {
                     self.pos += 1;
                     if !self.consume_value_atom() {
                         let span = self.span_here();
-                        self.error(span, "expected expression after operator", None);
+                        self.error(
+                            diagnostic_code!("parse.unexpected_token"),
+                            span,
+                            "expected expression after operator",
+                            None,
+                        );
                         return None;
                     }
                 }
@@ -1727,7 +2021,12 @@ impl<'a> BodyParser<'a> {
                     self.pos += 1;
                     if !self.consume_value_atom() {
                         let span = self.span_here();
-                        self.error(span, "expected expression after operator", None);
+                        self.error(
+                            diagnostic_code!("parse.unexpected_token"),
+                            span,
+                            "expected expression after operator",
+                            None,
+                        );
                         return None;
                     }
                 }
@@ -1744,11 +2043,9 @@ impl<'a> BodyParser<'a> {
         match parse_expression(&source) {
             Ok(expr) => Some((source, expr)),
             Err(message) => {
-                let span = SourceSpan {
-                    start: self.base + first.start,
-                    end: self.base + last.end,
-                };
+                let span = self.base.span(first.start, last.end);
                 self.error(
+                    diagnostic_code!("parse.invalid_expression"),
                     span,
                     format!("invalid field value expression: {message}"),
                     None,
@@ -1788,6 +2085,7 @@ impl<'a> BodyParser<'a> {
     }
 
     fn consume_balanced(&mut self, open: char, close: char) -> bool {
+        let opened_at = self.span_here();
         if !self.consume_sym(open) {
             return false;
         }
@@ -1799,7 +2097,13 @@ impl<'a> BodyParser<'a> {
                 Some(_) => {}
                 None => {
                     let span = self.span_here();
-                    self.error(span, format!("unclosed `{open}`"), None);
+                    self.unclosed(
+                        span,
+                        opened_at,
+                        format!("unclosed `{open}`"),
+                        None,
+                        format!("this `{open}` is opened here").as_str(),
+                    );
                     return false;
                 }
             }
@@ -1834,6 +2138,7 @@ impl<'a> BodyParser<'a> {
                 let span = self.span_here();
                 let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         "expected a duration after `timeout`".to_owned(),
                         Some(
@@ -1848,6 +2153,7 @@ impl<'a> BodyParser<'a> {
                     Some(seconds) if seconds > 0 => *timeout_seconds = Some(seconds),
                     _ => {
                         self.error(
+                            diagnostic_code!("type.invalid_literal"),
                             span,
                             format!("invalid timeout duration `{value}`"),
                             Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -1864,7 +2170,12 @@ impl<'a> BodyParser<'a> {
     fn parse_string_array(&mut self) -> Option<Vec<String>> {
         if !self.consume_sym('[') {
             let span = self.span_here();
-            self.error(span, "expected `[` to open a string list", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `[` to open a string list",
+                None,
+            );
             return None;
         }
         let mut values = Vec::new();
@@ -1878,6 +2189,7 @@ impl<'a> BodyParser<'a> {
                 other => {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         format!("expected a string in list, found {other:?}"),
                         None,
@@ -1897,7 +2209,12 @@ impl<'a> BodyParser<'a> {
             Some(Tok::TripleStr { text, content_type }) => Some(Prompt { text, content_type }),
             _ => {
                 let span = self.span_here();
-                self.error(span, "expected a prompt string", None);
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    span,
+                    "expected a prompt string",
+                    None,
+                );
                 None
             }
         }
@@ -2010,6 +2327,7 @@ impl<'a> BodyParser<'a> {
         if !self.at_sym('[') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `[\"skill\", …]` after `with skills`".to_owned(),
                 None,
@@ -2040,12 +2358,22 @@ impl<'a> BodyParser<'a> {
             } else {
                 "expected `access to <resource> { ... }` after `with`"
             };
-            self.error(span, detail.to_owned(), None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                detail.to_owned(),
+                None,
+            );
             return false;
         }
         if !self.consume_ident("to") {
             let span = self.span_here();
-            self.error(span, "expected `to` after `with access`".to_owned(), None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `to` after `with access`".to_owned(),
+                None,
+            );
             return false;
         }
         if self.consume_sym('{') {
@@ -2064,6 +2392,7 @@ impl<'a> BodyParser<'a> {
                 if !self.consume_sym('{') {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         "expected `{` to open the resource access-grant block".to_owned(),
                         None,
@@ -2081,7 +2410,7 @@ impl<'a> BodyParser<'a> {
             }
             if resources == 0 {
                 let span = self.span_from(start);
-                self.error(
+                self.error(diagnostic_code!("construct.missing_requirement"), 
                     span,
                     "access-grant shorthand block grants no resources".to_owned(),
                     Some(
@@ -2120,6 +2449,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `{` to open the access-grant block".to_owned(),
                 None,
@@ -2166,9 +2496,15 @@ impl<'a> BodyParser<'a> {
         let start = self.pos;
         self.pos += 1; // coerce
         let name = self.ident_text("coerce function name")?;
+        let opened_at = self.span_here();
         if !self.consume_sym('(') {
             let span = self.span_here();
-            self.error(span, "expected `(` after coerce function name", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `(` after coerce function name",
+                None,
+            );
             return None;
         }
         let mut args = Vec::new();
@@ -2178,7 +2514,13 @@ impl<'a> BodyParser<'a> {
             }
             if self.peek().is_none() {
                 let span = self.span_here();
-                self.error(span, "unclosed coerce argument list", None);
+                self.unclosed(
+                    span,
+                    opened_at,
+                    "unclosed coerce argument list",
+                    None,
+                    "this argument list is opened here",
+                );
                 return None;
             }
             let (source, _) = self.parse_value_expression()?;
@@ -2245,6 +2587,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`prompt` requires an `as` binding".to_owned(),
                 Some("write `prompt \"Summarize this\" as summary`".to_owned()),
@@ -2268,6 +2611,7 @@ impl<'a> BodyParser<'a> {
         if !matches!(self.advance().map(|t| t.tok), Some(Tok::Arrow)) {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `->` after the decide prompt".to_owned(),
                 Some("write `decide \"...\" -> { field type, ... } as name`".to_owned()),
@@ -2276,7 +2620,12 @@ impl<'a> BodyParser<'a> {
         }
         if !self.consume_sym('{') {
             let span = self.span_here();
-            self.error(span, "expected `{` to open the decide result shape", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `{` to open the decide result shape",
+                None,
+            );
             return None;
         }
         let mut result_fields = Vec::new();
@@ -2298,6 +2647,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`decide` requires an `as` binding".to_owned(),
                 Some(
@@ -2324,6 +2674,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("credential") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `credential` after `mint`".to_owned(),
                 Some("write `mint credential from <parent> { … } as token`".to_owned()),
@@ -2333,6 +2684,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("from") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `from <parent>` after `mint credential`".to_owned(),
                 Some(
@@ -2347,6 +2699,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `{` to open the exchange block".to_owned(),
                 Some(
@@ -2378,6 +2731,7 @@ impl<'a> BodyParser<'a> {
                         _ => {
                             let span = self.span_here();
                             self.error(
+                                diagnostic_code!("parse.unexpected_token"),
                                 span,
                                 "expected an HTTP method after `at`".to_owned(),
                                 Some("write `at POST \"https://issuer/token\"`".to_owned()),
@@ -2388,6 +2742,7 @@ impl<'a> BodyParser<'a> {
                     let Some(Tok::Str(url)) = self.peek().map(|t| t.tok.clone()) else {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             format!("expected a quoted URL after `at {method}`"),
                             None,
@@ -2403,6 +2758,7 @@ impl<'a> BodyParser<'a> {
                     let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             "expected a quoted header name after `header`".to_owned(),
                             Some("write `header \"Authorization\" basic stripe_api`".to_owned()),
@@ -2443,6 +2799,7 @@ impl<'a> BodyParser<'a> {
                     if body.is_some() {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("construct.cardinality_conflict"),
                             span,
                             "an exchange carries at most one `body`".to_owned(),
                             None,
@@ -2457,6 +2814,7 @@ impl<'a> BodyParser<'a> {
                     if !self.consume_ident("at") {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             "expected `at \"<path>\"` after `token`".to_owned(),
                             Some("write `token at \"$.access_token\"`".to_owned()),
@@ -2466,6 +2824,7 @@ impl<'a> BodyParser<'a> {
                     let Some(Tok::Str(path)) = self.peek().map(|t| t.tok.clone()) else {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             "expected a quoted path after `token at`".to_owned(),
                             None,
@@ -2482,6 +2841,7 @@ impl<'a> BodyParser<'a> {
                 _ => {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         "expected `at`, `header`, `body`, `token at` or `public` inside an \
                          exchange block"
@@ -2495,6 +2855,7 @@ impl<'a> BodyParser<'a> {
         let Some((method, url)) = method_url else {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "a mint exchange must name its endpoint".to_owned(),
                 Some("add `at POST \"https://issuer/token\"` inside the block".to_owned()),
@@ -2507,6 +2868,7 @@ impl<'a> BodyParser<'a> {
         let Some(token_path) = token_path else {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "a mint exchange must say where the token is".to_owned(),
                 Some("add `token at \"$.access_token\"` inside the block".to_owned()),
@@ -2552,6 +2914,7 @@ impl<'a> BodyParser<'a> {
             _ => {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected an HTTP method after `request`".to_owned(),
                     Some(
@@ -2565,6 +2928,7 @@ impl<'a> BodyParser<'a> {
         let Some(Tok::Str(url)) = self.peek().map(|t| t.tok.clone()) else {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 format!("expected a quoted URL after `request {method}`"),
                 Some(format!(
@@ -2591,6 +2955,7 @@ impl<'a> BodyParser<'a> {
                         let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
                             let span = self.span_here();
                             self.error(
+                                diagnostic_code!("parse.unexpected_token"),
                                 span,
                                 "expected a quoted header name after `header`".to_owned(),
                                 Some(
@@ -2635,6 +3000,7 @@ impl<'a> BodyParser<'a> {
                         if body.is_some() {
                             let span = self.span_here();
                             self.error(
+                                diagnostic_code!("construct.cardinality_conflict"),
                                 span,
                                 "a request carries at most one `body`".to_owned(),
                                 None,
@@ -2647,6 +3013,7 @@ impl<'a> BodyParser<'a> {
                     _ => {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             "expected `header` or `body` inside a request block".to_owned(),
                             None,
@@ -2662,6 +3029,7 @@ impl<'a> BodyParser<'a> {
             if !self.consume_ident("with") {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected `with <credential>` after `signed`".to_owned(),
                     Some("write `} signed with release_signing as put`".to_owned()),
@@ -2739,6 +3107,7 @@ impl<'a> BodyParser<'a> {
                 if !self.consume_ident(connective) {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         format!("expected `{connective}` after `{}`", spec.keyword),
                         None,
@@ -2761,14 +3130,28 @@ impl<'a> BodyParser<'a> {
             for field in &block_fields {
                 let Some(field_spec) = payload.iter().find(|f| f.name == field.name) else {
                     self.error(
+                        diagnostic_code!("construct.unknown_clause"),
                         field.span,
                         format!("unknown `{}` block field `{}`", spec.keyword, field.name),
-                        None,
+                        Some(crate::suggest_then_keyword(
+                            &field.name,
+                            payload.iter().map(|f| f.name),
+                            format!(
+                                "`{}` block fields are {}",
+                                spec.keyword,
+                                payload
+                                    .iter()
+                                    .map(|f| format!("`{}`", f.name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )),
                     );
                     return None;
                 };
                 let FieldValue::Expr { source, .. } = &field.value else {
                     self.error(
+                        diagnostic_code!("construct.invalid_clause_value"),
                         field.span,
                         format!(
                             "`{}` field `{}` must be an expression",
@@ -2788,6 +3171,7 @@ impl<'a> BodyParser<'a> {
                 if !seen.contains(&required.name) {
                     let span = self.span_from(start);
                     self.error(
+                        diagnostic_code!("construct.missing_requirement"),
                         span,
                         format!("`{}` requires a `{}` field", spec.keyword, required.name),
                         None,
@@ -2806,6 +3190,7 @@ impl<'a> BodyParser<'a> {
             BindingMode::Required if binding.is_none() => {
                 let span = self.span_from(start);
                 self.error(
+                    diagnostic_code!("construct.missing_requirement"),
                     span,
                     format!("`{}` requires an `as` binding", spec.keyword),
                     None,
@@ -2815,6 +3200,7 @@ impl<'a> BodyParser<'a> {
             BindingMode::None if binding.is_some() => {
                 let span = self.span_from(start);
                 self.error(
+                    diagnostic_code!("construct.incompatible_clause"),
                     span,
                     format!("`{}` does not take an `as` binding", spec.keyword),
                     None,
@@ -2850,7 +3236,7 @@ impl<'a> BodyParser<'a> {
         // silently decoding every format as text.
         if !matches!(format.as_str(), "text" | "markdown") {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
                     "`read {format}` is not supported in v0 — `read` decodes only `text` or `markdown` bodies"
@@ -2864,6 +3250,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("from") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `from` after read format".to_owned(),
                 Some(usage),
@@ -2874,6 +3261,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("at") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `at` after read store".to_owned(),
                 Some(usage),
@@ -2890,6 +3278,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`read` requires an `as` binding".to_owned(),
                 Some(usage),
@@ -2921,7 +3310,7 @@ impl<'a> BodyParser<'a> {
         // Rendering typed values as json/csv is `export` (deferred, fact-batch).
         if !matches!(format.as_str(), "text" | "markdown") {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
                     "`write {format}` is not supported in v0 — `write` renders only `text` or `markdown` bodies"
@@ -2935,6 +3324,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("to") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `to` after write format".to_owned(),
                 Some(usage),
@@ -2945,6 +3335,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("at") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `at` after write store".to_owned(),
                 Some(usage),
@@ -2969,11 +3360,16 @@ impl<'a> BodyParser<'a> {
                 }
                 other => {
                     self.error(
+                        diagnostic_code!("construct.unknown_clause"),
                         field.span,
                         format!(
                             "unknown `write` block field `{other}` (expected `body` or `mode`)"
                         ),
-                        Some(usage.clone()),
+                        Some(crate::suggest_then_keyword(
+                            other,
+                            ["body", "mode"],
+                            usage.clone(),
+                        )),
                     );
                     return None;
                 }
@@ -2982,6 +3378,7 @@ impl<'a> BodyParser<'a> {
         let Some(body) = body else {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`write` requires a `body` field".to_owned(),
                 Some(usage),
@@ -2991,19 +3388,24 @@ impl<'a> BodyParser<'a> {
         // The mode is required: "no silent overwrite" (spec/files.md).
         let Some(mode) = mode else {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.missing_requirement"), 
                 span,
                 "`write` requires an explicit `mode` (create/replace/upsert/append) — no silent overwrite".to_owned(),
                 Some(usage),
             );
             return None;
         };
-        if !matches!(mode.as_str(), "create" | "replace" | "upsert" | "append") {
+        if !WRITE_MODES.contains(&mode.as_str()) {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.unknown_option"),
                 span,
                 format!("unknown write mode `{mode}` (expected create/replace/upsert/append)"),
-                Some(usage),
+                Some(crate::suggest_then_keyword(
+                    &mode,
+                    WRITE_MODES.iter().copied(),
+                    usage,
+                )),
             );
             return None;
         }
@@ -3016,6 +3418,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`write` requires an `as` binding".to_owned(),
                 Some(usage),
@@ -3047,7 +3450,7 @@ impl<'a> BodyParser<'a> {
         // v0 `import` decodes the structured row codecs into typed facts.
         if !matches!(format.as_str(), "jsonl" | "json" | "csv") {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
                     "`import {format}` is not supported in v0 — `import` decodes `jsonl`, `json`, or `csv`"
@@ -3060,6 +3463,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("from") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `from` after import schema".to_owned(),
                 Some(usage),
@@ -3070,6 +3474,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("at") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `at` after import store".to_owned(),
                 Some(usage),
@@ -3086,6 +3491,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`import` requires an `as` binding".to_owned(),
                 Some(usage),
@@ -3116,7 +3522,7 @@ impl<'a> BodyParser<'a> {
         let format = self.ident_text("export format after `export`")?;
         if !matches!(format.as_str(), "jsonl" | "json" | "csv") {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.unknown_option"), 
                 span,
                 format!(
                     "`export {format}` is not supported in v0 — `export` writes `jsonl`, `json`, or `csv`"
@@ -3129,6 +3535,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("to") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `to` after export schema".to_owned(),
                 Some(usage),
@@ -3139,6 +3546,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("at") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `at` after export store".to_owned(),
                 Some(usage),
@@ -3146,9 +3554,11 @@ impl<'a> BodyParser<'a> {
             return None;
         }
         let (path, _) = self.parse_value_expression()?;
+        let opened_at = self.span_here();
         if !self.consume_sym('{') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `{` to open the export block".to_owned(),
                 Some(usage),
@@ -3166,7 +3576,13 @@ impl<'a> BodyParser<'a> {
             }
             if self.peek().is_none() {
                 let span = self.span_here();
-                self.error(span, "unclosed export block".to_owned(), Some(usage));
+                self.unclosed(
+                    span,
+                    opened_at,
+                    "unclosed export block".to_owned(),
+                    Some(usage),
+                    "this export block is opened here",
+                );
                 return None;
             }
             if self.consume_ident("where") {
@@ -3177,29 +3593,46 @@ impl<'a> BodyParser<'a> {
                 mode = Some(value);
             } else {
                 let span = self.span_here();
+                // The message never names the offending word — the caret does —
+                // so the word is read here only to measure it. `peek` does not
+                // consume, so error RECOVERY is unchanged.
+                let written = match self.peek().map(|token| &token.tok) {
+                    Some(Tok::Ident(word)) => word.clone(),
+                    _ => String::new(),
+                };
                 self.error(
+                    diagnostic_code!("construct.unknown_clause"),
                     span,
                     "unknown export block field (expected `where` or `mode`)".to_owned(),
-                    Some(usage.clone()),
+                    Some(crate::suggest_then_keyword(
+                        &written,
+                        ["where", "mode"],
+                        usage.clone(),
+                    )),
                 );
                 self.recover();
             }
         }
         let Some(mode) = mode else {
             let span = self.span_from(start);
-            self.error(
+            self.error(diagnostic_code!("construct.missing_requirement"), 
                 span,
                 "`export` requires an explicit `mode` (create/replace/upsert/append) — no silent overwrite".to_owned(),
                 Some(usage),
             );
             return None;
         };
-        if !matches!(mode.as_str(), "create" | "replace" | "upsert" | "append") {
+        if !WRITE_MODES.contains(&mode.as_str()) {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.unknown_option"),
                 span,
                 format!("unknown write mode `{mode}` (expected create/replace/upsert/append)"),
-                Some(usage),
+                Some(crate::suggest_then_keyword(
+                    &mode,
+                    WRITE_MODES.iter().copied(),
+                    usage,
+                )),
             );
             return None;
         }
@@ -3212,6 +3645,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`export` requires an `as` binding".to_owned(),
                 Some(usage),
@@ -3280,6 +3714,7 @@ impl<'a> BodyParser<'a> {
                     self.pos += 1;
                     if !is_iso8601_instant(&literal) {
                         self.error(
+                            diagnostic_code!("type.invalid_literal"),
                             span,
                             format!("invalid time literal `{literal}`"),
                             Some(
@@ -3308,7 +3743,7 @@ impl<'a> BodyParser<'a> {
                     text
                 }
                 _ => {
-                    self.error(
+                    self.error(diagnostic_code!("parse.unexpected_token"), 
                         span,
                         "expected a time literal or path after `timer until`".to_owned(),
                         Some("e.g. `timer until \"2026-06-15T09:00:00Z\" as deadline` or `timer until ticket.dueAt as deadline`".to_owned()),
@@ -3325,6 +3760,7 @@ impl<'a> BodyParser<'a> {
             if binding.is_none() {
                 let span = self.span_from(start);
                 self.error(
+                    diagnostic_code!("construct.missing_requirement"),
                     span,
                     "`timer` requires an `as` binding".to_owned(),
                     Some("rules react to the timer with `after <binding> succeeds`".to_owned()),
@@ -3345,6 +3781,7 @@ impl<'a> BodyParser<'a> {
         }
         let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected a duration after `timer`".to_owned(),
                 Some(
@@ -3357,6 +3794,7 @@ impl<'a> BodyParser<'a> {
         self.pos += 1;
         let Some(duration_seconds) = parse_short_duration_seconds(&value).filter(|s| *s > 0) else {
             self.error(
+                diagnostic_code!("type.invalid_literal"),
                 span,
                 format!("invalid timer duration `{value}`"),
                 Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -3372,6 +3810,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`timer` requires an `as` binding".to_owned(),
                 Some("rules react to the timer with `after <binding> succeeds`".to_owned()),
@@ -3412,15 +3851,18 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("keep") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `keep [<field>, …]` after the binding".to_owned(),
                 Some("write `redact customer keep [id, status] as safe`".to_owned()),
             );
             return None;
         }
+        let opened_at = self.span_here();
         if !self.consume_sym('[') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `[` to open the kept-field list".to_owned(),
                 Some("write `keep [id, status]`".to_owned()),
@@ -3434,10 +3876,12 @@ impl<'a> BodyParser<'a> {
             }
             if self.peek().is_none() {
                 let span = self.span_here();
-                self.error(
+                self.unclosed(
                     span,
+                    opened_at,
                     "unclosed kept-field list".to_owned(),
                     Some("add `]`".to_owned()),
+                    "this kept-field list is opened here",
                 );
                 return None;
             }
@@ -3446,6 +3890,7 @@ impl<'a> BodyParser<'a> {
             if !self.consume_sym(',') && !self.at_sym(']') {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected `,` or `]` in the kept-field list".to_owned(),
                     None,
@@ -3456,6 +3901,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("as") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`redact` requires an `as <binding>`".to_owned(),
                 Some("write `redact customer keep [id] as safe`".to_owned()),
@@ -3466,6 +3912,7 @@ impl<'a> BodyParser<'a> {
         if keep.is_empty() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`redact` must keep at least one field".to_owned(),
                 Some("a redaction that keeps nothing has no value to release".to_owned()),
@@ -3493,6 +3940,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("into") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `into <Type>` after the binding".to_owned(),
                 Some(
@@ -3507,6 +3955,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("as") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`declassify` requires an `as <binding>`".to_owned(),
                 Some("write `declassify patient into Receipt as receipt`".to_owned()),
@@ -3532,6 +3981,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("for") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `for <key>` after the lease name".to_owned(),
                 Some("write `acquire deploy_slot for r.env as slot`".to_owned()),
@@ -3545,6 +3995,7 @@ impl<'a> BodyParser<'a> {
             if !self.consume_ident("ttl") {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected `ttl` after `until`".to_owned(),
                     Some("`acquire ... until ttl` is the fire-and-forget form".to_owned()),
@@ -3562,6 +4013,7 @@ impl<'a> BodyParser<'a> {
             let span = self.span_here();
             let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected a duration after `wait`".to_owned(),
                     Some("use `<n><unit>` with unit s, m, h, or d, e.g. `wait 30s`".to_owned()),
@@ -3573,6 +4025,7 @@ impl<'a> BodyParser<'a> {
                 Some(seconds) if seconds > 0 => wait_seconds = Some(seconds),
                 _ => {
                     self.error(
+                        diagnostic_code!("type.invalid_literal"),
                         span,
                         format!("invalid wait duration `{value}`"),
                         Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -3590,6 +4043,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`acquire` requires an `as` binding".to_owned(),
                 Some(
@@ -3630,6 +4084,7 @@ impl<'a> BodyParser<'a> {
             let span = self.span_here();
             let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected a duration after `until`".to_owned(),
                     Some("use `<n><unit>` with unit s, m, h, or d, e.g. `until 300s`".to_owned()),
@@ -3641,6 +4096,7 @@ impl<'a> BodyParser<'a> {
                 Some(seconds) if seconds > 0 => ttl_seconds = Some(seconds),
                 _ => {
                     self.error(
+                        diagnostic_code!("type.invalid_literal"),
                         span,
                         format!("invalid ttl duration `{value}`"),
                         Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -3658,6 +4114,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`renew` requires an `as` binding".to_owned(),
                 Some(
@@ -3688,6 +4145,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("to") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `to <ledger>` after the entry payload".to_owned(),
                 Some("write `append Decision { ... } to decisions`".to_owned()),
@@ -3730,6 +4188,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("for") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `for <key>` after the counter name".to_owned(),
                 Some(
@@ -3743,6 +4202,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("amount") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `amount <expr>` after the counter key".to_owned(),
                 Some(
@@ -3761,6 +4221,7 @@ impl<'a> BodyParser<'a> {
             _ => {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected a number or path after `amount`".to_owned(),
                     None,
@@ -3777,6 +4238,7 @@ impl<'a> BodyParser<'a> {
         if binding.is_none() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 "`consume` requires an `as` binding".to_owned(),
                 Some(
@@ -3811,6 +4273,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("signal") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unsupported_syntax"),
                 span,
                 "the bare `emit <name>` statement was removed from the language; \
                  `emit` must be followed by `signal` or `milestone`"
@@ -3823,6 +4286,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("to") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `to <target>` after the signal name".to_owned(),
                 Some("write `emit signal deploy.finished to peer.id { ... }`".to_owned()),
@@ -3871,6 +4335,7 @@ impl<'a> BodyParser<'a> {
         let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected a quoted milestone name after `milestone`".to_owned(),
                 Some(
@@ -3925,6 +4390,7 @@ impl<'a> BodyParser<'a> {
                 if !self.at_ident("with") {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         "expected `with <binding>` after exec capability name".to_owned(),
                         Some(format!(
@@ -3937,6 +4403,7 @@ impl<'a> BodyParser<'a> {
                 let Some(Tok::Ident(stdin_binding)) = self.peek().map(|t| t.tok.clone()) else {
                     let span = self.span_here();
                     self.error(
+                        diagnostic_code!("parse.unexpected_token"),
                         span,
                         "expected a record binding after `with`".to_owned(),
                         Some(format!(
@@ -3953,7 +4420,7 @@ impl<'a> BodyParser<'a> {
             }
             _ => {
                 let span = self.span_here();
-                self.error(
+                self.error(diagnostic_code!("parse.unexpected_token"), 
                     span,
                     "expected a command string or capability name after `exec`".to_owned(),
                     Some(
@@ -3977,7 +4444,7 @@ impl<'a> BodyParser<'a> {
             };
             let Some(Tok::Ident(schema)) = self.peek().map(|t| t.tok.clone()) else {
                 let span = self.span_here();
-                self.error(
+                self.error(diagnostic_code!("parse.unexpected_token"), 
                     span,
                     "expected a schema name after `->`".to_owned(),
                     Some(
@@ -4008,6 +4475,7 @@ impl<'a> BodyParser<'a> {
             Some(parse) if parse.each && binding.is_some() => {
                 let span = self.span_from(start);
                 self.error(
+                    diagnostic_code!("construct.incompatible_clause"),
                     span,
                     "`-> each` produces a stream of facts, not a single binding".to_owned(),
                     Some("drop the `as` binding and react with `when <Schema> as item`".to_owned()),
@@ -4015,7 +4483,7 @@ impl<'a> BodyParser<'a> {
             }
             Some(parse) if !parse.each && binding.is_none() => {
                 let span = self.span_from(start);
-                self.error(
+                self.error(diagnostic_code!("construct.missing_requirement"), 
                     span,
                     "`->` without `each` parses one value and needs an `as` binding".to_owned(),
                     Some("write `exec \"report.sh\" -> Report as x` and read it with `after x succeeds as r`".to_owned()),
@@ -4050,6 +4518,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("credential") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `credential` after `obtain`",
                 Some("write `obtain credential <name> into <tracker> { … }`".to_owned()),
@@ -4060,6 +4529,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("into") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `into <tracker>` after the credential name",
                 Some(
@@ -4098,6 +4568,7 @@ impl<'a> BodyParser<'a> {
         if !self.consume_ident("issue") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 "expected `issue` after `file`",
                 Some("write `file issue into <tracker> { ... }`".to_owned()),
@@ -4106,7 +4577,12 @@ impl<'a> BodyParser<'a> {
         }
         if !self.consume_ident("into") {
             let span = self.span_here();
-            self.error(span, "expected `into <tracker>` after `file issue`", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `into <tracker>` after `file issue`",
+                None,
+            );
             return None;
         }
         let queue = self.ident_text("tracker name")?;
@@ -4134,6 +4610,7 @@ impl<'a> BodyParser<'a> {
         if self.at_ident("with") {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unsupported_syntax"),
                 span,
                 "`claim <issue> with ...` is not supported".to_owned(),
                 Some("declare a `tracker` and write `claim <issue> [ttl <dur>] [as x]`".to_owned()),
@@ -4149,6 +4626,7 @@ impl<'a> BodyParser<'a> {
             let span = self.span_here();
             let Some(Tok::Number(value)) = self.peek().map(|t| t.tok.clone()) else {
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected a duration after `ttl`".to_owned(),
                     Some("use `<n><unit>` with unit s, m, h, or d, e.g. `ttl 30m`".to_owned()),
@@ -4160,6 +4638,7 @@ impl<'a> BodyParser<'a> {
                 Some(seconds) if seconds > 0 => ttl_seconds = Some(seconds),
                 _ => {
                     self.error(
+                        diagnostic_code!("type.invalid_literal"),
                         span,
                         format!("invalid ttl duration `{value}`"),
                         Some("use `<n><unit>` with unit s, m, h, or d".to_owned()),
@@ -4250,6 +4729,7 @@ impl<'a> BodyParser<'a> {
         if !self.at_sym('{') {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("parse.unexpected_token"),
                 span,
                 format!("expected `{{` to open the `{keyword}` region"),
                 Some(format!(
@@ -4268,6 +4748,7 @@ impl<'a> BodyParser<'a> {
         if condition.is_empty() {
             let span = self.span_from(start);
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 format!("`{keyword}` requires a condition"),
                 Some("the condition is a pure query expression, like a guard".to_owned()),
@@ -4279,22 +4760,21 @@ impl<'a> BodyParser<'a> {
         let body_content_start = self
             .tokens
             .get(self.pos)
-            .map(|token| self.base + token.start)
-            .unwrap_or_else(|| self.base + self.tokens[body_open].end);
-        let body = self.parse_statements(true);
+            .map(|token| token.start)
+            .unwrap_or_else(|| self.tokens[body_open].end);
+        let opened_at = self.span_of_token(body_open);
+        let body = self.parse_statements(Some(opened_at));
         // parse_statements consumed the closing `}` (token before self.pos).
         let body_content_end = self
             .tokens
             .get(self.pos.saturating_sub(1))
-            .map(|token| self.base + token.start)
+            .map(|token| token.start)
             .unwrap_or(body_content_start);
-        let body_span = SourceSpan {
-            start: body_content_start,
-            end: body_content_end,
-        };
+        let body_text_range = body_content_start..body_content_end;
         if !(self.consume_ident("on") && self.consume_ident("lapse")) {
             let span = self.span_here();
             self.error(
+                diagnostic_code!("construct.missing_requirement"),
                 span,
                 format!("a `{keyword}` region requires its `on lapse {{ … }}` arm"),
                 Some(
@@ -4312,33 +4792,38 @@ impl<'a> BodyParser<'a> {
         };
         if !self.consume_sym('{') {
             let span = self.span_here();
-            self.error(span, "expected `{` to open the `on lapse` arm", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `{` to open the `on lapse` arm",
+                None,
+            );
             return None;
         }
         let lapse_open = self.pos - 1;
         let lapse_content_start = self
             .tokens
             .get(self.pos)
-            .map(|token| self.base + token.start)
-            .unwrap_or_else(|| self.base + self.tokens[lapse_open].end);
-        let lapse_body = self.parse_statements(true);
+            .map(|token| token.start)
+            .unwrap_or_else(|| self.tokens[lapse_open].end);
+        let opened_at = self.span_of_token(lapse_open);
+        let lapse_body = self.parse_statements(Some(opened_at));
         let lapse_content_end = self
             .tokens
             .get(self.pos.saturating_sub(1))
-            .map(|token| self.base + token.start)
+            .map(|token| token.start)
             .unwrap_or(lapse_content_start);
+        let (region_start, region_end) = self.range_from(start);
         Some(BodyStmt::Region(RegionBlock {
             until,
             condition,
             body,
             lapse_binding,
             lapse_body,
-            body_span,
-            lapse_span: SourceSpan {
-                start: lapse_content_start,
-                end: lapse_content_end,
-            },
-            span: self.span_from(start),
+            text_range: region_start..region_end,
+            body_text_range,
+            lapse_text_range: lapse_content_start..lapse_content_end,
+            span: self.base.span(region_start, region_end),
         }))
     }
 
@@ -4360,6 +4845,7 @@ impl<'a> BodyParser<'a> {
                     let Some(Tok::Str(name)) = self.peek().map(|t| t.tok.clone()) else {
                         let span = self.span_here();
                         self.error(
+                            diagnostic_code!("parse.unexpected_token"),
                             span,
                             "expected a quoted milestone name after `reaches`".to_owned(),
                             Some("write `after p reaches \"canary_live\" as m { ... }`".to_owned()),
@@ -4375,7 +4861,12 @@ impl<'a> BodyParser<'a> {
                 "times" => {
                     if !self.consume_ident("out") {
                         let span = self.span_here();
-                        self.error(span, "expected `out` after `times`", None);
+                        self.error(
+                            diagnostic_code!("parse.unexpected_token"),
+                            span,
+                            "expected `out` after `times`",
+                            None,
+                        );
                         return None;
                     }
                     AfterPredicate::TimedOut
@@ -4390,7 +4881,7 @@ impl<'a> BodyParser<'a> {
                 "stranded" => AfterPredicate::Stranded,
                 other => {
                     let span = self.span_from(start);
-                    self.error(
+                    self.error(diagnostic_code!("effect.unsupported_predicate"), 
                         span,
                         format!("unsupported `after` predicate `{other}`"),
                         Some(
@@ -4404,6 +4895,7 @@ impl<'a> BodyParser<'a> {
             _ => {
                 let span = self.span_here();
                 self.error(
+                    diagnostic_code!("parse.unexpected_token"),
                     span,
                     "expected `succeeds`, `fails`, `completes`, `times out`, or `cancelled`",
                     None,
@@ -4416,12 +4908,18 @@ impl<'a> BodyParser<'a> {
         } else {
             None
         };
+        let opened_at = self.span_here();
         if !self.consume_sym('{') {
             let span = self.span_here();
-            self.error(span, "expected `{` to open the `after` block", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `{` to open the `after` block",
+                None,
+            );
             return None;
         }
-        let body = self.parse_statements(true);
+        let body = self.parse_statements(Some(opened_at));
         Some(BodyStmt::After(AfterBlock {
             binding,
             predicate,
@@ -4436,9 +4934,15 @@ impl<'a> BodyParser<'a> {
         let start = self.pos;
         self.pos += 1; // case
         let scrutinee = self.ident_text("case scrutinee path")?;
+        let opened_at = self.span_here();
         if !self.consume_sym('{') {
             let span = self.span_here();
-            self.error(span, "expected `{` to open the `case` block", None);
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected `{` to open the `case` block",
+                None,
+            );
             return None;
         }
         let mut branches = Vec::new();
@@ -4448,7 +4952,13 @@ impl<'a> BodyParser<'a> {
             }
             if self.peek().is_none() {
                 let span = self.span_here();
-                self.error(span, "unclosed `case` block", Some("add `}`".to_owned()));
+                self.unclosed(
+                    span,
+                    opened_at,
+                    "unclosed `case` block",
+                    Some("add `}`".to_owned()),
+                    "this `case` block is opened here",
+                );
                 break;
             }
             let branch_start = self.pos;
@@ -4457,7 +4967,12 @@ impl<'a> BodyParser<'a> {
                 Some(Tok::Str(value)) => format!("{value:?}"),
                 _ => {
                     let span = self.span_here();
-                    self.error(span, "expected a case pattern", None);
+                    self.error(
+                        diagnostic_code!("parse.unexpected_token"),
+                        span,
+                        "expected a case pattern",
+                        None,
+                    );
                     self.recover();
                     continue;
                 }
@@ -4475,6 +4990,7 @@ impl<'a> BodyParser<'a> {
                         _ => {
                             let span = self.span_here();
                             self.error(
+                                diagnostic_code!("parse.unexpected_token"),
                                 span,
                                 "expected a binding name after `as`".to_owned(),
                                 Some("write `Variant as payload => { ... }`".to_owned()),
@@ -4510,17 +5026,28 @@ impl<'a> BodyParser<'a> {
             };
             if !matches!(self.advance().map(|t| t.tok), Some(Tok::FatArrow)) {
                 let span = self.span_here();
-                self.error(span, "expected `=>` after case pattern", None);
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    span,
+                    "expected `=>` after case pattern",
+                    None,
+                );
                 self.recover();
                 continue;
             }
+            let opened_at = self.span_here();
             if !self.consume_sym('{') {
                 let span = self.span_here();
-                self.error(span, "expected `{` to open the case branch", None);
+                self.error(
+                    diagnostic_code!("parse.unexpected_token"),
+                    span,
+                    "expected `{` to open the case branch",
+                    None,
+                );
                 self.recover();
                 continue;
             }
-            let body = self.parse_statements(true);
+            let body = self.parse_statements(Some(opened_at));
             branches.push(CaseBranch {
                 pattern,
                 binding,
@@ -4577,6 +5104,103 @@ impl<'a> BodyParser<'a> {
     }
 }
 
+/// The file write modes (`write`/`export`). One table for two sites that used to
+/// carry the same four strings in two `matches!` arms — "no silent overwrite"
+/// (spec/files.md) means the same four everywhere or it means nothing.
+const WRITE_MODES: &[&str] = &["create", "replace", "upsert", "append"];
+
+/// Every built-in rule-body statement verb, as `parse_statement` dispatches it.
+///
+/// NOT the same set as [`STATEMENT_KEYWORDS`] below, and the two must not be
+/// merged: that one is the error-RECOVERY resync set, which deliberately
+/// includes block words (`when`, `on`, `else`, `then`) that are not statements.
+/// This one is the vocabulary a misspelled verb is measured against, so it holds
+/// exactly the arms — guarded by the `STATEMENT-ARMS` sentinels and
+/// `rule_body_statement_keywords_lists_every_parsed_verb`.
+///
+/// The package effect verbs are NOT here: they live in
+/// `EFFECT_OPERATION_GRAMMAR` and are chained on at the two use sites, because
+/// which of them are in scope depends on the program.
+pub(crate) const RULE_BODY_STATEMENT_KEYWORDS: &[&str] = &[
+    "record",
+    "consume",
+    "done",
+    "during",
+    "until",
+    "tell",
+    "coerce",
+    "prompt",
+    "decide",
+    "call",
+    "request",
+    "mint",
+    "invoke",
+    "read",
+    "write",
+    "import",
+    "export",
+    "after",
+    "case",
+    "complete",
+    "fail",
+    "timer",
+    "cancel",
+    "exec",
+    "obtain",
+    "file",
+    "claim",
+    "release",
+    "finish",
+    "acquire",
+    "renew",
+    "append",
+    "emit",
+    "redact",
+    "declassify",
+];
+
+/// The built-in verbs and the package effect verbs, as one prose list — the
+/// second half of every "statements start with …" hint.
+///
+/// The two halves stay APART in the sentence, as the hand-written text this
+/// replaced had them: "… redact, declassify, or a package effect verb (seal,
+/// open, recall, …)". Flattening them into one comma-separated run is the
+/// information the generated list lost. A package effect verb is only spellable
+/// when the program has `use`d the package that defines it, so a reader who sees
+/// `recall` sitting among the built-ins has been told something false about
+/// where it comes from — and the ones they can reach depend on their own `use`
+/// lines, which is exactly what the parenthesis signals.
+/// The full rule-body statement vocabulary — built-in verbs then package effect
+/// verbs — as the two suggestion sites measure a misspelling against it.
+///
+/// One function rather than the chain written out twice, so the sweep in
+/// `closed_vocabularies_do_not_suggest_for_common_english` measures exactly what
+/// the compiler suggests from and cannot drift away from it.
+pub(crate) fn statement_keyword_vocabulary() -> Vec<&'static str> {
+    RULE_BODY_STATEMENT_KEYWORDS
+        .iter()
+        .copied()
+        .chain(EFFECT_OPERATION_GRAMMAR.iter().map(|spec| spec.keyword))
+        .collect()
+}
+
+fn statement_vocabulary() -> String {
+    let package_verbs = EFFECT_OPERATION_GRAMMAR
+        .iter()
+        .map(|spec| spec.keyword)
+        .collect::<Vec<_>>();
+    if package_verbs.is_empty() {
+        return crate::prose_list(RULE_BODY_STATEMENT_KEYWORDS.iter().copied(), "or");
+    }
+    // The package half IS the last alternative, so it carries the `or` and the
+    // built-in half stays a plain run.
+    format!(
+        "{}, or a package effect verb ({})",
+        RULE_BODY_STATEMENT_KEYWORDS.join(", "),
+        package_verbs.join(", ")
+    )
+}
+
 const STATEMENT_KEYWORDS: &[&str] = &[
     "record",
     "done",
@@ -4612,6 +5236,94 @@ const STATEMENT_KEYWORDS: &[&str] = &[
     "redact",
     "declassify",
 ];
+
+#[cfg(test)]
+mod line_map_tests {
+    use super::*;
+
+    /// `a`/`c` are copied from a file 100 bytes in; `GEN` is a generated line
+    /// spliced between them, and `c` comes from a DIFFERENT place in the file.
+    fn map() -> (String, BodyLineMap) {
+        let text = "alpha\nGEN\ngamma\n".to_owned();
+        let map = BodyLineMap::new(&text, vec![Some(100), None, Some(200)]).expect("map");
+        (text, map)
+    }
+
+    #[test]
+    fn a_copied_line_carries_its_column_across() {
+        let (_, map) = map();
+        assert_eq!(
+            map.span(1, 5),
+            Some(SourceSpan {
+                start: 101,
+                end: 105
+            })
+        );
+        assert_eq!(
+            map.span(10, 15),
+            Some(SourceSpan {
+                start: 200,
+                end: 205
+            })
+        );
+    }
+
+    #[test]
+    fn a_generated_line_has_no_source_position() {
+        let (_, map) = map();
+        assert_eq!(map.span(6, 9), None);
+        assert_eq!(map.source_offset(7), None);
+    }
+
+    #[test]
+    fn a_range_across_discontiguous_runs_degrades() {
+        let (_, map) = map();
+        // `alpha` through `gamma` crosses the generated line.
+        assert_eq!(map.span(0, 15), None);
+        // Two copied lines that are NOT adjacent in the file degrade too: the
+        // bytes between them in the output are not the bytes between them in
+        // the file.
+        let text = "alpha\ngamma\n";
+        let split = BodyLineMap::new(text, vec![Some(100), Some(200)]).expect("map");
+        assert_eq!(split.span(0, 11), None);
+        // Adjacent runs compose into one span.
+        let joined = BodyLineMap::new(text, vec![Some(100), Some(106)]).expect("map");
+        assert_eq!(
+            joined.span(0, 11),
+            Some(SourceSpan {
+                start: 100,
+                end: 111
+            })
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_offset_degrades_rather_than_reading_a_neighbour() {
+        let (text, map) = map();
+        assert_eq!(map.span(text.len() + 1, text.len() + 2), None);
+    }
+
+    #[test]
+    fn an_all_generated_text_has_no_map_at_all() {
+        assert_eq!(BodyLineMap::new("a\nb\n", vec![None, None]), None);
+        // A count that disagrees with the text is a rewriter bug, and the whole
+        // text degrades rather than misattributing a line.
+        assert_eq!(BodyLineMap::new("a\nb\n", vec![Some(0)]), None);
+    }
+
+    #[test]
+    fn crlf_lines_keep_their_bytes_and_their_offsets() {
+        let lines = raw_body_lines("a\r\nb\r\nc");
+        assert_eq!(lines, vec![("a\r", 0), ("b\r", 3), ("c", 6)]);
+        // Untouched lines rejoined with `\n` reproduce the original bytes.
+        let rejoined = lines
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rejoined, "a\r\nb\r\nc");
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,6 @@
+error[construct.unknown_clause]: unknown rule body statement `recrod`
+   --> examples/invalid/misspelled-keyword.whip:16:3
+   |
+16 |   recrod Done { note "ok" }
+   |   ^^^^^^
+   = help: did you mean `record`? statements start with record, consume, done, during, until, tell, coerce, prompt, decide, call, request, mint, invoke, read, write, import, export, after, case, complete, fail, timer, cancel, exec, obtain, file, claim, release, finish, acquire, renew, append, emit, redact, declassify, or a package effect verb (seal, open, recall, learn, curate, send, promote, undo, transport)

@@ -1,0 +1,14 @@
+error[expr.unreachable_case_branch]: rule `route` has an unreachable case branch after the `_` wildcard
+   --> examples/invalid/unreachable-case-branch.whip:31:5
+   |
+31 |     "open" => {
+   |     ^^^^^^
+   = note: this unguarded wildcard already matches every remaining value (examples/invalid/unreachable-case-branch.whip:26:5)
+   = help: move this branch before the wildcard, or remove it
+error[expr.unreachable_case_branch]: rule `route` has an unreachable case branch after the `_` wildcard
+   --> examples/invalid/unreachable-case-branch.whip:36:5
+   |
+36 |     "done" => {
+   |     ^^^^^^
+   = note: this unguarded wildcard already matches every remaining value (examples/invalid/unreachable-case-branch.whip:26:5)
+   = help: move this branch before the wildcard, or remove it

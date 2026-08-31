@@ -1,0 +1,37 @@
+// A one-keystroke typo in an agent's provider. Provider kinds come from package
+// manifests rather than from a compiled-in list, so the refusal is "no manifest
+// contributes this kind" — and it now underlines the agent that names it rather
+// than the top of the file.
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Issue {
+  id string
+}
+
+table issues as Issue [
+  { id "ISS-1" }
+]
+
+agent triager {
+  provider fixure
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  tell triager "summarize {{ issue.id }}" as turn
+
+  after turn completes {
+    complete result {
+      note "triaged"
+    }
+  }
+}

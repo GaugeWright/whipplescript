@@ -1,0 +1,17 @@
+// The parse-stage vocabularies: a misspelled statement verb and a misspelled
+// declaration-block clause head. Both were unreachable from a suggestion until
+// the match arms they dispatch on were mirrored into tables — a name a program
+// may WRITE has to be a name a diagnostic can SUGGEST.
+workflow MisspelledKeyword
+
+output result Done
+
+class Done {
+  note string
+}
+
+rule finish
+  when started
+=> {
+  recrod Done { note "ok" }
+}

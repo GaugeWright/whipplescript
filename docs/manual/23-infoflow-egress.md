@@ -14,11 +14,15 @@ an egress operation. The context of the turn goes to the model provider of the
 agent. The context includes each item that the turn read. Thus a provider is a
 governed principal, as each other principal is:
 
+<!-- render: examples/infoflow/agent-egress.whip envelope examples/diagnostics/uncleared-provider.policy code security.provider_egress_leak -->
 ```text
-error: denied egress in rule `summarize`: `crm` may be read by Operator
-only — sending this turn's context to provider `fixture` (clearance public)
-would disclose it to a model outside its readers (the checker denies every
-turn egress to a provider not cleared for everything the turn read)
+error[security.provider_egress_leak]: denied egress in rule `summarize`: `crm` may be read by Operator only — sending this turn's context to provider `fixture` (clearance public) would disclose it to a model outside its readers (the checker denies every turn egress to a provider not cleared for everything the turn read)
+   --> examples/infoflow/agent-egress.whip:35:3
+   |
+35 |   tell assistant as turn
+   |   ^^^^^^^^^^^^^^^^^^^^^^
+   = note: `assistant` is bound to provider `fixture` here (examples/infoflow/agent-egress.whip:17:7)
+   = help: bind the agent to a provider cleared for `crm`, or declassify before the turn
 ```
 
 The same denial covers the prompt of a coercion and the results of a tool of an
@@ -61,10 +65,14 @@ envelope. The terminal of a workflow is also a governed sink. A completion that
 gives confidential data to an invoker with no clearance is the same denied flow
 as a write to a public channel:
 
+<!-- render: examples/infoflow/agent-egress.whip envelope examples/diagnostics/uncleared-provider.policy code security.confidentiality_leak -->
 ```text
-error: denied flow in rule `summarize`: `crm` may be read by Operator only —
-writing it to `result` (readable by public) would expose it to parties
-outside its readers …
+error[security.confidentiality_leak]: denied flow in rule `summarize`: `crm` may be read by Operator only — writing it to `result` (readable by public) would expose it to parties outside its readers (the checker denies every flow from a value to a sink whose readers are not all within the value's reader set)
+   --> examples/infoflow/agent-egress.whip:35:3
+   |
+35 |   tell assistant as turn
+   |   ^^^^^^^^^^^^^^^^^^^^^^
+   = help: self-serve (no grant needed): separate the contexts — read `crm` in a distinct turn and pass only a bounded result. escalate (needs governance): route the release through a `coerce … declassified` whose output is the egress's whole payload, under `grant declassify crm to <role cleared for result>` (a grant alone never blesses a raw flow)
 ```
 
 ## Redaction: the tool that cuts

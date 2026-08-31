@@ -1,0 +1,6 @@
+error[graph.rule_never_fires]: rule `escalate` can never fire: nothing produces `Escalation`
+   --> examples/invalid/rule-never-fires.whip:36:8
+   |
+36 |   when Escalation as escalation
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: seed `Escalation` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system

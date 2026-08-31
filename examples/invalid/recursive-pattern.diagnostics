@@ -1,4 +1,4 @@
-error: recursive pattern application is not allowed (graph.unbounded_pattern_recursion): expansion cycle Loop -> Loop
+error[graph.unbounded_pattern_recursion]: recursive pattern application is not allowed: expansion cycle Loop -> Loop
    --> examples/invalid/recursive-pattern.whip:10:3
    |
 10 |   apply Loop<T> as inner {

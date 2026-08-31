@@ -1,0 +1,26 @@
+// Closed vocabularies: nothing to declare, so the did-you-mean prefixes the
+// list of legal values rather than an "otherwise declare it". These are tables
+// the compiler matches on, so a name is either in the table or it is not —
+// which is exactly the case where naming ONE candidate beats reprinting the set
+// and leaving the reader to spot the difference.
+workflow MisspelledVocabulary
+
+output result Done
+
+class Done {
+  note string
+}
+
+agent writer {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+  compaction summarise
+  thread contine
+}
+
+rule finish
+  when started
+=> {
+  complete result { note "ok" }
+}

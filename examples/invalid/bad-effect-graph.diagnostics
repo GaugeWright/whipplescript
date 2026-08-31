@@ -1,12 +1,24 @@
-error: rule `bad_after` has `after` block for unknown effect binding `claim`
-   --> examples/invalid/bad-effect-graph.whip:10:4
+warning[effect.unhandled_failure]: effect `claim`'s failure is unhandled in rule `bad_after`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/bad-effect-graph.whip:20:3
    |
-10 | => {
-   |    ^
-   = help: create an effect with `as claim` before the `after` block
-error: rule `bad_after` has unsupported `after` dependency predicate
-   --> examples/invalid/bad-effect-graph.whip:10:4
+20 |   claim item as claim
+   |   ^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after claim fails { … }` (typed failure or recovery) or observe every outcome with `after claim completes`
+error[effect.unsupported_predicate]: unsupported `after` predicate `retries`
+   --> examples/invalid/bad-effect-graph.whip:22:3
    |
-10 | => {
-   |    ^
-   = help: use `after name succeeds`, `after name fails`, or `after name completes`
+22 |   after claim retries {
+   |   ^^^^^^^^^^^^^^^^^^^
+   = help: use `succeeds`, `fails`, `completes`, `times out`, `cancelled`, or a coordination outcome (`held`, `contended`, `ok`, `over`)
+error[parse.unexpected_token]: expected a rule body statement
+   --> examples/invalid/bad-effect-graph.whip:22:23
+   |
+22 |   after claim retries {
+   |                       ^
+   = help: statements start with record, consume, done, during, until, tell, coerce, prompt, decide, call, request, mint, invoke, read, write, import, export, after, case, complete, fail, timer, cancel, exec, obtain, file, claim, release, finish, acquire, renew, append, emit, redact, declassify, or a package effect verb (seal, open, recall, learn, curate, send, promote, undo, transport)
+error[effect.unsatisfiable_dependency]: rule `bad_after` has `after` block for unknown effect binding `ghost`
+   --> examples/invalid/bad-effect-graph.whip:16:3
+   |
+16 |   after ghost succeeds {
+   |   ^^^^^^^^^^^^^^^^^^^^^^
+   = help: create an effect with `as ghost` before the `after` block

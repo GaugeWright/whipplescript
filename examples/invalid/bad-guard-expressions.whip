@@ -1,0 +1,78 @@
+// Five mistakes a person makes inside a `where` guard, one per rule: calling a
+// function the expression kernel does not have, doing arithmetic on a string,
+// writing an array literal whose items do not share a type, indexing an array as
+// if it were a map, and reading through an optional field without proving it is
+// there. The caret is the whole `when` clause in every case because `Expr`
+// carries no spans of its own (tracker D10) — these fixtures pin the codes and
+// the repairs, not a sub-expression location that does not exist yet.
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Owner {
+  team string
+}
+
+class Issue {
+  id string
+  title string
+  attempts int
+  labels string[]
+  meta map<string>
+  owner Owner?
+}
+
+table issues as Issue [
+  {
+    id "ISS-1"
+    title "the timer fires twice"
+    attempts 1
+    labels ["flaky"]
+    meta { team "runtime" }
+    owner { team "runtime" }
+  }
+]
+
+rule shout
+  when Issue as issue where uppercase(issue.title) == "FLAKY"
+=> {
+  complete result {
+    note "shouted"
+  }
+}
+
+rule count_words
+  when Issue as issue where issue.title + 1 > 2
+=> {
+  complete result {
+    note "counted"
+  }
+}
+
+rule triaged
+  when Issue as issue where issue.attempts in [1, "two"]
+=> {
+  complete result {
+    note "triaged"
+  }
+}
+
+rule owned_by_runtime
+  when Issue as issue where issue.labels["team"] == "runtime"
+=> {
+  complete result {
+    note "owned"
+  }
+}
+
+rule assigned_to_runtime
+  when Issue as issue where issue.owner.team == "runtime"
+=> {
+  complete result {
+    note "assigned"
+  }
+}

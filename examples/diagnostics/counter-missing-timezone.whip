@@ -1,0 +1,82 @@
+use std.coord
+
+workflow Budget
+
+// Manual chapter 14, "The timezone is not an option": the chapter's `Budget`
+// program with the counter's `timezone` clause deleted. A `daily` reset with no
+// anchor resolves to UTC, which is a documented default rather than a fault —
+// so this is a WARNING and the program is accepted, which is why it lives here
+// and not under examples/invalid/.
+
+output result Done
+
+class Job {
+  id string
+  team string
+  cost int
+}
+
+class Ran {
+  id string
+}
+
+class Deferred {
+  id string
+}
+
+class Done {
+  note string
+}
+
+counter tokens {
+  key Job
+  cap 100
+  reset daily
+}
+
+table jobs as Job [
+  {
+    id "j1"
+    team "core"
+    cost 60
+  }
+  {
+    id "j2"
+    team "core"
+    cost 60
+  }
+]
+
+rule admit
+  when Job as j
+=> {
+  consume tokens for j.team amount j.cost as spend
+
+  after spend ok {
+    done j -> record Ran {
+      id j.id
+    }
+  }
+
+  after spend over {
+    done j -> record Deferred {
+      id j.id
+    }
+  }
+}
+
+rule finish
+  when Ran as r where empty(Job)
+=> {
+  complete result {
+    note "budget applied"
+  }
+}
+
+rule all_deferred
+  when Deferred as d where empty(Job) && empty(Ran)
+=> {
+  complete result {
+    note "nothing fit today's budget"
+  }
+}

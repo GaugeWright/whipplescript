@@ -4,6 +4,82 @@
 //! helpers it already resolved against in scope.
 
 use super::*;
+
+/// Every field an `agent { … }` block accepts, in the order the parser dispatches
+/// them. `harness` is deliberately absent: it is the header clause
+/// `agent <name> using <harness>`, not a block field.
+///
+/// A table because a name a program may WRITE is a name a diagnostic must be
+/// able to SUGGEST, and match arms are unreachable from a suggestion. The
+/// duplication that a table introduces is the drift this file's
+/// `AGENT-FIELD-ARMS` sentinels and
+/// `agent_block_fields_lists_every_parsed_field` exist to refuse.
+pub(crate) const AGENT_BLOCK_FIELDS: &[&str] = &[
+    "provider",
+    "profile",
+    "capacity",
+    "skills",
+    "capabilities",
+    "requires",
+    "tools",
+    "compaction",
+    "thread",
+    "settings",
+];
+
+/// Every top-level declaration head the parser dispatches by hand, so a
+/// misspelled `clas`/`agnet`/`wrokflow` can be measured against something. The
+/// data-driven half of the vocabulary is not here — it is
+/// `DECLARATION_BLOCK_GRAMMAR`, and the two are chained at the use site.
+///
+/// `flow` is present because the parser still dispatches it, to say it was
+/// removed; suggesting it for `flwo` reaches that explanation rather than a bare
+/// "expected top-level declaration".
+///
+/// Guarded by the `TOP-LEVEL-ARMS` sentinels, which bracket the two `at_ident`
+/// chains this is transcribed from.
+pub(crate) const TOP_LEVEL_DECLARATION_KEYWORDS: &[&str] = &[
+    "description",
+    "workflow",
+    "pattern",
+    "include",
+    "use",
+    "apply",
+    "input",
+    "output",
+    "failure",
+    "flow",
+    "action",
+    "harness",
+    "agent",
+    "enum",
+    "signal",
+    "gauge",
+    "campaign",
+    "mark",
+    "source",
+    "test",
+    "class",
+    "table",
+    "coerce",
+    "assert",
+    "rule",
+];
+
+/// The calendar recurrence patterns (`every <pattern> at <hh:mm>`). Same reason
+/// as [`AGENT_BLOCK_FIELDS`]; guarded by the `CALENDAR-PATTERN-ARMS` sentinels.
+pub(crate) const CALENDAR_PATTERNS: &[&str] = &[
+    "day",
+    "weekday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+];
+
 /// Stage marker retained for the CLI scaffold.
 pub fn parser_stage() -> &'static str {
     whipplescript_core::IMPLEMENTATION_STAGE
@@ -182,6 +258,8 @@ pub(crate) fn lex(source: &str) -> Lexed {
         }
 
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.unexpected_character"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan {
                 start: index,
@@ -286,6 +364,8 @@ pub(crate) fn lex_string(source: &str, start: usize) -> (Token, usize, Option<Di
         },
         source.len(),
         Some(Diagnostic {
+            code: diagnostic_code!("parse.unterminated_string"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan {
                 start,
@@ -488,6 +568,21 @@ pub(crate) struct Parser<'a> {
     /// S7 inline contract payloads: classes synthesized from `output result {
     /// … }`-style blocks, appended to the item list after the parse loop.
     pub(crate) pending_contract_classes: Vec<ClassDecl>,
+    /// Token indices of brackets this file opens and never closes, computed once
+    /// over the whole token stream before parsing starts. Empty for every file
+    /// whose delimiters balance, which is the common case and the one where the
+    /// enclosing-block note below must stay silent.
+    pub(crate) unclosed_openers: Vec<usize>,
+}
+
+/// A bracket the parser is inside and that this file never closes.
+struct OpenBlock {
+    span: SourceSpan,
+    /// The opening character, so the advice can name the closer it wants.
+    bracket: char,
+    /// What the bracket opens (`class Decision`), when the tokens in front of it
+    /// name one. `None` for an anonymous block.
+    what: Option<String>,
 }
 
 pub(crate) struct ParsedWorkflow {
@@ -511,6 +606,8 @@ impl Parser<'_> {
                 if let Some(tag) = self.parse_tag() {
                     pending_tags.push(tag);
                 }
+            // TOP-LEVEL-ARMS-START (1 of 2) — mirrored by
+            // TOP_LEVEL_DECLARATION_KEYWORDS.
             } else if self.at_ident("description") {
                 self.parse_pending_description(&mut pending_description);
             } else if self.at_ident("workflow") {
@@ -522,7 +619,10 @@ impl Parser<'_> {
                         workflows.push(parsed_workflow.decl);
                     } else {
                         if workflow.is_some() {
-                            self.diagnostics.push(Diagnostic { related: Vec::new(),
+                            self.diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("construct.cardinality_conflict"),
+                                severity: Severity::Error,
+                                related: Vec::new(),
                                 span: parsed_workflow.decl.name.span,
                                 message: "multiple implicit workflow headers are not supported"
                                     .to_owned(),
@@ -547,6 +647,7 @@ impl Parser<'_> {
                 if let Some(pattern) = self.parse_pattern() {
                     patterns.push(pattern);
                 }
+            // TOP-LEVEL-ARMS-END (1 of 2)
             } else if let Some(item) =
                 self.parse_declaration_item(&mut pending_tags, &mut pending_description)
             {
@@ -557,7 +658,25 @@ impl Parser<'_> {
                 if self.is_at_end() {
                     break;
                 }
-                self.unexpected("top-level declaration");
+                // The offending word is already in the message
+                // (`found identifier \`clas\``), and the caret is under it; only
+                // the candidate set had to be threaded. `peek` does not consume,
+                // so recovery is unchanged.
+                let written = match self.peek().map(|token| &token.kind) {
+                    Some(TokenKind::Ident(word)) => word.clone(),
+                    _ => String::new(),
+                };
+                let candidate = crate::closest_keyword(
+                    &written,
+                    TOP_LEVEL_DECLARATION_KEYWORDS
+                        .iter()
+                        .copied()
+                        .chain(DECLARATION_BLOCK_GRAMMAR.iter().map(|spec| spec.keyword)),
+                );
+                self.unexpected_with(
+                    "top-level declaration",
+                    candidate.map(|name| format!("did you mean `{name}`?")),
+                );
                 if !self.is_at_end() {
                     self.advance();
                 }
@@ -755,6 +874,8 @@ impl Parser<'_> {
         };
         if name.is_empty() {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.invalid_name"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: "tag is missing a name".to_owned(),
@@ -767,6 +888,8 @@ impl Parser<'_> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
         {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.invalid_name"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!("tag `@{name}` contains unsupported characters"),
@@ -782,6 +905,8 @@ impl Parser<'_> {
     fn reject_pending_tags(&mut self, pending_tags: &mut Vec<TagDecl>, target: &str) {
         for tag in pending_tags.drain(..) {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.misplaced_annotation"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: tag.span,
                 message: format!("tag `@{}` cannot be attached to {target}", tag.name),
@@ -797,7 +922,10 @@ impl Parser<'_> {
             return;
         };
         if let Some(previous) = pending_description.replace(description) {
-            self.diagnostics.push(Diagnostic { related: Vec::new(),
+            self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.misplaced_annotation"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span: previous.span,
                 message: "description is not attached to a declaration".to_owned(),
                 suggestion: Some(
@@ -826,6 +954,8 @@ impl Parser<'_> {
     ) {
         if let Some(description) = pending_description.take() {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.misplaced_annotation"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: description.span,
                 message: format!("description cannot be attached to {target}"),
@@ -847,7 +977,10 @@ impl Parser<'_> {
             return false;
         }
         let span = token.span;
-        self.diagnostics.push(Diagnostic { related: Vec::new(),
+        self.diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.unsupported_syntax"),
+            severity: Severity::Error,
+            related: Vec::new(),
             span,
             message: format!(
                 "Gherkin keyword `{keyword}` is not WhippleScript workflow syntax"
@@ -887,6 +1020,7 @@ impl Parser<'_> {
             self.reject_pending_description(pending_description, spec.keyword);
             return self.parse_declaration_block(spec);
         }
+        // TOP-LEVEL-ARMS-START (2 of 2)
         if self.at_ident("include") {
             self.reject_pending_tags(pending_tags, "include");
             self.reject_pending_description(pending_description, "include");
@@ -916,6 +1050,8 @@ impl Parser<'_> {
                 .map(|token| token.span)
                 .unwrap_or(SourceSpan { start: 0, end: 0 });
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unsupported_syntax"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: "the `flow` declaration was removed".to_owned(),
@@ -1000,6 +1136,7 @@ impl Parser<'_> {
         } else if self.at_ident("rule") {
             self.parse_rule(std::mem::take(pending_tags), pending_description.take())
                 .map(Item::Rule)
+        // TOP-LEVEL-ARMS-END (2 of 2)
         } else {
             None
         }
@@ -1093,11 +1230,26 @@ impl Parser<'_> {
             };
             let Some(clause) = matched else {
                 let hint = spec.clauses.first().map(|clause| clause.unknown_hint);
+                let written = words.join(" ");
+                // The clause HEADS of the declaration block being parsed, which
+                // is one edit's distance from most of what an author gets wrong
+                // in a `lease`/`ledger`/`counter`/`tracker`/`file store` block.
+                let candidate = crate::closest_keyword(
+                    &written,
+                    spec.clauses.iter().map(|clause| clause.words.join(" ")),
+                );
+                let suggestion = match (candidate, hint) {
+                    (Some(name), Some(hint)) => Some(format!("did you mean `{name}`? {hint}")),
+                    (Some(name), None) => Some(format!("did you mean `{name}`?")),
+                    (None, hint) => hint.map(str::to_owned),
+                };
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: first_word_span,
-                    message: format!("unknown {} field `{}`", spec.keyword, words.join(" ")),
-                    suggestion: hint.map(str::to_owned),
+                    message: format!("unknown {} field `{}`", spec.keyword, written),
+                    suggestion,
                 });
                 self.synchronize_to_block_item();
                 continue;
@@ -1107,6 +1259,8 @@ impl Parser<'_> {
             if let Some(connective) = clause.connective {
                 if !self.consume_ident(connective) {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("parse.unexpected_token"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: first_word_span,
                         message: format!("expected `{connective}` after `{}`", clause.name),
@@ -1219,6 +1373,8 @@ impl Parser<'_> {
             DeclAstKind::Credential => {
                 let Some(kind) = bag.ident("kind") else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("credential `{}` must declare its kind", name.name),
@@ -1239,6 +1395,8 @@ impl Parser<'_> {
             DeclAstKind::Vault => {
                 let Some(kind) = bag.ident("kind") else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("vault `{}` must declare its kind", name.name),
@@ -1255,6 +1413,8 @@ impl Parser<'_> {
                 let allow = bag.idents("allow").unwrap_or_default();
                 if allow.is_empty() {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1282,6 +1442,8 @@ impl Parser<'_> {
                 let Some(members) = bag.idents("members").filter(|idents| !idents.is_empty())
                 else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("stream `{}` must declare its members", name.name),
@@ -1311,12 +1473,16 @@ impl Parser<'_> {
                         "hourly" | "daily" | "weekly" | "monthly"
                     ) {
                         self.diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.unknown_option"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: period.span,
                             message: format!("unknown reset period `{}`", period.name),
-                            suggestion: Some(
-                                "use `hourly`, `daily`, `weekly`, or `monthly`".to_owned(),
-                            ),
+                            suggestion: Some(crate::suggest_then_keyword(
+                                &period.name,
+                                ["hourly", "daily", "weekly", "monthly"],
+                                "use `hourly`, `daily`, `weekly`, or `monthly`",
+                            )),
                         });
                     }
                     period.name
@@ -1324,6 +1490,8 @@ impl Parser<'_> {
                 let shared = bag.flag("shared");
                 let (Some(key_type), Some(cap), Some(reset)) = (key_type, cap, reset) else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1353,6 +1521,8 @@ impl Parser<'_> {
                 let shared = bag.flag("shared");
                 let (Some(key_type), Some(ttl_seconds)) = (key_type, ttl_seconds) else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1384,6 +1554,8 @@ impl Parser<'_> {
                     (entry_schema, partition_field, retain_seconds)
                 else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1416,6 +1588,8 @@ impl Parser<'_> {
                 let provider = bag.ident("provider");
                 let Some(root) = bag.text("root") else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("file store `{}` is missing a root", name.name),
@@ -1668,7 +1842,10 @@ impl Parser<'_> {
                 TokenKind::Ident(value) => value.as_str(),
                 _ => "",
             };
-            self.diagnostics.push(Diagnostic { related: Vec::new(),
+            self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unsupported_syntax"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span: removed_kind.span,
                 message: format!("`use {removed_label}` is no longer supported"),
                 suggestion: Some(
@@ -1691,6 +1868,8 @@ impl Parser<'_> {
             Some(seconds) if seconds > 0 => Some(seconds),
             _ => {
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.invalid_literal"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: span.join(unit.span),
                     message: format!("invalid duration `{value}{}`", unit.name),
@@ -1713,6 +1892,9 @@ impl Parser<'_> {
         Some(HarnessDecl { name, kind, span })
     }
 
+    #[allow(clippy::doc_markdown)]
+    /// Parses an `agent` declaration. Its block fields are listed in
+    /// [`AGENT_BLOCK_FIELDS`], which the sentinels below tie to the match arms.
     fn parse_agent(&mut self) -> Option<AgentDecl> {
         let start = self.expect_keyword("agent")?.span.start;
         let name = self.expect_ident("agent name")?;
@@ -1754,6 +1936,9 @@ impl Parser<'_> {
                 continue;
             };
 
+            // AGENT-FIELD-ARMS-START — every arm here must appear in
+            // AGENT_BLOCK_FIELDS; `agent_block_fields_lists_every_parsed_field`
+            // fails when it does not.
             match field_name.name.as_str() {
                 "provider" => {
                     if let Some(provider) = self.expect_ident("provider name") {
@@ -1825,6 +2010,7 @@ impl Parser<'_> {
                         self.synchronize_to_block_item();
                     }
                 }
+                // AGENT-FIELD-ARMS-END
                 _ => {
                     let span = field_name.span;
                     fields.push(AgentField::Unknown {
@@ -1875,6 +2061,8 @@ impl Parser<'_> {
                 };
                 if line_of(previous_end) == line_of(variant.span.start) {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("parse.unexpected_token"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: variant.span,
                         message: format!(
@@ -1956,6 +2144,8 @@ impl Parser<'_> {
                 .any(|segment| segment.chars().next().is_some_and(char::is_uppercase))
         {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.invalid_name"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: name_span,
                 message: format!("signal name `{name}` must be dotted lowercase"),
@@ -2083,6 +2273,8 @@ impl Parser<'_> {
             Some("write `at least <n>` or `at most <n>`".to_owned())
         };
         self.diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.unexpected_token"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan {
                 start: gap_start,
@@ -2162,14 +2354,20 @@ impl Parser<'_> {
                     self.expect_string("labels source").map(GaugeJudge::Labels)
                 } else {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.unknown_clause"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: keyword.span,
                         message: "unknown judge form".to_owned(),
-                        suggestion: Some(
+                        suggestion: Some(crate::suggest_then_keyword(
+                            &match self.peek().map(|token| &token.kind) {
+                                Some(TokenKind::Ident(word)) => word.clone(),
+                                _ => String::new(),
+                            },
+                            ["coerce", "prompt", "exec", "labels"],
                             "judge forms are `coerce <Name>`, `prompt \"<template>\"`, \
-                             `exec \"<command>\"`, and `labels \"<source>\"`"
-                                .to_owned(),
-                        ),
+                             `exec \"<command>\"`, and `labels \"<source>\"`",
+                        )),
                     });
                     None
                 };
@@ -2179,6 +2377,8 @@ impl Parser<'_> {
                 };
                 if judge.is_some() {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.cardinality_conflict"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one judge".to_owned(),
@@ -2214,14 +2414,20 @@ impl Parser<'_> {
                         && stat[1..].chars().all(|ch| ch.is_ascii_digit());
                     if stat != "mean" && !is_quantile {
                         self.diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.unknown_option"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: subject_ident.span,
                             message: format!("unknown bar statistic `{stat}`"),
-                            suggestion: Some(
+                            // `mean` is the whole closed half of the vocabulary;
+                            // the quantile half is a SHAPE (`p<N>`), not a set,
+                            // so there is nothing there to be close to.
+                            suggestion: Some(crate::suggest_then_keyword(
+                                stat,
+                                ["mean"],
                                 "bars are chance-shaped (`P(<field>)`) or stat-shaped \
-                                 (`mean`, `p10`, `p90`, ...)"
-                                    .to_owned(),
-                            ),
+                                 (`mean`, `p10`, `p90`, ...)",
+                            )),
                         });
                     }
                     GaugeBarSubject::Stat {
@@ -2240,6 +2446,8 @@ impl Parser<'_> {
                 };
                 if expect.is_some() {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.cardinality_conflict"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: keyword.span,
                         message: "gauge declares more than one bar".to_owned(),
@@ -2263,13 +2471,24 @@ impl Parser<'_> {
                 }
             } else {
                 let span = self.peek().map(|token| token.span).unwrap_or(open.span);
+                // Same shape as the export block field in `body.rs`: the message
+                // does not carry the word, so it is read here only to measure
+                // it. `peek` does not consume; recovery is unchanged.
+                let written = match self.peek().map(|token| &token.kind) {
+                    Some(TokenKind::Ident(word)) => word.clone(),
+                    _ => String::new(),
+                };
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: "unknown gauge clause".to_owned(),
-                    suggestion: Some(
-                        "gauge clauses are `judge via`, `expect`, and `inputs`".to_owned(),
-                    ),
+                    suggestion: Some(crate::suggest_then_keyword(
+                        &written,
+                        ["judge", "expect", "inputs"],
+                        "gauge clauses are `judge via`, `expect`, and `inputs`",
+                    )),
                 });
                 self.synchronize_to_block_item();
             }
@@ -2280,6 +2499,8 @@ impl Parser<'_> {
             .unwrap_or(open.span.end);
         let Some(judge) = judge else {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: name.span,
                 message: format!("gauge `{}` declares no judge", name.name),
@@ -2402,14 +2623,22 @@ impl Parser<'_> {
             } else {
                 let span = self.peek().map(|token| token.span).unwrap_or(open.span);
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: "unknown campaign clause".to_owned(),
-                    suggestion: Some(
+                    // Same shape as the gauge clause above: the message does not
+                    // carry the word, so it is peeked purely to measure it.
+                    suggestion: Some(crate::suggest_then_keyword(
+                        &match self.peek().map(|token| &token.kind) {
+                            Some(TokenKind::Ident(word)) => word.clone(),
+                            _ => String::new(),
+                        },
+                        ["ascend", "reach", "guard", "sacrifice", "proposer"],
                         "campaign clauses are `ascend`, `reach`, `guard`, `sacrifice`, \
-                         and `proposer redacted`"
-                            .to_owned(),
-                    ),
+                         and `proposer redacted`",
+                    )),
                 });
                 self.synchronize_to_block_item();
             }
@@ -2420,6 +2649,8 @@ impl Parser<'_> {
             .unwrap_or(open.span.end);
         if ascend.is_empty() && reach.is_empty() {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: name.span,
                 message: format!("campaign `{}` names nothing to improve", name.name),
@@ -2513,6 +2744,8 @@ impl Parser<'_> {
                     Some(name) => {
                         if workflow.is_some() {
                             self.diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("construct.cardinality_conflict"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: name.span,
                                 message: "a test scenario binds at most one `workflow`".to_owned(),
@@ -2674,6 +2907,8 @@ impl Parser<'_> {
         }
         if segments.len() < 2 {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan {
                     start,
@@ -2917,6 +3152,8 @@ impl Parser<'_> {
             Some(binding) => binding,
             None => {
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.missing_requirement"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!("source `{}` must declare `observe as <binding>`", name.name),
@@ -2929,6 +3166,8 @@ impl Parser<'_> {
             Some(emit) => emit,
             None => {
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.missing_requirement"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -2946,6 +3185,8 @@ impl Parser<'_> {
                 Some(recurrence) => recurrence,
                 None => {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.missing_requirement"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("clock source `{}` must declare a recurrence", name.name),
@@ -2965,6 +3206,8 @@ impl Parser<'_> {
         } else {
             if recurrence.is_some() || timezone.is_some() || missed.is_some() {
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -3017,10 +3260,19 @@ impl Parser<'_> {
                 "d" => value as u64 * 86_400,
                 other => {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.unknown_option"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: unit.span,
                         message: format!("unknown duration unit `{other}`"),
-                        suggestion: Some("use `s`, `m`, `h`, or `d`".to_owned()),
+                        // Every unit is one character, so the length ceiling
+                        // leaves only a case difference reachable — `30S` is
+                        // named, `30sec` is correctly not.
+                        suggestion: Some(crate::suggest_then_keyword(
+                            other,
+                            ["s", "m", "h", "d"],
+                            "use `s`, `m`, `h`, or `d`",
+                        )),
                     });
                     return None;
                 }
@@ -3033,6 +3285,7 @@ impl Parser<'_> {
         }
         let pattern_ident =
             self.expect_ident("calendar pattern (`day`, `weekday`, or a weekday)")?;
+        // CALENDAR-PATTERN-ARMS-START — mirrored by CALENDAR_PATTERNS.
         let pattern = match pattern_ident.name.as_str() {
             "day" => CalendarPattern::Day,
             "weekday" => CalendarPattern::Weekday,
@@ -3043,14 +3296,19 @@ impl Parser<'_> {
             "friday" => CalendarPattern::Weekly(Weekday::Friday),
             "saturday" => CalendarPattern::Weekly(Weekday::Saturday),
             "sunday" => CalendarPattern::Weekly(Weekday::Sunday),
+            // CALENDAR-PATTERN-ARMS-END
             other => {
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_option"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: pattern_ident.span,
                     message: format!("unknown calendar pattern `{other}`"),
-                    suggestion: Some(
-                        "use `day`, `weekday`, or a weekday such as `monday`".to_owned(),
-                    ),
+                    suggestion: Some(crate::suggest_then_keyword(
+                        other,
+                        CALENDAR_PATTERNS.iter().copied(),
+                        "use `day`, `weekday`, or a weekday such as `monday`",
+                    )),
                 });
                 return None;
             }
@@ -3073,6 +3331,8 @@ impl Parser<'_> {
         let (minute, minute_span) = self.expect_u32("minute")?;
         if hour > 23 || minute > 59 {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: hour_span.join(minute_span),
                 message: format!("invalid time of day `{hour:02}:{minute:02}`"),
@@ -3233,12 +3493,16 @@ impl Parser<'_> {
                         is_key = true;
                     } else {
                         self.diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.unknown_clause"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: tag.span,
                             message: format!("unknown field tag `@{}`", tag.name),
-                            suggestion: Some(
-                                "the only field tag is `@key` (the class natural key)".to_owned(),
-                            ),
+                            suggestion: Some(crate::suggest_then_keyword(
+                                &tag.name,
+                                ["key"],
+                                "the only field tag is `@key` (the class natural key)",
+                            )),
                         });
                     }
                 }
@@ -3339,6 +3603,8 @@ impl Parser<'_> {
 
         if depth != 0 {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unclosed_delimiter"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan {
                     start: open.span.start,
@@ -3354,13 +3620,21 @@ impl Parser<'_> {
             start: body_start,
             end: body_end,
         };
-        let (text, span) = trimmed_source_text(self.source_text(body_span), body_span);
+        let (text, text_span) = trimmed_source_text(self.source_text(body_span), body_span);
+        // `span` is the row's outer `{`…`}` extent, the same convention every
+        // other `BlockSource` follows; `origin` — not `span` — is where `text`
+        // begins.
+        let outer = SourceSpan {
+            start: open.span.start,
+            end: close_end,
+        };
         Some(TableRow {
-            body: BlockSource { text, span },
-            span: SourceSpan {
-                start: open.span.start,
-                end: close_end,
+            body: BlockSource {
+                text,
+                span: outer,
+                origin: BodyOrigin::Source(text_span.start),
             },
+            span: outer,
         })
     }
 
@@ -3385,6 +3659,9 @@ impl Parser<'_> {
                     .to_owned();
                 let body = BlockSource {
                     text: format!("prompt {raw}"),
+                    // Synthesized sugar: `prompt ` is not in the file, so no
+                    // offset into this text is a source position.
+                    origin: BodyOrigin::Generated,
                     span: token.span,
                 };
                 let span = SourceSpan {
@@ -3493,6 +3770,8 @@ impl Parser<'_> {
                     .map(|token| token.span)
                     .unwrap_or(SourceSpan { start, end: start });
                 self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: "`with` is not a rule readiness clause".to_owned(),
@@ -3655,6 +3934,8 @@ impl Parser<'_> {
 
         if depth != 0 {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unclosed_delimiter"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
@@ -3694,6 +3975,8 @@ impl Parser<'_> {
 
         if clauses.is_empty() {
             self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan {
                     start: when.start,
@@ -3727,18 +4010,19 @@ impl Parser<'_> {
                     depth -= 1;
                     if depth == 0 {
                         body_end = token.span.start;
+                        let content = SourceSpan {
+                            start: body_start,
+                            end: body_end,
+                        };
+                        let (text, text_span) =
+                            trimmed_source_text(self.source_text(content), content);
                         return Some(BlockSource {
-                            text: self
-                                .source_text(SourceSpan {
-                                    start: body_start,
-                                    end: body_end,
-                                })
-                                .trim()
-                                .to_owned(),
+                            text,
                             span: SourceSpan {
                                 start: open.span.start,
                                 end: token.span.end,
                             },
+                            origin: BodyOrigin::Source(text_span.start),
                         });
                     }
                     body_end = token.span.end;
@@ -3750,6 +4034,8 @@ impl Parser<'_> {
         }
 
         self.diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.unclosed_delimiter"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan {
                 start: open.span.start,
@@ -3758,18 +4044,18 @@ impl Parser<'_> {
             message: "unterminated block".to_owned(),
             suggestion: Some("add a closing `}`".to_owned()),
         });
+        let content = SourceSpan {
+            start: body_start,
+            end: body_end,
+        };
+        let (text, text_span) = trimmed_source_text(self.source_text(content), content);
         Some(BlockSource {
-            text: self
-                .source_text(SourceSpan {
-                    start: body_start,
-                    end: body_end,
-                })
-                .trim()
-                .to_owned(),
+            text,
             span: SourceSpan {
                 start: open.span.start,
                 end: body_end,
             },
+            origin: BodyOrigin::Source(text_span.start),
         })
     }
 
@@ -4081,6 +4367,8 @@ impl Parser<'_> {
                 Ok(value) => Some((value, span)),
                 Err(_) => {
                     self.diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.invalid_literal"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!("{label} must fit in u32"),
@@ -4176,26 +4464,162 @@ impl Parser<'_> {
                 "end of file".to_owned(),
             ),
         };
-        self.diagnostics.push(Diagnostic {
+        let diagnostic = Diagnostic {
+            code: diagnostic_code!("parse.unexpected_token"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("expected {expected}, found {found}"),
             suggestion: suggestion_for_expected(&expected),
-        });
+        };
+        self.push_with_open_block(diagnostic);
+    }
+
+    /// Push a parse diagnostic, naming the block the parser is still inside when
+    /// — and only when — this file leaves a bracket open before this point.
+    ///
+    /// This is the whole of the unclosed-delimiter repair. A missing `}` does not
+    /// produce one error at the missing brace; it produces a cascade of errors at
+    /// tokens the parser then misreads as something else, none of which mentions
+    /// the delimiter at all. Naming the enclosing opener puts the one location
+    /// the author has to edit on every error in the cascade.
+    fn push_with_open_block(&mut self, mut diagnostic: Diagnostic) {
+        let Some(open) = self.enclosing_open_block() else {
+            self.diagnostics.push(diagnostic);
+            return;
+        };
+        // A note landing on its own caret tells the reader to look at where they
+        // already are.
+        if open.span.start == diagnostic.span.start {
+            self.diagnostics.push(diagnostic);
+            return;
+        }
+        let closer = closing_bracket(open.bracket).unwrap_or('}');
+        // The site's own advice wins when it has any: it knows what this
+        // particular parse wanted, and the note already carries the location.
+        if diagnostic.suggestion.is_none() {
+            diagnostic.suggestion = Some(match &open.what {
+                Some(what) => format!("add the `{closer}` that closes `{what}`"),
+                None => format!("add the `{closer}` that closes this `{}`", open.bracket),
+            });
+        }
+        let label = match &open.what {
+            Some(what) => format!("`{what}` is still open here"),
+            None => format!("this `{}` is still open here", open.bracket),
+        };
+        self.diagnostics
+            .push(diagnostic.with_related(open.span, label));
+    }
+
+    /// The innermost bracket that BOTH encloses `self.pos` AND this file never
+    /// closes, with what it opens (`class Decision`, `workflow Triage`) when the
+    /// tokens in front of it name one.
+    ///
+    /// Derived from the token stream rather than tracked in a push/pop stack
+    /// threaded through the block parsers. A tracked stack desynchronizes the
+    /// first time a block parser returns early through a `?` without popping,
+    /// and a stale opener renders a confidently WRONG note at a block that
+    /// closed long ago. A derivation cannot go stale.
+    ///
+    /// BOTH halves of that claim are load-bearing, and an earlier version
+    /// checked only the first. It asked whether SOME bracket before this point
+    /// goes unclosed and then named the innermost ENCLOSING bracket, which is a
+    /// different bracket whenever the missing closer belongs to an outer block.
+    /// On a file whose `workflow` forgot its final `}`, an error inside a
+    /// perfectly well-formed `class Ticket {…}` was told
+    ///
+    /// ```text
+    /// = note: `class Ticket` is still open here
+    /// = help: add the `}` that closes `class Ticket`
+    /// ```
+    ///
+    /// — advice to add a brace that is already written, which is the exact
+    /// failure this note exists to prevent. So the bracket named must itself be
+    /// one the whole-file counting pass proves is never closed.
+    ///
+    /// [`unclosed_openers`] is the residual stack of a pass over the ENTIRE
+    /// stream, and a stack only ever pops from the top, so its members that lie
+    /// before `pos` are exactly the enclosing brackets that survive to end of
+    /// input. The last of them is therefore the innermost bracket that is both
+    /// open here and never closed — no second stack pass required.
+    ///
+    /// Silence when there is none. A file whose delimiters balance gets no note
+    /// at all (otherwise every typo in the language would carry one), and so
+    /// does an error that sits before, or outside, the bracket that is actually
+    /// missing its partner.
+    ///
+    /// The cost is that the bracket named is not always the one the author has
+    /// to edit: for `class Decision {` left open inside `workflow Broken {`,
+    /// counting blames the workflow, because the class's `{` is popped by the
+    /// workflow's `}`. Which of the two the author meant is genuinely ambiguous
+    /// — only the workflow is PROVABLY unclosed, and a note that overstates what
+    /// it knows is worth less than one that understates it.
+    fn enclosing_open_block(&self) -> Option<OpenBlock> {
+        let limit = self.pos.min(self.tokens.len());
+        let open = *self
+            .unclosed_openers
+            .iter()
+            .rev()
+            .find(|&&index| index < limit)?;
+        let bracket = match self.tokens[open].kind {
+            TokenKind::Symbol(bracket) => bracket,
+            _ => return None,
+        };
+        Some(OpenBlock {
+            span: self.tokens[open].span,
+            bracket,
+            what: self.opened_name(open),
+        })
+    }
+
+    /// What the bracket at `index` opens, read off the one or two identifiers in
+    /// front of it: `class Decision` and `workflow Triage` name themselves,
+    /// while an anonymous `{` — a rule body, a table row — names nothing and
+    /// gets the generic label.
+    fn opened_name(&self, index: usize) -> Option<String> {
+        let name = match self.tokens.get(index.checked_sub(1)?)?.kind {
+            TokenKind::Ident(ref value) => value,
+            _ => return None,
+        };
+        match self
+            .tokens
+            .get(index.checked_sub(2)?)
+            .map(|token| &token.kind)
+        {
+            Some(TokenKind::Ident(keyword))
+                if TOP_LEVEL_DECLARATION_KEYWORDS.contains(&keyword.as_str()) =>
+            {
+                Some(format!("{keyword} {name}"))
+            }
+            _ => None,
+        }
     }
 
     fn unexpected(&mut self, expected: impl fmt::Display) {
+        self.unexpected_with(expected, None);
+    }
+
+    /// [`unexpected`](Self::unexpected) with a caller-supplied suggestion that
+    /// wins over the static `suggestion_for_expected` table — the hook a
+    /// did-you-mean needs, since only the caller knows the candidate universe.
+    /// The MESSAGE is untouched either way.
+    fn unexpected_with(&mut self, expected: impl fmt::Display, suggestion: Option<String>) {
         let Some(token) = self.peek() else {
             self.expected(expected);
             return;
         };
         let expected = expected.to_string();
-        self.diagnostics.push(Diagnostic {
+        let span = token.span;
+        let found = token.kind.label();
+        let diagnostic = Diagnostic {
+            code: diagnostic_code!("parse.unexpected_token"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: token.span,
-            message: format!("expected {expected}, found {}", token.kind.label()),
-            suggestion: suggestion_for_expected(&expected),
-        });
+            span,
+            message: format!("expected {expected}, found {found}"),
+            suggestion: suggestion.or_else(|| suggestion_for_expected(&expected)),
+        };
+        self.push_with_open_block(diagnostic);
     }
 
     fn synchronize_to_block_item(&mut self) {
@@ -4300,15 +4724,58 @@ pub(crate) fn suggestion_for_expected(expected: &str) -> Option<String> {
     }
 }
 
+/// The closer that matches `opener`, or `None` when `opener` is not a bracket.
+fn closing_bracket(opener: char) -> Option<char> {
+    match opener {
+        '{' => Some('}'),
+        '(' => Some(')'),
+        '[' => Some(']'),
+        _ => None,
+    }
+}
+
+/// Token indices of brackets the file opens and never closes.
+///
+/// One stack pass over the whole stream: whatever is still on the stack at end
+/// of input is a closer the author did not write. A closer that does not match
+/// the top is left alone rather than popping it, so one stray `)` in the middle
+/// of a file does not make every enclosing `{` look unclosed.
+///
+/// Note the asymmetry with the parser's own recovery: this pass does not parse,
+/// so it cannot be led astray by a declaration keyword being read as a field
+/// name. It answers exactly one question — does a bracket go unclosed, and where
+/// was it opened — and the parser consults it only to attach a note.
+fn unclosed_openers(tokens: &[Token]) -> Vec<usize> {
+    let mut stack: Vec<usize> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::Symbol('{' | '(' | '[') => stack.push(index),
+            TokenKind::Symbol(closer @ ('}' | ')' | ']')) => {
+                let matches_top = stack.last().is_some_and(|&open| {
+                    matches!(tokens[open].kind, TokenKind::Symbol(opener)
+                        if closing_bracket(opener) == Some(closer))
+                });
+                if matches_top {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    stack
+}
+
 /// Parses a source file into a recoverable AST plus diagnostics.
 pub fn parse_program(source: &str) -> ParseOutput {
     let lexed = lex(source);
+    let unclosed_openers = unclosed_openers(&lexed.tokens);
     let mut parser = Parser {
         source,
         tokens: lexed.tokens,
         pos: 0,
         diagnostics: lexed.diagnostics,
         pending_contract_classes: Vec::new(),
+        unclosed_openers,
     };
 
     let program = parser.parse_program();

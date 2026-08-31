@@ -1,4 +1,4 @@
-error: recursive workflow invocation is not allowed (graph.unbounded_workflow_invocation_recursion): invocation cycle Ping -> Pong -> Ping
+error[graph.unbounded_workflow_invocation_recursion]: recursive workflow invocation is not allowed: invocation cycle Ping -> Pong -> Ping
    --> examples/invalid/recursive-workflow-invocation.whip:12:6
    |
 12 |   => {

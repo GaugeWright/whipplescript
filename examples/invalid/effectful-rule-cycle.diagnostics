@@ -1,6 +1,6 @@
-error: effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle ping_step -> pong_step -> ping_step turns inside one commit, and rule `ping_step` runs effects on every turn of it
-   --> examples/invalid/effectful-rule-cycle.whip:30:4
+error[graph.unbounded_effect_recursion]: effectful rule cycle is not allowed: rule cycle ping_step -> pong_step -> ping_step turns inside one commit, and rule `ping_step` runs effects on every turn of it
+   --> examples/invalid/effectful-rule-cycle.whip:31:3
    |
-30 | => {
-   |    ^
-   = help: every edge of this cycle records its fact in the same commit that read one, so nothing paces it and each turn enqueues fresh effects at commit speed — put the recurrence behind an effect terminal (`after <effect> succeeds { record ... }`) so each turn waits on the world, or tag a rule `@external` when its facts genuinely arrive from outside the workflow
+31 |   tell worker "ping {{ p.n }}"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: field `n` rises by 1 on every hop, but no rule on the cycle bounds it, so nothing stops the turn; every edge of this cycle records its fact in the same commit that read one, so nothing paces it and each turn enqueues fresh effects at commit speed — put the recurrence behind an effect terminal (`after <effect> succeeds { record ... }`) so each turn waits on the world, give the cycle a measure that bounds it, or tag a rule `@external` when its facts genuinely arrive from outside the workflow

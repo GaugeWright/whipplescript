@@ -1,0 +1,12 @@
+error[construct.unknown_option]: agent `writer` uses unknown compaction strategy `summarise`
+   --> examples/invalid/misspelled-vocabulary.whip:18:14
+   |
+18 |   compaction summarise
+   |              ^^^^^^^^^
+   = help: did you mean `summarize`? supported strategies are `summarize`, `hard_reset`, `tool_results`, and `none`
+error[construct.unknown_option]: agent `writer` uses unknown thread mode `contine`
+   --> examples/invalid/misspelled-vocabulary.whip:19:10
+   |
+19 |   thread contine
+   |          ^^^^^^^
+   = help: did you mean `continue`? supported thread modes are `continue` and `fresh`

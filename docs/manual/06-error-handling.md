@@ -181,9 +181,14 @@ applies to each outcome. With the `case` statement from the next chapter, the
 Delete the `after attempt fails` branch from the `Fragile` program. First, the
 `whip check` command tells you the result of your change:
 
+<!-- render: examples/diagnostics/unhandled-failure-warning.whip code effect.unhandled_failure -->
 ```text
-warning: effect `attempt`'s failure is unhandled in rule `begin`; if it
-fails or times out, the instance will auto-fail with a generic reason
+warning[effect.unhandled_failure]: effect `attempt`'s failure is unhandled in rule `begin`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/diagnostics/unhandled-failure-warning.whip:28:3
+   |
+28 |   exec "false" as attempt
+   |   ^^^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after attempt fails { … }` (typed failure or recovery) or observe every outcome with `after attempt completes`
 ```
 
 Run the program:

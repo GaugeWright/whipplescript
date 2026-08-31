@@ -1,54 +1,60 @@
-error: rule `bad_coerce` uses an object literal without an expected object or map type
-   --> examples/invalid/bad-effect-payload.whip:29:4
+warning[effect.unhandled_failure]: effect `review`'s failure is unhandled in rule `bad_coerce`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after review fails { … }` (typed failure or recovery) or observe every outcome with `after review completes`
+error[expr.untyped_object_literal]: rule `bad_coerce` uses an object literal without an expected object or map type
+   --> examples/invalid/bad-effect-payload.whip:28:8
+   |
+28 |   when Task as task where { owner "Ada" } == task.owner
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = help: use object literals only in typed record fields or typed effect arguments
-error: rule `bad_coerce` compares incompatible expression types
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.unknown_field]: class `Owner` has no field `handle`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
-   = help: compare values with compatible scalar or finite-domain types
-error: class `Owner` has no field `handle`
-   --> examples/invalid/bad-effect-payload.whip:29:4
-   |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `Owner` is declared here (examples/invalid/bad-effect-payload.whip:3:7)
    = help: add `handle` to `class Owner` or use an existing field
-error: field `Payload.owner` is missing required object field `Owner.name`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.missing_required_field]: field `Payload.owner` is missing required object field `Owner.name`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
    = help: add `name` to the `owner` object literal
-error: field `Payload.phase` expects `string`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.invalid_literal]: field `Payload.phase` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `metadata` values are declared `string` here (examples/invalid/bad-effect-payload.whip:10:16)
    = help: record a value compatible with `string`
-error: field `Payload.tags` expects `string`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.invalid_literal]: field `Payload.tags` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `tags` elements are declared `string` here (examples/invalid/bad-effect-payload.whip:11:8)
    = help: record a value compatible with `string`
-error: class `Payload` has no field `extra`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.unknown_field]: class `Payload` has no field `extra`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `Payload` is declared here (examples/invalid/bad-effect-payload.whip:7:7)
    = help: add `extra` to `class Payload` or use an existing field
-error: field `coerce `reviewPayload`.metadata` expects `string`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.invalid_literal]: field `coerce `reviewPayload`.metadata` expects `string`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `metadata` values are declared `string` here (examples/invalid/bad-effect-payload.whip:23:52)
    = help: record a value compatible with `string`
-error: field `coerce `reviewPayload`.score` expects `int`
-   --> examples/invalid/bad-effect-payload.whip:29:4
+error[type.invalid_literal]: field `coerce `reviewPayload`.score` expects `int`
+   --> examples/invalid/bad-effect-payload.whip:30:3
    |
-29 | => {
-   |    ^
+30 |   coerce reviewPayload(
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   = note: `score` is declared `int` here (examples/invalid/bad-effect-payload.whip:23:67)
    = help: record a value compatible with `int`

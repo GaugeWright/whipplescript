@@ -1,6 +1,6 @@
-error: rule `finish` completes unknown workflow terminal `summary`
-   --> examples/invalid/bad-terminal-payload.whip:14:4
+error[type.unknown_terminal]: rule `finish` completes unknown workflow terminal `summary`
+   --> examples/invalid/bad-terminal-payload.whip:15:12
    |
-14 | => {
-   |    ^
+15 |   complete summary {
+   |            ^^^^^^^
    = help: declare `output summary Type` on the workflow first

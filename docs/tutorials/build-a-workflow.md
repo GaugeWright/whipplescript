@@ -149,16 +149,26 @@ Check the source that you have now:
 whip check triage.whip
 ```
 
+<!-- render: examples/diagnostics/tutorial-missing-terminal.whip -->
 ```text
-error: workflow `TicketTriage` has no rule that reaches `complete` or `fail`
-  = help: add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`,
-          or tag the workflow `@service` if it intentionally runs forever
+warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule `triage_open_ticket`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/diagnostics/tutorial-missing-terminal.whip:68:3
+   |
+68 |   tell triager as turn """markdown
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+error[graph.unreachable_terminal]: workflow `TicketTriage` has no rule that reaches `complete` or `fail`
+  --> examples/diagnostics/tutorial-missing-terminal.whip:1:1
+  |
+1 | workflow TicketTriage
+  | ^
+  = help: add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`, or tag the workflow `@service` if it intentionally runs forever
 ```
 
 The checker is correct. The workflow triages the tickets, but no rule completes
-the workflow. The checker also gives a warning: no arm handles the failure of
-`turn`. The next step routes the failure. Now add the gate for the person and
-the two ends.
+the workflow. The warning above it is the second finding: no arm handles the
+failure of `turn`. The next step routes the failure. Now add the gate for the
+person and the two ends.
 
 ## 5. Add the approval gate for a person
 

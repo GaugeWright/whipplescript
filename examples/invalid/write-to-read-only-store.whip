@@ -1,0 +1,45 @@
+// A file store is read-only until it says otherwise. This one declares
+// `allow read` and never `allow write`, and the rule writes to it anyway — the
+// mistake of assuming the root grants both directions because the process can
+// write there. The repair names the clause and says it bounds the writes, so
+// the reader does not reach for a broader grant than the glob they need.
+use std.files
+
+workflow Archive
+
+output result Saved
+failure error FileError
+
+class Saved {
+  path string
+}
+
+class FileError {
+  reason string
+}
+
+file store notes_store {
+  root "./.whipplescript/archive"
+  allow read ["notes/**"]
+}
+
+rule archive_note
+  when started
+=> {
+  write text to notes_store at "notes/hello.txt" {
+    body "hello from the archive"
+    mode upsert
+  } as written
+
+  after written succeeds {
+    complete result {
+      path "notes/hello.txt"
+    }
+  }
+
+  after written fails as write_error {
+    fail error {
+      reason write_error.reason
+    }
+  }
+}

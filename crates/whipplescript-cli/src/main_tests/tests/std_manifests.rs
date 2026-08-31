@@ -576,6 +576,45 @@ fn embedded_std_manifests_parse() {
     }
 }
 
+/// The agent-provider kinds are a CLOSED vocabulary, and one of the two places
+/// that fact is written down lives in another crate.
+///
+/// `construct.unknown_provider_kind` names a candidate through
+/// `suggest_then_keyword`, so the kind set is a closed vocabulary in the sense
+/// `Vocabulary::Language` means, and
+/// `whipplescript-parser`'s `closed_vocabularies_do_not_suggest_for_common_english`
+/// sweeps every such vocabulary against 184 ordinary English words to prove none
+/// of them produces a confident suggestion of an unrelated word. That sweep lives
+/// in the parser and cannot call this function, so it carries the list as a
+/// literal. THIS test is what stops the two drifting: add a provider kind to a
+/// manifest without adding it there and the sweep silently stops covering it.
+#[test]
+fn agent_provider_kinds_match_the_parser_sweep_mirror() {
+    // The full set with every adapter feature compiled in, which is what the
+    // parser's mirror lists. Under a reduced feature set the mirror is a
+    // superset, which costs the sweep nothing.
+    // The parser's own list, not a third hand-written copy. Comparing the real
+    // set against a local array would have compared two hand-written arrays and
+    // stayed green while the sweep stopped covering a kind.
+    let mirror = whipplescript_parser::SWEPT_AGENT_PROVIDER_KINDS;
+    let kinds = known_agent_provider_kinds(None);
+    for kind in kinds.keys() {
+        assert!(
+            mirror.contains(&kind.as_str()),
+            "provider kind `{kind}` is contributed by an embedded manifest but is \
+             missing from the mirror in whipplescript-parser's \
+             `closed_vocabularies()`, so the English sweep does not cover it"
+        );
+    }
+    #[cfg(all(feature = "codex", feature = "claude"))]
+    assert_eq!(
+        kinds.keys().map(String::as_str).collect::<Vec<_>>(),
+        mirror,
+        "the mirror in whipplescript-parser's `closed_vocabularies()` must be \
+         exactly the embedded kind set"
+    );
+}
+
 /// Manifest/adapter drift (spec/std-agent.md "Static checks" 4, slice 7):
 /// the thin provider packages' embedded manifests are present iff their
 /// adapter cargo feature is compiled in — a binary without feature `codex`

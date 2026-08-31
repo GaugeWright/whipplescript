@@ -130,16 +130,27 @@ Three semantics are important:
 The compiler checks the safety rules for a lease. The rules are not advice.
 Ignore the contended outcome, and the `whip check` command refuses the program:
 
+<!-- render: examples/diagnostics/lease-outcomes.whip code effect.unhandled_outcome -->
 ```text
-error: rule `ship` does not handle the `contended` outcome of lease `slot`
+error[effect.unhandled_outcome]: rule `ship` does not handle the `contended` outcome of lease `slot`
+   --> examples/diagnostics/lease-outcomes.whip:38:3
+   |
+38 |   acquire deploy_slot for d.env as slot
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: coordination outcomes are exhaustive: add `after slot contended { ... }`
 ```
 
 Hold a lease, and do not release the lease or get to a terminal on some branch.
 The command then gives this error:
 
+<!-- render: examples/diagnostics/lease-outcomes.whip code graph.unreleased_lease -->
 ```text
-error: rule `ship` can hold lease `slot` forever: the `held` branch neither
-releases it nor reaches a workflow terminal
+error[graph.unreleased_lease]: rule `ship` can hold lease `slot` forever: the `held` branch neither releases it nor reaches a workflow terminal
+   --> examples/diagnostics/lease-outcomes.whip:38:3
+   |
+38 |   acquire deploy_slot for d.env as slot
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `release slot` on every non-terminal path, or use `acquire ... until ttl` for fire-and-forget
 ```
 
 A progression can hold a maximum of one lease at a time. The compiler rejects a
@@ -269,11 +280,14 @@ operation and not before. Each outcome records the period that the runtime
 used. Thus a replay reads the same boundary. The timezone is necessary, as the
 schedules in chapter 10 need a timezone. The timezone is not an option:
 
+<!-- render: examples/diagnostics/counter-missing-timezone.whip code construct.missing_timezone -->
 ```text
-warning: counter `tokens` declares no `timezone`; its `daily` reset boundary
-anchors to UTC
-  = help: declare `timezone "<IANA zone>"` (e.g. `timezone "America/New_York"`)
-    to anchor the period locally
+warning[construct.missing_timezone]: counter `tokens` declares no `timezone`; its `daily` reset boundary anchors to UTC
+   --> examples/diagnostics/counter-missing-timezone.whip:31:1
+   |
+31 | counter tokens {
+   | ^^^^^^^^^^^^^^^^
+   = help: declare `timezone "<IANA zone>"` (e.g. `timezone "America/New_York"`) to anchor the period locally
 ```
 
 A daily budget that resets at midnight in a *different location* is incorrect

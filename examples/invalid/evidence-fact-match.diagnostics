@@ -1,4 +1,4 @@
-error: rule `react_to_stream` matches evidence-only fact `agent.turn.streamed`: in-turn observations are evidence, not rule-matchable facts
+error[graph.unmatchable_fact]: rule `react_to_stream` matches evidence-only fact `agent.turn.streamed`: in-turn observations are evidence, not rule-matchable facts
   --> examples/invalid/evidence-fact-match.whip:9:8
   |
 9 |   when fact agent.turn.streamed as ev

@@ -1,0 +1,83 @@
+workflow TicketTriage
+
+// The build-a-workflow tutorial at the end of step 3: everything the tutorial
+// has written so far, checked before the terminals exist. Step 4 is "let the
+// checker find the missing end", and this is the file the reader has in front
+// of them when they run `whip check triage.whip` there.
+
+use std.tracker
+
+output result TriageDecision
+failure error TriageBlocked
+
+class Ticket {
+  id string
+  title string
+  severity string
+  status string
+}
+
+class TriagedTicket {
+  id string
+  title string
+  severity string
+  plan string
+  status "triaged"
+}
+
+class TriageDecision {
+  decision string
+}
+
+class TriageBlocked {
+  reason string
+}
+
+class AwaitingSignoff {
+  request string
+}
+
+agent triager {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+tracker approvals
+tracker answers
+
+table tickets as Ticket [
+  {
+    id "T-31"
+    title "Login returns 500 on empty password"
+    severity "high"
+    status "open"
+  }
+  {
+    id "T-32"
+    title "Typo in footer copyright"
+    severity "low"
+    status "open"
+  }
+]
+
+rule triage_open_ticket
+  when Ticket as ticket where ticket.status == "open"
+  when triager is available
+=> {
+  tell triager as turn """markdown
+  Suggest an owner and a fix plan for this ticket:
+
+  {{ ticket.title }} (severity: {{ ticket.severity }})
+  """
+
+  after turn succeeds as triaged {
+    done ticket -> record TriagedTicket {
+      id ticket.id
+      title ticket.title
+      severity ticket.severity
+      plan triaged.summary
+      status "triaged"
+    }
+  }
+}

@@ -11,12 +11,12 @@ use std::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use whipplescript_core::{
-    ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry, EffectContract,
-    LibraryRegistration, Severity, TypedOutputValidation, CONSTRUCT_FAMILY_EFFECT_OPERATION,
-    CONSTRUCT_INTERFACE_CAPABILITY, CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE,
-    CONSTRUCT_INTERFACE_EFFECT_HANDLE, CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME,
-    CONSTRUCT_LOWERING_CAPABILITY_CALL, CORE_CAPABILITY_CALL_CONSTRUCT_ID,
-    PLATFORM_CONSTRUCT_CATALOG,
+    diagnostic_code, ConstructField, ConstructInterface, ConstructRegistration, ContractRegistry,
+    EffectContract, LibraryRegistration, Severity, TypedOutputValidation,
+    CONSTRUCT_FAMILY_EFFECT_OPERATION, CONSTRUCT_INTERFACE_CAPABILITY,
+    CONSTRUCT_INTERFACE_CARDINALITY_EXACTLY_ONE, CONSTRUCT_INTERFACE_EFFECT_HANDLE,
+    CONSTRUCT_INTERFACE_PHASE_COMPILE_RUNTIME, CONSTRUCT_LOWERING_CAPABILITY_CALL,
+    CORE_CAPABILITY_CALL_CONSTRUCT_ID, PLATFORM_CONSTRUCT_CATALOG,
 };
 // Generic JSON/string utilities relocated to the leaf core crate (S7 Step 2)
 // so the wasm-kernel-hostable package-registry validators can share them.
@@ -61,6 +61,7 @@ use whipplescript_kernel::{
     ProgramVersionInput,
     RuntimeKernel,
 };
+use whipplescript_parser::suggest_then_keyword;
 use whipplescript_parser::{
     format_program, format_program_preserving_comments, harness_class, lex_comments,
     parse_expression, BinaryOp, DependencyPredicate as IrDependencyPredicate, Diagnostic,
@@ -82,12 +83,13 @@ use whipplescript_provider_codex::{
 use whipplescript_store::{
     ArtifactView, CapabilityBinding, CapabilitySchemaRegistration, CheckpointCapture,
     ClaimableEffect, ComputeResultRegistration, DerivedFact, DiagnosticRecord, DiagnosticView,
-    EffectCancellation, EffectCompletion, EffectView, EventView, EvidenceLink, EvidenceLinkView,
-    EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent, NewFact, NewInstanceAuthority,
-    NewWorkflowInvocation, ProviderValidationEvidence, RestoreDecision, RetryEffect,
-    RevisionActivation, RevisionCancellationImpact, RevisionCandidate,
-    RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart, RunView, RuntimeStore,
-    SqliteStore, StatusView, StoreError, WorkflowInvocationView, WorkflowRevisionView,
+    DurableDiagnosticCode, EffectCancellation, EffectCompletion, EffectView, EventView,
+    EvidenceLink, EvidenceLinkView, EvidenceRecord, EvidenceView, FactView, InstanceView, NewEvent,
+    NewFact, NewInstanceAuthority, NewWorkflowInvocation, ProviderValidationEvidence,
+    RestoreDecision, RetryEffect, RevisionActivation, RevisionCancellationImpact,
+    RevisionCandidate, RevisionCompatibilityDiagnostic, RevisionCompatibilityReport, RunStart,
+    RunView, RuntimeStore, SqliteStore, StatusView, StoreError, WorkflowInvocationView,
+    WorkflowRevisionView,
 };
 // File-effect byte I/O routes through the FileStore seam (DR-0033 Phase 4); the
 // native backing is `std::fs`.
@@ -3740,13 +3742,7 @@ fn check(options: &CliOptions) -> ExitCode {
                     for diagnostic in diagnostics {
                         eprint!(
                             "{}",
-                            render_bundle_diagnostic(
-                                &path,
-                                &source,
-                                &segments,
-                                &diagnostic,
-                                "error"
-                            )
+                            render_bundle_diagnostic(&path, &source, &segments, &diagnostic)
                         );
                     }
                 }
@@ -4119,6 +4115,8 @@ fn lint_hosted_exec(
             }
             match &effect.exec_target {
                 Some(IrExecTarget::Raw) => diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.raw_exec_disabled"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: effect.span,
                     message: "raw `exec \"...\"` is not allowed in hosted exec profile".to_owned(),
@@ -4138,6 +4136,8 @@ fn lint_hosted_exec(
                         format!("declared script capabilities: {}", available.join(", "))
                     };
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.capability_not_declared"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -11211,6 +11211,11 @@ fn source_metadata_target_key(target_kind: &str, target: &str) -> String {
 
 fn parser_diagnostic_to_json(diagnostic: &Diagnostic) -> Value {
     let mut value = json!({
+        // spec/error-handling.md "Reports": every report diagnostic carries the
+        // stable code and the severity, and the text output is a rendering of
+        // this same object rather than a separate path.
+        "code": diagnostic.code.as_str(),
+        "severity": diagnostic.severity.as_str(),
         "message": diagnostic.message,
         "suggestion": diagnostic.suggestion,
         "source_span": source_span_to_json(diagnostic.span),
@@ -18330,7 +18335,7 @@ fn persist_revision_compatibility_diagnostics(
             instance_id,
             "revision-compatibility",
             &compatibility.candidate_version_id,
-            &diagnostic.code,
+            diagnostic.code.as_str(),
             &subject_id,
         ]);
         let diagnostic_id = store.record_diagnostic(DiagnosticRecord {
@@ -18338,7 +18343,7 @@ fn persist_revision_compatibility_diagnostics(
             program_id: None,
             program_version_id: None,
             severity: Severity::Error,
-            code: Some(&diagnostic.code),
+            code: Some(DurableDiagnosticCode::Registered(diagnostic.code)),
             message: &diagnostic.message,
             source_span_json: diagnostic.source_span_json.as_deref(),
             subject_type: Some("revision_compatibility"),
@@ -18413,7 +18418,9 @@ fn persist_revision_source_bundle_diagnostic(
         program_id: None,
         program_version_id: None,
         severity: Severity::Error,
-        code: Some("revision.source_bundle_unavailable"),
+        code: Some(DurableDiagnosticCode::Registered(
+            whipplescript_core::runtime_diagnostic_code!("revision.source_bundle_unavailable"),
+        )),
         message: &message,
         source_span_json: None,
         subject_type: Some("revision_source_bundle"),
@@ -19136,7 +19143,9 @@ fn persist_stale_step_program_diagnostic(
         program_id: None,
         program_version_id: Some(active_version_id),
         severity: Severity::Error,
-        code: Some("revision.stale_program_path"),
+        code: Some(DurableDiagnosticCode::Registered(
+            whipplescript_core::runtime_diagnostic_code!("revision.stale_program_path"),
+        )),
         message,
         source_span_json: None,
         subject_type: Some("program_path"),
@@ -20743,7 +20752,9 @@ fn process_running_cancellations(
             program_id: None,
             program_version_id: None,
             severity: Severity::Warning,
-            code: Some("provider.cancellation.unsupported"),
+            code: Some(DurableDiagnosticCode::Registered(
+                whipplescript_core::runtime_diagnostic_code!("provider.cancellation.unsupported"),
+            )),
             message: &message,
             source_span_json: None,
             subject_type: Some("effect"),
@@ -30077,11 +30088,15 @@ fn persist_assertion_diagnostics(
             program_id: Some(program_id),
             program_version_id: Some(version_id),
             severity: Severity::Error,
-            code: Some(match assertion.status {
-                AssertionStatus::Failed => "assertion.failed",
-                AssertionStatus::Error => "assertion.errored",
+            code: Some(DurableDiagnosticCode::Registered(match assertion.status {
+                AssertionStatus::Failed => {
+                    whipplescript_core::runtime_diagnostic_code!("assertion.failed")
+                }
+                AssertionStatus::Error => {
+                    whipplescript_core::runtime_diagnostic_code!("assertion.errored")
+                }
                 AssertionStatus::Passed => unreachable!("passed assertions filtered out"),
-            }),
+            })),
             message: &message,
             source_span_json: assertion.source_span_json.as_deref(),
             subject_type: Some("assertion"),
@@ -38660,7 +38675,7 @@ fn compile_source_path_with_root(
     for warning in &compiled.warnings {
         eprint!(
             "{}",
-            render_bundle_diagnostic(path, &bundle.source, &bundle.segments, warning, "warning")
+            render_bundle_diagnostic(path, &bundle.source, &bundle.segments, warning)
         );
     }
     if let Some(ir) = compiled.ir {
@@ -38812,10 +38827,12 @@ fn check_authority_imports(ir: &IrProgram) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut require = |package: &str, construct: &str, span: SourceSpan| {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("security.package_import_required"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
-                "{construct} requires `use {package}` (security.package_import_required): \
+                "{construct} requires `use {package}`: \
                  the import is the program's explicit opt-in to this authority"
             ),
             suggestion: Some(format!("add `use {package}` at the top of the program")),
@@ -38852,8 +38869,10 @@ fn check_script_hard_off(ir: &IrProgram) -> Vec<Diagnostic> {
         for effect in &rule.metadata.effects {
             if effect.kind == IrEffectKind::ExecCommand {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.script_disabled"),
+                    severity: Severity::Error,
                     span: effect.span,
-                    message: "`exec` requires `use std.script` (security.script_disabled): script \
+                    message: "`exec` requires `use std.script`: script \
                          execution is disabled unless the program imports the std.script package"
                         .to_owned(),
                     suggestion: Some(
@@ -38911,7 +38930,10 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                 .is_some_and(|region| region.body_lapsed.lines().any(line_reaches_terminal))
     });
     if !has_terminal && !service_tagged {
-        diagnostics.push(Diagnostic { related: Vec::new(),
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("graph.unreachable_terminal"),
+            severity: Severity::Error,
+            related: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: format!(
                 "workflow `{}` has no rule that reaches `complete` or `fail`",
@@ -38963,6 +38985,8 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
         .any(|tag| tag.target_kind == "workflow" && tag.name == "bounded");
     if bounded_tagged && service_tagged {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.tag_conflict"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: format!(
@@ -38983,6 +39007,8 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
     if tool_tagged {
         if service_tagged {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.tag_conflict"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
@@ -39003,6 +39029,8 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
         });
         if has_invoke {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.tool_not_convergent"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
@@ -39027,6 +39055,8 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             // termination guarantee a synchronous tool needs.
             if external_tagged {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("graph.tool_not_convergent"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!(
@@ -39042,6 +39072,8 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             for when in &rule.whens {
                 if when.pattern.trim_start().starts_with("message from") {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("graph.tool_not_convergent"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: when.span,
                         message: format!(
@@ -39079,7 +39111,10 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
                     // `fact ClassName` is an ordinary class match.
                     let read = format!("schema:{name}");
                     if !produced.contains(&read) && !input_schemas.contains(name) {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                        diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("graph.rule_never_fires"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: when.span,
                             message: format!(
                                 "rule `{}` can never fire: nothing produces `{name}`",
@@ -39096,7 +39131,10 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             };
             if pattern.starts_with("worker completed turn") {
                 if !has_tell {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("graph.rule_never_fires"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
                         span: when.span,
                         message: format!(
                             "rule `{}` can never fire: no rule creates an agent turn",
@@ -39131,7 +39169,10 @@ fn lint_workflow_liveness(ir: &IrProgram) -> Vec<Diagnostic> {
             {
                 continue;
             }
-            diagnostics.push(Diagnostic { related: Vec::new(),
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.rule_never_fires"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` can never fire: nothing produces `{first}`",
@@ -39187,10 +39228,16 @@ fn ir_agent_provider_kind_uses(ir: &IrProgram) -> Vec<(String, String, SourceSpa
     let mut uses = Vec::new();
     for agent in &ir.agents {
         if let Some(provider) = &agent.provider {
+            // `IrAgent::span` exists for exactly this diagnostic (its own doc
+            // comment says so), and this site was discarding it for a zero span
+            // — so every unknown-provider-kind refusal underlined byte 0 of the
+            // file, which is the `workflow` line, never the agent that names the
+            // kind. The harness arm below already carries its span; this one
+            // now does too.
             uses.push((
                 provider.clone(),
                 format!("agent `{}`", agent.name),
-                SourceSpan { start: 0, end: 0 },
+                agent.span,
             ));
         }
     }
@@ -39261,8 +39308,18 @@ fn known_agent_provider_kinds(
 /// Provider-kind-known check (spec/std-agent.md "Static checks" 1, the M5
 /// graduated ladder's bottom rung): a provider/harness kind contributed by NO
 /// known manifest — embedded std (feature-conditional) or locked third-party —
-/// is an error naming it a missing package. The middle rung (contributed but
-/// not imported) is `lint.missing_agent_import`, advisory only.
+/// is an error. The middle rung (contributed but not imported) is
+/// `lint.missing_agent_import`, advisory only.
+///
+/// The message states only what was MEASURED — no manifest contributes this
+/// kind — and leaves the cause to the help line. It used to assert one:
+/// "(missing package)", which is a guess, and the wrong one for the commonest
+/// arrival here. `provider fixure` is a keystroke from `fixture` and no package
+/// is missing at all. The known set is right here, so the repair names the
+/// candidate when there is one, through the same closed-vocabulary policy every
+/// other did-you-mean in the compiler uses (a provider kind is a name the
+/// LANGUAGE and its packages define, not one the author declared, so it gets the
+/// tighter `Vocabulary::Language` budget).
 fn agent_provider_kind_diagnostics(
     ir: &IrProgram,
     package_lock: Option<&LoadedPackageLock>,
@@ -39272,19 +39329,22 @@ fn agent_provider_kind_diagnostics(
         .into_iter()
         .filter(|(kind, _, _)| !known.contains_key(kind))
         .map(|(kind, owner, span)| Diagnostic {
+            code: diagnostic_code!("construct.unknown_provider_kind"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
                 "{owner} uses unknown provider kind `{kind}`: no known package \
-                 manifest contributes it (missing package)"
+                 manifest contributes it"
             ),
-            suggestion: Some(
+            suggestion: Some(suggest_then_keyword(
+                &kind,
+                known.keys(),
                 "provider kinds are contributed by package manifests (embedded std \
                  packages such as `std.agent`, `std.agent.codex`, `std.agent.claude`, \
                  or a locked third-party package); add the providing package to the \
-                 package lock, or use a contributed kind"
-                    .to_owned(),
-            ),
+                 package lock, or use a contributed kind",
+            )),
         })
         .collect()
 }
@@ -39338,6 +39398,8 @@ fn agent_requires_diagnostics(ir: &IrProgram) -> Vec<Diagnostic> {
                 ),
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("provider.feature_unavailable"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: format!(
@@ -39405,6 +39467,8 @@ fn lint_agent_tool_grants(
         for tool in &agent.tools {
             if let Err(reason) = resolve_tool_grant(program_path, ir, tool, package_lock_path) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("capability.invalid_tool_grant"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("agent `{}` is granted `{tool}`: {reason}", agent.name),
@@ -39581,6 +39645,8 @@ impl SourceBundleResolver {
                 source: String::new(),
                 segments: Vec::new(),
                 diagnostics: vec![Diagnostic {
+                    code: diagnostic_code!("graph.include_cycle"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("include cycle through `{}`", path.display()),
@@ -39627,6 +39693,8 @@ impl SourceBundleResolver {
                     }],
                     source,
                     diagnostics: vec![Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_include"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: include.path.span,
                         message: format!("duplicate include `{}`", include.path.value),
@@ -39644,6 +39712,8 @@ impl SourceBundleResolver {
                     }],
                     source,
                     diagnostics: vec![Diagnostic {
+                        code: diagnostic_code!("construct.invalid_include_path"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: include.path.span,
                         message: "include paths must be relative".to_owned(),
@@ -39662,6 +39732,8 @@ impl SourceBundleResolver {
                     }],
                     source,
                     diagnostics: vec![Diagnostic {
+                        code: diagnostic_code!("construct.invalid_include_path"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: include.path.span,
                         message: "only `.whip` includes are supported right now".to_owned(),
@@ -39739,31 +39811,54 @@ fn resolve_span_file<'a>(
 
 /// Render a diagnostic, attributing it to its originating file via the bundle
 /// segment table and reporting an in-file location. When `segments` is empty
-/// this degrades to `render_diagnostic_with_severity` over the whole source.
+/// this degrades to `render_diagnostic` over the whole source.
+///
+/// EVERY span is rebased, primary and related alike. Rebasing only the primary
+/// leaves the caret right and every `= note:` wrong in the same diagnostic,
+/// shifted by the length of the included prefix — a coordinate that looks
+/// authoritative and points at an unrelated line. A related span belonging to a
+/// DIFFERENT file of the bundle is resolved against its own file and printed
+/// with its own path; it is never printed with a coordinate read out of another
+/// file's text.
 fn render_bundle_diagnostic(
     root_path: &str,
     source: &str,
     segments: &[SourceSegment],
     diagnostic: &Diagnostic,
-    severity: &str,
 ) -> String {
     let (origin, file_start, file_end) =
         resolve_span_file(root_path, source, segments, diagnostic.span);
     let file_text = &source[file_start..file_end.min(source.len())];
-    let local = Diagnostic {
-        span: SourceSpan {
-            start: diagnostic.span.start.saturating_sub(file_start),
-            end: diagnostic
-                .span
-                .end
-                .saturating_sub(file_start)
-                .min(file_text.len()),
-        },
+    let primary = Diagnostic {
+        code: diagnostic.code,
+        severity: diagnostic.severity,
+        span: rebase_span(diagnostic.span, file_start, file_text.len()),
         message: diagnostic.message.clone(),
         suggestion: diagnostic.suggestion.clone(),
-        related: diagnostic.related.clone(),
+        related: Vec::new(),
     };
-    render_diagnostic_with_severity(origin, file_text, &local, severity)
+    let related = diagnostic
+        .related
+        .iter()
+        .map(|info| {
+            let (path, start, end) = resolve_span_file(root_path, source, segments, info.span);
+            let text = &source[start..end.min(source.len())];
+            RenderedRelated {
+                path,
+                location: locate_span(text, rebase_span(info.span, start, text.len())),
+                message: info.message.as_str(),
+            }
+        })
+        .collect::<Vec<_>>();
+    render_diagnostic_parts(origin, file_text, &primary, &related)
+}
+
+/// A bundle span in its own file's coordinates, clamped into that file's text.
+fn rebase_span(span: SourceSpan, file_start: usize, file_len: usize) -> SourceSpan {
+    SourceSpan {
+        start: span.start.saturating_sub(file_start).min(file_len),
+        end: span.end.saturating_sub(file_start).min(file_len),
+    }
 }
 
 fn canonical_or_original(path: &Path) -> Result<PathBuf, CompileFailure> {
@@ -40022,6 +40117,8 @@ fn run_expected_model_searches(
     let expected_no_solutions = expected.len() - expected_solutions;
     if actual.len() != expected.len() {
         let diagnostic = expected.first().map(|first_expected| Diagnostic {
+            code: diagnostic_code!("graph.model_search_mismatch"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: first_expected.span,
             message: format!(
@@ -40047,6 +40144,8 @@ fn run_expected_model_searches(
     for (index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
         if expected.outcome != *actual {
             let diagnostic = Diagnostic {
+                code: diagnostic_code!("graph.model_search_mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: expected.span,
                 message: format!("model-search counterexample for {}", expected.description),
@@ -41484,7 +41583,7 @@ fn report_compile_failure(path: &str, error: CompileFailure) -> ExitCode {
             for diagnostic in diagnostics {
                 eprint!(
                     "{}",
-                    render_bundle_diagnostic(path, &source, &segments, &diagnostic, "error")
+                    render_bundle_diagnostic(path, &source, &segments, &diagnostic)
                 );
             }
         }
@@ -42079,7 +42178,7 @@ fn revision_compatibility_diagnostic_to_json(
     diagnostic: &RevisionCompatibilityDiagnostic,
 ) -> Value {
     json!({
-        "code": diagnostic.code,
+        "code": diagnostic.code.as_str(),
         "message": diagnostic.message,
         "subject": diagnostic.subject,
         "source_span": diagnostic.source_span_json.as_deref().map(json_from_str),
@@ -42491,7 +42590,7 @@ fn revision_would_create_to_json(
             .map(|diagnostic| {
                 json!({
                     "severity": "error",
-                    "code": diagnostic.code,
+                    "code": diagnostic.code.as_str(),
                     "message": diagnostic.message,
                     "source_span": diagnostic.source_span_json.as_deref().map(json_from_str),
                     "subject": diagnostic.subject,
@@ -42787,23 +42886,57 @@ fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Renders one diagnostic at its `error[code]: message` head.
+///
+/// There is no severity parameter and there must not be one: the diagnostic
+/// carries its own severity, and a caller that passed a different string would
+/// be relabelling a diagnostic on its way to the terminal. That is exactly what
+/// the two former callers did — one hardcoded `"error"`, one `"warning"` — so a
+/// warning printed as an error whenever it reached the wrong one.
 fn render_diagnostic(path: &str, source: &str, diagnostic: &Diagnostic) -> String {
-    render_diagnostic_with_severity(path, source, diagnostic, "error")
+    // Single-file rendering: every related span is an offset into this same
+    // text, so each note resolves against `source` and prints `path`.
+    let related = diagnostic
+        .related
+        .iter()
+        .map(|info| RenderedRelated {
+            path,
+            location: locate_span(source, info.span),
+            message: info.message.as_str(),
+        })
+        .collect::<Vec<_>>();
+    render_diagnostic_parts(path, source, diagnostic, &related)
 }
 
-fn render_diagnostic_with_severity(
+/// A related label already resolved to the file it points into, so the `note:`
+/// line can name that file rather than borrowing the primary diagnostic's.
+struct RenderedRelated<'a> {
+    path: &'a str,
+    location: SourceLocation,
+    message: &'a str,
+}
+
+/// The one renderer. `diagnostic.related` is IGNORED here — related labels
+/// arrive pre-resolved in `related`, because only the caller knows which file
+/// each of their spans belongs to.
+fn render_diagnostic_parts(
     path: &str,
     source: &str,
     diagnostic: &Diagnostic,
-    severity: &str,
+    related: &[RenderedRelated<'_>],
 ) -> String {
     let location = locate_span(source, diagnostic.span);
     let gutter_width = location.line.to_string().len();
     let underline = underline_for_span(&location, diagnostic.span);
     let mut rendered = String::new();
 
-    rendered.push_str(severity);
-    rendered.push_str(": ");
+    // spec/error-handling.md "Rendering": `error[type.unknown_field]: <message>`.
+    // Both halves of the head come from the diagnostic — `Severity::as_str`
+    // already returns the spec's `error`/`warning`/`info`/`hint` tokens.
+    rendered.push_str(diagnostic.severity.as_str());
+    rendered.push('[');
+    rendered.push_str(diagnostic.code.as_str());
+    rendered.push_str("]: ");
     rendered.push_str(&diagnostic.message);
     rendered.push('\n');
     rendered.push_str(&format!(
@@ -42830,16 +42963,17 @@ fn render_diagnostic_with_severity(
     ));
 
     // Related information (secondary spans) renders as `note:` lines pointing at
-    // the linked location (spec/error-handling.md "Spans And Labels").
-    for info in &diagnostic.related {
-        let related_location = locate_span(source, info.span);
+    // the linked location (spec/error-handling.md "Spans And Labels"). The path
+    // comes from the label, never from the primary diagnostic: in a bundle the
+    // two can be different files.
+    for info in related {
         rendered.push_str(&format!(
             "{:>width$} = note: {} ({}:{}:{})\n",
             "",
             info.message,
-            display_path(path),
-            related_location.line,
-            related_location.column,
+            display_path(info.path),
+            info.location.line,
+            info.location.column,
             width = gutter_width
         ));
     }
@@ -42864,15 +42998,31 @@ struct SourceLocation {
     line_text: String,
 }
 
+/// The largest character boundary at or before `index`, which is clamped into
+/// `text` first. Slicing anywhere else panics.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// The smallest character boundary at or after `index`, clamped into `text`.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
 fn locate_span(source: &str, span: SourceSpan) -> SourceLocation {
     // Clamp to a valid char boundary so a span that points past the source
     // (e.g. a diagnostic on statically expanded `flow`/`action` text, whose
     // length need not match its original source span) can never panic the
     // byte-slicing below — it degrades to a best-effort location instead.
-    let mut start = span.start.min(source.len());
-    while start > 0 && !source.is_char_boundary(start) {
-        start -= 1;
-    }
+    let start = floor_char_boundary(source, span.start);
     let (line, column) = line_column(source, start);
     let line_start = source[..start]
         .rfind('\n')
@@ -42894,16 +43044,19 @@ fn locate_span(source: &str, span: SourceSpan) -> SourceLocation {
 }
 
 fn underline_for_span(location: &SourceLocation, span: SourceSpan) -> String {
-    let underline_start = span.start.max(location.line_start);
-    let underline_end = span.end.min(location.line_end).max(underline_start);
-    let width = if underline_end == underline_start {
+    // Both ends are byte offsets into the file; `line_text` is the slice of it
+    // this line covers. Clamp into the line and then onto character boundaries
+    // — `locate_span` above already does this for the caret position, and the
+    // underline has to as well: a span whose end (or start) lands inside a
+    // multi-byte character panicked the slice below rather than rendering.
+    // Degrading outward covers the whole character instead of half of one.
+    let text = location.line_text.as_str();
+    let start = floor_char_boundary(text, span.start.saturating_sub(location.line_start));
+    let end = ceil_char_boundary(text, span.end.saturating_sub(location.line_start)).max(start);
+    let width = if end == start {
         1
     } else {
-        location.line_text
-            [underline_start - location.line_start..underline_end - location.line_start]
-            .chars()
-            .count()
-            .max(1)
+        text[start..end].chars().count().max(1)
     };
 
     "^".repeat(width)

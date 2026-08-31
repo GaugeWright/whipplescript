@@ -32,11 +32,14 @@ to the root and stays in the root. The two `allow` lists are the policy:
   denial and fails closed for each operation that the static analysis did not
   see:
 
+<!-- render: examples/diagnostics/store-write-not-granted.whip code capability.not_granted -->
 ```text
-error: rule `ingest` writes to store `project_files`, which permits no
-writes — stores are read-only by default
-  = help: declare `allow write ["<glob>", …]` on `file store project_files`
-    to permit (and bound) writes
+error[capability.not_granted]: rule `ingest` writes to store `project_files`, which permits no writes — stores are read-only by default
+   --> examples/diagnostics/store-write-not-granted.whip:37:5
+   |
+37 |     write text to project_files at "out/summary.md" {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: declare `allow write ["<glob>", …]` on `file store project_files` to permit (and bound) writes
 ```
 
 This is the same shape as each limit in Part III. The mandatory `cap` value of

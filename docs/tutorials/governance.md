@@ -51,15 +51,44 @@ WHIPPLESCRIPT_IFC_ENVELOPE=examples/infoflow/governance.policy \
   whip check examples/infoflow/support-triage-unsafe.whip
 ```
 
+<!-- render: examples/infoflow/support-triage-unsafe.whip envelope examples/infoflow/governance.policy -->
 ```text
+information-flow guarantee report
+  guaranteed invariants (proven by the checker on every rule):
+    - file:/srv/crm.db: may not flow to a sink not cleared for Operator (unless an audited declassify clears it); may not be influenced by data below Operator (unless an audited endorse vouches it)
+    - internal:reviewed: may not flow to a sink not cleared for Operator (unless an audited declassify clears it)
+    - result: may not flow to a sink not cleared for Operator (unless an audited declassify clears it)
   violations caught in this program: 2
-error: denied flow in rule `triage`: `crm` may be read by Operator only —
-writing it to `public_reply` (readable by public) would expose it to
-parties outside its readers …
-error: denied influence in rule `triage`: `inbox` is untrusted (integrity
-public) — it can never influence `crm`, which only Operator-vouched data
-may shape …
+  flagged risks: none (every touched resource is governed)
+  trusted surface (declassify + endorse grants): none
+  cleared principals (providers/humans, not protected data):
+    - selfhost:llama (cleared for Operator; vouched writer from Operator)
+  information-flow surface (every door this workflow opens):
+    - crm
+    - fact:Ticket
+    - inbox
+    - public_reply
+  fact provenance (computed producer reach a consumer inherits, DR-0045):
+    - fact:Ticket carries: nothing (clean chain)
+  result/milestone flow signature (per field, the reads a consumer inherits, fact-granular):
+    - result.ok carries reads: crm, inbox
+error[security.confidentiality_leak]: denied flow in rule `triage`: `crm` may be read by Operator only — writing it to `public_reply` (readable by public) would expose it to parties outside its readers (the checker denies every flow from a value to a sink whose readers are not all within the value's reader set)
+   --> examples/infoflow/support-triage-unsafe.whip:44:3
+   |
+44 |   read text from crm at "customer.json" as crm_record
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: self-serve (no grant needed): separate the contexts — read `crm` in a distinct turn and pass only a bounded result. escalate (needs governance): route the release through a `coerce … declassified` whose output is the egress's whole payload, under `grant declassify crm to <role cleared for public_reply>` (a grant alone never blesses a raw flow)
+error[security.integrity_injection]: denied influence in rule `triage`: `inbox` is untrusted (integrity public) — it can never influence `crm`, which only Operator-vouched data may shape (the checker denies every flow from lower-integrity data into a higher-integrity sink; the sanctioned crossing is a source-marked `endorsed` coerce)
+   --> examples/infoflow/support-triage-unsafe.whip:44:3
+   |
+44 |   read text from crm at "customer.json" as crm_record
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: self-serve (no grant needed): do not let `inbox` influence `crm` — gate the sink on trusted data. escalate (needs governance): route the influence through a `coerce … endorsed` whose output is the sink's whole payload, under `grant endorse inbox to <role>` (a grant alone never vouches a raw influence)
 ```
+
+That is the whole of what the command prints: the guarantee report first — its
+`violations caught in this program: 2` line counts the denials that follow — and
+then the two denials themselves. Section 7 below reads the report line by line.
 
 One rule read the CRM, wrote mail from an attacker into the CRM, and sent the
 record out by email. The checker denied the two halves. Each denial gives two

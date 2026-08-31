@@ -1,0 +1,22 @@
+// The spec's worked example (spec/error-handling.md "Rendering"): a field name
+// one edit away from a field the class declares one line up. The compiler holds
+// the candidate set at the moment it rejects the name, so it names it.
+workflow MisspelledField
+
+class Issue {
+  title string
+  priority string
+  reporter string
+}
+
+agent triager {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  tell triager "escalate {{ issue.prioirty }} for {{ issue.reportr }}"
+}

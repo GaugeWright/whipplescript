@@ -1,0 +1,72 @@
+// A half-finished rename, in two places. `Triage` used to take an input called
+// `issue` and now takes one called `ticket`; the first call was updated by
+// pasting the new input in without deleting the old one, and pasting it twice.
+// The second call still names the workflow by a spelling that no longer exists,
+// so it gets the candidate rather than a bare "unknown workflow".
+workflow Router {
+  input request Incoming
+  output result Routed
+
+  class Incoming {
+    id string
+  }
+
+  class Reviewed {
+    id string
+  }
+
+  class Routed {
+    id string
+  }
+
+  rule route
+    when Incoming as incoming
+  => {
+    invoke Triage {
+      ticket { id incoming.id }
+      ticket { id incoming.id }
+      issue { id incoming.id }
+    } as triage
+
+    after triage succeeds as verdict {
+      record Reviewed {
+        id verdict.id
+      }
+    }
+  }
+
+  rule recheck
+    when Reviewed as reviewed
+  => {
+    invoke Triaged {
+      ticket { id reviewed.id }
+    } as second
+
+    after second succeeds as verdict {
+      complete result {
+        id verdict.id
+      }
+    }
+  }
+}
+
+workflow Triage {
+  input ticket Ticket
+  output verdict Verdict
+
+  class Ticket {
+    id string
+  }
+
+  class Verdict {
+    id string
+  }
+
+  rule decide
+    when Ticket as ticket
+  => {
+    complete verdict {
+      id ticket.id
+    }
+  }
+}

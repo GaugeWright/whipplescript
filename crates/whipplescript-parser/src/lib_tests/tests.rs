@@ -93,6 +93,7 @@ fn declaration_block_grammar_table_is_complete() {
         pos: 0,
         diagnostics: Vec::new(),
         pending_contract_classes: Vec::new(),
+        unclosed_openers: Vec::new(),
     };
     let spec = parser
         .declaration_block_spec_at()
@@ -3543,9 +3544,20 @@ rule bad_guard
     assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
         .message
         .contains("missing required object field `Owner.name`")));
+    // The object literal in `{ phase "kernel" } == task.metadata` is refused
+    // ONCE, as the untyped literal it is. The comparison it then fails is
+    // DERIVED from that — the checker has just said the operand has no type —
+    // and reporting both put two diagnostics on one span for one mistake.
     assert!(compiled.diagnostics.iter().any(|diagnostic| diagnostic
         .message
-        .contains("compares incompatible expression types")));
+        .contains("uses an object literal without an expected object or map type")));
+    assert!(
+        !compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("compares incompatible expression types")),
+        "{:?}",
+        compiled.diagnostics
+    );
 }
 
 #[test]
@@ -6693,7 +6705,10 @@ fn rule_body_refusals_fire() {
             ("rule `r` has `after out reaches \"half\"` for `out`, which is not a workflow-invoke binding in this rule", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce classify(t.title) as out\n  after out reaches \"half\" { complete result { ok true } }\n}\n"),
             ("rule `r` observes acquire `s` with `succeeds`, which also matches a Contended outcome (the acquire op completes either way)", "use std.coord\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nlease slot { key T slots 1 ttl 10m }\nrule r\n  when T as t\n=> {\n  acquire slot for t.id as s\n  after s succeeds { complete result { ok true } }\n}\n"),
             ("rule `r` observes counter consume `c` with `succeeds`, which also matches an Over outcome (the consume op completes either way)", "use std.coord\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { name string }\ncounter budget { key T cap 3 reset daily }\nrule r\n  when T as t\n=> {\n  consume budget for t.name amount 1 as c\n  after c succeeds { complete result { ok true } }\n}\n"),
-            ("rule `r` has unsupported `after` dependency predicate", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce classify(t.title) as out\n  after out explodes { complete result { ok true } }\n}\n"),
+            // The body parser's refusal, not the rule-line scanner's: the two
+            // used to report this one mistake twice on one span, and the
+            // scanner's copy is gone. This wording names the predicate.
+            ("unsupported `after` predicate `explodes`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce classify(t.title) as out\n  after out explodes { complete result { ok true } }\n}\n"),
             ("rule `r` records unknown class `Missing`", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> {\n  record Missing { ok true }\n  complete result { ok true }\n}\n"),
             ("rule `r` has malformed coerce call", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t\n=> {\n  coerce notacall as out\n  after out completes { complete result { ok true } }\n}\n"),
             ("rule `r` has malformed workflow invocation", "workflow W\noutput result R\nclass R { ok bool }\nrule r\n  when started\n=> {\n  invoke as child\n  after child succeeds { complete result { ok true } }\n}\n"),
@@ -7443,9 +7458,8 @@ workflow B {
     let compiled = compile_program_with_root(source, Some("A"));
     assert!(compiled.ir.is_none());
     assert!(
-        compiled.diagnostics.iter().any(|d| d
-            .message
-            .contains("graph.unbounded_workflow_invocation_recursion")
+        compiled.diagnostics.iter().any(|d| d.code.as_str()
+            == "graph.unbounded_workflow_invocation_recursion"
             && d.message.contains("A -> B -> A")),
         "{:?}",
         compiled.diagnostics
@@ -7497,9 +7511,10 @@ workflow C {
 "#;
     let compiled = compile_program_with_root(source, Some("A"));
     assert!(
-        !compiled.diagnostics.iter().any(|d| d
-            .message
-            .contains("graph.unbounded_workflow_invocation_recursion")),
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "graph.unbounded_workflow_invocation_recursion"),
         "acyclic chain wrongly flagged: {:?}",
         compiled.diagnostics
     );
@@ -8915,6 +8930,22 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bad-expression-functions.whip"),
         ),
         (
+            "bad-comparisons",
+            include_str!("../../../../examples/invalid/bad-comparisons.whip"),
+        ),
+        (
+            "bad-case-branches",
+            include_str!("../../../../examples/invalid/bad-case-branches.whip"),
+        ),
+        (
+            "bad-source-declarations",
+            include_str!("../../../../examples/invalid/bad-source-declarations.whip"),
+        ),
+        (
+            "bad-access-grants",
+            include_str!("../../../../examples/invalid/bad-access-grants.whip"),
+        ),
+        (
             "bad-finite-domain",
             include_str!("../../../../examples/invalid/bad-finite-domain.whip"),
         ),
@@ -8962,7 +8993,117 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             "invoke-service-workflow",
             include_str!("../../../../examples/invalid/invoke-service-workflow.whip"),
         ),
+        // D4 — the four shapes a did-you-mean takes. Each one is a real
+        // misspelling of a name declared in the same file, so the suggestion is
+        // reachable and a regression is visible in the snapshot.
+        (
+            "misspelled-field",
+            include_str!("../../../../examples/invalid/misspelled-field.whip"),
+        ),
+        (
+            "misspelled-name",
+            include_str!("../../../../examples/invalid/misspelled-name.whip"),
+        ),
+        (
+            "misspelled-vocabulary",
+            include_str!("../../../../examples/invalid/misspelled-vocabulary.whip"),
+        ),
+        (
+            "misspelled-keyword",
+            include_str!("../../../../examples/invalid/misspelled-keyword.whip"),
+        ),
+        // D5 — the two classes of paired location. `unclosed-brace` is the
+        // cascade a missing `}` produces: three errors at tokens the parser
+        // misread, every one of them now naming the brace on line 7.
+        // `duplicate-declaration` is the other direction — the error is the
+        // SECOND declaration and the useful location is the first.
+        (
+            "unclosed-brace",
+            include_str!("../../../../examples/invalid/unclosed-brace.whip"),
+        ),
+        (
+            "duplicate-declaration",
+            include_str!("../../../../examples/invalid/duplicate-declaration.whip"),
+        ),
+        // D7 — the mistakes a person actually makes, one fixture per shape of
+        // mistake rather than one per code. Each of these was written by
+        // reaching for a plausible program first and reading what came out
+        // second, which is how the wrong-line caret on
+        // `construct.unknown_provider_kind` and the illegal `number` in the
+        // payload-contract repair were found.
+        (
+            "unterminated-string",
+            include_str!("../../../../examples/invalid/unterminated-string.whip"),
+        ),
+        (
+            "bad-guard-expressions",
+            include_str!("../../../../examples/invalid/bad-guard-expressions.whip"),
+        ),
+        (
+            "bad-terminal-shape",
+            include_str!("../../../../examples/invalid/bad-terminal-shape.whip"),
+        ),
+        (
+            "unhandled-lease-outcome",
+            include_str!("../../../../examples/invalid/unhandled-lease-outcome.whip"),
+        ),
+        (
+            "bad-invocation-inputs",
+            include_str!("../../../../examples/invalid/bad-invocation-inputs.whip"),
+        ),
+        (
+            "unreachable-case-branch",
+            include_str!("../../../../examples/invalid/unreachable-case-branch.whip"),
+        ),
+        (
+            "write-to-read-only-store",
+            include_str!("../../../../examples/invalid/write-to-read-only-store.whip"),
+        ),
     ];
+
+    // Three fixtures are refused by a WHOLE-PROGRAM analysis that runs in the
+    // CLI over the lowered IR, not by `compile_program`: the missing
+    // `use std.script` is decided against the program's imports, the
+    // never-firing rule needs the producer set of the whole bundle, and the
+    // unknown provider kind needs the package manifests. `compile_program`
+    // therefore ACCEPTS all three and the
+    // loop below would have nothing to walk, so they get their own assertion —
+    // that the parser plane is silent on them — while `whip check` and the
+    // `.diagnostics` snapshot pin their codes, spans and repairs.
+    //
+    // They are listed here because the glob guard in
+    // `scripts/regen-invalid-diagnostics.sh` requires every
+    // `examples/invalid/*.whip` to appear in this test; without that, a fixture
+    // whose refusal moved planes would sit unasserted and unnoticed.
+    let whole_program_fixtures = [
+        (
+            "missing-script-import",
+            include_str!("../../../../examples/invalid/missing-script-import.whip"),
+        ),
+        (
+            "rule-never-fires",
+            include_str!("../../../../examples/invalid/rule-never-fires.whip"),
+        ),
+        (
+            "unknown-provider-kind",
+            include_str!("../../../../examples/invalid/unknown-provider-kind.whip"),
+        ),
+    ];
+    for (name, source) in whole_program_fixtures {
+        let compiled = compile_program(source);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{name} is listed as refused by the whole-program plane, but \
+             compile_program refused it too: {:?} — move it into `fixtures` \
+             above so the corpus invariants apply to its diagnostics",
+            compiled.diagnostics
+        );
+        assert!(
+            compiled.ir.is_some(),
+            "{name} did not lower, so `whip check` never reaches the \
+             whole-program analysis that is supposed to refuse it"
+        );
+    }
 
     for (name, source) in fixtures {
         let compiled = compile_program(source);
@@ -8979,7 +9120,567 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             "{name} emitted a diagnostic without a suggestion: {:?}",
             compiled.diagnostics
         );
+        // Standing invariant over the whole corpus (tracker D5): a related note
+        // may never land on the caret its own diagnostic is already under. Such
+        // a note tells the reader to go and look at where they are, and it is
+        // the failure mode every paired-span site can fall into by pointing at
+        // the wrong one of the two locations it holds.
+        for diagnostic in &compiled.diagnostics {
+            assert!(
+                diagnostic
+                    .related
+                    .iter()
+                    .all(|related| related.span.start != diagnostic.span.start),
+                "{name} attached a note to its own caret: {diagnostic:?}"
+            );
+        }
+        // Standing invariant over the whole corpus (tracker D6): no fixture may
+        // print one diagnostic twice. Cheap, permanent, and it fires on any new
+        // duplicate producer rather than waiting for someone to read a snapshot.
+        let mut seen = BTreeSet::new();
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .all(|diagnostic| seen.insert(crate::diagnostic_key(diagnostic))),
+            "{name} emitted the same diagnostic twice: {:?}",
+            compiled.diagnostics
+        );
+        // Standing invariant over the whole corpus (tracker D3): the channel a
+        // diagnostic travels in and the severity it declares must agree. See
+        // `compile_output_channels_agree_with_severity` for the statement of
+        // why, and for the warning half this corpus cannot reach.
+        assert_eq!(
+            compiled.channel_severity_violation().map(|(why, _)| why),
+            None,
+            "{name}: {:?}",
+            compiled.channel_severity_violation()
+        );
     }
+}
+
+/// THE INVARIANT tying `CompileOutput`'s two channels to the `severity` field.
+///
+/// Both exist and both stay: the channel is the BLOCKING decision — a non-empty
+/// `diagnostics` fails the compile and `whip check` exits non-zero, `warnings`
+/// never blocks — while `severity` is what the text renderer, the JSON report,
+/// and the LSP now read. Nothing derives one from the other any more, which is
+/// precisely why they can drift apart silently, so the agreement is asserted
+/// rather than assumed:
+///
+///   * everything in `diagnostics` is `Severity::Error`;
+///   * nothing in `warnings` is.
+///
+/// The `debug_assert!` in `compile_program_with_root` catches this on every
+/// debug compile. This test is the part that survives `--release` and that fails
+/// when the check itself is deleted.
+#[test]
+fn compile_output_channels_agree_with_severity() {
+    // A program whose only fault is a warning: `exec` handled for success only,
+    // so the failure path draws the R1a warning and the program still compiles.
+    let warns = r#"
+use std.script
+
+workflow ChannelWarn
+
+output result Done
+failure error Broken
+
+class Done { note string }
+class Broken { reason string }
+class Trigger { id string }
+
+table seed as Trigger [
+  { id "t" }
+]
+
+rule r
+  when Trigger as t
+=> {
+  exec "true" as x
+
+  after x succeeds {
+    complete result { note "ok" }
+  }
+}
+"#;
+    let warned = compile_program(warns);
+    // Bite, both halves: a corpus that produced no warnings would let a broken
+    // warning channel pass, and one that produced no errors would let a broken
+    // error channel pass.
+    assert!(warned.diagnostics.is_empty(), "{:?}", warned.diagnostics);
+    assert!(
+        !warned.warnings.is_empty(),
+        "the warning fixture stopped warning, so this test no longer covers the          non-blocking channel"
+    );
+    assert_eq!(
+        warned.channel_severity_violation().map(|(why, _)| why),
+        None,
+        "{:?}",
+        warned.channel_severity_violation()
+    );
+    assert!(
+        warned
+            .warnings
+            .iter()
+            .all(|warning| warning.severity == Severity::Warning),
+        "{:?}",
+        warned.warnings
+    );
+
+    let refused = compile_program(
+        "class Task { title string }
+
+rule r
+  when Nope as n
+=> { }
+",
+    );
+    assert!(!refused.diagnostics.is_empty());
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Severity::Error),
+        "{:?}",
+        refused.diagnostics
+    );
+    assert_eq!(
+        refused.channel_severity_violation().map(|(why, _)| why),
+        None,
+        "{:?}",
+        refused.channel_severity_violation()
+    );
+
+    // And the check itself bites. Without these two, deleting the body of
+    // `channel_severity_violation` and returning `None` would leave every
+    // assertion above passing.
+    let mislabelled = CompileOutput {
+        ir: None,
+        diagnostics: vec![Diagnostic::warning(
+            diagnostic_code!("parse.unexpected_token"),
+            SourceSpan { start: 0, end: 1 },
+            "a warning that blocks",
+        )],
+        warnings: Vec::new(),
+    };
+    assert_eq!(
+        mislabelled.channel_severity_violation().map(|(why, _)| why),
+        Some("blocking `diagnostics` carries a non-error")
+    );
+    let unblocked = CompileOutput {
+        ir: None,
+        diagnostics: Vec::new(),
+        warnings: vec![Diagnostic::error(
+            diagnostic_code!("parse.unexpected_token"),
+            SourceSpan { start: 0, end: 1 },
+            "an error that does not block",
+        )],
+    };
+    assert_eq!(
+        unblocked.channel_severity_violation().map(|(why, _)| why),
+        Some("non-blocking `warnings` carries an error")
+    );
+}
+
+/// The three structural producers of duplicate diagnostics (tracker D6), each
+/// reproduced. Every one printed the SAME finding more than once before the
+/// fixes; the counts here are what a reader now sees.
+#[test]
+fn a_finding_is_reported_once_per_mistake() {
+    // P1 — multi-workflow aggregation. Every workflow is lowered against the
+    // same globals, so an error in a TOP-LEVEL declaration was re-derived once
+    // per workflow: two workflows printed it twice, three would print it three
+    // times.
+    let two_workflows = r#"
+class Task { title string }
+
+assert count(MissingTask) == 0
+
+workflow Alpha {
+  output done D
+  class D { note string }
+  rule a
+    when Task as task
+  => { complete done { note task.title } }
+}
+
+workflow Beta {
+  output done D2
+  class D2 { note string }
+  rule b
+    when Task as task
+  => { complete done { note task.title } }
+}
+"#;
+    let compiled = compile_program(two_workflows);
+    let unknown_schema = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message == "assertion queries unknown fact schema `MissingTask`"
+        })
+        .count();
+    assert_eq!(
+        unknown_schema, 1,
+        "the global assertion error was re-derived per workflow: {:?}",
+        compiled.diagnostics
+    );
+
+    // P2 — a single-line `record` is scanned by the line-wise field-path pass
+    // AND by the record-value walk. Written across three lines it appears once
+    // (`record_depth` skips the body lines), which is what made the difference
+    // look like a formatting question.
+    let single_line_record = r#"
+workflow P2
+output done D
+class D { note string }
+class Task { title string }
+class Out { detail string }
+
+rule r
+  when Task as task
+=> {
+  record Out { detail task.nosuch }
+  complete done { note task.title }
+}
+"#;
+    let compiled = compile_program(single_line_record);
+    let bad_path = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("invalid field path `task.nosuch`")
+        })
+        .count();
+    assert_eq!(
+        bad_path, 1,
+        "the single-line record's field path was reported by two passes: {:?}",
+        compiled.diagnostics
+    );
+
+    // P3 — three walkers validate the same `case` guard. They used to report at
+    // two different spans, so structural equality could not collapse them and
+    // the author saw one mistake described twice in two places.
+    let case_guard = r#"
+workflow P3
+output done D
+class D { note string }
+class Task { title string  provider "codex" | "claude" }
+
+rule r
+  when Task as task
+=> {
+  case task.provider {
+    "codex" where task.nosuch == 1 => { complete done { note task.title } }
+    "claude" => { complete done { note task.title } }
+  }
+}
+"#;
+    let compiled = compile_program(case_guard);
+    let guard_path = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("invalid field path `task.nosuch`")
+        })
+        .count();
+    assert_eq!(
+        guard_path, 1,
+        "the case guard's field path was reported by more than one walker: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A `case` arm's BODY is walked by the arm walkers and by the line-wise scan,
+/// and the two used to disagree about where the finding was: the walkers
+/// reported at the arm's PATTERN because the body they held was re-joined from
+/// its lines and carried no offsets. A duplicate that survives because two
+/// passes disagree about WHERE is worse than one that converges — nothing can
+/// recognise it as one mistake, and the reader is shown two carets in two
+/// places for one misspelling.
+#[test]
+fn a_case_arm_body_is_reported_at_the_arm_body() {
+    let source = r#"
+workflow ArmBody
+output done D
+class D { note string }
+class Out { detail string }
+class Task { title string  provider "codex" | "claude" }
+
+rule r
+  when Task as task
+=> {
+  case task.provider {
+    "codex" => {
+      record Out { detail task.nosuch }
+      complete done { note task.title }
+    }
+    "claude" => {
+      complete done { note task.title }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let bad_path: Vec<_> = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("invalid field path `task.nosuch`")
+        })
+        .collect();
+    assert_eq!(
+        bad_path.len(),
+        1,
+        "the arm body's field path was reported more than once: {:?}",
+        compiled.diagnostics
+    );
+    assert_eq!(
+        &source[bad_path[0].span.start..bad_path[0].span.end],
+        "nosuch",
+        "the caret left the misspelled field"
+    );
+}
+
+/// `record <Schema> from <binding> { <field> }` writes only the field name; the
+/// value it stands for (`<binding>.<field>`) is synthesized, so offsets measured
+/// against that string are not positions in the source at all. Resolving them
+/// anyway walked off the end of the field name and underlined whatever followed
+/// — here the record's closing `}`, several lines below, which the finding is
+/// not about. An anchor that cannot place a range says so instead.
+#[test]
+fn a_shorthand_record_field_never_underlines_past_itself() {
+    let source = r#"
+workflow ShorthandSpan
+output done D
+class D { note string }
+class ReviewRequest { headline string }
+class HumanDecision { subject string }
+
+rule shorthand_span
+  when ReviewRequest as request
+=> {
+  record HumanDecision from request {
+    subject
+  }
+  complete done { note request.headline }
+}
+"#;
+    let compiled = compile_program(source);
+    let bad_path: Vec<_> = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("invalid field path `request.subject`")
+        })
+        .collect();
+    assert_eq!(
+        bad_path.len(),
+        1,
+        "expected exactly the shorthand's field-path error: {:?}",
+        compiled.diagnostics
+    );
+    // Either the field name itself or the coarse rule-body fallback that
+    // contains it. What it must never be is the run of source that FOLLOWS the
+    // field name, which is where the unclamped offsets landed: `\n  }`, the
+    // record's closing brace, underlined as if it were the mistake.
+    let underlined = &source[bad_path[0].span.start..bad_path[0].span.end];
+    assert!(
+        underlined == "subject" || underlined.contains("subject"),
+        "the caret ran off the field name onto `{underlined}`"
+    );
+}
+
+/// Two rules may carry the same name — the compiler accepts it (D14) — so a
+/// whole-program check that looked its rule's body origin up BY NAME re-parsed
+/// one rule's text against another rule's position, and put the caret on a
+/// statement that performs no write at all.
+#[test]
+fn a_duplicate_rule_name_does_not_borrow_another_rules_position() {
+    let source = r#"
+use std.files
+
+workflow DupRuleName
+output result Saved
+class Saved { content string }
+
+file store notes_store {
+  root "./.whipplescript/dup-demo"
+  allow read ["notes/**"]
+}
+
+rule same_name
+  when started
+=> {
+  write text to notes_store at "notes/hello.txt" {
+    body "hello"
+    mode upsert
+  } as written
+
+  after written completes {
+    complete result { content "done" }
+  }
+}
+
+rule same_name
+  when started
+=> {
+  complete result { content "other" }
+}
+"#;
+    let compiled = compile_program(source);
+    let write_policy: Vec<_> = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("which permits no writes"))
+        .collect();
+    assert_eq!(
+        write_policy.len(),
+        1,
+        "expected exactly the read-only-store refusal: {:?}",
+        compiled.diagnostics
+    );
+    let underlined = &source[write_policy[0].span.start..write_policy[0].span.end];
+    assert!(
+        underlined.starts_with("write text to notes_store"),
+        "the caret landed on `{underlined}`, which performs no write"
+    );
+}
+
+/// Several parts of one fragment can be wrong the same way while none of them
+/// has a span of its own (`Expr` carries no spans — D10), so one pass reports
+/// the same message at the same span more than once and every copy is a
+/// separate mistake. A collapse over the finished diagnostic list cannot tell
+/// that from a re-report; it would show the reader one wrong list item, and the
+/// second only after they fixed the first and re-ran.
+#[test]
+fn two_wrong_items_of_one_argument_are_two_findings() {
+    let source = r#"
+workflow DupCoerce
+output done Result
+class Result { note string }
+class Task { title string }
+class Verdict { note string }
+
+coerce classify(tags string[], title string) -> Verdict {
+  prompt """
+  classify
+  """
+}
+
+rule r
+  when Task as task
+=> {
+  coerce classify(
+    [1, 2],
+    task.title
+  ) as verdict
+  after verdict completes {
+    complete done { note task.title }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let wrong_item = compiled
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message == "field `coerce `classify`.tags` expects `string`"
+        })
+        .count();
+    assert_eq!(
+        wrong_item, 2,
+        "one of the two wrong list items was collapsed away: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The per-pass dedup is a net, and a net must not catch what it is not for.
+#[test]
+fn merging_passes_keeps_distinct_findings_and_order() {
+    let span = |start, end| SourceSpan { start, end };
+    let diagnostic = |start, end, message: &str, suggestion: Option<&str>| Diagnostic {
+        code: diagnostic_code!("parse.unexpected_token"),
+        severity: Severity::Error,
+        related: Vec::new(),
+        span: span(start, end),
+        message: message.to_owned(),
+        suggestion: suggestion.map(str::to_owned),
+    };
+    // One pass, and nothing it said is dropped. Two DIFFERENT findings at one
+    // span is the case that makes a span-only key a lie —
+    // `examples/invalid/bad-record.whip` used to put five of these on one arrow,
+    // and finer spans make convergence more common, not less. And the same
+    // finding TWICE from one pass is two mistakes with no spans to tell them
+    // apart (`coerce f([1, 2])` against a `string[]`), which is why this is
+    // per-pass and not a collapse over the finished list.
+    let first_pass = vec![
+        diagnostic(3, 9, "second", None),
+        diagnostic(3, 9, "first", None),
+        diagnostic(3, 9, "second", None),
+        diagnostic(3, 9, "second", Some("but repair it this way")),
+        diagnostic(1, 2, "first", None),
+    ];
+    let mut passes = crate::RuleBodyPasses::default();
+    let mut diagnostics = Vec::new();
+    passes.run(&mut diagnostics, |out| out.extend(first_pass.clone()));
+    assert_eq!(
+        diagnostics, first_pass,
+        "one pass had its own output filtered"
+    );
+
+    // A second pass over the same text says the same things again, and the
+    // reader learns nothing from the repeat — including the finding the first
+    // pass legitimately made twice, which is not owed a third copy.
+    passes.run(&mut diagnostics, |out| out.extend(first_pass.clone()));
+    assert_eq!(
+        diagnostics, first_pass,
+        "a re-reporting pass got through, or a first-pass finding was dropped"
+    );
+
+    // A second pass that says something MORE keeps the extra copy: two passes
+    // each reporting once is one mistake, but a pass reporting three times
+    // where the last said two is a third thing to fix.
+    passes.run(&mut diagnostics, |out| {
+        out.extend([
+            diagnostic(3, 9, "second", None),
+            diagnostic(3, 9, "second", None),
+            diagnostic(3, 9, "second", None),
+            diagnostic(7, 8, "new", None),
+        ])
+    });
+    assert_eq!(
+        diagnostics,
+        [
+            first_pass.clone(),
+            vec![
+                diagnostic(3, 9, "second", None),
+                diagnostic(7, 8, "new", None)
+            ],
+        ]
+        .concat(),
+        "the extra copy or the new finding went missing"
+    );
+
+    // A different `related` label is a different thing to tell the reader.
+    let labelled = vec![
+        diagnostic(3, 9, "same", None).with_related(span(1, 2), "declared here"),
+        diagnostic(3, 9, "same", None).with_related(span(4, 5), "declared here"),
+    ];
+    let mut passes = crate::RuleBodyPasses::default();
+    let mut diagnostics = Vec::new();
+    passes.run(&mut diagnostics, |out| out.extend(labelled.clone()));
+    passes.run(&mut diagnostics, |out| out.extend(labelled.clone()));
+    assert_eq!(diagnostics, labelled, "a related label was collapsed away");
 }
 
 /// Seven refusals that a mutation sweep found nothing exercised: disabling
@@ -10271,9 +10972,10 @@ rule finish
     let compiled = compile_program(source);
 
     assert!(
-        compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.bounded_workflow_effect_cycle")),
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"),
         "{:?}",
         compiled.diagnostics
     );
@@ -10376,9 +11078,7 @@ fn rejects_same_commit_effectful_rule_cycle_across_two_rules() {
     assert!(compiled.ir.is_none());
     assert!(
         compiled.diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("effectful rule cycle is not allowed (graph.unbounded_effect_recursion)")
+            diagnostic.code.as_str() == "graph.unbounded_effect_recursion"
                 && diagnostic.message.contains(
                     "rule cycle ping_step -> pong_step -> ping_step turns inside one commit",
                 )
@@ -10440,9 +11140,10 @@ rule finish
 
     assert!(compiled.ir.is_none());
     assert!(
-        compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.unbounded_effect_recursion")),
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.unbounded_effect_recursion"),
         "{:?}",
         compiled.diagnostics
     );
@@ -10826,10 +11527,13 @@ rule turn
 
     assert!(compiled.ir.is_none());
     assert!(
-        compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.unbounded_effect_recursion")
-            && diagnostic.message.contains("turn -> turn")),
+        compiled
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.code.as_str() == "graph.unbounded_effect_recursion"
+                    && diagnostic.message.contains("turn -> turn")
+            ),
         "{:?}",
         compiled.diagnostics
     );
@@ -10904,8 +11608,7 @@ rule turn
         let compiled = compile_program(&program(tag));
         assert!(
             compiled.diagnostics.iter().any(|diagnostic| diagnostic
-                .message
-                .contains("graph.bounded_workflow_effect_cycle")),
+                .code.as_str() == "graph.bounded_workflow_effect_cycle"),
             "{tag}: {:?}",
             compiled.diagnostics
         );
@@ -10965,9 +11668,8 @@ fn bounded_workflow_refuses_a_world_paced_effect_cycle() {
     assert!(compiled.ir.is_none());
     assert!(
         compiled.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message.contains(
-                "effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle)",
-            ) && diagnostic.message.contains("is `@bounded`")
+            diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
+                && diagnostic.message.contains("is `@bounded`")
         }),
         "{:?}",
         compiled.diagnostics
@@ -10986,10 +11688,13 @@ fn tool_workflow_refuses_a_world_paced_effect_cycle() {
 
     assert!(compiled.ir.is_none());
     assert!(
-        compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.bounded_workflow_effect_cycle")
-            && diagnostic.message.contains("bounded by DR-0025")),
+        compiled
+            .diagnostics
+            .iter()
+            .any(
+                |diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
+                    && diagnostic.message.contains("bounded by DR-0025")
+            ),
         "{:?}",
         compiled.diagnostics
     );
@@ -11078,9 +11783,10 @@ rule give_up
     let compiled = compile_program(source);
 
     assert!(
-        !compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.unbounded_effect_recursion")),
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.unbounded_effect_recursion"),
         "the retry idiom must keep compiling: {:?}",
         compiled.diagnostics
     );
@@ -11098,11 +11804,10 @@ fn rejects_agent_tool_grant_cycle() {
     assert!(compiled.ir.is_none());
     assert!(
         compiled.diagnostics.iter().any(|diagnostic| {
-            diagnostic.message.contains(
-                "recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion)",
-            ) && diagnostic
-                .message
-                .contains("invoke-tool cycle Alpha -> Beta -> Alpha")
+            diagnostic.code.as_str() == "graph.unbounded_tool_grant_recursion"
+                && diagnostic
+                    .message
+                    .contains("invoke-tool cycle Alpha -> Beta -> Alpha")
         }),
         "{:?}",
         compiled.diagnostics
@@ -11187,9 +11892,9 @@ workflow Alpha {
     for root in ["Top", "Alpha"] {
         let compiled = compile_program_with_root(source, Some(root));
         assert!(
-            !compiled.diagnostics.iter().any(|diagnostic| diagnostic
-                .message
-                .contains("graph.unbounded_tool_grant_recursion")),
+            !compiled.diagnostics.iter().any(
+                |diagnostic| diagnostic.code.as_str() == "graph.unbounded_tool_grant_recursion"
+            ),
             "root {root}: {:?}",
             compiled.diagnostics
         );
@@ -11222,9 +11927,10 @@ workflow Grants {
     let compiled = compile_program(source);
 
     assert!(
-        !compiled.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains("graph.unbounded_tool_grant_recursion")),
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.unbounded_tool_grant_recursion"),
         "{:?}",
         compiled.diagnostics
     );
@@ -11242,9 +11948,7 @@ fn rejects_invoke_of_a_service_workflow() {
     assert!(compiled.ir.is_none());
     assert!(
         compiled.diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("graph.invoke_awaits_service_workflow")
+            diagnostic.code.as_str() == "graph.invoke_awaits_service_workflow"
                 && diagnostic
                     .message
                     .contains("rule `relay` invokes `Forever`")
@@ -12204,9 +12908,7 @@ fn rejects_self_recursive_pattern_application() {
     assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
     let diagnostic = &compiled.diagnostics[0];
     assert!(
-        diagnostic
-            .message
-            .contains("graph.unbounded_pattern_recursion"),
+        diagnostic.code.as_str() == "graph.unbounded_pattern_recursion",
         "{}",
         diagnostic.message
     );
@@ -12246,7 +12948,7 @@ apply Ping<Item> as top {
     let recursion: Vec<&Diagnostic> = compiled
         .diagnostics
         .iter()
-        .filter(|d| d.message.contains("graph.unbounded_pattern_recursion"))
+        .filter(|d| d.code.as_str() == "graph.unbounded_pattern_recursion")
         .collect();
     // One cycle, reported once (members covered are not re-reported).
     assert_eq!(recursion.len(), 1, "{:?}", compiled.diagnostics);
@@ -12285,7 +12987,7 @@ apply Outer<Item> as top {
         !compiled
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("graph.unbounded_pattern_recursion")),
+            .any(|d| d.code.as_str() == "graph.unbounded_pattern_recursion"),
         "non-recursive nesting must not be flagged as recursion: {:?}",
         compiled.diagnostics
     );
@@ -15440,8 +16142,16 @@ source clock as daily {
     );
 }
 
+/// A calendar schedule without a timezone WARNS; it does not refuse.
+///
+/// One fault, one code, one severity: a counter whose reset period has the same
+/// UTC-anchoring hazard already only warned, under `construct.missing_timezone`,
+/// while this site refused under `construct.missing_requirement`. spec/std-time.md
+/// states the behaviour as "defaults to UTC and emits a diagnostic RECOMMENDING
+/// an explicit anchor", which is a warning; the refusal was the outlier, and its
+/// own message said "should".
 #[test]
-fn calendar_clock_source_requires_timezone() {
+fn calendar_clock_source_warns_without_a_timezone() {
     let source = r#"
 workflow NeedsTimezone
 
@@ -15460,11 +16170,16 @@ source clock as daily {
 }
 "#;
     let compiled = compile_program(source);
+    let warning = compiled
+        .warnings
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("should declare a `timezone`"))
+        .unwrap_or_else(|| panic!("{:?} / {:?}", compiled.diagnostics, compiled.warnings));
+    assert_eq!(warning.code.as_str(), "construct.missing_timezone");
+    assert_eq!(warning.severity, Severity::Warning);
+    // It warns, so the program still compiles.
     assert!(
-        compiled
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("should declare a `timezone`")),
+        compiled.diagnostics.is_empty(),
         "{:?}",
         compiled.diagnostics
     );
@@ -17221,4 +17936,1786 @@ rule seal_it
         !compiled.diagnostics.is_empty(),
         "a missing `with` must not parse as a valid seal"
     );
+}
+
+// --- Rule-body span origin (tracker D2a/D2b) --------------------------------
+//
+// `BlockSource` carries where its `text` begins (`BodyOrigin`), so nothing
+// downstream has to reconstruct it. The two reconstructions it replaced were
+// both wrong: `span.start` is the `{`, one-plus-leading-whitespace bytes before
+// `text[0]`, and `span.end - (2 + text.len())` assumes exactly one newline and
+// no trailing whitespace before the closing `}`.
+
+/// The source text a diagnostic underlines. Slicing panics unless the span sits
+/// on character boundaries, which is half of what these tests assert.
+fn diagnostic_text<'a>(source: &'a str, diagnostic: &Diagnostic) -> &'a str {
+    &source[diagnostic.span.start..diagnostic.span.end]
+}
+
+/// The 1-based CHARACTER column a diagnostic renders at (what the CLI shows).
+fn diagnostic_column(source: &str, diagnostic: &Diagnostic) -> usize {
+    let line_start = source[..diagnostic.span.start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    source[line_start..diagnostic.span.start].chars().count() + 1
+}
+
+fn find_diagnostic<'a>(compiled: &'a CompileOutput, needle: &str) -> &'a Diagnostic {
+    compiled
+        .diagnostics
+        .iter()
+        .chain(compiled.warnings.iter())
+        .find(|diagnostic| diagnostic.message.contains(needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "no diagnostic containing {needle:?}; got {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .chain(compiled.warnings.iter())
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+const SKEWED_BODY: &str = r#"workflow Skew
+output result Done
+
+class Order {
+  id string
+}
+
+class Done {
+  id string
+}
+
+rule start
+  when started
+=> {
+  record Order { id "a" }
+}
+
+rule act
+  when Order as order
+=> {
+  record Done { id order.id }
+  frobnicate order
+}
+"#;
+
+#[test]
+fn body_ast_spans_are_real_source_positions() {
+    // The base handed to the body parser used to be the `{`, so every
+    // BodyAst-derived span was short by `1 + leading whitespace`: this
+    // diagnostic landed on the last column of the PREVIOUS line.
+    let compiled = compile_program(SKEWED_BODY);
+    let diagnostic = find_diagnostic(&compiled, "unknown rule body statement `frobnicate`");
+    assert_eq!(diagnostic_text(SKEWED_BODY, diagnostic), "frobnicate");
+    assert_eq!(diagnostic_column(SKEWED_BODY, diagnostic), 3);
+}
+
+/// A `case` arm over an enum with one bad variant, `{trailing}` substituted
+/// into the otherwise-blank line before the rule's closing `}`.
+fn case_arm_program(trailing: &str) -> String {
+    format!(
+        r#"workflow Ws
+output result Done
+
+enum Phase {{
+  Draft
+  Final
+}}
+
+class Order {{
+  id string
+  phase Phase
+}}
+
+class Done {{
+  id string
+}}
+
+rule act
+  when Order as order
+=> {{
+  case order.phase {{
+    Nope => {{ record Done {{ id order.id }} }}
+    Draft => {{ record Done {{ id order.id }} }}
+    Final => {{ record Done {{ id order.id }} }}
+  }}
+{trailing}
+}}
+"#
+    )
+}
+
+#[test]
+fn rule_body_spans_do_not_move_with_trailing_whitespace() {
+    // The origin used to be reconstructed from the END of the block
+    // (`span.end - (2 + text.len())`), so whitespace between the last statement
+    // and the closing `}` shifted every caret in the rule to the right.
+    for trailing in ["", "      ", "\t", "  \n   "] {
+        let source = case_arm_program(trailing);
+        let compiled = compile_program(&source);
+        let diagnostic = find_diagnostic(&compiled, "has no variant `Nope`");
+        assert_eq!(
+            diagnostic_text(&source, diagnostic),
+            "Nope",
+            "trailing whitespace {trailing:?} moved the caret"
+        );
+        assert_eq!(diagnostic_column(&source, diagnostic), 5);
+    }
+}
+
+#[test]
+fn rule_body_spans_are_character_correct_across_multibyte_text() {
+    // Spans are byte offsets and columns are character counts. A body carrying
+    // multi-byte text before the fault must neither panic the slicing nor
+    // misalign the column.
+    for filler in ["café ☕", "日本語のメモ", "🙂🙂🙂"] {
+        let source = format!(
+            r#"workflow Multibyte
+output result Done
+
+class Order {{
+  id string
+  note string
+}}
+
+class Done {{
+  id string
+}}
+
+rule act
+  when Order as order
+=> {{
+  record Done {{ id "{filler}" }}
+  frobnicate order
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        let diagnostic = find_diagnostic(&compiled, "unknown rule body statement `frobnicate`");
+        assert_eq!(diagnostic_text(&source, diagnostic), "frobnicate");
+        assert_eq!(diagnostic_column(&source, diagnostic), 3);
+    }
+}
+
+#[test]
+fn expanded_rule_bodies_keep_their_copied_lines_exact() {
+    // `then` expansion reprints the chained effect and inserts `}` lines, but
+    // copies every other line byte for byte. The per-line map (tracker D2d)
+    // keeps a diagnostic on a copied line exact; before it, this landed on the
+    // rule's `=> {`.
+    let source = r#"workflow Expanded
+output result Done
+
+enum Phase {
+  Draft
+  Final
+}
+
+class Order {
+  id string
+  phase Phase
+}
+
+class Done {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "worker"
+  capacity 1
+}
+
+rule act
+  when Order as order
+=> {
+  then one <- tell worker "a"
+  case order.phase {
+    Nope => { record Done { id order.id } }
+    Draft => { record Done { id order.id } }
+    Final => { record Done { id order.id } }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = find_diagnostic(&compiled, "has no variant `Nope`");
+    assert_eq!(diagnostic_text(source, diagnostic), "Nope");
+    assert_eq!(diagnostic_column(source, diagnostic), 5);
+}
+
+/// A rule whose body carries `{lead}` lines of filler before the offending
+/// `tell`, so the offending line moves and the span has to move with it.
+fn then_expanded_program(lead: usize) -> String {
+    let mut body = String::from("  then plan <- tell worker \"go\"\n");
+    for index in 0..lead {
+        body.push_str(&format!("  record Seen {{ note \"n{index}\" }}\n"));
+    }
+    body.push_str("  tell worker as t \"second\"\n");
+    body.push_str(
+        "  after t succeeds {\n    done order\n    complete result { id order.id }\n  }\n",
+    );
+    format!(
+        r#"workflow Expanded
+output result Done
+
+class Order {{
+  id string
+}}
+
+class Seen {{
+  note string
+}}
+
+class Done {{
+  id string
+}}
+
+agent worker {{
+  provider fixture
+  profile "worker"
+  capacity 1
+}}
+
+rule act
+  when Order as order
+  when worker is available
+=> {{
+{body}}}
+"#
+    )
+}
+
+#[test]
+fn a_then_expanded_body_lands_on_the_offending_line_not_the_arrow() {
+    // The regression D2a's honest-but-coarse half introduced: `then` is common
+    // sugar, and marking the whole body generated moved every caret in it onto
+    // the rule's `=> {`. Six bodies, one offending statement, six different
+    // lines — each must land on its own line AND column.
+    for lead in 0..6 {
+        let source = then_expanded_program(lead);
+        let compiled = compile_program(&source);
+        let diagnostic = find_diagnostic(&compiled, "effect `t`'s failure is unhandled");
+        assert_eq!(
+            diagnostic_text(&source, diagnostic),
+            "tell worker as t \"second\"",
+            "lead {lead} named the wrong token"
+        );
+        assert_eq!(diagnostic_column(&source, diagnostic), 3, "lead {lead}");
+        let line = source[..diagnostic.span.start].matches('\n').count() + 1;
+        let expected = source
+            .lines()
+            .position(|text| text.contains("as t "))
+            .expect("offending line")
+            + 1;
+        assert_eq!(line, expected, "lead {lead} landed on the wrong line");
+    }
+}
+
+#[test]
+fn a_generated_line_still_degrades_to_the_block_span() {
+    // The other half of the map: `then` REPRINTS the chained effect, so the
+    // line it emits is not the file's. A diagnostic there must fall back to the
+    // block rather than compute an offset into text that is not source.
+    let source = r#"workflow Generated
+output result Done
+
+class Order {
+  id string
+}
+
+class Done {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "worker"
+  capacity 1
+}
+
+rule act
+  when Order as order
+  when worker is available
+=> {
+  then plan <- tell nobody "go"
+  done order
+  complete result { id order.id }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = find_diagnostic(&compiled, "nobody");
+    assert_eq!(
+        diagnostic.span,
+        block_span_of(source),
+        "a generated line must degrade to the block, never to a computed offset"
+    );
+}
+
+/// The `=> {` … `}` extent of the single rule in `source`.
+fn block_span_of(source: &str) -> SourceSpan {
+    let start = source.find("=> {").expect("rule arrow") + 3;
+    SourceSpan {
+        start,
+        end: source.len() - 1,
+    }
+}
+
+#[test]
+fn one_action_does_not_cost_a_crlf_file_its_span_precision() {
+    // `action` expansion rebuilt EVERY rule body from `str::lines()`, which
+    // deletes `\r`. On a CRLF file the rebuild therefore differed from the file
+    // even for a rule with no call in it, so the body lost its source origin
+    // and every caret in the file fell back to its rule's `=> {`.
+    let lf = r#"workflow Endings
+output result Done
+
+class Order {
+  id string
+}
+
+class Note {
+  note string
+}
+
+class Done {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "worker"
+  capacity 1
+}
+
+action log_it(who string) {
+  tell who as logged "note it"
+  after logged succeeds {
+    record Note { note "done" }
+  }
+}
+
+rule act
+  when Order as order
+  when worker is available
+=> {
+  log_it(worker)
+  done order
+  complete result { id order.id }
+}
+
+rule untouched
+  when Note as note
+=> {
+  done note
+  tell worker as u "unhandled"
+  after u succeeds {
+    complete result { id "x" }
+  }
+}
+
+rule chained
+  when Note as note
+  when worker is available
+=> {
+  then step <- tell worker "go"
+  done note
+  complete result { id "y" }
+}
+"#;
+    let crlf = lf.replace('\n', "\r\n");
+    for (label, source) in [("lf", lf.to_owned()), ("crlf", crlf.clone())] {
+        let compiled = compile_program(&source);
+        let diagnostic = find_diagnostic(&compiled, "effect `u`'s failure is unhandled");
+        assert_eq!(
+            diagnostic_text(&source, diagnostic),
+            "tell worker as u \"unhandled\"",
+            "{label} named the wrong token"
+        );
+        assert_eq!(diagnostic_column(&source, diagnostic), 3, "{label}");
+    }
+
+    // And the rebuild is byte-preserving, not merely span-preserving: an
+    // expansion pass may not quietly delete the file's line endings out of
+    // every rule body it walks past. `then` expansion had the same defect, so
+    // both a rule it rewrites and a rule it only copies are checked.
+    let ir = compile_program(&crlf).ir.expect("compiles");
+    for name in ["untouched", "chained"] {
+        let rule = ir
+            .rules
+            .iter()
+            .find(|rule| rule.name == name)
+            .unwrap_or_else(|| panic!("rule {name}"));
+        assert!(
+            rule.body.contains("\r\n"),
+            "{name}: the rebuild deleted the file's line endings: {:?}",
+            rule.body
+        );
+    }
+}
+
+#[test]
+fn action_then_and_region_expansion_compose() {
+    // The three rewriters run in sequence over one body, each handed the
+    // previous one's output. Composition is resolving each pass's input offsets
+    // through the origin the body already carries, so a line copied through all
+    // three is still exact.
+    let source = r#"workflow Composed
+output result Done
+failure error Failed
+
+class Order {
+  id string
+  status string
+}
+
+class Note {
+  note string
+}
+
+class Done {
+  id string
+}
+
+class Failed {
+  id string
+}
+
+agent worker {
+  provider fixture
+  profile "worker"
+  capacity 1
+}
+
+action log_it(who string) {
+  tell who as logged "note it"
+  after logged succeeds {
+    record Note { note "done" }
+  }
+}
+
+rule act
+  when Order as order
+  when worker is available
+=> {
+  log_it(worker)
+  during order.status == "open" {
+    then plan <- tell worker "go"
+    tell worker as t "second"
+    after t succeeds {
+      done order
+      complete result { id order.id }
+    }
+  } on lapse {
+    fail error { id order.id }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = find_diagnostic(&compiled, "effect `t`'s failure is unhandled");
+    assert_eq!(
+        diagnostic_text(source, diagnostic),
+        "tell worker as t \"second\""
+    );
+    assert_eq!(diagnostic_column(source, diagnostic), 5);
+}
+
+#[test]
+fn a_multibyte_character_in_expression_position_does_not_panic() {
+    // The expression tokenizer advanced one BYTE past an unrecognised
+    // character, so the next slice cut a multi-byte character in half and
+    // panicked `whip check` outright. Two, three, and four-byte characters all
+    // have to survive it — a fix that handles `é` and not an emoji is half a
+    // fix. The program stays refused; it just says so instead of crashing.
+    for filler in ["é", "日", "🚀", "é日🚀"] {
+        let source = format!(
+            r#"workflow Multibyte
+output result Done
+
+class Order {{
+  id string
+}}
+
+class Done {{
+  id string
+}}
+
+agent worker {{
+  provider fixture
+  profile "worker"
+  capacity 1
+}}
+
+rule act
+  when Order as order
+  when worker is available
+=> {{
+  tell worker as turn "caf{filler} au lait"
+  after turn succeeds {{
+    done order
+    complete result {{ id order.id }}
+  }}
+}}
+"#
+        );
+        let compiled = compile_program(&source);
+        assert_eq!(
+            compiled.diagnostics,
+            Vec::new(),
+            "{filler}: a multi-byte prompt is ordinary prose, not a crash"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D4 — naming a candidate when a name is rejected.
+//
+// These tests are the ONLY thing standing between the did-you-mean work and
+// silent regression: every site it touches is an existing refusal, so
+// `scripts/check-new-refusals.sh` and the mutation sweep — which find refusals
+// by the message pushed at a site — see nothing when a suggestion stops firing.
+// The refusal keeps refusing; only the help line goes quiet.
+// ---------------------------------------------------------------------------
+
+/// One policy, pinned at both edges. A budget that drifts wider starts naming
+/// unrelated names; one that drifts narrower stops naming the typo the reader
+/// actually made, and neither shows up in any snapshot that has no near miss in
+/// it.
+#[test]
+fn closest_name_policy() {
+    // Case only. The highest-confidence hit there is, and it survives the
+    // length ceiling even for a one-character name.
+    assert_eq!(
+        closest_name("priority", ["Priority"]),
+        Some("Priority".to_owned())
+    );
+    assert_eq!(
+        closest_name("S", ["s", "m", "h", "d"]),
+        Some("s".to_owned())
+    );
+
+    // Transposition is ONE edit (OSA). Plain Levenshtein charges two, which is
+    // what put the commonest human typo out of budget on a short name.
+    assert_eq!(
+        closest_name("prioirty", ["priority"]),
+        Some("priority".to_owned())
+    );
+    assert_eq!(
+        closest_name("tuseday", ["tuesday", "thursday"]),
+        Some("tuesday".to_owned())
+    );
+
+    // The length tiers. A three-character name gets one edit, a mid-length one
+    // two, a long one three.
+    assert_eq!(closest_name("ttl", ["ttk"]), Some("ttk".to_owned()));
+    assert_eq!(closest_name("cap", ["key"]), None);
+    // Short tier (up to 5): one edit only. `title` and `table` are two edits
+    // apart, and naming one for the other is the wrong-suggestion cost this
+    // policy is tuned to avoid.
+    assert_eq!(closest_name("title", ["table"]), None);
+    assert_eq!(closest_name("tabel", ["table"]), Some("table".to_owned()));
+
+    // Mid tier (6..=9): two edits land, three do not.
+    assert_eq!(
+        closest_name("provdr", ["provider"]),
+        Some("provider".to_owned())
+    );
+    assert_eq!(closest_name("provr", ["provider"]), None);
+    // Long tier (10+): three edits still read as a typo.
+    assert_eq!(
+        closest_name("observaton_fild", ["observation_fields"]),
+        Some("observation_fields".to_owned())
+    );
+    // Five, on any length, is a different name.
+    assert_eq!(
+        closest_name("observaton_fild", ["observations_fielded"]),
+        None
+    );
+
+    // Padding does not buy edits. The budget comes from the SHORTER name, so a
+    // long string that merely CONTAINS a short one is not a misspelling of it.
+    // This is the case that made `warn_near_miss_semantic_tags` — the one site
+    // where this helper decides whether a diagnostic exists at all — warn that
+    // `@bounded123` looked like `@bounded`.
+    assert_eq!(closest_name("bounded123", ["bounded"]), None);
+    assert_eq!(
+        closest_name("boundde", ["bounded"]),
+        Some("bounded".to_owned())
+    );
+
+    // The `min(len) - 1` ceiling: a typo must be a smaller edit than rewriting
+    // the shorter name outright. `at` and `to` share nothing.
+    assert_eq!(closest_name("at", ["to"]), None);
+    assert_eq!(closest_name("x", ["y"]), None);
+
+    // Never the name the author already wrote — a site may route a name here
+    // after rejecting it for kind or scope rather than spelling.
+    assert_eq!(closest_name("priority", ["priority", "prioritz"]), None);
+
+    // Deterministic tie-break: two candidates at the same distance always give
+    // the same one, whichever order the universe arrives in. Suppressing on a
+    // tie was rejected — it loses `stat` -> `state` whenever `stats` exists,
+    // and a reader takes a suggestion for a guess, not a verdict.
+    assert_eq!(
+        closest_name("stat", ["state", "stats"]),
+        Some("state".to_owned())
+    );
+    assert_eq!(
+        closest_name("stat", ["stats", "state"]),
+        Some("state".to_owned())
+    );
+
+    // Far is silent. A wrong suggestion costs more than none: it sends the
+    // reader to edit the wrong thing.
+    assert_eq!(closest_name("reporter", ["title", "priority"]), None);
+    assert_eq!(closest_name("anything", std::iter::empty::<&str>()), None);
+}
+
+/// Every vocabulary the LANGUAGE defines, as the sweep below measures them.
+///
+/// Assembled by hand from the `suggest_then_keyword`/`closest_keyword` call
+/// sites, because that is the set the policy has to hold for. A vocabulary that
+/// drifts out of this list loses its sweep coverage silently, so a new closed
+/// vocabulary belongs here the day it gains a suggestion.
+fn closed_vocabularies() -> Vec<(&'static str, Vec<String>)> {
+    let own = |name: &'static str, words: &[&str]| {
+        (
+            name,
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    vec![
+        (
+            "rule body statements",
+            crate::body::statement_keyword_vocabulary()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ),
+        (
+            "top-level declarations",
+            crate::syntax::TOP_LEVEL_DECLARATION_KEYWORDS
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect(),
+        ),
+        own("agent block fields", crate::syntax::AGENT_BLOCK_FIELDS),
+        own("calendar patterns", crate::syntax::CALENDAR_PATTERNS),
+        own("std packages", crate::STD_PACKAGE_IDS),
+        own("file store providers", crate::FILE_STORE_PROVIDERS),
+        ("credential kinds", crate::credential_kind_spellings()),
+        own(
+            "agent feature classes",
+            ::whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY,
+        ),
+        own("write modes", &["create", "replace", "upsert", "append"]),
+        own("file operations", &["read", "write", "import", "export"]),
+        own("memory operations", &["recall", "learn", "curate"]),
+        own("vcs operations", &["repair"]),
+        own("duration units", &["s", "m", "h", "d"]),
+        own(
+            "recurrence periods",
+            &["hourly", "daily", "weekly", "monthly"],
+        ),
+        own("judge forms", &["coerce", "prompt", "exec", "labels"]),
+        own("gauge clauses", &["judge", "expect", "inputs"]),
+        own(
+            "campaign clauses",
+            &["ascend", "reach", "guard", "sacrifice", "proposer"],
+        ),
+        own("bar stats", &["mean"]),
+        own("field tags", &["key"]),
+        own("thread modes", &["continue", "fresh"]),
+        own("settings sources", &["project", "user", "none"]),
+        own(
+            "compaction strategies",
+            &["summarize", "hard_reset", "tool_results", "none"],
+        ),
+        own("coerce fields", &["prompt", "provider"]),
+        own("stream write clauses", &["body", "mode"]),
+        own("file write clauses", &["where", "mode"]),
+        own(
+            "timer observation fields",
+            &[
+                "scheduled_at",
+                "observed_at",
+                "occurrence_id",
+                "missed_count",
+                "schedule_name",
+            ],
+        ),
+        // A MIRROR. This vocabulary is assembled from package manifests in the
+        // CLI's whole-program pass (`known_agent_provider_kinds`), which this
+        // crate cannot call, so the sweep carries the set as a literal.
+        // `agent_provider_kinds_match_the_parser_sweep_mirror` in the CLI fails
+        // when the two drift — without it, adding a provider kind would silently
+        // remove it from this sweep.
+        own("agent provider kinds", crate::SWEPT_AGENT_PROVIDER_KINDS),
+        own("file observation fields", &["line", "line_index", "path"]),
+        own("http observation fields", &["item", "item_index", "url"]),
+    ]
+}
+
+/// 184 common English words, none of them WhippleScript keywords. The point of
+/// the list is that it is ORDINARY: these are words an author writes in a
+/// comment, a description, or a binding name, and any of them can land in a
+/// keyword position during a recovery cascade.
+const COMMON_ENGLISH: &str = "the be to of and a in that have it for not on with he as you do at \
+     this but his by from they we say her she or an will my one all would there their what so up \
+     out if about who get which go me when make can like time no just him know take people into \
+     year your good some could them see other than then now look only come its over think also \
+     back after use two how our work first well way even new want because any these give day most \
+     us man find here thing tell try ask need feel become leave put mean keep let begin seem help \
+     talk turn start might show hear play run move live believe hold bring happen write provide \
+     sit stand lose pay meet include continue set learn change lead understand watch follow stop \
+     create speak read allow add spend grow open walk win offer remember love consider appear buy \
+     wait serve die send expect build stay fall cut reach kill remain suggest raise pass sell \
+     require report decide pull";
+
+/// THE ACCEPTANCE SWEEP for the closed half of the policy.
+///
+/// A closed vocabulary is small, and English is dense: at two edits an ordinary
+/// word reliably lands on an unrelated member. Under the OPEN budget this sweep
+/// produced twelve such suggestions — `happen` and `appear` both on `append`,
+/// `create` on `curate`, `expect` and `report` both on `export`, `require` on
+/// `acquire`, `remain` on `repair` — none of which is a typo of anything, and
+/// each of which sends the reader to write a verb they never meant.
+///
+/// The bar is not zero, because a genuine single-keystroke slip has to keep
+/// working. It is: every survivor must be exactly ONE edit, and the whole list
+/// is pinned here so that widening the budget shows up as a diff rather than as
+/// a quieter compiler nobody measured.
+#[test]
+fn closed_vocabularies_do_not_suggest_for_common_english() {
+    let words = COMMON_ENGLISH.split_whitespace().collect::<Vec<_>>();
+    assert!(
+        words.len() >= 100,
+        "the sweep needs at least 100 words, got {}",
+        words.len()
+    );
+    let vocabularies = closed_vocabularies();
+
+    let mut hits = Vec::new();
+    let mut probes = 0usize;
+    for (name, vocabulary) in &vocabularies {
+        for word in &words {
+            if vocabulary.iter().any(|entry| entry == word) {
+                continue;
+            }
+            probes += 1;
+            if let Some(candidate) = closest_keyword(word, vocabulary.iter()) {
+                hits.push((*name, (*word).to_owned(), candidate));
+            }
+        }
+    }
+
+    // Every survivor is one edit from the word the author wrote — a single
+    // keystroke, which is what "plausible typo" means here.
+    for (vocabulary, word, candidate) in &hits {
+        assert_eq!(
+            edit_distance(word, candidate),
+            1,
+            "`{word}` -> `{candidate}` ({vocabulary}) is not a single-keystroke slip"
+        );
+    }
+
+    // THE COUNTERFACTUAL, so this test proves the split is doing work rather
+    // than merely recording a number. The same sweep under the OPEN budget.
+    let mut open_only = std::collections::BTreeSet::new();
+    for (_, vocabulary) in &vocabularies {
+        for word in &words {
+            if vocabulary.iter().any(|entry| entry == word) {
+                continue;
+            }
+            if let Some(candidate) = closest_name(word, vocabulary.iter()) {
+                if edit_distance(word, &candidate) > 1 {
+                    open_only.insert(((*word).to_owned(), candidate));
+                }
+            }
+        }
+    }
+    let open_only_expected: std::collections::BTreeSet<(String, String)> = [
+        ("appear", "append"),
+        ("create", "curate"),
+        ("expect", "export"),
+        ("happen", "append"),
+        ("remain", "repair"),
+        ("report", "export"),
+        ("require", "acquire"),
+    ]
+    .into_iter()
+    .map(|(word, candidate)| (word.to_owned(), candidate.to_owned()))
+    .collect();
+    assert_eq!(
+        open_only, open_only_expected,
+        "the two-edit false positives the closed budget exists to remove moved"
+    );
+
+    // The whole surviving set, written out. Thirteen pairs out of 5133 probes,
+    // and every one of them is one keystroke: a dropped letter (`time`/`timer`,
+    // `spend`/`send`, `provide`/`provider`, `require`/`requires`), a
+    // transposition (`sell`/`seal`, `move`/`mode`), a single substitution
+    // (`well`/`tell`, `lead`/`read`, `fall`/`call`, `there`/`where`,
+    // `like`/`line`, `live`/`line`), or a single insertion (`here`/`where`).
+    // Each is a slip an author could genuinely make at a keyboard, which is the
+    // bar; none is the "different word entirely" class the open budget produced.
+    let distinct = hits
+        .iter()
+        .map(|(_, word, candidate)| (word.as_str(), candidate.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected: std::collections::BTreeSet<(&str, &str)> = [
+        ("fall", "call"),
+        ("here", "where"),
+        ("lead", "read"),
+        ("like", "line"),
+        ("live", "line"),
+        ("move", "mode"),
+        ("provide", "provider"),
+        ("require", "requires"),
+        ("sell", "seal"),
+        ("spend", "send"),
+        ("there", "where"),
+        ("time", "timer"),
+        ("well", "tell"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        distinct,
+        expected,
+        "the closed-vocabulary false-positive set moved (probes: {probes}, \
+         vocabularies: {})",
+        vocabularies.len()
+    );
+}
+
+/// The other half of the same sweep: tightening the closed budget must not have
+/// been achieved by silencing everything. Every one of these is a real
+/// misspelling of a real keyword, and every one still names its candidate.
+#[test]
+fn a_closed_vocabulary_still_names_a_real_typo() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        // Rule body statement verbs, one shape of typo each: transposition,
+        // omission, doubling, substitution, insertion.
+        ("reocrd", "record", &["record", "consume", "done", "tell"]),
+        ("recrd", "record", &["record", "release", "read"]),
+        ("recordd", "record", &["record", "read"]),
+        ("recore", "record", &["record", "release"]),
+        ("compelte", "complete", &["complete", "consume"]),
+        ("cancle", "cancel", &["cancel", "call", "case"]),
+        ("invkoe", "invoke", &["invoke", "import"]),
+        ("cerce", "coerce", &["coerce", "case"]),
+        ("emti", "emit", &["emit", "export"]),
+        ("declassifi", "declassify", &["declassify", "decide"]),
+        // Top-level declaration heads.
+        ("clas", "class", &["class", "call", "campaign"]),
+        ("agnet", "agent", &["agent", "assert"]),
+        ("wrokflow", "workflow", &["workflow", "write"]),
+        ("patern", "pattern", &["pattern", "pull"]),
+        ("harnes", "harness", &["harness", "harvest"]),
+        ("singal", "signal", &["signal", "source"]),
+        ("includ", "include", &["include", "input"]),
+        ("desciption", "description", &["description", "decide"]),
+        // Agent block fields.
+        ("provder", "provider", &["provider", "profile"]),
+        ("capabilites", "capabilities", &["capabilities", "capacity"]),
+        ("compation", "compaction", &["compaction", "capacity"]),
+        ("setings", "settings", &["settings", "skills"]),
+        ("requries", "requires", &["requires", "reach"]),
+        // Calendar patterns.
+        ("tuseday", "tuesday", &["tuesday", "thursday"]),
+        ("wendesday", "wednesday", &["wednesday", "weekday"]),
+        ("weekady", "weekday", &["weekday", "weekly"]),
+        // Modes, operations and clause heads.
+        ("replcae", "replace", &["create", "replace", "upsert"]),
+        ("upser", "upsert", &["create", "replace", "upsert"]),
+        ("epxort", "export", &["read", "write", "import", "export"]),
+        ("reall", "recall", &["recall", "learn", "curate"]),
+        ("curat", "curate", &["recall", "learn", "curate"]),
+        (
+            "montly",
+            "monthly",
+            &["hourly", "daily", "weekly", "monthly"],
+        ),
+        (
+            "weekyl",
+            "weekly",
+            &["hourly", "daily", "weekly", "monthly"],
+        ),
+        ("summarise", "summarize", &["summarize", "hard_reset"]),
+        ("contiune", "continue", &["continue", "fresh"]),
+        ("projct", "project", &["project", "user", "none"]),
+        ("whre", "where", &["where", "mode"]),
+        // Package identifiers.
+        ("std.memry", "std.memory", &["std.memory", "std.messaging"]),
+        ("std.tracer", "std.tracker", &["std.tracker", "std.time"]),
+    ];
+    let mut lost = Vec::new();
+    for (typo, expected, vocabulary) in cases {
+        match closest_keyword(typo, vocabulary.iter().copied()) {
+            Some(candidate) if candidate == *expected => {}
+            other => lost.push(format!("`{typo}` -> {other:?}, wanted `{expected}`")),
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "the closed budget stopped naming a real typo:\n{}",
+        lost.join("\n")
+    );
+}
+
+/// Casing is load-bearing in a closed vocabulary and incidental in an open one,
+/// so case folding belongs on the OPEN axis only.
+///
+/// Every keyword the language defines is lowercase. An `UpperCamel` token in a
+/// keyword position is a CLASS name that a recovery cascade dragged there, not a
+/// misspelled verb, and telling its author they meant the verb `record` sends
+/// them to delete the declaration they were writing.
+#[test]
+fn a_closed_vocabulary_does_not_fold_case() {
+    assert_eq!(closest_keyword("Record", ["record", "release"]), None);
+    assert_eq!(closest_keyword("CLASS", ["class", "campaign"]), None);
+    // ...while the open axis, whose candidates the author declared, still does.
+    assert_eq!(
+        closest_name("Record", ["record"]),
+        Some("record".to_owned())
+    );
+    assert_eq!(
+        closest_name("priority", ["Priority"]),
+        Some("Priority".to_owned())
+    );
+}
+
+/// The two budgets, stated side by side. The 6..=9 second edit is the whole
+/// difference, and it is exactly where a closed vocabulary breaks.
+#[test]
+fn the_closed_budget_is_tighter_than_the_open_one() {
+    // Two edits: a typo among declared names, a different word among keywords.
+    assert_eq!(
+        closest_name("happen", ["append"]),
+        Some("append".to_owned())
+    );
+    assert_eq!(closest_keyword("happen", ["append"]), None);
+    assert_eq!(
+        closest_name("expect", ["export"]),
+        Some("export".to_owned())
+    );
+    assert_eq!(closest_keyword("expect", ["export"]), None);
+
+    // One edit at four shared characters or more: both axes name it.
+    assert_eq!(
+        closest_keyword("appnd", ["append"]),
+        Some("append".to_owned())
+    );
+    assert_eq!(closest_keyword("clas", ["class"]), Some("class".to_owned()));
+
+    // Below four shared characters the closed axis is silent, because every
+    // short English word has a neighbour in any vocabulary.
+    assert_eq!(closest_keyword("say", ["day", "weekday"]), None);
+    assert_eq!(closest_keyword("all", ["call", "case"]), None);
+    assert_eq!(closest_keyword("dya", ["day", "weekday"]), None);
+    assert_eq!(closest_name("dya", ["day"]), Some("day".to_owned()));
+}
+
+/// The two composers keep a site's own advice when there is no candidate. A
+/// hand-written fallback that says how to DECLARE the thing is not worth
+/// trading for a suggestion that is only sometimes there.
+#[test]
+fn composers_keep_the_fallback_when_nothing_is_close() {
+    assert_eq!(
+        suggest_otherwise("Isue", ["Issue"], "declare `class Isue` first"),
+        "did you mean `Issue`? otherwise declare `class Isue` first"
+    );
+    assert_eq!(
+        suggest_otherwise("Zebra", ["Issue"], "declare `class Zebra` first"),
+        "declare `class Zebra` first"
+    );
+    assert_eq!(
+        suggest_then("uspert", ["create", "replace", "upsert"], "use one of: …"),
+        "did you mean `upsert`? use one of: …"
+    );
+    assert_eq!(
+        suggest_then("nonsense", ["create", "replace"], "use one of: …"),
+        "use one of: …"
+    );
+}
+
+/// The spec's own worked example (`spec/error-handling.md` "Rendering"): a
+/// misspelled field on a bound schema names the field one line up.
+#[test]
+fn a_misspelled_field_names_the_declared_one() {
+    let source = r#"
+workflow Triage
+
+class Issue {
+  title string
+  priority string
+}
+
+agent worker {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  tell worker "look at {{ issue.prioirty }}"
+}
+"#;
+    let compiled = compile_program(source);
+    let help = compiled
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.suggestion.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        help.contains("did you mean `priority`?"),
+        "field-path funnel named no candidate: {help}"
+    );
+}
+
+/// D5, the delimiter half. A missing `}` produces a cascade at tokens the parser
+/// then misreads, and before this row not one of those errors mentioned a
+/// delimiter. The assertion is on the LOCATION, not the wording: every error the
+/// cascade produces has to name a bracket the file genuinely leaves open.
+///
+/// The bracket named is the WORKFLOW's, not the class's, and that is the honest
+/// answer rather than the convenient one. Counting brackets, the class's `{` IS
+/// closed — by the `}` on the last line, which the author wrote for the
+/// workflow. Which of the two is the missing one is genuinely ambiguous, and
+/// only the workflow's is provable. `an_error_inside_a_closed_block_gets_no_note`
+/// is what naming the innermost ENCLOSING bracket instead cost.
+#[test]
+fn an_unclosed_block_names_the_brace_that_opened_it() {
+    let source = "workflow Broken {\n  class Decision {\n    ok bool\n\n  rule start\n    when Started\n    => {\n      complete { ok true }\n    }\n}\n";
+    // The `{` of `workflow Broken {` — the one bracket here that no `}` matches.
+    let opener = source.find('{').expect("fixture shape changed");
+
+    let parsed = crate::parse_program(source);
+    assert!(
+        !parsed.diagnostics.is_empty(),
+        "the unclosed-brace program stopped being refused"
+    );
+    for diagnostic in &parsed.diagnostics {
+        let named = diagnostic
+            .related
+            .iter()
+            .any(|related| related.span.start == opener);
+        assert!(
+            named,
+            "an error in the unclosed-brace cascade points at no opener: {diagnostic:?}"
+        );
+    }
+}
+
+/// THE GUARD THAT MATTERS. An earlier version of this note asked only whether
+/// SOME bracket before the error goes unclosed, and then named the innermost
+/// bracket ENCLOSING the error — a different bracket whenever the missing closer
+/// belongs to an outer block. On this program, whose `class Ticket` closes on
+/// line 5 and whose `workflow` never closes at all, it said
+///
+/// ```text
+/// = note: `class Ticket` is still open here
+/// = help: add the `}` that closes `class Ticket`
+/// ```
+///
+/// which tells the reader to add a brace that is already written. A note that is
+/// WRONG is worse than no note; it is the one thing this row exists to stop.
+#[test]
+fn an_error_inside_a_closed_block_gets_no_note() {
+    let source = "workflow Wrong {\n  class Ticket {\n    ok bool\n    4 5\n  }\n";
+    let class_opener = source
+        .find("{\n    ok bool")
+        .expect("fixture shape changed");
+    let workflow_opener = source.find('{').expect("fixture shape changed");
+
+    let parsed = crate::parse_program(source);
+    assert!(
+        !parsed.diagnostics.is_empty(),
+        "the fixture stopped producing a parse error, so it proves nothing"
+    );
+    for diagnostic in &parsed.diagnostics {
+        for related in &diagnostic.related {
+            assert_ne!(
+                related.span.start, class_opener,
+                "a block that IS closed was named as still open: {diagnostic:?}"
+            );
+        }
+    }
+    // The note is not merely absent, either: the bracket that really is unclosed
+    // is still named, so this test cannot be satisfied by giving up on the note.
+    assert!(
+        parsed.diagnostics.iter().any(|diagnostic| diagnostic
+            .related
+            .iter()
+            .any(|related| related.span.start == workflow_opener)),
+        "the genuinely unclosed bracket went unnamed: {:?}",
+        parsed.diagnostics
+    );
+}
+
+/// The guard, in both directions. The note above is only honest because it is
+/// silent when the file's delimiters balance — otherwise every typo in the
+/// language would carry a note about the block it happens to sit in.
+#[test]
+fn a_balanced_program_gets_no_open_block_note() {
+    let source = r#"
+workflow Balanced {
+  class Decision {
+    ok 42
+  }
+}
+"#;
+    let parsed = crate::parse_program(source);
+    assert!(
+        !parsed.diagnostics.is_empty(),
+        "the fixture stopped producing a parse error, so it proves nothing"
+    );
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.related.is_empty()),
+        "a balanced file was told it is inside an unclosed block: {:?}",
+        parsed.diagnostics
+    );
+}
+
+/// The other side of the same guard. An error EARLIER in the file than the
+/// bracket that goes unclosed must not be told it is inside a block — the block
+/// it is inside closes perfectly well, and the missing closer is somewhere it
+/// has not reached.
+#[test]
+fn an_error_before_the_unclosed_bracket_gets_no_note() {
+    let source = r#"
+workflow Late {
+  class Decision {
+    ok 42
+  }
+}
+
+agent worker {
+  provider fixture
+"#;
+    let parsed = crate::parse_program(source);
+    let early = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.span.start < source.find("agent worker").expect("shape"))
+        .collect::<Vec<_>>();
+    assert!(
+        !early.is_empty(),
+        "the fixture stopped producing an error before the unclosed block"
+    );
+    assert!(
+        early.iter().all(|diagnostic| diagnostic.related.is_empty()),
+        "an error before the unclosed bracket was blamed on it: {early:?}"
+    );
+}
+
+/// The body parser's own unclosed-block errors report where the SEARCH gave up,
+/// which is the end of the rule body. Without the opener that location is
+/// useless — it is never the one the author edits.
+#[test]
+fn an_unclosed_body_bracket_names_its_opener() {
+    let source = r#"
+workflow Triage {
+  class Ticket {
+    kind string
+  }
+
+  rule route
+    when Ticket as t
+    => {
+      redact t keep [
+    }
+}
+"#;
+    let opener = source.find('[').expect("fixture shape changed");
+    // The rule BODY is parsed during lowering, not by `parse_program`.
+    let compiled = compile_program(source);
+    let unclosed = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unclosed kept-field list"))
+        .expect("the unclosed kept-field list stopped being refused");
+    assert!(
+        unclosed
+            .related
+            .iter()
+            .any(|related| related.span.start == opener),
+        "the unclosed kept-field list points at no `[`: {unclosed:?}"
+    );
+}
+
+/// D5, the duplicate half. Three families, each of which had both locations in
+/// hand and printed one: a schema, an agent, and a stream membership.
+#[test]
+fn a_duplicate_declaration_points_at_the_first() {
+    let source = r#"
+workflow Duplicates
+
+class Ticket {
+  kind string
+}
+
+class Ticket {
+  kind int
+}
+
+agent triager {
+  provider fixture
+}
+
+agent triager {
+  provider fixture
+}
+
+stream ops {
+  members [triager]
+}
+
+stream review {
+  members [triager]
+}
+"#;
+    let compiled = compile_program(source);
+    let paired = |needle: &str, first: &str| {
+        let diagnostic = compiled
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` stopped being refused"));
+        let expected = source
+            .find(first)
+            .unwrap_or_else(|| panic!("shape: {first}"));
+        assert!(
+            diagnostic
+                .related
+                .iter()
+                .any(|related| related.span.start == expected),
+            "`{needle}` names no first declaration: {diagnostic:?}"
+        );
+        assert!(
+            diagnostic
+                .related
+                .iter()
+                .all(|related| related.span.start != diagnostic.span.start),
+            "`{needle}` pointed the reader at the caret they are already on"
+        );
+    };
+    // The FIRST occurrence of each name in the source is the declaration the
+    // second one duplicates.
+    paired("schema `Ticket` is declared more than once", "Ticket {");
+    paired("agent `triager` is declared more than once", "triager {");
+    paired("is already a member of stream `ops`", "triager]");
+}
+
+/// D5, the definition-site half. A rejected field names the class it is not on;
+/// the note says where that class is, which is the file the reader has to open
+/// when the schema is not the one in front of them.
+#[test]
+fn an_unknown_field_points_at_the_class_declaration() {
+    let source = r#"
+workflow Triage
+
+class Issue {
+  title string
+  priority int
+}
+
+agent worker {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  tell worker "look at {{ issue.nope }}"
+}
+"#;
+    let declaration = source.find("Issue {").expect("fixture shape changed");
+    let compiled = compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("has no field `nope`"))
+        .expect("the unknown field stopped being refused");
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.span.start == declaration),
+        "the unknown field names no declaration: {diagnostic:?}"
+    );
+}
+
+/// A wrong-typed literal names the type it does not match; the note says who
+/// declared that type, which is the line to edit if the DECLARATION is the thing
+/// that is wrong.
+#[test]
+fn a_wrong_typed_literal_points_at_the_declared_type() {
+    let source = r#"
+workflow Triage
+
+output done Result
+
+class Result {
+  count int
+}
+
+class Issue {
+  title string
+}
+
+rule triage
+  when Issue as issue
+=> {
+  complete done { count "many" }
+}
+"#;
+    let declared = source.find("int").expect("fixture shape changed");
+    let compiled = compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("expects `int`"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the wrong-typed literal stopped being refused: {:?}",
+                compiled.diagnostics
+            )
+        });
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.span.start == declared),
+        "the type mismatch names no declaration: {diagnostic:?}"
+    );
+}
+
+/// The label a related note carries has to be true of the SPAN it points at, and
+/// a collection type is checked by descending into it — which decouples the two.
+///
+/// Before `TypeAnchor`, three of the eleven notes this row added said something
+/// the source contradicts: `tags string[]` produced "`tags` is declared `string`
+/// here" pointing at the ELEMENT type, and `metadata map<string>` produced
+/// "`metadata` is declared `string` here" pointing inside the `map<…>`. A third
+/// named a map KEY as if it were a declared field.
+#[test]
+fn a_collection_element_note_says_element() {
+    let source = r#"
+workflow Triage
+
+output done Result
+
+class Result {
+  tags string[]
+  meta map<string>
+}
+
+class Issue {
+  title string
+}
+
+rule triage
+  when Issue as issue
+=> {
+  complete done { tags ["ok", 7] meta { phase 3 } }
+}
+"#;
+    let element = source.find("string[]").expect("fixture shape changed");
+    let map_value = source.find("map<string>").expect("fixture shape changed") + "map<".len();
+    let compiled = compile_program(source);
+    let labels = compiled
+        .diagnostics
+        .iter()
+        .flat_map(|diagnostic| &diagnostic.related)
+        .map(|related| (related.span.start, related.message.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        labels.contains(&(
+            element,
+            "`tags` elements are declared `string` here".to_owned()
+        )),
+        "the array-element note does not agree with its span: {labels:?}"
+    );
+    assert!(
+        labels.contains(&(
+            map_value,
+            "`meta` values are declared `string` here".to_owned()
+        )),
+        "the map-value note does not agree with its span: {labels:?}"
+    );
+    // And nothing claims the outer field is declared the inner type, nor names
+    // the map KEY as a declared field.
+    for (_, label) in &labels {
+        assert_ne!(label, "`tags` is declared `string` here");
+        assert_ne!(label, "`meta` is declared `string` here");
+        assert_ne!(label, "`phase` is declared `string` here");
+    }
+}
+
+/// MAJOR 3 / the one site where a did-you-mean decides whether a diagnostic
+/// EXISTS. `warn_near_miss_semantic_tags` owns its threshold, so retuning the
+/// suggestion policy cannot delete a warning as a side effect of changing
+/// wording — which is exactly what happened when the two shared one.
+#[test]
+fn a_near_miss_semantic_tag_still_warns() {
+    // Both of these warned, then went silent when the shared suggestion budget
+    // tightened. The shared policy still declines them, and the site still
+    // warns: that gap IS the decoupling.
+    assert_eq!(near_miss_semantic_tag("bound"), Some("bounded"));
+    assert_eq!(near_miss_semantic_tag("tul"), Some("tool"));
+    assert_eq!(closest_name("bound", ["bounded"]), None);
+    assert_eq!(closest_name("tul", ["tool"]), None);
+
+    // The site's own ceiling still holds at the top end: padding a name does not
+    // make it a misspelling, and an unrelated tag stays a tag.
+    assert_eq!(near_miss_semantic_tag("bounded123"), None);
+    assert_eq!(near_miss_semantic_tag("release-gate"), None);
+    assert_eq!(near_miss_semantic_tag("fixture"), None);
+    // A one-letter overlap is not a near miss of anything.
+    assert_eq!(near_miss_semantic_tag("t"), None);
+
+    // End to end, because a unit test on the helper cannot see the walk.
+    let source = r#"
+@bound
+@tul
+workflow Tagged
+
+class Started {
+  ok bool
+}
+
+rule start
+  when Started as started
+=> {
+  record Started { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    let warnings = compiled
+        .warnings
+        .iter()
+        .map(|warning| warning.message.clone())
+        .collect::<Vec<_>>();
+    for (tag, candidate) in [("bound", "bounded"), ("tul", "tool")] {
+        assert!(
+            warnings.iter().any(|message| message
+                == &format!("tag `@{tag}` is not a semantic tag, and looks like `@{candidate}`")),
+            "the near-miss warning for `@{tag}` went silent: {warnings:?}"
+        );
+    }
+}
+
+/// MAJOR 5. A did-you-mean must name something LEGAL in the position it is
+/// offered for, or following it just produces a different error.
+#[test]
+fn a_discriminant_suggestion_names_only_a_literal_union_field() {
+    let source = r#"
+workflow Triage
+
+class Decision {
+  kind "a" | "b"
+  kimb string
+  detail string when kimd is "a"
+}
+
+class Issue {
+  title string
+}
+
+rule triage
+  when Issue as issue
+=> {
+  record Issue { title "x" }
+}
+"#;
+    let compiled = compile_program(source);
+    let diagnostic = compiled
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unknown discriminant `kimd`"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the unknown-discriminant refusal stopped firing: {:?}",
+                compiled.diagnostics
+            )
+        });
+    let help = diagnostic.suggestion.clone().unwrap_or_default();
+    // `kimb` and `kind` are both one edit from `kimd`, and `kimb` wins the
+    // alphabetical tie-break — so an unfiltered candidate set names it. Its type
+    // is a plain `string`, so following that advice lands the author on "not a
+    // string-literal discriminant". `kind` is the legal neighbour.
+    assert!(
+        help.contains("did you mean `kind`?"),
+        "the discriminant suggestion named no legal field: {help}"
+    );
+    assert!(
+        !help.contains("`kimb`"),
+        "the discriminant suggestion named a field that is illegal here: {help}"
+    );
+}
+
+/// MAJOR 7. Three sites held both the rejected name and the candidate set and
+/// printed only the set. Their siblings were wired; these were not.
+#[test]
+fn the_last_three_use_one_of_sites_name_a_candidate() {
+    let source = r#"
+workflow Triage
+
+agent responder {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+class Decision {
+  mode "manual" | "auto"
+  owner AgentRef<responder>
+}
+
+class Issue {
+  title string
+}
+
+rule triage
+  when Issue as issue
+=> {
+  record Decision { mode "manul" owner respondor }
+}
+"#;
+    let compiled = compile_program(source);
+    let help = compiled
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.suggestion.clone())
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        help.contains("did you mean `manual`?"),
+        "validate_union_literal named no candidate: {help}"
+    );
+    assert!(
+        help.contains("did you mean `responder`?"),
+        "the AgentRef record field named no candidate: {help}"
+    );
+}
+
+/// A generated prose list has to keep what the hand-written one conveyed. Losing
+/// the conjunction turns an exhaustive vocabulary into what reads as a fragment;
+/// flattening the package effect verbs into the built-ins tells the reader they
+/// are always available, which they are not.
+#[test]
+fn a_generated_vocabulary_list_reads_as_english() {
+    assert_eq!(prose_list(["a"], "and"), "a");
+    assert_eq!(prose_list(["a", "b"], "and"), "a and b");
+    assert_eq!(prose_list(["a", "b", "c"], "or"), "a, b, or c");
+    assert_eq!(prose_list(std::iter::empty::<&str>(), "and"), "");
+
+    let source = r#"
+workflow Triage
+
+agent worker {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+  compation "summarize"
+}
+
+class Issue {
+  title string
+}
+
+rule triage
+  when Issue as issue
+=> {
+  reocrd Issue { title "x" }
+}
+"#;
+    let compiled = compile_program(source);
+    let help = compiled
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.suggestion.clone())
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        help.contains("`compaction`, `thread`, and `settings`"),
+        "the agent-field list lost its conjunction: {help}"
+    );
+    assert!(
+        help.contains("redact, declassify, or a package effect verb ("),
+        "the statement list flattened the package effect verbs into the built-ins: {help}"
+    );
+}
+
+/// Three tables restate what a `match` already knows, which is a real cost: the
+/// table drifts the first time an arm lands without one, and the drift is
+/// invisible — the parser keeps working and only the suggestion goes quiet.
+/// Each is tied to its arms by sentinel comments, and this is the tie.
+#[test]
+fn keyword_tables_list_every_parsed_arm() {
+    fn arms(source: &str, start: &str, end: &str) -> Vec<String> {
+        let from = source
+            .find(start)
+            .unwrap_or_else(|| panic!("sentinel {start} missing — the table is unguarded"));
+        let to = source
+            .find(end)
+            .unwrap_or_else(|| panic!("sentinel {end} missing — the table is unguarded"));
+        assert!(from < to, "sentinels {start}/{end} are out of order");
+        let mut found = Vec::new();
+        for line in source[from..to].lines() {
+            // A match arm's patterns are the quoted literals BEFORE its `=>`;
+            // a guard (`"consume" if …`) sits between them and still counts.
+            let Some((patterns, _)) = line.split_once("=>") else {
+                continue;
+            };
+            let mut rest = patterns;
+            while let Some(open) = rest.find('"') {
+                let Some(close) = rest[open + 1..].find('"') else {
+                    break;
+                };
+                found.push(rest[open + 1..open + 1 + close].to_owned());
+                rest = &rest[open + 1 + close + 1..];
+            }
+        }
+        assert!(!found.is_empty(), "no arms found between {start} and {end}");
+        found
+    }
+
+    let body_source = include_str!("../body.rs");
+    for arm in arms(
+        body_source,
+        "// STATEMENT-ARMS-START",
+        "// STATEMENT-ARMS-END",
+    ) {
+        assert!(
+            crate::body::RULE_BODY_STATEMENT_KEYWORDS.contains(&arm.as_str()),
+            "`{arm}` is a rule body statement the parser accepts but \
+             RULE_BODY_STATEMENT_KEYWORDS does not list, so no misspelling of it \
+             can ever be suggested"
+        );
+    }
+
+    let syntax_source = include_str!("../syntax.rs");
+    // The top-level heads are an `else if self.at_ident("…")` chain rather than
+    // a `match`, in two regions, so they are collected by their dispatch call.
+    let mut top_level = Vec::new();
+    for part in 1..=2 {
+        let region = {
+            let start = format!("// TOP-LEVEL-ARMS-START ({part} of 2)");
+            let end = format!("// TOP-LEVEL-ARMS-END ({part} of 2)");
+            let from = syntax_source
+                .find(&start)
+                .unwrap_or_else(|| panic!("sentinel {start} missing"));
+            let to = syntax_source
+                .find(&end)
+                .unwrap_or_else(|| panic!("sentinel {end} missing"));
+            assert!(from < to, "sentinels for part {part} are out of order");
+            &syntax_source[from..to]
+        };
+        let mut rest = region;
+        while let Some(at) = rest.find("at_ident(\"") {
+            rest = &rest[at + "at_ident(\"".len()..];
+            let close = rest.find('"').expect("unterminated at_ident literal");
+            top_level.push(rest[..close].to_owned());
+            rest = &rest[close..];
+        }
+    }
+    assert!(!top_level.is_empty(), "no top-level dispatch heads found");
+    for head in &top_level {
+        assert!(
+            crate::syntax::TOP_LEVEL_DECLARATION_KEYWORDS.contains(&head.as_str()),
+            "`{head}` is a top-level declaration the parser dispatches but \
+             TOP_LEVEL_DECLARATION_KEYWORDS does not list"
+        );
+    }
+    for keyword in crate::syntax::TOP_LEVEL_DECLARATION_KEYWORDS {
+        assert!(
+            top_level.iter().any(|head| head == keyword),
+            "TOP_LEVEL_DECLARATION_KEYWORDS names `{keyword}`, which no arm dispatches"
+        );
+    }
+
+    for arm in arms(
+        syntax_source,
+        "// AGENT-FIELD-ARMS-START",
+        "// AGENT-FIELD-ARMS-END",
+    ) {
+        assert!(
+            crate::syntax::AGENT_BLOCK_FIELDS.contains(&arm.as_str()),
+            "`{arm}` is an agent field the parser accepts but AGENT_BLOCK_FIELDS \
+             does not list"
+        );
+    }
+    for arm in arms(
+        syntax_source,
+        "// CALENDAR-PATTERN-ARMS-START",
+        "// CALENDAR-PATTERN-ARMS-END",
+    ) {
+        assert!(
+            crate::syntax::CALENDAR_PATTERNS.contains(&arm.as_str()),
+            "`{arm}` is a calendar pattern the parser accepts but \
+             CALENDAR_PATTERNS does not list"
+        );
+    }
+
+    // And the converse for each: a table entry the parser does not accept would
+    // suggest a name that does not work.
+    let statement_arms = arms(
+        body_source,
+        "// STATEMENT-ARMS-START",
+        "// STATEMENT-ARMS-END",
+    );
+    for keyword in crate::body::RULE_BODY_STATEMENT_KEYWORDS {
+        assert!(
+            statement_arms.iter().any(|arm| arm == keyword),
+            "RULE_BODY_STATEMENT_KEYWORDS names `{keyword}`, which no arm parses"
+        );
+    }
+    let agent_arms = arms(
+        syntax_source,
+        "// AGENT-FIELD-ARMS-START",
+        "// AGENT-FIELD-ARMS-END",
+    );
+    for field in crate::syntax::AGENT_BLOCK_FIELDS {
+        assert!(
+            agent_arms.iter().any(|arm| arm == field),
+            "AGENT_BLOCK_FIELDS names `{field}`, which no arm parses"
+        );
+    }
+    let calendar_arms = arms(
+        syntax_source,
+        "// CALENDAR-PATTERN-ARMS-START",
+        "// CALENDAR-PATTERN-ARMS-END",
+    );
+    for pattern in crate::syntax::CALENDAR_PATTERNS {
+        assert!(
+            calendar_arms.iter().any(|arm| arm == pattern),
+            "CALENDAR_PATTERNS names `{pattern}`, which no arm parses"
+        );
+    }
 }

@@ -1,0 +1,19 @@
+error[expr.non_exhaustive_case]: rule `non_exhaustive` has non-exhaustive case; missing triaged, done
+   --> examples/invalid/bad-case-branches.whip:21:4
+   |
+21 | => {
+   |    ^
+   = help: add branches for every value or add `_ => { ... }`
+error[expr.duplicate_case_pattern]: rule `repeats_a_pattern` has duplicate unguarded case pattern `open`
+   --> examples/invalid/bad-case-branches.whip:40:5
+   |
+40 |     "open" => {
+   |     ^^^^^^
+   = note: `open` is already matched here (examples/invalid/bad-case-branches.whip:35:5)
+   = help: remove the duplicate branch or add mutually exclusive `where` guards
+error[expr.case_pattern_mismatch]: rule `matches_a_value_outside_the_domain` case pattern cannot be `archived`
+   --> examples/invalid/bad-case-branches.whip:77:5
+   |
+77 |     "archived" => {
+   |     ^^^^^^^^^^
+   = help: use one of: open, triaged, done

@@ -11,6 +11,11 @@ pub(crate) fn lower_program(
 ) -> CompileOutput {
     let mut diagnostics = Vec::new();
     let mut warnings = Vec::new();
+    // One entry per `ir.rules` entry, in the same order: the source block that
+    // rule's body text came from, recorded as the rule lowers. Whole-program
+    // checks below see only `IrRule`, which keeps the body text and drops where
+    // it came from.
+    let mut rule_bodies: Vec<BlockSource> = Vec::new();
     let (program, pattern_applications) = expand_pattern_applications(program, &mut diagnostics);
     let pending_regions: BTreeMap<String, IrRegion>;
     let program = {
@@ -72,18 +77,20 @@ pub(crate) fn lower_program(
     // The lapse arm is spliced out of every rule body above, so analysis can only
     // reach it through here (DR-0043 Decision 7 obligation 2).
     semantic.regions = pending_regions.clone();
-    let workflow = match program.workflow {
-        Some(workflow) => workflow.name,
-        None => {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: SourceSpan { start: 0, end: 0 },
-                message: "expected workflow declaration".to_owned(),
-                suggestion: Some("add `workflow Name` before declarations".to_owned()),
-            });
-            "<missing>".to_owned()
-        }
-    };
+    // `select_root_workflow` is the ONLY way into this function — both call sites
+    // in `lib.rs` go through it — and it returns `Ok` only for a program that HAS
+    // a root. The header form falls through to `Ok(program)` after the guard that
+    // rejects "declares no `workflow` at all"; the block form builds
+    // `workflow: Some(selected.name)`. A source that declares no workflow is
+    // refused THERE, as `construct.missing_workflow`.
+    //
+    // The `None` arm this used to carry was therefore dead, and the second code
+    // it pushed for that one fault — `parse.expected_declaration` — was reached
+    // by nothing at all. One fault, one code: the refusal lives at the guard.
+    let workflow = program
+        .workflow
+        .expect("select_root_workflow admits only a program that has a root workflow")
+        .name;
 
     let mut ir = IrProgram {
         workflow,
@@ -144,7 +151,7 @@ pub(crate) fn lower_program(
             .filter_map(|item| match item {
                 Item::Rule(rule) => Some((
                     rule,
-                    body::parse_rule_body(&rule.body.text, rule.body.span.start).0,
+                    body::parse_rule_body(&rule.body.text, rule.body.body_base()).0,
                 )),
                 _ => None,
             })
@@ -179,6 +186,8 @@ pub(crate) fn lower_program(
                 let _ = action;
             }
             Item::Pattern(pattern) => diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.invalid_declaration_scope"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: pattern.span,
                 message: format!(
@@ -188,6 +197,8 @@ pub(crate) fn lower_program(
                 suggestion: Some("declare patterns at source top level".to_owned()),
             }),
             Item::Apply(apply) => diagnostics.push(Diagnostic {
+                code: diagnostic_code!("lowering.unexpanded_pattern_application"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.span,
                 message: format!(
@@ -220,15 +231,21 @@ pub(crate) fn lower_program(
                 if let Some(provider) = &file_store.provider {
                     if !FILE_STORE_PROVIDERS.contains(&provider.name.as_str()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.unknown_provider"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: provider.span,
                             message: format!(
                                 "file store `{}` names unknown provider `{}`",
                                 file_store.name.name, provider.name
                             ),
-                            suggestion: Some(format!(
-                                "declare one of the v1 file providers: {}",
-                                FILE_STORE_PROVIDERS.join(", ")
+                            suggestion: Some(crate::suggest_then_keyword(
+                                &provider.name,
+                                FILE_STORE_PROVIDERS.iter().copied(),
+                                format!(
+                                    "declare one of the v1 file providers: {}",
+                                    FILE_STORE_PROVIDERS.join(", ")
+                                ),
                             )),
                         });
                         // Fall through: the store still lowers so read/write
@@ -261,21 +278,25 @@ pub(crate) fn lower_program(
                     &semantic.schemas.events,
                     &mut diagnostics,
                 );
-                lower_source(*source, &mut ir, &mut diagnostics)
+                lower_source(*source, &mut ir, &mut diagnostics, &mut warnings)
             }
             Item::Test(test) => lower_test(test, &mut ir, &mut diagnostics),
             Item::Lease(lease) => {
                 if !schema_names.contains(&lease.key_type.name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_schema"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: lease.key_type.span,
                         message: format!(
                             "lease `{}` keys on undeclared type `{}`",
                             lease.name.name, lease.key_type.name
                         ),
-                        suggestion: Some(
-                            "key a lease on an entity class the workflow already models".to_owned(),
-                        ),
+                        suggestion: Some(crate::suggest_otherwise(
+                            &lease.key_type.name,
+                            schema_names.iter(),
+                            "key a lease on an entity class the workflow already models",
+                        )),
                     });
                 }
                 ir.leases.push(IrLease {
@@ -290,13 +311,19 @@ pub(crate) fn lower_program(
             Item::Ledger(ledger) => {
                 if !schema_names.contains(&ledger.entry_schema.name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_schema"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: ledger.entry_schema.span,
                         message: format!(
                             "ledger `{}` records undeclared entry type `{}`",
                             ledger.name.name, ledger.entry_schema.name
                         ),
-                        suggestion: Some("declare the entry class before the ledger".to_owned()),
+                        suggestion: Some(crate::suggest_otherwise(
+                            &ledger.entry_schema.name,
+                            schema_names.iter(),
+                            "declare the entry class before the ledger",
+                        )),
                     });
                 }
                 ir.ledgers.push(IrLedger {
@@ -311,16 +338,19 @@ pub(crate) fn lower_program(
             Item::Counter(counter) => {
                 if !schema_names.contains(&counter.key_type.name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_schema"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: counter.key_type.span,
                         message: format!(
                             "counter `{}` keys on undeclared type `{}`",
                             counter.name.name, counter.key_type.name
                         ),
-                        suggestion: Some(
-                            "key a counter on an entity class the workflow already models"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(crate::suggest_otherwise(
+                            &counter.key_type.name,
+                            schema_names.iter(),
+                            "key a counter on an entity class the workflow already models",
+                        )),
                     });
                 }
                 ir.counters.push(IrCounter {
@@ -353,6 +383,7 @@ pub(crate) fn lower_program(
                     &semantic,
                     &workflow_contract_names,
                     &mut ir,
+                    &mut rule_bodies,
                     &mut diagnostics,
                 )
             }
@@ -387,6 +418,7 @@ pub(crate) fn lower_program(
                     &semantic,
                     &workflow_contract_names,
                     &mut ir,
+                    &mut rule_bodies,
                     &mut diagnostics,
                 )
             }
@@ -408,7 +440,7 @@ pub(crate) fn lower_program(
         }
     }
     expand_source_emit_from(&mut ir, &mut diagnostics);
-    validate_file_store_write_policy(&ir, &mut diagnostics);
+    validate_file_store_write_policy(&ir, &rule_bodies, &mut diagnostics);
     warn_inert_memory_grant_on_native_adapter(&ir, &mut warnings);
     warn_counter_without_timezone(&ir, &mut warnings);
     warn_near_miss_semantic_tags(&ir, &mut warnings);
@@ -477,6 +509,8 @@ fn lower_assert(
             });
         }
         Err(message) => diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.invalid_expression"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: assertion.span,
             message: format!("invalid assertion expression: {message}"),
@@ -537,12 +571,15 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagno
     };
     if use_decl.name.value.starts_with("std.") && !std_family_known(&use_decl.name.value) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("package_set.unknown_package"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: use_decl.name.span,
             message: format!("unknown standard package `{}`", use_decl.name.value),
-            suggestion: Some(format!(
-                "standard packages are {}",
-                STD_PACKAGE_IDS.join(", ")
+            suggestion: Some(crate::suggest_then_keyword(
+                &use_decl.name.value,
+                STD_PACKAGE_IDS.iter().copied(),
+                format!("standard packages are {}", STD_PACKAGE_IDS.join(", ")),
             )),
         });
     }
@@ -555,7 +592,16 @@ fn lower_use(use_decl: UseDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagno
 
 fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
     if tracker.provider.name != "builtin" {
+        // NOT `construct.unknown_provider`. The other two provider refusals
+        // (file store, channel) reject a name that is in no vocabulary — the
+        // fault is "unknown". This one rejects every name but `builtin`,
+        // including `github`/`linear`/`jira`, which the language KNOWS and has
+        // deferred; its own message says "unavailable", not "unknown". A code
+        // reading `unknown_provider` beside a message reading "unavailable" is
+        // the code contradicting the message it ships next to.
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("provider.feature_unavailable"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: tracker.provider.span,
             message: format!(
@@ -583,16 +629,21 @@ fn lower_stream(stream: StreamDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         .iter()
         .find(|other| other.name == stream.name.name)
     {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: stream.name.span,
-            message: format!("duplicate stream `{}`", stream.name.name),
-            suggestion: Some(format!(
-                "stream `{}` is already declared with members [{}]",
-                existing.name,
-                existing.members.join(", ")
-            )),
-        });
+        diagnostics.push(
+            Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: stream.name.span,
+                message: format!("duplicate stream `{}`", stream.name.name),
+                suggestion: Some(format!(
+                    "stream `{}` is already declared with members [{}]",
+                    existing.name,
+                    existing.members.join(", ")
+                )),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
         return;
     }
     ir.streams.push(IrStream {
@@ -618,6 +669,8 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
     {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: channel.name.span,
                 message: format!("channel `{}` is declared more than once", channel.name.name),
@@ -639,13 +692,21 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
             .collect::<Vec<_>>()
             .join(", ");
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.unknown_provider"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: channel.provider.span,
             message: format!(
                 "channel `{}` names unknown messaging provider `{}`",
                 channel.name.name, channel.provider.name
             ),
-            suggestion: Some(format!("declare one of the v1 providers: {known}")),
+            suggestion: Some(crate::suggest_then_keyword(
+                &channel.provider.name,
+                CHANNEL_PROVIDER_REPORTS
+                    .iter()
+                    .map(|report| report.short_name),
+                format!("declare one of the v1 providers: {known}"),
+            )),
         });
         // Fall through: the channel still lowers so `send via`/`when message
         // from` sites do not cascade an unknown-channel error on top.
@@ -676,6 +737,8 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
     {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: vault.span,
                 message: format!("vault `{}` is declared more than once", vault.name.name),
@@ -692,6 +755,8 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
     let kind = whipplescript_custody::CredentialKind::parse(&normalized).ok();
     if kind.is_none() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.unknown_option"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: vault.kind.span,
             message: format!(
@@ -709,6 +774,8 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
         let spelling = entry.name.replace('_', "-");
         let Ok(operation) = whipplescript_custody::Operation::parse(&spelling) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.unknown_option"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: entry.span,
                 message: format!(
@@ -734,6 +801,8 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
                     .map(|candidate| candidate.as_str())
                     .collect();
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: entry.span,
                     message: format!(
@@ -760,6 +829,8 @@ fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
         }
         Some(policy) => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.unknown_option"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: policy.span,
                 message: format!(
@@ -797,6 +868,8 @@ fn lower_credential(
     {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: credential.span,
                 message: format!(
@@ -817,15 +890,21 @@ fn lower_credential(
     let normalized = credential.kind.name.replace('_', "-");
     if whipplescript_custody::CredentialKind::parse(&normalized).is_err() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.unknown_option"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: credential.kind.span,
             message: format!(
                 "credential `{}` names unknown kind `{}`",
                 credential.name.name, credential.kind.name
             ),
-            suggestion: Some(format!(
-                "declare one of: {}",
-                crate::credential_kind_spellings().join(", ")
+            suggestion: Some(crate::suggest_then_keyword(
+                &credential.kind.name,
+                crate::credential_kind_spellings(),
+                format!(
+                    "declare one of: {}",
+                    crate::credential_kind_spellings().join(", ")
+                ),
             )),
         });
         // Fall through: the credential still lowers so reference sites do
@@ -843,6 +922,8 @@ fn lower_credential(
         let spelling = entry.name.replace('_', "-");
         let Ok(operation) = whipplescript_custody::Operation::parse(&spelling) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.unknown_option"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: entry.span,
                 message: format!(
@@ -868,6 +949,8 @@ fn lower_credential(
                     .map(|candidate| candidate.as_str())
                     .collect();
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: entry.span,
                     message: format!(
@@ -900,6 +983,8 @@ fn lower_gauge(gauge: GaugeDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagn
     if let Some(existing) = ir.gauges.iter().find(|other| other.name == gauge.name.name) {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: gauge.name.span,
                 message: format!("gauge `{}` is declared more than once", gauge.name.name),
@@ -943,6 +1028,8 @@ fn lower_mark(mark: MarkDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
     if let Some(existing) = ir.marks.iter().find(|other| other.name == mark.name.value) {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: mark.name.span,
                 message: format!("mark `{}` is declared more than once", mark.name.value),
@@ -967,6 +1054,8 @@ fn lower_campaign(campaign: CampaignDecl, ir: &mut IrProgram, diagnostics: &mut 
     {
         diagnostics.push(
             Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: campaign.name.span,
                 message: format!(
@@ -1055,15 +1144,21 @@ fn lower_agent(
     if let Some(harness) = &agent.harness {
         if !harness_kinds.contains_key(&harness.name) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_harness"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: harness.span,
                 message: format!(
                     "agent `{}` uses unknown harness `{}`",
                     agent.name.name, harness.name
                 ),
-                suggestion: Some(format!(
-                    "declare `harness {}: fixture` before using it",
-                    harness.name
+                suggestion: Some(crate::suggest_otherwise(
+                    &harness.name,
+                    harness_kinds.keys(),
+                    format!(
+                        "declare `harness {}: fixture` before using it",
+                        harness.name
+                    ),
                 )),
             });
         }
@@ -1077,6 +1172,8 @@ fn lower_agent(
     if let Some(delegate) = &agent.delegated_to {
         if harness_class(&delegate.name) != HarnessClass::Delegated {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: delegate.span,
                 message: format!(
@@ -1102,6 +1199,8 @@ fn lower_agent(
             AgentField::Provider(provider) => {
                 if lowered.provider.is_some() {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_field"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: provider.span,
                         message: format!(
@@ -1114,7 +1213,10 @@ fn lower_agent(
                     });
                 }
                 if agent.harness.is_some() {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.cardinality_conflict"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares both `using` harness and direct provider `{}`",
@@ -1127,7 +1229,10 @@ fn lower_agent(
                     });
                 }
                 if agent.delegated_to.is_some() {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.cardinality_conflict"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
                         span: provider.span,
                         message: format!(
                             "agent `{}` declares both `delegated to` and direct provider `{}`",
@@ -1148,6 +1253,8 @@ fn lower_agent(
             AgentField::Capacity(capacity, span) => {
                 if capacity == 0 {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.invalid_clause_value"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1164,6 +1271,8 @@ fn lower_agent(
                 for skill in skills {
                     if !seen.insert(skill.value.clone()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.duplicate_field"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: skill.span,
                             message: format!(
@@ -1181,6 +1290,8 @@ fn lower_agent(
                 for capability in capabilities {
                     if !seen.insert(capability.value.clone()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.duplicate_field"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: capability.span,
                             message: format!(
@@ -1205,20 +1316,30 @@ fn lower_agent(
                         .contains(&class.name.as_str())
                     {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.unknown_option"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: class.span,
                             message: format!(
                                 "agent `{}` requires unknown feature class `{}`",
                                 agent.name.name, class.name
                             ),
-                            suggestion: Some(format!(
-                                "feature classes come from the DR-0015 taxonomy: {}",
-                                whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY.join(", ")
+                            suggestion: Some(crate::suggest_then_keyword(
+                                &class.name,
+                                whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY
+                                    .iter()
+                                    .copied(),
+                                format!(
+                                    "feature classes come from the DR-0015 taxonomy: {}",
+                                    whipplescript_core::AGENT_FEATURE_CLASS_TAXONOMY.join(", ")
+                                ),
                             )),
                         });
                     }
                     if !seen.insert(class.name.clone()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.duplicate_field"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: class.span,
                             message: format!(
@@ -1236,6 +1357,8 @@ fn lower_agent(
                 for tool in tools {
                     if !seen.insert(tool.name.clone()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.duplicate_field"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: tool.span,
                             message: format!(
@@ -1252,6 +1375,8 @@ fn lower_agent(
                 const STRATEGIES: [&str; 4] = ["summarize", "hard_reset", "tool_results", "none"];
                 if lowered.compaction.is_some() {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_field"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: strategy.span,
                         message: format!(
@@ -1263,16 +1388,19 @@ fn lower_agent(
                 }
                 if !STRATEGIES.contains(&strategy.name.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.unknown_option"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: strategy.span,
                         message: format!(
                             "agent `{}` uses unknown compaction strategy `{}`",
                             agent.name.name, strategy.name
                         ),
-                        suggestion: Some(
-                            "supported strategies are `summarize`, `hard_reset`, `tool_results`, and `none`"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(crate::suggest_then_keyword(
+                            &strategy.name,
+                            STRATEGIES.iter().copied(),
+                            "supported strategies are `summarize`, `hard_reset`, `tool_results`, and `none`",
+                        )),
                     });
                 }
                 compaction_span = Some(strategy.span);
@@ -1282,6 +1410,8 @@ fn lower_agent(
                 const MODES: [&str; 2] = ["continue", "fresh"];
                 if lowered.thread.is_some() {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_field"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: mode.span,
                         message: format!(
@@ -1293,15 +1423,19 @@ fn lower_agent(
                 }
                 if !MODES.contains(&mode.name.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.unknown_option"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: mode.span,
                         message: format!(
                             "agent `{}` uses unknown thread mode `{}`",
                             agent.name.name, mode.name
                         ),
-                        suggestion: Some(
-                            "supported thread modes are `continue` and `fresh`".to_owned(),
-                        ),
+                        suggestion: Some(crate::suggest_then_keyword(
+                            &mode.name,
+                            MODES.iter().copied(),
+                            "supported thread modes are `continue` and `fresh`",
+                        )),
                     });
                 }
                 thread_span = Some(mode.span);
@@ -1311,6 +1445,8 @@ fn lower_agent(
                 const SOURCES: [&str; 3] = ["project", "user", "none"];
                 if lowered.settings.is_some() {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.duplicate_field"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: sources.span,
                         message: format!(
@@ -1322,31 +1458,53 @@ fn lower_agent(
                 }
                 if !SOURCES.contains(&sources.name.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.unknown_option"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: sources.span,
                         message: format!(
                             "agent `{}` uses unknown settings source `{}`",
                             agent.name.name, sources.name
                         ),
-                        suggestion: Some(
-                            "supported settings sources are `project`, `user`, and `none`"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(crate::suggest_then_keyword(
+                            &sources.name,
+                            SOURCES.iter().copied(),
+                            "supported settings sources are `project`, `user`, and `none`",
+                        )),
                     });
                 }
                 settings_span = Some(sources.span);
                 lowered.settings = Some(sources.name);
             }
             AgentField::Unknown { name, .. } => {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_clause"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: name.span,
                     message: format!(
                         "unknown agent field `{}` on agent `{}`",
                         name.name, agent.name.name
                     ),
-                    suggestion: Some(
-                        "supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, `compaction`, and `settings`".to_owned(),
-                    ),
+                    // The vocabulary comes from the table the parser's own match
+                    // arms are checked against, not from prose. The prose here
+                    // had gone stale — it omitted `requires` and `thread`, which
+                    // the parser has accepted for as long as they have existed.
+                    // It also read as English, with a closing `and`, and the
+                    // generated list keeps that: see `prose_list`.
+                    suggestion: Some(crate::suggest_then_keyword(
+                        &name.name,
+                        crate::syntax::AGENT_BLOCK_FIELDS.iter().copied(),
+                        format!(
+                            "supported agent fields are {}",
+                            crate::prose_list(
+                                crate::syntax::AGENT_BLOCK_FIELDS
+                                    .iter()
+                                    .map(|field| format!("`{field}`")),
+                                "and",
+                            )
+                        ),
+                    )),
                 });
             }
         }
@@ -1387,6 +1545,8 @@ fn lower_agent(
         if lowered.harness_class == HarnessClass::Delegated {
             if let Some(span) = compaction_span {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -1401,6 +1561,8 @@ fn lower_agent(
             }
             if let Some(span) = thread_span {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.incompatible_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -1415,6 +1577,8 @@ fn lower_agent(
             }
         } else if let Some(span) = settings_span {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -1450,6 +1614,8 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
     for variant in &enum_decl.variants {
         if !variants.insert(variant.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: variant.span,
                 message: format!(
@@ -1466,6 +1632,8 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
         for field in &variant.fields {
             if field.name.name == "variant" {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.reserved_name"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: field.name.span,
                     message: format!(
@@ -1521,17 +1689,22 @@ fn lower_enum(enum_decl: EnumDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Dia
 }
 
 fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if ir
+    if let Some(existing) = ir
         .tests
         .iter()
-        .any(|existing| existing.name == test.name.value)
+        .find(|existing| existing.name == test.name.value)
     {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: test.name.span,
-            message: format!("test `{}` is declared more than once", test.name.value),
-            suggestion: Some("give each test scenario a distinct name".to_owned()),
-        });
+        diagnostics.push(
+            Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: test.name.span,
+                message: format!("test `{}` is declared more than once", test.name.value),
+                suggestion: Some("give each test scenario a distinct name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
     }
     if !test
         .clauses
@@ -1539,6 +1712,8 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
         .any(|clause| matches!(clause, TestClause::Expect(_)))
     {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.missing_requirement"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: test.span,
             message: format!("test `{}` has no `expect` clause", test.name.value),
@@ -1588,18 +1763,28 @@ fn lower_test(test: TestDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnost
     });
 }
 
-fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if ir
+fn lower_source(
+    source: SourceDecl,
+    ir: &mut IrProgram,
+    diagnostics: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    if let Some(existing) = ir
         .sources
         .iter()
-        .any(|existing| existing.name == source.name.name)
+        .find(|existing| existing.name == source.name.name)
     {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: source.name.span,
-            message: format!("source `{}` is declared more than once", source.name.name),
-            suggestion: Some("remove the duplicate source declaration".to_owned()),
-        });
+        diagnostics.push(
+            Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: source.name.span,
+                message: format!("source `{}` is declared more than once", source.name.name),
+                suggestion: Some("remove the duplicate source declaration".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
     }
     // Clock-source static checks (spec/std-time.md): a recurring schedule must
     // declare a missed policy (no silent default), and a calendar schedule should
@@ -1608,6 +1793,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         let recurring = !matches!(clock.recurrence, Recurrence::At { .. });
         if recurring && clock.missed.is_none() {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: clock.span,
                 message: format!(
@@ -1619,9 +1806,26 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
                 ),
             });
         }
+        // ONE fault, one code, one severity. "A periodic construct declares no
+        // timezone" was two codes and two severities: this site refused a
+        // calendar source under `construct.missing_requirement`, while a counter
+        // whose reset period has the same UTC-anchoring hazard only WARNED, under
+        // `construct.missing_timezone` (`warn_counter_without_timezone`).
+        //
+        // The warning is the right half, and this site's own message says so —
+        // "SHOULD declare a `timezone`", which is not what a refusal sounds like.
+        // spec/std-time.md states the behaviour twice ("defaults to UTC and emits
+        // a diagnostic RECOMMENDING an explicit anchor", and again in its shipped
+        // list: "a calendar schedule SHOULD declare `timezone`"); only its section
+        // heading said "must", and the heading is the outlier. An omitted anchor
+        // resolves to a defined, documented default, so it is a legibility risk,
+        // not the class of fault this compiler exists to refuse.
         if matches!(clock.recurrence, Recurrence::EveryCalendar { .. }) && clock.timezone.is_none()
         {
-            diagnostics.push(Diagnostic { related: Vec::new(),
+            warnings.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_timezone"),
+                severity: Severity::Warning,
+                related: Vec::new(),
                 span: clock.span,
                 message: format!(
                     "calendar source `{}` should declare a `timezone`",
@@ -1641,6 +1845,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     let is_file = source.provider.name == "file";
     if is_file && source.path.is_none() && source.watch.is_none() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.missing_requirement"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: source.span,
             message: format!(
@@ -1656,6 +1862,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     }
     if is_file && source.path.is_some() && source.watch.is_some() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.cardinality_conflict"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: source
                 .watch
@@ -1676,6 +1884,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     if !is_file {
         if let Some(path) = &source.path {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: path.span,
                 message: format!(
@@ -1689,6 +1899,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         }
         if let Some(watch) = &source.watch {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: watch.span,
                 message: format!(
@@ -1707,6 +1919,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     let is_http = source.provider.name == "http";
     if is_http && source.url.is_none() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.missing_requirement"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: source.span,
             message: format!(
@@ -1724,6 +1938,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
             let scheme_ok = url.value.starts_with("http://") || url.value.starts_with("https://");
             if !scheme_ok {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.invalid_clause_value"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: url.span,
                     message: format!(
@@ -1741,6 +1957,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
     if !is_http {
         if let Some(url) = &source.url {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: url.span,
                 message: format!(
@@ -1772,6 +1990,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
         };
         if !(is_http || is_file && source.watch.is_none()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -1795,6 +2015,8 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
                 }
                 _ => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.invalid_clause_value"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -1851,18 +2073,29 @@ fn lower_source(source: SourceDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Di
 }
 
 fn lower_event(event: EventDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    if ir.events.iter().any(|existing| existing.name == event.name) {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: event.name_span,
-            message: format!("signal `{}` is declared more than once", event.name),
-            suggestion: Some("remove the duplicate signal declaration".to_owned()),
-        });
+    if let Some(existing) = ir
+        .events
+        .iter()
+        .find(|existing| existing.name == event.name)
+    {
+        diagnostics.push(
+            Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: event.name_span,
+                message: format!("signal `{}` is declared more than once", event.name),
+                suggestion: Some("remove the duplicate signal declaration".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
     }
     let mut fields = BTreeSet::new();
     for field in &event.fields {
         if !fields.insert(field.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.name.span,
                 message: format!(
@@ -1905,6 +2138,8 @@ fn lower_class(
     for field in &class_decl.fields {
         if !fields.insert(field.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.name.span,
                 message: format!(
@@ -1928,6 +2163,8 @@ fn lower_class(
     if key_fields.len() > 1 {
         for field in key_fields.into_iter().skip(1) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.cardinality_conflict"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.span,
                 message: format!(
@@ -1963,23 +2200,32 @@ fn lower_table(
     semantic: &SemanticContext,
     workflow_contract_names: &WorkflowContractNames,
     ir: &mut IrProgram,
+    rule_bodies: &mut Vec<BlockSource>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !semantic.schemas.class_exists(&table.schema.name) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_schema"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: table.schema.span,
             message: format!(
                 "table `{}` targets unknown class `{}`",
                 table.name.name, table.schema.name
             ),
-            suggestion: Some("declare the class before seeding rows for it".to_owned()),
+            suggestion: Some(crate::suggest_otherwise(
+                &table.schema.name,
+                semantic.schemas.classes.keys(),
+                "declare the class before seeding rows for it",
+            )),
         });
         return;
     }
 
     if table.rows.is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.missing_requirement"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: table.span,
             message: format!("table `{}` has no rows", table.name.name),
@@ -2013,6 +2259,8 @@ fn lower_table(
         body: BlockSource {
             text: body,
             span: table.span,
+            // Synthesized from the table's rows; the text is not in the file.
+            origin: BodyOrigin::Generated,
         },
         span: table.span,
     };
@@ -2028,7 +2276,14 @@ fn lower_table(
         .collect::<Vec<_>>();
 
     let rule_name = rule.name.name.clone();
-    lower_rule(rule, semantic, workflow_contract_names, ir, diagnostics);
+    lower_rule(
+        rule,
+        semantic,
+        workflow_contract_names,
+        ir,
+        rule_bodies,
+        diagnostics,
+    );
     if let Some(rule) = ir
         .rules
         .iter_mut()
@@ -2050,6 +2305,8 @@ fn lower_coerce(
     for param in &coerce.params {
         if !params.insert(param.name.name.clone()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: param.name.span,
                 message: format!(
@@ -2089,6 +2346,7 @@ fn lower_rule(
     semantic: &SemanticContext,
     workflow_contract_names: &WorkflowContractNames,
     ir: &mut IrProgram,
+    rule_bodies: &mut Vec<BlockSource>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     validate_canonical_rule_body_syntax(&rule, diagnostics);
@@ -2097,7 +2355,8 @@ fn lower_rule(
     // here rather than silent no-ops at lowering time. The AST is a pure
     // function of (text, span) and three checks below read it, so it is parsed
     // ONCE here and lent to them rather than re-lexed per check.
-    let (body_ast, body_diagnostics) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+    let (body_ast, body_diagnostics) =
+        body::parse_rule_body(&rule.body.text, rule.body.body_base());
     diagnostics.extend(body_diagnostics);
     let metadata = analyze_rule(&rule, &body_ast, semantic, diagnostics);
     validate_workflow_terminal_actions(
@@ -2113,6 +2372,18 @@ fn lower_rule(
     validate_message_from_channels(&rule, semantic, diagnostics);
     validate_evidence_fact_not_matched(&rule, diagnostics);
     validate_turn_access_grants(&rule, &metadata, diagnostics);
+    // `IrRule.body` is `rule.body.text` verbatim but carries no origin, so a
+    // whole-program check that re-parses it had no way to place a caret and
+    // reported at offset 0 — the `workflow` line. Keep the source block so it
+    // can.
+    //
+    // Pushed BESIDE the rule, in the same statement, rather than into a map
+    // keyed by rule name: the compiler accepts two rules with the same name in
+    // one workflow (a hole recorded as D14), and a name-keyed map kept only the
+    // last, so the write-policy check re-parsed one rule's body against
+    // ANOTHER's origin and put the caret on a statement that performs no write.
+    // Position cannot collide.
+    rule_bodies.push(rule.body.clone());
     ir.rules.push(IrRule {
         name: rule.name.name,
         whens: rule.whens.into_iter().map(lower_when_clause).collect(),

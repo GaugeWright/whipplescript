@@ -266,7 +266,7 @@ fn try_alpha_rule(rule: &RuleDecl) -> Option<RuleDecl> {
         return None;
     }
 
-    let (mut ast, diagnostics) = parse_rule_body(&rule.body.text, rule.body.span.start);
+    let (mut ast, diagnostics) = parse_rule_body(&rule.body.text, rule.body.body_base());
     if !diagnostics.is_empty() {
         return None;
     }
@@ -363,7 +363,8 @@ fn try_alpha_rule(rule: &RuleDecl) -> Option<RuleDecl> {
 
     let mut renamed = rule.clone();
     renamed.whens = whens;
-    renamed.body.text = body;
+    // Alpha-renamed reprint: the text is no longer the file's.
+    renamed.body.rewrite(body);
     Some(renamed)
 }
 

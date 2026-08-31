@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use crate::body::{self, BodyStmt};
 use crate::body_print::{print_statement_rn, rename_text};
-use crate::{ActionDecl, Diagnostic, Item, SourceSpan};
+use crate::{diagnostic_code, ActionDecl, Diagnostic, Item, Severity, SourceSpan};
 
 /// Inlines every action call in each rule body. Diagnostics (undeclared action,
 /// arity mismatch, `as` binding, forbidden statement, nested call) carry the
@@ -38,13 +38,17 @@ pub fn expand_action_calls(
     for item in items.iter_mut() {
         if let Item::Rule(rule) = item {
             let span = rule.body.span;
-            rule.body.text = expand_in_text(
+            let (expanded, origins) = expand_in_text(
                 &rule.body.text,
                 &by_name,
                 &mut call_index,
                 span,
                 diagnostics,
             );
+            // Inlining an action re-serializes the call site's statements;
+            // every other line is copied byte for byte, and `origins` says
+            // which is which (tracker D2d).
+            rule.body.rewrite_mapped(expanded, origins);
         }
     }
 }
@@ -52,20 +56,30 @@ pub fn expand_action_calls(
 /// Rewrites every action-call statement in `text` with its inlined expansion,
 /// preserving all other lines verbatim. `span` is the enclosing rule body span,
 /// used only for diagnostics.
+///
+/// Returns the expanded text and, per output line, the byte offset in `text`
+/// the line was copied from (`None` for a line this pass generated).
 fn expand_in_text(
     text: &str,
     by_name: &BTreeMap<&str, &ActionDecl>,
     call_index: &mut usize,
     span: SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
-) -> String {
-    let lines: Vec<&str> = text.lines().collect();
+) -> (String, Vec<Option<usize>>) {
+    // `raw_body_lines` keeps each line's `\r`, so a rule with no call in it
+    // rebuilds byte-identically and keeps its source origin. `str::lines`
+    // deleted every `\r`, so ONE action anywhere in a CRLF file silently
+    // downgraded every rule body in that file to a block-span fallback.
+    let raw = body::raw_body_lines(text);
+    let lines: Vec<&str> = raw.iter().map(|(line, _)| *line).collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut origins: Vec<Option<usize>> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         let Some(name) = call_name_at(line, by_name) else {
             out.push(line.to_owned());
+            origins.push(Some(raw[i].1));
             i += 1;
             continue;
         };
@@ -79,6 +93,7 @@ fn expand_in_text(
                 "close the `(` with a matching `)`",
             ));
             out.push(line.to_owned());
+            origins.push(Some(raw[i].1));
             i += 1;
             continue;
         };
@@ -113,11 +128,23 @@ fn expand_in_text(
             span,
             diagnostics,
         ) {
-            out.push(block);
+            // The inlined chain is serialized from the action's AST, so none of
+            // its lines is a slice of this file. An empty expansion still
+            // occupies the call's line, as it did when the block went in whole.
+            let mut emitted = 0usize;
+            for block_line in block.lines() {
+                out.push(block_line.to_owned());
+                origins.push(None);
+                emitted += 1;
+            }
+            if emitted == 0 {
+                out.push(String::new());
+                origins.push(None);
+            }
         }
         i += consumed;
     }
-    out.join("\n")
+    (out.join("\n"), origins)
 }
 
 /// Expands a single call into re-indented rule-body text, or `None` (with a
@@ -160,7 +187,7 @@ fn expand_one_call(
     }
 
     let (mut ast, body_diagnostics) =
-        body::parse_rule_body(&action.body.text, action.body.span.start);
+        body::parse_rule_body(&action.body.text, action.body.body_base());
     diagnostics.extend(body_diagnostics);
     if !validate_body(&ast.statements, name, span, diagnostics) {
         return None;
@@ -433,6 +460,8 @@ fn reindent(block: &str, indent: &str) -> String {
 
 fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
     Diagnostic {
+        code: diagnostic_code!("construct.invalid_expansion"),
+        severity: Severity::Error,
         related: Vec::new(),
         span,
         message,

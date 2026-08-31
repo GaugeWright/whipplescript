@@ -1,0 +1,37 @@
+workflow AlertWatch
+
+// The liveness refusal the diagnostics guide and the troubleshooting page both
+// print: a workflow that reacts forever and never settles. `watch` consumes the
+// alert and records a note, so the rules fire and the program is otherwise well
+// formed — nothing here runs `complete` or `fail`, and the workflow is not
+// tagged `@service`, so nothing promises the instance ever ends.
+//
+// The comment sits BELOW the declaration on purpose: this diagnostic reports at
+// 1:1, so a leading comment would put a prose line under the caret in every
+// page that prints this sample.
+
+output result Summary
+
+class Summary {
+  note string
+}
+
+class Alert {
+  id string
+}
+
+class Noted {
+  id string
+}
+
+table alerts as Alert [
+  { id "a-1" }
+]
+
+rule watch
+  when Alert as alert
+=> {
+  done alert -> record Noted {
+    id alert.id
+  }
+}

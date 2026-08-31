@@ -82,8 +82,14 @@ A `bool` value branches on the literals `true` and `false`.
 
 Delete the `Reference` arm. The `check` command then refuses the program:
 
+<!-- render: examples/diagnostics/non-exhaustive-case.whip code expr.non_exhaustive_case -->
 ```text
-error: rule `shelve` has non-exhaustive case; missing Reference
+error[expr.non_exhaustive_case]: rule `shelve` has non-exhaustive case; missing Reference
+   --> examples/diagnostics/non-exhaustive-case.whip:39:4
+   |
+39 | => {
+   |    ^
+   = help: add branches for every value or add `_ => { ... }`
 ```
 
 This behavior is the practical value of a closed set. If a person adds a new

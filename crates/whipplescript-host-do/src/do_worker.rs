@@ -26,8 +26,8 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::branches::Branches;
 use whipplescript_store::files::FileStore;
 use whipplescript_store::{
-    CheckpointCapture, ClaimableEffect, NewInstanceAuthority, RestoreDecision, RuntimeStore,
-    StoreError,
+    CheckpointCapture, ClaimableEffect, DurableDiagnosticCode, NewInstanceAuthority,
+    RestoreDecision, RuntimeStore, StoreError,
 };
 
 use crate::do_instance::{
@@ -399,7 +399,11 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                                 program_id: Some(&instance.program_id),
                                 program_version_id: Some(&stored.version_id),
                                 severity: whipplescript_store::Severity::Warning,
-                                code: Some("do.revision_drift"),
+                                code: Some(DurableDiagnosticCode::Registered(
+                                    whipplescript_store::runtime_diagnostic_code!(
+                                        "do.revision_drift"
+                                    ),
+                                )),
                                 message: &message,
                                 source_span_json: None,
                                 subject_type: Some("program_version"),

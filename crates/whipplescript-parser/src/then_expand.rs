@@ -25,7 +25,7 @@
 
 use crate::body::{self, BodyStmt};
 use crate::body_print::{print_effect, push_stmt_line};
-use crate::{Diagnostic, Item, SourceSpan};
+use crate::{diagnostic_code, Diagnostic, Item, Severity, SourceSpan};
 
 /// The reserved namespace for synthetic `then` effect handles. Author bindings
 /// may not start with it (checked before expansion), so a `__then_*` binding is
@@ -51,7 +51,11 @@ pub fn expand_then_statements(items: &mut [Item], diagnostics: &mut Vec<Diagnost
             if !has_then_line(&rule.body.text) {
                 continue;
             }
-            rule.body.text = expand_in_text(&rule.body.text, span, diagnostics);
+            let (expanded, origins) = expand_in_text(&rule.body.text, span, diagnostics);
+            // `then` expansion reprints the chained effect and inserts `}`
+            // lines; every other line is copied byte for byte, and `origins`
+            // says which is which (tracker D2d).
+            rule.body.rewrite_mapped(expanded, origins);
         }
     }
 }
@@ -75,9 +79,20 @@ fn parse_then_header(trimmed: &str) -> Option<(String, String)> {
     Some((binding.to_owned(), effect.to_owned()))
 }
 
-fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic>) -> String {
-    let lines: Vec<&str> = text.lines().collect();
+/// Returns the expanded text and, per output line, the byte offset in `text`
+/// the line was copied from (`None` for a line this pass generated).
+fn expand_in_text(
+    text: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> (String, Vec<Option<usize>>) {
+    // `raw_body_lines` keeps each line's `\r`, so `join("\n")` below reproduces
+    // a CRLF file's bytes exactly; `str::lines` deleted them, which made every
+    // body in such a file differ from the file and lose its source origin.
+    let raw = body::raw_body_lines(text);
+    let lines: Vec<&str> = raw.iter().map(|(line, _)| *line).collect();
     let mut out: Vec<String> = Vec::new();
+    let mut origins: Vec<Option<usize>> = Vec::new();
     // Original-text brace depth at which each open wrap's `then` line sat; the
     // wrap's inserted `}` goes in when the ORIGINAL depth drops below it (its
     // enclosing block closed) — LIFO, before the closing line itself.
@@ -92,6 +107,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
         // accounting, no `then` detection inside them.
         if in_raw_string {
             out.push(line.to_owned());
+            origins.push(Some(raw[i].1));
             if line.matches("\"\"\"").count() % 2 == 1 {
                 in_raw_string = false;
             }
@@ -116,6 +132,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
                 ));
                 diagnostics.extend(parse_diagnostics);
                 out.push(line.to_owned());
+                origins.push(Some(raw[i].1));
                 i += 1;
                 continue;
             };
@@ -139,6 +156,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
             print_effect(&effect, level, &|name: &str| name.to_owned(), &mut printed);
             for printed_line in printed.lines() {
                 out.push(printed_line.to_owned());
+                origins.push(None);
             }
             let mut opener = String::new();
             push_stmt_line(
@@ -147,6 +165,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
                 &format!("after {handle} succeeds as {binding} {{"),
             );
             out.push(opener.trim_end_matches('\n').to_owned());
+            origins.push(None);
             wraps.push(depth);
             i += 1 + consumed_extra;
             continue;
@@ -170,6 +189,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
                         "}",
                     );
                     out.push(closer.trim_end_matches('\n').to_owned());
+                    origins.push(None);
                     wraps.pop();
                 } else {
                     break;
@@ -177,6 +197,7 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
             }
         }
         out.push(line.to_owned());
+        origins.push(Some(raw[i].1));
         if line.matches("\"\"\"").count() % 2 == 1 {
             in_raw_string = true;
         }
@@ -189,8 +210,9 @@ fn expand_in_text(text: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic
         let mut closer = String::new();
         push_stmt_line(&mut closer, wraps.len() + 1, "}");
         out.push(closer.trim_end_matches('\n').to_owned());
+        origins.push(None);
     }
-    out.join("\n")
+    (out.join("\n"), origins)
 }
 
 /// Brace depth delta ignoring braces inside double-quoted string literals on
@@ -242,6 +264,8 @@ fn brace_delta_outside_strings(line: &str) -> i32 {
 
 fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
     Diagnostic {
+        code: diagnostic_code!("construct.invalid_expansion"),
+        severity: Severity::Error,
         related: Vec::new(),
         span,
         message,
@@ -256,7 +280,15 @@ mod tests {
     fn expand(text: &str) -> (String, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let span = SourceSpan { start: 0, end: 0 };
-        let out = expand_in_text(text, span, &mut diagnostics);
+        let (out, origins) = expand_in_text(text, span, &mut diagnostics);
+        // The map is only usable if it has exactly one entry per output line,
+        // and a missed `origins.push` is otherwise invisible: the body just
+        // silently goes back to the block-span fallback.
+        assert_eq!(
+            origins.len(),
+            body::raw_body_lines(&out).len(),
+            "one origin entry per output line"
+        );
         (out, diagnostics)
     }
 

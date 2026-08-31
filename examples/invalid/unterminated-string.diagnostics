@@ -1,0 +1,12 @@
+error[parse.unterminated_string]: unterminated string literal
+   --> examples/invalid/unterminated-string.whip:31:16
+   |
+31 |   tell triager "summarize {{ issue.title }} for {{ issue.id }}
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: close the string literal
+error[parse.unclosed_delimiter]: unterminated block
+   --> examples/invalid/unterminated-string.whip:30:4
+   |
+30 | => {
+   |    ^
+   = help: add a closing `}`

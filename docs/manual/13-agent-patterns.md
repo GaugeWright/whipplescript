@@ -284,10 +284,14 @@ This shape is not only idiomatic. The checker needs this shape. The checker
 rejects an effectful rule that records its own trigger class *without* a
 consume operation:
 
+<!-- render: examples/diagnostics/unconsumed-trigger.whip code effect.unconsumed_trigger -->
 ```text
-error: effectful rule `attempt` preserves trigger fact `schema:Attempt`
-  = help: consume or advance the triggering fact, or move the next effect
-    behind an external completion event
+error[effect.unconsumed_trigger]: effectful rule `attempt` preserves trigger fact `schema:Attempt`
+   --> examples/diagnostics/unconsumed-trigger.whip:47:4
+   |
+47 | => {
+   |    ^
+   = help: consume or advance the triggering fact, or move the next effect behind an external completion event
 ```
 
 That condition is the retry loop with no limit. The `whip check` command

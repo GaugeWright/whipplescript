@@ -1,0 +1,62 @@
+use std.coord
+
+workflow Ship
+
+// Manual chapter 14, "The compiler holds the discipline": the chapter's `Ship`
+// program with the `after slot contended` branch deleted and the `release slot`
+// dropped from the held branch — the two mistakes the chapter says the compiler
+// refuses. Both refusals land on the one `acquire`, which is why the chapter's
+// two samples select one code each out of this program.
+
+output result Done
+
+class Deploy {
+  service string
+  env string
+}
+
+class Done {
+  note string
+}
+
+lease deploy_slot {
+  key Deploy
+  slots 1
+  ttl 10m
+}
+
+table deploys as Deploy [
+  {
+    service "api"
+    env "prod"
+  }
+]
+
+rule ship
+  when Deploy as d
+=> {
+  acquire deploy_slot for d.env as slot
+
+  after slot held {
+    timer 5s as deploying
+
+    after deploying completes {
+      done d
+      record Shipped {
+        service d.service
+      }
+    }
+  }
+}
+
+class Shipped {
+  service string
+}
+
+rule finish
+  when Shipped as s
+=> {
+  complete result {
+    note "deployed"
+  }
+}

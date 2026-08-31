@@ -1,0 +1,30 @@
+error[parse.invalid_expression]: rule `shout` has invalid guard expression: unexpected token in expression `uppercase(issue.title) == "FLAKY"`
+   --> examples/invalid/bad-guard-expressions.whip:41:8
+   |
+41 |   when Issue as issue where uppercase(issue.title) == "FLAKY"
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists
+error[expr.non_numeric_operand]: rule `count_words` uses arithmetic with a non-numeric operand
+   --> examples/invalid/bad-guard-expressions.whip:49:8
+   |
+49 |   when Issue as issue where issue.title + 1 > 2
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use `+ - * /` only with int or float values
+error[expr.mixed_array_types]: rule `triaged` has mixed-type array literal
+   --> examples/invalid/bad-guard-expressions.whip:57:8
+   |
+57 |   when Issue as issue where issue.attempts in [1, "two"]
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use array literals whose elements share one type
+error[expr.non_map_index]: rule `owned_by_runtime` indexes a non-map expression
+   --> examples/invalid/bad-guard-expressions.whip:65:8
+   |
+65 |   when Issue as issue where issue.labels["team"] == "runtime"
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: use indexing only on map values
+error[expr.optional_without_presence]: rule `assigned_to_runtime` has unsafe optional path `issue.owner.team`: `owner` must be proven present before accessing `team`
+   --> examples/invalid/bad-guard-expressions.whip:73:8
+   |
+73 |   when Issue as issue where issue.owner.team == "runtime"
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: prove `issue.owner` present in the same expression, to the LEFT of an `and` (which is what carries the proof rightward): `exists(issue.owner) and ...` or `issue.owner != null and ...`

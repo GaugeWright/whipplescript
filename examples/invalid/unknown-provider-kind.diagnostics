@@ -1,0 +1,6 @@
+error[construct.unknown_provider_kind]: agent `triager` uses unknown provider kind `fixure`: no known package manifest contributes it
+   --> examples/invalid/unknown-provider-kind.whip:21:7
+   |
+21 | agent triager {
+   |       ^^^^^^^
+   = help: did you mean `fixture`? provider kinds are contributed by package manifests (embedded std packages such as `std.agent`, `std.agent.codex`, `std.agent.claude`, or a locked third-party package); add the providing package to the package lock, or use a contributed kind

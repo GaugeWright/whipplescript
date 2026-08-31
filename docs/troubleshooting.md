@@ -102,22 +102,35 @@ The same rule applies to the `run` command, the `step` command, and the
 
 ## The `whip check` command reports an error about liveness
 
-```text
-error: workflow `X` has no rule that reaches `complete` or `fail`
-```
+Two faults produce a liveness error, and the code in the head line says which.
 
-Add a rule that runs a `complete` statement or a `fail` statement. As an
-alternative, add the `@service` tag to the workflow. Use the tag when the
-workflow runs continuously by design.
+1.  **The workflow cannot end.** No rule in it reaches `complete` or `fail`.
 
-```text
-error: rule `X` can never fire: nothing produces `Y`
-```
+    <!-- render: examples/diagnostics/no-terminal-rule.whip code graph.unreachable_terminal -->
+    ```text
+    error[graph.unreachable_terminal]: workflow `AlertWatch` has no rule that reaches `complete` or `fail`
+      --> examples/diagnostics/no-terminal-rule.whip:1:1
+      |
+    1 | workflow AlertWatch
+      | ^
+      = help: add a rule that runs `complete <output> { ... }` or `fail <failure> { ... }`, or tag the workflow `@service` if it intentionally runs forever
+    ```
 
-Make `Y` producible. Seed the fact from a `table` declaration. As an
-alternative, record the fact in a different rule, or declare the fact as an
-`input` of the workflow. If the fact comes from outside the workflow, add the
-`@external` tag to the rule.
+2.  **A rule cannot fire.** Nothing in the bundle produces the fact it matches.
+
+    <!-- render: examples/invalid/rule-never-fires.whip code graph.rule_never_fires -->
+    ```text
+    error[graph.rule_never_fires]: rule `escalate` can never fire: nothing produces `Escalation`
+       --> examples/invalid/rule-never-fires.whip:36:8
+       |
+    36 |   when Escalation as escalation
+       |        ^^^^^^^^^^^^^^^^^^^^^^^^
+       = help: seed `Escalation` from a table, record it in another rule, declare it as a workflow input, or tag the rule `@external` if it arrives from an external system
+    ```
+
+Both help lines carry the repair. The `@service` and `@external` tags they
+mention are declarations about the world rather than ways to silence the check;
+the [Diagnostics guide](diagnostics.md) says what each one commits you to.
 
 ## The `whip doctor` command reports absent tools
 

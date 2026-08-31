@@ -1,18 +1,18 @@
-error: agent `worker` capacity must be greater than zero
+error[construct.invalid_clause_value]: agent `worker` capacity must be greater than zero
   --> examples/invalid/bad-agent.whip:5:12
   |
 5 |   capacity 0
   |            ^
   = help: use `capacity 1` or a larger integer
-error: agent `worker` attaches skill `repo-user` more than once
+error[construct.duplicate_field]: agent `worker` attaches skill `repo-user` more than once
   --> examples/invalid/bad-agent.whip:6:24
   |
 6 |   skills ["repo-user", "repo-user"]
   |                        ^^^^^^^^^^^
   = help: remove the duplicate skill entry
-error: unknown agent field `mystery` on agent `worker`
+error[construct.unknown_clause]: unknown agent field `mystery` on agent `worker`
   --> examples/invalid/bad-agent.whip:7:3
   |
 7 |   mystery "field"
   |   ^^^^^^^
-  = help: supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `tools`, `compaction`, and `settings`
+  = help: supported agent fields are `provider`, `profile`, `capacity`, `skills`, `capabilities`, `requires`, `tools`, `compaction`, `thread`, and `settings`

@@ -17,8 +17,8 @@ use whipplescript_parser::IrProgram;
 use whipplescript_store::coordination::Coordination;
 use whipplescript_store::items::WorkItems;
 use whipplescript_store::{
-    DiagnosticRecord, EffectCancellation, EffectCancellationRequest, EventView, RuleCommit,
-    RuleCommitRevisionGuard, RuntimeStore, StoreError,
+    DiagnosticRecord, DurableDiagnosticCode, EffectCancellation, EffectCancellationRequest,
+    EventView, RuleCommit, RuleCommitRevisionGuard, RuntimeStore, StoreError,
 };
 
 use crate::idempotency_key;
@@ -159,7 +159,9 @@ fn park_if_step_budget_spent<S: RuntimeStore + Coordination + WorkItems>(
         program_id: None,
         program_version_id: None,
         severity: Severity::Warning,
-        code: Some("instance.step_budget.parked"),
+        code: Some(DurableDiagnosticCode::Registered(
+            whipplescript_core::runtime_diagnostic_code!("instance.step_budget.parked"),
+        )),
         message: &message,
         source_span_json: None,
         subject_type: Some("instance"),
@@ -244,7 +246,9 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 program_id: None,
                 program_version_id: None,
                 severity: Severity::Error,
-                code: Some("rule.fixpoint.unbounded"),
+                code: Some(DurableDiagnosticCode::Registered(
+                    whipplescript_core::runtime_diagnostic_code!("rule.fixpoint.unbounded"),
+                )),
                 message: &message,
                 source_span_json: None,
                 subject_type: Some("rule"),
@@ -699,7 +703,11 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         program_id: None,
                         program_version_id: Some(&group.version_id),
                         severity: Severity::Error,
-                        code: Some("rule.lowering.unresolved"),
+                        code: Some(DurableDiagnosticCode::Registered(
+                            whipplescript_core::runtime_diagnostic_code!(
+                                "rule.lowering.unresolved"
+                            ),
+                        )),
                         message: &message,
                         source_span_json: None,
                         subject_type: Some("rule"),
@@ -746,7 +754,11 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                         program_id: None,
                         program_version_id: Some(&group.version_id),
                         severity: Severity::Warning,
-                        code: Some("workflow.unhandled_failure"),
+                        code: Some(DurableDiagnosticCode::Registered(
+                            whipplescript_core::runtime_diagnostic_code!(
+                                "workflow.unhandled_failure"
+                            ),
+                        )),
                         message: &message,
                         source_span_json: None,
                         subject_type: Some("rule"),
@@ -1319,7 +1331,9 @@ fn load_version_ir<S: RuntimeStore>(
             program_id: None,
             program_version_id: Some(version_id),
             severity: Severity::Warning,
-            code: Some("progression.version_unavailable"),
+            code: Some(DurableDiagnosticCode::Registered(
+                whipplescript_core::runtime_diagnostic_code!("progression.version_unavailable"),
+            )),
             message: &message,
             source_span_json: None,
             subject_type: Some("program_version"),
@@ -1590,7 +1604,9 @@ pub fn apply_rule_cancels<S: RuntimeStore>(
                     program_id: None,
                     program_version_id: None,
                     severity: Severity::Info,
-                    code: Some("cancel.noop"),
+                    code: Some(DurableDiagnosticCode::Registered(
+                        whipplescript_core::runtime_diagnostic_code!("cancel.noop"),
+                    )),
                     message: &format!(
                         "rule `{rule_name}` cancelled effect `{effect_id}` after it reached a terminal status"
                     ),

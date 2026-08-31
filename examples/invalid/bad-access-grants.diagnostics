@@ -1,0 +1,24 @@
+warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule `review`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/bad-access-grants.whip:35:3
+   |
+35 |   tell reviewer "review the docs"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+warning[effect.unhandled_failure]: effect `turn`'s failure is unhandled in rule `grants_nothing`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/bad-access-grants.whip:53:3
+   |
+53 |   tell reviewer "review again"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after turn fails { … }` (typed failure or recovery) or observe every outcome with `after turn completes`
+error[construct.missing_requirement]: rule `grants_nothing` has a `with access to project_files` grant that grants no operations
+   --> examples/invalid/bad-access-grants.whip:53:3
+   |
+53 |   tell reviewer "review again"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: list at least one operation in the grant block, or drop the grant
+error[capability.invalid_grant_operation]: rule `review` grants `recall` on file store `project_files`, which is not a file operation
+   --> examples/invalid/bad-access-grants.whip:35:3
+   |
+35 |   tell reviewer "review the docs"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: file-store grants allow `read`, `write`, `import`, or `export`

@@ -1,0 +1,51 @@
+// Three ways to get a workflow terminal's payload SHAPE wrong; the shape follows
+// the contract the terminal was declared with. `score` is a scalar contract and
+// is given a field block, `error` is a class contract and is given a bare
+// string — each is the mistake of writing the shape the other terminal uses.
+// `stage` is the third case: an `enum` is neither, so there is no shape that
+// would have worked and the repair names the contract types that exist.
+workflow ScoreReview
+
+output score float
+output stage Stage
+failure error Rejected
+
+enum Stage {
+  Draft
+  Shipped
+}
+
+class Rejected {
+  reason string
+}
+
+class Submission {
+  id string
+  words int
+}
+
+table submissions as Submission [
+  { id "SUB-1" words 900 }
+]
+
+rule score
+  when Submission as submission
+=> {
+  complete score {
+    value submission.words
+  }
+}
+
+rule publish
+  when Submission as submission where submission.words > 500
+=> {
+  complete stage {
+    name "Shipped"
+  }
+}
+
+rule reject
+  when Submission as submission where submission.words == 0
+=> {
+  fail error "the submission is empty"
+}

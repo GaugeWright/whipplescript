@@ -1,0 +1,22 @@
+// A missing `}` does not produce one error at the missing brace: it produces a
+// cascade at tokens the parser then misreads as something else. The `}` the
+// author meant for `class Decision` is never written, so `rule` and `start` are
+// read as a field and its type, `when` starts a presence condition, and the `=>`
+// is what finally fails — three errors, none of them about a delimiter. Each one
+// now names a bracket the file genuinely leaves open.
+//
+// That bracket is the WORKFLOW's, not the class's, and the difference is the
+// whole point. Counting brackets, the class's `{` IS closed — by the `}` on the
+// last line, which the author wrote for the workflow. Only the workflow's `{` is
+// provably unmatched, so only it can be named: a note that calls a block open
+// when it is closed tells the reader to add a brace they already wrote.
+workflow UnclosedBrace {
+  class Decision {
+    ok bool
+
+  rule start
+    when Started
+    => {
+      complete { ok true }
+    }
+}

@@ -1,0 +1,63 @@
+// Invalid: turn-access grants that name operations the resource cannot perform,
+// or that grant nothing at all. A grant is the authority boundary a reader is
+// most likely to get wrong by hand, so these refusals are worth pinning against
+// real output rather than against inspection.
+use std.files
+
+workflow BadAccessGrants
+
+output result ReviewSummary
+
+class ReviewTask {
+  id string
+}
+
+class ReviewSummary {
+  note string
+}
+
+file store project_files {
+  root "."
+  allow read ["docs/**"]
+  allow write ["reports/**"]
+}
+
+agent reviewer {
+  provider owned
+  profile "repo-writer"
+  capacity 1
+}
+
+rule review
+  when ReviewTask as task
+  when reviewer is available
+=> {
+  tell reviewer "review the docs"
+    with access to project_files {
+      // `recall` is a memory-pool operation, not a file-store one.
+      recall ["docs/**"]
+    }
+    as turn
+
+  after turn succeeds as summary {
+    complete result {
+      note summary.text
+    }
+  }
+}
+
+rule grants_nothing
+  when ReviewTask as task
+  when reviewer is available
+=> {
+  tell reviewer "review again"
+    with access to project_files {
+    }
+    as turn
+
+  after turn succeeds as summary {
+    complete result {
+      note summary.text
+    }
+  }
+}

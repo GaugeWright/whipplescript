@@ -1,0 +1,39 @@
+// Invalid: expression-level type relations. Each rule below asks the checker to
+// relate two values whose types cannot be related — comparing a string to an
+// int, ordering values that have no order, using a non-boolean where a boolean
+// operator needs one, and testing membership against something that is not a
+// collection. These are the mistakes a user makes while WRITING a guard, so the
+// codes are worth pinning against real output rather than against inspection.
+workflow BadComparisons
+
+class Task {
+  title string
+  priority int
+  ready bool
+  labels string[]
+}
+
+rule compares_incompatible_types
+  when Task as task where task.title == task.priority
+=> {
+}
+
+rule orders_unorderable_values
+  when Task as task where task.title > task.ready
+=> {
+}
+
+rule uses_a_non_boolean_operand
+  when Task as task where task.priority && task.ready
+=> {
+}
+
+rule tests_membership_against_a_scalar
+  when Task as task where task.title in task.priority
+=> {
+}
+
+rule reads_an_undeclared_binding
+  when Task as task where other.title == task.title
+=> {
+}

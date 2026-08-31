@@ -2,8 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod diagnostic_code_register;
 pub mod json;
 pub mod selection;
+
+pub use diagnostic_code_register::{DIAGNOSTIC_CODES, RUNTIME_DIAGNOSTIC_CODES};
 
 /// Implementation-stage label shown alongside the version (for project tracking;
 /// does not replace the semantic version).
@@ -398,6 +401,342 @@ impl Severity {
             Self::Hint => 4,
         }
     }
+}
+
+/// The reserved top-level diagnostic namespaces, verbatim from
+/// spec/error-handling.md "## Codes". This list is the spec's, not this
+/// module's: adding an entry here without the spec change (and the decision
+/// record the spec's Code Governance section requires) is a defect.
+///
+/// There is no escape hatch beside it. The migration sentinel `unassigned`,
+/// and the arm of [`namespace_is_reserved`] that accepted it, were deleted the
+/// moment the last placeholder was assigned — so a code outside this list is
+/// now a compile error with nowhere to hide.
+pub const DIAGNOSTIC_NAMESPACES: &[&str] = &[
+    "parse",
+    "type",
+    "expr",
+    "graph",
+    "effect",
+    "construct",
+    "lowering",
+    "capability",
+    "runtime",
+    "provider",
+    "package_set",
+    "package_lock",
+    "package_contract",
+    "security",
+    "lint",
+];
+
+/// The reserved top-level namespaces of the RUNTIME diagnostic plane —
+/// spec/error-handling.md "### Runtime Plane Codes". These are the codes a run
+/// records durably through [`RuntimeDiagnosticCode`], NOT the ones `check`
+/// emits; `expect diagnostic` in a workflow test matches against this space.
+///
+/// It is a separate list because it is a separate plane, and because reserving
+/// a check-time namespace and reserving a runtime one are different governance
+/// acts. `provider` appears in both: `provider.feature_unavailable` is emitted
+/// at check time and recorded at run time, which is the one code the two planes
+/// deliberately share.
+pub const RUNTIME_DIAGNOSTIC_NAMESPACES: &[&str] = &[
+    "artifact",
+    "assertion",
+    "cancel",
+    "do",
+    // The instance as a whole, as distinct from a rule or an effect inside it:
+    // parked on a step budget, and whatever else reports on the run itself.
+    // Added when #335 landed `instance.step_budget.parked`. This list names the
+    // domains the runtime reports on, so a genuinely new domain joins it rather
+    // than the code being bent into an existing namespace to satisfy a check.
+    "instance",
+    "progression",
+    "provider",
+    "revision",
+    "rule",
+    "runtime",
+    "schema",
+    "workflow",
+];
+
+/// A stable dotted diagnostic code (spec/error-handling.md "## Codes"), e.g.
+/// `type.unknown_field`. Codes are append-only: one may be added, never renamed
+/// or removed once shipped, so a malformed or off-namespace code is a permanent
+/// defect rather than a cosmetic one.
+///
+/// **There is no constructor.** The field is private and nothing public builds
+/// one, so the only values that exist are the entries of [`DIAGNOSTIC_CODES`],
+/// which is generated from `spec/diagnostic-codes.txt`. [`diagnostic_code!`]
+/// does not MINT a code, it SELECTS one: it resolves its literal to an index
+/// into that array at compile time and fails the build when the literal is not
+/// in the register.
+///
+/// That is the difference between this and a validating constructor. A
+/// validator answers "is this string well formed and in a reserved namespace?",
+/// which `parse.i_just_made_this_up` passes — so a `pub const fn` returning a
+/// code was a door that any caller could walk through at RUNTIME to mint a code
+/// that is in no register, under a namespace it does not own, that no gate
+/// would ever see. Selection has no such door: a code that is not in the
+/// register cannot be built at all, in const context or out of it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct DiagnosticCode(&'static str);
+
+/// A stable dotted diagnostic code of the RUNTIME plane
+/// (spec/error-handling.md "### Runtime Plane Codes"), e.g.
+/// `revision.contract_removed`.
+///
+/// A separate type from [`DiagnosticCode`] because it is a separate plane with
+/// separate namespaces and a separate register — and because the store's
+/// durable diagnostic rows used to carry `Option<&str>` here, which meant any
+/// string at all was a code: unvalidated, unregistered, and invisible to every
+/// gate that guards the check-time set. Sealed exactly the same way: no
+/// constructor, only selection from [`RUNTIME_DIAGNOSTIC_CODES`] through
+/// [`runtime_diagnostic_code!`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct RuntimeDiagnosticCode(&'static str);
+
+/// Why [`DiagnosticCode::validate`] refused a literal.
+///
+/// Validation is now a QUESTION, not a door: it returns whether a string could
+/// ever be a code, and hands back no code either way. The register tests ask it
+/// of every ledger line, so a hand-edit cannot introduce an entry no producer
+/// could ever have written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticCodeFault {
+    EmptySegment,
+    IllegalCharacter,
+    NotDotted,
+    TrailingDot,
+    UnreservedNamespace,
+}
+
+impl DiagnosticCodeFault {
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::EmptySegment => "diagnostic code has an empty segment",
+            Self::IllegalCharacter => "diagnostic code must be `[a-z0-9_]` segments joined by `.`",
+            Self::NotDotted => "diagnostic code must be dotted: `<namespace>.<leaf>`",
+            Self::TrailingDot => "diagnostic code ends with `.`",
+            Self::UnreservedNamespace => {
+                "diagnostic code uses a namespace spec/error-handling.md does not reserve"
+            }
+        }
+    }
+}
+
+/// The shape rule for a code, applied against one plane's namespace list.
+///
+/// `const` so a register test can run it at compile time, and returning `()` on
+/// success so that passing it cannot produce a code.
+pub const fn validate_code_shape(
+    code: &str,
+    namespaces: &[&str],
+) -> Result<(), DiagnosticCodeFault> {
+    let bytes = code.as_bytes();
+    let mut index = 0usize;
+    let mut dots = 0usize;
+    let mut segment_len = 0usize;
+    let mut namespace_end = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'.' {
+            if segment_len == 0 {
+                return Err(DiagnosticCodeFault::EmptySegment);
+            }
+            if dots == 0 {
+                namespace_end = index;
+            }
+            dots += 1;
+            segment_len = 0;
+        } else if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' {
+            segment_len += 1;
+        } else {
+            return Err(DiagnosticCodeFault::IllegalCharacter);
+        }
+        index += 1;
+    }
+    if dots == 0 {
+        return Err(DiagnosticCodeFault::NotDotted);
+    }
+    if segment_len == 0 {
+        return Err(DiagnosticCodeFault::TrailingDot);
+    }
+    if !namespace_is_reserved(bytes, namespace_end, namespaces) {
+        return Err(DiagnosticCodeFault::UnreservedNamespace);
+    }
+    Ok(())
+}
+
+impl DiagnosticCode {
+    /// Whether `code` could be a check-plane code at all. See
+    /// [`validate_code_shape`] — this answers a question and returns no code.
+    pub const fn validate(code: &str) -> Result<(), DiagnosticCodeFault> {
+        validate_code_shape(code, DIAGNOSTIC_NAMESPACES)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    /// The top-level namespace segment — the owning subsystem, for governance
+    /// checks and grouping.
+    pub fn namespace(self) -> &'static str {
+        match self.0.split_once('.') {
+            Some((namespace, _)) => namespace,
+            None => self.0,
+        }
+    }
+}
+
+impl RuntimeDiagnosticCode {
+    /// Whether `code` could be a runtime-plane code at all.
+    pub const fn validate(code: &str) -> Result<(), DiagnosticCodeFault> {
+        validate_code_shape(code, RUNTIME_DIAGNOSTIC_NAMESPACES)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    pub fn namespace(self) -> &'static str {
+        match self.0.split_once('.') {
+            Some((namespace, _)) => namespace,
+            None => self.0,
+        }
+    }
+}
+
+/// `str::starts_with` and slice comparison are not const, so the namespace check
+/// is spelled out. `bytes[..namespace_end]` is the code's first segment.
+const fn namespace_is_reserved(bytes: &[u8], namespace_end: usize, namespaces: &[&str]) -> bool {
+    let mut index = 0usize;
+    while index < namespaces.len() {
+        if segment_equals(bytes, namespace_end, namespaces[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+const fn segment_equals(bytes: &[u8], segment_end: usize, candidate: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    if candidate.len() != segment_end {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < segment_end {
+        if bytes[index] != candidate[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const fn str_equals(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0usize;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Where `code` sits in [`DIAGNOSTIC_CODES`], or `None` when the register does
+/// not carry it.
+///
+/// Public only because [`diagnostic_code!`] expands in other crates. It hands
+/// back an INDEX, never a code, so calling it outside the macro — at runtime or
+/// anywhere else — can produce nothing that is not already registered.
+#[doc(hidden)]
+pub const fn diagnostic_code_index(code: &str) -> Option<usize> {
+    let mut index = 0usize;
+    while index < DIAGNOSTIC_CODES.len() {
+        if str_equals(DIAGNOSTIC_CODES[index].0, code) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Where `code` sits in [`RUNTIME_DIAGNOSTIC_CODES`], or `None`.
+#[doc(hidden)]
+pub const fn runtime_diagnostic_code_index(code: &str) -> Option<usize> {
+    let mut index = 0usize;
+    while index < RUNTIME_DIAGNOSTIC_CODES.len() {
+        if str_equals(RUNTIME_DIAGNOSTIC_CODES[index].0, code) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+impl std::fmt::Display for DiagnosticCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::fmt::Display for RuntimeDiagnosticCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+/// The only way to name a [`DiagnosticCode`] — invoke it with a code literal,
+/// as in `diagnostic_code!("type.unknown_field")`.
+///
+/// It does not build a code; it looks one up. The `const` binding forces the
+/// lookup to happen at compile time, so a literal the register does not carry
+/// fails the BUILD at the site that wrote it, naming the one command that
+/// allocates a code. A validating constructor could only ever have asked
+/// whether the string was well shaped, which is a much weaker question: it
+/// admits every well-shaped invention, and admits it at runtime too.
+#[macro_export]
+macro_rules! diagnostic_code {
+    ($literal:literal) => {{
+        const CODE: $crate::DiagnosticCode = match $crate::diagnostic_code_index($literal) {
+            Some(index) => $crate::DIAGNOSTIC_CODES[index],
+            None => panic!(concat!(
+                "diagnostic code `",
+                $literal,
+                "` is not in the register (spec/diagnostic-codes.txt). Allocate it with \
+                 scripts/regen-diagnostic-codes.sh, which adds the ledger line and the \
+                 register entry together."
+            )),
+        };
+        CODE
+    }};
+}
+
+/// The only way to name a [`RuntimeDiagnosticCode`] — the runtime plane's
+/// counterpart to [`diagnostic_code!`], resolved against
+/// `spec/diagnostic-codes-runtime.txt`.
+#[macro_export]
+macro_rules! runtime_diagnostic_code {
+    ($literal:literal) => {{
+        const CODE: $crate::RuntimeDiagnosticCode =
+            match $crate::runtime_diagnostic_code_index($literal) {
+                Some(index) => $crate::RUNTIME_DIAGNOSTIC_CODES[index],
+                None => panic!(concat!(
+                    "runtime diagnostic code `",
+                    $literal,
+                    "` is not in the runtime register (spec/diagnostic-codes-runtime.txt). \
+                     Allocate it with scripts/regen-diagnostic-codes.sh."
+                )),
+            };
+        CODE
+    }};
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2074,5 +2413,100 @@ mod registry_wellformedness_refusal_tests {
         let mut r = registry();
         r.constructs[0].keyword = "  \t ".to_owned();
         assert!(codes(&r).contains("construct_keyword_empty"));
+    }
+}
+
+#[cfg(test)]
+#[path = "lib_tests/diagnostic_code_ledger.rs"]
+mod diagnostic_code_ledger_tests;
+
+#[cfg(test)]
+mod diagnostic_code_tests {
+    use super::*;
+
+    #[test]
+    fn a_well_formed_code_keeps_its_text_and_names_its_namespace() {
+        let code = diagnostic_code!("type.unknown_field");
+        assert_eq!(code.as_str(), "type.unknown_field");
+        assert_eq!(code.namespace(), "type");
+        assert_eq!(code.to_string(), "type.unknown_field");
+        // Deeper leaves are allowed; the namespace is still the first segment.
+        // Asked of the shape rule rather than of the macro, because a
+        // three-segment code that no producer emits is not in the register and
+        // so — correctly — cannot be named at all.
+        assert_eq!(
+            DiagnosticCode::validate("package_contract.invalid_capability.scope"),
+            Ok(())
+        );
+        assert_eq!(
+            runtime_diagnostic_code!("schema.coerce.timed_out").namespace(),
+            "schema"
+        );
+    }
+
+    /// The shape rule accepts one code per reserved namespace, and nothing else.
+    ///
+    /// This used to be written with `diagnostic_code!("parse.x")` and friends,
+    /// which no longer compiles — and that is the point of the change under
+    /// test. `diagnostic_code!` does not validate a string into a code any more,
+    /// it SELECTS a registered one, so `parse.x` cannot be built even here.
+    /// Validation is now a question anyone may ask and nobody can turn into a
+    /// code, which also means the REJECT side is finally assertable: it used to
+    /// be a `panic!` in const context that a test could not observe.
+    #[test]
+    fn the_shape_rule_accepts_every_reserved_namespace_and_nothing_else() {
+        for namespace in DIAGNOSTIC_NAMESPACES {
+            let code = format!("{namespace}.x");
+            assert_eq!(
+                DiagnosticCode::validate(&code),
+                Ok(()),
+                "`{code}` should be well formed"
+            );
+        }
+        for namespace in RUNTIME_DIAGNOSTIC_NAMESPACES {
+            let code = format!("{namespace}.x");
+            assert_eq!(RuntimeDiagnosticCode::validate(&code), Ok(()));
+        }
+
+        for (code, fault) in [
+            ("parse", DiagnosticCodeFault::NotDotted),
+            ("parse.", DiagnosticCodeFault::TrailingDot),
+            ("parse..x", DiagnosticCodeFault::EmptySegment),
+            ("parse.unknownField", DiagnosticCodeFault::IllegalCharacter),
+            ("Parse.x", DiagnosticCodeFault::IllegalCharacter),
+            ("parses.x", DiagnosticCodeFault::UnreservedNamespace),
+            // The planes do not share namespaces: a runtime namespace is not a
+            // check-time one, and the reverse.
+            ("revision.x", DiagnosticCodeFault::UnreservedNamespace),
+        ] {
+            assert_eq!(
+                DiagnosticCode::validate(code),
+                Err(fault),
+                "`{code}` should be refused as {fault:?}"
+            );
+        }
+        assert_eq!(
+            RuntimeDiagnosticCode::validate("construct.x"),
+            Err(DiagnosticCodeFault::UnreservedNamespace)
+        );
+    }
+
+    /// The register is the whole of the code space: a code that is not in it
+    /// cannot be named, and a code that is in it resolves to itself.
+    #[test]
+    fn the_register_is_the_whole_code_space() {
+        assert_eq!(diagnostic_code_index("parse.i_just_made_this_up"), None);
+        assert_eq!(runtime_diagnostic_code_index("revision.invented"), None);
+        for (index, code) in DIAGNOSTIC_CODES.iter().enumerate() {
+            assert_eq!(diagnostic_code_index(code.as_str()), Some(index));
+        }
+        for (index, code) in RUNTIME_DIAGNOSTIC_CODES.iter().enumerate() {
+            assert_eq!(runtime_diagnostic_code_index(code.as_str()), Some(index));
+        }
+        // Selection, not minting: the macro yields the register's own entry.
+        assert_eq!(
+            diagnostic_code!("type.unknown_field").as_str(),
+            "type.unknown_field"
+        );
     }
 }

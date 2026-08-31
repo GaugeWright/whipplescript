@@ -1,0 +1,6 @@
+error[capability.not_granted]: rule `archive_note` writes to store `notes_store`, which permits no writes — stores are read-only by default
+   --> examples/invalid/write-to-read-only-store.whip:29:3
+   |
+29 |   write text to notes_store at "notes/hello.txt" {
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: declare `allow write ["<glob>", …]` on `file store notes_store` to permit (and bound) writes

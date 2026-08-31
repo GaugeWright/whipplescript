@@ -1,30 +1,35 @@
-error: rule `bad_record` has invalid field path `request.missing`: schema `WorkItem` has no field `missing`
-   --> examples/invalid/bad-record.whip:18:4
+error[type.unknown_field]: rule `bad_record` has invalid field path `request.missing`: schema `ReviewRequest` has no field `missing`
+   --> examples/invalid/bad-record.whip:24:21
    |
-18 | => {
-   |    ^
+24 |     subject request.missing
+   |                     ^^^^^^^
+   = note: `ReviewRequest` is declared here (examples/invalid/bad-record.whip:3:7)
    = help: use a field declared on the bound schema or add it to the class declaration
-error: enum `ReviewStatus` has no variant `Maybe`
-   --> examples/invalid/bad-record.whip:18:4
+error[type.unknown_enum_variant]: enum `ReviewStatus` has no variant `Maybe`
+   --> examples/invalid/bad-record.whip:25:12
    |
-18 | => {
-   |    ^
+25 |     status Maybe
+   |            ^^^^^
+   = note: `status` is declared `ReviewStatus` here (examples/invalid/bad-record.whip:15:10)
    = help: use one of: Accept, Blocked, Revise
-error: field `HumanDecision.confidence` expects `float`
-   --> examples/invalid/bad-record.whip:18:4
+error[type.invalid_literal]: field `HumanDecision.confidence` expects `float`
+   --> examples/invalid/bad-record.whip:26:16
    |
-18 | => {
-   |    ^
+26 |     confidence "high"
+   |                ^^^^^^
+   = note: `confidence` is declared `float` here (examples/invalid/bad-record.whip:16:14)
    = help: record a value compatible with `float`
-error: field `HumanDecision.mode` cannot be `scripted`
-   --> examples/invalid/bad-record.whip:18:4
+error[type.invalid_literal]: field `HumanDecision.mode` cannot be `scripted`
+   --> examples/invalid/bad-record.whip:27:10
    |
-18 | => {
-   |    ^
+27 |     mode "scripted"
+   |          ^^^^^^^^^^
+   = note: `mode` is declared `"manual" | "auto"` here (examples/invalid/bad-record.whip:17:8)
    = help: use one of: manual, auto
-error: class `HumanDecision` has no field `extra`
-   --> examples/invalid/bad-record.whip:18:4
+error[type.unknown_field]: class `HumanDecision` has no field `extra`
+   --> examples/invalid/bad-record.whip:28:5
    |
-18 | => {
-   |    ^
+28 |     extra "field"
+   |     ^^^^^
+   = note: `HumanDecision` is declared here (examples/invalid/bad-record.whip:13:7)
    = help: add `extra` to `class HumanDecision` or record an existing field

@@ -1,0 +1,18 @@
+# Manual chapter 23, "Egress through a provider" and "Flow signatures".
+#
+# The same environment `examples/infoflow/governance.policy` labels, with the
+# two grants that clear the doors REMOVED — no `grant provider fixture` and no
+# `grant output result`. An ungranted principal sits at the bottom of both axes
+# (public), so `examples/infoflow/agent-egress.whip` is refused twice: once for
+# the turn context that reaches the model, once for the payload that reaches the
+# invoker. Restore either grant and that half passes, which is the chapter's
+# point: governance decides which models and which invokers are in the trust
+# domain, and the author does not.
+#
+# It is a separate file rather than an edit to governance.policy because that
+# policy is the one the infoflow examples pass under; making it fail would break
+# the thing it demonstrates.
+
+# The CRM holds customer PII. Only a party acting for Operator may read it, and
+# only Operator-vouched data may be written into it.
+grant file_store crm -> file:/srv/crm.db readable by Operator from Operator

@@ -25,10 +25,16 @@ mod then_expand;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
+    ops::Range,
 };
 use whipplescript_core::{
     ContractRegistry, EffectContract, LibraryRegistration, TypedOutputValidation,
 };
+// Re-exported, not redefined: `Diagnostic`'s two new fields are typed by the
+// canonical `DiagnosticCode`/`Severity` in whipplescript-core, and a consumer
+// that imports `Diagnostic` from here gets them from the same path rather than
+// reaching for a second copy.
+pub use whipplescript_core::{diagnostic_code, DiagnosticCode, Severity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SourceSpan {
@@ -47,6 +53,15 @@ impl SourceSpan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
+    /// The stable dotted identifier (spec/error-handling.md "## Codes"). Tests
+    /// pin this, the span, and the suggestion; the wording is free to improve.
+    pub code: DiagnosticCode,
+    /// The diagnostic's *intrinsic* level (spec/error-handling.md "## Severity"),
+    /// and the single source of truth for how it renders in text, JSON, and the
+    /// LSP. Which of [`CompileOutput`]'s two vectors it travels in is the
+    /// BLOCKING decision, not a severity label — but the two must agree, which
+    /// [`CompileOutput::channel_severity_violation`] checks.
+    pub severity: Severity,
     pub span: SourceSpan,
     pub message: String,
     pub suggestion: Option<String>,
@@ -67,6 +82,35 @@ pub struct RelatedInfo {
 }
 
 impl Diagnostic {
+    /// A blocking diagnostic: `Severity::Error`, no suggestion, no related
+    /// labels. The builders below add those, so a call site reads as the code
+    /// and the sentence first and the trimmings after.
+    pub fn error(code: DiagnosticCode, span: SourceSpan, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            severity: Severity::Error,
+            span,
+            message: message.into(),
+            suggestion: None,
+            related: Vec::new(),
+        }
+    }
+
+    /// A non-blocking diagnostic. It must travel in [`CompileOutput::warnings`],
+    /// never in `diagnostics` — see `channel_severity_violation`.
+    pub fn warning(code: DiagnosticCode, span: SourceSpan, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(code, span, message)
+        }
+    }
+
+    /// Attaches the `= help:` line (builder style).
+    pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = Some(suggestion.into());
+        self
+    }
+
     /// Attaches a related-information label at `span` (builder style, so the
     /// common no-related case stays a plain struct literal that only needs the
     /// new field defaulted).
@@ -1090,7 +1134,111 @@ pub struct WhenClause {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockSource {
     pub text: String,
+    /// The block's OUTER extent: `{` through `}` wherever the surface has
+    /// braces, and the whole construct that stands in for a block where it does
+    /// not (the prompt-only `coerce` sugar, a `table` lowered to a rule). It is
+    /// the fallback span for anything genuinely about the block as a whole.
+    ///
+    /// It is NOT where `text` starts — `text` is trimmed of the brace and the
+    /// surrounding whitespace. `origin` is what carries that; use
+    /// [`BlockSource::span_of`] to turn a text offset into a source span.
     pub span: SourceSpan,
+    /// Where `text` came from. Set once at parse time and narrowed by every
+    /// pass that rewrites the text.
+    pub origin: BodyOrigin,
+}
+
+/// Whether a `BlockSource`'s text is still a slice of the file, and where.
+///
+/// Keeping only `text` and the block `span` loses the one fact every precise
+/// diagnostic needs: where `text[0]` lives. Consumers used to reconstruct it —
+/// from `span.start` (short by `1 + leading whitespace`) or from `span.end -
+/// (2 + text.len())` (wrong whenever the closing `}` is not preceded by exactly
+/// one newline) — and every reconstruction was wrong in some program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BodyOrigin {
+    /// `text` is a verbatim slice of the file beginning at this byte offset.
+    Source(usize),
+    /// `text` was assembled by a line-based rewriter (`then` expansion, action
+    /// inlining, region surgery) that copied most of its input verbatim. The
+    /// map says which output lines are still the file's bytes and where they
+    /// live; an offset anywhere else degrades to `span`.
+    Mapped(body::BodyLineMap),
+    /// `text` was synthesized or rewritten token-by-token (pattern
+    /// substitution, an alpha-renamed reprint, a lowered `table`), so no offset
+    /// into it is a source position.
+    Generated,
+}
+
+impl BlockSource {
+    /// The base to hand [`body::parse_rule_body`], so no AST span is a lie.
+    pub fn body_base(&self) -> body::BodyBase<'_> {
+        match &self.origin {
+            BodyOrigin::Source(start) => body::BodyBase::Source(*start),
+            BodyOrigin::Mapped(map) => body::BodyBase::Mapped {
+                map,
+                fallback: self.span,
+            },
+            BodyOrigin::Generated => body::BodyBase::Generated(self.span),
+        }
+    }
+
+    /// The source span for `text[range]`, degrading to the block span when the
+    /// text has no source position for it. Never panics: the arithmetic is on
+    /// byte offsets and the renderer clamps a span it cannot place.
+    pub fn span_of(&self, range: std::ops::Range<usize>) -> SourceSpan {
+        self.body_base().span(range.start, range.end)
+    }
+
+    /// Record that `text` is no longer a slice of the file. Every pass that
+    /// rewrites the text non-byte-preservingly must call this, or the offsets
+    /// it leaves behind will name tokens that are not there.
+    pub fn mark_generated(&mut self) {
+        self.origin = BodyOrigin::Generated;
+    }
+
+    /// The file offset a byte offset into the CURRENT text names, or `None`
+    /// when the text has no source position for it.
+    fn source_offset(&self, offset: usize) -> Option<usize> {
+        match &self.origin {
+            BodyOrigin::Source(start) => Some(start + offset),
+            BodyOrigin::Mapped(map) => map.source_offset(offset),
+            BodyOrigin::Generated => None,
+        }
+    }
+
+    /// Replace the text, downgrading the origin unless the rewrite was a no-op.
+    fn rewrite(&mut self, text: String) {
+        if text != self.text {
+            self.text = text;
+            self.mark_generated();
+        }
+    }
+
+    /// Replace the text with a line-based rewriter's output, carrying its
+    /// per-output-line provenance.
+    ///
+    /// `input_offsets` holds one entry per line of `text`: the byte offset in
+    /// the CURRENT text of the line those bytes were copied from, or `None` for
+    /// a line the rewriter generated. Resolving each of those through the
+    /// origin the body already has IS the composition — action inlining, then
+    /// `then` expansion, then region surgery each report offsets into the text
+    /// they were handed, so the maps never have to be composed with each other
+    /// and a body may be rewritten any number of times without drifting.
+    fn rewrite_mapped(&mut self, text: String, input_offsets: Vec<Option<usize>>) {
+        if text == self.text {
+            return;
+        }
+        let resolved = input_offsets
+            .into_iter()
+            .map(|offset| offset.and_then(|offset| self.source_offset(offset)))
+            .collect();
+        self.origin = match body::BodyLineMap::new(&text, resolved) {
+            Some(map) => BodyOrigin::Mapped(map),
+            None => BodyOrigin::Generated,
+        };
+        self.text = text;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1105,6 +1253,39 @@ pub struct CompileOutput {
     pub diagnostics: Vec<Diagnostic>,
     /// Non-fatal diagnostics (deprecations, style); never block compilation.
     pub warnings: Vec<Diagnostic>,
+}
+
+impl CompileOutput {
+    /// The invariant tying the two channels to the severity FIELD.
+    ///
+    /// The channel is the blocking decision — a non-empty `diagnostics` means
+    /// the compile failed and `whip check` exits non-zero, while `warnings`
+    /// never blocks — and severity is now what every renderer reads. Nothing
+    /// derives one from the other any more, so they can silently disagree: an
+    /// `Error` that landed in `warnings` would print `error[...]` and let the
+    /// program compile, and a `Warning` in `diagnostics` would block while
+    /// telling the reader it is only a warning. Both are the same defect, and
+    /// this is where it is caught.
+    ///
+    /// Returns the first offending diagnostic with a description of which way it
+    /// disagrees, or `None` when the two agree.
+    pub fn channel_severity_violation(&self) -> Option<(&'static str, &Diagnostic)> {
+        if let Some(diagnostic) = self
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity != Severity::Error)
+        {
+            return Some(("blocking `diagnostics` carries a non-error", diagnostic));
+        }
+        if let Some(diagnostic) = self
+            .warnings
+            .iter()
+            .find(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            return Some(("non-blocking `warnings` carries an error", diagnostic));
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2336,6 +2517,11 @@ struct SchemaIndex {
     /// (discriminant field, required literal)`. A conditioned field is readable
     /// only inside a matching `case <root>.<disc>` arm.
     presence: BTreeMap<String, BTreeMap<String, (String, String)>>,
+    /// Where each schema is declared, so a diagnostic that rejects a field can
+    /// point at the class that has no such field. Deliberately ABSENT for the
+    /// kernel-owned builtins inserted by `with_builtins`: they have no source to
+    /// point at, and a note pointing at nothing is worse than no note.
+    decl_spans: BTreeMap<String, SourceSpan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2598,6 +2784,118 @@ pub fn workflow_names(source: &str) -> Vec<String> {
 }
 
 pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOutput {
+    let output = compile_program_with_root_inner(source, root);
+    // The channel and the severity field must agree (see
+    // `CompileOutput::channel_severity_violation`). This is the cheap in-process
+    // guard on every debug compile; the standing test over the whole invalid
+    // corpus is `compile_output_channels_agree_with_severity` in lib_tests.
+    debug_assert!(
+        output.channel_severity_violation().is_none(),
+        "{:?}",
+        output.channel_severity_violation()
+    );
+    output
+}
+
+/// Everything a reader can observe about a diagnostic, as an orderable key.
+///
+/// `Diagnostic` already derives `Eq`; the tuple exists only because it derives
+/// neither `Ord` nor `Hash`.
+type DiagnosticKey = (
+    usize,
+    usize,
+    String,
+    Option<String>,
+    Vec<(usize, usize, String)>,
+);
+
+fn diagnostic_key(diagnostic: &Diagnostic) -> DiagnosticKey {
+    (
+        diagnostic.span.start,
+        diagnostic.span.end,
+        diagnostic.message.clone(),
+        diagnostic.suggestion.clone(),
+        diagnostic
+            .related
+            .iter()
+            .map(|info| (info.span.start, info.span.end, info.message.clone()))
+            .collect(),
+    )
+}
+
+/// The part of a diagnostic that is settled before `annotate_cross_workflow_leak`
+/// can add to it.
+fn diagnostic_key_without_related(diagnostic: &Diagnostic) -> (usize, usize, String) {
+    (
+        diagnostic.span.start,
+        diagnostic.span.end,
+        diagnostic.message.clone(),
+    )
+}
+
+/// What the passes over one rule body have already told the reader, so the next
+/// pass over the same text does not tell them again.
+///
+/// Several passes walk one rule body on purpose, and they overlap: the line-wise
+/// scan in `analyze_rule` sees a `record` statement, a `case` arm's body and a
+/// `case` guard, and so do `validate_record_blocks`, the two case-metadata
+/// walkers, and `validate_case_blocks`. Each is the only pass that knows
+/// something (a record's schema, a branch's payload binding, the foreign schemas
+/// an invoke-derived binding resolves in), so none can be dropped — and once D2c
+/// gave them all a precise anchor, their overlapping findings land on the same
+/// token and become byte-identical. That is one mistake described several times.
+///
+/// Deduplicated PER PASS, and deliberately not over the finished diagnostic list.
+/// A single pass repeating itself is not repeating itself: several parts of one
+/// fragment can be wrong the same way while none of them has a span of its own
+/// (`Expr` carries no spans — D10), so one pass legitimately emits the same
+/// message at the same span more than once. `coerce classify([1, 2])` against a
+/// `string[]` parameter is two wrong list items, and a reader who is shown one
+/// fixes it, re-runs, and only then learns about the other. A collapse over the
+/// whole list cannot tell that from a re-report; this can, because it knows
+/// which pass said what.
+#[derive(Default)]
+struct RuleBodyPasses {
+    /// For each finding, the most copies any single pass produced of it.
+    said: BTreeMap<DiagnosticKey, usize>,
+}
+
+impl RuleBodyPasses {
+    /// Fold back the diagnostics one pass appended from `mark` onward, dropping
+    /// the ones an EARLIER pass already reported and keeping this pass's own
+    /// repeats.
+    ///
+    /// A pass that is not run through here neither hides anything nor is
+    /// hidden — it simply does not participate, which is the safe direction: an
+    /// unregistered overlap shows up as a duplicate a reader can see, never as
+    /// a finding that silently went missing.
+    fn merge(&mut self, diagnostics: &mut Vec<Diagnostic>, mark: usize) {
+        let produced = diagnostics.split_off(mark);
+        let mut budget = self.said.clone();
+        let mut counts: BTreeMap<DiagnosticKey, usize> = BTreeMap::new();
+        for diagnostic in produced {
+            let key = diagnostic_key(&diagnostic);
+            *counts.entry(key.clone()).or_default() += 1;
+            match budget.get_mut(&key) {
+                Some(remaining) if *remaining > 0 => *remaining -= 1,
+                _ => diagnostics.push(diagnostic),
+            }
+        }
+        for (key, produced) in counts {
+            let said = self.said.entry(key).or_default();
+            *said = (*said).max(produced);
+        }
+    }
+
+    /// `merge` around a pass that appends to `diagnostics` itself.
+    fn run(&mut self, diagnostics: &mut Vec<Diagnostic>, pass: impl FnOnce(&mut Vec<Diagnostic>)) {
+        let mark = diagnostics.len();
+        pass(diagnostics);
+        self.merge(diagnostics, mark);
+    }
+}
+
+fn compile_program_with_root_inner(source: &str, root: Option<&str>) -> CompileOutput {
     let parsed = parse_program(source);
     if !parsed.diagnostics.is_empty() {
         return CompileOutput {
@@ -2666,6 +2964,26 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
         }
 
         let mut aggregated = Vec::new();
+        // A diagnostic about a TOP-LEVEL declaration is re-derived once per
+        // workflow, because every workflow is lowered against the same globals:
+        // two workflows print it twice, three print it three times. Keep the
+        // first derivation.
+        //
+        // MULTISET, not set. A key may legitimately repeat WITHIN one workflow —
+        // four bad items in one list literal are four findings that share a
+        // statement-head span and a message, and `Expr` carries no spans to tell
+        // them apart (D10). Counting per workflow and dropping only down to the
+        // largest count any earlier workflow already showed removes the
+        // cross-workflow copies while keeping every repeat a single lowering
+        // genuinely produced. Keying on presence alone collapsed those four to
+        // one; the repeats are the reader's only signal that more than one item
+        // is wrong.
+        //
+        // Filtered BEFORE `annotate_cross_workflow_leak` runs, because that
+        // annotation MUTATES each copy — pushing a `related` entry naming the
+        // sibling that owns the name — so two copies of one finding can end up
+        // structurally unequal and a later structural comparison would keep both.
+        let mut emitted: BTreeMap<(usize, usize, String), usize> = BTreeMap::new();
         for workflow in &parsed.program.workflows {
             let name = workflow.name.name.clone();
             let own_locals: BTreeSet<String> = workflow
@@ -2684,6 +3002,19 @@ pub fn compile_program_with_root(source: &str, root: Option<&str>) -> CompileOut
                 }
                 Err(diagnostics) => diagnostics,
             };
+            // Count this workflow's derivations, then keep only the excess over
+            // what an earlier workflow already showed for the same key.
+            let mut seen_here: BTreeMap<(usize, usize, String), usize> = BTreeMap::new();
+            diagnostics.retain(|diagnostic| {
+                let key = diagnostic_key_without_related(diagnostic);
+                let here = seen_here.entry(key.clone()).or_insert(0);
+                *here += 1;
+                *here > emitted.get(&key).copied().unwrap_or(0)
+            });
+            for (key, count) in seen_here {
+                let entry = emitted.entry(key).or_insert(0);
+                *entry = (*entry).max(count);
+            }
             for diagnostic in &mut diagnostics {
                 annotate_cross_workflow_leak(
                     diagnostic,
@@ -3278,6 +3609,8 @@ fn select_root_workflow(
     // than silently compiled as an anonymous root.
     if program.workflow.is_none() && program.workflows.is_empty() {
         return Err(vec![Diagnostic {
+            code: diagnostic_code!("construct.missing_workflow"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: SourceSpan { start: 0, end: 0 },
             message: "program declares no `workflow`".to_owned(),
@@ -3296,6 +3629,8 @@ fn select_root_workflow(
                 Some(workflow) if workflow.name == root => {}
                 Some(workflow) => {
                     return Err(vec![Diagnostic {
+                        code: diagnostic_code!("type.unknown_workflow"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: workflow.span,
                         message: format!("root workflow `{root}` was not found"),
@@ -3304,6 +3639,8 @@ fn select_root_workflow(
                 }
                 None => {
                     return Err(vec![Diagnostic {
+                        code: diagnostic_code!("type.unknown_workflow"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: SourceSpan { start: 0, end: 0 },
                         message: format!("root workflow `{root}` was not found"),
@@ -3332,6 +3669,8 @@ fn select_root_workflow(
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(vec![Diagnostic {
+                    code: diagnostic_code!("type.unknown_workflow"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: SourceSpan { start: 0, end: 0 },
                     message: format!("root workflow `{root}` was not found"),
@@ -3348,6 +3687,8 @@ fn select_root_workflow(
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(vec![Diagnostic {
+                code: diagnostic_code!("construct.ambiguous_root_workflow"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: SourceSpan { start: 0, end: 0 },
                 message: "multiple workflow declarations require an explicit root".to_owned(),
@@ -4613,16 +4954,20 @@ fn validate_turn_access_grant_file_operations(ir: &IrProgram, diagnostics: &mut 
                 }
                 for op in &grant.operations {
                     if !FILE_OPERATIONS.contains(&op.operation.as_str()) {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                        diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("capability.invalid_grant_operation"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants `{}` on file store `{}`, which is not a file operation",
                                 rule.name, op.operation, grant.resource
                             ),
-                            suggestion: Some(
-                                "file-store grants allow `read`, `write`, `import`, or `export`"
-                                    .to_owned(),
-                            ),
+                            suggestion: Some(suggest_then_keyword(
+                                &op.operation,
+                                FILE_OPERATIONS.iter().copied(),
+                                "file-store grants allow `read`, `write`, `import`, or `export`",
+                            )),
                         });
                     }
                 }
@@ -4655,15 +5000,19 @@ fn validate_turn_access_grant_memory_operations(ir: &IrProgram, diagnostics: &mu
                 for op in &grant.operations {
                     if !MEMORY_OPERATIONS.contains(&op.operation.as_str()) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("capability.invalid_grant_operation"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` grants `{}` on memory pool `{}`, which is not a memory operation",
                                 rule.name, op.operation, grant.resource
                             ),
-                            suggestion: Some(
-                                "memory-pool grants allow `recall`, `learn`, or `curate`".to_owned(),
-                            ),
+                            suggestion: Some(suggest_then_keyword(
+                                &op.operation,
+                                MEMORY_OPERATIONS.iter().copied(),
+                                "memory-pool grants allow `recall`, `learn`, or `curate`",
+                            )),
                         });
                     }
                 }
@@ -4709,6 +5058,8 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                 };
                 if !declared.contains(name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_resource"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -4724,6 +5075,8 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                 for op in &grant.operations {
                     let Ok(operation) = Operation::parse(&op.operation) else {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("capability.invalid_grant_operation"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!(
@@ -4743,6 +5096,8 @@ fn validate_turn_access_grant_vaults(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                     };
                     if !operation.is_container() {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("capability.invalid_narrowing"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!(
@@ -4801,6 +5156,8 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
                         .map(|candidate| candidate.as_str())
                         .collect();
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("capability.credential_kind_mismatch"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -4820,15 +5177,30 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
     }
 }
 
-/// std.coord slice 3: a counter without a declared `timezone` anchors its
-/// reset-period boundary to UTC — legal, but a daily/weekly/monthly quota
-/// silently rolling over at an operator-surprising hour is worth a warning.
 /// S4 (file-store default posture): a store is READ-ONLY by default — a
 /// `write`/`export` against a store with no `allow write [...]` policy will
 /// fail closed at runtime, so surface it as a check error here ("catch before
 /// deployment"). Reads/imports need no clause (mounting the root is the read
 /// consent); `allow read [...]` narrows them.
-fn validate_file_store_write_policy(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+///
+/// `rule_bodies` holds one source block per `ir.rules` entry, in the same
+/// order: the block that rule's `IrRule.body` text was taken from. `IrRule`
+/// keeps the text and drops the origin, so re-parsing it at base `0` put every
+/// diagnostic this raises at `1:1` — on the `workflow` line, in a file whose
+/// offending `write` may be a hundred lines further down.
+///
+/// Paired by POSITION and not by rule name. The compiler accepts two rules with
+/// the same name in one workflow (D14 in spec/diagnostic-quality-tracker.md),
+/// so a name-keyed map kept the last of them and this check re-parsed one
+/// rule's body against another rule's origin — a caret confidently under a
+/// statement that performs no write at all. A length mismatch would mean a rule
+/// reached `ir.rules` by some path that did not record its block; the check
+/// degrades to the coarse base rather than pairing the wrong two.
+fn validate_file_store_write_policy(
+    ir: &IrProgram,
+    rule_bodies: &[BlockSource],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let read_only: BTreeSet<&str> = ir
         .file_stores
         .iter()
@@ -4855,6 +5227,8 @@ fn validate_file_store_write_policy(ir: &IrProgram, diagnostics: &mut Vec<Diagno
                     if let Some(store) = store {
                         if read_only.contains(store.as_str()) {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("capability.not_granted"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
@@ -4881,8 +5255,22 @@ fn validate_file_store_write_policy(ir: &IrProgram, diagnostics: &mut Vec<Diagno
             }
         }
     }
-    for rule in &ir.rules {
-        let (ast, _) = body::parse_rule_body(&rule.body, 0);
+    // Positional pairing is only sound while the two lists are the same length;
+    // if they are not, no entry can be trusted to belong to the rule beside it,
+    // so every rule takes the coarse base rather than some of them taking a
+    // confidently wrong caret.
+    let aligned = rule_bodies.len() == ir.rules.len();
+    for (index, rule) in ir.rules.iter().enumerate() {
+        // A rule with no recorded block cannot happen today — every `IrRule` is
+        // pushed by `lower_rule`, which records one beside it — but a base is
+        // still needed, and `Generated` is the honest one: it degrades to the
+        // fallback rather than naming a byte offset nothing stands at.
+        let base = aligned
+            .then(|| rule_bodies.get(index))
+            .flatten()
+            .map(BlockSource::body_base)
+            .unwrap_or(body::BodyBase::Generated(zero_span()));
+        let (ast, _) = body::parse_rule_body(&rule.body, base);
         walk(&ast.statements, &rule.name, &read_only, diagnostics);
     }
 }
@@ -4914,6 +5302,8 @@ fn expand_source_emit_from(ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>
         };
         if from != source.observe_binding {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_binding"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: source.span,
                 message: format!(
@@ -5015,6 +5405,8 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
                 continue;
             }
             warnings.push(Diagnostic {
+                code: diagnostic_code!("effect.unhandled_failure"),
+                severity: Severity::Warning,
                 related: Vec::new(),
                 span: effect.span,
                 message: format!(
@@ -5036,6 +5428,72 @@ fn warn_unhandled_effect_failures(ir: &IrProgram, warnings: &mut Vec<Diagnostic>
 /// deliberately leaves open.
 const SEMANTIC_TAGS: &[&str] = &["bounded", "external", "private", "service", "tool"];
 
+/// How far a tag may be from a semantic one and still be warned about.
+///
+/// OWNED BY THIS SITE, and deliberately not read out of [`suggestion_budget`].
+/// Everywhere else a did-you-mean decides what a diagnostic SAYS; here it
+/// decides whether the diagnostic EXISTS, and a threshold shared with the
+/// wording knob makes a warning disappear as a side effect of retuning prose.
+/// That is exactly what happened once: tightening the suggestion budget silently
+/// deleted the warnings for `@bound` and `@tul`, which is an acceptance change
+/// wearing a wording change's clothes. Move this number on purpose, with
+/// `a_near_miss_semantic_tag_still_warns` to say what moved.
+const SEMANTIC_TAG_NEAR_MISS_EDITS: usize = 2;
+
+/// The semantic tag `name` is a near miss for, under this site's own threshold
+/// AND its own metric.
+///
+/// Two edits, and strictly fewer than the shorter of the two names, so a tag
+/// cannot be "a misspelling" of a word it barely overlaps and padding buys
+/// nothing: `@bounded123` is three edits from `@bounded` and stays silent.
+///
+/// Both halves are deliberately private to this site, because this is the one
+/// place where the near-miss calculation decides whether a DIAGNOSTIC EXISTS
+/// rather than what one says. Sharing the threshold already deleted two
+/// warnings once, when the suggestion budget was retuned for wording. Sharing
+/// the METRIC is the same hazard one level down: `edit_distance` counts a
+/// transposition as one edit so that `prioirty` can find `priority`, and that
+/// is a wording improvement which must not silently widen what warns. So this
+/// keeps plain Levenshtein, and a change to either knob above can no longer
+/// move this warning's existence.
+fn near_miss_semantic_tag(name: &str) -> Option<&'static str> {
+    let folded = name.to_lowercase();
+    let len = folded.chars().count();
+    SEMANTIC_TAGS
+        .iter()
+        .copied()
+        .map(|tag| (semantic_tag_edit_distance(&folded, tag), tag))
+        .filter(|&(distance, tag)| {
+            distance <= SEMANTIC_TAG_NEAR_MISS_EDITS && distance < len.min(tag.chars().count())
+        })
+        .min_by_key(|&(distance, tag)| (distance, tag))
+        .map(|(_, tag)| tag)
+}
+
+/// Plain Levenshtein, for [`near_miss_semantic_tag`] only.
+///
+/// Deliberately NOT `edit_distance`, and deliberately not "improved" to match
+/// it. See that function's comment: the suggestion metric is free to get better
+/// at recognising typos, and this one may only change when someone means to
+/// change which programs warn.
+fn semantic_tag_edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, from) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, to) in b.iter().enumerate() {
+            let substitution = usize::from(from != to);
+            current[j + 1] = (previous[j] + substitution)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
 /// Warn on a tag that is one or two letters away from a semantic one.
 ///
 /// Tags are free-form by design, so an unknown tag cannot be an error — but that
@@ -5044,18 +5502,16 @@ const SEMANTIC_TAGS: &[&str] = &["bounded", "external", "private", "service", "t
 /// case where silence is almost certainly wrong, so it is a warning: the
 /// analysis stays free of false refusals while the typo stops being invisible.
 fn warn_near_miss_semantic_tags(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
-    let semantic = SEMANTIC_TAGS
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect::<Vec<_>>();
     for tag in &ir.source_tags {
-        if semantic.contains(&tag.name) {
+        if SEMANTIC_TAGS.contains(&tag.name.as_str()) {
             continue;
         }
-        let Some(candidate) = closest_name(&tag.name, semantic.iter()) else {
+        let Some(candidate) = near_miss_semantic_tag(&tag.name) else {
             continue;
         };
         warnings.push(Diagnostic {
+            code: diagnostic_code!("construct.near_miss_tag"),
+            severity: Severity::Warning,
             related: Vec::new(),
             span: tag.span,
             message: format!(
@@ -5069,10 +5525,15 @@ fn warn_near_miss_semantic_tags(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) 
     }
 }
 
+/// std.coord slice 3: a counter without a declared `timezone` anchors its
+/// reset-period boundary to UTC — legal, but a daily/weekly/monthly quota
+/// silently rolling over at an operator-surprising hour is worth a warning.
 fn warn_counter_without_timezone(ir: &IrProgram, warnings: &mut Vec<Diagnostic>) {
     for counter in &ir.counters {
         if counter.timezone.is_none() {
             warnings.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_timezone"),
+                severity: Severity::Warning,
                 related: Vec::new(),
                 span: counter.span,
                 message: format!(
@@ -5128,6 +5589,8 @@ fn warn_inert_memory_grant_on_native_adapter(ir: &IrProgram, warnings: &mut Vec<
             for grant in &effect.access_grants {
                 if memory_pools.contains(grant.resource.as_str()) {
                     warnings.push(Diagnostic {
+                        code: diagnostic_code!("capability.inert_grant"),
+                        severity: Severity::Warning,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -5229,10 +5692,13 @@ fn detect_pattern_recursion(
             for member in &cycle {
                 recursive.insert(member.clone());
             }
-            diagnostics.push(Diagnostic { related: Vec::new(),
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unbounded_pattern_recursion"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span,
                 message: format!(
-                    "recursive pattern application is not allowed (graph.unbounded_pattern_recursion): expansion cycle {}",
+                    "recursive pattern application is not allowed: expansion cycle {}",
                     cycle.join(" -> ")
                 ),
                 suggestion: Some(
@@ -5268,7 +5734,7 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
                 let Item::Rule(rule) = item else {
                     continue;
                 };
-                for statement in workflow_invoke_statements(&rule.body.text) {
+                for (statement, _) in workflow_invoke_statements(&rule.body.text) {
                     if let Some((target, _)) = invoke_statement_parts(&statement) {
                         if target != name {
                             entry.push((target.to_owned(), rule.body.span));
@@ -5337,10 +5803,12 @@ fn detect_workflow_invoke_recursion(program: &Program, diagnostics: &mut Vec<Dia
                 flagged.insert(member.clone());
             }
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unbounded_workflow_invocation_recursion"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
-                    "recursive workflow invocation is not allowed (graph.unbounded_workflow_invocation_recursion): invocation cycle {}",
+                    "recursive workflow invocation is not allowed: invocation cycle {}",
                     cycle.join(" -> ")
                 ),
                 suggestion: Some(
@@ -5363,7 +5831,7 @@ fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<
             let Item::Rule(rule) = item else {
                 continue;
             };
-            for statement in workflow_invoke_statements(&rule.body.text) {
+            for (statement, at) in workflow_invoke_statements(&rule.body.text) {
                 let Some((target, _)) = invoke_statement_parts(&statement) else {
                     continue;
                 };
@@ -5371,8 +5839,10 @@ fn detect_private_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                     continue;
                 }
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("graph.invoke_private_workflow"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: rule.body.span_of(at),
                     message: format!(
                         "rule `{}` invokes private workflow `{target}`",
                         rule.name.name
@@ -5455,7 +5925,7 @@ fn detect_service_workflow_invocations(program: &Program, diagnostics: &mut Vec<
             let Item::Rule(rule) = item else {
                 continue;
             };
-            for statement in workflow_invoke_statements(&rule.body.text) {
+            for (statement, at) in workflow_invoke_statements(&rule.body.text) {
                 let Some((target, _)) = invoke_statement_parts(&statement) else {
                     continue;
                 };
@@ -5465,10 +5935,12 @@ fn detect_service_workflow_invocations(program: &Program, diagnostics: &mut Vec<
                     continue;
                 }
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("graph.invoke_awaits_service_workflow"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: rule.body.span_of(at),
                     message: format!(
-                        "rule `{}` invokes `{target}`, which is tagged `@service` (graph.invoke_awaits_service_workflow): `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output",
+                        "rule `{}` invokes `{target}`, which is tagged `@service`: `@service` declares that a workflow need not terminate, and an invocation awaits its terminal output",
                         rule.name.name
                     ),
                     suggestion: Some(
@@ -5687,10 +6159,12 @@ fn detect_agent_tool_grant_recursion(program: &Program, diagnostics: &mut Vec<Di
                 flagged.insert(member.clone());
             }
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unbounded_tool_grant_recursion"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
-                    "recursive agent tool grant is not allowed (graph.unbounded_tool_grant_recursion): invoke-tool cycle {}",
+                    "recursive agent tool grant is not allowed: invoke-tool cycle {}",
                     cycle.join(" -> ")
                 ),
                 suggestion: Some(
@@ -5708,16 +6182,20 @@ fn expand_pattern_applications(
 ) -> (Program, Vec<IrPatternApplication>) {
     let mut patterns = BTreeMap::new();
     for pattern in &program.patterns {
-        if patterns
-            .insert(pattern.name.name.clone(), pattern.clone())
-            .is_some()
-        {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: pattern.name.span,
-                message: format!("pattern `{}` is declared more than once", pattern.name.name),
-                suggestion: Some("rename one pattern declaration".to_owned()),
-            });
+        // `insert` hands back the declaration it displaced, which is exactly the
+        // first one; it used to be dropped by `.is_some()`.
+        if let Some(prior) = patterns.insert(pattern.name.name.clone(), pattern.clone()) {
+            diagnostics.push(
+                Diagnostic {
+                    code: diagnostic_code!("construct.duplicate_declaration"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: pattern.name.span,
+                    message: format!("pattern `{}` is declared more than once", pattern.name.name),
+                    suggestion: Some("rename one pattern declaration".to_owned()),
+                }
+                .with_related(prior.name.span, "first declared here"),
+            );
         }
     }
 
@@ -5738,6 +6216,8 @@ fn expand_pattern_applications(
         };
         let Some(pattern) = patterns.get(&apply.pattern.name) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_pattern"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.pattern.span,
                 message: format!("pattern `{}` was not found", apply.pattern.name),
@@ -5747,6 +6227,8 @@ fn expand_pattern_applications(
         };
         if pattern.type_params.len() != apply.type_args.len() {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.type_argument_arity"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.span,
                 message: format!(
@@ -5871,6 +6353,8 @@ fn parse_pattern_value_arguments(
         let mut parts = line.splitn(2, char::is_whitespace);
         let Some(name) = parts.next().filter(|name| is_identifier(name)) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.invalid_pattern_argument"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
@@ -5887,6 +6371,8 @@ fn parse_pattern_value_arguments(
             .filter(|value| !value.is_empty())
         else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.invalid_pattern_argument"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
@@ -5899,6 +6385,8 @@ fn parse_pattern_value_arguments(
         };
         if args.insert(name.to_owned(), value.to_owned()).is_some() {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_pattern_argument"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: apply.body.span,
                 message: format!(
@@ -5932,6 +6420,8 @@ fn pattern_body_admission(
 ) -> Option<Diagnostic> {
     match item {
         Item::WorkflowContract(contract) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: contract.span,
             message: "workflow contracts are not allowed in pattern bodies".to_owned(),
@@ -5940,6 +6430,8 @@ fn pattern_body_admission(
             ),
         }),
         Item::Pattern(pattern) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: pattern.span,
             message: "nested pattern declarations are not supported in pattern bodies".to_owned(),
@@ -5949,6 +6441,8 @@ fn pattern_body_admission(
         // graph.unbounded_pattern_recursion diagnostic by detect_pattern_recursion;
         // don't also emit the generic "not supported yet" message for it.
         Item::Apply(apply) if !recursive_patterns.contains(&apply.pattern.name) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: apply.span,
             message: "pattern applications inside pattern bodies are not supported yet".to_owned(),
@@ -5960,24 +6454,32 @@ fn pattern_body_admission(
         // program's sites and a campaign partitions this program's gauge
         // vector — neither is a reusable template fragment.
         Item::Gauge(gauge) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: gauge.span,
             message: "gauge declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare gauges at source top level".to_owned()),
         }),
         Item::Campaign(campaign) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: campaign.span,
             message: "campaign declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare campaigns at source top level".to_owned()),
         }),
         Item::Mark(mark) => Some(Diagnostic {
+            code: diagnostic_code!("construct.forbidden_pattern_item"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: mark.span,
             message: "mark declarations are not allowed in pattern bodies".to_owned(),
             suggestion: Some("declare marks at source top level".to_owned()),
         }),
         Item::Rule(rule) => pattern_rule_terminal_span(rule).map(|span| Diagnostic {
+            code: diagnostic_code!("construct.pattern_terminal_action"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
@@ -6002,11 +6504,8 @@ fn pattern_rule_terminal_span(rule: &RuleDecl) -> Option<SourceSpan> {
         let leading = line.len() - trimmed_start.len();
         let statement = trimmed_start.trim_end();
         if is_pattern_terminal_statement(statement) {
-            let start = rule.body.span.start + offset + leading;
-            return Some(SourceSpan {
-                start,
-                end: start + statement.len(),
-            });
+            let start = offset + leading;
+            return Some(rule.body.span_of(start..start + statement.len()));
         }
         offset += line.len();
     }
@@ -6128,12 +6627,13 @@ fn expand_pattern_item(
             let generated = format!("table:{}", name.name);
             table.name = name;
             for row in &mut table.rows {
-                row.body.text = substitute_pattern_text(
+                let substituted = substitute_pattern_text(
                     &row.body.text,
                     type_substitutions,
                     value_substitutions,
                     local_names,
                 );
+                row.body.rewrite(substituted);
             }
             Some((generated, Item::Table(table)))
         }
@@ -6147,12 +6647,13 @@ fn expand_pattern_item(
             }
             coerce.output =
                 substitute_pattern_type(coerce.output.clone(), type_substitutions, local_names);
-            coerce.body.text = substitute_pattern_text(
+            let substituted = substitute_pattern_text(
                 &coerce.body.text,
                 type_substitutions,
                 value_substitutions,
                 local_names,
             );
+            coerce.body.rewrite(substituted);
             Some((generated, Item::Coerce(coerce)))
         }
         Item::Assert(mut assertion) => {
@@ -6176,12 +6677,13 @@ fn expand_pattern_item(
                     local_names,
                 );
             }
-            rule.body.text = substitute_pattern_text(
+            let substituted = substitute_pattern_text(
                 &rule.body.text,
                 type_substitutions,
                 value_substitutions,
                 local_names,
             );
+            rule.body.rewrite(substituted);
             Some((generated, Item::Rule(rule)))
         }
     }
@@ -6391,6 +6893,8 @@ fn collect_schema_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) ->
 
         if !names.insert(name.name.clone()) {
             let mut diagnostic = Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: name.span,
                 message: format!("schema `{}` is declared more than once", name.name),
@@ -6412,41 +6916,64 @@ fn collect_harness_kinds(
     program: &Program,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeMap<String, String> {
-    let mut kinds: BTreeMap<String, String> = BTreeMap::new();
+    // Name -> (kind, span of the FIRST declaration). The span rides along only so
+    // a duplicate can point back at what it duplicates; the returned map drops it.
+    let mut kinds: BTreeMap<String, (String, SourceSpan)> = BTreeMap::new();
     for item in &program.items {
         let Item::Harness(harness) = item else {
             continue;
         };
-        if kinds
-            .insert(harness.name.name.clone(), harness.kind.name.clone())
-            .is_some()
-        {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: harness.name.span,
-                message: format!("harness `{}` is declared more than once", harness.name.name),
-                suggestion: Some(
-                    "rename one harness declaration or merge the harness settings".to_owned(),
-                ),
-            });
+        if let Some((_, first)) = kinds.get(&harness.name.name) {
+            diagnostics.push(
+                Diagnostic {
+                    code: diagnostic_code!("construct.duplicate_declaration"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: harness.name.span,
+                    message: format!("harness `{}` is declared more than once", harness.name.name),
+                    suggestion: Some(
+                        "rename one harness declaration or merge the harness settings".to_owned(),
+                    ),
+                }
+                .with_related(*first, "first declared here"),
+            );
+            continue;
         }
+        kinds.insert(
+            harness.name.name.clone(),
+            (harness.kind.name.clone(), harness.name.span),
+        );
     }
     kinds
+        .into_iter()
+        .map(|(name, (kind, _))| (name, kind))
+        .collect()
 }
 
 fn collect_agent_names(program: &Program, diagnostics: &mut Vec<Diagnostic>) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
+    // The first declaration span per name, so a duplicate can point back at it —
+    // the same shape `collect_schema_names` uses just above.
+    let mut first_spans: BTreeMap<String, SourceSpan> = BTreeMap::new();
     for item in &program.items {
         let Item::Agent(agent) = item else {
             continue;
         };
         if !names.insert(agent.name.name.clone()) {
-            diagnostics.push(Diagnostic {
+            let mut diagnostic = Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: agent.name.span,
                 message: format!("agent `{}` is declared more than once", agent.name.name),
                 suggestion: Some("rename one agent declaration or merge the settings".to_owned()),
-            });
+            };
+            if let Some(first) = first_spans.get(&agent.name.name) {
+                diagnostic = diagnostic.with_related(*first, "first declared here");
+            }
+            diagnostics.push(diagnostic);
+        } else {
+            first_spans.insert(agent.name.name.clone(), agent.name.span);
         }
     }
     names
@@ -6464,6 +6991,9 @@ fn collect_workflow_contract_names(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> WorkflowContractNames {
     let mut names = WorkflowContractNames::default();
+    // Keyed by (kind, name): `input title` and `output title` are different
+    // declarations, and a duplicate must point at the first of its OWN kind.
+    let mut first_spans: BTreeMap<(&str, String), SourceSpan> = BTreeMap::new();
     for item in &program.items {
         let Item::WorkflowContract(contract) = item else {
             continue;
@@ -6477,7 +7007,9 @@ fn collect_workflow_contract_names(
             .insert(contract.name.name.clone(), contract.ty.clone())
             .is_some()
         {
-            diagnostics.push(Diagnostic {
+            let mut diagnostic = Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: contract.name.span,
                 message: format!(
@@ -6486,7 +7018,17 @@ fn collect_workflow_contract_names(
                     contract.name.name
                 ),
                 suggestion: Some("remove the duplicate workflow contract".to_owned()),
-            });
+            };
+            let key = (contract.kind.as_str(), contract.name.name.clone());
+            if let Some(first) = first_spans.get(&key) {
+                diagnostic = diagnostic.with_related(*first, "first declared here");
+            }
+            diagnostics.push(diagnostic);
+        } else {
+            first_spans.insert(
+                (contract.kind.as_str(), contract.name.name.clone()),
+                contract.name.span,
+            );
         }
     }
     names
@@ -6692,7 +7234,7 @@ fn coordination_resources_used_by_items(items: &[Item]) -> BTreeSet<String> {
         let Item::Rule(rule) = item else {
             continue;
         };
-        let (body, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+        let (body, _) = body::parse_rule_body(&rule.body.text, rule.body.body_base());
         collect_coordination_resources_from_statements(&body.statements, &mut resources);
     }
     resources
@@ -6750,7 +7292,7 @@ fn collect_milestone_declarations(items: &[Item]) -> BTreeMap<String, String> {
         let Item::Rule(rule) = item else {
             continue;
         };
-        for (name, class) in milestone_emissions_in_body(&rule.body.text) {
+        for (name, class, _) in milestone_emissions_in_body(&rule.body.text) {
             milestones.entry(name).or_insert(class);
         }
     }
@@ -6773,27 +7315,35 @@ fn validate_milestone_statements(
 ) {
     // Child side: every `emit milestone "<name>" of <Class>` payload class must
     // exist.
-    for (name, class) in milestone_emissions_in_body(&rule.body.text) {
+    for (name, class, at) in milestone_emissions_in_body(&rule.body.text) {
         if !class.is_empty() && !semantic.schemas.class_exists(&class) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_schema"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` emits milestone `{name}` with unknown payload class `{class}`",
                     rule.name.name
                 ),
-                suggestion: Some(format!("declare `class {class}` before projecting it")),
+                suggestion: Some(suggest_otherwise(
+                    &class,
+                    semantic.schemas.classes.keys(),
+                    format!("declare `class {class}` before projecting it"),
+                )),
             });
         }
     }
 
     // Parent side: every `after <p> reaches "<name>"` must name a milestone the
     // invoked child declares.
-    for (binding, milestone) in milestone_reaches_in_body(&rule.body.text) {
+    for (binding, milestone, at) in milestone_reaches_in_body(&rule.body.text) {
         let Some(workflow) = invoke_binding_workflow(rule, &binding) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_binding"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` has `after {binding} reaches \"{milestone}\"` for `{binding}`, which is not a workflow-invoke binding in this rule",
                     rule.name.name
@@ -6829,8 +7379,10 @@ fn validate_milestone_statements(
                 format!("workflow `{workflow}` declares: {available}")
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_milestone"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: rule.body.span_of(at),
                 message: format!(
                     "rule `{}` reaches milestone `{milestone}` that workflow `{workflow}` does not declare",
                     rule.name.name
@@ -6843,10 +7395,11 @@ fn validate_milestone_statements(
 
 /// Parses `after <binding> reaches "<name>"` headers out of a rule body's text,
 /// returning (binding, milestone-name) pairs. Mirrors `milestone_emissions_in_body`.
-fn milestone_reaches_in_body(body: &str) -> Vec<(String, String)> {
+fn milestone_reaches_in_body(body: &str) -> Vec<(String, String, Range<usize>)> {
     let mut out = Vec::new();
-    for raw in body.lines() {
+    for (raw, offset) in body_line_offsets(body) {
         let trimmed = raw.trim();
+        let head = offset + (raw.len() - raw.trim_start().len());
         let Some(rest) = trimmed.strip_prefix("after ") else {
             continue;
         };
@@ -6863,7 +7416,11 @@ fn milestone_reaches_in_body(body: &str) -> Vec<(String, String)> {
         if !(quoted.starts_with('"') && quoted.ends_with('"') && quoted.len() >= 2) {
             continue;
         }
-        out.push((binding.to_owned(), quoted.trim_matches('"').to_owned()));
+        out.push((
+            binding.to_owned(),
+            quoted.trim_matches('"').to_owned(),
+            head..head + trimmed.len(),
+        ));
     }
     out
 }
@@ -6872,7 +7429,7 @@ fn milestone_reaches_in_body(body: &str) -> Vec<(String, String)> {
 /// workflow name within a single rule, so a sibling `after <binding> reaches`
 /// can find the child workflow whose milestones it observes.
 fn invoke_binding_workflow(rule: &RuleDecl, binding: &str) -> Option<String> {
-    for statement in workflow_invoke_statements(&rule.body.text) {
+    for (statement, _) in workflow_invoke_statements(&rule.body.text) {
         let (target, _) = invoke_statement_parts(&statement)?;
         if let Some(as_binding) = binding_after_as(&statement) {
             if as_binding == binding {
@@ -6965,10 +7522,11 @@ fn invoke_failure_class(
 /// text, returning (name, class) pairs (class is empty for a bare milestone).
 /// Text-based to mirror the other body scanners (`workflow_invoke_statements`)
 /// and stay independent of flow-vs-rule body provenance.
-fn milestone_emissions_in_body(body: &str) -> Vec<(String, String)> {
+fn milestone_emissions_in_body(body: &str) -> Vec<(String, String, Range<usize>)> {
     let mut out = Vec::new();
-    for raw in body.lines() {
+    for (raw, offset) in body_line_offsets(body) {
         let trimmed = raw.trim();
+        let head = offset + (raw.len() - raw.trim_start().len());
         let Some(rest) = trimmed.strip_prefix("emit milestone ") else {
             continue;
         };
@@ -6993,7 +7551,7 @@ fn milestone_emissions_in_body(body: &str) -> Vec<(String, String)> {
                     .to_owned()
             })
             .unwrap_or_default();
-        out.push((name, class));
+        out.push((name, class, head..head + trimmed.len()));
     }
     out
 }
@@ -7270,6 +7828,8 @@ impl SchemaIndex {
     fn insert_item(&mut self, item: &Item) {
         match item {
             Item::Enum(enum_decl) => {
+                self.decl_spans
+                    .insert(enum_decl.name.name.clone(), enum_decl.name.span);
                 self.enums.insert(
                     enum_decl.name.name.clone(),
                     enum_decl
@@ -7296,10 +7856,9 @@ impl SchemaIndex {
                     for field in &variant.fields {
                         fields.insert(field.name.name.clone(), field.ty.clone());
                     }
-                    self.classes.insert(
-                        format!("{}.{}", enum_decl.name.name, variant.name.name),
-                        fields,
-                    );
+                    let generated = format!("{}.{}", enum_decl.name.name, variant.name.name);
+                    self.decl_spans.insert(generated.clone(), variant.name.span);
+                    self.classes.insert(generated, fields);
                 }
             }
             Item::Class(class_decl) => {
@@ -7311,10 +7870,13 @@ impl SchemaIndex {
                         .map(|field| (field.name.name.clone(), field.ty.clone()))
                         .collect(),
                 );
+                self.decl_spans
+                    .insert(class_decl.name.name.clone(), class_decl.name.span);
                 self.insert_presence(&class_decl.name.name, &class_decl.fields);
             }
             Item::Event(event) => {
                 self.events.insert(event.name.clone());
+                self.decl_spans.insert(event.name.clone(), event.name_span);
                 // The payload schema is indexed under the dotted signal name,
                 // unreachable from user class declarations, so bare `when
                 // <signal> as x` bindings type-check field access.
@@ -7359,13 +7921,24 @@ impl SchemaIndex {
         self.classes.extend(other.classes);
         self.enums.extend(other.enums);
         self.presence.extend(other.presence);
+        self.decl_spans.extend(other.decl_spans);
+    }
+
+    /// Where `name` is declared, when it is declared in this program. `None` for
+    /// a builtin, which is the case every caller has to tolerate.
+    fn decl_span(&self, name: &str) -> Option<SourceSpan> {
+        self.decl_spans.get(name).copied()
     }
 
     fn class_exists(&self, name: &str) -> bool {
         self.classes.contains_key(name)
     }
 
-    fn resolve_field_path(&self, root_schema: &str, path: &[String]) -> Result<TypeSyntax, String> {
+    fn resolve_field_path(
+        &self,
+        root_schema: &str,
+        path: &[String],
+    ) -> Result<TypeSyntax, FieldPathError> {
         // Dotted runtime fact names (general `when fact <name>` matches) are
         // untyped — unless a declared `event` (or generated `<Enum>.<Variant>`
         // class) indexes a payload schema under the dotted name, in which
@@ -7386,19 +7959,41 @@ impl SchemaIndex {
             },
         };
 
-        for field in path {
+        for (index, field) in path.iter().enumerate() {
             let Some(fields) = self.classes.get(&schema) else {
-                return Err(format!("schema `{schema}` has no declared fields"));
+                return Err(FieldPathError::at(
+                    index,
+                    format!("schema `{schema}` has no declared fields"),
+                ));
             };
             let Some(field_ty) = fields.get(field) else {
-                return Err(format!("schema `{schema}` has no field `{field}`"));
+                return Err(FieldPathError::at_field(
+                    index,
+                    format!("schema `{schema}` has no field `{field}`"),
+                    closest_name(field, fields.keys()),
+                    &schema,
+                ));
             };
 
             current = field_ty.clone();
             match schema_name_for_path(&current) {
                 Some(next_schema) => schema = next_schema,
+                // Value equality against the LAST segment, deliberately, and not
+                // the `index + 1 != path.len()` this plainly means. Index
+                // equality refuses strictly more: for `a.b.b`, where a
+                // non-schema intermediate repeats the final segment's name, the
+                // value test reads `field != path.last()` as false and accepts.
+                // That is a refusal hole, and closing it is an ACCEPTANCE change
+                // — a program that compiles today would stop compiling — so it
+                // does not ride along inside a span fix. Recorded as D14 in
+                // spec/diagnostic-quality-tracker.md. The failing segment's
+                // index is carried for the caret either way, which is all a span
+                // change is entitled to move.
                 None if field != path.last().expect("path is non-empty") => {
-                    return Err(format!("field `{field}` is not a schema value"));
+                    return Err(FieldPathError::at(
+                        index,
+                        format!("field `{field}` is not a schema value"),
+                    ));
                 }
                 None => {}
             }
@@ -7478,39 +8073,54 @@ pub const STD_PACKAGE_IDS: &[&str] = &[
 /// declared agent, and membership is single-valued — one stream per
 /// agent, so the sync topology stays a tree.
 fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
-    let mut memberships: Vec<(&str, &str)> = Vec::new(); // (agent, stream)
+    // (agent, holding stream, span of the membership that claimed it). The span
+    // is the third element because the message names the holding stream and then
+    // leaves the reader to go and find where it lists this agent.
+    let mut memberships: Vec<(&str, &str, SourceSpan)> = Vec::new();
     for stream in &ir.streams {
         for (member, span) in stream.members.iter().zip(&stream.member_spans) {
             if !ir.agents.iter().any(|agent| agent.name == *member) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_agent"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: *span,
                     message: format!(
                         "stream `{}` member `{}` is not a declared agent",
                         stream.name, member
                     ),
-                    suggestion: Some(
+                    suggestion: Some(suggest_otherwise(
+                        member,
+                        ir.agents.iter().map(|agent| agent.name.as_str()),
                         "stream members are agent declarations; declare the agent \
-                         or remove it from the stream"
-                            .to_owned(),
-                    ),
+                         or remove it from the stream",
+                    )),
                 });
                 continue;
             }
-            if let Some((_, holder)) = memberships.iter().find(|(agent, _)| agent == member) {
-                diagnostics.push(Diagnostic {
-                    related: Vec::new(),
-                    span: *span,
-                    message: format!("agent `{member}` is already a member of stream `{holder}`",),
-                    suggestion: Some(
-                        "membership is single-valued (the sync topology stays a \
-                         tree): an agent homes to exactly one stream"
-                            .to_owned(),
-                    ),
-                });
+            if let Some((_, holder, claimed_at)) =
+                memberships.iter().find(|(agent, _, _)| agent == member)
+            {
+                diagnostics.push(
+                    Diagnostic {
+                        code: diagnostic_code!("construct.cardinality_conflict"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        span: *span,
+                        message: format!(
+                            "agent `{member}` is already a member of stream `{holder}`",
+                        ),
+                        suggestion: Some(
+                            "membership is single-valued (the sync topology stays a \
+                             tree): an agent homes to exactly one stream"
+                                .to_owned(),
+                        ),
+                    }
+                    .with_related(*claimed_at, format!("`{holder}` lists `{member}` here")),
+                );
                 continue;
             }
-            memberships.push((member, &stream.name));
+            memberships.push((member, &stream.name, *span));
         }
     }
     // `on stream <name>` on a tell must name a declared stream — the
@@ -7520,13 +8130,16 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
             if let Some(target) = &effect.on_stream {
                 if !ir.streams.iter().any(|stream| stream.name == *target) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_stream"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!("`on stream {target}` names an undeclared stream"),
-                        suggestion: Some(
-                            "declare the stream at top level: `stream <name> { members [...] }`"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(suggest_otherwise(
+                            target,
+                            ir.streams.iter().map(|stream| stream.name.as_str()),
+                            "declare the stream at top level: `stream <name> { members [...] }`",
+                        )),
                     });
                 }
             }
@@ -7540,6 +8153,8 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                     let literal = &trimmed[1..trimmed.len() - 1];
                     if let Err(error) = whipplescript_core::selection::parse(literal) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("parse.invalid_selection"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!("the selection does not parse: {error}"),
@@ -7564,6 +8179,8 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                 }
                 if effect.kind != IrEffectKind::WorkflowInvoke {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("capability.grant_not_permitted"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: "a `vcs` access grant rides an `invoke` only".to_owned(),
@@ -7579,17 +8196,23 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                 for op in &grant.operations {
                     if op.operation != "repair" {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("capability.invalid_grant_operation"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!("unknown `vcs` grant operation `{}`", op.operation),
-                            suggestion: Some(
-                                "the vcs resource grants `repair for <binding>`".to_owned(),
-                            ),
+                            suggestion: Some(suggest_then_keyword(
+                                &op.operation,
+                                ["repair"],
+                                "the vcs resource grants `repair for <binding>`",
+                            )),
                         });
                         continue;
                     }
                     let Some(target) = &op.target else {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("construct.missing_requirement"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: "`repair` names no binding".to_owned(),
@@ -7607,6 +8230,8 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                     });
                     if !bound {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.unknown_binding"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!("`repair for {target}` names no binding of this rule"),
@@ -7625,6 +8250,8 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
             if let Some(target) = &effect.transport_onto {
                 if target != "mainline" && !ir.streams.iter().any(|stream| stream.name == *target) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_stream"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -7746,16 +8373,22 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
     for mark in &ir.marks {
         if !ir.rules.iter().any(|rule| rule.name == mark.site) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_rule"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: mark.span,
                 message: format!("mark `{}` rides unknown site `{}`", mark.name, mark.site),
-                suggestion: Some(format!(
-                    "declared rules: {}",
-                    ir.rules
-                        .iter()
-                        .map(|rule| rule.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                suggestion: Some(suggest_then(
+                    &mark.site,
+                    ir.rules.iter().map(|rule| rule.name.as_str()),
+                    format!(
+                        "declared rules: {}",
+                        ir.rules
+                            .iter()
+                            .map(|rule| rule.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 )),
             });
         }
@@ -7764,12 +8397,21 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
     let resolves = |name: &str| gauge_names.contains(name) || BUILTIN_GAUGES.contains(&name);
     let unknown = |name: &str, span: SourceSpan, diagnostics: &mut Vec<Diagnostic>| {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_gauge"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("unknown gauge `{name}`"),
-            suggestion: Some(format!(
-                "declare `gauge {name} {{ ... }}` or use a built-in gauge ({})",
-                BUILTIN_GAUGES.join(", ")
+            suggestion: Some(suggest_otherwise(
+                name,
+                gauge_names
+                    .iter()
+                    .copied()
+                    .chain(BUILTIN_GAUGES.iter().copied()),
+                format!(
+                    "declare `gauge {name} {{ ... }}` or use a built-in gauge ({})",
+                    BUILTIN_GAUGES.join(", ")
+                ),
             )),
         });
     };
@@ -7782,13 +8424,19 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
             {
                 None => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_coerce"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: gauge.span,
                         message: format!(
                             "gauge `{}` judges via undeclared coerce `{}`",
                             gauge.name, gauge.judge_target
                         ),
-                        suggestion: Some("declare the coerce this gauge judges with".to_owned()),
+                        suggestion: Some(suggest_otherwise(
+                            &gauge.judge_target,
+                            ir.coerces.iter().map(|coerce| coerce.name.as_str()),
+                            "declare the coerce this gauge judges with",
+                        )),
                     });
                 }
                 // Explicit-argument binding (settled 2026-07-14): the
@@ -7803,6 +8451,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     if gauge.judge_args.len() == 1 && gauge.judge_args[0] == "record" {
                         if coerce.params.len() != 1 {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("expr.arity_mismatch"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: gauge.span,
                                 message: format!(
@@ -7830,6 +8480,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                             };
                             if !valid {
                                 diagnostics.push(Diagnostic {
+                                    code: diagnostic_code!("expr.invalid_path"),
+                                    severity: Severity::Error,
                                     related: Vec::new(),
                                     span: gauge.span,
                                     message: format!(
@@ -7848,6 +8500,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                         }
                         if gauge.judge_args.len() != coerce.params.len() {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("expr.arity_mismatch"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: gauge.span,
                                 message: format!(
@@ -7871,6 +8525,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
         }
         if !gauge.inputs.is_empty() && gauge.judge_kind != "exec" {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.incompatible_clause"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: gauge.span,
                 message: format!(
@@ -7883,6 +8539,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
         for input in &gauge.inputs {
             if input == &gauge.name {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("graph.gauge_input_cycle"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: gauge.span,
                     message: format!("derived gauge `{}` cannot input itself", gauge.name),
@@ -7925,6 +8583,8 @@ fn validate_improve_declarations(ir: &IrProgram, diagnostics: &mut Vec<Diagnosti
                     )
                 };
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.duplicate_member"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: campaign.span,
                     message,
@@ -7954,6 +8614,24 @@ impl HarnessClass {
     }
 }
 
+/// The agent `provider` kinds the closed-vocabulary English sweep covers.
+///
+/// The kinds are contributed by package manifests the CLI embeds, and the CLI
+/// depends on this crate rather than the other way round, so a list here is
+/// unavoidably a MIRROR of that set. It sits in production code, away from the
+/// sweep that reads it, so the CLI-side guard can compare the real set against
+/// THIS list. Both copies were test-local before, which meant that guard
+/// compared one hand-written array against another hand-written array — it
+/// would have stayed green while the sweep silently stopped covering a kind.
+pub const SWEPT_AGENT_PROVIDER_KINDS: &[&str] = &[
+    "claude",
+    "codex",
+    "command",
+    "fixture",
+    "native-fixture",
+    "owned",
+];
+
 /// Classify a harness kind (DR-0034 Decision 6). Total over the supported kinds:
 /// `owned` and the credential-free `fixture` model client are Managed; every other
 /// kind (codex/claude sidecars, the `native-fixture` delegated adapter, `command`)
@@ -7975,6 +8653,8 @@ fn validate_test_expr_source(
 ) {
     if source.trim().is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.empty_expression"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("{label} is empty"),
@@ -7984,6 +8664,8 @@ fn validate_test_expr_source(
     }
     if let Err(error) = parse_expression(source) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.invalid_expression"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("{label} is not a valid expression: {error}"),
@@ -8026,31 +8708,50 @@ fn validate_presence_conditions(
         };
         let Some(disc_field) = fields.iter().find(|candidate| &candidate.name.name == disc) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.span,
                 message: format!(
                     "`{container}` field `{}` is conditioned on unknown discriminant `{disc}`",
                     field.name.name
                 ),
-                suggestion: Some(
-                    "`when <field> is \"...\"` must name a literal-union field of the same schema"
-                        .to_owned(),
-                ),
+                // Only the siblings that are LEGAL here: the very next match
+                // rejects a discriminant that is not a string-literal union, so
+                // offering one as a did-you-mean would send the reader from one
+                // error to a different one. `literal_union_values` is that
+                // filter, applied before the suggestion rather than after it.
+                suggestion: Some(suggest_then(
+                    disc,
+                    fields
+                        .iter()
+                        .filter(|sibling| literal_union_values(&sibling.ty).is_some())
+                        .map(|sibling| sibling.name.name.as_str()),
+                    "`when <field> is \"...\"` must name a literal-union field of the same schema",
+                )),
             });
             continue;
         };
         match literal_union_values(&disc_field.ty) {
             Some(values) if values.iter().any(|value| value == literal) => {}
             Some(values) => diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.span,
                 message: format!(
                     "`{container}` field `{}` is conditioned on `{disc} is \"{literal}\"`, which is not a value of `{disc}`",
                     field.name.name
                 ),
-                suggestion: Some(format!("use one of: {}", values.join(", "))),
+                suggestion: Some(suggest_then(
+                    literal,
+                    values.iter(),
+                    format!("use one of: {}", values.join(", ")),
+                )),
             }),
             None => diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: field.span,
                 message: format!(
@@ -8177,6 +8878,8 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
         if let Some(rest) = trimmed.strip_prefix("provider ") {
             if rest.split_whitespace().count() != 1 {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.invalid_clause"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: coerce.name.span,
                     message: format!(
@@ -8190,13 +8893,19 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
         }
         let field = trimmed.split_whitespace().next().unwrap_or(trimmed);
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.unknown_clause"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: coerce.name.span,
             message: format!(
                 "unknown coerce field `{field}` on coerce `{}`",
                 coerce.name.name
             ),
-            suggestion: Some("supported coerce fields are `prompt` and `provider`".to_owned()),
+            suggestion: Some(suggest_then_keyword(
+                field,
+                ["prompt", "provider"],
+                "supported coerce fields are `prompt` and `provider`",
+            )),
         });
     }
 }
@@ -8232,12 +8941,15 @@ fn validate_type_refs(
             let normalized = kind.name.replace('_', "-");
             if whipplescript_custody::CredentialKind::parse(&normalized).is_err() {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.unknown_option"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: kind.span,
                     message: format!("`secret` names unknown credential kind `{}`", kind.name),
-                    suggestion: Some(format!(
-                        "name one of: {}",
-                        credential_kind_spellings().join(", ")
+                    suggestion: Some(suggest_then_keyword(
+                        &kind.name,
+                        credential_kind_spellings(),
+                        format!("name one of: {}", credential_kind_spellings().join(", ")),
                     )),
                 });
             }
@@ -8246,37 +8958,59 @@ fn validate_type_refs(
         TypeSyntax::Ref { name } => {
             if !schema_names.contains(&name.name) && !is_builtin_schema_ref(&name.name) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_schema"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: name.span,
                     message: format!("unknown schema reference `{}`", name.name),
-                    suggestion: Some(format!(
-                        "declare `class {}` or `enum {}` before using it",
-                        name.name, name.name
+                    suggestion: Some(suggest_otherwise(
+                        &name.name,
+                        schema_names
+                            .iter()
+                            .map(String::as_str)
+                            .chain(BUILTIN_SCHEMA_REFS.iter().copied()),
+                        format!(
+                            "declare `class {}` or `enum {}` before using it",
+                            name.name, name.name
+                        ),
                     )),
                 });
             }
         }
         TypeSyntax::AgentRef { agents, .. } => {
-            let mut seen = BTreeSet::new();
+            let mut seen: BTreeMap<String, SourceSpan> = BTreeMap::new();
             for agent in agents {
-                if !seen.insert(agent.name.clone()) {
-                    diagnostics.push(Diagnostic {
-                        related: Vec::new(),
-                        span: agent.span,
-                        message: format!("AgentRef lists agent `{}` more than once", agent.name),
-                        suggestion: Some(
-                            "remove the duplicate agent from the AgentRef domain".to_owned(),
-                        ),
-                    });
+                if let Some(first) = seen.get(&agent.name) {
+                    diagnostics.push(
+                        Diagnostic {
+                            code: diagnostic_code!("construct.duplicate_member"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
+                            span: agent.span,
+                            message: format!(
+                                "AgentRef lists agent `{}` more than once",
+                                agent.name
+                            ),
+                            suggestion: Some(
+                                "remove the duplicate agent from the AgentRef domain".to_owned(),
+                            ),
+                        }
+                        .with_related(*first, "first listed here"),
+                    );
+                } else {
+                    seen.insert(agent.name.clone(), agent.span);
                 }
                 if !agent_names.contains(&agent.name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_agent"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: agent.span,
                         message: format!("AgentRef references unknown agent `{}`", agent.name),
-                        suggestion: Some(format!(
-                            "declare `agent {}` before using it in AgentRef",
-                            agent.name
+                        suggestion: Some(suggest_otherwise(
+                            &agent.name,
+                            agent_names.iter(),
+                            format!("declare `agent {}` before using it in AgentRef", agent.name),
                         )),
                     });
                 }
@@ -8296,21 +9030,28 @@ fn validate_type_refs(
     }
 }
 
+/// The kernel-owned schema names a program may reference without declaring.
+///
+/// A table rather than a `matches!` arm because a name a program may WRITE is a
+/// name a diagnostic must be able to SUGGEST: `TerminalFaild` is unreachable
+/// from a match expression. `is_builtin_schema_ref` reads it, so the two cannot
+/// disagree.
+const BUILTIN_SCHEMA_REFS: &[&str] = &[
+    "AgentTurn",
+    "WorkItem",
+    "Evidence",
+    "VcsChange",
+    "VcsContention",
+    "VcsPromotion",
+    "VcsStall",
+    "TerminalFailed",
+    "TerminalTimedOut",
+    "TerminalCancelled",
+    "TerminalOutcome",
+];
+
 fn is_builtin_schema_ref(name: &str) -> bool {
-    matches!(
-        name,
-        "AgentTurn"
-            | "WorkItem"
-            | "Evidence"
-            | "VcsChange"
-            | "VcsContention"
-            | "VcsPromotion"
-            | "VcsStall"
-            | "TerminalFailed"
-            | "TerminalTimedOut"
-            | "TerminalCancelled"
-            | "TerminalOutcome"
-    )
+    BUILTIN_SCHEMA_REFS.contains(&name)
 }
 
 /// The terminal-family schemas are `origin = observer` (discriminated-families
@@ -8336,11 +9077,19 @@ fn is_observer_only_schema(name: &str) -> bool {
 }
 
 fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Diagnostic>) {
-    for line in rule.body.text.lines().map(str::trim) {
+    for (raw, offset) in body_line_offsets(&rule.body.text) {
+        let line = raw.trim();
+        let at = BodyAnchor::text(
+            &rule.body,
+            offset + (raw.len() - raw.trim_start().len()),
+            line,
+        );
         if line.starts_with("then ") {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unsupported_syntax"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` uses unsupported `then` sequencing",
                     rule.name.name
@@ -8352,8 +9101,10 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
         }
         if line.starts_with("after ") && line.contains("=>") {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unsupported_syntax"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` uses unsupported `after ... =>` sequencing",
                     rule.name.name
@@ -8596,10 +9347,12 @@ fn validate_effectful_rule_recursion(
                 format!("`@tool` workflow `{}` is bounded by DR-0025", ir.workflow)
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.bounded_workflow_effect_cycle"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
-                    "effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle): {declaration}, and rule cycle {} runs the effects of rule `{}` on every turn",
+                    "effect cycle in a bounded workflow is not allowed: {declaration}, and rule cycle {} runs the effects of rule `{}` on every turn",
                     cycle.join(" -> "),
                     rules[effectful].name
                 ),
@@ -8609,10 +9362,12 @@ fn validate_effectful_rule_recursion(
             });
         } else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unbounded_effect_recursion"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
-                    "effectful rule cycle is not allowed (graph.unbounded_effect_recursion): rule cycle {} turns inside one commit, and rule `{}` runs effects on every turn of it",
+                    "effectful rule cycle is not allowed: rule cycle {} turns inside one commit, and rule `{}` runs effects on every turn of it",
                     cycle.join(" -> "),
                     rules[effectful].name
                 ),
@@ -8756,13 +9511,16 @@ fn validate_message_from_channels(
         };
         if !semantic.channels.iter().any(|c| c.as_str() == channel) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_channel"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: when.span,
                 message: format!("`when message from {channel}` names an unknown channel"),
-                suggestion: Some(
-                    "declare it with `channel <name> { provider … }`, or correct the channel name"
-                        .to_owned(),
-                ),
+                suggestion: Some(suggest_otherwise(
+                    channel,
+                    semantic.channels.iter(),
+                    "declare it with `channel <name> { provider … }`, or correct the channel name",
+                )),
             });
             continue;
         }
@@ -8779,6 +9537,8 @@ fn validate_message_from_channels(
         {
             if report.direction == "outbound_only" {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("provider.feature_unavailable"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: when.span,
                     message: format!(
@@ -8818,16 +9578,19 @@ fn validate_send_channels(
                             {
                                 if !semantic.channels.contains(&channel.source) {
                                     diagnostics.push(Diagnostic {
+                                        code: diagnostic_code!("type.unknown_channel"),
+                                        severity: Severity::Error,
                                         related: Vec::new(),
                                         span: effect.span,
                                         message: format!(
                                             "`send via {}` names an unknown channel",
                                             channel.source
                                         ),
-                                        suggestion: Some(
-                                            "declare it with `channel <name> { provider … }`, or correct the channel name"
-                                                .to_owned(),
-                                        ),
+                                        suggestion: Some(suggest_otherwise(
+                                            &channel.source,
+                                            semantic.channels.iter(),
+                                            "declare it with `channel <name> { provider … }`, or correct the channel name",
+                                        )),
                                     });
                                 } else if let Some(report) = semantic
                                     .channel_providers
@@ -8845,6 +9608,8 @@ fn validate_send_channels(
                                     // closed at check time, not at dispatch.
                                     if report.direction == "inbound_only" {
                                         diagnostics.push(Diagnostic {
+                                            code: diagnostic_code!("provider.feature_unavailable"),
+                                            severity: Severity::Error,
                                             related: Vec::new(),
                                             span: effect.span,
                                             message: format!(
@@ -8866,16 +9631,19 @@ fn validate_send_channels(
                             if let Some(pool) = fields.iter().find(|field| field.name == "pool") {
                                 if !semantic.memory_pools.contains(&pool.source) {
                                     diagnostics.push(Diagnostic {
+                                        code: diagnostic_code!("type.unknown_memory_pool"),
+                                        severity: Severity::Error,
                                         related: Vec::new(),
                                         span: effect.span,
                                         message: format!(
                                             "`{keyword}` names unknown memory pool `{}`",
                                             pool.source
                                         ),
-                                        suggestion: Some(
-                                            "declare it with `memory pool <name> { … }`, or correct the pool name"
-                                                .to_owned(),
-                                        ),
+                                        suggestion: Some(suggest_otherwise(
+                                            &pool.source,
+                                            semantic.memory_pools.iter(),
+                                            "declare it with `memory pool <name> { … }`, or correct the pool name",
+                                        )),
                                     });
                                 }
                             }
@@ -8926,6 +9694,8 @@ fn validate_turn_access_grants(
         for grant in &effect.access_grants {
             if grant.operations.is_empty() {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.missing_requirement"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: effect.span,
                     message: format!(
@@ -8941,6 +9711,8 @@ fn validate_turn_access_grants(
             validate_credential_grant_classes(rule, effect.span, grant, diagnostics);
             if !seen.insert(grant.resource.clone()) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("capability.duplicate_grant"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: effect.span,
                     message: format!(
@@ -8995,6 +9767,8 @@ fn validate_credential_grant_classes(
             continue;
         }
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("capability.invalid_narrowing"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
@@ -9031,7 +9805,10 @@ fn validate_evidence_fact_not_matched(rule: &RuleDecl, diagnostics: &mut Vec<Dia
             continue;
         };
         if EVIDENCE_ONLY_TURN_FACTS.contains(&name.as_str()) {
-            diagnostics.push(Diagnostic { related: Vec::new(),
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unmatchable_fact"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span: when.span,
                 message: format!(
                     "rule `{}` matches evidence-only fact `{name}`: in-turn observations are evidence, not rule-matchable facts",
@@ -9051,6 +9828,34 @@ fn validate_evidence_fact_not_matched(rule: &RuleDecl, diagnostics: &mut Vec<Dia
 /// derivation sees ordinary text), and returns the pre-rendered region
 /// metadata (removed / lapsed variants, region effect scopes) to attach onto
 /// the lowered `IrRule`s.
+/// Per-output-line origins for a text assembled by copying byte runs of one
+/// input, each run given as `(output start, input start, length)`.
+///
+/// A line that sits entirely inside one run is a verbatim copy and maps to the
+/// input offset it came from; a line that straddles two runs is part of neither
+/// and maps to `None`. Region surgery is a byte splice rather than a line
+/// rewrite, so this is how it reports what it kept.
+fn line_map_from_copies(out_text: &str, copies: &[(usize, usize, usize)]) -> Vec<Option<usize>> {
+    let lines = body::raw_body_lines(out_text);
+    (0..lines.len())
+        .map(|index| {
+            // The RAW extent, terminator included: a line whose content is the
+            // file's but whose newline came from the next run is not one run's,
+            // and the map promises whole lines.
+            let start = lines[index].1;
+            let end = lines
+                .get(index + 1)
+                .map(|(_, next)| *next)
+                .unwrap_or(out_text.len());
+            copies
+                .iter()
+                .filter(|(_, _, len)| *len > 0)
+                .find(|(out_start, _, len)| start >= *out_start && end <= out_start + len)
+                .map(|(out_start, in_start, _)| in_start + (start - out_start))
+        })
+        .collect()
+}
+
 fn extract_rule_regions(
     items: &mut [Item],
     diagnostics: &mut Vec<Diagnostic>,
@@ -9060,7 +9865,7 @@ fn extract_rule_regions(
         let Item::Rule(rule) = item else {
             continue;
         };
-        let (ast, _) = body::parse_rule_body(&rule.body.text, rule.body.span.start);
+        let (ast, _) = body::parse_rule_body(&rule.body.text, rule.body.body_base());
         let mut regions = Vec::new();
         collect_region_blocks(&ast.statements, &[], &mut regions);
         if regions.is_empty() {
@@ -9068,6 +9873,8 @@ fn extract_rule_regions(
         }
         if regions.len() > 1 {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.cardinality_conflict"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: regions[1].0.span,
                 message: format!(
@@ -9085,6 +9892,8 @@ fn extract_rule_regions(
         let (region, region_case_arms) = regions[0].clone();
         if count_effect_statements(&region.body) == 0 {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: region.span,
                 message: format!(
@@ -9115,6 +9924,8 @@ fn extract_rule_regions(
         for root in &arm_roots {
             if region_bindings.contains(root) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.binding_out_of_scope"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: region.span,
                     message: format!(
@@ -9131,13 +9942,20 @@ fn extract_rule_regions(
                 });
             }
         }
-        // Variant surgery. All spans are absolute; rebase onto the body text.
-        let base = rule.body.span.start;
+        // Variant surgery. The region's three extents are already relative to
+        // the body text (they have to be: the text may be generated, and then
+        // no source offset exists to rebase from).
         let text = rule.body.text.clone();
-        let clamp = |offset: usize| offset.saturating_sub(base).min(text.len());
-        let (r_start, r_end) = (clamp(region.span.start), clamp(region.span.end));
-        let (b_start, b_end) = (clamp(region.body_span.start), clamp(region.body_span.end));
-        let (l_start, l_end) = (clamp(region.lapse_span.start), clamp(region.lapse_span.end));
+        let clamp = |offset: usize| offset.min(text.len());
+        let (r_start, r_end) = (clamp(region.text_range.start), clamp(region.text_range.end));
+        let (b_start, b_end) = (
+            clamp(region.body_text_range.start),
+            clamp(region.body_text_range.end),
+        );
+        let (l_start, l_end) = (
+            clamp(region.lapse_text_range.start),
+            clamp(region.lapse_text_range.end),
+        );
         if !(r_start <= b_start
             && b_start <= b_end
             && b_end <= l_start
@@ -9145,6 +9963,8 @@ fn extract_rule_regions(
             && l_end <= r_end)
         {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("lowering.internal"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: region.span,
                 message: format!(
@@ -9165,7 +9985,10 @@ fn extract_rule_regions(
         // ancestor is the scope the kernel keys its effect id under.
         let mut effect_bindings = BTreeSet::new();
         collect_effect_binding_names(&region.body, &mut effect_bindings);
-        let (holds_ast, _) = body::parse_rule_body(&variant_holds, 0);
+        // The holds variant is spliced text; only its structure is read here,
+        // and a `Generated` base keeps any span it does produce honest.
+        let (holds_ast, _) =
+            body::parse_rule_body(&variant_holds, body::BodyBase::Generated(rule.body.span));
         let mut region_effects = Vec::new();
         assign_region_effect_scopes(
             &holds_ast.statements,
@@ -9186,7 +10009,18 @@ fn extract_rule_regions(
                 arm_case_arms: region_case_arms,
             },
         );
-        rule.body.text = variant_holds;
+        // Region surgery is three verbatim byte runs spliced together: the text
+        // before the region, the region's own body, and the text after it. A
+        // line that sits entirely inside one run is still the file's bytes, and
+        // the map says so; a line that straddles a splice does not, and degrades
+        // (tracker D2d).
+        let copies = [
+            (0usize, 0usize, r_start),
+            (r_start, b_start, b_end - b_start),
+            (r_start + (b_end - b_start), r_end, text.len() - r_end),
+        ];
+        let origins = line_map_from_copies(&variant_holds, &copies);
+        rule.body.rewrite_mapped(variant_holds, origins);
     }
     pending
 }
@@ -9441,7 +10275,10 @@ fn validate_effectful_self_trigger(
         if metadata.fact_reads.contains(written_fact)
             && !metadata.fact_consumes.contains(written_fact)
         {
-            diagnostics.push(Diagnostic { related: Vec::new(),
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("effect.unconsumed_trigger"),
+                severity: Severity::Error,
+                related: Vec::new(),
                 span: rule.body.span,
                 message: format!(
                     "effectful rule `{}` preserves trigger fact `{written_fact}`",
@@ -9477,12 +10314,21 @@ fn validate_workflow_terminal_actions(
     // Statement boundaries, not line starts: a terminal written inside the block
     // that opens on its own line escaped every check below. See
     // `terminal_actions_in_line`.
-    for (line, action, start) in rule.body.text.lines().map(str::trim).flat_map(|line| {
-        terminal_actions_in_line(line)
-            .into_iter()
-            .map(move |(action, start)| (line, action, start))
-    }) {
+    for (line, head, action, start) in body_line_offsets(&rule.body.text)
+        .into_iter()
+        .map(|(line, at)| (line.trim(), at + (line.len() - line.trim_start().len())))
+        .flat_map(|(line, head)| {
+            terminal_actions_in_line(line)
+                .into_iter()
+                .map(move |(action, start)| (line, head, action, start))
+        })
+    {
         let rest = &line[start..];
+        // The terminal NAME, which is what every diagnostic in this loop is
+        // about — an unknown terminal, a payload shape that does not match the
+        // contract that name declares.
+        let name_at = head + start + (rest.len() - rest.trim_start().len());
+        let name_anchor = |name: &str| BodyAnchor::slice(&rule.body, name_at, name.len());
         let declared = if action == "complete" {
             &contracts.outputs
         } else {
@@ -9500,26 +10346,37 @@ fn validate_workflow_terminal_actions(
                 let value = rest.trim().get(name.len()..).unwrap_or("").trim();
                 if !declared.contains_key(name) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_terminal"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: name_anchor(name).whole(),
                         message: format!(
                             "rule `{}` {action}s unknown workflow terminal `{name}`",
                             rule.name.name
                         ),
-                        suggestion: Some(format!(
-                            "declare `{kind} {name} Type` on the workflow first",
-                            kind = if action == "complete" {
-                                "output"
-                            } else {
-                                "failure"
-                            }
+                        suggestion: Some(suggest_otherwise(
+                            name,
+                            declared.keys(),
+                            format!(
+                                "declare `{kind} {name} Type` on the workflow first",
+                                kind = if action == "complete" {
+                                    "output"
+                                } else {
+                                    "failure"
+                                }
+                            ),
                         )),
                     });
                     continue;
                 }
                 if let Some(contract_ty) = declared.get(name) {
+                    let value_at = name_at + rest.trim().len() - value.len();
                     validate_scalar_terminal_payload(
                         rule,
+                        AssignmentAnchor {
+                            field: name_anchor(name),
+                            value: BodyAnchor::slice(&rule.body, value_at, value.len()),
+                        },
                         action,
                         name,
                         value,
@@ -9548,8 +10405,10 @@ fn validate_workflow_terminal_actions(
             }
         }) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.malformed_statement"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: BodyAnchor::text(&rule.body, head, line).whole(),
                 message: format!("rule `{}` has malformed `{action}` action", rule.name.name),
                 suggestion: Some(format!(
                     "{action} a declared workflow terminal with a payload block"
@@ -9559,19 +10418,25 @@ fn validate_workflow_terminal_actions(
         };
         if !declared.contains_key(name) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_terminal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: name_anchor(name).whole(),
                 message: format!(
                     "rule `{}` {action}s unknown workflow terminal `{name}`",
                     rule.name.name
                 ),
-                suggestion: Some(format!(
-                    "declare `{kind} {name} Type` on the workflow first",
-                    kind = if action == "complete" {
-                        "output"
-                    } else {
-                        "failure"
-                    }
+                suggestion: Some(suggest_otherwise(
+                    name,
+                    declared.keys(),
+                    format!(
+                        "declare `{kind} {name} Type` on the workflow first",
+                        kind = if action == "complete" {
+                            "output"
+                        } else {
+                            "failure"
+                        }
+                    ),
                 )),
             });
             continue;
@@ -9581,6 +10446,7 @@ fn validate_workflow_terminal_actions(
         };
         validate_workflow_terminal_payload(
             rule,
+            name_anchor(name),
             action,
             name,
             contract_ty,
@@ -9595,6 +10461,7 @@ fn validate_workflow_terminal_actions(
 #[allow(clippy::too_many_arguments)]
 fn validate_workflow_terminal_payload(
     rule: &RuleDecl,
+    at: BodyAnchor,
     action: &str,
     terminal_name: &str,
     contract_ty: &TypeSyntax,
@@ -9603,13 +10470,17 @@ fn validate_workflow_terminal_payload(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let Some((_, _, body)) = workflow_terminal_blocks(&rule.body.text).into_iter().find(
+    let Some((_, _, block)) = workflow_terminal_blocks(&rule.body.text).into_iter().find(
         |(candidate_action, candidate_name, _)| {
             candidate_action == action && candidate_name == terminal_name
         },
     ) else {
         return;
     };
+    let Some(body) = rule.body.text.get(block.clone()) else {
+        return;
+    };
+    let block_anchor = BodyAnchor::text(&rule.body, block.start, body);
     let schema = match contract_ty {
         TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => &name.name,
         TypeSyntax::Primitive { .. }
@@ -9618,8 +10489,10 @@ fn validate_workflow_terminal_payload(
             // A scalar (primitive/literal/union) contract takes a bare value, not
             // a field block.
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "workflow terminal `{terminal_name}` has a scalar payload contract but is given a field block"
                 ),
@@ -9630,28 +10503,32 @@ fn validate_workflow_terminal_payload(
             return;
         }
         _ => {
-            diagnostics.push(Diagnostic { related: Vec::new(),
-                span: rule.body.span,
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unsupported_payload_contract"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: at.whole(),
                 message: format!(
                     "workflow terminal `{terminal_name}` uses an unsupported payload contract type"
                 ),
                 suggestion: Some(
-                    "declare the terminal payload as a class (field block) or a scalar type (number/string/bool)"
+                    "declare the terminal payload as a class (field block) or a scalar type (`string`, `int`, `float`, or `bool`)"
                         .to_owned(),
                 ),
             });
             return;
         }
     };
-    for assignment in collect_field_assignments(&body) {
-        let (field, value) = match assignment {
-            RecordFieldAssignment::Value { field, value } => (field, value),
-            RecordFieldAssignment::Shorthand { field } => (field.clone(), field),
+    for site in collect_field_assignments(body) {
+        let (field, value) = match &site.assignment {
+            RecordFieldAssignment::Value { field, value } => (field.clone(), value.clone()),
+            RecordFieldAssignment::Shorthand { field } => (field.clone(), field.clone()),
         };
         let line = format!("{field} {value}");
         validate_record_field(
             rule,
             &line,
+            assignment_anchor(block_anchor, &site),
             schema,
             semantic,
             binding_types,
@@ -9659,7 +10536,7 @@ fn validate_workflow_terminal_payload(
             diagnostics,
         );
     }
-    validate_required_terminal_fields(rule, schema, terminal_name, &body, semantic, diagnostics);
+    validate_required_terminal_fields(at, schema, terminal_name, body, semantic, diagnostics);
 }
 
 /// Validates a bare-scalar terminal payload (`complete result 0.9` /
@@ -9670,6 +10547,7 @@ fn validate_workflow_terminal_payload(
 #[allow(clippy::too_many_arguments)]
 fn validate_scalar_terminal_payload(
     rule: &RuleDecl,
+    site: AssignmentAnchor,
     action: &str,
     terminal_name: &str,
     value: &str,
@@ -9682,8 +10560,10 @@ fn validate_scalar_terminal_payload(
     if let TypeSyntax::Ref { name } = contract_ty {
         if semantic.schemas.class_exists(&name.name) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: site.field.whole(),
                 message: format!(
                     "workflow terminal `{terminal_name}` has a class payload contract `{}` but is given a bare scalar value",
                     name.name
@@ -9695,8 +10575,10 @@ fn validate_scalar_terminal_payload(
     }
     if value.is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.missing_payload_value"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: site.field.whole(),
             message: format!("workflow terminal `{terminal_name}` is missing its scalar value"),
             suggestion: Some(format!("write `{action} {terminal_name} <value>`")),
         });
@@ -9705,7 +10587,7 @@ fn validate_scalar_terminal_payload(
     // A literal value is typechecked against the scalar contract; a binding
     // expression has its roots (and any field path) validated.
     validate_literal_assignment(
-        rule,
+        site.value,
         terminal_name,
         "value",
         contract_ty,
@@ -9715,27 +10597,30 @@ fn validate_scalar_terminal_payload(
     );
     if let Some(root) = dangling_value_root(value, known_roots) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_binding"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: site.value.whole(),
             message: format!(
                 "rule `{}` has unknown binding `{root}` in `{action} {terminal_name}` value",
                 rule.name.name
             ),
-            suggestion: Some(
-                "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                    .to_owned(),
-            ),
+            suggestion: Some(suggest_binding_root(
+                &root,
+                known_roots,
+                BINDING_ROOT_FALLBACK,
+            )),
         });
-    } else if let Some((root, path)) = expression_path(value) {
+    } else if let Some(dotted) = expression_dotted_path(value) {
         // Local scopes only. A terminal payload line is also walked by the
         // scoped field-path pass in `analyze_rule`, which is where an
         // invoke-derived binding resolves; making this one scope-aware too would
         // report the same read twice.
         check_field_path(
             rule,
-            &root,
-            &path,
-            rule.body.span,
+            &dotted.root.clone(),
+            &dotted.path(),
+            FieldPathSpans::scanned(site.value, &dotted),
             SchemaScopes::local(&semantic.schemas),
             binding_types,
             diagnostics,
@@ -9744,7 +10629,7 @@ fn validate_scalar_terminal_payload(
 }
 
 fn validate_required_terminal_fields(
-    rule: &RuleDecl,
+    at: BodyAnchor,
     schema: &str,
     terminal_name: &str,
     body: &str,
@@ -9756,7 +10641,7 @@ fn validate_required_terminal_fields(
     };
     let seen = collect_field_assignments(body)
         .into_iter()
-        .map(|assignment| match assignment {
+        .map(|site| match site.assignment {
             RecordFieldAssignment::Value { field, .. }
             | RecordFieldAssignment::Shorthand { field } => field,
         })
@@ -9765,8 +10650,11 @@ fn validate_required_terminal_fields(
         if seen.contains(required) || matches!(ty, TypeSyntax::Optional { .. }) {
             continue;
         }
-        diagnostics.push(Diagnostic { related: Vec::new(),
-            span: rule.body.span,
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.missing_required_field"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: at.whole(),
             message: format!(
                 "workflow terminal `{terminal_name}` is missing required field `{schema}.{required}`"
             ),
@@ -9828,6 +10716,8 @@ fn analyze_rule(
             && !pattern_text.ends_with(" is available")
         {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.unsupported_when_pattern"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: when.span,
                 message: format!(
@@ -9843,13 +10733,14 @@ fn analyze_rule(
         if let Some((binding, schema)) = binding_from_when(&when.text) {
             validate_binding_name(rule, &binding, when.span, diagnostics);
             if !schema.contains('.') && !semantic.schemas.class_exists(&schema) {
-                let suggestion = match closest_name(&schema, semantic.schemas.classes.keys()) {
-                    Some(candidate) => {
-                        format!("did you mean `{candidate}`? otherwise declare `class {schema}`")
-                    }
-                    None => format!("declare `class {schema}` before matching it"),
-                };
+                let suggestion = suggest_otherwise(
+                    &schema,
+                    semantic.schemas.classes.keys(),
+                    format!("declare `class {schema}` before matching it"),
+                );
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_schema"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: when.span,
                     message: format!("rule `{}` matches unknown class `{schema}`", rule.name.name),
@@ -9863,14 +10754,21 @@ fn analyze_rule(
                 && !pattern_text.trim_start().starts_with("fact ")
                 && !semantic.schemas.events.contains(&schema)
             {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_signal"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: when.span,
                     message: format!(
                         "rule `{}` reacts to undeclared signal `{schema}`",
                         rule.name.name
                     ),
-                    suggestion: Some(format!(
-                        "declare `signal {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
+                    suggestion: Some(suggest_otherwise(
+                        &schema,
+                        semantic.schemas.events.iter(),
+                        format!(
+                            "declare `signal {schema} {{ ... }}` for a typed reaction, or use `when fact {schema} as ...` for an untyped one"
+                        ),
                     )),
                 });
             }
@@ -9947,7 +10845,7 @@ fn analyze_rule(
             Some((binding?, kind))
         })
         .collect();
-    for statement in effect_payload_statements(&rule.body.text) {
+    for (statement, _) in effect_payload_statements(&rule.body.text) {
         if let Some((kind, Some(binding))) = parse_effect_line(statement.trim()) {
             effect_binding_kinds.insert(binding, kind);
         }
@@ -9955,8 +10853,14 @@ fn analyze_rule(
     // `after <binding> <predicate> as <alias>`: the alias carries the
     // effect's completed payload type, so case dispatch and field access
     // through it type-check.
-    for line in rule.body.text.lines() {
-        let Some(rest) = line.trim().strip_prefix("after ") else {
+    for (raw, offset) in body_line_offsets(&rule.body.text) {
+        let line = raw.trim();
+        let at = BodyAnchor::text(
+            &rule.body,
+            offset + (raw.len() - raw.trim_start().len()),
+            line,
+        );
+        let Some(rest) = line.strip_prefix("after ") else {
             continue;
         };
         let mut words = rest.split_whitespace();
@@ -9986,8 +10890,10 @@ fn analyze_rule(
                 };
                 let negative_arm = negative.to_lowercase();
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!(
                         "rule `{}` observes {verb} `{binding}` with `succeeds`, which also \
                          matches a {negative} outcome (the op completes either way)",
@@ -10005,8 +10911,10 @@ fn analyze_rule(
             match effect_binding_kinds.get(binding) {
                 Some(IrEffectKind::LeaseAcquire) => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: at.whole(),
                         message: format!(
                             "rule `{}` observes acquire `{binding}` with `succeeds`, which also \
                              matches a Contended outcome (the acquire op completes either way)",
@@ -10021,8 +10929,10 @@ fn analyze_rule(
                 }
                 Some(IrEffectKind::CounterConsume) => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("effect.ambiguous_outcome_predicate"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: at.whole(),
                         message: format!(
                             "rule `{}` observes counter consume `{binding}` with `succeeds`, \
                              which also matches an Over outcome (the consume op completes \
@@ -10143,32 +11053,70 @@ fn analyze_rule(
     }
     for when in &rule.whens {
         if let (_, Some(guard)) = split_when_guard(&when.text) {
-            validate_expression(rule, guard, semantic, &binding_types, "guard", diagnostics);
-            validate_known_field_paths(rule, guard, semantic, &binding_types, diagnostics);
+            validate_expression(
+                rule,
+                guard,
+                when.span,
+                semantic,
+                &binding_types,
+                "guard",
+                diagnostics,
+            );
+            // The guard is part of the `when` clause, not of the body, so the
+            // clause is the closest span this scan can honestly name.
+            validate_known_field_paths(
+                rule,
+                guard,
+                BodyAnchor::fixed(when.span),
+                semantic,
+                &binding_types,
+                diagnostics,
+            );
             if let Some(expr) = lower_expression(guard, when.span) {
                 metadata
                     .projection_reads
                     .extend(collect_projection_reads(&expr.expr));
             }
         }
-        validate_availability_when(rule, &when.text, semantic, &binding_types, diagnostics);
+        validate_availability_when(
+            rule,
+            &when.text,
+            when.span,
+            semantic,
+            &binding_types,
+            diagnostics,
+        );
     }
-    validate_case_blocks(rule, semantic, &binding_types, diagnostics);
-    metadata.case_branches =
-        collect_rule_case_metadata(rule, semantic, &binding_types, diagnostics);
-    let terminal_metadata = collect_terminal_case_metadata(
-        rule,
-        semantic,
-        &binding_types,
-        &effect_payload_types,
-        diagnostics,
-    );
+    // The passes below overlap on purpose; see `RuleBodyPasses` for what that
+    // costs the reader and why deduplicating per pass is not the same thing as
+    // deduplicating the finished list.
+    let mut passes = RuleBodyPasses::default();
+    passes.run(diagnostics, |diagnostics| {
+        validate_case_blocks(rule, semantic, &binding_types, diagnostics)
+    });
+    let mut case_branches = Vec::new();
+    passes.run(diagnostics, |diagnostics| {
+        case_branches = collect_rule_case_metadata(rule, semantic, &binding_types, diagnostics);
+    });
+    metadata.case_branches = case_branches;
+    let mut terminal_metadata = TerminalMetadata::default();
+    passes.run(diagnostics, |diagnostics| {
+        terminal_metadata = collect_terminal_case_metadata(
+            rule,
+            semantic,
+            &binding_types,
+            &effect_payload_types,
+            diagnostics,
+        );
+    });
     // Complete value-position root set: typed bindings plus every binding NAME
     // the body introduces (AST-collected, so multi-line-prompt `tell`/`exec`
     // results and `case` payloads are covered, which `binding_types` omits).
     let mut known_roots: BTreeSet<String> = binding_types.keys().cloned().collect();
     collect_all_binding_names(&body_ast.statements, &mut known_roots);
-    validate_record_blocks(rule, semantic, &binding_types, &known_roots, diagnostics);
+    passes.run(diagnostics, |diagnostics| {
+        validate_record_blocks(rule, semantic, &binding_types, &known_roots, diagnostics)
+    });
     validate_effect_payloads(rule, semantic, &binding_types, &known_roots, diagnostics);
     validate_effect_field_roots(rule, &body_ast.statements, &known_roots, diagnostics);
     validate_emit_signal_declarations(
@@ -10283,11 +11231,25 @@ fn analyze_rule(
     let mut anonymous_effects = 0usize;
     let mut record_depth = 0i32;
 
-    for raw_line in rule.body.text.lines() {
+    // The last pass over the body text, and the one that overlaps every other:
+    // it scans each statement line, so a `record` block, a `case` arm's body and
+    // a `case` guard are all walked here a second time.
+    let line_scan = diagnostics.len();
+
+    // Offsets, not just text: every diagnostic this loop raises is about a
+    // statement, and without knowing where the line starts the only span it
+    // could name was the whole rule body — the `=> {` arrow, for every one of
+    // them.
+    for (raw_line, raw_offset) in body_line_offsets(&rule.body.text) {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
+        let statement = BodyAnchor::text(
+            &rule.body,
+            raw_offset + (raw_line.len() - raw_line.trim_start().len()),
+            line,
+        );
 
         if record_depth > 0 {
             record_depth += brace_delta(line);
@@ -10296,8 +11258,11 @@ fn analyze_rule(
 
         if let Some(binding) = binding_after_multiline_string_end(line) {
             misplaced_effect_bindings.insert(binding.clone());
-            diagnostics.push(Diagnostic { related: Vec::new(),
-                span: rule.body.span,
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.misplaced_binding"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: statement.whole(),
                 message: format!(
                     "rule `{}` places effect binding `{binding}` after a multiline string delimiter",
                     rule.name.name
@@ -10308,7 +11273,7 @@ fn analyze_rule(
             });
             continue;
         }
-        validate_rule_prompt_content_type_annotation(rule, line, diagnostics);
+        validate_rule_prompt_content_type_annotation(rule, line, statement, diagnostics);
 
         if line.starts_with('}') {
             block_stack.pop();
@@ -10320,6 +11285,7 @@ fn analyze_rule(
             validate_known_field_paths_scoped(
                 rule,
                 line,
+                statement,
                 semantic,
                 &binding_types,
                 &foreign_schemas,
@@ -10329,10 +11295,18 @@ fn analyze_rule(
         }
 
         let active_afters = after_scopes(&block_stack);
-        validate_binding_uses(rule, line, &seen_bindings, &active_afters, diagnostics);
+        validate_binding_uses(
+            rule,
+            line,
+            statement,
+            &seen_bindings,
+            &active_afters,
+            diagnostics,
+        );
         validate_known_field_paths_scoped(
             rule,
             line,
+            statement,
             semantic,
             &binding_types,
             &foreign_schemas,
@@ -10345,16 +11319,19 @@ fn analyze_rule(
                 // unknown-binding diagnostic only.
                 Some(_) => {}
                 None => diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_binding"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: statement.whole(),
                     message: format!(
                         "rule `{}` consumes unknown fact binding `{binding}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
-                        "consume a binding introduced by a `when Class as binding` clause"
-                            .to_owned(),
-                    ),
+                    suggestion: Some(suggest_otherwise(
+                        &binding,
+                        binding_types.keys(),
+                        "consume a binding introduced by a `when Class as binding` clause",
+                    )),
                 }),
             }
             if !line.contains("->") {
@@ -10364,30 +11341,27 @@ fn analyze_rule(
 
         if line.starts_with("after ") {
             if let Some(alias) = binding_after_as(line) {
-                validate_binding_name(rule, &alias, rule.body.span, diagnostics);
+                validate_binding_name(rule, &alias, statement.whole(), diagnostics);
             }
-            match parse_after_line(line) {
-                // The unknown-binding half is `validate_after_bindings`, over the
-                // parsed body: this scanner cannot see an effect that shares a
-                // line with the block enclosing it, and reported a binding
-                // unknown that was defined one line above. The predicate half
-                // stays here — an unsupported predicate does not reach the AST.
-                Some((binding, predicate)) => {
-                    block_stack.push(BlockFrame::After { binding, predicate });
-                }
-                None => {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span: rule.body.span,
-                        message: format!(
-                            "rule `{}` has unsupported `after` dependency predicate",
-                            rule.name.name
-                        ),
-                        suggestion: Some(
-                            "use `after name succeeds`, `after name fails`, `after name completes`, `after name times out`, or `after name cancelled`"
-                                .to_owned(),
-                        ),
-                    });
-                }
+            // The unknown-binding half is `validate_after_bindings`, over the
+            // parsed body: this scanner cannot see an effect that shares a line
+            // with the block enclosing it, and reported a binding unknown that
+            // was defined one line above.
+            //
+            // The predicate half USED to be reported here too, on the theory
+            // that an unsupported predicate does not reach the AST. It does not
+            // need to: the body parser has already refused the same line, with a
+            // better message (it names the predicate and lists the legal ones),
+            // and it refused it under `effect.unsupported_predicate` as well —
+            // so the two producers put two diagnostics on one span for one
+            // mistake, and a downstream test pinning either pinned half the
+            // truth. This re-parse is also coarser than the parser it shadows:
+            // it splits the line at the first `{`, so a milestone name
+            // containing a brace made it report a predicate fault on a line the
+            // parser accepts. The scanner keeps only the job the parser cannot
+            // do for it, tracking the block stack.
+            if let Some((binding, predicate)) = parse_after_line(line) {
+                block_stack.push(BlockFrame::After { binding, predicate });
             }
             continue;
         }
@@ -10405,6 +11379,7 @@ fn analyze_rule(
             validate_agent_tell_target(
                 rule,
                 line,
+                statement,
                 &kind,
                 semantic,
                 &binding_types,
@@ -10416,7 +11391,7 @@ fn analyze_rule(
                 .clone()
                 .unwrap_or_else(|| format!("effect{anonymous_effects}"));
             if let Some(binding) = &binding {
-                validate_binding_name(rule, binding, rule.body.span, diagnostics);
+                validate_binding_name(rule, binding, statement.whole(), diagnostics);
                 seen_bindings.insert(binding.clone());
                 if let Some(schema) = effect_binding_schema(line, &kind, semantic) {
                     binding_types.insert(binding.clone(), schema);
@@ -10459,6 +11434,7 @@ fn analyze_rule(
             });
         }
     }
+    passes.merge(diagnostics, line_scan);
 
     // One resolution of the rule's item/lease bindings, shared by the effect
     // walk and the payload-reads walk so the two cannot disagree about which
@@ -11502,7 +12478,12 @@ struct TerminalBranchSource {
     scrutinee: String,
     pattern: String,
     guard: Option<String>,
+    /// Byte range of the guard within the rule body text, when it has one.
+    guard_at: Option<Range<usize>>,
     body: String,
+    /// Byte range of `body` within the rule body text, when it was sliced out
+    /// of source rather than left empty.
+    body_at: Option<Range<usize>>,
     pattern_span: SourceSpan,
 }
 
@@ -11512,7 +12493,12 @@ struct RuleCaseBranchSource {
     scrutinee_type: TypeSyntax,
     pattern: String,
     guard: Option<String>,
+    /// Byte range of the guard within the rule body text, when it has one.
+    guard_at: Option<Range<usize>>,
     body: String,
+    /// Byte range of `body` within the rule body text, when it was sliced out
+    /// of source rather than left empty.
+    body_at: Option<Range<usize>>,
     pattern_span: SourceSpan,
 }
 
@@ -11535,7 +12521,7 @@ fn collect_effect_payload_types(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeMap<String, IrType> {
     let mut payloads = BTreeMap::new();
-    for statement in effect_payload_statements(&rule.body.text) {
+    for (statement, at) in effect_payload_statements(&rule.body.text) {
         let line = statement.trim();
         let Some((kind, Some(binding))) = parse_effect_line(line) else {
             continue;
@@ -11548,8 +12534,10 @@ fn collect_effect_payload_types(
         match payloads.get(&binding) {
             Some(existing) if existing != &payload => {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("effect.binding_type_conflict"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: rule.body.span_of(at.clone()),
                     message: format!(
                         "rule `{}` reuses effect binding `{binding}` for effects with conflicting result types",
                         rule.name.name
@@ -11631,28 +12619,42 @@ fn collect_rule_case_metadata(
         {
             branch_scope.insert(binding, schema);
         }
+        // The guard is a slice of the branch line, so a finding inside it can
+        // name the guard. Three walkers validate the same guard (this one,
+        // `validate_case_blocks`, and the line-wise scan); anchoring them all
+        // here is what lets the duplicate collapse see one finding rather than
+        // the same finding at three different carets.
+        let guard_anchor = branch_anchor(rule, branch.guard_at.clone(), branch.pattern_span);
         if let Some(guard) = &branch.guard {
             validate_expression(
                 rule,
                 guard,
+                guard_anchor.whole(),
                 semantic,
                 &branch_scope,
                 "case guard",
                 diagnostics,
             );
-            validate_known_field_paths_at_span(
+            validate_known_field_paths(
                 rule,
                 guard,
-                branch.pattern_span,
+                guard_anchor,
                 semantic,
                 &branch_scope,
                 diagnostics,
             );
         }
-        validate_known_field_paths_at_span(
+        // The arm BODY is anchored at the body and not at the arm's pattern.
+        // The line-wise scan in `analyze_rule` walks the same lines, so a bad
+        // field path inside an arm was reported twice — once under the field,
+        // once under the pattern — and two passes disagreeing about WHERE is
+        // worse than one finding: no collapse can tell it is one mistake, and
+        // the reader is shown two. Anchored here, the two copies land on the
+        // same token and converge.
+        validate_known_field_paths(
             rule,
             &branch.body,
-            branch.pattern_span,
+            branch_anchor(rule, branch.body_at.clone(), branch.pattern_span),
             semantic,
             &branch_scope,
             diagnostics,
@@ -11689,16 +12691,7 @@ fn rule_case_branch_sources(
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
 ) -> Vec<RuleCaseBranchSource> {
-    let lines = rule
-        .body
-        .text
-        .lines()
-        .scan(0usize, |offset, line| {
-            let current = *offset;
-            *offset += line.len() + 1;
-            Some((line, current))
-        })
-        .collect::<Vec<_>>();
+    let lines = body_line_offsets(&rule.body.text);
     let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut branches = Vec::new();
     let mut index = 0usize;
@@ -11725,31 +12718,51 @@ fn rule_case_branch_sources(
             if depth == 1 {
                 if let Some((pattern, guard, body_start)) = terminal_branch_header(branch_trimmed) {
                     let pattern_column = case_pattern_column(branch_line, pattern);
-                    let pattern_span = SourceSpan {
-                        start: rule_body_text_start(rule) + branch_line_offset + pattern_column,
-                        end: rule_body_text_start(rule)
-                            + branch_line_offset
-                            + pattern_column
-                            + pattern.len(),
-                    };
-                    let mut body_lines = Vec::new();
+                    let pattern_start = branch_line_offset + pattern_column;
+                    let pattern_span = rule
+                        .body
+                        .span_of(pattern_start..pattern_start + pattern.len());
+                    let guard_at = guard.and_then(|guard| {
+                        let start = branch_line_offset + slice_offset(branch_line, guard)?;
+                        Some(start..start + guard.len())
+                    });
+                    let guard = guard.map(str::to_owned);
+                    // The arm's body lines are a CONTIGUOUS run — the only
+                    // line this loop drops is the one that closes the arm,
+                    // which is necessarily the last — so the body is a byte
+                    // range into the rule body text rather than a copy, and a
+                    // finding inside it keeps a source position. Joining the
+                    // same lines with "\n" reproduces exactly these bytes
+                    // (`body::raw_body_lines` drops only the `\n`), so the
+                    // text handed to the checkers is unchanged.
+                    let mut body_at: Option<Range<usize>> = None;
                     let mut branch_depth = brace_delta(body_start).max(1);
                     index += 1;
                     while index < lines.len() && branch_depth > 0 {
-                        let body_line = lines[index].0;
+                        let (body_line, body_line_offset) = lines[index];
                         let next_depth = branch_depth + brace_delta(body_line);
                         if next_depth >= 1 {
-                            body_lines.push(body_line.to_owned());
+                            let start = body_at
+                                .as_ref()
+                                .map_or(body_line_offset, |range: &Range<usize>| range.start);
+                            body_at = Some(start..body_line_offset + body_line.len());
                         }
                         branch_depth = next_depth;
                         index += 1;
                     }
+                    let body = body_at
+                        .clone()
+                        .and_then(|range| rule.body.text.get(range))
+                        .unwrap_or_default()
+                        .to_owned();
                     branches.push(RuleCaseBranchSource {
                         scrutinee: scrutinee.to_owned(),
                         scrutinee_type: scrutinee_type.clone(),
                         pattern: pattern.to_owned(),
                         guard,
-                        body: body_lines.join("\n"),
+                        guard_at,
+                        body,
+                        body_at,
                         pattern_span,
                     });
                     continue;
@@ -11843,18 +12856,37 @@ fn collect_terminal_case_metadata(
                     )),
             }
         }
+        let guard_anchor = branch_anchor(rule, branch.guard_at.clone(), branch.pattern_span);
         if let Some(guard) = &branch.guard {
             validate_expression(
                 rule,
                 guard,
+                guard_anchor.whole(),
                 semantic,
                 &branch_scope,
                 "case guard",
                 diagnostics,
             );
-            validate_known_field_paths(rule, guard, semantic, &branch_scope, diagnostics);
+            validate_known_field_paths(
+                rule,
+                guard,
+                guard_anchor,
+                semantic,
+                &branch_scope,
+                diagnostics,
+            );
         }
-        validate_known_field_paths(rule, &branch.body, semantic, &branch_scope, diagnostics);
+        // Anchored at the body, for the reason `collect_rule_case_metadata`
+        // gives: the line-wise scan reports the same finding, and it has to
+        // land on the same token to be recognised as the same finding.
+        validate_known_field_paths(
+            rule,
+            &branch.body,
+            branch_anchor(rule, branch.body_at.clone(), branch.pattern_span),
+            semantic,
+            &branch_scope,
+            diagnostics,
+        );
         metadata.branches.push(IrTerminalCaseBranch {
             scrutinee: branch.scrutinee,
             tag,
@@ -11906,7 +12938,8 @@ fn envelope_fields_read_on_payload(
 ) -> Vec<IrEnvelopeFieldOnPayload> {
     let mut fields = BTreeSet::new();
     for text in std::iter::once(body).chain(guard) {
-        for (root, path) in dotted_paths(text) {
+        for dotted in dotted_paths(text) {
+            let (root, path) = dotted.into_pair();
             if root != binding {
                 continue;
             }
@@ -11932,16 +12965,7 @@ fn envelope_fields_read_on_payload(
 }
 
 fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
-    let lines = rule
-        .body
-        .text
-        .lines()
-        .scan(0usize, |offset, line| {
-            let current = *offset;
-            *offset += line.len() + 1;
-            Some((line, current))
-        })
-        .collect::<Vec<_>>();
+    let lines = body_line_offsets(&rule.body.text);
     let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut branches = Vec::new();
     let mut index = 0usize;
@@ -11964,30 +12988,50 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
             if depth == 1 {
                 if let Some((pattern, guard, body_start)) = terminal_branch_header(branch_trimmed) {
                     let pattern_column = case_pattern_column(branch_line, pattern);
-                    let pattern_span = SourceSpan {
-                        start: rule_body_text_start(rule) + branch_line_offset + pattern_column,
-                        end: rule_body_text_start(rule)
-                            + branch_line_offset
-                            + pattern_column
-                            + pattern.len(),
-                    };
-                    let mut body_lines = Vec::new();
+                    let pattern_start = branch_line_offset + pattern_column;
+                    let pattern_span = rule
+                        .body
+                        .span_of(pattern_start..pattern_start + pattern.len());
+                    let guard_at = guard.and_then(|guard| {
+                        let start = branch_line_offset + slice_offset(branch_line, guard)?;
+                        Some(start..start + guard.len())
+                    });
+                    let guard = guard.map(str::to_owned);
+                    // The arm's body lines are a CONTIGUOUS run — the only
+                    // line this loop drops is the one that closes the arm,
+                    // which is necessarily the last — so the body is a byte
+                    // range into the rule body text rather than a copy, and a
+                    // finding inside it keeps a source position. Joining the
+                    // same lines with "\n" reproduces exactly these bytes
+                    // (`body::raw_body_lines` drops only the `\n`), so the
+                    // text handed to the checkers is unchanged.
+                    let mut body_at: Option<Range<usize>> = None;
                     let mut branch_depth = brace_delta(body_start).max(1);
                     index += 1;
                     while index < lines.len() && branch_depth > 0 {
-                        let body_line = lines[index].0;
+                        let (body_line, body_line_offset) = lines[index];
                         let next_depth = branch_depth + brace_delta(body_line);
                         if next_depth >= 1 {
-                            body_lines.push(body_line.to_owned());
+                            let start = body_at
+                                .as_ref()
+                                .map_or(body_line_offset, |range: &Range<usize>| range.start);
+                            body_at = Some(start..body_line_offset + body_line.len());
                         }
                         branch_depth = next_depth;
                         index += 1;
                     }
+                    let body = body_at
+                        .clone()
+                        .and_then(|range| rule.body.text.get(range))
+                        .unwrap_or_default()
+                        .to_owned();
                     branches.push(TerminalBranchSource {
                         scrutinee: scrutinee.to_owned(),
                         pattern: pattern.to_owned(),
                         guard,
-                        body: body_lines.join("\n"),
+                        guard_at,
+                        body,
+                        body_at,
                         pattern_span,
                     });
                     continue;
@@ -12001,19 +13045,60 @@ fn terminal_case_branch_sources(rule: &RuleDecl) -> Vec<TerminalBranchSource> {
     branches
 }
 
-fn rule_body_text_start(rule: &RuleDecl) -> usize {
-    rule.body.span.end.saturating_sub(2 + rule.body.text.len())
+/// The anchor for one piece of a `case` branch — its guard, its body — given
+/// where that piece sits in the rule body text.
+///
+/// Degrades to the branch pattern when the position could not be recovered (a
+/// branch inside a rewritten body), which is the nearest span that is still
+/// true of the finding.
+fn branch_anchor(
+    rule: &RuleDecl,
+    at: Option<Range<usize>>,
+    pattern_span: SourceSpan,
+) -> BodyAnchor<'_> {
+    match at {
+        Some(range) => BodyAnchor::slice(&rule.body, range.start, range.len()),
+        None => BodyAnchor::fixed(pattern_span),
+    }
 }
 
-fn terminal_branch_header(line: &str) -> Option<(&str, Option<String>, &str)> {
+/// The byte offset of `part` within `whole`, when `part` IS a subslice of it.
+///
+/// Splitting and trimming a `&str` throws its position away, and the scanners
+/// here do both before they know a diagnostic is coming. The pointers still
+/// carry it, so nothing has to be re-found by searching for the text — which
+/// would land on the wrong copy the moment a line repeats a token.
+fn slice_offset(whole: &str, part: &str) -> Option<usize> {
+    let base = whole.as_ptr() as usize;
+    let start = part.as_ptr() as usize;
+    (start >= base && start + part.len() <= base + whole.len()).then(|| start - base)
+}
+
+/// Every line of a body text, paired with its byte offset within that text.
+///
+/// The line content matches `str::lines` exactly (no terminator, `\r\n`
+/// handled), but the offsets are counted from the raw text rather than assumed
+/// to be one byte per break, so a CRLF file does not drift a byte per line.
+/// This is the read-only view; the rewriters use [`body::raw_body_lines`],
+/// which keeps the `\r` because their output has to reproduce the file.
+fn body_line_offsets(text: &str) -> Vec<(&str, usize)> {
+    body::raw_body_lines(text)
+        .into_iter()
+        .map(|(line, start)| (line.strip_suffix('\r').unwrap_or(line), start))
+        .collect()
+}
+
+fn terminal_branch_header(line: &str) -> Option<(&str, Option<&str>, &str)> {
     let (head, body_start) = line.split_once("=>")?;
     let body_start = body_start.trim();
     if !body_start.starts_with('{') {
         return None;
     }
     let head = head.trim();
+    // The guard stays a SUBSLICE of `line` so the caller can recover where it
+    // was written (see `slice_offset`); owning it here would lose that.
     let (pattern, guard) = match head.split_once(" where ") {
-        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim().to_owned())),
+        Some((pattern, guard)) => (pattern.trim(), Some(guard.trim())),
         None => (head, None),
     };
     Some((pattern, guard, body_start))
@@ -12284,14 +13369,18 @@ fn validate_mint_credential(
     };
     if !declared_credentials.contains(parent.as_str()) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_credential"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: effect.span,
             message: format!(
                 "rule `{}` mints from undeclared credential `{parent}`",
                 rule.name.name
             ),
-            suggestion: Some(format!(
-                "declare it: `credential {parent} {{ kind bearer }}`"
+            suggestion: Some(suggest_otherwise(
+                parent,
+                declared_credentials.iter().copied(),
+                format!("declare it: `credential {parent} {{ kind bearer }}`"),
             )),
         });
     }
@@ -12307,6 +13396,8 @@ fn validate_mint_credential(
     // parent's authority at all.
     if presented.is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("security.mint_parent_not_presented"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: effect.span,
             message: format!(
@@ -12325,6 +13416,8 @@ fn validate_mint_credential(
     for handle in presented {
         if handle != parent {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.mint_parent_not_presented"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: effect.span,
                 message: format!(
@@ -12372,6 +13465,8 @@ fn validate_credential_allow(
                         continue;
                     }
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("capability.not_granted"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span,
                         message: format!(
@@ -12506,15 +13601,21 @@ fn validate_obtain_credential(
         return;
     }
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("type.unknown_credential"),
+        severity: Severity::Error,
         related: Vec::new(),
         span: effect.span,
         message: format!(
             "rule `{}` escalates for undeclared credential `{credential}`",
             rule.name.name
         ),
-        suggestion: Some(format!(
-            "declare it with `credential {credential} {{ kind bearer }}`; governance supplies \
-             the address"
+        suggestion: Some(suggest_otherwise(
+            credential,
+            declared_credentials.iter().copied(),
+            format!(
+                "declare it with `credential {credential} {{ kind bearer }}`; governance supplies \
+                 the address"
+            ),
         )),
     });
 }
@@ -12576,6 +13677,8 @@ fn validate_no_raw_authorization_header(
             continue;
         }
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("security.raw_authorization_header"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: header.span,
             message: format!(
@@ -12606,14 +13709,18 @@ fn validate_http_request(
     for handle in request.credential_handles() {
         if !declared_credentials.contains(handle) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_credential"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: effect.span,
                 message: format!(
                     "rule `{}` presents undeclared credential `{handle}` in a `request`",
                     rule.name.name
                 ),
-                suggestion: Some(format!(
-                    "declare it with `credential {handle} {{ kind bearer }}`"
+                suggestion: Some(suggest_otherwise(
+                    handle,
+                    declared_credentials.iter().copied(),
+                    format!("declare it with `credential {handle} {{ kind bearer }}`"),
                 )),
             });
         }
@@ -12627,6 +13734,8 @@ fn validate_http_request(
         let mut names: Vec<&str> = distinct.into_iter().collect();
         names.sort_unstable();
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("security.multiple_credentials_presented"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: effect.span,
             message: format!(
@@ -12648,6 +13757,8 @@ fn validate_http_request(
     // time is cheaper than discovering it against a live endpoint.
     if request.slot_count() == 0 && request.signed_with.is_none() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("security.unauthenticated_request"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: effect.span,
             message: format!(
@@ -12968,15 +14079,26 @@ fn validate_after_bindings(
                 if !defined.contains(&after.binding) {
                     let binding = &after.binding;
                     let suggestion = if misplaced.contains(binding) {
+                        // The binding EXISTS; it was written in a place the
+                        // scanner could not attach it. Naming a near neighbour
+                        // here would send the reader to rename a correct binding.
                         format!(
                             "move `as {binding}` onto the effect line before the multiline string"
                         )
                     } else {
-                        format!("create an effect with `as {binding}` before the `after` block")
+                        suggest_otherwise(
+                            binding,
+                            defined.iter(),
+                            format!(
+                                "create an effect with `as {binding}` before the `after` block"
+                            ),
+                        )
                     };
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("effect.unsatisfiable_dependency"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: after.span,
                         message: format!(
                             "rule `{}` has `after` block for unknown effect binding `{binding}`",
                             rule.name.name
@@ -13336,6 +14458,7 @@ fn effect_idempotency_key(
 fn validate_coerce_call(
     rule: &RuleDecl,
     line: &str,
+    at: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     known_roots: &BTreeSet<String>,
@@ -13343,8 +14466,10 @@ fn validate_coerce_call(
 ) {
     let Some((function_name, args)) = parse_coerce_call(line) else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.malformed_statement"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("rule `{}` has malformed coerce call", rule.name.name),
             suggestion: Some("write `coerce functionName(arg, ...) as name`".to_owned()),
         });
@@ -13352,22 +14477,30 @@ fn validate_coerce_call(
     };
     let Some(params) = semantic.coerce_params.get(function_name) else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_coerce"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!(
                 "rule `{}` calls unknown coerce function `{function_name}`",
                 rule.name.name
             ),
-            suggestion: Some(format!(
-                "declare `coerce {function_name}(...) -> Output {{ ... }}` before using it"
+            suggestion: Some(suggest_otherwise(
+                function_name,
+                semantic.coerce_params.keys(),
+                format!(
+                    "declare `coerce {function_name}(...) -> Output {{ ... }}` before using it"
+                ),
             )),
         });
         return;
     };
     if args.len() != params.len() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.arity_mismatch"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!(
                 "rule `{}` calls coerce `{function_name}` with {} argument(s), expected {}",
                 rule.name.name,
@@ -13384,22 +14517,28 @@ fn validate_coerce_call(
         // whose root is not a known binding is a typo/unbound reference, which the
         // type-checker below accepts leniently.
         if let Some(root) = dangling_value_root(arg, known_roots) {
-            diagnostics.push(Diagnostic { related: Vec::new(),
-                span: rule.body.span,
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_binding"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: at.whole(),
                 message: format!(
                     "rule `{}` has unknown binding `{root}` in coerce `{function_name}` argument",
                     rule.name.name
                 ),
-                suggestion: Some(
-                    "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                        .to_owned(),
-                ),
+                suggestion: Some(suggest_binding_root(
+                    &root,
+                    known_roots,
+                    BINDING_ROOT_FALLBACK,
+                )),
             });
         }
         validate_expr_source_against_type(
             rule,
+            at,
             &format!("coerce `{function_name}`"),
             &param.name.name,
+            TypeAnchor::Field(&param.name.name),
             &param.ty,
             arg,
             semantic,
@@ -13416,12 +14555,13 @@ fn validate_effect_payloads(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for statement in effect_payload_statements(&rule.body.text) {
+    for (statement, at) in effect_payload_statements(&rule.body.text) {
         let trimmed = statement.trim();
         if trimmed.starts_with("coerce ") {
             validate_coerce_call(
                 rule,
                 trimmed,
+                BodyAnchor::slice(&rule.body, at.start, at.len()),
                 semantic,
                 binding_types,
                 known_roots,
@@ -13438,11 +14578,14 @@ fn validate_workflow_invocations(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for statement in workflow_invoke_statements(&rule.body.text) {
+    for (statement, head) in workflow_invoke_statements(&rule.body.text) {
+        let at = BodyAnchor::slice(&rule.body, head.start, head.len());
         let Some((target, body)) = invoke_statement_parts(&statement) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.malformed_statement"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` has malformed workflow invocation",
                     rule.name.name
@@ -13453,8 +14596,10 @@ fn validate_workflow_invocations(
         };
         if semantic.workflow.as_deref() == Some(target) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.unbounded_workflow_invocation_recursion"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` recursively invokes workflow `{target}`",
                     rule.name.name
@@ -13468,13 +14613,19 @@ fn validate_workflow_invocations(
         }
         let Some(surface) = semantic.workflow_inputs.get(target) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_workflow"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` invokes unknown workflow `{target}`",
                     rule.name.name
                 ),
-                suggestion: Some("invoke a workflow declared in this source bundle".to_owned()),
+                suggestion: Some(suggest_otherwise(
+                    target,
+                    semantic.workflow_inputs.keys(),
+                    "invoke a workflow declared in this source bundle",
+                )),
             });
             continue;
         };
@@ -13483,15 +14634,17 @@ fn validate_workflow_invocations(
         invocation_semantic.schemas.merge(surface.schemas.clone());
         let assignments = collect_field_assignments(body);
         let mut seen = BTreeSet::new();
-        for assignment in assignments {
-            let (field, value) = match assignment {
+        for site in assignments {
+            let (field, value) = match site.assignment {
                 RecordFieldAssignment::Value { field, value } => (field, value),
                 RecordFieldAssignment::Shorthand { field } => (field.clone(), field),
             };
             if !seen.insert(field.clone()) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.duplicate_field"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!("workflow invocation `{target}` repeats input `{field}`"),
                     suggestion: Some("remove the duplicate invocation input".to_owned()),
                 });
@@ -13505,34 +14658,42 @@ fn validate_workflow_invocations(
                     .collect::<Vec<_>>()
                     .join(", ");
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unexpected_field"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!("workflow `{target}` has no input `{field}`"),
                     suggestion: Some(if known.is_empty() {
                         "remove the invocation payload; the target declares no inputs".to_owned()
                     } else {
-                        format!("pass one of: {known}")
+                        suggest_then(
+                            &field,
+                            surface.inputs.keys(),
+                            format!("pass one of: {known}"),
+                        )
                     }),
                 });
                 continue;
             };
             if let Some(root) = dangling_value_root(&value, known_roots) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
-                    span: rule.body.span,
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_binding"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: at.whole(),
                     message: format!(
                         "rule `{}` has unknown binding `{root}` in `invoke {target}` input `{field}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
-                        "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                            .to_owned(),
-                    ),
+                    suggestion: Some(suggest_binding_root(&root, known_roots, BINDING_ROOT_FALLBACK)),
                 });
             }
             validate_expr_source_against_type(
                 rule,
+                at,
                 target,
                 &field,
+                TypeAnchor::Field(&field),
                 input_ty,
                 &value,
                 &invocation_semantic,
@@ -13545,8 +14706,10 @@ fn validate_workflow_invocations(
                 continue;
             }
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.missing_required_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!("workflow invocation `{target}` is missing input `{input}`"),
                 suggestion: Some(format!(
                     "add `{input}` to the `{target}` invocation payload"
@@ -13556,9 +14719,11 @@ fn validate_workflow_invocations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_agent_tell_target(
     rule: &RuleDecl,
     line: &str,
+    at: BodyAnchor,
     kind: &IrEffectKind,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
@@ -13570,8 +14735,10 @@ fn validate_agent_tell_target(
     }
     let Some(target) = parse_tell_target(line) else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.malformed_statement"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("rule `{}` has malformed tell target", rule.name.name),
             suggestion: Some("write `tell agentName ...` or `tell task.agentRef ...`".to_owned()),
         });
@@ -13579,8 +14746,10 @@ fn validate_agent_tell_target(
     };
     if target.starts_with('"') {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.mismatch"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!(
                 "rule `{}` uses a string literal as a tell target",
                 rule.name.name
@@ -13596,16 +14765,20 @@ fn validate_agent_tell_target(
             // exist) — caught here since the type lookup returns None silently. A
             // known root with a bad path is left to other validation.
             if let Some(root) = dangling_value_root(target, known_roots) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
-                    span: rule.body.span,
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_binding"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: at.whole(),
                     message: format!(
                         "rule `{}` has unknown binding `{root}` in tell target `{target}`",
                         rule.name.name
                     ),
-                    suggestion: Some(
-                        "reference a binding from a `when ... as name` clause or an effect `as` binding"
-                            .to_owned(),
-                    ),
+                    suggestion: Some(suggest_binding_root(
+                        &root,
+                        known_roots,
+                        "reference a binding from a `when ... as name` clause or an effect `as` binding",
+                    )),
                 });
             }
             return;
@@ -13614,6 +14787,7 @@ fn validate_agent_tell_target(
             for agent in agents {
                 validate_agent_capabilities(
                     rule,
+                    at,
                     &agent.name,
                     &required_capabilities,
                     semantic,
@@ -13622,8 +14796,10 @@ fn validate_agent_tell_target(
             }
         } else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "rule `{}` uses non-AgentRef dynamic tell target `{target}`",
                     rule.name.name
@@ -13638,18 +14814,32 @@ fn validate_agent_tell_target(
     }
     if !semantic.agents.contains(target) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_agent"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("rule `{}` tells unknown agent `{target}`", rule.name.name),
-            suggestion: Some("declare the target agent before telling it".to_owned()),
+            suggestion: Some(suggest_otherwise(
+                target,
+                semantic.agents.iter(),
+                "declare the target agent before telling it",
+            )),
         });
         return;
     }
-    validate_agent_capabilities(rule, target, &required_capabilities, semantic, diagnostics);
+    validate_agent_capabilities(
+        rule,
+        at,
+        target,
+        &required_capabilities,
+        semantic,
+        diagnostics,
+    );
 }
 
 fn validate_agent_capabilities(
     rule: &RuleDecl,
+    at: BodyAnchor,
     agent: &str,
     required_capabilities: &[String],
     semantic: &SemanticContext,
@@ -13665,14 +14855,21 @@ fn validate_agent_capabilities(
         .unwrap_or_default();
     for capability in required_capabilities {
         if !declared.contains(capability) {
-            diagnostics.push(Diagnostic { related: Vec::new(),
-                span: rule.body.span,
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.capability_not_declared"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: at.whole(),
                 message: format!(
                     "rule `{}` tells agent `{agent}` requiring undeclared capability `{capability}`",
                     rule.name.name
                 ),
-                suggestion: Some(format!(
-                    "add `{capability}` to agent `{agent}` capabilities or choose another AgentRef target"
+                suggestion: Some(suggest_otherwise(
+                    capability,
+                    declared.iter(),
+                    format!(
+                        "add `{capability}` to agent `{agent}` capabilities or choose another AgentRef target"
+                    ),
                 )),
             });
         }
@@ -13682,6 +14879,7 @@ fn validate_agent_capabilities(
 fn validate_availability_when(
     rule: &RuleDecl,
     when: &str,
+    at: SourceSpan,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -13696,8 +14894,10 @@ fn validate_availability_when(
         };
         if !matches!(ty, TypeSyntax::AgentRef { .. }) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at,
                 message: format!(
                     "rule `{}` checks availability for non-AgentRef `{target}`",
                     rule.name.name
@@ -13712,10 +14912,16 @@ fn validate_availability_when(
     }
     if !semantic.agents.contains(target) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_agent"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at,
             message: format!("rule `{}` checks unknown agent `{target}`", rule.name.name),
-            suggestion: Some("declare the target agent before checking availability".to_owned()),
+            suggestion: Some(suggest_otherwise(
+                target,
+                semantic.agents.iter(),
+                "declare the target agent before checking availability",
+            )),
         });
     }
 }
@@ -13748,10 +14954,14 @@ struct ExprValidationContext {
 }
 
 impl ExprValidationContext {
-    fn rule(rule: &RuleDecl) -> Self {
+    /// `at` is where the expression was WRITTEN — the `when` clause holding the
+    /// guard, the `case` branch pattern, the record field's value. An expression
+    /// has no spans of its own (D10), so this is as close as a finding inside
+    /// one can land.
+    fn rule(rule: &RuleDecl, at: SourceSpan) -> Self {
         Self {
             subject: format!("rule `{}`", rule.name.name),
-            span: rule.body.span,
+            span: at,
         }
     }
 
@@ -13766,6 +14976,7 @@ impl ExprValidationContext {
 fn validate_expression(
     rule: &RuleDecl,
     expr: &str,
+    at: SourceSpan,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     label: &str,
@@ -13777,13 +14988,16 @@ fn validate_expression(
                 &expr,
                 semantic,
                 &ExprScope::from_bindings(binding_types),
-                &ExprValidationContext::rule(rule),
+                &ExprValidationContext::rule(rule, at),
                 label,
                 diagnostics,
             );
         }
-        Err(message) => diagnostics.push(Diagnostic { related: Vec::new(),
-            span: rule.body.span,
+        Err(message) => diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.invalid_expression"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: at,
             message: format!("rule `{}` has invalid {label} expression: {message}", rule.name.name),
             suggestion: Some("use deterministic field paths, literals, boolean operators, comparisons, membership, count, or exists".to_owned()),
         }),
@@ -13810,6 +15024,8 @@ fn validate_parsed_expression(
     let ty = infer_expr_type(expr, semantic, scope, context, diagnostics);
     if ty != ExprType::Bool && ty != ExprType::Unknown {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.non_boolean_condition"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: context.span,
             message: format!("{} has non-boolean {label} expression", context.subject),
@@ -13834,10 +15050,17 @@ fn validate_expr_node(
             let root = &path[0];
             let Some(schema) = scope.binding_types.get(root) else {
                 if let Some(schema) = &scope.implicit_schema {
-                    if let Err(message) =
+                    if let Err(fault) =
                         validate_optional_path_access(schema, path, semantic, presence_proofs)
                     {
+                        // The implicit-schema arm passes the author's WHOLE
+                        // path, so the unproven prefix is its first `consumed`
+                        // segments.
+                        let unproven = path[..fault.consumed].join(".");
+                        let message = fault.message;
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("expr.optional_without_presence"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: context.span,
                             message: format!(
@@ -13845,15 +15068,18 @@ fn validate_expr_node(
                                 context.subject,
                                 path.join(".")
                             ),
-                            suggestion: Some(
-                                "prove the optional value is present before reading through it"
-                                    .to_owned(),
-                            ),
+                            suggestion: Some(optional_presence_repair(&unproven)),
                         });
                         return;
                     }
-                    if let Err(message) = semantic.schemas.resolve_field_path(schema, path) {
-                        diagnostics.push(Diagnostic {
+                    if let Err(error) = semantic.schemas.resolve_field_path(schema, path) {
+                        let suggestion =
+                            error.suggestion("use a field declared on the queried schema");
+                        let failed_on = error.schema.clone();
+                        let message = error.message;
+                        let diagnostic = Diagnostic {
+                            code: diagnostic_code!("type.unknown_field"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: context.span,
                             message: format!(
@@ -13861,27 +15087,42 @@ fn validate_expr_node(
                                 context.subject,
                                 path.join(".")
                             ),
-                            suggestion: Some(
-                                "use a field declared on the queried schema".to_owned(),
-                            ),
+                            suggestion: Some(suggestion),
+                        };
+                        diagnostics.push(match &failed_on {
+                            Some(failed_on) => {
+                                declared_here(diagnostic, failed_on, &semantic.schemas)
+                            }
+                            None => diagnostic,
                         });
                     }
                     return;
                 }
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_binding"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} has unknown expression root `{root}`", context.subject),
-                    suggestion: Some(
-                        "use a binding introduced by a `when ... as name` clause".to_owned(),
-                    ),
+                    suggestion: Some(suggest_otherwise(
+                        root,
+                        scope.binding_types.keys(),
+                        "use a binding introduced by a `when ... as name` clause",
+                    )),
                 });
                 return;
             };
-            if let Err(message) =
+            if let Err(fault) =
                 validate_optional_path_access(schema, &path[1..], semantic, presence_proofs)
             {
+                // This arm hands the checker the path WITHOUT its binding root,
+                // so the prefix it reports is one segment short of what the
+                // author would have to write in `exists(...)`. Put the root back.
+                let unproven = path[..1 + fault.consumed].join(".");
+                let message = fault.message;
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.optional_without_presence"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -13889,14 +15130,17 @@ fn validate_expr_node(
                         context.subject,
                         path.join(".")
                     ),
-                    suggestion: Some(
-                        "prove the optional value is present before reading through it".to_owned(),
-                    ),
+                    suggestion: Some(optional_presence_repair(&unproven)),
                 });
                 return;
             }
-            if let Err(message) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
-                diagnostics.push(Diagnostic {
+            if let Err(error) = semantic.schemas.resolve_field_path(schema, &path[1..]) {
+                let suggestion = error.suggestion("use a field declared on the bound schema");
+                let failed_on = error.schema.clone();
+                let message = error.message;
+                let diagnostic = Diagnostic {
+                    code: diagnostic_code!("type.unknown_field"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -13904,7 +15148,11 @@ fn validate_expr_node(
                         context.subject,
                         path.join(".")
                     ),
-                    suggestion: Some("use a field declared on the bound schema".to_owned()),
+                    suggestion: Some(suggestion),
+                };
+                diagnostics.push(match &failed_on {
+                    Some(failed_on) => declared_here(diagnostic, failed_on, &semantic.schemas),
+                    None => diagnostic,
                 });
             }
         }
@@ -13921,6 +15169,8 @@ fn validate_expr_node(
             let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.non_string_map_key"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} indexes a map with a non-string key", context.subject),
@@ -13937,6 +15187,8 @@ fn validate_expr_node(
         }
         Expr::Object(fields) => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.untyped_object_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: context.span,
                 message: format!(
@@ -14062,14 +15314,23 @@ fn validate_unknown_implicit_ident(
         return;
     }
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("type.unknown_field"),
+        severity: Severity::Error,
         related: Vec::new(),
         span: context.span,
         message: format!(
             "{} fact query `{schema}` has unknown field `{name}`",
             context.subject
         ),
-        suggestion: Some(format!(
-            "use a field declared on `{schema}` inside the query `where` expression"
+        suggestion: Some(suggest_otherwise(
+            name,
+            semantic
+                .schemas
+                .classes
+                .get(schema)
+                .into_iter()
+                .flat_map(BTreeMap::keys),
+            format!("use a field declared on `{schema}` inside the query `where` expression"),
         )),
     });
 }
@@ -14099,7 +15360,10 @@ fn validate_function_call(
     match name {
         "count" => {
             if args.len() != 1 {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.arity_mismatch"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `count` with {} arguments, expected 1",
@@ -14116,6 +15380,8 @@ fn validate_function_call(
             let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
             if !is_countable_type(&ty) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsupported_argument_type"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14133,6 +15399,8 @@ fn validate_function_call(
         "exists" => {
             if args.len() != 1 {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.arity_mismatch"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14146,7 +15414,10 @@ fn validate_function_call(
             }
             let ty = infer_expr_type(&args[0], semantic, scope, context, diagnostics);
             if !matches!(args[0], Expr::Index { .. }) && !is_exists_type(&ty) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsupported_argument_type"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: context.span,
                     message: format!(
                         "{} calls `exists` with unsupported argument type `{}`",
@@ -14163,6 +15434,8 @@ fn validate_function_call(
         "empty" => {
             if args.len() != 1 {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.arity_mismatch"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14184,6 +15457,8 @@ fn validate_function_call(
                 // only when `empty(T)` is).
                 let optional = matches!(ty, ExprType::Optional(_));
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsupported_argument_type"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14216,6 +15491,8 @@ fn validate_query_expr(
     if *kind == QueryKind::Fact {
         let Some(schema) = query_head_schema(head, semantic) else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_schema"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: context.span,
                 message: format!(
@@ -14223,7 +15500,11 @@ fn validate_query_expr(
                     context.subject,
                     head.trim()
                 ),
-                suggestion: Some("use a declared class name in fact queries".to_owned()),
+                suggestion: Some(suggest_otherwise(
+                    head.trim(),
+                    semantic.schemas.classes.keys(),
+                    "use a declared class name in fact queries",
+                )),
             });
             return;
         };
@@ -14232,6 +15513,8 @@ fn validate_query_expr(
             let ty = infer_expr_type(guard, semantic, &guard_scope, context, diagnostics);
             if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.non_boolean_condition"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14246,12 +15529,41 @@ fn validate_query_expr(
     }
 }
 
+/// An optional read with nothing proving the optional present.
+///
+/// `consumed` is how many segments of the slice handed to
+/// [`validate_optional_path_access`] the unproven optional ends at, so a caller
+/// that passed a SUFFIX of the author's path can still name the prefix as the
+/// author wrote it — which is what the repair has to say out loud.
+struct OptionalAccessFault {
+    message: String,
+    consumed: usize,
+}
+
+/// The repair for `expr.optional_without_presence`, naming the CONSTRUCTS that
+/// prove presence.
+///
+/// The old help — "prove the optional value is present before reading through
+/// it" — restated the message and named nothing, so a reader who did not already
+/// know the language learnt only that they were stuck. Three forms prove it
+/// (see [`collect_presence_proofs`]): `exists(p)`, `p != null`, and
+/// `!(p == null)`. The proof also has to sit to the LEFT of an `and` in the same
+/// expression, because that is the only direction the proof set flows, and a
+/// repair that omits that sends the reader to write a guard that still fails.
+fn optional_presence_repair(path: &str) -> String {
+    format!(
+        "prove `{path}` present in the same expression, to the LEFT of an `and` \
+         (which is what carries the proof rightward): `exists({path}) and ...` \
+         or `{path} != null and ...`"
+    )
+}
+
 fn validate_optional_path_access(
     root_schema: &str,
     path: &[String],
     semantic: &SemanticContext,
     presence_proofs: &BTreeSet<String>,
-) -> Result<(), String> {
+) -> Result<(), OptionalAccessFault> {
     let mut schema = root_schema.to_owned();
     let mut prefix = Vec::new();
     for (index, field) in path.iter().enumerate() {
@@ -14264,11 +15576,14 @@ fn validate_optional_path_access(
         prefix.push(field.clone());
         if let TypeSyntax::Optional { inner, .. } = field_ty {
             if index + 1 < path.len() && !presence_proofs.contains(&prefix.join(".")) {
-                return Err(format!(
-                    "`{}` must be proven present before accessing `{}`",
-                    prefix.join("."),
-                    path[index + 1..].join(".")
-                ));
+                return Err(OptionalAccessFault {
+                    message: format!(
+                        "`{}` must be proven present before accessing `{}`",
+                        prefix.join("."),
+                        path[index + 1..].join(".")
+                    ),
+                    consumed: index + 1,
+                });
             }
             if let Some(next_schema) = schema_name_for_path(inner) {
                 schema = next_schema;
@@ -14411,6 +15726,8 @@ fn infer_expr_type(
             let key_ty = infer_expr_type(key, semantic, scope, context, diagnostics);
             if !matches!(key_ty, ExprType::String | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.non_string_map_key"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} indexes a map with a non-string key", context.subject),
@@ -14424,6 +15741,8 @@ fn infer_expr_type(
                 ExprType::Unknown => ExprType::Unknown,
                 _ => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("expr.non_map_index"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: context.span,
                         message: format!("{} indexes a non-map expression", context.subject),
@@ -14447,6 +15766,8 @@ fn infer_expr_type(
             let inner = infer_expr_type(expr, semantic, scope, context, diagnostics);
             if !matches!(inner, ExprType::Bool | ExprType::Unknown) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.non_boolean_operand"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14467,6 +15788,8 @@ fn infer_expr_type(
             "empty" => ExprType::Bool,
             _ => {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsupported_function"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14502,11 +15825,25 @@ fn infer_binary_type(
 ) -> ExprType {
     let left_ty = infer_expr_type(left, semantic, scope, context, diagnostics);
     let right_ty = infer_expr_type(right, semantic, scope, context, diagnostics);
+    // ONE user mistake, one diagnostic. An object literal in an expression
+    // position has already been refused as `expr.untyped_object_literal` — the
+    // checker has just said this operand has no type — so every type RELATION it
+    // then fails is DERIVED from that one fault. `{ owner "Ada" } == task.owner`
+    // reported `expr.untyped_object_literal` AND `expr.incomparable_types` on
+    // one span, so a downstream test could pin either and pin half the truth,
+    // and the reader was shown two problems where they had made one.
+    //
+    // Only the relation is suppressed. The operand's own refusal still stands,
+    // and it is the one that names the edit.
+    let operand_is_untyped_object =
+        matches!(left, Expr::Object(_)) || matches!(right, Expr::Object(_));
     match op {
         BinaryOp::And | BinaryOp::Or => {
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Bool | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("expr.non_boolean_operand"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: context.span,
                         message: format!(
@@ -14523,8 +15860,10 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Eq | BinaryOp::Ne => {
-            if !types_comparable(&left_ty, &right_ty) {
+            if !types_comparable(&left_ty, &right_ty) && !operand_is_untyped_object {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.incomparable_types"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} compares incompatible expression types", context.subject),
@@ -14536,8 +15875,10 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            if !is_orderable_pair(&left_ty, &right_ty) {
+            if !is_orderable_pair(&left_ty, &right_ty) && !operand_is_untyped_object {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unorderable_types"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} orders non-orderable expression values", context.subject),
@@ -14551,8 +15892,10 @@ fn infer_binary_type(
         BinaryOp::In | BinaryOp::NotIn => {
             match &right_ty {
                 ExprType::Array(item_ty) => {
-                    if !types_comparable(&left_ty, item_ty) {
+                    if !types_comparable(&left_ty, item_ty) && !operand_is_untyped_object {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("expr.incomparable_types"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: context.span,
                             message: format!(
@@ -14569,6 +15912,8 @@ fn infer_binary_type(
                 ExprType::Map(_) => {
                     if !is_string_like_key_type(&left_ty) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("expr.non_string_map_key"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: context.span,
                             message: format!(
@@ -14583,6 +15928,8 @@ fn infer_binary_type(
                 }
                 ExprType::Unknown => {}
                 _ => diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.non_collection_membership"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14600,6 +15947,8 @@ fn infer_binary_type(
             for ty in [&left_ty, &right_ty] {
                 if !matches!(ty, ExprType::Int | ExprType::Float | ExprType::Unknown) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("expr.non_numeric_operand"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: context.span,
                         message: format!(
@@ -14640,6 +15989,8 @@ fn infer_array_type(
             Some(existing) if types_comparable(existing, &ty) => {}
             Some(_) => {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.mixed_array_types"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!("{} has mixed-type array literal", context.subject),
@@ -14888,13 +16239,19 @@ fn validate_finite_domain_expr(
     for literal in literals.into_iter().flatten() {
         if !domain.iter().any(|value| value == &literal) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span: context.span,
                 message: format!(
                     "{} compares finite-domain value to unknown `{literal}`",
                     context.subject
                 ),
-                suggestion: Some(format!("use one of: {}", domain.join(", "))),
+                suggestion: Some(suggest_then(
+                    &literal,
+                    domain.iter(),
+                    format!("use one of: {}", domain.join(", ")),
+                )),
             });
         }
     }
@@ -14923,6 +16280,8 @@ fn validate_finite_domain_relation(
                 .all(|value| !right_domain.iter().any(|right| right == value))
             {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsatisfiable_comparison"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14949,6 +16308,8 @@ fn validate_finite_domain_relation(
                 .all(|literal| !domain.iter().any(|value| value == literal))
             {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsatisfiable_comparison"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -14972,6 +16333,8 @@ fn validate_finite_domain_relation(
                     .all(|value| literals.iter().any(|literal| literal == value))
             {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.unsatisfiable_comparison"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: context.span,
                     message: format!(
@@ -15108,16 +16471,7 @@ fn validate_case_blocks(
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let lines = rule
-        .body
-        .text
-        .lines()
-        .scan(0usize, |offset, line| {
-            let current = *offset;
-            *offset += line.len() + 1;
-            Some((line, current))
-        })
-        .collect::<Vec<_>>();
+    let lines = body_line_offsets(&rule.body.text);
     let text_lines = lines.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
@@ -15130,9 +16484,12 @@ fn validate_case_blocks(
         let terminal_case = scrutinee_ty.is_none()
             && active_completes_binding_for_case(&text_lines, index, scrutinee);
         if scrutinee_ty.is_none() && !terminal_case {
+            let head = lines[index].1 + (lines[index].0.len() - lines[index].0.trim_start().len());
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.untyped_case_scrutinee"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: BodyAnchor::text(&rule.body, head, trimmed).whole(),
                 message: format!(
                     "rule `{}` has case scrutinee `{scrutinee}` that is not a typed path",
                     rule.name.name
@@ -15152,13 +16509,10 @@ fn validate_case_blocks(
                     let branch = SpanCaseBranchHead {
                         pattern: branch.pattern,
                         guard: branch.guard,
-                        pattern_span: SourceSpan {
-                            start: rule_body_text_start(rule) + line_offset + pattern_column,
-                            end: rule_body_text_start(rule)
-                                + line_offset
-                                + pattern_column
-                                + branch.pattern.len(),
-                        },
+                        pattern_span: rule.body.span_of(
+                            line_offset + pattern_column
+                                ..line_offset + pattern_column + branch.pattern.len(),
+                        ),
                     };
                     branches.push(branch);
                     if terminal_case {
@@ -15193,18 +16547,26 @@ fn validate_case_blocks(
                                 branch_scope.insert(binding, schema);
                             }
                         }
+                        let at = branch_anchor(
+                            rule,
+                            slice_offset(raw_line, guard).map(|offset| {
+                                line_offset + offset..line_offset + offset + guard.len()
+                            }),
+                            branch.pattern_span,
+                        );
                         validate_expression(
                             rule,
                             guard,
+                            at.whole(),
                             semantic,
                             &branch_scope,
                             "case guard",
                             diagnostics,
                         );
-                        validate_known_field_paths_at_span(
+                        validate_known_field_paths(
                             rule,
                             guard,
-                            branch.pattern_span,
+                            at,
                             semantic,
                             &branch_scope,
                             diagnostics,
@@ -15340,6 +16702,8 @@ fn validate_case_pattern(
     if pattern == "None" {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.case_pattern_mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -15354,6 +16718,8 @@ fn validate_case_pattern(
     if pattern.starts_with("Some ") {
         if !matches!(scrutinee_ty, Some(TypeSyntax::Optional { .. })) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.case_pattern_mismatch"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -15376,12 +16742,18 @@ fn validate_case_pattern(
             let (variant, binding) = sum_case_pattern_parts(pattern);
             if !variants.contains(variant) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_enum_variant"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!("enum `{}` has no variant `{variant}`", name.name),
-                    suggestion: Some(format!(
-                        "use one of: {}",
-                        variants.iter().cloned().collect::<Vec<_>>().join(", ")
+                    suggestion: Some(suggest_then(
+                        variant,
+                        variants.iter(),
+                        format!(
+                            "use one of: {}",
+                            variants.iter().cloned().collect::<Vec<_>>().join(", ")
+                        ),
                     )),
                 });
                 return;
@@ -15394,6 +16766,8 @@ fn validate_case_pattern(
                     .class_exists(&format!("{}.{variant}", name.name))
             {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.variant_without_payload"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -15407,6 +16781,8 @@ fn validate_case_pattern(
         TypeSyntax::Union { variants, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.invalid_case_pattern"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -15422,6 +16798,8 @@ fn validate_case_pattern(
         TypeSyntax::AgentRef { agents, .. } => {
             let Some(literal) = parse_literal_expr(pattern) else {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.invalid_case_pattern"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -15444,6 +16822,8 @@ fn validate_case_pattern(
         TypeSyntax::Primitive { name, .. } if name == "bool" => {
             if !matches!(pattern, "true" | "false") {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("expr.case_pattern_mismatch"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
@@ -15456,6 +16836,8 @@ fn validate_case_pattern(
         }
         _ => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("expr.unmatchable_scrutinee"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -15496,7 +16878,10 @@ fn validate_terminal_case_pattern(
     };
     let uses_as = matches!(second, Some("as"));
     if parts.next().is_some() || binding.is_none() || !uses_as {
-        diagnostics.push(Diagnostic { related: Vec::new(),
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.invalid_case_pattern"),
+            severity: Severity::Error,
+            related: Vec::new(),
             span,
             message: format!(
                 "rule `{}` has malformed terminal-output case pattern `{pattern}`",
@@ -15509,6 +16894,8 @@ fn validate_terminal_case_pattern(
     let tags = terminal_case_tags();
     if !tags.contains(&tag) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_terminal_tag"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
@@ -15547,6 +16934,8 @@ fn validate_terminal_case_coverage(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.non_exhaustive_case"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: rule.body.span,
             message: format!(
@@ -15566,24 +16955,34 @@ fn validate_duplicate_terminal_case_patterns(
     branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut seen = BTreeSet::new();
+    // Keyed by normalized pattern, valued by the branch that first matched it:
+    // both spans of a duplicate are in hand here, so the second can name the
+    // first instead of leaving the reader to scan the arms.
+    let mut seen: BTreeMap<String, SourceSpan> = BTreeMap::new();
     for branch in branches.iter().filter(|branch| branch.guard.is_none()) {
         let Some(pattern) = normalized_terminal_case_pattern(branch.pattern) else {
             continue;
         };
-        if !seen.insert(pattern.to_owned()) {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: branch.pattern_span,
-                message: format!(
-                    "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
-                    rule.name.name
-                ),
-                suggestion: Some(
-                    "remove the duplicate branch or add mutually exclusive `where` guards"
-                        .to_owned(),
-                ),
-            });
+        if let Some(first) = seen.get(pattern) {
+            diagnostics.push(
+                Diagnostic {
+                    code: diagnostic_code!("expr.duplicate_case_pattern"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: branch.pattern_span,
+                    message: format!(
+                        "rule `{}` has duplicate unguarded terminal-output case pattern `{pattern}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "remove the duplicate branch or add mutually exclusive `where` guards"
+                            .to_owned(),
+                    ),
+                }
+                .with_related(*first, format!("`{pattern}` is already matched here")),
+            );
+        } else {
+            seen.insert(pattern.to_owned(), branch.pattern_span);
         }
     }
 }
@@ -15621,6 +17020,8 @@ fn validate_case_coverage(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.non_exhaustive_case"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: rule.body.span,
             message: format!(
@@ -15638,24 +17039,31 @@ fn validate_duplicate_case_patterns(
     branches: &[SpanCaseBranchHead<'_>],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeMap<String, SourceSpan> = BTreeMap::new();
     for branch in branches.iter().filter(|branch| branch.guard.is_none()) {
         let Some(pattern) = normalized_case_pattern(branch.pattern) else {
             continue;
         };
-        if !seen.insert(pattern.to_owned()) {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: branch.pattern_span,
-                message: format!(
-                    "rule `{}` has duplicate unguarded case pattern `{pattern}`",
-                    rule.name.name
-                ),
-                suggestion: Some(
-                    "remove the duplicate branch or add mutually exclusive `where` guards"
-                        .to_owned(),
-                ),
-            });
+        if let Some(first) = seen.get(pattern) {
+            diagnostics.push(
+                Diagnostic {
+                    code: diagnostic_code!("expr.duplicate_case_pattern"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: branch.pattern_span,
+                    message: format!(
+                        "rule `{}` has duplicate unguarded case pattern `{pattern}`",
+                        rule.name.name
+                    ),
+                    suggestion: Some(
+                        "remove the duplicate branch or add mutually exclusive `where` guards"
+                            .to_owned(),
+                    ),
+                }
+                .with_related(*first, format!("`{pattern}` is already matched here")),
+            );
+        } else {
+            seen.insert(pattern.to_owned(), branch.pattern_span);
         }
     }
 }
@@ -15677,6 +17085,8 @@ fn validate_unreachable_after_fallback(
         if let Some(prior) = fallback_span {
             diagnostics.push(
                 Diagnostic {
+                    code: diagnostic_code!("expr.unreachable_case_branch"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: branch.pattern_span,
                     message: format!(
@@ -15793,6 +17203,8 @@ fn validate_union_case_pattern(
     }
     let LiteralExpr::String(value) = literal else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.invalid_case_pattern"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
@@ -15805,10 +17217,16 @@ fn validate_union_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.case_pattern_mismatch"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("rule `{}` case pattern cannot be `{value}`", rule.name.name),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: Some(suggest_then(
+                value,
+                allowed.iter(),
+                format!("use one of: {}", allowed.join(", ")),
+            )),
         });
     }
 }
@@ -15826,6 +17244,8 @@ fn validate_agent_ref_case_pattern(
         .collect::<Vec<_>>();
     let (LiteralExpr::String(value) | LiteralExpr::Ident(value)) = literal else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("expr.invalid_case_pattern"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("rule `{}` has non-agent case pattern", rule.name.name),
@@ -15835,10 +17255,16 @@ fn validate_agent_ref_case_pattern(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_agent"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!("AgentRef has no agent `{value}`"),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: Some(suggest_then(
+                value,
+                allowed.iter(),
+                format!("use one of: {}", allowed.join(", ")),
+            )),
         });
     }
 }
@@ -15846,6 +17272,7 @@ fn validate_agent_ref_case_pattern(
 fn validate_binding_uses(
     rule: &RuleDecl,
     line: &str,
+    at: BodyAnchor,
     seen_bindings: &BTreeSet<String>,
     scope_stack: &[(String, DependencyPredicate)],
     diagnostics: &mut Vec<Diagnostic>,
@@ -15858,8 +17285,11 @@ fn validate_binding_uses(
             continue;
         }
 
-        diagnostics.push(Diagnostic { related: Vec::new(),
-            span: rule.body.span,
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("effect.output_scope_leak"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: at.whole(),
             message: format!(
                 "rule `{}` uses effect output `{root}` outside a matching `after {root} ...` block",
                 rule.name.name
@@ -16094,11 +17524,18 @@ fn split_expression_args(args: &str) -> Vec<&str> {
     values
 }
 
-fn effect_payload_statements(body: &str) -> Vec<String> {
+/// Each statement paired with the byte range, in `body`, of its HEAD LINE.
+///
+/// The range is what lets a diagnostic about a statement land on the statement.
+/// A multi-line statement is re-joined here rather than sliced, so only its head
+/// line has a source range — which is where the reader looks anyway, and is
+/// honest in a way an invented interior offset would not be.
+fn effect_payload_statements(body: &str) -> Vec<(String, Range<usize>)> {
     collect_body_statements(body, effect_payload_statement_balance)
 }
 
-fn workflow_invoke_statements(body: &str) -> Vec<String> {
+/// See [`effect_payload_statements`] for what the offset means.
+fn workflow_invoke_statements(body: &str) -> Vec<(String, Range<usize>)> {
     collect_body_statements(body, workflow_invoke_statement_balance)
 }
 
@@ -16112,8 +17549,14 @@ enum StatementBalance {
 fn collect_body_statements(
     body: &str,
     statement_balance: fn(&str) -> Option<StatementBalance>,
-) -> Vec<String> {
-    let lines = body.lines().collect::<Vec<_>>();
+) -> Vec<(String, Range<usize>)> {
+    let raw = body_line_offsets(body);
+    let lines = raw.iter().map(|(line, _)| *line).collect::<Vec<_>>();
+    let head_range = |index: usize| {
+        let (line, start) = raw[index];
+        let lead = line.len() - line.trim_start().len();
+        start + lead..start + lead + line.trim().len()
+    };
     let mut statements = Vec::new();
     let mut index = 0usize;
     let mut record_depth = 0i32;
@@ -16148,18 +17591,18 @@ fn collect_body_statements(
         }
         if let Some(balance) = statement_balance(trimmed) {
             match balance {
-                StatementBalance::None => statements.push(trimmed.to_owned()),
+                StatementBalance::None => statements.push((trimmed.to_owned(), head_range(index))),
                 StatementBalance::Parens => {
                     let (statement, next_index) =
                         statement_until_balanced(&lines, index, trimmed, paren_delta);
-                    statements.push(statement);
+                    statements.push((statement, head_range(index)));
                     index = next_index + 1;
                     continue;
                 }
                 StatementBalance::Braces => {
                     let (statement, next_index) =
                         statement_until_balanced(&lines, index, trimmed, brace_delta);
-                    statements.push(statement);
+                    statements.push((statement, head_range(index)));
                     index = next_index + 1;
                     continue;
                 }
@@ -16590,6 +18033,8 @@ fn validate_redactions(
         );
         let Some(schema) = source_schema else {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.unknown_schema"),
+                severity: Severity::Error,
                 related: Vec::new(),
                 span,
                 message: format!(
@@ -16610,13 +18055,19 @@ fn validate_redactions(
         for field in keep {
             if !src_fields.contains_key(field) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_field"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span,
                     message: format!(
                         "rule `{}` redacts `{source}` keeping unknown field `{field}` of `{schema}`",
                         rule.name.name
                     ),
-                    suggestion: Some(format!("keep a field declared on `{schema}`")),
+                    suggestion: Some(suggest_otherwise(
+                        field,
+                        src_fields.keys(),
+                        format!("keep a field declared on `{schema}`"),
+                    )),
                 });
             }
         }
@@ -16841,6 +18292,8 @@ fn refuse_confined_crossing(
         return;
     };
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("security.confinement_crossing"),
+        severity: Severity::Error,
         related: Vec::new(),
         span,
         message: format!(
@@ -17174,6 +18627,8 @@ fn validate_seal_storage(
                         continue;
                     }
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.seal_type_mismatch"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: field.span,
                         message: format!(
@@ -17283,6 +18738,8 @@ fn validate_declassify_projection(
             } => {
                 if !semantic.schemas.class_exists(target_type) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_schema"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: *span,
                         message: format!(
@@ -17318,6 +18775,8 @@ fn validate_declassify_projection(
                         .is_err()
                     {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("security.declassify_projection_mismatch"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: *span,
                             message: format!(
@@ -17435,6 +18894,8 @@ fn validate_open_type_agreement(
                 };
                 let TypeSyntax::Sealed { inner, .. } = resolved else {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.not_sealed"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -17456,6 +18917,8 @@ fn validate_open_type_agreement(
                     continue;
                 }
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.seal_type_mismatch"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: effect.span,
                     message: format!(
@@ -17694,6 +19157,8 @@ fn validate_recorded_schemas(
             let schema = &record.schema;
             if is_observer_only_schema(schema) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("construct.reserved_name"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: record.span,
                     message: format!(
@@ -17707,10 +19172,16 @@ fn validate_recorded_schemas(
                 });
             } else if !semantic.schemas.class_exists(schema) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_schema"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: record.span,
                     message: format!("rule `{}` records unknown class `{schema}`", rule.name.name),
-                    suggestion: Some(format!("declare `class {schema}` before recording it")),
+                    suggestion: Some(suggest_otherwise(
+                        schema,
+                        semantic.schemas.classes.keys(),
+                        format!("declare `class {schema}` before recording it"),
+                    )),
                 });
             }
         }
@@ -17818,6 +19289,8 @@ fn validate_coordination_discipline(
         for required in required_arms {
             if !predicates.contains(*required) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("effect.unhandled_outcome"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: *span,
                     message: format!(
@@ -17856,6 +19329,8 @@ fn validate_coordination_discipline(
             {
                 if !renewable.contains(acquire_binding.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_binding"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -17897,6 +19372,8 @@ fn validate_coordination_discipline(
             if let body::BodyEffectKind::TrackerRelease { item } = &effect.kind {
                 if !releasable.contains(item.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_binding"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -17913,7 +19390,10 @@ fn validate_coordination_discipline(
     });
 
     if acquires.len() > 1 {
-        diagnostics.push(Diagnostic { related: Vec::new(),
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("effect.multiple_leases"),
+            severity: Severity::Error,
+            related: Vec::new(),
             span: acquires[1].2,
             message: format!(
                 "rule `{}` acquires more than one lease in a single progression",
@@ -17933,7 +19413,10 @@ fn validate_coordination_discipline(
         collect_after_predicates(statements, binding, &mut predicates);
         for required in ["held", "contended"] {
             if !predicates.contains(required) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("effect.unhandled_outcome"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of lease `{binding}`",
@@ -17947,7 +19430,10 @@ fn validate_coordination_discipline(
         }
         if let Some(held_body) = find_after_body(statements, binding, body::AfterPredicate::Held) {
             if !releases_or_terminates(held_body, binding) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("graph.unreleased_lease"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` can hold lease `{binding}` forever: the `held` branch neither releases it nor reaches a workflow terminal",
@@ -17965,7 +19451,10 @@ fn validate_coordination_discipline(
         collect_after_predicates(statements, binding, &mut predicates);
         for required in ["ok", "over"] {
             if !predicates.contains(required) {
-                diagnostics.push(Diagnostic { related: Vec::new(),
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("effect.unhandled_outcome"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
                     span: *span,
                     message: format!(
                         "rule `{}` does not handle the `{required}` outcome of counter consume `{binding}`",
@@ -18170,6 +19659,8 @@ fn check_conditioned_read(
         return;
     }
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("expr.conditional_without_presence"),
+        severity: Severity::Error,
         related: Vec::new(),
         span,
         message: format!(
@@ -18194,7 +19685,8 @@ fn check_conditioned_reads_in_text(
     allowed: &BTreeSet<(String, String)>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (root, path) in dotted_paths(text) {
+    for dotted in dotted_paths(text) {
+        let (root, path) = dotted.into_pair();
         let Some(first) = path.first() else {
             continue;
         };
@@ -18223,7 +19715,11 @@ fn interpolation_paths(text: &str) -> Vec<(String, Vec<String>)> {
         let Some(close) = after_open.find("}}") else {
             break;
         };
-        paths.extend(dotted_paths(&after_open[..close]));
+        paths.extend(
+            dotted_paths(&after_open[..close])
+                .into_iter()
+                .map(DottedPath::into_pair),
+        );
         rest = &after_open[close + 2..];
     }
     paths
@@ -18770,53 +20266,80 @@ fn validate_body_effect_operands(
                     body::BodyEffectKind::LeaseAcquire { resource, .. }
                         if !semantic.leases.contains(resource) =>
                     {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                        diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.unknown_resource"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` acquires undeclared lease `{resource}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(format!(
-                                "declare `lease {resource} {{ key <Type>  slots <N>  ttl <duration> }}`"
+                            suggestion: Some(suggest_otherwise(
+                                resource,
+                                semantic.leases.iter(),
+                                format!(
+                                    "declare `lease {resource} {{ key <Type>  slots <N>  ttl <duration> }}`"
+                                ),
                             )),
                         });
                     }
                     body::BodyEffectKind::LedgerAppend { ledger, schema, .. } => {
                         if !semantic.ledgers.contains(ledger) {
-                            diagnostics.push(Diagnostic { related: Vec::new(),
+                            diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("type.unknown_resource"),
+                                severity: Severity::Error,
+                                related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends to undeclared ledger `{ledger}`",
                                     rule.name.name
                                 ),
-                                suggestion: Some(format!(
-                                    "declare `ledger {ledger} {{ entry <Type>  partition by <field>  retain <duration> }}`"
+                                suggestion: Some(suggest_otherwise(
+                                    ledger,
+                                    semantic.ledgers.iter(),
+                                    format!(
+                                        "declare `ledger {ledger} {{ entry <Type>  partition by <field>  retain <duration> }}`"
+                                    ),
                                 )),
                             });
                         }
                         if !semantic.schemas.class_exists(schema) {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("type.unknown_schema"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` appends unknown entry class `{schema}`",
                                     rule.name.name
                                 ),
-                                suggestion: Some(format!("declare `class {schema}` first")),
+                                suggestion: Some(suggest_otherwise(
+                                    schema,
+                                    semantic.schemas.classes.keys(),
+                                    format!("declare `class {schema}` first"),
+                                )),
                             });
                         }
                     }
                     body::BodyEffectKind::CounterConsume { counter, .. }
                         if !semantic.counters.contains(counter) =>
                     {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                        diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.unknown_resource"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` consumes undeclared counter `{counter}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(format!(
-                                "declare `counter {counter} {{ key <Type>  cap <N>  reset <period> }}`"
+                            suggestion: Some(suggest_otherwise(
+                                counter,
+                                semantic.counters.iter(),
+                                format!(
+                                    "declare `counter {counter} {{ key <Type>  cap <N>  reset <period> }}`"
+                                ),
                             )),
                         });
                     }
@@ -18838,14 +20361,20 @@ fn validate_body_effect_operands(
                     match binding_types.get(stdin_binding) {
                         None => {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("type.unknown_binding"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
                                     "rule `{}` uses unknown binding `{stdin_binding}` in `exec {name} with {stdin_binding}` — `with` requires a typed record binding",
                                     rule.name.name
                                 ),
-                                suggestion: Some(format!(
-                                    "bind a typed record first (e.g. `when <Class> as {stdin_binding}` or `coerce ... -> <Class> as {stdin_binding}`) and pass that binding to `with`"
+                                suggestion: Some(suggest_otherwise(
+                                    stdin_binding,
+                                    binding_types.keys(),
+                                    format!(
+                                        "bind a typed record first (e.g. `when <Class> as {stdin_binding}` or `coerce ... -> <Class> as {stdin_binding}`) and pass that binding to `with`"
+                                    ),
                                 )),
                             });
                         }
@@ -18858,6 +20387,8 @@ fn validate_body_effect_operands(
                             if schema.contains('.') && !semantic.schemas.class_exists(schema) =>
                         {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("type.mismatch"),
+                                severity: Severity::Error,
                                 related: Vec::new(),
                                 span: effect.span,
                                 message: format!(
@@ -18878,18 +20409,14 @@ fn validate_body_effect_operands(
                 } = &effect.kind
                 {
                     if !semantic.schemas.class_exists(&parse.schema) {
-                        let suggestion =
-                            match closest_name(&parse.schema, semantic.schemas.classes.keys()) {
-                                Some(candidate) => format!(
-                                    "did you mean `{candidate}`? otherwise declare `class {}`",
-                                    parse.schema
-                                ),
-                                None => format!(
-                                    "declare `class {}` before parsing into it",
-                                    parse.schema
-                                ),
-                            };
+                        let suggestion = suggest_otherwise(
+                            &parse.schema,
+                            semantic.schemas.classes.keys(),
+                            format!("declare `class {}` before parsing into it", parse.schema),
+                        );
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.unknown_schema"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!(
@@ -18913,16 +20440,20 @@ fn validate_body_effect_operands(
                 let root = segments.next().unwrap_or_default();
                 let path = segments.map(str::to_owned).collect::<Vec<_>>();
                 let Some(schema) = binding_types.get(root) else {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_binding"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
                         span: effect.span,
                         message: format!(
                             "rule `{}` uses unknown binding `{root}` in `timer until {until}`",
                             rule.name.name
                         ),
-                        suggestion: Some(
-                            "bind a fact in `when` and reference a `time` field on it, or use an ISO-8601 literal"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(suggest_otherwise(
+                            root,
+                            binding_types.keys(),
+                            "bind a fact in `when` and reference a `time` field on it, or use an ISO-8601 literal",
+                        )),
                     });
                     continue;
                 };
@@ -18932,8 +20463,9 @@ fn validate_body_effect_operands(
                     continue;
                 }
                 let resolved = if path.is_empty() {
-                    Err(format!(
-                        "`{root}` is a `{schema}` record, not a `time` value"
+                    Err(FieldPathError::at(
+                        0,
+                        format!("`{root}` is a `{schema}` record, not a `time` value"),
                     ))
                 } else {
                     semantic.schemas.resolve_field_path(schema, &path)
@@ -18941,7 +20473,10 @@ fn validate_body_effect_operands(
                 match resolved {
                     Ok(TypeSyntax::Primitive { ref name, .. }) if name == "time" => {}
                     Ok(_) => {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                        diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.mismatch"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` uses non-time operand `{until}` in `timer until`",
@@ -18952,17 +20487,28 @@ fn validate_body_effect_operands(
                             )),
                         });
                     }
-                    Err(message) => {
-                        diagnostics.push(Diagnostic { related: Vec::new(),
+                    Err(error) => {
+                        let suggestion = error.suggestion(
+                            "reference a `time`-typed field on a bound fact, or use an ISO-8601 literal",
+                        );
+                        let failed_on = error.schema.clone();
+                        let message = error.message;
+                        let diagnostic = Diagnostic {
+                            code: diagnostic_code!("type.unknown_field"),
+                            severity: Severity::Error,
+                            related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` has invalid `timer until` operand `{until}`: {message}",
                                 rule.name.name
                             ),
-                            suggestion: Some(
-                                "reference a `time`-typed field on a bound fact, or use an ISO-8601 literal"
-                                    .to_owned(),
-                            ),
+                            suggestion: Some(suggestion),
+                        };
+                        diagnostics.push(match &failed_on {
+                            Some(failed_on) => {
+                                declared_here(diagnostic, failed_on, &semantic.schemas)
+                            }
+                            None => diagnostic,
                         });
                     }
                 }
@@ -19086,7 +20632,7 @@ fn validate_lapse_arm(
         validate_known_field_paths_in_index(
             rule,
             line,
-            rule.body.span,
+            BodyAnchor::rule(rule),
             // The synthesized view classes are local to this check; an ambient
             // binding the arm inherits may still be invoke-derived and resolve in
             // a child's index.
@@ -19105,7 +20651,12 @@ fn validate_lapse_arm(
     // instance — and the splice is the only reason the rule-body pass never saw it.
     // The allowed set starts from the `case` arms the region sits inside, so an arm
     // under `case e.kind { "deploy" => … }` keeps that arm's allowances.
-    let (arm_ast, _) = body::parse_rule_body(&region.arm_content, 0);
+    // `arm_content` is cut from the (possibly expanded) body text, so no offset
+    // into it is a source position.
+    let (arm_ast, _) = body::parse_rule_body(
+        &region.arm_content,
+        body::BodyBase::Generated(rule.body.span),
+    );
     let mut allowed = BTreeSet::new();
     for (scrutinee, pattern) in &region.arm_case_arms {
         allowed.extend(family_b_arm_allowed(
@@ -19177,15 +20728,16 @@ impl<'a> SchemaScopes<'a> {
 fn validate_known_field_paths(
     rule: &RuleDecl,
     line: &str,
+    anchor: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    validate_known_field_paths_at_span(
+    validate_known_field_paths_in_index(
         rule,
         line,
-        rule.body.span,
-        semantic,
+        anchor,
+        SchemaScopes::local(&semantic.schemas),
         binding_types,
         diagnostics,
     );
@@ -19196,6 +20748,7 @@ fn validate_known_field_paths(
 fn validate_known_field_paths_scoped(
     rule: &RuleDecl,
     line: &str,
+    anchor: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     foreign: &BTreeMap<String, String>,
@@ -19204,30 +20757,12 @@ fn validate_known_field_paths_scoped(
     validate_known_field_paths_in_index(
         rule,
         line,
-        rule.body.span,
+        anchor,
         SchemaScopes {
             local: &semantic.schemas,
             foreign,
             workflows: &semantic.workflow_inputs,
         },
-        binding_types,
-        diagnostics,
-    );
-}
-
-fn validate_known_field_paths_at_span(
-    rule: &RuleDecl,
-    line: &str,
-    span: SourceSpan,
-    semantic: &SemanticContext,
-    binding_types: &BTreeMap<String, String>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    validate_known_field_paths_in_index(
-        rule,
-        line,
-        span,
-        SchemaScopes::local(&semantic.schemas),
         binding_types,
         diagnostics,
     );
@@ -19274,7 +20809,7 @@ fn check_field_path(
     rule: &RuleDecl,
     root: &str,
     path: &[String],
-    span: SourceSpan,
+    spans: FieldPathSpans,
     scopes: SchemaScopes,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -19286,19 +20821,37 @@ fn check_field_path(
     if !schemas.class_exists(schema) {
         return FieldPathCheck::SchemaNotIndexed;
     }
-    if let Err(message) = schemas.resolve_field_path(schema, path) {
-        diagnostics.push(Diagnostic {
+    if let Err(error) = schemas.resolve_field_path(schema, path) {
+        let suggestion = error.suggestion(
+            "use a field declared on the bound schema or add it to the class declaration",
+        );
+        let FieldPathError {
+            index,
+            message,
+            schema: failed_on,
+            ..
+        } = error;
+        let diagnostic = Diagnostic {
+            code: diagnostic_code!("type.unknown_field"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span,
+            // The caret goes under the segment that did not resolve, not under
+            // the whole path: `issue.prioirty` is wrong at `prioirty`, and
+            // underlining `issue` too says the binding is the mistake.
+            span: spans.field(index),
             message: format!(
                 "rule `{}` has invalid field path `{root}.{}`: {message}",
                 rule.name.name,
                 path.join(".")
             ),
-            suggestion: Some(
-                "use a field declared on the bound schema or add it to the class declaration"
-                    .to_owned(),
-            ),
+            suggestion: Some(suggestion),
+        };
+        // The class named in the message is the one whose fields the reader has
+        // to consult, and for a nested path it is NOT the one they can see at
+        // the binding.
+        diagnostics.push(match &failed_on {
+            Some(failed_on) => declared_here(diagnostic, failed_on, schemas),
+            None => diagnostic,
         });
     }
     FieldPathCheck::Resolved
@@ -19307,13 +20860,21 @@ fn check_field_path(
 fn validate_known_field_paths_in_index(
     rule: &RuleDecl,
     line: &str,
-    span: SourceSpan,
+    anchor: BodyAnchor,
     scopes: SchemaScopes,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (root, path) in dotted_paths(line) {
-        check_field_path(rule, &root, &path, span, scopes, binding_types, diagnostics);
+    for dotted in dotted_paths(line) {
+        check_field_path(
+            rule,
+            &dotted.root,
+            &dotted.path(),
+            FieldPathSpans::scanned(anchor, &dotted),
+            scopes,
+            binding_types,
+            diagnostics,
+        );
     }
 }
 
@@ -19427,6 +20988,7 @@ fn validate_sealed_effect_inputs(
                     }
                     let targets = dotted_paths(source)
                         .into_iter()
+                        .map(DottedPath::into_pair)
                         .chain(roots.into_iter().map(|root| (root, Vec::new())));
                     for (root, path) in targets {
                         let Some(root_schema) = binding_types.get(&root) else {
@@ -19475,6 +21037,8 @@ fn validate_sealed_effect_inputs(
                 }
                 for (at, payload) in found {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.sealed_value_crossing"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: effect.span,
                         message: format!(
@@ -19530,7 +21094,264 @@ fn validate_sealed_effect_inputs(
     }
 }
 
-fn dotted_paths(line: &str) -> Vec<(String, Vec<String>)> {
+/// Where one `<field> <value>` assignment was written, so a diagnostic about the
+/// FIELD and one about the VALUE do not land on the same token.
+///
+/// "class `HumanDecision` has no field `extra`" is about the name; "field
+/// `HumanDecision.confidence` expects `float`" is about what was written on the
+/// right of it. Reporting both at one span was the honest thing to do while
+/// neither had a position; with both in hand, conflating them would be a new
+/// kind of wrong.
+#[derive(Clone, Copy)]
+struct AssignmentAnchor<'a> {
+    field: BodyAnchor<'a>,
+    value: BodyAnchor<'a>,
+}
+
+/// Why a `<root>.<a>.<b>` read did not resolve, and *which* segment of it did
+/// not.
+///
+/// The message alone was enough while every field-path diagnostic reported at
+/// the enclosing rule body. Once the caller can place a caret, it needs to know
+/// that the failure is at `b` and not at `root` — otherwise a precise span is
+/// precisely wrong.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FieldPathError {
+    /// Index into the path of the segment that failed to resolve.
+    index: usize,
+    /// Unchanged from when this was a bare `String`, so no fixture wording
+    /// moved when the type did.
+    message: String,
+    /// The closest field declared on the schema that actually failed, if one is
+    /// close enough to be worth naming (D4). Carried on the error rather than
+    /// recomputed by the caller because only this function knows WHICH hop of a
+    /// nested path failed, and so which class's fields are the candidates.
+    did_you_mean: Option<String>,
+    /// The schema the lookup failed ON — the last hop reached, not the path's
+    /// root. For `invoice.customer.emial` the caller wants `Customer` declared
+    /// here, not `Invoice`, and only the resolver walking the path knows which
+    /// that is. `None` for a failure that is not about a schema's fields.
+    schema: Option<String>,
+}
+
+impl FieldPathError {
+    fn at(index: usize, message: String) -> Self {
+        Self {
+            index,
+            message,
+            did_you_mean: None,
+            schema: None,
+        }
+    }
+
+    /// A failure the resolver can name a candidate for.
+    fn at_field(index: usize, message: String, did_you_mean: Option<String>, schema: &str) -> Self {
+        Self {
+            index,
+            message,
+            did_you_mean,
+            schema: Some(schema.to_owned()),
+        }
+    }
+
+    /// The site's own suggestion, prefixed with a candidate when there is one.
+    /// With no candidate the hand-written text stands alone: a fallback that
+    /// tells the author how to declare the field is not worth trading for a
+    /// suggestion that is only sometimes there.
+    fn suggestion(&self, fallback: &str) -> String {
+        match &self.did_you_mean {
+            Some(name) => format!("did you mean `{name}`? otherwise {fallback}"),
+            None => fallback.to_owned(),
+        }
+    }
+}
+
+/// How a caller of [`check_field_path`] wants a failure inside a field path
+/// placed.
+///
+/// A caller that found the path by scanning source text can underline the
+/// offending segment; one holding a line it rebuilt from an AST node has no
+/// offsets to give and says so, rather than inventing them.
+#[derive(Clone, Copy)]
+struct FieldPathSpans<'a> {
+    anchor: BodyAnchor<'a>,
+    scanned: Option<&'a DottedPath>,
+}
+
+impl<'a> FieldPathSpans<'a> {
+    /// `path` as scanned out of the fragment `anchor` describes.
+    fn scanned(anchor: BodyAnchor<'a>, path: &'a DottedPath) -> Self {
+        Self {
+            anchor,
+            scanned: Some(path),
+        }
+    }
+
+    /// Where a failure at `index` in the path belongs.
+    fn field(self, index: usize) -> SourceSpan {
+        match self.scanned {
+            Some(path) => self.anchor.at(path.field_range(index)),
+            None => self.anchor.whole(),
+        }
+    }
+}
+
+/// Where a fragment of text a checker is scanning lives, so a diagnostic about
+/// a token inside it can name the token instead of the block that contains it.
+///
+/// The rule-body checks scan raw text line by line — deliberately, because
+/// `Expr` carries no spans and an AST walk cannot reach inside an expression.
+/// A line scanner therefore has to carry the one fact a precise span needs:
+/// where the fragment it was handed starts in the body text. `BlockSource`
+/// already knows how to turn a body offset into a file span (and how to degrade
+/// when the body was rewritten), so an anchor is just that offset plus the body
+/// to resolve it against.
+#[derive(Clone, Copy)]
+struct BodyAnchor<'a> {
+    /// The body the fragment is a slice of, or `None` when the fragment was
+    /// synthesized (a line rebuilt from an AST node, a `when` clause) and no
+    /// offset into it is a source position.
+    body: Option<&'a BlockSource>,
+    /// Byte offset of the fragment within that body's `text`.
+    base: usize,
+    /// Byte length of the fragment, so `whole()` can span it.
+    len: usize,
+    /// The span every offset degrades to.
+    fallback: SourceSpan,
+}
+
+impl<'a> BodyAnchor<'a> {
+    /// A fragment with no source position of its own: every offset in it
+    /// reports at `span`.
+    fn fixed(span: SourceSpan) -> Self {
+        Self {
+            body: None,
+            base: 0,
+            len: 0,
+            fallback: span,
+        }
+    }
+
+    /// The whole of a rule body, reported at the block span. The honest anchor
+    /// for a finding that is about the rule rather than about a token.
+    fn rule(rule: &'a RuleDecl) -> Self {
+        Self::fixed(rule.body.span)
+    }
+
+    /// `body.text[base..base + len]`.
+    fn slice(body: &'a BlockSource, base: usize, len: usize) -> Self {
+        Self {
+            body: Some(body),
+            base,
+            len,
+            fallback: body.span,
+        }
+    }
+
+    /// The fragment `text` starting at `base` in `body.text`.
+    fn text(body: &'a BlockSource, base: usize, text: &str) -> Self {
+        Self::slice(body, base, text.len())
+    }
+
+    /// Whether `range` is a position INSIDE this fragment.
+    ///
+    /// A caller can hand over a range measured against text that is not the
+    /// fragment — a value string synthesized for a shorthand record field is
+    /// `<binding>.<field>` while the anchor is only the `<field>` the author
+    /// wrote — and such a range means nothing here. Resolving it anyway walks
+    /// off the end of the fragment and underlines whatever source happens to
+    /// follow.
+    fn holds(&self, range: &Range<usize>) -> bool {
+        range.start <= range.end && range.end <= self.len
+    }
+
+    /// The anchor for `fragment[range]`, so a scanner that hands a sub-fragment
+    /// to another scanner keeps the provenance.
+    fn sub(self, range: Range<usize>) -> Self {
+        match self.body {
+            Some(body) if self.holds(&range) => {
+                Self::slice(body, self.base + range.start, range.len())
+            }
+            // Not a position in this fragment, so nothing narrower than the
+            // fallback is true of it — see `holds`.
+            _ => Self::fixed(self.fallback),
+        }
+    }
+
+    /// The span of `fragment[range]`, degrading to the fallback when the body
+    /// has no source position for it — or when `range` is not a position in
+    /// this fragment at all.
+    ///
+    /// Degrading rather than clamping, deliberately. Clamping a range that
+    /// overruns the fragment turns a badly-wrong caret into a slightly-wrong
+    /// one, which still points at text the finding is not about; the coarse
+    /// span at least says only true things. That is the trade the whole D2
+    /// series has made.
+    fn at(self, range: Range<usize>) -> SourceSpan {
+        match self.body {
+            Some(body) if !range.is_empty() && self.holds(&range) => {
+                body.span_of(self.base + range.start..self.base + range.end)
+            }
+            _ => self.fallback,
+        }
+    }
+
+    /// The span of the whole fragment.
+    fn whole(self) -> SourceSpan {
+        self.at(0..self.len)
+    }
+}
+
+/// One `a.b.c` read found by scanning raw text, and where each of its segments
+/// sits inside that text.
+///
+/// The offsets are the whole reason this is a struct rather than the
+/// `(String, Vec<String>)` pair it used to be. A field-path diagnostic is the
+/// highest-traffic error in the language, and without them the only span a
+/// caller could report was its own — the enclosing rule body — so
+/// "schema `Task` has no field `titel`" underlined the rule's `=> {` arrow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DottedPath {
+    root: String,
+    /// Byte offset of `root` within the scanned text.
+    root_at: usize,
+    /// Each `.field` after the root, with its own byte offset. Never empty — a
+    /// bare identifier is not a path and is not yielded.
+    fields: Vec<(String, usize)>,
+}
+
+impl DottedPath {
+    /// The field names alone, for the checks that resolve a path rather than
+    /// point at one.
+    fn path(&self) -> Vec<String> {
+        self.fields.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// The pair this used to be, for a caller with no use for offsets.
+    fn into_pair(self) -> (String, Vec<String>) {
+        let path = self.path();
+        (self.root, path)
+    }
+
+    /// Byte range of the whole `root.a.b` path within the scanned text.
+    fn range(&self) -> Range<usize> {
+        let end = self
+            .fields
+            .last()
+            .map_or(self.root_at + self.root.len(), |(name, at)| at + name.len());
+        self.root_at..end
+    }
+
+    /// Byte range of the `index`-th field segment (`0` is the first `.field`),
+    /// falling back to the whole path when there is no such segment.
+    fn field_range(&self, index: usize) -> Range<usize> {
+        self.fields
+            .get(index)
+            .map_or_else(|| self.range(), |(name, at)| *at..at + name.len())
+    }
+}
+
+fn dotted_paths(line: &str) -> Vec<DottedPath> {
     let bytes = line.as_bytes();
     let mut paths = Vec::new();
     let mut index = 0;
@@ -19560,11 +21381,15 @@ fn dotted_paths(line: &str) -> Vec<(String, Vec<String>)> {
             while index < bytes.len() && is_ident_continue(bytes[index]) {
                 index += 1;
             }
-            fields.push(line[field_start..index].to_owned());
+            fields.push((line[field_start..index].to_owned(), field_start));
         }
 
         if !fields.is_empty() {
-            paths.push((root.to_owned(), fields));
+            paths.push(DottedPath {
+                root: root.to_owned(),
+                root_at: root_start,
+                fields,
+            });
         }
     }
 
@@ -19608,6 +21433,8 @@ fn validate_binding_name(
 ) {
     if RESERVED_BINDING_KEYWORDS.contains(&binding) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.reserved_name"),
+            severity: Severity::Error,
             related: Vec::new(),
             span,
             message: format!(
@@ -19621,34 +21448,405 @@ fn validate_binding_name(
     }
 }
 
-fn closest_name<'a>(target: &str, candidates: impl Iterator<Item = &'a String>) -> Option<String> {
-    let target_lower = target.to_lowercase();
-    candidates
-        .map(|candidate| {
-            let distance = edit_distance(&target_lower, &candidate.to_lowercase());
-            (distance, candidate)
-        })
-        .filter(|(distance, candidate)| {
-            *distance <= 2 && *distance < target.len().min(candidate.len())
-        })
-        .min_by_key(|(distance, candidate)| (*distance, candidate.as_str().to_owned()))
-        .map(|(_, candidate)| candidate.clone())
+/// Which universe a did-you-mean's candidates come from. The two need DIFFERENT
+/// budgets, and one policy over both is what turned ordinary English words into
+/// confident suggestions of unrelated keywords.
+///
+/// The axis is where the candidates came from, not how many there are:
+///
+/// - [`Vocabulary::Declared`] — an OPEN universe of names the AUTHOR wrote:
+///   fields, classes, agents, workflows, rules, bindings, the literal values of
+///   a union they declared. The author typed the candidate minutes ago and is
+///   reaching for it again, so a near miss really is a slip of the fingers, and
+///   the budget can afford to be generous. A finite candidate list does not make
+///   a vocabulary closed — an enum's variants are still names their author
+///   chose.
+/// - [`Vocabulary::Language`] — a CLOSED set the LANGUAGE defines: statement
+///   verbs, declaration heads, clause heads, block field names, modes, units,
+///   provider ids. Here the token the author wrote is very often a real English
+///   word that is simply not in the language, and at two edits a real word
+///   reliably lands on an unrelated real word: `happen` on `append`, `create` on
+///   `curate`, `expect` and `report` both on `export`, `require` on `acquire`.
+///   None of those is a typo of anything, and each sends the reader to write a
+///   verb they never meant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Vocabulary {
+    Declared,
+    Language,
 }
 
+/// The largest edit distance that still reads as a *typo* rather than as a
+/// different word, for two names sharing `len` characters.
+///
+/// `len` is the length of the SHORTER of the two names being compared, never of
+/// the one the author wrote. Scaling by the author's name alone lets padding buy
+/// edits: `@bounded123` is eleven characters and would earn three edits against
+/// the seven-character `@bounded`. A budget is earned by the length the two
+/// names actually share.
+///
+/// The tiers are the whole of the "is this close enough" question — every other
+/// part of the policy is a refinement on top (see [`closest_in`]).
+fn suggestion_budget(vocabulary: Vocabulary, len: usize) -> usize {
+    let budget = match vocabulary {
+        // A name the author declared. Two edits in five characters is forty per
+        // cent of the name and reads as a different word rather than a slip:
+        // `title` is exactly two edits from `table`, and offering it sends the
+        // reader to change the wrong thing.
+        Vocabulary::Declared => match len {
+            0..=5 => 1,
+            6..=9 => 2,
+            _ => 3,
+        },
+        // ONE edit, at every length, and none at all below four shared
+        // characters. Justified by a sweep, not by taste: 184 common English
+        // words against all 23 closed vocabularies (see
+        // `closed_vocabularies_do_not_suggest_for_common_english`).
+        //
+        // Two edits is where a closed vocabulary breaks. The same sweep under
+        // the `Declared` tiers produces twelve suggestions that are a different
+        // word rather than a typo, all of them from the 6..=9 tier's second
+        // edit, and every one of them survives no matter which words are in the
+        // list — the vocabulary is small and English is dense.
+        //
+        // The four-character floor is the other half. At three characters one
+        // edit is a third of the word, and every short English word has a
+        // neighbour in any vocabulary: `say`, `way` and `pay` all reach `day`,
+        // `all` reaches `call`, `one` reaches both `done` and `none`, `us`
+        // reaches `use`. It costs the genuine typo of a three-letter keyword
+        // (`dya` no longer reaches `day`), which is a real loss and a small one:
+        // the fallback at every one of these sites already enumerates the whole
+        // domain, so the reader is one line away from the answer, whereas a
+        // wrong suggestion sends them somewhere else entirely.
+        Vocabulary::Language => usize::from(len >= 4),
+    };
+    // A typo is always a smaller edit than rewriting the shorter name outright.
+    budget.min(len.saturating_sub(1))
+}
+
+/// The closest name the AUTHOR declared, or `None` when nothing is close enough.
+/// See [`closest_in`]; this is the open half of the policy.
+pub(crate) fn closest_name<S, I>(target: &str, candidates: I) -> Option<String>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    closest_in(target, candidates, Vocabulary::Declared)
+}
+
+/// The closest word the LANGUAGE defines, or `None` when nothing is close
+/// enough. See [`closest_in`]; this is the closed half of the policy, and it is
+/// deliberately much quieter than [`closest_name`].
+pub(crate) fn closest_keyword<S, I>(target: &str, candidates: I) -> Option<String>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    closest_in(target, candidates, Vocabulary::Language)
+}
+
+/// The closest candidate to `target`, or `None` when nothing is close enough.
+///
+/// ONE policy for every did-you-mean site in the compiler, parameterized on the
+/// one axis that genuinely differs ([`Vocabulary`]), because a suggestion that
+/// means something different in two places is worse than no suggestion:
+///
+/// - **A length-scaled budget** ([`suggestion_budget`]) over the SHORTER of the
+///   two names, capped at that length minus one so a typo is always a smaller
+///   edit than rewriting the shorter name outright. Padding a name does not buy
+///   it edits.
+/// - **Transposition costs one edit** ([`edit_distance`] is the restricted
+///   Damerau/OSA variant), because swapping two keys is the dominant human typo
+///   and plain Levenshtein charges it double — which is exactly what pushes
+///   `piroity` out of budget for `priority`.
+/// - **Case folding, on the OPEN axis only.** `Priority` and `priority` are the
+///   same mistake among names the author declared, in a language whose classes
+///   are `UpperCamel` and whose fields are `snake_case`, so both sides are
+///   folded and the candidate comes back in its declared casing. In a closed
+///   vocabulary casing is load-bearing rather than incidental: every keyword is
+///   lowercase, and an `UpperCamel` token in keyword position is a class name a
+///   recovery cascade dragged there, not a misspelling. So the closed axis
+///   compares case-sensitively AND refuses a candidate that differs from the
+///   token by case alone — otherwise a class called `Record` appearing where a
+///   statement was expected is told it means the verb `record`.
+/// - **Deterministic tie-breaking** on `(distance, candidate)`, so two equally
+///   close candidates always give the same answer regardless of whether the
+///   universe arrived as a sorted map or an unordered `Vec`. A diagnostic that
+///   changes between runs is worse than one that suggests nothing.
+/// - **Never the name the author already wrote.** A site may route a name here
+///   after rejecting it for a reason other than spelling (kind, scope,
+///   ownership); telling the author to write what they wrote is noise.
+/// - **Silence when the best candidate is far.** A wrong suggestion costs more
+///   than no suggestion — it sends the reader to edit the wrong thing —
+///   and `spec/error-handling.md` "Suggestions And Fixits" asks for one
+///   high-confidence suggestion over a list of vague possibilities. So: one
+///   candidate, never a list, and `None` rather than a guess.
+///
+/// This helper may never decide whether a diagnostic EXISTS — only what it says.
+/// The one site that ever wanted that owns its own threshold
+/// ([`SEMANTIC_TAG_NEAR_MISS_EDITS`]), so that retuning suggestion wording here
+/// cannot silently delete a warning.
+pub(crate) fn closest_in<S, I>(
+    target: &str,
+    candidates: I,
+    vocabulary: Vocabulary,
+) -> Option<String>
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    let fold = vocabulary == Vocabulary::Declared;
+    let measured_target = if fold {
+        target.to_lowercase()
+    } else {
+        target.to_owned()
+    };
+    let target_len = measured_target.chars().count();
+    let mut best: Option<(usize, String)> = None;
+    for candidate in candidates {
+        let candidate = candidate.as_ref();
+        if candidate == target {
+            return None;
+        }
+        // Closed vocabulary: a token that differs from a keyword only in case is
+        // a name, not a slip. Folding here is what suggested the verb `record`
+        // for a class called `Record`.
+        if !fold && candidate.to_lowercase() == target.to_lowercase() {
+            continue;
+        }
+        let measured_candidate = if fold {
+            candidate.to_lowercase()
+        } else {
+            candidate.to_owned()
+        };
+        let candidate_len = measured_candidate.chars().count();
+        let shared = target_len.min(candidate_len);
+        let ceiling = suggestion_budget(vocabulary, shared);
+        let distance = edit_distance(&measured_target, &measured_candidate);
+        // On the open axis a pure case difference is distance 0 and passes even
+        // a ceiling of 0, which is what makes `Priority` reachable from
+        // `priority`.
+        if distance > ceiling {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_distance, best_name)) => {
+                (distance, candidate) < (*best_distance, best_name.as_str())
+            }
+        };
+        if better {
+            best = Some((distance, candidate.to_owned()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// Restricted Damerau-Levenshtein (optimal string alignment): insertion,
+/// deletion, and substitution cost one, and so does transposing two adjacent
+/// characters. Three rows rather than two, which is the whole cost of counting
+/// `ab` -> `ba` as the single edit a reader would call it.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    let mut two_back = vec![0usize; b.len() + 1];
     let mut previous: Vec<usize> = (0..=b.len()).collect();
     let mut current = vec![0usize; b.len() + 1];
-    for (i, a_char) in a.iter().enumerate() {
+    for i in 0..a.len() {
         current[0] = i + 1;
-        for (j, b_char) in b.iter().enumerate() {
-            let substitution = previous[j] + usize::from(a_char != b_char);
-            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        for j in 0..b.len() {
+            let substitution = previous[j] + usize::from(a[i] != b[j]);
+            let mut best = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+            if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
+                best = best.min(two_back[j - 1] + 1);
+            }
+            current[j + 1] = best;
         }
+        // Rotate the three rows; `current` becomes the scratch row for the next
+        // pass and is fully overwritten before it is read.
+        std::mem::swap(&mut two_back, &mut previous);
         std::mem::swap(&mut previous, &mut current);
     }
     previous[b.len()]
+}
+
+/// Point a diagnostic that rejects a name at where the schema it rejected the
+/// name FOR is declared: "`Issue` is declared here".
+///
+/// The message already names the schema; what it does not give is a location, so
+/// a reader who wants to see the field list has to go and find the declaration.
+/// Silent for a kernel-owned builtin, which has no source to point at — an
+/// absent note is the honest answer there, not a note aimed at line 1.
+fn declared_here(diagnostic: Diagnostic, schema: &str, schemas: &SchemaIndex) -> Diagnostic {
+    match schemas.decl_span(schema) {
+        // A note landing on the caret the reader is already on says nothing.
+        Some(span) if span.start != diagnostic.span.start => {
+            diagnostic.with_related(span, format!("`{schema}` is declared here"))
+        }
+        _ => diagnostic,
+    }
+}
+
+/// WHICH type a `type_declared_here` note is pointing at, so the label can say
+/// something the source at that span actually supports.
+///
+/// A collection type is checked by descending into it: `tags string[]` is
+/// checked one element at a time against `string`, and `metadata map<string>`
+/// one value at a time. The descent keeps the OUTER field's name — the messages
+/// need it — but the type in hand, and therefore the SPAN, is now the inner one.
+/// Labelling that with the plain sentence produced three notes in the corpus
+/// that the source flatly contradicts: "`tags` is declared `string` here"
+/// pointing at the `string` inside `string[]`, and "`metadata` is declared
+/// `string` here" pointing inside `map<string>`. The third named a map KEY
+/// (`phase`) as if it were a declared field.
+///
+/// So the anchor travels with the type, and each variant has a sentence that is
+/// true of the span it lands on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TypeAnchor<'a> {
+    /// The type in hand is the field's declared type, verbatim.
+    Field(&'a str),
+    /// The type in hand is the ELEMENT type of the field's declared array.
+    Element(&'a str),
+    /// The type in hand is the VALUE type of the field's declared map.
+    MapValue(&'a str),
+}
+
+impl<'a> TypeAnchor<'a> {
+    /// The label for a note landing on `ty`'s own span.
+    fn label(self, ty: &TypeSyntax) -> String {
+        let declared = ty.to_source();
+        match self {
+            Self::Field(field) => format!("`{field}` is declared `{declared}` here"),
+            Self::Element(field) => format!("`{field}` elements are declared `{declared}` here"),
+            Self::MapValue(field) => format!("`{field}` values are declared `{declared}` here"),
+        }
+    }
+
+    /// Descend into an array element. The field NAME is kept; only the claim
+    /// about it weakens.
+    fn element(self) -> Self {
+        Self::Element(self.field())
+    }
+
+    /// Descend into a map value.
+    fn map_value(self) -> Self {
+        Self::MapValue(self.field())
+    }
+
+    fn field(self) -> &'a str {
+        match self {
+            Self::Field(field) | Self::Element(field) | Self::MapValue(field) => field,
+        }
+    }
+}
+
+/// Point a type mismatch at where the field's type is DECLARED: "`priority` is
+/// declared `int` here".
+///
+/// The message says what was expected; the note says who decided that, which is
+/// the line the author edits if the expectation is the thing that is wrong.
+/// Silent for a type with no source position — the kernel-owned builtin schemas
+/// build their fields from `zero_span`, and a note at offset 0 would send the
+/// reader to the first character of the file.
+fn type_declared_here(
+    diagnostic: Diagnostic,
+    anchor: TypeAnchor<'_>,
+    ty: &TypeSyntax,
+) -> Diagnostic {
+    let declared_at = ty.span();
+    if declared_at == zero_span() || declared_at.start == diagnostic.span.start {
+        return diagnostic;
+    }
+    diagnostic.with_related(declared_at, anchor.label(ty))
+}
+
+/// "did you mean `x`? otherwise <fallback>" — the author may legitimately have
+/// meant a name that does not exist yet, and the fallback tells them how to
+/// declare it. With no candidate the fallback stands alone, unchanged: a
+/// hand-written suggestion is never lost to gain a sometimes-absent one.
+///
+/// Candidates are names the author DECLARED ([`Vocabulary::Declared`]); an
+/// "otherwise declare it" fallback only makes sense for that universe.
+pub(crate) fn suggest_otherwise<S, I>(
+    target: &str,
+    candidates: I,
+    fallback: impl Into<String>,
+) -> String
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    let fallback = fallback.into();
+    match closest_name(target, candidates) {
+        Some(name) => format!("did you mean `{name}`? otherwise {fallback}"),
+        None => fallback,
+    }
+}
+
+/// "did you mean `x`? <domain>" — where the fallback already enumerates every
+/// legal value and there is nothing to declare, so "otherwise" would be a lie.
+///
+/// Candidates are still names the author DECLARED ([`Vocabulary::Declared`]) —
+/// an enum's variants, a class's fields, the rules of this program. The list
+/// being finite is not what makes a vocabulary closed; use
+/// [`suggest_then_keyword`] when the language, not the author, chose the words.
+pub(crate) fn suggest_then<S, I>(target: &str, candidates: I, domain: impl Into<String>) -> String
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    let domain = domain.into();
+    match closest_name(target, candidates) {
+        Some(name) => format!("did you mean `{name}`? {domain}"),
+        None => domain,
+    }
+}
+
+/// A closed vocabulary as English prose: `a, b, and c` (or `or`), never a bare
+/// comma-separated dump.
+///
+/// Generating a list from the table it describes is what stops it going stale,
+/// but a generated list is not automatically as good as the hand-written one it
+/// replaces. The conjunction is the part that carries meaning: without it a
+/// reader cannot tell whether the list is exhaustive or merely the beginning of
+/// one, and "`compaction`, `thread`, `settings`" reads like a fragment where
+/// "`compaction`, `thread`, and `settings`" reads like the whole vocabulary.
+pub(crate) fn prose_list<S, I>(items: I, conjunction: &str) -> String
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    let items = items
+        .into_iter()
+        .map(|item| item.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    match items.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, [first])) => format!("{first} {conjunction} {last}"),
+        Some((last, rest)) => format!("{}, {conjunction} {last}", rest.join(", ")),
+    }
+}
+
+/// [`suggest_then`] over a CLOSED vocabulary the LANGUAGE defines
+/// ([`Vocabulary::Language`]) — statement verbs, declaration heads, clause
+/// heads, modes, units, provider ids. Same sentence, much tighter threshold; see
+/// [`Vocabulary`] for why the two cannot share one.
+///
+/// `pub` because the closed vocabularies do not all live in this crate: the
+/// agent-provider kinds come from package manifests and are only assembled in
+/// the CLI's whole-program pass. A did-you-mean there has to be THIS policy
+/// rather than a second one, or the same near miss gets two answers.
+pub fn suggest_then_keyword<S, I>(target: &str, words: I, domain: impl Into<String>) -> String
+where
+    S: AsRef<str>,
+    I: IntoIterator<Item = S>,
+{
+    let domain = domain.into();
+    match closest_keyword(target, words) {
+        Some(name) => format!("did you mean `{name}`? {domain}"),
+        None => domain,
+    }
 }
 
 fn fact_read_from_when(when: &str) -> String {
@@ -19679,19 +21877,24 @@ fn parse_record_start(line: &str) -> Option<(String, Option<String>)> {
     Some((schema, from_binding))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_record_field(
     rule: &RuleDecl,
     line: &str,
+    site: AssignmentAnchor,
     record_schema: &str,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let at = site.value;
     let Some((field, expr)) = record_field_assignment(line) else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.invalid_field_assignment"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: site.field.whole(),
             message: format!(
                 "rule `{}` has malformed field assignment in `record {record_schema}`",
                 rule.name.name
@@ -19705,24 +21908,33 @@ fn validate_record_field(
         return;
     };
     let Some(field_ty) = fields.get(field) else {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: rule.body.span,
-            message: format!("class `{record_schema}` has no field `{field}`"),
-            suggestion: Some(format!(
-                "add `{field}` to `class {record_schema}` or record an existing field"
-            )),
-        });
+        diagnostics.push(declared_here(
+            Diagnostic {
+                code: diagnostic_code!("type.unknown_field"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: site.field.whole(),
+                message: format!("class `{record_schema}` has no field `{field}`"),
+                suggestion: Some(suggest_otherwise(
+                    field,
+                    fields.keys(),
+                    format!("add `{field}` to `class {record_schema}` or record an existing field"),
+                )),
+            },
+            record_schema,
+            &semantic.schemas,
+        ));
         return;
     };
 
-    if let Some((root, path)) = expression_path(expr) {
+    if let Some(dotted) = expression_dotted_path(expr) {
+        let (root, path) = (dotted.root.clone(), dotted.path());
         // Local scopes only, for the same reason as the terminal payload above.
         match check_field_path(
             rule,
             &root,
             &path,
-            rule.body.span,
+            FieldPathSpans::scanned(at, &dotted),
             SchemaScopes::local(&semantic.schemas),
             binding_types,
             diagnostics,
@@ -19737,16 +21949,19 @@ fn validate_record_field(
             FieldPathCheck::Unbound => {
                 if let Some(root) = dangling_value_root(expr, known_roots) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_binding"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: at.whole(),
                         message: format!(
                             "rule `{}` has unknown binding `{root}` in `record {record_schema}` field `{field}`",
                             rule.name.name
                         ),
-                        suggestion: Some(
-                            "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(suggest_binding_root(
+                            &root,
+                            known_roots,
+                            BINDING_ROOT_FALLBACK,
+                        )),
                     });
                 }
             }
@@ -19754,7 +21969,7 @@ fn validate_record_field(
     }
 
     validate_literal_assignment(
-        rule,
+        at,
         record_schema,
         field,
         field_ty,
@@ -19764,6 +21979,7 @@ fn validate_record_field(
     );
     validate_expected_assignment(
         rule,
+        at,
         record_schema,
         field,
         field_ty,
@@ -19785,6 +22001,28 @@ fn record_field_assignment(line: &str) -> Option<(&str, &str)> {
 /// external-event payload and the coerce prompt context. An explicit allowlist
 /// so genuine typos are still caught.
 const SPECIAL_VALUE_ROOTS: &[&str] = &["external", "ctx"];
+
+/// The repair for a dangling value-position root, shared by the six sites that
+/// reject one so the advice cannot drift between them.
+const BINDING_ROOT_FALLBACK: &str = "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern";
+
+/// The did-you-mean for a value-position root that names nothing.
+///
+/// Six sites reject a dangling root — terminal payloads, coerce arguments,
+/// invoke inputs, tell targets, record fields, bare operands — and they share
+/// ONE universe: the bindings this rule body introduces, plus the special roots
+/// above. Composed here rather than at each site so the six cannot drift into
+/// suggesting from six slightly different sets.
+fn suggest_binding_root(root: &str, known_roots: &BTreeSet<String>, fallback: &str) -> String {
+    suggest_otherwise(
+        root,
+        known_roots
+            .iter()
+            .map(String::as_str)
+            .chain(SPECIAL_VALUE_ROOTS.iter().copied()),
+        fallback,
+    )
+}
 
 /// Collects every binding NAME a rule body introduces, from the parsed AST so it
 /// is robust to multi-line prompts and nesting (the line-based effect collectors
@@ -19849,13 +22087,14 @@ fn validate_source_emit_signal_declared(
 ) {
     let signal = &source.emit.signal;
     if signal.contains('.') && !declared_signals.contains(signal) {
-        let suggestion = match closest_name(signal, declared_signals.iter()) {
-            Some(candidate) => {
-                format!("did you mean `{candidate}`? otherwise declare `signal {signal} {{ ... }}`")
-            }
-            None => format!("declare `signal {signal} {{ ... }}` so rules can react to it"),
-        };
+        let suggestion = suggest_otherwise(
+            signal,
+            declared_signals.iter(),
+            format!("declare `signal {signal} {{ ... }}` so rules can react to it"),
+        );
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_signal"),
+            severity: Severity::Error,
             related: Vec::new(),
             span: source.emit.signal_span,
             message: format!(
@@ -19897,6 +22136,8 @@ fn validate_source_emit_signal_declared(
         if let [field] = segments.as_slice() {
             if !fields.contains(&field.name.as_str()) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_field"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: field.span,
                     message: format!(
@@ -19907,9 +22148,10 @@ fn validate_source_emit_signal_declared(
                         source.provider.name,
                         field.name
                     ),
-                    suggestion: Some(format!(
-                        "available observation fields: {}",
-                        fields.join(", ")
+                    suggestion: Some(suggest_then_keyword(
+                        &field.name,
+                        fields.iter().copied(),
+                        format!("available observation fields: {}", fields.join(", ")),
                     )),
                 });
             }
@@ -19928,6 +22170,8 @@ fn validate_source_emit_signal_declared(
             };
             if &binding.name != observe {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.unknown_binding"),
+                    severity: Severity::Error,
                     related: Vec::new(),
                     span: *span,
                     message: format!(
@@ -19943,15 +22187,18 @@ fn validate_source_emit_signal_declared(
             if let Some(obs_field) = segments.first() {
                 if !fields.contains(&obs_field.name.as_str()) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_field"),
+                        severity: Severity::Error,
                         related: Vec::new(),
                         span: obs_field.span,
                         message: format!(
                             "source `{}` emit reads `{}.{}`, but a `{}` source's observation has no field `{}`",
                             source.name.name, observe, obs_field.name, source.provider.name, obs_field.name
                         ),
-                        suggestion: Some(format!(
-                            "available observation fields: {}",
-                            fields.join(", ")
+                        suggestion: Some(suggest_then_keyword(
+                            &obs_field.name,
+                            fields.iter().copied(),
+                            format!("available observation fields: {}", fields.join(", ")),
                         )),
                     });
                 }
@@ -19980,15 +22227,21 @@ fn validate_emit_signal_declarations(
                 if let body::BodyEffectKind::Notify { event, .. } = &effect.kind {
                     if !declared_signals.contains(event) {
                         diagnostics.push(Diagnostic {
+                            code: diagnostic_code!("type.unknown_signal"),
+                            severity: Severity::Error,
                             related: Vec::new(),
                             span: effect.span,
                             message: format!(
                                 "rule `{}` emits undeclared signal `{event}`",
                                 rule.name.name
                             ),
-                            suggestion: Some(format!(
-                                "declare `signal {event} {{ ... }}` so the emitted payload is typed and admissible, \
-                                 or check the signal name"
+                            suggestion: Some(suggest_otherwise(
+                                event,
+                                declared_signals.iter(),
+                                format!(
+                                    "declare `signal {event} {{ ... }}` so the emitted payload is typed and admissible, \
+                                     or check the signal name"
+                                ),
                             )),
                         });
                     }
@@ -20034,6 +22287,7 @@ fn validate_effect_field_roots(
                     if let Some(from) = from {
                         check_operand_root(
                             rule,
+                            effect.span,
                             &format!("emit `{event}` from"),
                             from,
                             known_roots,
@@ -20042,6 +22296,7 @@ fn validate_effect_field_roots(
                     }
                     check_operand_root(
                         rule,
+                        effect.span,
                         &format!("emit `{event}` target"),
                         target_expr,
                         known_roots,
@@ -20076,7 +22331,14 @@ fn validate_effect_field_roots(
                     );
                 }
                 body::BodyEffectKind::TrackerFinish { item, fields } => {
-                    check_operand_root(rule, "finish item", item, known_roots, diagnostics);
+                    check_operand_root(
+                        rule,
+                        effect.span,
+                        "finish item",
+                        item,
+                        known_roots,
+                        diagnostics,
+                    );
                     check_field_value_roots(rule, "finish", fields, known_roots, diagnostics);
                 }
                 body::BodyEffectKind::LedgerAppend { ledger, fields, .. } => {
@@ -20093,6 +22355,7 @@ fn validate_effect_field_roots(
                 } => {
                     check_operand_root(
                         rule,
+                        effect.span,
                         &format!("acquire `{resource}` key"),
                         key_expr,
                         known_roots,
@@ -20106,6 +22369,7 @@ fn validate_effect_field_roots(
                 } => {
                     check_operand_root(
                         rule,
+                        effect.span,
                         &format!("consume `{counter}` key"),
                         key_expr,
                         known_roots,
@@ -20113,6 +22377,7 @@ fn validate_effect_field_roots(
                     );
                     check_operand_root(
                         rule,
+                        effect.span,
                         &format!("consume `{counter}` amount"),
                         amount_expr,
                         known_roots,
@@ -20159,22 +22424,27 @@ fn dangling_value_root(value: &str, known_roots: &BTreeSet<String>) -> Option<St
 /// as the field/record validators.
 fn check_operand_root(
     rule: &RuleDecl,
+    at: SourceSpan,
     context: &str,
     operand: &str,
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if let Some(root) = dangling_value_root(operand, known_roots) {
-        diagnostics.push(Diagnostic { related: Vec::new(),
-            span: rule.body.span,
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_binding"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: at,
             message: format!(
                 "rule `{}` has unknown binding `{root}` in {context} `{operand}`",
                 rule.name.name
             ),
-            suggestion: Some(
-                "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                    .to_owned(),
-            ),
+            suggestion: Some(suggest_binding_root(
+                &root,
+                known_roots,
+                BINDING_ROOT_FALLBACK,
+            )),
         });
     }
 }
@@ -20190,16 +22460,20 @@ fn check_field_value_roots(
         match &field.value {
             body::FieldValue::Expr { source, .. } => {
                 if let Some(root) = dangling_value_root(source, known_roots) {
-                    diagnostics.push(Diagnostic { related: Vec::new(),
-                        span: rule.body.span,
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.unknown_binding"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        span: field.span,
                         message: format!(
                             "rule `{}` has unknown binding `{root}` in {context} field `{}`",
                             rule.name.name, field.name
                         ),
-                        suggestion: Some(
-                            "reference a binding from a `when ... as name` clause, an effect `as` binding, or a `case` pattern"
-                                .to_owned(),
-                        ),
+                        suggestion: Some(suggest_binding_root(
+                            &root,
+                            known_roots,
+                            BINDING_ROOT_FALLBACK,
+                        )),
                     });
                 }
             }
@@ -20226,16 +22500,22 @@ fn validate_record_blocks(
     known_roots: &BTreeSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (schema, from_binding, body) in record_blocks(&rule.body.text) {
+    for (schema, from_binding, block) in record_blocks(&rule.body.text) {
+        let Some(body) = rule.body.text.get(block.clone()) else {
+            continue;
+        };
+        let block_anchor = BodyAnchor::text(&rule.body, block.start, body);
         // A token where a field NAME was expected is a value the author wrote
         // that nothing consumes. The splitter skips it silently, so
         // `record Out { title  "hello" }` compiled clean and recorded the
         // shorthand's value instead of the literal — a different value than the
         // source says, with no diagnostic anywhere.
-        for stray in body::stray_value_tokens(&body) {
+        for (stray, stray_at) in body::stray_value_tokens(body) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("parse.invalid_field_assignment"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: block_anchor.at(stray_at),
                 message: format!(
                     "rule `{}` has a value with no field name in `record {schema}`: `{stray}`",
                     rule.name.name
@@ -20245,8 +22525,9 @@ fn validate_record_blocks(
                 )),
             });
         }
-        for assignment in collect_field_assignments(&body) {
-            let (field, value) = match assignment {
+        for site in collect_field_assignments(body) {
+            let at = assignment_anchor(block_anchor, &site);
+            let (field, value) = match site.assignment {
                 RecordFieldAssignment::Value { field, value } => (field, value),
                 RecordFieldAssignment::Shorthand { field } => {
                     let value = from_binding
@@ -20260,6 +22541,7 @@ fn validate_record_blocks(
             validate_record_field(
                 rule,
                 &line,
+                at,
                 &schema,
                 semantic,
                 binding_types,
@@ -20270,12 +22552,30 @@ fn validate_record_blocks(
     }
 }
 
-fn record_blocks(body: &str) -> Vec<(String, Option<String>, String)> {
+/// Place one assignment inside the block it was split out of.
+///
+/// A shorthand field has no value text, so its value diagnostics fall back to
+/// the field name — the only thing the author wrote.
+fn assignment_anchor<'a>(block: BodyAnchor<'a>, site: &RecordFieldSite) -> AssignmentAnchor<'a> {
+    let field = block.sub(site.field_at.clone());
+    AssignmentAnchor {
+        field,
+        value: site
+            .value_at
+            .clone()
+            .map_or(field, |value| block.sub(value)),
+    }
+}
+
+fn record_blocks(body: &str) -> Vec<(String, Option<String>, Range<usize>)> {
     let mut blocks = Vec::new();
-    let lines = body.lines().collect::<Vec<_>>();
+    let raw = body_line_offsets(body);
+    let lines = raw.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
-        let trimmed = lines[index].trim();
+        let (line, line_start) = raw[index];
+        let trimmed = line.trim();
+        let head = line_start + (line.len() - line.trim_start().len());
         let Some((schema, from_binding)) = parse_record_start(trimmed) else {
             index += 1;
             continue;
@@ -20286,29 +22586,34 @@ fn record_blocks(body: &str) -> Vec<(String, Option<String>, String)> {
         if brace_delta(trimmed) == 0 && trimmed.contains('{') {
             if let (Some(open), Some(close)) = (trimmed.find('{'), trimmed.rfind('}')) {
                 if close > open {
-                    blocks.push((
-                        schema,
-                        from_binding,
-                        trimmed[open + 1..close].trim().to_owned(),
-                    ));
+                    let inner = &trimmed[open + 1..close];
+                    let lead = inner.len() - inner.trim_start().len();
+                    let start = head + open + 1 + lead;
+                    blocks.push((schema, from_binding, start..start + inner.trim().len()));
                 }
             }
             index += 1;
             continue;
         }
         let mut depth = brace_delta(trimmed);
-        let mut record_lines = Vec::new();
+        // The block's fields are a CONTIGUOUS run of lines — the only line the
+        // old join dropped was the closing `}`, which is necessarily the last —
+        // so the block can be a byte range into the body rather than a copy,
+        // and every field inside it keeps a source position.
+        let mut span: Option<Range<usize>> = None;
         index += 1;
         while index < lines.len() && depth > 0 {
-            let line = lines[index];
+            let (line, line_start) = raw[index];
             let before = depth;
             depth += brace_delta(line);
             if !(before == 1 && depth == 0 && line.trim() == "}") {
-                record_lines.push(line.to_owned());
+                let range =
+                    span.as_ref().map_or(line_start, |range| range.start)..line_start + line.len();
+                span = Some(range);
             }
             index += 1;
         }
-        blocks.push((schema, from_binding, record_lines.join("\n")));
+        blocks.push((schema, from_binding, span.unwrap_or(head..head)));
     }
     blocks
 }
@@ -20373,12 +22678,15 @@ fn inline_terminal_block(rest: &str) -> Option<&str> {
     None
 }
 
-fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, String)> {
+fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, Range<usize>)> {
     let mut blocks = Vec::new();
-    let lines = body.lines().collect::<Vec<_>>();
+    let raw = body_line_offsets(body);
+    let lines = raw.iter().map(|(line, _)| *line).collect::<Vec<_>>();
     let mut index = 0usize;
     while index < lines.len() {
-        let trimmed = lines[index].trim();
+        let (line, line_start) = raw[index];
+        let trimmed = line.trim();
+        let head = line_start + (line.len() - line.trim_start().len());
         let mut consumed_following_lines = false;
         for (action, start) in terminal_actions_in_line(trimmed) {
             let rest = &trimmed[start..];
@@ -20396,30 +22704,36 @@ fn workflow_terminal_blocks(body: &str) -> Vec<(String, String, String)> {
             // are counted from the TERMINAL's own opening brace rather than from
             // the whole line's balance.
             if let Some(inner) = inline_terminal_block(rest) {
-                let terminal_lines = if inner.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![inner.to_owned()]
-                };
-                blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
+                let inner_at = rest
+                    .find('{')
+                    .map(|open| {
+                        let after = &rest[open + 1..];
+                        let lead = after.len() - after.trim_start().len();
+                        let at = head + start + open + 1 + lead;
+                        at..at + inner.len()
+                    })
+                    .unwrap_or(head..head);
+                blocks.push((action.to_owned(), name, inner_at));
                 continue;
             }
             // Otherwise the block continues onto the lines below; a terminal
             // whose payload spans lines is the only statement on its line, so
             // consuming them here cannot skip a sibling.
             let mut depth = brace_delta(rest);
-            let mut terminal_lines = Vec::new();
+            let mut span: Option<Range<usize>> = None;
             index += 1;
             while index < lines.len() && depth > 0 {
-                let line = lines[index];
+                let (line, line_start) = raw[index];
                 let before = depth;
                 depth += brace_delta(line);
                 if !(before == 1 && depth == 0 && line.trim() == "}") {
-                    terminal_lines.push(line.to_owned());
+                    let range = span.as_ref().map_or(line_start, |range| range.start)
+                        ..line_start + line.len();
+                    span = Some(range);
                 }
                 index += 1;
             }
-            blocks.push((action.to_owned(), name, terminal_lines.join("\n")));
+            blocks.push((action.to_owned(), name, span.unwrap_or(head..head)));
             consumed_following_lines = true;
             break;
         }
@@ -20436,26 +22750,51 @@ enum RecordFieldAssignment {
     Shorthand { field: String },
 }
 
-fn collect_field_assignments(body: &str) -> Vec<RecordFieldAssignment> {
+/// One field assignment and where its parts were written, relative to the block
+/// body it was split out of.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordFieldSite {
+    assignment: RecordFieldAssignment,
+    /// Byte range of the field name.
+    field_at: Range<usize>,
+    /// Byte range of the value expression, absent for a shorthand field.
+    value_at: Option<Range<usize>>,
+}
+
+fn collect_field_assignments(body: &str) -> Vec<RecordFieldSite> {
     // Token-level splitting (R5): structure comes from tokens, never line
     // breaks, so a single-line multi-field payload
     // (`complete result { first "a" second "b" }`) collects every field —
     // the same splitter the kernel and table rows already use.
     body::split_field_assignments(body)
         .into_iter()
-        .map(|assignment| match assignment.value {
-            Some(value) => RecordFieldAssignment::Value {
-                field: assignment.name,
-                value,
-            },
-            None => RecordFieldAssignment::Shorthand {
-                field: assignment.name,
-            },
+        .map(|assignment| {
+            let field_at = assignment.name_at..assignment.name_at + assignment.name.len();
+            let value_at = assignment.value_at.clone();
+            let assignment = match assignment.value {
+                Some(value) => RecordFieldAssignment::Value {
+                    field: assignment.name,
+                    value,
+                },
+                None => RecordFieldAssignment::Shorthand {
+                    field: assignment.name,
+                },
+            };
+            RecordFieldSite {
+                assignment,
+                field_at,
+                value_at,
+            }
         })
         .collect()
 }
 
 fn expression_path(expr: &str) -> Option<(String, Vec<String>)> {
+    Some(expression_dotted_path(expr)?.into_pair())
+}
+
+/// The single dotted path an expression holds, keeping its offsets.
+fn expression_dotted_path(expr: &str) -> Option<DottedPath> {
     let mut paths = dotted_paths(expr);
     if paths.len() != 1 {
         return None;
@@ -20463,8 +22802,37 @@ fn expression_path(expr: &str) -> Option<(String, Vec<String>)> {
     Some(paths.remove(0))
 }
 
+/// The line-scanner twin of [`validate_literal_against_type`], reached when the
+/// value is raw source text rather than a parsed `Expr`. Annotated at the same
+/// boundary and for the same reason.
 fn validate_literal_assignment(
-    rule: &RuleDecl,
+    at: BodyAnchor,
+    record_schema: &str,
+    field: &str,
+    field_ty: &TypeSyntax,
+    expr: &str,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut found = Vec::new();
+    validate_literal_assignment_inner(
+        at,
+        record_schema,
+        field,
+        field_ty,
+        expr,
+        semantic,
+        &mut found,
+    );
+    diagnostics.extend(
+        found
+            .into_iter()
+            .map(|diagnostic| type_declared_here(diagnostic, TypeAnchor::Field(field), field_ty)),
+    );
+}
+
+fn validate_literal_assignment_inner(
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     field_ty: &TypeSyntax,
@@ -20478,13 +22846,15 @@ fn validate_literal_assignment(
 
     match field_ty {
         TypeSyntax::Primitive { name, .. } => {
-            validate_primitive_literal(rule, record_schema, field, name, &literal, diagnostics)
+            validate_primitive_literal(at, record_schema, field, name, &literal, diagnostics)
         }
         TypeSyntax::LiteralString { value, .. } => {
             if literal != LiteralExpr::String(value.as_str()) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.invalid_literal"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
                     ),
@@ -20494,7 +22864,7 @@ fn validate_literal_assignment(
         }
         TypeSyntax::Ref { name } => {
             validate_enum_literal(
-                rule,
+                at,
                 record_schema,
                 field,
                 &name.name,
@@ -20504,15 +22874,17 @@ fn validate_literal_assignment(
             );
         }
         TypeSyntax::Union { variants, .. } => {
-            validate_union_literal(rule, record_schema, field, variants, &literal, diagnostics);
+            validate_union_literal(at, record_schema, field, variants, &literal, diagnostics);
         }
         TypeSyntax::AgentRef { agents, .. } => {
-            validate_agent_ref_literal(rule, record_schema, field, agents, &literal, diagnostics);
+            validate_agent_ref_literal(at, record_schema, field, agents, &literal, diagnostics);
         }
         TypeSyntax::Optional { inner, .. } => {
             if literal != LiteralExpr::Null {
-                validate_literal_assignment(
-                    rule,
+                // The unannotated body: the declaration to name is the outer
+                // `int?`, once, not `int` again one level down.
+                validate_literal_assignment_inner(
+                    at,
                     record_schema,
                     field,
                     inner,
@@ -20535,8 +22907,10 @@ fn validate_literal_assignment(
         TypeSyntax::Sealed { .. } => {
             if !matches!(literal, LiteralExpr::Ident(_)) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.invalid_literal"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects `{}`, which has no literal form",
                         field_ty.to_source()
@@ -20554,8 +22928,10 @@ fn validate_literal_assignment(
         // own type-syntax variant rather than a primitive name.
         TypeSyntax::Secret { .. } => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
                     field_ty.to_source()
@@ -20574,6 +22950,7 @@ fn validate_literal_assignment(
 #[allow(clippy::too_many_arguments)]
 fn validate_expected_assignment(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     field_ty: &TypeSyntax,
@@ -20587,8 +22964,10 @@ fn validate_expected_assignment(
     }
     validate_expr_source_against_type(
         rule,
+        at,
         record_schema,
         field,
+        TypeAnchor::Field(field),
         field_ty,
         expr,
         semantic,
@@ -20600,8 +22979,10 @@ fn validate_expected_assignment(
 #[allow(clippy::too_many_arguments)]
 fn validate_expr_source_against_type(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
+    anchor: TypeAnchor<'_>,
     expected_ty: &TypeSyntax,
     expr: &str,
     semantic: &SemanticContext,
@@ -20614,8 +22995,10 @@ fn validate_expr_source_against_type(
                 Ok(Expr::Object(fields)) => fields,
                 Ok(_) => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("type.mismatch"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: at.whole(),
                         message: format!("field `{record_schema}.{field}` expects a map literal"),
                         suggestion: Some(format!("record `{field} {{ key value }}`")),
                     });
@@ -20623,8 +23006,10 @@ fn validate_expr_source_against_type(
                 }
                 Err(message) => {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("parse.invalid_expression"),
+                        severity: Severity::Error,
                         related: Vec::new(),
-                        span: rule.body.span,
+                        span: at.whole(),
                         message: format!(
                             "field `{record_schema}.{field}` expects a map literal: {message}"
                         ),
@@ -20636,8 +23021,10 @@ fn validate_expr_source_against_type(
             for map_field in &parsed {
                 validate_expr_against_type(
                     rule,
+                    at,
                     record_schema,
                     field,
+                    anchor.map_value(),
                     inner,
                     &map_field.value,
                     semantic,
@@ -20651,8 +23038,10 @@ fn validate_expr_source_against_type(
                 for item in items {
                     validate_expr_against_type(
                         rule,
+                        at,
                         record_schema,
                         field,
+                        anchor.element(),
                         inner,
                         &item,
                         semantic,
@@ -20663,8 +23052,10 @@ fn validate_expr_source_against_type(
             }
             Ok(expr) => validate_inferred_assignment_type(
                 rule,
+                at,
                 record_schema,
                 field,
+                anchor,
                 expected_ty,
                 &expr,
                 semantic,
@@ -20672,15 +23063,17 @@ fn validate_expr_source_against_type(
                 diagnostics,
             ),
             Err(message) => {
-                push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics)
+                push_invalid_assignment_expr(rule, at, record_schema, field, message, diagnostics)
             }
         },
         TypeSyntax::Optional { inner, .. } => {
             if expr.trim() != "null" {
                 validate_expr_source_against_type(
                     rule,
+                    at,
                     record_schema,
                     field,
+                    anchor,
                     inner,
                     expr,
                     semantic,
@@ -20695,8 +23088,10 @@ fn validate_expr_source_against_type(
                 Ok(expr) => {
                     validate_inferred_assignment_type(
                         rule,
+                        at,
                         record_schema,
                         field,
+                        anchor,
                         expected_ty,
                         &expr,
                         semantic,
@@ -20706,12 +23101,20 @@ fn validate_expr_source_against_type(
                     return;
                 }
                 Err(message) => {
-                    push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics);
+                    push_invalid_assignment_expr(
+                        rule,
+                        at,
+                        record_schema,
+                        field,
+                        message,
+                        diagnostics,
+                    );
                     return;
                 }
             };
             validate_object_literal_fields(
                 rule,
+                at,
                 record_schema,
                 field,
                 &name.name,
@@ -20724,8 +23127,10 @@ fn validate_expr_source_against_type(
         _ => match parse_expression(expr) {
             Ok(expr) => validate_inferred_assignment_type(
                 rule,
+                at,
                 record_schema,
                 field,
+                anchor,
                 expected_ty,
                 &expr,
                 semantic,
@@ -20733,7 +23138,7 @@ fn validate_expr_source_against_type(
                 diagnostics,
             ),
             Err(message) => {
-                push_invalid_assignment_expr(rule, record_schema, field, message, diagnostics)
+                push_invalid_assignment_expr(rule, at, record_schema, field, message, diagnostics)
             }
         },
     }
@@ -20742,8 +23147,10 @@ fn validate_expr_source_against_type(
 #[allow(clippy::too_many_arguments)]
 fn validate_expr_against_type(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
+    anchor: TypeAnchor<'_>,
     expected_ty: &TypeSyntax,
     expr: &Expr,
     semantic: &SemanticContext,
@@ -20756,8 +23163,10 @@ fn validate_expr_against_type(
                 for item in items {
                     validate_expr_against_type(
                         rule,
+                        at,
                         record_schema,
                         field,
+                        anchor.element(),
                         inner,
                         item,
                         semantic,
@@ -20769,13 +23178,19 @@ fn validate_expr_against_type(
         }
         Expr::Object(fields) => match expected_ty {
             TypeSyntax::Map { inner, .. } => {
-                for field in fields {
+                for map_field in fields {
+                    // The MESSAGE names the map key the author wrote; the NOTE
+                    // stays anchored to the field whose declared `map<…>` set
+                    // the expectation, because the key is not declared anywhere
+                    // and `anchor` is what the note's span points at.
                     validate_expr_against_type(
                         rule,
+                        at,
                         record_schema,
-                        field.key.as_str(),
+                        map_field.key.as_str(),
+                        anchor.map_value(),
                         inner,
-                        &field.value,
+                        &map_field.value,
                         semantic,
                         scope,
                         diagnostics,
@@ -20785,6 +23200,7 @@ fn validate_expr_against_type(
             TypeSyntax::Ref { name } if semantic.schemas.class_exists(&name.name) => {
                 validate_object_literal_fields(
                     rule,
+                    at,
                     record_schema,
                     field,
                     &name.name,
@@ -20796,8 +23212,10 @@ fn validate_expr_against_type(
             }
             _ => validate_inferred_assignment_type(
                 rule,
+                at,
                 record_schema,
                 field,
+                anchor,
                 expected_ty,
                 expr,
                 semantic,
@@ -20807,8 +23225,10 @@ fn validate_expr_against_type(
         },
         _ => validate_inferred_assignment_type(
             rule,
+            at,
             record_schema,
             field,
+            anchor,
             expected_ty,
             expr,
             semantic,
@@ -20820,14 +23240,17 @@ fn validate_expr_against_type(
 
 fn push_invalid_assignment_expr(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     message: String,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("parse.invalid_expression"),
+        severity: Severity::Error,
         related: Vec::new(),
-        span: rule.body.span,
+        span: at.whole(),
         message: format!(
             "rule `{}` has invalid expression for field `{record_schema}.{field}`: {message}",
             rule.name.name
@@ -20842,6 +23265,7 @@ fn push_invalid_assignment_expr(
 #[allow(clippy::too_many_arguments)]
 fn validate_object_literal_fields(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     object_schema: &str,
@@ -20857,8 +23281,10 @@ fn validate_object_literal_fields(
     for object_field in object_fields {
         if !seen.insert(object_field.key.clone()) {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.duplicate_field"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` repeats object field `{}`",
                     object_field.key
@@ -20868,24 +23294,37 @@ fn validate_object_literal_fields(
             continue;
         }
         let Some(field_ty) = schema_fields.get(&object_field.key) else {
-            diagnostics.push(Diagnostic {
-                related: Vec::new(),
-                span: rule.body.span,
-                message: format!(
-                    "class `{object_schema}` has no field `{}`",
-                    object_field.key
-                ),
-                suggestion: Some(format!(
-                    "add `{}` to `class {object_schema}` or use an existing field",
-                    object_field.key
-                )),
-            });
+            diagnostics.push(declared_here(
+                Diagnostic {
+                    code: diagnostic_code!("type.unknown_field"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: at.whole(),
+                    message: format!(
+                        "class `{object_schema}` has no field `{}`",
+                        object_field.key
+                    ),
+                    suggestion: Some(suggest_otherwise(
+                        &object_field.key,
+                        schema_fields.keys(),
+                        format!(
+                            "add `{}` to `class {object_schema}` or use an existing field",
+                            object_field.key
+                        ),
+                    )),
+                },
+                object_schema,
+                &semantic.schemas,
+            ));
             continue;
         };
         validate_expr_against_type(
             rule,
+            at,
             object_schema,
             &object_field.key,
+            // A fresh anchor: `field_ty` IS this object field's declared type.
+            TypeAnchor::Field(&object_field.key),
             field_ty,
             &object_field.value,
             semantic,
@@ -20897,8 +23336,11 @@ fn validate_object_literal_fields(
         if seen.contains(required) || matches!(ty, TypeSyntax::Optional { .. }) {
             continue;
         }
-        diagnostics.push(Diagnostic { related: Vec::new(),
-            span: rule.body.span,
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.missing_required_field"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: at.whole(),
             message: format!(
                 "field `{record_schema}.{field}` is missing required object field `{object_schema}.{required}`"
             ),
@@ -20910,8 +23352,10 @@ fn validate_object_literal_fields(
 #[allow(clippy::too_many_arguments)]
 fn validate_inferred_assignment_type(
     rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
+    anchor: TypeAnchor<'_>,
     expected_ty: &TypeSyntax,
     expr: &Expr,
     semantic: &SemanticContext,
@@ -20921,9 +23365,10 @@ fn validate_inferred_assignment_type(
     let literal = expr_literal_as_literal_expr(expr);
     if let Some(literal) = literal {
         validate_literal_against_type(
-            rule,
+            at,
             record_schema,
             field,
+            anchor,
             expected_ty,
             &literal,
             semantic,
@@ -20932,28 +23377,69 @@ fn validate_inferred_assignment_type(
         return;
     }
 
-    let context = ExprValidationContext::rule(rule);
+    let context = ExprValidationContext::rule(rule, at.whole());
     let mut local_diagnostics = Vec::new();
     let actual_ty = infer_expr_type(expr, semantic, scope, &context, &mut local_diagnostics);
     diagnostics.extend(local_diagnostics);
     let expected_expr_ty = expr_type_from_type_syntax(expected_ty, semantic);
     if !types_comparable(&actual_ty, &expected_expr_ty) {
-        diagnostics.push(Diagnostic {
-            related: Vec::new(),
-            span: rule.body.span,
-            message: format!(
-                "field `{record_schema}.{field}` receives incompatible expression type"
-            ),
-            suggestion: Some(format!(
-                "record a value compatible with `{}`",
-                expected_ty.to_source()
-            )),
-        });
+        diagnostics.push(type_declared_here(
+            Diagnostic {
+                code: diagnostic_code!("type.mismatch"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: at.whole(),
+                message: format!(
+                    "field `{record_schema}.{field}` receives incompatible expression type"
+                ),
+                suggestion: Some(format!(
+                    "record a value compatible with `{}`",
+                    expected_ty.to_source()
+                )),
+            },
+            anchor,
+            expected_ty,
+        ));
     }
 }
 
+/// Check a literal against the type its field declares, and point every finding
+/// at the DECLARATION that set the expectation.
+///
+/// The annotation lives here rather than at the eight leaf pushes below because
+/// every one of them says the same thing — this literal is not what the field is
+/// declared to hold — and the reader's next move is always to go and look at the
+/// declaration. The leaves stay ignorant of related information.
+#[allow(clippy::too_many_arguments)]
 fn validate_literal_against_type(
-    rule: &RuleDecl,
+    at: BodyAnchor,
+    record_schema: &str,
+    field: &str,
+    anchor: TypeAnchor<'_>,
+    field_ty: &TypeSyntax,
+    literal: &LiteralExpr<'_>,
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut found = Vec::new();
+    validate_literal_against_type_inner(
+        at,
+        record_schema,
+        field,
+        field_ty,
+        literal,
+        semantic,
+        &mut found,
+    );
+    diagnostics.extend(
+        found
+            .into_iter()
+            .map(|diagnostic| type_declared_here(diagnostic, anchor, field_ty)),
+    );
+}
+
+fn validate_literal_against_type_inner(
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     field_ty: &TypeSyntax,
@@ -20963,13 +23449,15 @@ fn validate_literal_against_type(
 ) {
     match field_ty {
         TypeSyntax::Primitive { name, .. } => {
-            validate_primitive_literal(rule, record_schema, field, name, literal, diagnostics)
+            validate_primitive_literal(at, record_schema, field, name, literal, diagnostics)
         }
         TypeSyntax::LiteralString { value, .. } => {
             if literal != &LiteralExpr::String(value.as_str()) {
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("type.invalid_literal"),
+                    severity: Severity::Error,
                     related: Vec::new(),
-                    span: rule.body.span,
+                    span: at.whole(),
                     message: format!(
                         "field `{record_schema}.{field}` expects literal string `{value}`"
                     ),
@@ -20979,7 +23467,7 @@ fn validate_literal_against_type(
         }
         TypeSyntax::Ref { name } => {
             validate_enum_literal(
-                rule,
+                at,
                 record_schema,
                 field,
                 &name.name,
@@ -20989,15 +23477,18 @@ fn validate_literal_against_type(
             );
         }
         TypeSyntax::Union { variants, .. } => {
-            validate_union_literal(rule, record_schema, field, variants, literal, diagnostics);
+            validate_union_literal(at, record_schema, field, variants, literal, diagnostics);
         }
         TypeSyntax::AgentRef { agents, .. } => {
-            validate_agent_ref_literal(rule, record_schema, field, agents, literal, diagnostics);
+            validate_agent_ref_literal(at, record_schema, field, agents, literal, diagnostics);
         }
         TypeSyntax::Optional { inner, .. } => {
             if literal != &LiteralExpr::Null {
-                validate_literal_against_type(
-                    rule,
+                // The unannotated body, deliberately: the declaration the reader
+                // has to look at is `int?`, named once, not `int` named again
+                // one level down.
+                validate_literal_against_type_inner(
+                    at,
                     record_schema,
                     field,
                     inner,
@@ -21012,8 +23503,10 @@ fn validate_literal_against_type(
         // is more useful than the mismatch it would otherwise surface later.
         TypeSyntax::Sealed { .. } => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` expects `{}`, which has no literal form",
                     field_ty.to_source()
@@ -21029,8 +23522,10 @@ fn validate_literal_against_type(
         // own type-syntax variant rather than a primitive name.
         TypeSyntax::Secret { .. } => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!(
                     "field `{record_schema}.{field}` is `{}`: secrets have no literal form",
                     field_ty.to_source()
@@ -21058,7 +23553,7 @@ fn expr_literal_as_literal_expr(expr: &Expr) -> Option<LiteralExpr<'_>> {
 }
 
 fn validate_agent_ref_literal(
-    rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     agents: &[Ident],
@@ -21071,8 +23566,10 @@ fn validate_agent_ref_literal(
         .collect::<Vec<_>>();
     if let LiteralExpr::String(value) = literal {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!(
                 "field `{record_schema}.{field}` expects an AgentRef value, not string `{value}`"
             ),
@@ -21085,8 +23582,10 @@ fn validate_agent_ref_literal(
     }
     let LiteralExpr::Ident(value) = literal else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects an AgentRef value"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
@@ -21094,10 +23593,16 @@ fn validate_agent_ref_literal(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot reference agent `{value}`"),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: Some(suggest_then(
+                value,
+                allowed.iter(),
+                format!("use one of: {}", allowed.join(", ")),
+            )),
         });
     }
 }
@@ -21608,6 +24113,10 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             });
             continue;
         }
+        // `index` is always on a character boundary here: every branch above
+        // advances over ASCII bytes, and the fallback below advances by a whole
+        // character. Slicing on a byte inside a multi-byte character panicked
+        // (a non-ASCII character in a prompt crashed `whip check`).
         let rest = &source[index..];
         if rest.starts_with("&&") {
             tokens.push(ExprToken {
@@ -21640,17 +24149,24 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             });
             index += 2;
         } else {
+            // One character, not one byte: `byte as char` would mangle a
+            // multi-byte character into its lead byte and leave `index` inside
+            // it, which panicked the next slice.
+            // One character, not one byte: `byte as char` would mangle a
+            // multi-byte character into its lead byte and leave `index` inside
+            // it, which panicked the next slice.
+            let symbol = rest.chars().next().unwrap_or(byte as char);
+            index += symbol.len_utf8();
             tokens.push(ExprToken {
-                kind: ExprTokenKind::Symbol(byte as char),
+                kind: ExprTokenKind::Symbol(symbol),
             });
-            index += 1;
         }
     }
     tokens
 }
 
 fn validate_primitive_literal(
-    rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     primitive: &str,
@@ -21670,8 +24186,10 @@ fn validate_primitive_literal(
     );
     if !valid {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects `{primitive}`"),
             suggestion: Some(format!("record a value compatible with `{primitive}`")),
         });
@@ -21680,16 +24198,20 @@ fn validate_primitive_literal(
     match (primitive, literal) {
         ("duration", LiteralExpr::String(value)) if parse_duration_seconds(value).is_none() => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid duration literal"),
                 suggestion: Some("use an ISO-8601 duration such as `\"PT30M\"`".to_owned()),
             });
         }
         ("time", LiteralExpr::String(value)) if parse_time_epoch_seconds(value).is_none() => {
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_literal"),
+                severity: Severity::Error,
                 related: Vec::new(),
-                span: rule.body.span,
+                span: at.whole(),
                 message: format!("field `{record_schema}.{field}` has invalid time literal"),
                 suggestion: Some(
                     "use an RFC3339 timestamp such as `\"2026-05-29T10:00:00Z\"`".to_owned(),
@@ -21701,7 +24223,7 @@ fn validate_primitive_literal(
 }
 
 fn validate_enum_literal(
-    rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     schema: &str,
@@ -21714,8 +24236,10 @@ fn validate_enum_literal(
     };
     let LiteralExpr::Ident(variant) = literal else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects enum `{schema}`"),
             suggestion: Some(format!(
                 "use one of: {}",
@@ -21726,19 +24250,25 @@ fn validate_enum_literal(
     };
     if !variants.contains(*variant) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.unknown_enum_variant"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("enum `{schema}` has no variant `{variant}`"),
-            suggestion: Some(format!(
-                "use one of: {}",
-                variants.iter().cloned().collect::<Vec<_>>().join(", ")
+            suggestion: Some(suggest_then(
+                variant,
+                variants.iter(),
+                format!(
+                    "use one of: {}",
+                    variants.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
             )),
         });
     }
 }
 
 fn validate_union_literal(
-    rule: &RuleDecl,
+    at: BodyAnchor,
     record_schema: &str,
     field: &str,
     variants: &[TypeSyntax],
@@ -21757,8 +24287,10 @@ fn validate_union_literal(
     }
     let LiteralExpr::String(value) = literal else {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` expects one of its literal variants"),
             suggestion: Some(format!("use one of: {}", allowed.join(", "))),
         });
@@ -21766,10 +24298,16 @@ fn validate_union_literal(
     };
     if !allowed.contains(value) {
         diagnostics.push(Diagnostic {
+            code: diagnostic_code!("type.invalid_literal"),
+            severity: Severity::Error,
             related: Vec::new(),
-            span: rule.body.span,
+            span: at.whole(),
             message: format!("field `{record_schema}.{field}` cannot be `{value}`"),
-            suggestion: Some(format!("use one of: {}", allowed.join(", "))),
+            suggestion: Some(suggest_then(
+                value,
+                allowed.iter(),
+                format!("use one of: {}", allowed.join(", ")),
+            )),
         });
     }
 }
@@ -21847,6 +24385,7 @@ fn binding_after_multiline_string_end(line: &str) -> Option<String> {
 fn validate_rule_prompt_content_type_annotation(
     rule: &RuleDecl,
     line: &str,
+    at: BodyAnchor,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if !(line.starts_with("tell ") || line.starts_with("coerce ")) {
@@ -21856,8 +24395,10 @@ fn validate_rule_prompt_content_type_annotation(
         return;
     };
     diagnostics.push(Diagnostic {
+        code: diagnostic_code!("parse.invalid_content_type"),
+        severity: Severity::Error,
         related: Vec::new(),
-        span: rule.body.span,
+        span: at.whole(),
         message: format!(
             "rule `{}` has malformed multiline prompt content type `{annotation}`",
             rule.name.name
@@ -21880,7 +24421,10 @@ fn validate_coerce_prompt_content_type_annotations(
         let Some(annotation) = malformed_prompt_content_type_annotation(line) else {
             continue;
         };
-        diagnostics.push(Diagnostic { related: Vec::new(),
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("parse.invalid_content_type"),
+            severity: Severity::Error,
+            related: Vec::new(),
             span: coerce.body.span,
             message: format!(
                 "coerce `{}` has malformed multiline prompt content type `{annotation}`",

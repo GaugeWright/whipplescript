@@ -1,4 +1,4 @@
-error: program declares no `workflow`
+error[construct.missing_workflow]: program declares no `workflow`
   --> examples/invalid/headerless-library.whip:1:1
   |
 1 | # Invalid: a source with no explicit `workflow` is a library fragment, not a

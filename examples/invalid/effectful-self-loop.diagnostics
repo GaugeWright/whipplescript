@@ -1,6 +1,6 @@
-error: effectful rule `loop` preserves trigger fact `schema:WorkItem`
-   --> examples/invalid/effectful-self-loop.whip:14:4
+error[effect.unconsumed_trigger]: effectful rule `loop` preserves trigger fact `schema:WorkItem`
+   --> examples/invalid/effectful-self-loop.whip:15:4
    |
-14 | => {
+15 | => {
    |    ^
    = help: consume or advance the triggering fact, or move the next effect behind an external completion event

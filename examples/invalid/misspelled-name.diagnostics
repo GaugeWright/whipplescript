@@ -1,0 +1,18 @@
+error[type.unknown_schema]: rule `respond` matches unknown class `Incidnt`
+   --> examples/invalid/misspelled-name.whip:21:8
+   |
+21 |   when Incidnt as incident
+   |        ^^^^^^^^^^^^^^^^^^^
+   = help: did you mean `Incident`? otherwise declare `class Incidnt` before matching it
+error[type.unknown_agent]: rule `respond` tells unknown agent `respondr`
+   --> examples/invalid/misspelled-name.whip:23:3
+   |
+23 |   tell respondr "handle it"
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: did you mean `responder`? otherwise declare the target agent before telling it
+error[type.unknown_schema]: rule `respond` records unknown class `Resolutoin`
+   --> examples/invalid/misspelled-name.whip:24:3
+   |
+24 |   record Resolutoin { note "done" }
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: did you mean `Resolution`? otherwise declare `class Resolutoin` before recording it

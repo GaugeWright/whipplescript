@@ -1,0 +1,6 @@
+error[security.script_disabled]: `exec` requires `use std.script`: script execution is disabled unless the program imports the std.script package
+   --> examples/invalid/missing-script-import.whip:29:3
+   |
+29 |   exec "make check" as run
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `use std.script` at the top of the program to enable script execution

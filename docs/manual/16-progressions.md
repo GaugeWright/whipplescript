@@ -252,9 +252,14 @@ introduces the `plan` binding and the `approved` binding. These bindings can be
 absent at the moment when the arm runs. Thus a direct reference to one of these
 bindings is a compile error:
 
+<!-- render: examples/diagnostics/lapse-arm-scope.whip code expr.binding_out_of_scope -->
 ```text
-error: the `on lapse` arm of rule `ship` references `plan`, a binding the
-region introduces — it may not exist when the arm runs
+error[expr.binding_out_of_scope]: the `on lapse` arm of rule `ship` references `plan`, a binding the region introduces — it may not exist when the arm runs
+   --> examples/diagnostics/lapse-arm-scope.whip:37:4
+   |
+37 | => {
+   |    ^
+   = help: reference only bindings from before the region, or bind the progress view (`on lapse as got`) and read `got.<binding>` — its fields are present exactly if that step settled
 ```
 
 The permitted method to see the progress is the **progress view**. The
@@ -292,9 +297,14 @@ The checker types the whole view. A field that is neither a step of this region
 nor `steps` is a compile error, and so is a path through a status, because a
 status is a string:
 
+<!-- render: examples/diagnostics/progress-view-field.whip code type.unknown_field -->
 ```text
-error: rule `ship` reads `got.plna`, but the progress view of this region has no
-field `plna`
+error[type.unknown_field]: rule `ship` has invalid field path `got.plna`: schema `region.ship.Progress` has no field `plna`
+   --> examples/diagnostics/progress-view-field.whip:37:4
+   |
+37 | => {
+   |    ^
+   = help: did you mean `plan`? otherwise use a field declared on the bound schema or add it to the class declaration
 ```
 
 The runtime pins the statuses in the same commit as the values, so a step that

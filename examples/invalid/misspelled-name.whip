@@ -1,0 +1,25 @@
+// Open universes: a name the author could legitimately have meant to declare.
+// The did-you-mean prefixes the site's own "otherwise declare it" advice rather
+// than replacing it — with no candidate near, that advice is all there is.
+workflow MisspelledName
+
+class Incident {
+  title string
+}
+
+class Resolution {
+  note string
+}
+
+agent responder {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule respond
+  when Incidnt as incident
+=> {
+  tell respondr "handle it"
+  record Resolutoin { note "done" }
+}

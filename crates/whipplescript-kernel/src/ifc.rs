@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use whipplescript_parser::{
-    Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule, IrWorkflowContractKind, QueryKind,
-    RelatedInfo,
+    diagnostic_code, Diagnostic, IrEffectKind, IrEffectNode, IrProgram, IrRule,
+    IrWorkflowContractKind, QueryKind, RelatedInfo, Severity,
 };
 
 use crate::host_policy::{PlacementPolicy, ProviderBindingPolicy};
@@ -3200,6 +3200,8 @@ pub fn check_ifc_program_with_imports(ir: &IrProgram, imports: &[IrProgram]) -> 
     match VerifiedEnvelope::load_from_env() {
         EnvelopeStatus::Ungoverned => Vec::new(),
         EnvelopeStatus::Rejected(message) => vec![Diagnostic {
+            code: diagnostic_code!("security.envelope_rejected"),
+            severity: Severity::Error,
             span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
             message: format!("governance envelope rejected: {message}"),
             suggestion: Some(
@@ -3260,6 +3262,8 @@ pub fn check_imported_tool_surfaces(imported: &[(String, Vec<String>)]) -> Vec<D
     imported_surface_gaps(imported, &verified)
         .into_iter()
         .map(|(tool, doors)| Diagnostic {
+            code: diagnostic_code!("security.ungoverned_tool_surface"),
+            severity: Severity::Error,
             span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
             message: format!(
                 "denied import of tool `{tool}`: it opens doors the governance envelope does not \
@@ -4019,6 +4023,8 @@ fn flag_redacted_egress_projections(
                 )
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.projection_leak"),
+                severity: Severity::Error,
                 span,
                 message: format!(
                     "denied flow in rule `{rule}`: the redacted egress `{sink}` still carries \
@@ -4183,6 +4189,8 @@ pub fn check_with_envelope_imports(
                 continue;
             }
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.unvouched_endorsement"),
+                severity: Severity::Error,
                 span: when.span,
                 message: format!(
                     "`claim … endorsed` in rule `{rule}` claims out of tracker `{tracker}`, \
@@ -4240,6 +4248,8 @@ pub fn check_with_envelope_imports(
                         continue;
                     }
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.endorsed_prose_field"),
+                        severity: Severity::Error,
                         span: rule_span,
                         message: format!(
                             "in rule `{rule}`, `{schema}.{field_name}` is shaped by an endorsed \
@@ -4319,6 +4329,8 @@ pub fn check_with_envelope_imports(
                                     envelope.admits_request(resource, &request.method, &request.url)
                                 {
                                     diagnostics.push(Diagnostic {
+                                        code: diagnostic_code!("security.egress_scope_exceeded"),
+                                        severity: Severity::Error,
                                         span: effect.span,
                                         message: format!(
                                             "denied egress in rule `{}`: {problem}",
@@ -4452,6 +4464,8 @@ pub fn check_with_envelope_imports(
                             grant.operations.iter().any(|op| is_read_op(&op.operation));
                         if reads_resource && envelope.leaks(resource, provider) {
                             diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("security.provider_egress_leak"),
+                                severity: Severity::Error,
                                 span: effect.span,
                                 message: format!(
                                     "denied egress in rule `{rule}`: `{resource}` may be read by \
@@ -4529,6 +4543,8 @@ pub fn check_with_envelope_imports(
             {
                 if envelope.leaks(resource, principal) {
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.provider_egress_leak"),
+                        severity: Severity::Error,
                         span: effect.span,
                         message: format!(
                             "denied egress in rule `{rule}`: a `coerce`/`decide`/`prompt` reads \
@@ -4652,6 +4668,8 @@ pub fn check_with_envelope_imports(
                 .cloned()
                 .collect();
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.projection_leak"),
+                severity: Severity::Error,
                 span: redact_span,
                 message: format!(
                     "denied flow in rule `{rule}`: the bounded-type egress `{sink}` carries \
@@ -4711,6 +4729,8 @@ pub fn check_with_envelope_imports(
                         for resource in &reads {
                             if envelope.leaks(resource, provider) {
                                 diagnostics.push(Diagnostic {
+                                    code: diagnostic_code!("security.provider_egress_leak"),
+                                    severity: Severity::Error,
                                     span: effect.span,
                                     message: format!(
                                         "denied egress in rule `{rule}`: agent `{agent}` may call \
@@ -4978,6 +4998,8 @@ pub fn check_with_envelope_imports(
                 ""
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.integrity_injection"),
+                severity: Severity::Error,
                 span: report_span,
                 message: format!(
                     "denied influence in rule `{rule}`: the output of executor `{handle}` \
@@ -5003,6 +5025,8 @@ pub fn check_with_envelope_imports(
                 ""
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.confidentiality_leak"),
+                severity: Severity::Error,
                 span: report_span,
                 message: format!(
                     "denied flow in rule `{rule}`: `{src}` may be read by {src_reader} only — \
@@ -5029,6 +5053,8 @@ pub fn check_with_envelope_imports(
                 None => format!("`{src}`"),
             };
             diagnostics.push(Diagnostic {
+                code: diagnostic_code!("security.integrity_injection"),
+                severity: Severity::Error,
                 span: report_span,
                 message: format!(
                     "denied influence in rule `{rule}`: {src_name} is untrusted (integrity \
@@ -5106,6 +5132,8 @@ pub fn check_with_envelope_imports(
                     "endorse"
                 };
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.untrusted_selector"),
+                    severity: Severity::Error,
                     span: effect.span,
                     message: format!(
                         "denied influence in rule `{rule}`: the low-integrity discriminant \
@@ -5133,6 +5161,8 @@ pub fn check_with_envelope_imports(
                     continue;
                 }
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.untrusted_selector"),
+                    severity: Severity::Error,
                     span: effect.span,
                     message: format!(
                         "denied influence in rule `{rule}`: the low-integrity selector \
@@ -5203,6 +5233,8 @@ fn check_turn_unwrap_scoping(
                     }
                     let available = envelope.unwrap_types_for(credential);
                     diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("security.unwrap_not_granted"),
+                        severity: Severity::Error,
                         span: effect.span,
                         related: Vec::new(),
                         message: format!(
@@ -5292,6 +5324,8 @@ pub fn check_principal_ceiling(
             if !cleared && flagged.insert(format!("{}:{src}", rule.name)) {
                 let required = envelope.reader_label(src);
                 diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("security.principal_ceiling_exceeded"),
+                    severity: Severity::Error,
                     span,
                     message: format!(
                         "denied read in rule `{rule}`: the agent acts-for `{principal_role}`, \

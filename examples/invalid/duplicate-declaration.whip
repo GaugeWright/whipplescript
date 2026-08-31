@@ -1,0 +1,34 @@
+// Every "declared more than once" refusal knows both locations and used to print
+// one. The second declaration is the error; the first is the thing the author has
+// to look at to decide which of the two to keep.
+workflow DuplicateDeclaration
+
+class Ticket {
+  kind string
+}
+
+class Ticket {
+  kind int
+}
+
+agent triager {
+  provider fixture
+}
+
+agent triager {
+  provider fixture
+}
+
+stream ops {
+  members [triager]
+}
+
+stream review {
+  members [triager]
+}
+
+rule route
+  when Ticket as ticket
+=> {
+  tell triager "route {{ ticket.kind }}"
+}

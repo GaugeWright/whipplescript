@@ -122,9 +122,7 @@ workflow Child {
     assert!(
         found.iter().any(|diagnostic| {
             diagnostic.message.contains("in workflow `Child`")
-                && diagnostic
-                    .message
-                    .contains("security.package_import_required")
+                && diagnostic.code.as_str() == "security.package_import_required"
         }),
         "{:?}",
         found.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()

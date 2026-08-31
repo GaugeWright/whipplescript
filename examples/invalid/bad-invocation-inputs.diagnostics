@@ -1,0 +1,18 @@
+error[type.duplicate_field]: workflow invocation `Triage` repeats input `ticket`
+   --> examples/invalid/bad-invocation-inputs.whip:25:5
+   |
+25 |     invoke Triage {
+   |     ^^^^^^^^^^^^^^^
+   = help: remove the duplicate invocation input
+error[type.unexpected_field]: workflow `Triage` has no input `issue`
+   --> examples/invalid/bad-invocation-inputs.whip:25:5
+   |
+25 |     invoke Triage {
+   |     ^^^^^^^^^^^^^^^
+   = help: pass one of: `ticket`
+error[type.unknown_workflow]: rule `recheck` invokes unknown workflow `Triaged`
+   --> examples/invalid/bad-invocation-inputs.whip:41:5
+   |
+41 |     invoke Triaged {
+   |     ^^^^^^^^^^^^^^^^
+   = help: did you mean `Triage`? otherwise invoke a workflow declared in this source bundle

@@ -72,10 +72,29 @@ WHIP="$WHIP" python3 - <<'PY'
 import os, pathlib, re, subprocess, sys, tempfile
 
 WHIP = os.environ["WHIP"]
-FENCE = re.compile(r"^```whip\n(.*?)^```", re.S | re.M)
+# INDENT-AWARE, for the same reason scripts/regen-docs-diagnostics.sh is: this
+# regex was anchored at column 0, so a ```whip fence indented under a list item
+# — the ordinary markdown shape — was invisible and its program went unchecked
+# with nothing saying so. The fence's own indent is captured and stripped from
+# the body before the program is compiled, because a program indented by four
+# spaces is not the program the page shows.
+FENCE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)```whip[ \t]*\n(?P<body>.*?)^[ \t]*```",
+    re.S,
+)
 DIRECTIVE = re.compile(r"<!--\s*check:\s*(.*?)\s*-->\s*$")
 ELISION = re.compile(r"\.\.\.|…")
 WORKFLOW = re.compile(r"^\s*workflow\s", re.M)
+
+
+def strip_indent(body: str, indent: str) -> str:
+    """`body` with the fence's own indent removed from each line it starts."""
+    if not indent:
+        return body
+    return "\n".join(
+        line[len(indent):] if line.startswith(indent) else line
+        for line in body.split("\n")
+    )
 
 # HOW MANY PROGRAMS EACH PAGE CONTRIBUTES.
 #
@@ -86,7 +105,14 @@ WORKFLOW = re.compile(r"^\s*workflow\s", re.M)
 # after the run: a page that checks fewer programs than it did is an error, and
 # adding one is a deliberate edit rather than a side effect.
 EXPECTED = {
-    "docs/diagnostics.md": 2,
+    # docs/diagnostics.md is deliberately absent (0). It contributed two
+    # programs — a "this is the correction" workflow for a pasted Gherkin file,
+    # and a bare `@service workflow WorkerDaemon` — and both went with the
+    # sections around them once those diagnostics started carrying their own
+    # repair (tracker D8). What that page prints now is OUTPUT rather than
+    # source: every fence in it is a rendered diagnostic, generated from a
+    # program elsewhere in the corpus and gated by
+    # scripts/regen-docs-diagnostics.sh.
     "docs/language-reference.md": 8,
     "docs/manual.md": 2,
     "docs/manual/01-smallest-workflow.md": 1,
@@ -301,7 +327,7 @@ for md in sorted(pathlib.Path("docs").rglob("*.md")):
     text = md.read_text()
     contexts: dict[str, str] = {}
     for match in FENCE.finditer(text):
-        body = match.group(1)
+        body = strip_indent(match.group("body"), match.group("indent"))
         where = f"{md}:{text[:match.start()].count(chr(10)) + 1}"
         raw = directive_for(text, match.start())
 

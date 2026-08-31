@@ -1,0 +1,42 @@
+// A wildcard written first. `_ => { ... }` matches every remaining value, so the
+// two specific branches under it can never run — the mistake is putting the
+// catch-all at the top the way a `switch` default is often written. The note
+// points at the wildcard that swallowed them, which is the line to move.
+workflow Triage
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Ticket {
+  id string
+  status "open" | "triaged" | "done"
+}
+
+table tickets as Ticket [
+  { id "T-1" status "open" }
+]
+
+rule route
+  when Ticket as ticket
+=> {
+  case ticket.status {
+    _ => {
+      complete result {
+        note "unrouted"
+      }
+    }
+    "open" => {
+      complete result {
+        note "opened"
+      }
+    }
+    "done" => {
+      complete result {
+        note "closed"
+      }
+    }
+  }
+}

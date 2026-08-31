@@ -1,0 +1,12 @@
+error[effect.unhandled_outcome]: rule `grab` does not handle the `contended` outcome of lease `slot`
+   --> examples/invalid/unhandled-lease-outcome.whip:39:5
+   |
+39 |     acquire deploy_slot for ticket.id as slot
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: coordination outcomes are exhaustive: add `after slot contended { ... }`
+error[graph.unreleased_lease]: rule `grab` can hold lease `slot` forever: the `held` branch neither releases it nor reaches a workflow terminal
+   --> examples/invalid/unhandled-lease-outcome.whip:39:5
+   |
+39 |     acquire deploy_slot for ticket.id as slot
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `release slot` on every non-terminal path, or use `acquire ... until ttl` for fire-and-forget

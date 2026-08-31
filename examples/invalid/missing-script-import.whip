@@ -1,0 +1,41 @@
+// The commonest capability mistake: a rule runs `exec` and the program never
+// imports `std.script`. Script execution is off by default, so the refusal is a
+// capability refusal rather than a syntax one — the program is well formed and
+// the author only forgot one line at the top.
+workflow Build
+
+output result Done
+failure error Broken
+
+class Done {
+  note string
+}
+
+class Broken {
+  reason string
+}
+
+class Commit {
+  sha string
+}
+
+table commits as Commit [
+  { sha "9b2ba18" }
+]
+
+rule build
+  when Commit as commit
+=> {
+  exec "make check" as run
+
+  after run succeeds {
+    complete result {
+      note "the build is green"
+    }
+  }
+  after run fails {
+    fail error {
+      reason "the build is red"
+    }
+  }
+}

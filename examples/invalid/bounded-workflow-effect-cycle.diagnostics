@@ -1,6 +1,6 @@
-error: effect cycle in a bounded workflow is not allowed (graph.bounded_workflow_effect_cycle): workflow `BoundedWorkflowEffectCycle` is `@bounded`, and rule cycle ping_step -> pong_step -> ping_step runs the effects of rule `ping_step` on every turn
-   --> examples/invalid/bounded-workflow-effect-cycle.whip:29:4
+error[graph.bounded_workflow_effect_cycle]: effect cycle in a bounded workflow is not allowed: workflow `BoundedWorkflowEffectCycle` is `@bounded`, and rule cycle ping_step -> pong_step -> ping_step runs the effects of rule `ping_step` on every turn
+   --> examples/invalid/bounded-workflow-effect-cycle.whip:30:3
    |
-29 | => {
-   |    ^
-   = help: a bounded workflow settles instead of turning, so it may not loop with the world at all: break the cycle, or drop `@bounded` if this workflow is meant to keep going (a `@tool` workflow has no such choice — it is invoked inside an agent turn and that turn must end)
+30 |   tell worker "ping {{ p.n }}" as t
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: field `n` rises by 1 on every hop, but no rule on the cycle bounds it, so nothing stops the turn; a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going

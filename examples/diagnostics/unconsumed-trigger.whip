@@ -1,0 +1,70 @@
+workflow Retry
+
+// Manual chapter 13, "the checker needs this shape": the chapter's retry loop
+// with the `done a ->` consume dropped from the failure branch, so `attempt`
+// records its own trigger class without advancing it. That is a retry loop with
+// no budget, and the checker refuses it.
+
+output result Done
+failure error GaveUp
+
+class Task {
+  name string
+}
+
+class Attempt {
+  task string
+  n int
+}
+
+class Done {
+  body string
+}
+
+class GaveUp {
+  reason string
+}
+
+agent summarizer
+
+table tasks as Task [
+  {
+    name "tidal power"
+  }
+]
+
+rule start
+  when Task as task
+=> {
+  done task -> record Attempt {
+    task task.name
+    n 1
+  }
+}
+
+rule attempt
+  when Attempt as a where a.n <= 3
+=> {
+  tell summarizer as turn "Summarize {{ a.task }} in two sentences."
+
+  after turn succeeds as ok {
+    complete result {
+      body ok.summary
+    }
+  }
+
+  after turn fails as e {
+    record Attempt {
+      task a.task
+      n a.n + 1
+    }
+  }
+}
+
+rule give_up
+  when Attempt as a where a.n > 3
+=> {
+  fail error {
+    reason "three attempts failed"
+  }
+}

@@ -1,0 +1,49 @@
+workflow Deploy
+
+// Manual chapter 16, "The progress view": the chapter's `Deploy` program with
+// the `on lapse` arm reaching for `plan`, a binding the region itself
+// introduces. The arm can run before that step ever settles, so the reference
+// is refused and the progress view is the sanctioned way to see it.
+
+output result Done
+failure error Halted
+
+class Incident {
+  sev string
+}
+
+class Done {
+  note string
+}
+
+class Halted {
+  reason string
+}
+
+rule trouble
+  when started
+=> {
+  timer 2s as spark
+
+  after spark completes {
+    record Incident {
+      sev "sev1"
+    }
+  }
+}
+
+rule ship
+  when started
+=> {
+  until exists(Incident where sev == "sev1") {
+    then plan <- timer 1s
+    then approved <- timer 6s
+    complete result {
+      note "shipped"
+    }
+  } on lapse {
+    fail error {
+      reason plan.status
+    }
+  }
+}

@@ -1,0 +1,51 @@
+workflow Sorter
+
+// Manual chapter 7, "The compiler checks exhaustiveness": the chapter's `Sorter`
+// program with the `Reference` arm of the `case` deleted, which is the change
+// the chapter tells the reader to make.
+
+output result Done
+
+class Done {
+  note string
+}
+
+enum Genre {
+  Fiction
+  Reference
+}
+
+class Book {
+  title string
+  genre Genre
+  format "print" | "ebook"
+}
+
+class Shelved {
+  title string
+  shelf string
+}
+
+table books as Book [
+  {
+    title "Dune"
+    genre Fiction
+    format "print"
+  }
+]
+
+rule shelve
+  when Book as b
+=> {
+  case b.genre {
+    Fiction => {
+      record Shelved { title b.title shelf "novels" }
+    }
+  }
+}
+
+rule finish
+  when Shelved as s
+=> {
+  complete result { note s.shelf }
+}
