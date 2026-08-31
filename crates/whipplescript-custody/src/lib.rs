@@ -24,6 +24,7 @@ pub mod canon;
 #[cfg(target_family = "unix")]
 pub mod client;
 pub mod egress;
+pub mod sign_prefix;
 
 use std::fmt;
 

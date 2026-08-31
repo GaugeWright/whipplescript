@@ -985,3 +985,110 @@ fn rotate_refuses_a_remote_credential_with_no_openbao_connection() {
         "the refusal must name what is missing: {detail}"
     );
 }
+
+/// The signing bound of DR-0053 §14's amendment, enforced where it has to be.
+///
+/// `CustodyOk::Signed` returns the signature to whip, so a standalone `sign` is
+/// an oracle whose payload whip chooses. The custodian holding the bound is
+/// what makes it hold against a fully compromised whip rather than merely an
+/// escaped agent — a bound whip supplied is one whip could choose.
+#[test]
+fn a_configured_prefix_bounds_what_a_credential_may_sign() {
+    let mut store = SealedStore::create(None, "test-passphrase").expect("create");
+    store
+        .register(
+            name("acme/github"),
+            CredentialKind::HmacSha256,
+            Zeroizing::new(b"app-key".to_vec()),
+            None,
+        )
+        .expect("register");
+    let mut prefixes = std::collections::BTreeMap::new();
+    prefixes.insert(
+        name("acme/github"),
+        vec![whipplescript_custody::sign_prefix::named("jwt-rs256-header").expect("named")],
+    );
+    let custodian = Custodian::new(store, Box::new(DeniedEgress)).with_sign_prefixes(prefixes);
+
+    let sign = |payload: &[u8]| {
+        custodian.handle(&call(CustodyOp::Sign {
+            credential: name("acme/github"),
+            alg: SignatureAlg::HmacSha256,
+            derivation: Vec::new(),
+            payload_b64: B64.encode(payload),
+        }))
+    };
+
+    let jwt = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJnaXRodWIifQ";
+    assert!(
+        matches!(sign(jwt).outcome, Ok(CustodyOk::Signed { .. })),
+        "a payload inside the bound must sign"
+    );
+
+    // The property the mechanism rests on: a key bounded to one protocol's
+    // prefix cannot produce another protocol's signature.
+    let tls = whipplescript_custody::sign_prefix::named("tls13-client-auth").expect("named");
+    let reply = sign(&tls);
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("a TLS CertificateVerify must be refused: {reply:?}");
+    };
+    assert!(
+        detail.contains("begins with none of the configured prefixes"),
+        "the refusal must say why: {detail}"
+    );
+}
+
+/// A credential the configuration does not name is unbounded. Naming one is
+/// what opts it in — a custodian that refused unnamed credentials on upgrade
+/// would take every existing deployment down rather than tighten it.
+#[test]
+fn an_unnamed_credential_signs_without_a_prefix_bound() {
+    let custodian = custodian_with(&[("acme/other", CredentialKind::HmacSha256, b"key")]);
+    let reply = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("acme/other"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"anything at all"),
+    }));
+    assert!(
+        matches!(reply.outcome, Ok(CustodyOk::Signed { .. })),
+        "{reply:?}"
+    );
+}
+
+/// r3 transit signs with the key inside the engine, so a derivation chain — the
+/// §7 fold that produces a subkey from the raw material — has nothing to fold.
+/// Refused by name rather than silently signing without the chain, which would
+/// produce a valid signature under the wrong key.
+///
+/// Reachable without a server: the refusal happens after the client is resolved
+/// and before any request, so a client pointed at a closed port is enough.
+#[test]
+fn r3_refuses_a_derivation_chain_rather_than_ignoring_it() {
+    let mut store = SealedStore::create(None, "test-passphrase").expect("create");
+    store
+        .register_remote(
+            name("acme/remote"),
+            CredentialKind::HmacSha256,
+            "transit-key".into(),
+            None,
+        )
+        .expect("register remote");
+    let custodian = Custodian::new(store, Box::new(DeniedEgress)).with_openbao(Arc::new(
+        whipplescript_custodian::openbao::Client::new("http://127.0.0.1:1", "token"),
+    ));
+
+    let reply = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("acme/remote"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: vec!["20260831".into(), "us-east-1".into()],
+        payload_b64: B64.encode(b"payload"),
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("a derivation chain on r3 must refuse: {reply:?}");
+    };
+    assert!(
+        detail.contains("does not support derivation chains"),
+        "the refusal must name what it cannot do: {detail}"
+    );
+}

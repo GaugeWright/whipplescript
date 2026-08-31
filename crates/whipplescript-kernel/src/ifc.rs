@@ -174,6 +174,12 @@ pub struct Envelope {
     /// said where this credential may reach, which the caller treats as a
     /// refusal for a governed program; an empty one cannot be written.
     request_scopes: BTreeMap<String, Vec<String>>,
+    /// Declared literal prefixes a `sign` payload must begin with, by
+    /// credential (DR-0053 §14 Amendment 2026-08-29). Governance's bound on the
+    /// signing oracle: `CustodyOk::Signed` returns the signature to whip, so
+    /// without one a compromised whip obtains a signature over bytes of its
+    /// choosing under any credential the grant names.
+    sign_prefixes: BTreeMap<String, Vec<Vec<u8>>>,
     /// signal resources (`signal:<name>`) governance marks INTERNAL (H8 stage b): an
     /// internal signal is an internal channel, NOT an external entry point, so its
     /// integrity at a receiver is DERIVED from its emitters (carriage) rather than
@@ -351,6 +357,7 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -668,6 +675,7 @@ impl Envelope {
             deleg,
             declassify,
             request_scopes,
+            sign_prefixes,
             integrity,
             endorse,
             unwrap_grants,
@@ -705,6 +713,7 @@ impl Envelope {
         let mut declassify = Vec::new();
         let mut unwrap_grants: Vec<UnwrapGrant> = Vec::new();
         let mut request_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut sign_prefixes: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
         let mut integrity = BTreeMap::new();
         let mut endorse = Vec::new();
         let mut principals = BTreeSet::new();
@@ -832,6 +841,38 @@ impl Envelope {
             // arm for the same reason `unwrap` is: there is no `->` on this
             // line, so the generic arm would reject it complaining about a
             // resource id it does not want.
+            // `grant sign <Credential> for prefix <entry>[, <entry> …]`
+            // (DR-0053 §14 Amendment 2026-08-29). Matched before the generic
+            // `grant <kind> <handle> -> <address>` arm for the same reason
+            // `request` is: there is no `->` on this line.
+            if tokens.first().copied() == Some("grant") && tokens.get(1).copied() == Some("sign") {
+                let (Some(credential), Some("for"), Some("prefix")) = (
+                    tokens.get(2).copied(),
+                    tokens.get(3).copied(),
+                    tokens.get(4).copied(),
+                ) else {
+                    return Err(format!(
+                        "line {}: sign grant needs \
+                         `grant sign <Credential> for prefix <entry>[, <entry> …]` \
+                         (the list is required: a signing oracle with no bound is \
+                         one a compromised whip aims wherever it likes)",
+                        index + 1
+                    ));
+                };
+                reject_pattern_resource(credential)
+                    .map_err(|problem| format!("line {}: {problem}", index + 1))?;
+                let raw = tokens[5..].join(" ");
+                // Parsed HERE, as the policy is admitted, so a malformed entry
+                // is an error the operator sees when they write it rather than
+                // a silent never-match at signing time.
+                let parsed = whipplescript_custody::sign_prefix::parse_list(&raw)
+                    .map_err(|problem| format!("line {}: sign grant: {problem}", index + 1))?;
+                sign_prefixes
+                    .entry(credential.to_owned())
+                    .or_default()
+                    .extend(parsed);
+                continue;
+            }
             if tokens.first().copied() == Some("grant") && tokens.get(1).copied() == Some("request")
             {
                 let (Some(credential), Some("for")) =
@@ -1145,6 +1186,7 @@ impl Envelope {
             deleg,
             declassify,
             request_scopes,
+            sign_prefixes,
             integrity,
             endorse,
             unwrap_grants,
@@ -1703,6 +1745,35 @@ impl Envelope {
     /// is §14's "the list is required" read as an admission rule rather than a
     /// well-formedness one: a credential nobody scoped is a credential nobody
     /// said may reach anywhere.
+    /// Whether governance permits SIGNING `payload` under `credential`
+    /// (DR-0053 §14 Amendment 2026-08-29).
+    ///
+    /// The same fail-closed shape as `admits_request`, and for the same reason:
+    /// governance that never mentions a credential does not constrain it, but
+    /// once it takes one under management, silence about a bound is an omission
+    /// rather than a decision. The ancestor walk means a bound on a vault binds
+    /// every member, including ones that do not exist yet.
+    pub fn admits_sign(&self, credential: &str, payload: &[u8]) -> Result<(), String> {
+        let Some(prefixes) =
+            credential_ancestors(credential).find_map(|probe| self.sign_prefixes.get(probe))
+        else {
+            if !credential_ancestors(credential).any(|probe| self.governs(probe)) {
+                return Ok(());
+            }
+            return Err(format!(
+                "governance binds credential `{credential}` but names no signing bound for it: \
+                 add `grant sign {credential} for prefix <entry>` to the policy"
+            ));
+        };
+        if whipplescript_custody::sign_prefix::admits(prefixes, payload) {
+            return Ok(());
+        }
+        Err(format!(
+            "denied signing under `{credential}`: the payload begins with none of the granted \
+             prefixes — a signing oracle bounded to one protocol cannot produce another's"
+        ))
+    }
+
     pub fn admits_request(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
         let Some(entries) = self.request_scope(credential) else {
             // Governance that never mentions this credential does not constrain
@@ -2890,6 +2961,12 @@ impl VerifiedEnvelope {
     /// Whether this verified policy admits `method url` under `credential`.
     pub fn admits_request(&self, credential: &str, method: &str, url: &str) -> Result<(), String> {
         self.envelope.admits_request(credential, method, url)
+    }
+
+    /// The signing bound of DR-0053 §14's amendment, delegated like its
+    /// egress twin.
+    pub fn admits_sign(&self, credential: &str, payload: &[u8]) -> Result<(), String> {
+        self.envelope.admits_sign(credential, payload)
     }
 
     /// The custody class this verified policy demands of any endpoint delegated
@@ -12680,6 +12757,85 @@ rule refund
             messages.iter().any(|m| m.contains("stripe_api")),
             "an external response must not silently vouch for a guarded sink: {messages:#?}"
         );
+    }
+
+    /// `grant sign <C> for prefix <entry>` bounds the signing oracle
+    /// (DR-0053 §14 Amendment 2026-08-29). `CustodyOk::Signed` returns the
+    /// signature to whip, so without a bound a compromised whip obtains a
+    /// signature over bytes of its choosing.
+    ///
+    /// The property worth pinning is cross-protocol: a key granted the JWT
+    /// header cannot produce a TLS `CertificateVerify`, whose input begins with
+    /// sixty-four `0x20` bytes.
+    #[test]
+    fn a_sign_grant_bounds_the_payload_by_prefix() {
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential GithubApp -> credential:acme/github  sealed at process\n\
+             grant sign GithubApp for prefix jwt-rs256-header\n",
+        )
+        .expect("valid envelope");
+
+        let jwt = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJnaXRodWIifQ";
+        assert!(envelope.admits_sign("GithubApp", jwt).is_ok());
+
+        let tls = whipplescript_custody::sign_prefix::named("tls13-client-auth").expect("named");
+        let refused = envelope
+            .admits_sign("GithubApp", &tls)
+            .expect_err("a TLS CertificateVerify must not be signed by a JWT-bounded key");
+        assert!(
+            refused.contains("begins with none of the granted prefixes"),
+            "{refused}"
+        );
+
+        // Governance that never mentions a credential does not constrain it —
+        // the same fail-closed shape `admits_request` has, and the reason an
+        // ungoverned deployment keeps working.
+        assert!(envelope.admits_sign("other/key", jwt).is_ok());
+    }
+
+    /// Taking a credential under management and then naming no signing bound is
+    /// an omission, not a decision. This is the half that makes the grant worth
+    /// having: without it, `grant credential X` alone would leave the oracle
+    /// unbounded while reading as governed.
+    #[test]
+    fn a_governed_credential_with_no_sign_bound_is_refused() {
+        // Keyed on the declared HANDLE, as `admits_request` is: `governs`
+        // resolves a handle to its address, and the effect's resource is the
+        // handle rather than the custodian's name for it.
+        let envelope = Envelope::from_dsl(
+            "authority acme\n\
+             grant credential GithubApp -> credential:acme/github  sealed at process\n",
+        )
+        .expect("valid envelope");
+        let refused = envelope
+            .admits_sign("GithubApp", b"anything")
+            .expect_err("a governed credential with no bound must refuse");
+        assert!(refused.contains("names no signing bound"), "{refused}");
+    }
+
+    /// A malformed grant is refused where the operator writes it, rather than
+    /// becoming a bound that never matches at signing time.
+    #[test]
+    fn a_malformed_sign_grant_is_refused_at_policy_admission() {
+        for bad in [
+            "grant sign GithubApp for prefix\n",
+            "grant sign GithubApp for prefix not-a-known-name\n",
+            "grant sign GithubApp for prefix hex:abc\n",
+            "grant sign GithubApp jwt-rs256-header\n",
+        ] {
+            let text = format!("authority acme\n{bad}");
+            let refused = Envelope::from_dsl(&text)
+                .err()
+                .unwrap_or_else(|| panic!("`{bad}` must not be admitted"));
+            // Asserting the TEXT, not just that something failed: any refusal
+            // satisfies `is_err`, including ones that have nothing to do with
+            // the grant's shape.
+            assert!(
+                refused.contains("sign grant"),
+                "`{bad}` must be refused as a sign grant: {refused}"
+            );
+        }
     }
 
     #[test]

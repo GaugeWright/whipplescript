@@ -31,6 +31,7 @@ const USAGE: &str = "usage:
   whip-custodian list   --store <path>
   whip-custodian revoke --store <path> --name <credential>
   whip-custodian serve  --store <path> --socket <path> [--egress-allow <host,host,*.suffix>]
+                        [--sign-prefix <cred>=<entry>[,<entry>][;<cred>=<entry>]]
 
 passphrase: WHIPPLESCRIPT_CUSTODIAN_PASSPHRASE or --passphrase-file <path>
 openbao (r3): serve connects when BAO_ADDR (or VAULT_ADDR) is set, using BAO_TOKEN (or VAULT_TOKEN)";
@@ -219,7 +220,46 @@ fn serve_command(
         }
         None => Box::new(DeniedEgress),
     };
-    let mut custodian = Custodian::new(store, egress);
+    // The signing bound of DR-0053 §14's amendment. Configured HERE rather than
+    // read from whip's governance for the same reason the egress allow-list is:
+    // it must hold against a fully compromised whip, and a bound whip supplies
+    // is one whip can choose.
+    //
+    // Unlike egress, absence ADMITS. Egress denies by default because a
+    // custodian that egresses nowhere is safe and loud; a custodian that signs
+    // nothing is neither — it would take down every deployment that signs today
+    // rather than tighten it. Naming a credential is what opts it in.
+    let mut sign_prefixes: std::collections::BTreeMap<
+        whipplescript_custody::CredentialName,
+        Vec<Vec<u8>>,
+    > = std::collections::BTreeMap::new();
+    // One flag, `;` between credentials and `,` between entries — the same
+    // single-flag shape `--egress-allow <host,host>` uses, rather than a
+    // repeated flag the argument parser does not carry.
+    for spec in args
+        .flags
+        .get("sign-prefix")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty())
+    {
+        let (credential, entries) = spec.split_once('=').ok_or_else(|| {
+            format!("--sign-prefix needs `<credential>=<entry>[,<entry>]`: {spec}")
+        })?;
+        let name = whipplescript_custody::CredentialName::new(credential.trim())
+            .map_err(|e| format!("--sign-prefix credential: {e}"))?;
+        let parsed = whipplescript_custody::sign_prefix::parse_list(entries)
+            .map_err(|e| format!("--sign-prefix {credential}: {e}"))?;
+        eprintln!(
+            "whip-custodian: {} may sign {} prefix(es)",
+            name,
+            parsed.len()
+        );
+        sign_prefixes.entry(name).or_default().extend(parsed);
+    }
+    let mut custodian = Custodian::new(store, egress).with_sign_prefixes(sign_prefixes);
     // r3: connect to OpenBao when the environment names one. A
     // configured-but-unreachable OpenBao is a startup error, not a
     // daemon that silently serves remote entries it cannot reach.

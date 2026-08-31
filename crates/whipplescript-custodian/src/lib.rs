@@ -107,6 +107,8 @@ pub struct Custodian {
     /// Shared because the daemon's token-renewal thread holds the same
     /// client: renewal is a property of the connection, not of any one call.
     openbao: Option<Arc<openbao::Client>>,
+    /// Per-credential signing bounds; see `with_sign_prefixes`.
+    sign_prefixes: BTreeMap<CredentialName, Vec<Vec<u8>>>,
     rng: SystemRandom,
 }
 
@@ -125,8 +127,28 @@ impl Custodian {
             use_counts: Mutex::new(BTreeMap::new()),
             egress,
             openbao: None,
+            sign_prefixes: BTreeMap::new(),
             rng: SystemRandom::new(),
         }
+    }
+
+    /// Bound what a credential may SIGN, by literal payload prefix (DR-0053 §14
+    /// Amendment 2026-08-29).
+    ///
+    /// Configured at the daemon rather than read from whip's governance, for
+    /// the same reason the egress allow-list is: the bound has to hold against
+    /// a fully compromised whip, and a bound whip supplies is one whip can
+    /// choose. The two are the same shape — governance checks at compile time,
+    /// the custodian enforces at use time, and neither is the other's backup.
+    ///
+    /// Absent means UNBOUND, matching the egress allow-list's shape only in
+    /// spelling: there, absence denies everything. Here it admits, because
+    /// every existing deployment signs without prefixes and a custodian that
+    /// refused them on upgrade would take the tree down rather than tighten it.
+    /// Naming a credential is what opts it in.
+    pub fn with_sign_prefixes(mut self, prefixes: BTreeMap<CredentialName, Vec<Vec<u8>>>) -> Self {
+        self.sign_prefixes = prefixes;
+        self
     }
 
     /// Attach an r3 OpenBao transit client (built by the daemon from
@@ -320,7 +342,10 @@ impl Custodian {
                 derivation,
                 payload_b64,
                 ..
-            } => op_sign(kind, &material, *alg, derivation, payload_b64),
+            } => {
+                self.admits_sign(&name, payload_b64)?;
+                op_sign(kind, &material, *alg, derivation, payload_b64)
+            }
             CustodyOp::Verify {
                 alg,
                 payload_b64,
@@ -412,6 +437,7 @@ impl Custodian {
                             .into(),
                     });
                 }
+                self.admits_sign(name, payload_b64)?;
                 let payload = decode_b64(payload_b64)?;
                 let (key_version, signature) = client
                     .transit_sign(key_name, &payload, kind)
@@ -511,6 +537,33 @@ impl Custodian {
             })?;
         Ok(CustodyOk::Derived {
             credential: derived_name,
+        })
+    }
+
+    /// Refuse a payload that begins with none of a credential's granted
+    /// prefixes (DR-0053 §14 Amendment 2026-08-29).
+    ///
+    /// Enforced on BOTH signing paths — local and r3 remote — because a bound
+    /// that held only on one would be a bound an operator could not reason
+    /// about, and the remote rung is the production one.
+    ///
+    /// A credential the configuration does not name is unbounded. Naming one is
+    /// what opts it in, which is what keeps this from breaking every deployment
+    /// that signs today.
+    fn admits_sign(&self, name: &CredentialName, payload_b64: &str) -> Result<(), CustodyError> {
+        let Some(prefixes) = self.sign_prefixes.get(name) else {
+            return Ok(());
+        };
+        let payload = decode_b64(payload_b64)?;
+        if whipplescript_custody::sign_prefix::admits(prefixes, &payload) {
+            return Ok(());
+        }
+        Err(CustodyError::Backend {
+            detail: format!(
+                "credential {name} may not sign this payload: it begins with none of the \
+                 configured prefixes. a signing oracle bounded to one protocol cannot produce \
+                 another's"
+            ),
         })
     }
 
