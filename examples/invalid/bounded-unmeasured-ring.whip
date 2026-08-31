@@ -1,0 +1,54 @@
+@bounded
+workflow BoundedUnmeasuredRing
+
+output result Done
+
+# A `@bounded` workflow promises to settle in a number of steps the program
+# fixes and the data does not. This ring carries no effect, so the effect-cycle
+# refusal never looked at it — and nothing proves it stops, so it turns inside
+# the pass forever. Give it a measure (an `int` field every hop advances by a
+# literal step, with a rule on the ring bounding it) or drop `@bounded`.
+
+class Done {
+  n int
+}
+
+class Ping {
+  n int
+}
+
+class Pong {
+  n int
+}
+
+rule seed
+  when started
+=> {
+  record Ping {
+    n 0
+  }
+}
+
+rule to_pong
+  when Ping as p
+=> {
+  done p -> record Pong {
+    n p.n + 1
+  }
+}
+
+rule to_ping
+  when Pong as q
+=> {
+  done q -> record Ping {
+    n q.n + 1
+  }
+}
+
+rule finish
+  when Ping as p where p.n > 99999
+=> {
+  complete result {
+    n p.n
+  }
+}

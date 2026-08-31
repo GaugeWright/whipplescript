@@ -1,0 +1,6 @@
+error[graph.bounded_workflow_effect_cycle]: unmeasured cycle in a bounded workflow is not allowed: workflow `BoundedUnmeasuredRing` is `@bounded`, and rule cycle to_pong -> to_ping -> to_pong turns with nothing proving it stops
+   --> examples/invalid/bounded-unmeasured-ring.whip:33:8
+   |
+33 |   when Ping as p
+   |        ^^^^^^^^^
+   = help: field `n` rises by 2 on every hop, but no rule on the cycle bounds it, so nothing stops the turn; a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going

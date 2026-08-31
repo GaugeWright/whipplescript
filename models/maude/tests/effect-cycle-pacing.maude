@@ -73,3 +73,34 @@ search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
   bounded paced(ra, rb) paced(rb, rc) effectful(ra) effectful(rb) effectful(rc)
   counted(mtPairs) reaches(mtPairs) rejected(mtRules)
   =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Coverage: an UNMEASURED effect-free ring is rejected under the declaration.
+--- Nothing is enqueued and no effect rides it, yet the ring turns inside the
+--- pass and nothing proves it stops, so the workflow does not settle in any
+--- number of steps the program fixes.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  bounded unmeasured(ra) sameCommit(ra, rb) sameCommit(rb, ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* C:Cfg rejected(ra & RS:RuleSet) .
+
+--- Bite: the SAME ring with a measure is never rejected. A ring that provably
+--- cannot turn forever settles, which is all the declaration asked for — this
+--- is what keeps the refusal from being the pre-pacing mistake in another form.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  bounded sameCommit(ra, rb) sameCommit(rb, ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: the same unmeasured ring WITHOUT the declaration is never rejected.
+--- Pure monotonic recursion stays allowed where nothing promised it settles.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  unmeasured(ra) sameCommit(ra, rb) sameCommit(rb, ra)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .
+
+--- Bite: an unmeasured effect-free CHAIN under the declaration is never
+--- rejected. The refusal names a RING, not the absence of a measure.
+search [1] in WHIPPLESCRIPT-EFFECT-CYCLE-PACING :
+  bounded unmeasured(ra) sameCommit(ra, rb) sameCommit(rb, rc)
+  counted(mtPairs) reaches(mtPairs) rejected(mtRules)
+  =>* rejected(R:Rule & RS:RuleSet) RESIDUAL:Cfg .

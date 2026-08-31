@@ -9615,12 +9615,35 @@ fn validate_effectful_rule_recursion(
         {
             continue;
         }
-        let Some(&effectful) = component
+        // An effect-bearing rule is what the DEFAULT refusal is about: the harm
+        // spec/semantics.md names is a cycle enqueueing effects without waiting
+        // for the world.
+        //
+        // Under `@bounded` the promise is different and so is the condition. The
+        // declaration says the workflow settles in a number of steps the program
+        // fixes and the data does not, and a ring that turns inside the pass
+        // breaks that promise whether or not an effect rides it — an effect-free
+        // `n + 1` ring in a `@bounded` workflow ran 1346 turns with no effect
+        // anywhere in it and no diagnostic. The effect condition was a leftover
+        // from sharing this code with the unbounded case, not a considered
+        // narrowing.
+        //
+        // What makes refusing it right rather than merely stricter is DR-0081:
+        // the measure pass runs over EVERY cycle, effect-free ones included, so
+        // a ring that provably cannot turn forever is admitted on its measure
+        // and only an unmeasured ring is refused. That is what `@bounded`
+        // already means — no unmeasured loop — and without measures this would
+        // have had to refuse the guard-bounded ring too, which is the mistake
+        // the pacing change corrected.
+        let effectful_member = component
             .iter()
             .find(|&&member| !rules[member].metadata.effects.is_empty())
+            .copied();
+        let Some(effectful) = effectful_member.or_else(|| bounded_workflow.then(|| component[0]))
         else {
             continue;
         };
+        let component_carries_an_effect = effectful_member.is_some();
 
         // Name a concrete round trip rather than an unordered set: BFS from the
         // effectful rule back to itself over the direct edges of the component.
@@ -9664,12 +9687,15 @@ fn validate_effectful_rule_recursion(
             measure::MeasureOutcome::None => {}
         }
         // The span of the effect that the cycle re-runs: the most useful line to
-        // stand on, and the only span an `IrRule` carries.
+        // stand on, and the only span an `IrRule` carries. An effect-free ring
+        // under `@bounded` has no such span, and the whens carry one — the
+        // trigger that keeps re-admitting is the next most useful line.
         let span = rules[effectful]
             .metadata
             .effects
             .first()
             .map(|effect| effect.span)
+            .or_else(|| rules[effectful].whens.first().map(|when| when.span))
             .unwrap_or(SourceSpan { start: 0, end: 0 });
         // DR-0081 §8: when the analysis nearly had a measure, the suggestion
         // leads with which half was missing rather than restating the rule.
@@ -9694,11 +9720,18 @@ fn validate_effectful_rule_recursion(
                 severity: Severity::Error,
                 related: Vec::new(),
                 span,
-                message: format!(
-                    "effect cycle in a bounded workflow is not allowed: {declaration}, and rule cycle {} runs the effects of rule `{}` on every turn",
-                    cycle.join(" -> "),
-                    rules[effectful].name
-                ),
+                message: if component_carries_an_effect {
+                    format!(
+                        "effect cycle in a bounded workflow is not allowed: {declaration}, and rule cycle {} runs the effects of rule `{}` on every turn",
+                        cycle.join(" -> "),
+                        rules[effectful].name
+                    )
+                } else {
+                    format!(
+                        "unmeasured cycle in a bounded workflow is not allowed: {declaration}, and rule cycle {} turns with nothing proving it stops",
+                        cycle.join(" -> ")
+                    )
+                },
                 suggestion: with_miss(
                     "a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going",
                 ),

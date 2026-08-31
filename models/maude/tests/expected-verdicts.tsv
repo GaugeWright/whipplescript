@@ -36,7 +36,7 @@ credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN
-effect-cycle-pacing.maude	SSSSNNNNNN
+effect-cycle-pacing.maude	SSSSNNNNNNSNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
 effect-key.maude	SSSNNSNN

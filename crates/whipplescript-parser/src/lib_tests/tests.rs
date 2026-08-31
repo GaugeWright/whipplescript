@@ -9641,6 +9641,10 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bad-agent.whip"),
         ),
         (
+            "bounded-unmeasured-ring",
+            include_str!("../../../../examples/invalid/bounded-unmeasured-ring.whip"),
+        ),
+        (
             "view-effect-in-view",
             include_str!("../../../../examples/invalid/view-effect-in-view.whip"),
         ),
@@ -21312,5 +21316,81 @@ rule finish
             .any(|diagnostic| diagnostic.code == diagnostic_code!("construct.view_region")),
         "expected the region refusal, got: {:?}",
         compiled.diagnostics
+    );
+}
+
+/// `@bounded` promises the workflow settles in a number of steps the program
+/// fixes and the data does not, so an UNMEASURED ring breaks that promise
+/// whether or not an effect rides it. The effect condition that once qualified
+/// this refusal was a leftover from sharing its code with the unbounded case.
+#[test]
+fn a_bounded_workflow_refuses_an_unmeasured_effect_free_ring() {
+    let source = include_str!("../../../../examples/invalid/bounded-unmeasured-ring.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code
+                == diagnostic_code!("graph.bounded_workflow_effect_cycle")),
+        "expected the bounded-ring refusal, got: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The control, and the reason this is not the pre-pacing mistake in another
+/// form: the SAME ring with a measure is admitted. A ring that provably cannot
+/// turn forever settles, which is all the declaration asked for. Without this
+/// the rule above could be refusing every ring and nobody would notice.
+#[test]
+fn a_bounded_workflow_admits_the_same_ring_once_it_is_measured() {
+    let source = r#"@bounded
+workflow BoundedMeasuredRing
+
+output result Done
+
+class Done {
+  n int
+}
+
+class Attempt {
+  n int
+}
+
+rule seed
+  when started
+=> {
+  record Attempt {
+    n 0
+  }
+}
+
+rule advance
+  when Attempt as a where a.n < 3
+=> {
+  done a -> record Attempt {
+    n a.n + 1
+  }
+}
+
+rule finish
+  when Attempt as a where a.n >= 3
+=> {
+  complete result {
+    n a.n
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled
+        .ir
+        .expect("a measured ring compiles under `@bounded`");
+    assert!(
+        !ir.measures.is_empty(),
+        "the ring is admitted BECAUSE it has a measure, so one must be published"
     );
 }

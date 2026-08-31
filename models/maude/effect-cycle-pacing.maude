@@ -36,7 +36,12 @@
 ---   * a cycle that closes only through a paced edge is NEVER rejected, so one
 ---     wait on the world is enough to pace the whole ring;
 ---   * an effect-free same-commit cycle is NEVER rejected;
----   * an acyclic chain in a bounded workflow is NEVER rejected.
+---   * an acyclic chain in a bounded workflow is NEVER rejected;
+---   * an UNMEASURED effect-free ring IS rejected under the bounded
+---     declaration, while the same ring with a measure, the same unmeasured
+---     ring without the declaration, and an unmeasured effect-free CHAIN under
+---     it are all never rejected — so the refusal names an unmeasured RING
+---     under a DECLARATION, and neither half alone.
 mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
   protecting BOOL .
 
@@ -73,6 +78,7 @@ mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
   op paced : Rule Rule -> Cfg [ctor] .       --- edge that waits on an effect terminal
   op preservedSelf : Rule -> Cfg [ctor] .    --- self-edge the per-rule refusal owns
   op bounded : -> Cfg [ctor] .               --- the workflow declares that it settles
+  op unmeasured : Rule -> Cfg [ctor] .       --- no measure proves this ring stops
   op tool : -> Cfg [ctor] .                  --- @tool, the same promise via DR-0025
   op effectful : Rule -> Cfg [ctor] .        --- rule runs at least one effect
   op reaches : PairSet -> Cfg [ctor] .       --- transitive reachability over counted edges
@@ -122,4 +128,21 @@ mod WHIPPLESCRIPT-EFFECT-CYCLE-PACING is
   crl [reject] : reaches(pair(C, C) ; PS) effectful(E) rejected(RS)
       => reaches(pair(C, C) ; PS) effectful(E) rejected(C & RS)
       if onCycle(C, E, (pair(C, C) ; PS)) /\ memberRule(C, RS) = false .
+
+  --- The refusal under the declaration, which needs no effect. `bounded` says
+  --- the workflow settles in a number of steps the program fixes and the data
+  --- does not, and a ring that turns inside the pass breaks that promise
+  --- whether or not an effect rides it. The effect condition on the rule above
+  --- is what makes an effect-free ring legal, and that is exactly the promise
+  --- `bounded` is not entitled to make.
+  ---
+  --- What keeps this from being the pre-pacing mistake in another form is the
+  --- measure. DR-0081's analysis runs over EVERY cycle, effect-free ones
+  --- included, so a ring that provably cannot turn forever is admitted on its
+  --- proof and only an UNMEASURED ring is refused. `unmeasured` is the token
+  --- for "termination-measure.maude proved nothing here"; its absence is a
+  --- proof, which is why the condition is a token rather than a negation.
+  crl [reject-bounded-unmeasured] : bounded unmeasured(C) reaches(pair(C, C) ; PS) rejected(RS)
+      => bounded unmeasured(C) reaches(pair(C, C) ; PS) rejected(C & RS)
+      if memberRule(C, RS) = false .
 endm
