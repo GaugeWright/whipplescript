@@ -24189,8 +24189,18 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for CustodyCapabi
                     ),
                 };
             };
+            let floor = match credential_rung_floor() {
+                Ok(floor) => floor,
+                Err(message) => {
+                    return CapabilityOutcome::Failed {
+                        error_kind: "custody".to_owned(),
+                        message,
+                    }
+                }
+            };
+            let guarded = whipplescript_custody::RungFloor::new(Box::new(transport), floor);
             whipplescript_kernel::effect_handlers::run_custody_capability(
-                &transport,
+                &guarded,
                 effect,
                 &self.run_id,
             )
@@ -25360,12 +25370,46 @@ fn run_queue_effect(
 /// Boxed so both arms return ONE type: a non-Unix build has no transport type
 /// to name, and an `Infallible` placeholder would still have to satisfy
 /// `CustodyTransport` at the call site.
+/// This run's `require credential <rung>` floor (DR-0053 §4).
+///
+/// A REJECTED envelope is an error rather than "no floor". Reading a tampered
+/// or malformed policy as ungoverned would let anyone lower the bar by
+/// corrupting the file that sets it, which is the shape §4 exists to prevent.
+pub(crate) fn credential_rung_floor() -> Result<Option<whipplescript_custody::Rung>, String> {
+    floor_from_envelope(crate::ifc::VerifiedEnvelope::load_from_env())
+}
+
+/// The decision the function above makes, over a value rather than the process
+/// environment.
+///
+/// Split out so the REJECTED arm is reachable in a test: reaching it through
+/// `load_from_env` means writing a corrupt envelope to disk and pointing an env
+/// var at it mid-suite, which races every other test in the binary. Which
+/// status means which floor needs no environment to decide.
+fn floor_from_envelope(
+    status: crate::ifc::EnvelopeStatus,
+) -> Result<Option<whipplescript_custody::Rung>, String> {
+    match status {
+        crate::ifc::EnvelopeStatus::Ungoverned => Ok(None),
+        crate::ifc::EnvelopeStatus::Rejected(message) => {
+            Err(format!("governance envelope rejected: {message}"))
+        }
+        crate::ifc::EnvelopeStatus::Verified(verified) => Ok(verified.credential_min_rung()),
+    }
+}
+
 #[cfg(target_family = "unix")]
 pub(crate) fn custody_egress_transport(
 ) -> Result<Option<Box<dyn whipplescript_custody::CustodyTransport>>, String> {
+    let floor = credential_rung_floor()?;
     Ok(
         whipplescript_custody::client::UnixSocketTransport::from_env().map(|transport| {
-            Box::new(transport) as Box<dyn whipplescript_custody::CustodyTransport>
+            // Wrapped HERE, at the one constructor, so every caller of this
+            // function is guarded by construction rather than by remembering.
+            Box::new(whipplescript_custody::RungFloor::new(
+                Box::new(transport),
+                floor,
+            )) as Box<dyn whipplescript_custody::CustodyTransport>
         }),
     )
 }

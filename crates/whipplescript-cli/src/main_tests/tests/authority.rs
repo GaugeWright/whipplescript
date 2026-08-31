@@ -752,3 +752,27 @@ fn coordination_owner_strips_workflow_principal_prefix() {
     );
     assert_eq!(coordination_owner_from_principal(""), None);
 }
+
+/// DR-0053 §4: a REJECTED policy is an error, never "no floor".
+///
+/// Pinned because the sweep found it unexercised. Reading a tampered envelope as
+/// ungoverned would let anyone lower the bar by corrupting the file that sets
+/// it, which is the shape the signed floor exists to prevent.
+#[test]
+fn a_tampered_policy_cannot_lower_the_credential_rung_floor() {
+    let refused = floor_from_envelope(crate::ifc::EnvelopeStatus::Rejected(
+        "attestation does not verify".to_owned(),
+    ))
+    .expect_err("a rejected envelope is not a missing one");
+    assert_eq!(
+        refused,
+        "governance envelope rejected: attestation does not verify"
+    );
+
+    // The control, and the progressive-rigor half: no envelope at all is
+    // ungoverned dev mode, which keeps working at r0.
+    assert_eq!(
+        floor_from_envelope(crate::ifc::EnvelopeStatus::Ungoverned),
+        Ok(None)
+    );
+}

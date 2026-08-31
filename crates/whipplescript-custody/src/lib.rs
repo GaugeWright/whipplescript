@@ -1270,6 +1270,65 @@ pub trait CustodyTransport: Send + Sync {
     fn call(&self, call: CustodyCall) -> Result<CustodyReply, TransportError>;
 }
 
+/// Enforce `require credential <rung>` on every reply that passes through.
+///
+/// DR-0053 §4 puts the floor in the SIGNED policy so that provisioning a
+/// credential cannot also lower the bar it is judged against, and
+/// `credential-rung-evidence.maude` states the rule this implements: admission
+/// compares the floor against the rung the custodian DERIVED, and nothing in
+/// the configuration can move it.
+///
+/// It is a decorator on the transport rather than a check at each call site
+/// because there are four call sites today — wrap, unwrap, sign, request — and
+/// a fifth would otherwise be able to forget. Every reply crosses this trait,
+/// so wrapping the transport is the one place that cannot be bypassed by
+/// adding a caller.
+///
+/// **The floor was inert before this.** `require credential hardware` parsed,
+/// canonicalised, round-tripped and had an accessor with no callers, and
+/// `CustodyError::RungBelowFloor` was constructed only by a serialisation test.
+/// A program could require r2 and run at r0 with nothing to say so.
+pub struct RungFloor {
+    inner: Box<dyn CustodyTransport>,
+    /// `None` is ungoverned dev mode — progressive rigor, the same shape the
+    /// envelope's own absence has. A floor engages when governance names one.
+    floor: Option<Rung>,
+}
+
+impl RungFloor {
+    pub fn new(inner: Box<dyn CustodyTransport>, floor: Option<Rung>) -> Self {
+        Self { inner, floor }
+    }
+}
+
+impl CustodyTransport for RungFloor {
+    fn call(&self, call: CustodyCall) -> Result<CustodyReply, TransportError> {
+        let reply = self.inner.call(call)?;
+        let Some(floor) = self.floor else {
+            return Ok(reply);
+        };
+        // Written as the REFUSAL under a guard rather than the admission,
+        // because the refusal is what has to be measurable: a fall-through
+        // carries no message to rewrite and no condition to falsify, so the
+        // mutation sweep reported it unmeasured. Ordered by the ladder, so the
+        // guard is the model's `geq(R, M)` negated.
+        // The use_id and the derived rung are KEPT below. An operator reading
+        // the record needs to know which use was refused and what it actually
+        // ran at; replacing them with the floor would describe the policy
+        // rather than what happened.
+        if reply.rung < floor {
+            return Ok(CustodyReply {
+                outcome: Err(CustodyError::RungBelowFloor {
+                    required: floor,
+                    actual: reply.rung,
+                }),
+                ..reply
+            });
+        }
+        Ok(reply)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1532,98 @@ mod tests {
         let wire = serde_json::to_string(&reply).expect("serialize");
         let back: CustodyReply = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back, reply);
+    }
+
+    struct FixedRung(Rung);
+
+    impl CustodyTransport for FixedRung {
+        fn call(&self, _call: CustodyCall) -> Result<CustodyReply, TransportError> {
+            Ok(CustodyReply {
+                use_id: "use-1".to_owned(),
+                rung: self.0,
+                degraded: self.0 == Rung::Process,
+                outcome: Ok(CustodyOk::Signed {
+                    signature_b64: "c2ln".to_owned(),
+                    key_version: None,
+                }),
+            })
+        }
+    }
+
+    fn signing_call() -> CustodyCall {
+        CustodyCall::new(
+            UseAttribution {
+                run_id: "run-1".to_owned(),
+                actor: None,
+                effect_key: None,
+            },
+            CustodyOp::Sign {
+                credential: CredentialName::new("release_signing").expect("name"),
+                alg: SignatureAlg::Ed25519,
+                derivation: vec![],
+                payload_b64: "cGF5bG9hZA==".to_owned(),
+            },
+        )
+    }
+
+    /// DR-0053 §4: admission compares the policy floor against the rung the
+    /// custodian DERIVED. Before this the comparison did not exist — the floor
+    /// parsed and round-tripped, and `RungBelowFloor` was built only by a
+    /// serialisation test.
+    #[test]
+    fn a_credential_below_the_policy_floor_is_refused() {
+        let guarded = RungFloor::new(Box::new(FixedRung(Rung::Process)), Some(Rung::Hardware));
+        let reply = guarded
+            .call(signing_call())
+            .expect("the transport answered");
+        assert_eq!(
+            reply.outcome,
+            Err(CustodyError::RungBelowFloor {
+                required: Rung::Hardware,
+                actual: Rung::Process,
+            })
+        );
+        // What ACTUALLY ran is kept: an operator reading the record needs the
+        // use and the real rung, not the policy echoed back at them.
+        assert_eq!(reply.use_id, "use-1");
+        assert_eq!(reply.rung, Rung::Process);
+    }
+
+    #[test]
+    fn a_credential_at_or_above_the_floor_passes_through_untouched() {
+        // The control. Without it a guard that refused everything would satisfy
+        // the test above.
+        for derived in [Rung::Hardware, Rung::Remote] {
+            let guarded = RungFloor::new(Box::new(FixedRung(derived)), Some(Rung::Hardware));
+            let reply = guarded.call(signing_call()).expect("answered");
+            assert!(
+                reply.outcome.is_ok(),
+                "{derived} satisfies a hardware floor"
+            );
+            assert_eq!(reply.rung, derived);
+        }
+    }
+
+    #[test]
+    fn no_floor_is_ungoverned_rather_than_a_floor_of_zero() {
+        // Progressive rigor: governance opts in. A run with no `require
+        // credential` keeps working at r0, which is the same shape an absent
+        // envelope has.
+        let guarded = RungFloor::new(Box::new(FixedRung(Rung::Process)), None);
+        assert!(guarded
+            .call(signing_call())
+            .expect("answered")
+            .outcome
+            .is_ok());
+    }
+
+    #[test]
+    fn the_ladder_orders_every_rung_so_the_comparison_is_total() {
+        // `RungFloor` leans on the derive order. If a rung were inserted out of
+        // order, a floor would silently admit something beneath it.
+        assert!(Rung::Process < Rung::OsKeyring);
+        assert!(Rung::OsKeyring < Rung::Hardware);
+        assert!(Rung::Hardware < Rung::Remote);
     }
 
     #[test]

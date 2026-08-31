@@ -292,13 +292,23 @@ def neutralise_guard(lines: list[str], index: int) -> list[str] | None:
     Scans back a few lines because `rustfmt` puts a long condition and its
     `return Err(` on separate lines, and stops at the first guard so a nested
     `if` cannot falsify its parent.
+
+    COMMENT lines do not count against that budget. A comment is not code, and
+    counting it meant that explaining a refusal moved it out of reach of the one
+    instrument that asks whether anything exercises it — write four lines about
+    why a refusal exists and the refusal silently became unmeasurable. Found
+    that way, by a comment of exactly that length.
     """
-    for offset in range(0, 4):
-        probe = index - offset
-        if probe < 0:
-            break
+    budget = 4
+    probe = index
+    while budget > 0 and probe >= 0:
+        if lines[probe].strip().startswith("//"):
+            probe -= 1
+            continue
+        budget -= 1
         found = GUARD_LINE.match(lines[probe])
         if not found:
+            probe -= 1
             continue
         mutated = list(lines)
         mutated[probe] = f"{found.group(1)}{found.group(2)} false {{"
