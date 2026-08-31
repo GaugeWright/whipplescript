@@ -248,6 +248,20 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    /// The closed set, in declaration order. `Operation::ALL` has had this
+    /// since the protocol landed; the kinds did not, so every site needing to
+    /// enumerate them hand-listed all seven — a second table that would drift
+    /// the first time a kind was added.
+    pub const ALL: [CredentialKind; 7] = [
+        CredentialKind::Bearer,
+        CredentialKind::Basic,
+        CredentialKind::Raw,
+        CredentialKind::HmacSha256,
+        CredentialKind::Ed25519,
+        CredentialKind::AwsSigv4,
+        CredentialKind::JwtRs256,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             CredentialKind::Bearer => "bearer",

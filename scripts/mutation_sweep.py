@@ -219,6 +219,50 @@ def neutralise(line: str) -> str | None:
     return mutated if mutated != line else None
 
 
+# A refusal guarded by a condition on one of the preceding lines:
+#
+#     if entry.revoked {
+#         return Err(CustodyError::Revoked { credential: name });
+#
+# `if` or `else if`, opening a block that ends the line. The guard is what
+# decides whether the refusal fires, so falsifying it is a true neutralisation —
+# the refusal stops refusing and the code still typechecks, because the branch
+# is merely dead.
+GUARD_LINE = re.compile(r"^(\s*)(\}\s*else\s+if|if)\s+(?!let\b).+\{\s*$")
+
+
+def neutralise_guard(lines: list[str], index: int) -> list[str] | None:
+    """Falsify the guard that decides whether a refusal fires.
+
+    This exists because `mutate_message` is the only tool for an error
+    expression, and it can only catch tests that assert on the TEXT. A refusal
+    built from a typed variant carries no text at all —
+    `Err(CustodyError::Revoked { credential })` — so a whole idiom was
+    unmeasurable, and the custodian's core admission path (unknown, revoked,
+    kind mismatch) was invisible to the one instrument that asks whether a
+    refusal is exercised.
+
+    Falsifying the guard is strictly a better mutation than rewriting a message
+    where both apply, so it is tried first: it asks whether anything notices the
+    refusal STOPPED, rather than whether anything reads what it said.
+
+    Scans back a few lines because `rustfmt` puts a long condition and its
+    `return Err(` on separate lines, and stops at the first guard so a nested
+    `if` cannot falsify its parent.
+    """
+    for offset in range(0, 4):
+        probe = index - offset
+        if probe < 0:
+            break
+        found = GUARD_LINE.match(lines[probe])
+        if not found:
+            continue
+        mutated = list(lines)
+        mutated[probe] = f"{found.group(1)}{found.group(2)} false {{"
+        return mutated
+    return None
+
+
 def mutate_message(line: str) -> str | None:
     """Replace a message's text while keeping its format placeholders.
 
@@ -296,6 +340,11 @@ def apply_mutation(lines: list[str], site: Site) -> list[str] | None:
     if replaced is not None:
         mutated[index] = replaced
         return mutated
+    # Before the message rewrite: falsifying the guard asks the stronger
+    # question, and it is the only one available to a refusal with no message.
+    guarded = neutralise_guard(mutated, index)
+    if guarded is not None:
+        return guarded
     for offset in range(0, 6):
         if index + offset >= len(mutated):
             break
@@ -361,16 +410,23 @@ def sweep(
     return survivors, unmeasured
 
 
-# Four plants, one per refusal SHAPE the scanner claims to see: a pushed
+# Five plants, one per refusal SHAPE the scanner claims to see: a pushed
 # diagnostic that neutralises to `drop`, a tail-position error whose message
 # carries a positional placeholder (so a mutation that drops placeholders stops
 # compiling and the self test fails instead of the sweep reporting false
-# catches), and an `ok_or_else` that turns an absent value into an error.
+# catches), an `ok_or_else` that turns an absent value into an error, and a
+# GUARDED refusal carrying no message at all.
 #
 # The third was added 2026-08-26 with the scanner rule that finds it. A
 # detection rule with nothing planted against it is the same defect this script
 # exists to catch, one level up: the rule could stop matching and every sweep
 # would still come back clean.
+#
+# The fifth was added 2026-08-31 with `neutralise_guard`, and it is the one that
+# has to be MEASURED rather than merely reported. A message-less refusal has no
+# text to rewrite, so before that mutation the sweep skipped it — and a skip and
+# an unreachable plant both read as "not caught" unless the self test insists on
+# the difference. This plant fails if the guard mutation stops landing.
 PLANT = """
 // `unused_variables` is allowed because the mutation this plant exists to test
 // rewrites the push to `drop`, which leaves `diagnostics` unused. A crate that
@@ -397,6 +453,23 @@ fn mutation_sweep_self_test_tail_refusal(reached: bool, detail: &str) -> Result<
 #[derive(Debug)]
 enum MutationSweepSelfTestError {
     Missing(String),
+    // No payload, so a refusal built from it carries no message to rewrite —
+    // the shape `neutralise_guard` exists for.
+    Guarded,
+}
+
+// A refusal with NO message, fired by a guard. This is the custodian's
+// admission shape (`if entry.revoked { return Err(CustodyError::Revoked { … }) }`)
+// and the whole class was unmeasurable until the guard mutation: `mutate_message`
+// finds no text, so the sweep skipped it and reported "unknown, not covered".
+#[allow(dead_code)]
+fn mutation_sweep_self_test_guarded_refusal(
+    reached: bool,
+) -> Result<(), MutationSweepSelfTestError> {
+    if reached {
+        return Err(MutationSweepSelfTestError::Guarded);
+    }
+    Ok(())
 }
 
 // TWO plants, because the two shapes are found by different code and only one
@@ -425,7 +498,9 @@ fn mutation_sweep_self_test_wrapped_ok_or_refusal(
 }
 """
 
-PLANT_MARKER = "mutation sweep self test"
+# How many refusals `PLANT` contains. Asserted rather than counted so that
+# adding a plant without teaching the self test about it fails loudly.
+PLANT_COUNT = 5
 
 
 def self_test(target: str, filter_expr: str, backup: str) -> bool:
@@ -436,13 +511,18 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
     result, and would turn this script into the thing it exists to detect.
     """
     source = open(backup).read()
+    # Plants are selected by POSITION, not by their message. The fifth plant is
+    # a message-less guarded refusal — the shape `neutralise_guard` exists for —
+    # so a marker match would silently drop the one plant whose whole point is
+    # having no text, and the self test would keep reporting four of four.
+    original_lines = len(source.split("\n"))
     open(target, "w").write(source + PLANT)
     planted = find_sites(open(target).read().split("\n"))
-    matching = [site for site in planted if PLANT_MARKER in site.label]
-    if len(matching) != 4:
+    matching = [site for site in planted if site.line >= original_lines]
+    if len(matching) != PLANT_COUNT:
         print(
-            f"SELF TEST FAILED: the site scanner found {len(matching)} of the 4 "
-            f"planted refusals",
+            f"SELF TEST FAILED: the site scanner found {len(matching)} of the "
+            f"{PLANT_COUNT} planted refusals",
             file=sys.stderr,
         )
         return False
@@ -454,7 +534,7 @@ def self_test(target: str, filter_expr: str, backup: str) -> bool:
             file=sys.stderr,
         )
         return False
-    if len(survivors) != 4:
+    if len(survivors) != PLANT_COUNT:
         print(
             "SELF TEST FAILED: the sweep reported an unreachable planted refusal "
             "as exercised, so its mutations are not landing",

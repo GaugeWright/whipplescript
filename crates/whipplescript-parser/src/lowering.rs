@@ -98,6 +98,7 @@ pub(crate) fn lower_program(
         streams: Vec::new(),
         channels: Vec::new(),
         credentials: Vec::new(),
+        vaults: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
         campaigns: Vec::new(),
@@ -207,6 +208,7 @@ pub(crate) fn lower_program(
             // The `file store` declaration (capability-scoped store identity)
             // lowers to its name + literal root; the runtime file provider reads
             // `<root>/<path>` for `read` effects against this store.
+            Item::Vault(vault) => lower_vault(vault, &mut ir, &mut diagnostics),
             Item::FileStore(file_store) => {
                 // Conditioned check (spec/std-files.md "Static checks"): the
                 // optional `provider <name>` clause must name a known file
@@ -654,6 +656,132 @@ fn lower_channel(channel: ChannelDecl, ir: &mut IrProgram, diagnostics: &mut Vec
     });
 }
 
+/// The `retain` policy of a vault whose clause is absent. `instance` reaps at
+/// terminal; `durable` means the vault owns its contents and reconciliation is
+/// the operator's. The safe option is the default deliberately (DR-0053 §5
+/// Amendment): the failure mode under it is loud — generate, forget to hand
+/// off, and the credential dies at instance end — while an unbounded default
+/// accumulates authority nobody tracks.
+const VAULT_RETAIN_DEFAULT: &str = "instance";
+const VAULT_RETAIN_POLICIES: [&str; 2] = ["instance", "durable"];
+
+fn lower_vault(vault: VaultDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(existing) = ir
+        .vaults
+        .iter()
+        .find(|declared| declared.name == vault.name.name)
+    {
+        diagnostics.push(
+            Diagnostic {
+                related: Vec::new(),
+                span: vault.span,
+                message: format!("vault `{}` is declared more than once", vault.name.name),
+                suggestion: Some("give each vault a unique name".to_owned()),
+            }
+            .with_related(existing.span, "first declared here"),
+        );
+        return;
+    }
+    // A vault is a `/`-PREFIX in `CredentialName`, so a name that already
+    // carries a separator would nest two containers and make the ancestor walk
+    // ambiguous about which one governance bound.
+    let normalized = vault.kind.name.replace('_', "-");
+    let kind = whipplescript_custody::CredentialKind::parse(&normalized).ok();
+    if kind.is_none() {
+        diagnostics.push(Diagnostic {
+            related: Vec::new(),
+            span: vault.kind.span,
+            message: format!(
+                "vault `{}` names unknown kind `{}`",
+                vault.name.name, vault.kind.name
+            ),
+            suggestion: Some(format!(
+                "declare one of: {}",
+                crate::credential_kind_spellings().join(", ")
+            )),
+        });
+    }
+    let mut allow: Vec<String> = Vec::new();
+    for entry in &vault.allow {
+        let spelling = entry.name.replace('_', "-");
+        let Ok(operation) = whipplescript_custody::Operation::parse(&spelling) else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: entry.span,
+                message: format!(
+                    "vault `{}` allows unknown operation `{}`",
+                    vault.name.name, entry.name
+                ),
+                suggestion: Some(format!(
+                    "name one of: {}",
+                    whipplescript_custody::Operation::ALL
+                        .iter()
+                        .map(|op| op.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+            continue;
+        };
+        if let Some(kind) = kind {
+            if !kind.supports(operation) {
+                let able: Vec<&str> = whipplescript_custody::CredentialKind::ALL
+                    .into_iter()
+                    .filter(|candidate| candidate.supports(operation))
+                    .map(|candidate| candidate.as_str())
+                    .collect();
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: entry.span,
+                    message: format!(
+                        "vault `{}` is `{normalized}` and allows `{}`, which that kind cannot perform",
+                        vault.name.name,
+                        operation.as_str()
+                    ),
+                    suggestion: Some(if able.is_empty() {
+                        "no declared kind performs that operation".to_owned()
+                    } else {
+                        format!("kinds that can: {}", able.join(", "))
+                    }),
+                });
+                continue;
+            }
+        }
+        allow.push(operation.as_str().to_owned());
+    }
+    allow.sort();
+    allow.dedup();
+    let retain = match &vault.retain {
+        Some(policy) if VAULT_RETAIN_POLICIES.contains(&policy.name.as_str()) => {
+            policy.name.clone()
+        }
+        Some(policy) => {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: policy.span,
+                message: format!(
+                    "vault `{}` names unknown retention `{}`",
+                    vault.name.name, policy.name
+                ),
+                suggestion: Some(format!(
+                    "declare one of: {}",
+                    VAULT_RETAIN_POLICIES.join(", ")
+                )),
+            });
+            VAULT_RETAIN_DEFAULT.to_owned()
+        }
+        None => VAULT_RETAIN_DEFAULT.to_owned(),
+    };
+    ir.vaults.push(IrVault {
+        name: vault.name.name,
+        kind: normalized,
+        allow,
+        retain,
+        provider: vault.provider.map(|provider| provider.name),
+        span: vault.span,
+    });
+}
+
 fn lower_credential(
     credential: CredentialDecl,
     ir: &mut IrProgram,
@@ -700,9 +828,67 @@ fn lower_credential(
         // Fall through: the credential still lowers so reference sites do
         // not cascade an unknown-credential error on top.
     }
+    // `allow [<op>, ...]` names the operations this declaration admits
+    // (DR-0053 §14 Amendment). Two refusals, both reusing vocabulary the
+    // protocol already owns: an operation outside the closed seven, and one the
+    // KIND cannot perform — the second is the same relation the use-site check
+    // enforces, moved to the declaration so the mismatch is caught where it is
+    // written rather than where it is used.
+    let kind = whipplescript_custody::CredentialKind::parse(&normalized).ok();
+    let mut allow: Vec<String> = Vec::new();
+    for entry in &credential.allow {
+        let spelling = entry.name.replace('_', "-");
+        let Ok(operation) = whipplescript_custody::Operation::parse(&spelling) else {
+            diagnostics.push(Diagnostic {
+                related: Vec::new(),
+                span: entry.span,
+                message: format!(
+                    "credential `{}` allows unknown operation `{}`",
+                    credential.name.name, entry.name
+                ),
+                suggestion: Some(format!(
+                    "name one of: {}",
+                    whipplescript_custody::Operation::ALL
+                        .iter()
+                        .map(|op| op.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+            continue;
+        };
+        if let Some(kind) = kind {
+            if !kind.supports(operation) {
+                let able: Vec<&str> = whipplescript_custody::CredentialKind::ALL
+                    .iter()
+                    .filter(|candidate| candidate.supports(operation))
+                    .map(|candidate| candidate.as_str())
+                    .collect();
+                diagnostics.push(Diagnostic {
+                    related: Vec::new(),
+                    span: entry.span,
+                    message: format!(
+                        "credential `{}` is `{normalized}` and allows `{}`, which that kind cannot perform",
+                        credential.name.name,
+                        operation.as_str()
+                    ),
+                    suggestion: Some(if able.is_empty() {
+                        "no declared kind performs that operation".to_owned()
+                    } else {
+                        format!("kinds that can: {}", able.join(", "))
+                    }),
+                });
+                continue;
+            }
+        }
+        allow.push(operation.as_str().to_owned());
+    }
+    allow.sort();
+    allow.dedup();
     ir.credentials.push(IrCredential {
         name: credential.name.name,
         kind: normalized,
+        allow,
         span: credential.span,
     });
 }

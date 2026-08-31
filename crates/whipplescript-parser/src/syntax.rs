@@ -330,6 +330,7 @@ pub(crate) enum DeclAstKind {
     FileStore,
     Stream,
     Credential,
+    Vault,
 }
 
 /// One order-free clause of a `declaration_block` construct: a named value
@@ -1228,7 +1229,54 @@ impl Parser<'_> {
                     });
                     return None;
                 };
-                Some(Item::Credential(CredentialDecl { name, kind, span }))
+                Some(Item::Credential(CredentialDecl {
+                    name,
+                    kind,
+                    allow: bag.idents("allow").unwrap_or_default(),
+                    span,
+                }))
+            }
+            DeclAstKind::Vault => {
+                let Some(kind) = bag.ident("kind") else {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!("vault `{}` must declare its kind", name.name),
+                        suggestion: Some(format!(
+                            "add `kind <kind>` inside the vault block ({})",
+                            crate::credential_kind_spellings().join(" | ")
+                        )),
+                    });
+                    return None;
+                };
+                // Required here, unlike on a `credential`: a vault hands an
+                // agent unbounded generated members, so it must say what those
+                // members may do (DR-0053 §14 Amendment).
+                let allow = bag.idents("allow").unwrap_or_default();
+                if allow.is_empty() {
+                    self.diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "vault `{}` must declare the operations it allows",
+                            name.name
+                        ),
+                        suggestion: Some(
+                            "add `allow [<operation>, ...]` inside the vault block — a container \
+                             of dynamically-named credentials has to say what its members may do"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                }
+                Some(Item::Vault(VaultDecl {
+                    name,
+                    kind,
+                    allow,
+                    retain: bag.ident("retain"),
+                    provider: bag.ident("provider"),
+                    span,
+                }))
             }
             DeclAstKind::Stream => {
                 let Some(members) = bag.idents("members").filter(|idents| !idents.is_empty())

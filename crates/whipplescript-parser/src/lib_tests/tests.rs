@@ -18,8 +18,8 @@ fn declaration_block_grammar_table_is_complete() {
         .collect();
     assert_eq!(
         keywords.len(),
-        9,
-        "expected exactly 9 declaration_block specs"
+        10,
+        "expected exactly 10 declaration_block specs"
     );
     for expected in [
         "tracker",
@@ -31,6 +31,7 @@ fn declaration_block_grammar_table_is_complete() {
         "memory pool",
         "stream",
         "credential",
+        "vault",
     ] {
         assert!(
             keywords.contains(&expected),
@@ -65,6 +66,15 @@ fn declaration_block_grammar_table_is_complete() {
     assert!(!clause("lease", "shared").list);
     assert_eq!(clause("lease", "shared").connective, None);
 
+    // A vault's `allow` is a bracketed IDENTIFIER list, unlike the file store's
+    // glob lists, and it is REQUIRED — the clause is what a container of
+    // dynamically-named credentials says about what its members may do
+    // (DR-0053 §14 Amendment). `credential`'s copy is the same shape, optional.
+    for keyword in ["vault", "credential"] {
+        let allow = clause(keyword, "allow");
+        assert!(allow.list, "`{keyword}` allow must be list:true");
+        assert!(matches!(allow.kind, ClauseKind::Identifier));
+    }
     // file-store `allow read`/`allow write` are multi-word glob lists.
     for (name, words) in [
         ("allow read", ["allow", "read"]),
@@ -13657,6 +13667,330 @@ rule j
             .iter()
             .any(|library| library.id == "std.custody"),
         "declaring a credential registers std.custody"
+    );
+}
+
+/// `vault <name> { … }` (DR-0053 §5 Amendment 2026-08-29): a declared CONTAINER
+/// of dynamically-named credentials, modelled on `file store`.
+///
+/// Homogeneous by declaration — `kind` sits on the container so a
+/// dynamically-named member keeps the static kind refusal — and `allow` is
+/// REQUIRED here where it is optional on a `credential`, because a vault hands
+/// an agent unbounded generated members and must say what they may do.
+#[test]
+fn a_vault_declares_a_kind_a_required_allow_list_and_a_retention() {
+    let program = |body: &str| -> String {
+        format!(
+            r#"@service
+workflow V
+
+use std.custody
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+vault {body}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule j
+  when Ticket as t where t.status == "open"
+=> {{
+  complete result {{ ok true }}
+}}
+"#
+        )
+    };
+    let messages = |body: &str| -> Vec<String> {
+        compile_program(&program(body))
+            .diagnostics
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+
+    assert_eq!(
+        messages("deploy_keys { kind ed25519  allow [sign] }"),
+        Vec::<String>::new()
+    );
+
+    // Required, unlike on a credential.
+    let missing = messages("k { kind ed25519 }");
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.contains("vault `k` must declare the operations it allows")),
+        "{missing:?}"
+    );
+
+    // The container's kind bounds its members' operations.
+    let wrong = messages("k { kind bearer  allow [wrap] }");
+    assert!(
+        wrong
+            .iter()
+            .any(|m| m.contains("is `bearer` and allows `wrap`, which that kind cannot perform")),
+        "{wrong:?}"
+    );
+
+    // `kind` is required too, and for the same reason `allow` is: a container
+    // whose members have no declared kind cannot keep the static kind refusal.
+    let no_kind = messages("k { allow [wrap] }");
+    assert!(
+        no_kind
+            .iter()
+            .any(|m| m.contains("vault `k` must declare its kind")),
+        "{no_kind:?}"
+    );
+
+    let unknown_kind = messages("k { kind nonsense  allow [wrap] }");
+    assert!(
+        unknown_kind
+            .iter()
+            .any(|m| m.contains("vault `k` names unknown kind `nonsense`")),
+        "{unknown_kind:?}"
+    );
+
+    let unknown_op = messages("k { kind raw  allow [bogus] }");
+    assert!(
+        unknown_op
+            .iter()
+            .any(|m| m.contains("vault `k` allows unknown operation `bogus`")),
+        "{unknown_op:?}"
+    );
+
+    // A vault is a `/`-prefix in `CredentialName`, so two containers sharing a
+    // name would make the ancestor walk ambiguous about which one governance
+    // bound.
+    let duplicate = messages("k { kind raw  allow [wrap] }\n\nvault k { kind raw  allow [wrap] }");
+    assert!(
+        duplicate
+            .iter()
+            .any(|m| m.contains("vault `k` is declared more than once")),
+        "{duplicate:?}"
+    );
+
+    let bad_retain = messages("k { kind raw  allow [wrap]  retain forever }");
+    assert!(
+        bad_retain
+            .iter()
+            .any(|m| m.contains("names unknown retention `forever`")),
+        "{bad_retain:?}"
+    );
+
+    // `retain instance` is the DEFAULT, and that is the safety claim: the
+    // dangerous option has to be typed, as with a file store's `allow write`.
+    let ir = compile_program(&program("k { kind raw  allow [wrap, unwrap] }"))
+        .ir
+        .expect("compiles");
+    assert_eq!(ir.vaults.len(), 1);
+    assert_eq!(ir.vaults[0].retain, "instance");
+    assert_eq!(ir.vaults[0].allow, vec!["unwrap", "wrap"]);
+    assert!(ir
+        .to_snapshot()
+        .contains("vault k kind=raw allow=[unwrap, wrap] retain=instance"));
+
+    let durable = compile_program(&program(
+        "k { kind raw  allow [wrap]  retain durable  provider openbao }",
+    ))
+    .ir
+    .expect("compiles");
+    assert_eq!(durable.vaults[0].retain, "durable");
+    assert_eq!(durable.vaults[0].provider.as_deref(), Some("openbao"));
+}
+
+/// A vault must survive `whip fmt` whole. It carries four clauses and a
+/// formatter that rebuilds from the AST drops what it does not print — losing
+/// `allow` would silently widen the container's ceiling, and losing `retain
+/// durable` would silently make its contents reapable.
+#[test]
+fn fmt_round_trips_a_vault() {
+    let source = r#"@service
+workflow FmtVault
+
+use std.custody
+
+output result R
+class R {
+  ok bool
+}
+
+vault tenant_keys {
+  kind raw
+  allow [wrap, unwrap]
+  retain durable
+  provider openbao
+}
+
+class Ticket {
+  id string
+  status "open"
+}
+
+table seed as Ticket [
+  {
+    id "T1"
+    status "open"
+  }
+]
+
+rule j
+  when Ticket as t where t.status == "open"
+=> {
+  complete result {
+    ok true
+  }
+}
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    for clause in [
+        "kind raw",
+        "allow [wrap, unwrap]",
+        "retain durable",
+        "provider openbao",
+    ] {
+        assert!(
+            formatted.contains(clause),
+            "`{clause}` must survive formatting:\n{formatted}"
+        );
+    }
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
+    );
+}
+
+/// `allow [<op>, ...]` (DR-0053 §14 Amendment 2026-08-29) is the author-side
+/// ceiling: which operations this declaration admits. Governance's grants stay
+/// the operator-side ceiling beneath it.
+///
+/// Absent means every operation the kind supports, never "none" — so a
+/// declaration written before the clause existed keeps meaning what it meant.
+#[test]
+fn a_credential_allow_list_bounds_its_operations() {
+    let program = |allow: &str| -> String {
+        format!(
+            r#"@service
+workflow AllowList
+
+use std.custody
+
+output result R
+class R {{ ok bool }}
+class Ticket {{ id string  status "open" }}
+
+credential api {{ kind bearer{allow} }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule go
+  when Ticket as t where t.status == "open"
+=> {{
+  request POST "https://api.example.com/v1/x" {{
+    header "Authorization" bearer api
+    body {{ note t.id }}
+  }} as pushed
+  after pushed succeeds {{
+    complete result {{ ok true }}
+  }}
+}}
+"#
+        )
+    };
+    let messages = |allow: &str| -> Vec<String> {
+        compile_program(&program(allow))
+            .diagnostics
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+
+    // No clause: unchanged. This is the compatibility claim, and it is the one
+    // worth pinning hardest — every credential declared before the clause
+    // existed relies on it.
+    assert_eq!(messages(""), Vec::<String>::new());
+
+    // The use is `request`, and the list admits it.
+    assert_eq!(messages("  allow [request]"), Vec::<String>::new());
+
+    // The list admits `mint`, which a bearer CAN do — so this is not the kind
+    // check firing. The refusal is that the rule's use is `request`.
+    let outside = messages("  allow [mint]");
+    assert!(
+        outside.iter().any(|m| m
+            .contains("uses credential `api` for `request`, which its declaration does not allow")),
+        "{outside:?}"
+    );
+
+    // An operation the KIND cannot perform is refused at the declaration, where
+    // it is written, rather than at the use.
+    let wrong_kind = messages("  allow [sign]");
+    assert!(
+        wrong_kind
+            .iter()
+            .any(|m| m.contains("is `bearer` and allows `sign`, which that kind cannot perform")),
+        "{wrong_kind:?}"
+    );
+
+    // Outside the closed seven entirely.
+    let unknown = messages("  allow [bogus]");
+    assert!(
+        unknown
+            .iter()
+            .any(|m| m.contains("allows unknown operation `bogus`")),
+        "{unknown:?}"
+    );
+
+    // The list reaches the IR and its snapshot, sorted.
+    let ir = compile_program(&program("  allow [request, mint]"))
+        .ir
+        .expect("compiles");
+    assert_eq!(ir.credentials[0].allow, vec!["mint", "request"]);
+    assert!(ir.to_snapshot().contains("allow=[mint, request]"));
+}
+
+/// The clause must survive `whip fmt`. A formatter that rebuilds a declaration
+/// from the AST drops whatever it does not emit, and dropping THIS one would
+/// silently widen a credential's ceiling.
+#[test]
+fn fmt_round_trips_a_credential_allow_list() {
+    let source = r#"@service
+workflow FmtAllow
+
+use std.custody
+
+output result R
+class R {
+  ok bool
+}
+
+credential api {
+  kind bearer
+  allow [request, mint]
+}
+
+signal go.now {
+  x string
+}
+
+rule j
+  when go.now as g
+=> {
+  complete result {
+    ok true
+  }
+}
+"#;
+    let formatted = format_program(source).formatted.expect("formats");
+    assert!(
+        formatted.contains("allow [request, mint]"),
+        "the clause must survive formatting:\n{formatted}"
+    );
+    assert_eq!(
+        format_program(&formatted).formatted.expect("re-formats"),
+        formatted,
+        "formatting must be idempotent"
     );
 }
 

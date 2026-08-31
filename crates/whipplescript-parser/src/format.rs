@@ -383,9 +383,46 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
             }
             push_line(formatted, "}");
         }
+        Item::Vault(vault) => {
+            push_line(formatted, format!("vault {} {{", vault.name.name));
+            push_line(formatted, format!("  kind {}", vault.kind.name));
+            push_line(
+                formatted,
+                format!(
+                    "  allow [{}]",
+                    vault
+                        .allow
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            if let Some(retain) = &vault.retain {
+                push_line(formatted, format!("  retain {}", retain.name));
+            }
+            if let Some(provider) = &vault.provider {
+                push_line(formatted, format!("  provider {}", provider.name));
+            }
+            push_line(formatted, "}");
+        }
         Item::Credential(credential) => {
             push_line(formatted, format!("credential {} {{", credential.name.name));
             push_line(formatted, format!("  kind {}", credential.kind.name));
+            if !credential.allow.is_empty() {
+                push_line(
+                    formatted,
+                    format!(
+                        "  allow [{}]",
+                        credential
+                            .allow
+                            .iter()
+                            .map(|entry| entry.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
             push_line(formatted, "}");
         }
         Item::FileStore(file_store) => {

@@ -424,6 +424,7 @@ fn emit_declaration_row(
         "file store" => "DeclAstKind::FileStore",
         "stream" => "DeclAstKind::Stream",
         "credential" => "DeclAstKind::Credential",
+        "vault" => "DeclAstKind::Vault",
         other => fail(&format!(
             "declaration_block keyword `{other}` has no known DeclAstKind builder seam"
         )),

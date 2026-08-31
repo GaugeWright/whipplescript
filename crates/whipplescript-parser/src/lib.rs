@@ -141,6 +141,7 @@ pub enum Item {
     Tracker(TrackerDecl),
     Channel(ChannelDecl),
     Credential(CredentialDecl),
+    Vault(VaultDecl),
     Stream(StreamDecl),
     Gauge(GaugeDecl),
     Mark(MarkDecl),
@@ -182,6 +183,7 @@ impl Item {
             Self::Gauge(decl) => decl.span,
             Self::Mark(decl) => decl.span,
             Self::Campaign(decl) => decl.span,
+            Self::Vault(decl) => decl.span,
             Self::FileStore(decl) => decl.span,
             Self::MemoryPool(decl) => decl.span,
             Self::Action(decl) => decl.span,
@@ -297,6 +299,39 @@ pub struct ChannelDecl {
     pub span: SourceSpan,
 }
 
+/// `vault <name> { kind <k>  allow [<op>, ...] [retain instance|durable]
+/// [provider <p>] }` — a declared CONTAINER of dynamically-named credentials
+/// (DR-0053 §5 Amendment 2026-08-29).
+///
+/// Modelled on `file store`: a named container over contents the author cannot
+/// enumerate, with per-operation grants attached to the container and a
+/// `provider` naming the backend. It needs no new naming, because
+/// `CredentialName` is `/`-separated and a vault is a PREFIX
+/// (`deploy_keys/ci-2026-08`) — the convention `mint` established with
+/// `{parent}/mint-{fingerprint}`.
+///
+/// Homogeneous by declaration. A dynamically-named member would otherwise lose
+/// the static refusal of `sign … with` a `bearer`, since the compiler cannot
+/// know what is in the slot; putting `kind` on the CONTAINER is what keeps that
+/// check reachable, and it costs nothing real because a vault of deploy keys
+/// holds one kind.
+///
+/// `allow` is REQUIRED here and optional on a `credential`: the hazard is the
+/// container's — it hands an agent unbounded generated members — and a vault is
+/// new, so requiring it costs no compatibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultDecl {
+    pub name: Ident,
+    pub kind: Ident,
+    pub allow: Vec<Ident>,
+    /// `retain instance` (the default) or `retain durable`. The safe option is
+    /// the default and the dangerous one has to be typed, as with a file
+    /// store's `allow write`.
+    pub retain: Option<Ident>,
+    pub provider: Option<Ident>,
+    pub span: SourceSpan,
+}
+
 /// `credential <name> { kind <kind> }` (std.custody; DR-0053 §5): a bare
 /// handle naming a custodian entry — governance supplies reality via
 /// `grant credential … -> credential:<addr>`, and material never appears in
@@ -309,6 +344,11 @@ pub struct ChannelDecl {
 pub struct CredentialDecl {
     pub name: Ident,
     pub kind: Ident,
+    /// `allow [<operation>, ...]` (DR-0053 §14 Amendment 2026-08-29): the
+    /// operations this declaration admits. Empty means the clause was absent,
+    /// which keeps meaning every operation the kind supports — a singular
+    /// declaration without it is unchanged, and only a `vault` requires it.
+    pub allow: Vec<Ident>,
     pub span: SourceSpan,
 }
 
@@ -1080,6 +1120,7 @@ pub struct IrProgram {
     pub streams: Vec<IrStream>,
     pub channels: Vec<IrChannel>,
     pub credentials: Vec<IrCredential>,
+    pub vaults: Vec<IrVault>,
     pub gauges: Vec<IrGauge>,
     pub marks: Vec<IrMark>,
     pub campaigns: Vec<IrCampaign>,
@@ -1227,6 +1268,21 @@ pub struct IrChannel {
     pub span: SourceSpan,
 }
 
+/// A lowered `vault`: a declared container of dynamically-named credentials
+/// (DR-0053 §5 Amendment). See `VaultDecl`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrVault {
+    pub name: String,
+    /// Kebab-case credential kind — every member carries it.
+    pub kind: String,
+    /// The operations members may perform. Never empty: the clause is required.
+    pub allow: Vec<String>,
+    /// `instance` (default) or `durable`.
+    pub retain: String,
+    pub provider: Option<String>,
+    pub span: SourceSpan,
+}
+
 /// A lowered `credential` declaration (DR-0053 §5): a handle plus its
 /// declared kind, normalized to the custody protocol's kebab-case. Metadata
 /// only — reality (material, sealing rung, grants) lives with the custodian
@@ -1236,6 +1292,10 @@ pub struct IrCredential {
     pub name: String,
     /// Kebab-case credential kind (`bearer`, `hmac-sha256`, …).
     pub kind: String,
+    /// The operations this declaration admits (DR-0053 §14 Amendment). EMPTY
+    /// means the clause was absent and every operation the kind supports is
+    /// admitted; it never means "none". Sorted, so the snapshot is stable.
+    pub allow: Vec<String>,
     pub span: SourceSpan,
 }
 
@@ -2187,6 +2247,12 @@ struct SemanticContext {
     /// Kinds are stored kebab-case, matching the custody protocol.
     /// Consumed by the `request` presentation check below; `verify` follows.
     credentials: BTreeMap<String, String>,
+    /// Declared `allow [<op>, ...]` lists by credential name (DR-0053 §14
+    /// Amendment 2026-08-29). ABSENT from the map means the clause was not
+    /// written, which admits every operation the kind supports; present-and-
+    /// empty cannot occur, because an empty list would be a declaration that
+    /// admits nothing and the parser records no clause for it.
+    credential_allow: BTreeMap<String, Vec<String>>,
     /// Declared `memory pool` names (std.memory); `recall`/`learn`/`curate`
     /// must name one (MEM-1 check 1).
     memory_pools: BTreeSet<String>,
@@ -2664,6 +2730,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Tracker(decl) => ("tracker", decl.name.name.clone(), decl.span),
             Item::Channel(decl) => ("channel", decl.name.name.clone(), decl.span),
             Item::Credential(decl) => ("credential", decl.name.name.clone(), decl.span),
+            Item::Vault(decl) => ("vault", decl.name.name.clone(), decl.span),
             Item::FileStore(decl) => ("file store", decl.name.name.clone(), decl.span),
             Item::MemoryPool(decl) => ("memory pool", decl.name.name.clone(), decl.span),
             Item::Event(decl) => ("signal", decl.name.clone(), decl.span),
@@ -3118,6 +3185,7 @@ fn referenced_decl_name(item: &Item) -> Option<(String, SourceSpan)> {
         Item::Counter(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Tracker(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Channel(decl) => Some((decl.name.name.clone(), decl.span)),
+        Item::Vault(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::FileStore(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::MemoryPool(decl) => Some((decl.name.name.clone(), decl.span)),
         Item::Event(decl) => Some((decl.name.clone(), decl.span)),
@@ -3558,13 +3626,31 @@ impl IrProgram {
             }
         }
 
+        if !self.vaults.is_empty() {
+            push_line(&mut snapshot, "vaults");
+            for vault in &self.vaults {
+                let mut line = format!(
+                    "  vault {} kind={} allow=[{}] retain={}",
+                    vault.name,
+                    vault.kind,
+                    vault.allow.join(", "),
+                    vault.retain
+                );
+                if let Some(provider) = &vault.provider {
+                    line.push_str(&format!(" provider={provider}"));
+                }
+                push_line(&mut snapshot, line);
+            }
+        }
+
         if !self.credentials.is_empty() {
             push_line(&mut snapshot, "credentials");
             for credential in &self.credentials {
-                push_line(
-                    &mut snapshot,
-                    format!("  credential {} kind={}", credential.name, credential.kind),
-                );
+                let mut line = format!("  credential {} kind={}", credential.name, credential.kind);
+                if !credential.allow.is_empty() {
+                    line.push_str(&format!(" allow=[{}]", credential.allow.join(", ")));
+                }
+                push_line(&mut snapshot, line);
             }
         }
 
@@ -4586,19 +4672,11 @@ fn validate_turn_access_grant_credential_kinds(ir: &IrProgram, diagnostics: &mut
                     if kind.supports(operation) {
                         continue;
                     }
-                    let able: Vec<&str> = [
-                        CredentialKind::Bearer,
-                        CredentialKind::Basic,
-                        CredentialKind::Raw,
-                        CredentialKind::HmacSha256,
-                        CredentialKind::Ed25519,
-                        CredentialKind::AwsSigv4,
-                        CredentialKind::JwtRs256,
-                    ]
-                    .into_iter()
-                    .filter(|candidate| candidate.supports(operation))
-                    .map(|candidate| candidate.as_str())
-                    .collect();
+                    let able: Vec<&str> = CredentialKind::ALL
+                        .into_iter()
+                        .filter(|candidate| candidate.supports(operation))
+                        .map(|candidate| candidate.as_str())
+                        .collect();
                     diagnostics.push(Diagnostic {
                         related: Vec::new(),
                         span: effect.span,
@@ -5852,6 +5930,7 @@ fn expand_pattern_item(
             format!("credential:{}", credential.name.name),
             Item::Credential(credential),
         )),
+        Item::Vault(vault) => Some((format!("vault:{}", vault.name.name), Item::Vault(vault))),
         // Gauges, campaigns, and marks are rejected from pattern bodies by
         // `pattern_body_admission` (objective intent and cut points are
         // top-level); there is deliberately no expansion path for them.
@@ -6306,6 +6385,7 @@ impl SemanticContext {
         let mut channels = BTreeSet::new();
         let mut channel_providers = BTreeMap::new();
         let mut credentials = BTreeMap::new();
+        let mut credential_allow: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut memory_pools = BTreeSet::new();
         let mut trackers = BTreeSet::new();
 
@@ -6352,6 +6432,16 @@ impl SemanticContext {
                         credential.name.name.clone(),
                         credential.kind.name.replace('_', "-"),
                     );
+                    if !credential.allow.is_empty() {
+                        credential_allow.insert(
+                            credential.name.name.clone(),
+                            credential
+                                .allow
+                                .iter()
+                                .map(|entry| entry.name.replace('_', "-"))
+                                .collect(),
+                        );
+                    }
                 }
                 Item::MemoryPool(pool) => {
                     memory_pools.insert(pool.name.name.clone());
@@ -6380,6 +6470,7 @@ impl SemanticContext {
             channels,
             channel_providers,
             credentials,
+            credential_allow,
             memory_pools,
             trackers,
             regions: BTreeMap::new(),
@@ -7992,8 +8083,7 @@ fn validate_coerce_body_fields(coerce: &CoerceDecl, diagnostics: &mut Vec<Diagno
 /// than typed out, so a kind added to `CredentialKind` appears in every
 /// suggestion that lists them instead of in whichever one someone remembered.
 pub(crate) fn credential_kind_spellings() -> Vec<String> {
-    use whipplescript_custody::CredentialKind::*;
-    [Bearer, Basic, Raw, HmacSha256, Ed25519, AwsSigv4, JwtRs256]
+    whipplescript_custody::CredentialKind::ALL
         .iter()
         .map(|kind| kind.as_str().replace('-', "_"))
         .collect()
@@ -9921,6 +10011,7 @@ fn analyze_rule(
         &semantic.schemas.events,
         diagnostics,
     );
+    validate_credential_allow(rule, &body_ast.statements, semantic, diagnostics);
     validate_http_requests(
         rule,
         &body_ast.statements,
@@ -12084,6 +12175,128 @@ fn validate_mint_credential(
             });
         }
     }
+}
+
+/// A credential may only be used for an operation its declaration admits
+/// (DR-0053 §14 Amendment 2026-08-29).
+///
+/// `allow [<op>, ...]` is a ceiling the AUTHOR writes, checked here; §14's
+/// governance grants remain the ceiling an OPERATOR writes. A declaration with
+/// no `allow` clause is absent from the map and admits every operation its kind
+/// supports, so nothing that compiled before this check compiles differently.
+///
+/// Walks every nesting form rather than only `after`, because a `seal` inside a
+/// `case` arm is as much a use as one at the top of a rule body — the sibling
+/// `validate_http_requests` walker predates `case` and reaches less.
+fn validate_credential_allow(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    semantic: &SemanticContext,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if semantic.credential_allow.is_empty() {
+        return;
+    }
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                for (credential, operation, span) in credential_uses(effect) {
+                    let Some(allowed) = semantic.credential_allow.get(&credential) else {
+                        continue;
+                    };
+                    if allowed.iter().any(|entry| entry == operation) {
+                        continue;
+                    }
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span,
+                        message: format!(
+                            "rule `{}` uses credential `{credential}` for `{operation}`, which its \
+                             declaration does not allow (allows {})",
+                            rule.name.name,
+                            allowed.join(", ")
+                        ),
+                        suggestion: Some(format!(
+                            "add `{operation}` to the credential's `allow` list, or use a \
+                             credential declared for it"
+                        )),
+                    });
+                }
+            }
+            body::BodyStmt::After(after) => {
+                validate_credential_allow(rule, &after.body, semantic, diagnostics)
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_credential_allow(rule, &branch.body, semantic, diagnostics);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_credential_allow(rule, &region.body, semantic, diagnostics);
+                validate_credential_allow(rule, &region.lapse_body, semantic, diagnostics);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every `(credential, operation)` one effect exercises.
+///
+/// Four sources, and they are the four places a credential name meets an
+/// operation in a rule body: a `request`'s presentation slots and `signed
+/// with`, a `mint`'s parent, `seal`/`open`'s `credential` field, and a turn's
+/// `with access to credential … { … }` grant.
+fn credential_uses(effect: &body::EffectStmt) -> Vec<(String, &'static str, SourceSpan)> {
+    use whipplescript_custody::Operation;
+    let mut uses: Vec<(String, &'static str, SourceSpan)> = Vec::new();
+    match &effect.kind {
+        body::BodyEffectKind::HttpRequest {
+            headers,
+            signed_with,
+            ..
+        } => {
+            for header in headers {
+                if let body::RequestHeaderValue::Credential { handle, .. } = &header.value {
+                    uses.push((handle.clone(), Operation::Request.as_str(), header.span));
+                }
+            }
+            // `signed with` is a SIGN of the canonical request, not a
+            // presentation — a credential may be allowed one and not the other.
+            if let Some(handle) = signed_with {
+                uses.push((handle.clone(), Operation::Sign.as_str(), effect.span));
+            }
+        }
+        body::BodyEffectKind::MintCredential { parent, .. } => {
+            uses.push((parent.clone(), Operation::Mint.as_str(), effect.span));
+        }
+        body::BodyEffectKind::ConstructCapabilityCall {
+            target_capability,
+            fields,
+            ..
+        } => {
+            let operation = match target_capability.as_str() {
+                CUSTODY_WRAP_CAPABILITY => Operation::Wrap.as_str(),
+                CUSTODY_UNWRAP_CAPABILITY => Operation::Unwrap.as_str(),
+                _ => return uses,
+            };
+            if let Some(field) = fields.iter().find(|field| field.name == "credential") {
+                uses.push((field.source.trim().to_owned(), operation, effect.span));
+            }
+        }
+        _ => {}
+    }
+    // A turn grant names its operations outright, and rides any effect kind.
+    for grant in effect.kind.access_grants() {
+        let Some(name) = grant.resource.strip_prefix("credential ") else {
+            continue;
+        };
+        for op in &grant.operations {
+            if let Ok(operation) = Operation::parse(&op.operation) {
+                uses.push((name.to_owned(), operation.as_str(), effect.span));
+            }
+        }
+    }
+    uses
 }
 
 fn validate_http_requests(

@@ -22,8 +22,60 @@
                 "kind": "identifier",
                 "required": true,
                 "list": false,
-                "unknown_hint": "credential fields are `kind`",
+                "unknown_hint": "credential fields are `kind` and `allow`",
                 "missing_summary": "add `kind <kind>` inside the credential block (bearer | basic | raw | hmac-sha256 | ed25519 | aws-sigv4 | jwt-rs256)"
+              },
+              {
+                "name": "allow",
+                "kind": "identifier",
+                "required": false,
+                "list": true,
+                "unknown_hint": "credential fields are `kind` and `allow`",
+                "missing_summary": "add `allow [<operation>, ...]` inside the credential block (request | sign | verify | derive | wrap | unwrap | mint)"
+              }
+            ]
+          }
+        },
+        {
+          "id": "custody.vault",
+          "construct_family": "declaration_block",
+          "keyword": "vault",
+          "scope": "top_level",
+          "grammar": {
+            "shape": "declaration_block",
+            "keyword": "vault",
+            "clauses": [
+              {
+                "name": "kind",
+                "kind": "identifier",
+                "required": true,
+                "list": false,
+                "unknown_hint": "vault fields are `kind`, `allow`, `retain` and `provider`",
+                "missing_summary": "add `kind <kind>` inside the vault block (bearer | basic | raw | hmac-sha256 | ed25519 | aws-sigv4 | jwt-rs256)"
+              },
+              {
+                "name": "allow",
+                "kind": "identifier",
+                "required": true,
+                "list": true,
+                "unknown_hint": "vault fields are `kind`, `allow`, `retain` and `provider`",
+                "missing_summary": "add `allow [<operation>, ...]` inside the vault block (request | sign | verify | derive | wrap | unwrap | mint)"
+              },
+              {
+                "name": "retain",
+                "kind": "identifier",
+                "required": false,
+                "list": false,
+                "unknown_hint": "vault fields are `kind`, `allow`, `retain` and `provider`",
+                "missing_summary": "add `retain instance` or `retain durable` inside the vault block"
+              },
+              {
+                "name": "provider",
+                "kind": "identifier",
+                "required": false,
+                "list": false,
+                "unknown_hint": "vault fields are `kind`, `allow`, `retain` and `provider`",
+                "missing_summary": "add `provider <name>` inside the vault block"
               }
             ]
           }

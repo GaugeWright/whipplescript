@@ -721,6 +721,7 @@ pub fn empty_ir_program() -> IrProgram {
         streams: Vec::new(),
         channels: Vec::new(),
         credentials: Vec::new(),
+        vaults: Vec::new(),
         gauges: Vec::new(),
         marks: Vec::new(),
         campaigns: Vec::new(),
