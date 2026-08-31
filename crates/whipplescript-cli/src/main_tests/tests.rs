@@ -1304,6 +1304,7 @@ fn create_runtime_identity_instance(
             program_name: workflow,
             source_hash: &format!("{workflow}-source"),
             ir_hash: &format!("{workflow}-ir"),
+            ir_snapshot: None,
             compiler_version: "test",
             declared_capabilities_json: "[]",
             declared_profiles_json: "[]",

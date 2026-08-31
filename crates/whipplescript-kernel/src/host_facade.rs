@@ -133,6 +133,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                     source_hash: &package.source_hash,
                     ir_hash: &package.ir_hash,
                     compiler_version: HOST_PROTOCOL,
+                    ir_snapshot: None,
                 },
                 &package.program,
             )
@@ -509,6 +510,7 @@ impl<S: RuntimeStore> GovernedHostFacade<S> {
                             source_hash: &package.source_hash,
                             ir_hash: &package.ir_hash,
                             compiler_version: HOST_PROTOCOL,
+                            ir_snapshot: None,
                         },
                     )
                     .map_err(HostFacadeError::Store)?;

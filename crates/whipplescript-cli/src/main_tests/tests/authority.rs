@@ -264,6 +264,7 @@ workflow Child {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &parent_ir,
         )
@@ -341,6 +342,7 @@ workflow Child {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &parent_ir,
         )
@@ -497,6 +499,7 @@ workflow Child {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &parent_ir,
         )
@@ -577,6 +580,7 @@ workflow Child {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &parent_ir,
         )
@@ -692,6 +696,7 @@ workflow Child {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &parent_ir,
         )

@@ -526,6 +526,7 @@ class Done {
                 program_name: name,
                 source_hash: "source-1",
                 ir_hash: "ir-1",
+                ir_snapshot: None,
                 compiler_version: "test",
                 declared_capabilities_json: "[]",
                 declared_profiles_json: "[]",

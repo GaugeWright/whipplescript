@@ -9653,6 +9653,10 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/view-terminal-in-view.whip"),
         ),
         (
+            "bounded-tracker-ring",
+            include_str!("../../../../examples/invalid/bounded-tracker-ring.whip"),
+        ),
+        (
             "bad-record",
             include_str!("../../../../examples/invalid/bad-record.whip"),
         ),
@@ -12804,6 +12808,75 @@ fn tool_workflow_refuses_a_world_paced_effect_cycle() {
                 |diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
                     && diagnostic.message.contains("bounded by DR-0025")
             ),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// DR-0084: the same refusal, reached through a TRACKER instead of a schema
+/// fact. `file` makes a ready issue, `release` hands a claimed one back, and the
+/// matching rule therefore re-presents its own work.
+///
+/// Before DR-0084 `rule_dependencies` carried only schema-fact edges, so this
+/// ring was invisible to the very check that exists to refuse it: the graph
+/// showed two unrelated rules and a `@bounded` workflow that never settles
+/// compiled clean.
+#[test]
+fn bounded_workflow_refuses_a_tracker_mediated_ring() {
+    let source = include_str!("../../../../examples/invalid/bounded-tracker-ring.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"
+                && diagnostic.message.contains("spin -> spin")
+        }),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The edge is real but the refusal is not universal: outside `@bounded` a
+/// tracker ring is world-paced — `file` and `release` are effects, so the issue
+/// does not become ready until a terminal arrives — and that is the queue-worker
+/// loop the language is for. DR-0081's pacing boundary decides this, unchanged.
+#[test]
+fn a_tracker_ring_is_legal_in_a_workflow_that_never_promised_to_settle() {
+    let bounded = include_str!("../../../../examples/invalid/bounded-tracker-ring.whip");
+    let source = bounded.replace("@bounded", "@service");
+    let compiled = compile_program(&source);
+
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The producer set is deliberately narrow, and this is the case that proves it
+/// does not over-refuse. `claim` and `finish` take work OUT of ready; only
+/// `file` and `release` put it in. A bounded workflow that claims an issue and
+/// finishes it closes no ring, so counting every tracker verb as a write would
+/// refuse a program that plainly settles.
+#[test]
+fn finishing_a_claimed_item_is_not_a_tracker_write() {
+    let bounded = include_str!("../../../../examples/invalid/bounded-tracker-ring.whip");
+    let source = bounded.replace(
+        "    release issue\n",
+        "    finish issue {\n      summary \"done\"\n    }\n",
+    );
+    assert!(source.contains("finish issue"), "fixture shape changed");
+    let compiled = compile_program(&source);
+
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"),
         "{:?}",
         compiled.diagnostics
     );

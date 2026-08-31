@@ -2267,6 +2267,7 @@ fn replay_scenario(
                 source_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&source),
                 ir_hash: &whipplescript_kernel::rule_lowering::stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             ir,
         )

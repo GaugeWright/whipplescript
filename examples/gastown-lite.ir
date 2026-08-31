@@ -84,4 +84,6 @@ rules
       case decision.verdict type=union<literal<"merge"> | literal<"revise"> | literal<"blocked">> pattern=literal:"blocked" guard=- body_hash=7131ffc41c4190ff0d03d76828c6707e span=2458..2467
     body_hash 02c957e883c9a832daf0dfbfbbab9259
 rule_dependencies
+  file_ticket --tracker:backlog--> implement_ready_ticket
+  implement_ready_ticket --tracker:backlog--> implement_ready_ticket
   table_workspaces --schema:WorkspaceReady--> implement_ready_ticket

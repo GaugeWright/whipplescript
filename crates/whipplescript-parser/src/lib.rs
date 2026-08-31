@@ -2003,6 +2003,24 @@ pub struct IrRuleMetadata {
     /// Cycle-analysis-only, and deliberately NOT rendered in the `.ir` snapshot,
     /// so it adds no golden/hash churn.
     pub immediate_fact_writes: Vec<String>,
+    /// DR-0084: the declared resources this rule OBSERVES, as `tracker:<name>`.
+    ///
+    /// A `when <tracker> has ready issue` is a produce/consume coupling exactly
+    /// like a schema fact read, but it does not name a schema, so
+    /// `fact_read_from_when` files it under `pattern:` and
+    /// `build_rule_dependencies` never matches it. These two fields are what let
+    /// the rule-dependency graph carry the edge.
+    pub resource_reads: Vec<String>,
+    /// DR-0084: the declared resources this rule makes work AVAILABLE in, as
+    /// `tracker:<name>` — a `file` into a queue, or a `release` returning a
+    /// claimed item to ready. `claim` and `finish` are not writes: they take
+    /// work out of ready rather than putting it in, so counting them would
+    /// invent edges and over-refuse.
+    ///
+    /// Like `immediate_fact_writes` above, both fields are analysis-only and
+    /// deliberately NOT rendered in the `.ir` snapshot. The edges they produce
+    /// ARE rendered, in `rule_dependencies`, which is the point.
+    pub resource_writes: Vec<String>,
     pub record_sources: Vec<IrRecordSource>,
     pub fact_consumes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
@@ -9837,6 +9855,58 @@ fn dependency_read_facts(metadata: &IrRuleMetadata) -> Vec<String> {
         .collect()
 }
 
+/// DR-0084: the trackers a rule observes, as `tracker:<name>`.
+///
+/// Mirrors the pattern `binding_resources` already matches for binding
+/// resolution, so the two cannot disagree about what a tracker observation
+/// looks like. An undeclared name is not a read — an unknown tracker is its own
+/// diagnostic, and inventing an edge for it would refuse on top of that.
+fn tracker_resource_reads(rule: &RuleDecl, semantic: &SemanticContext) -> Vec<String> {
+    let mut reads = BTreeSet::new();
+    for when in &rule.whens {
+        let (pattern, _) = split_when_guard(&when.text);
+        let words: Vec<&str> = pattern.split_whitespace().collect();
+        if let ["has", "ready", "issue"] = &words[1..words.len().min(4)] {
+            if semantic.trackers.contains(words[0]) {
+                reads.insert(format!("tracker:{}", words[0]));
+            }
+        }
+    }
+    reads.into_iter().collect()
+}
+
+/// DR-0084: the trackers a rule puts ready work INTO, as `tracker:<name>`.
+///
+/// `file` creates a ready issue. `release` returns a claimed one to ready, which
+/// is the same availability from a consumer's side and is how a review loop
+/// re-presents its own work. `claim` and `finish` are deliberately absent: they
+/// remove work from ready, so treating them as writes would manufacture edges
+/// and refuse programs that never close a loop.
+fn tracker_resource_writes(
+    rule: &RuleDecl,
+    body_ast: &body::BodyAst,
+    semantic: &SemanticContext,
+) -> Vec<String> {
+    let bindings = binding_resources(rule, &body_ast.statements, &semantic.trackers);
+    let mut writes = BTreeSet::new();
+    for_each_body(&body_ast.statements, &mut |stmt| {
+        let body::BodyStmt::Effect(effect) = stmt else {
+            return;
+        };
+        let queue = match &effect.kind {
+            body::BodyEffectKind::TrackerFile { queue, .. } => Some(queue.clone()),
+            body::BodyEffectKind::TrackerRelease { item } => bindings.get(item).cloned(),
+            _ => None,
+        };
+        if let Some(queue) = queue {
+            if semantic.trackers.contains(&queue) {
+                writes.insert(format!("tracker:{queue}"));
+            }
+        }
+    });
+    writes.into_iter().collect()
+}
+
 fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
     let reads_by_rule = rules
         .iter()
@@ -9844,9 +9914,22 @@ fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
         .collect::<Vec<_>>();
     let mut dependencies = Vec::new();
     for producer in rules {
-        for produced_fact in &producer.metadata.fact_writes {
+        // DR-0084: a resource coupling is a rule dependency on the same terms as
+        // a schema fact. It is never an `immediate_fact_writes` entry — a `file`
+        // is an effect, so the issue does not exist until a terminal arrives —
+        // which is why the default-pacing rule in
+        // `validate_effectful_rule_recursion` skips these edges and only a
+        // `@bounded` workflow, which promised to settle, counts them.
+        let produced = producer
+            .metadata
+            .fact_writes
+            .iter()
+            .chain(&producer.metadata.resource_writes);
+        for produced_fact in produced {
             for (consumer, reads) in rules.iter().zip(&reads_by_rule) {
-                if reads.contains(produced_fact) {
+                if reads.contains(produced_fact)
+                    || consumer.metadata.resource_reads.contains(produced_fact)
+                {
                     dependencies.push(IrRuleDependency {
                         producer: producer.name.clone(),
                         consumer: consumer.name.clone(),
@@ -11197,6 +11280,8 @@ fn analyze_rule(
             .iter()
             .map(|when| fact_read_from_when(&when.text))
             .collect(),
+        resource_reads: tracker_resource_reads(rule, semantic),
+        resource_writes: tracker_resource_writes(rule, body_ast, semantic),
         max_after_depth: max_after_depth(&body_ast.statements),
         ..IrRuleMetadata::default()
     };

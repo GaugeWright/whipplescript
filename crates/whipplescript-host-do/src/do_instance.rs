@@ -2095,6 +2095,7 @@ mod tests {
                     source_hash: "src",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )
@@ -2208,6 +2209,7 @@ mod tests {
                     source_hash: "src-exec",
                     ir_hash: "ir-exec",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )
@@ -2423,6 +2425,7 @@ mod tests {
                     source_hash: "src",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )
@@ -2548,6 +2551,7 @@ mod tests {
                     source_hash: "src",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )
@@ -2684,6 +2688,7 @@ mod tests {
                     source_hash: "src",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )
@@ -2922,6 +2927,7 @@ mod tests {
                     source_hash: "src-turn",
                     ir_hash: "ir-turn",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &ir,
             )

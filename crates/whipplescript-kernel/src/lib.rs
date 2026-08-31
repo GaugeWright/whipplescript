@@ -108,6 +108,19 @@ pub struct ProgramVersionInput<'a> {
     pub source_hash: &'a str,
     pub ir_hash: &'a str,
     pub compiler_version: &'a str,
+    /// The `.ir` snapshot `ir_hash` is the hash of, supplied by whoever computed
+    /// that hash — never derived here.
+    ///
+    /// Deriving it from the `IrProgram` looked tidier and was wrong: on the host
+    /// protocol path `ir_hash` arrives from a REMOTE compiler while the program
+    /// is compiled locally, and the two IRs legitimately differ across
+    /// toolchains — that divergence is exactly what
+    /// `reattest_instance_program` exists to absorb. A locally-derived snapshot
+    /// would then be stored against a hash naming a different document.
+    ///
+    /// `None` means the caller has no snapshot it can vouch for, and nothing is
+    /// stored. See `NewProgramVersion::ir_snapshot` for the store-side guard.
+    pub ir_snapshot: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -972,6 +985,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             program_name: input.program_name,
             source_hash: input.source_hash,
             ir_hash: input.ir_hash,
+            ir_snapshot: None,
             compiler_version: input.compiler_version,
             declared_capabilities_json: "[]",
             declared_profiles_json: "[]",
@@ -997,6 +1011,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             source_hash: input.source_hash,
             ir_hash: input.ir_hash,
             compiler_version: input.compiler_version,
+            ir_snapshot: input.ir_snapshot,
             declared_capabilities_json: "[]",
             declared_profiles_json: &declared_profiles_json,
             declared_skills_json: &declared_skills_json,
@@ -1021,6 +1036,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                 program_name: input.program_name,
                 source_hash: input.source_hash,
                 ir_hash: input.ir_hash,
+                ir_snapshot: None,
                 compiler_version: input.compiler_version,
                 declared_capabilities_json: "[]",
                 declared_profiles_json: "[]",
@@ -4572,6 +4588,7 @@ rule noop
                     source_hash: "source-1",
                     ir_hash: "ir-1",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -4583,6 +4600,7 @@ rule noop
                     source_hash: "source-2",
                     ir_hash: "ir-2",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -4653,6 +4671,7 @@ rule noop
                     source_hash: "source-1",
                     ir_hash: "ir-1",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -4753,6 +4772,7 @@ rule noop
                     source_hash: "source-1",
                     ir_hash: "ir-1",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -4860,6 +4880,7 @@ rule noop
                     source_hash: "source-1",
                     ir_hash: "ir-1",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -4956,6 +4977,7 @@ rule start
                     source_hash: "source",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -5084,6 +5106,7 @@ rule start
                     source_hash: "source",
                     ir_hash: "ir",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )
@@ -5146,6 +5169,7 @@ rule start
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -5769,6 +5793,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("version records");
         let instance_id = kernel.create_instance(&version, "{}").expect("instance");
@@ -5809,6 +5834,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -5880,6 +5906,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -5912,6 +5939,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -5991,6 +6019,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6181,6 +6210,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6266,6 +6296,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6378,6 +6409,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6555,6 +6587,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6649,6 +6682,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6836,6 +6870,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -6923,6 +6958,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -7082,6 +7118,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -7716,6 +7753,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -7864,6 +7902,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -7982,6 +8021,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -8143,6 +8183,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -8247,6 +8288,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -8360,6 +8402,7 @@ rule wait
                 source_hash: "source",
                 ir_hash: "ir",
                 compiler_version: "test",
+                ir_snapshot: None,
             })
             .expect("program version creates");
         let instance_id = kernel
@@ -8511,6 +8554,7 @@ rule wait
                     source_hash: "s",
                     ir_hash: "i",
                     compiler_version: "test",
+                    ir_snapshot: None,
                 },
                 &program,
             )

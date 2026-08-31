@@ -1,0 +1,50 @@
+# DR-0084: a produce/consume ring that runs through a TRACKER rather than
+# through a schema fact. `file` puts a ready issue into the queue, `spin`
+# matches it, and `release` returns the claimed item to ready — so `spin`
+# re-presents its own work and the loop turns forever.
+#
+# Every hop waits on an effect terminal, so this is world-paced and perfectly
+# legal in an ordinary workflow: it is the queue-worker loop the language is
+# for. `@bounded` is the author's declaration that this workflow settles, and
+# looping with the world is what that rules out.
+#
+# Before DR-0084 the compiler could not see this cycle at all. The coupling runs
+# through `tracker.file`/`tracker.release` effects rather than a schema `record`,
+# and `rule_dependencies` carried only schema-fact edges, so the graph the
+# refusal reads showed two unrelated rules.
+@bounded
+workflow BoundedTrackerRing
+
+use std.tracker
+
+output result Report
+class Report { seen int }
+
+tracker backlog {
+  provider builtin
+}
+
+rule seed
+  when started
+=> {
+  file issue into backlog {
+    title "seed"
+    body "the item this workflow keeps handing back to itself"
+  }
+}
+
+rule spin
+  when backlog has ready issue as issue
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    release issue
+  }
+}
+
+rule settle
+  when Report as r
+=> {
+  complete result { seen r.seen }
+}

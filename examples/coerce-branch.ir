@@ -40,4 +40,6 @@ rules
       effect1 kind=tracker.file binding=- key=156eb35678c182e9d002e61ccea00108
     body_hash 730386b76fd397c24a45d6c2353028be
 rule_dependencies
+  classify_request --tracker:review--> classify_request
   classify_request --schema:ClassifiedMessage--> route_classified
+  route_classified --tracker:review--> classify_request

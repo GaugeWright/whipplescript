@@ -481,6 +481,7 @@ fn hermetic_capability_exec_served_from_cache_on_second_run() {
                 source_hash: &stable_hash_hex(&source_text),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: None,
             },
             &ir,
         )

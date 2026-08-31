@@ -283,6 +283,21 @@ pub struct NewProgramVersion<'a> {
     pub source_hash: &'a str,
     pub ir_hash: &'a str,
     pub compiler_version: &'a str,
+    /// The `.ir` snapshot this version's `ir_hash` is the hash OF, captured
+    /// content-addressed alongside the row.
+    ///
+    /// `ir_hash` is `stable_hash_hex(snapshot)` and `content_blobs.id` IS the
+    /// content hash, so the snapshot lands under the id the version already
+    /// carries: no second pointer, and `get_content(&record.ir_hash)` reads it
+    /// back. Without it a program version records a hash of a document nobody
+    /// kept, and an instance's static structure is unrecoverable for anyone who
+    /// no longer holds the exact source (the view-model note's G1).
+    ///
+    /// `None` where the caller genuinely has no snapshot — it withholds the
+    /// bytes rather than inventing them. A `Some` whose hash disagrees with
+    /// `ir_hash` is refused with [`StoreError::ContentMismatch`]: one of the two
+    /// is wrong and guessing which would defeat the point of storing either.
+    pub ir_snapshot: Option<&'a str>,
     pub declared_capabilities_json: &'a str,
     pub declared_profiles_json: &'a str,
     pub declared_skills_json: &'a str,
@@ -1512,6 +1527,23 @@ impl SqliteStore {
             params![&program_id, version.source_hash, version.ir_hash],
             |row| row.get::<_, String>(0),
         )?;
+        // Same transaction as the row on purpose: a version whose snapshot did
+        // not land is a version whose `ir_hash` names nothing, which is the
+        // state this field exists to prevent.
+        if let Some(snapshot) = version.ir_snapshot {
+            let actual = stable_hash_hex(snapshot);
+            if actual != version.ir_hash {
+                return Err(StoreError::ContentMismatch {
+                    id: version.ir_hash.to_owned(),
+                    actual,
+                    source: "program version ir snapshot",
+                });
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+                params![&actual, snapshot, snapshot.len() as i64],
+            )?;
+        }
         tx.commit()?;
 
         Ok(ProgramVersionRecord {
@@ -15353,6 +15385,61 @@ mod tests {
         assert_eq!(row_count(&store, "effects"), 0);
     }
 
+    /// G1 of the instance view-model note: a program version records
+    /// `ir_hash` but used to keep nothing that hash names, so an instance's
+    /// static structure was unrecoverable to anyone without the exact source.
+    /// The snapshot rides under the id the version already carries, so the read
+    /// back needs no second pointer.
+    #[test]
+    fn program_version_snapshot_is_readable_under_its_own_ir_hash() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let snapshot = "workflow Demo\nrules\n  rule only\n    when started\n";
+        let ir_hash = stable_hash_hex(snapshot);
+
+        let mut version = test_program_version("Demo", "source-1", &ir_hash);
+        version.ir_snapshot = Some(snapshot);
+        store
+            .create_program_version(version)
+            .expect("program version creates");
+
+        assert_eq!(
+            store.get_content(&ir_hash).expect("read"),
+            Some(snapshot.to_owned()),
+            "the snapshot reads back under the version's own ir_hash"
+        );
+    }
+
+    /// The write is guarded, not trusting: a caller whose `ir_hash` does not
+    /// describe the snapshot it handed over has one of the two wrong, and
+    /// storing either would make `ir_hash` a value that names the wrong
+    /// document. Refusing is what turns `ir_hash` from recorded into checkable.
+    #[test]
+    fn program_version_refuses_a_snapshot_its_ir_hash_does_not_describe() {
+        let mut store = SqliteStore::open_in_memory().expect("store opens");
+        let snapshot = "workflow Demo\nrules\n";
+
+        let mut version = test_program_version("Demo", "source-1", "ir-hash-of-something-else");
+        version.ir_snapshot = Some(snapshot);
+        let refused = store.create_program_version(version);
+
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::ContentMismatch { id, actual, source })
+                    if id == "ir-hash-of-something-else"
+                        && actual == &stable_hash_hex(snapshot)
+                        && *source == "program version ir snapshot"
+            ),
+            "expected ContentMismatch, got {refused:?}"
+        );
+        assert_eq!(
+            row_count(&store, "program_versions"),
+            0,
+            "the refusal rolls back the version row too — no half-written version"
+        );
+        assert_eq!(row_count(&store, "content_blobs"), 0);
+    }
+
     #[test]
     fn activate_revision_rechecks_compatibility_in_transaction() {
         let mut store = SqliteStore::open_in_memory().expect("store opens");
@@ -20860,6 +20947,7 @@ mod tests {
             program_name,
             source_hash,
             ir_hash,
+            ir_snapshot: None,
             compiler_version: "test",
             declared_capabilities_json: "[]",
             declared_profiles_json: "[]",

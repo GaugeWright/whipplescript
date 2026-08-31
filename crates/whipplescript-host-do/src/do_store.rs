@@ -3779,6 +3779,26 @@ fn do_insert_program_version<Sql: DoSql>(
             ],
         )
         .map_err(sql_err)?;
+    // Parity with the native host: the snapshot `ir_hash` names is captured
+    // under that id, and a snapshot disagreeing with the id it was handed is
+    // refused rather than stored. Omitting this here would leave hosted
+    // instances with the exact gap the field closes, which no schema check
+    // would notice — `content_blobs` already exists on both sides.
+    if let Some(snapshot) = version.ir_snapshot {
+        let actual = stable_hash_hex(snapshot);
+        if actual != version.ir_hash {
+            return Err(StoreError::ContentMismatch {
+                id: version.ir_hash.to_owned(),
+                actual,
+                source: "program version ir snapshot",
+            });
+        }
+        sql.execute(
+            "INSERT OR IGNORE INTO content_blobs (id, body, byte_len) VALUES (?1, ?2, ?3)",
+            &[text(&actual), text(snapshot), int(snapshot.len() as i64)],
+        )
+        .map_err(sql_err)?;
+    }
     version_rows
         .first()
         .map(|r| as_text(&r[0]))
@@ -11404,6 +11424,7 @@ pub(crate) mod tests {
                 program_name: "format-guard",
                 source_hash: "sh1",
                 ir_hash: "ih1",
+                ir_snapshot: None,
                 compiler_version: "1.0",
                 declared_capabilities_json: "[]",
                 declared_profiles_json: "[]",
@@ -11489,6 +11510,59 @@ pub(crate) mod tests {
         }
     }
 
+    /// Parity with the native host for the view-model note's G1: the `.ir`
+    /// snapshot a version's `ir_hash` names is captured under that id, and a
+    /// snapshot the id does not describe is refused rather than filed against
+    /// the wrong name.
+    ///
+    /// Hosted-side parity is exactly where this can rot unnoticed — the schema
+    /// gate compares declarations and never exercises a write — so both halves
+    /// are pinned here against real SQLite.
+    #[test]
+    fn do_store_captures_the_ir_snapshot_its_hash_names_and_refuses_one_it_does_not() {
+        let mut store = store();
+        let snapshot = "workflow Demo\nrules\n  rule only\n    when started\n";
+        let ir_hash = stable_hash_hex(snapshot);
+
+        let mk = |ir_hash: &'static str, snap: Option<&'static str>| NewProgramVersion {
+            program_name: "demo",
+            source_hash: "sh1",
+            ir_hash,
+            ir_snapshot: snap,
+            compiler_version: "1.0",
+            declared_capabilities_json: "[]",
+            declared_profiles_json: "[]",
+            declared_skills_json: "[]",
+            declared_schemas_json: "[]",
+            analysis_summary_json: "{}",
+            generated_artifacts_json: "[]",
+            artifact_root: None,
+        };
+
+        let hash_static: &'static str = Box::leak(ir_hash.clone().into_boxed_str());
+        let snap_static: &'static str = Box::leak(snapshot.to_owned().into_boxed_str());
+        store
+            .create_program_version(mk(hash_static, Some(snap_static)))
+            .expect("create pv");
+        assert_eq!(
+            store.get_content(&ir_hash).expect("read"),
+            Some(snapshot.to_owned()),
+            "the snapshot reads back under the version's own ir_hash"
+        );
+
+        let refused = store.create_program_version(mk("not-the-hash", Some(snap_static)));
+        assert!(
+            matches!(
+                &refused,
+                Err(StoreError::ContentMismatch { id, actual, source })
+                    if id == "not-the-hash"
+                        && actual == &ir_hash
+                        && *source == "program version ir snapshot"
+            ),
+            "expected ContentMismatch, got {refused:?}"
+        );
+    }
+
     /// create_program_version upserts a program + version (idempotent on the
     /// content hashes); register_package_manifest fans a manifest out across the
     /// registration tables. Both verified against real SQLite.
@@ -11500,6 +11574,7 @@ pub(crate) mod tests {
             program_name: "orders",
             source_hash: "sh1",
             ir_hash: "ih1",
+            ir_snapshot: None,
             compiler_version: "1.0",
             declared_capabilities_json: "[]",
             declared_profiles_json: "[]",

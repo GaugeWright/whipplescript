@@ -44,3 +44,5 @@ rules
       review --succeeds--> effect4
       review --fails--> effect5
     body_hash 13505c8a19a1cbf39e44638654974327
+rule_dependencies
+  work_ready_item --tracker:backlog--> work_ready_item

@@ -48,3 +48,5 @@ rules
       turn --succeeds--> effect3
       active_claim --fails--> effect4
     body_hash cebc3e2dc4bdf7ea35c2ce61bca8f2af
+rule_dependencies
+  implement_ready_item --tracker:backlog--> implement_ready_item

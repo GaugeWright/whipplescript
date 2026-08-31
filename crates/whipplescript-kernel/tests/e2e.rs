@@ -159,6 +159,7 @@ fn e2e_concurrent_instances_do_not_cross_contaminate_facts() {
             source_hash: "source",
             ir_hash: "ir",
             compiler_version: "e2e",
+            ir_snapshot: None,
         })
         .expect("program version creates");
     let first = kernel
@@ -370,6 +371,7 @@ fn e2e_legacy_manifest_registered_effect_runs_through_outbox() {
             source_hash: "source",
             ir_hash: "ir",
             compiler_version: "e2e",
+            ir_snapshot: None,
         })
         .expect("program version creates");
     let instance_id = kernel
@@ -1198,6 +1200,7 @@ fn kernel_from_source(name: &str, source: &str) -> (RuntimeKernel<NativeStores>,
             source_hash: "source",
             ir_hash: "ir",
             compiler_version: "e2e",
+            ir_snapshot: None,
         })
         .expect("program version creates");
     let instance_id = kernel
@@ -1248,6 +1251,7 @@ rule {label}_noop
                 source_hash: &format!("{label}-source"),
                 ir_hash: &format!("{label}-ir"),
                 compiler_version: "e2e",
+                ir_snapshot: None,
             },
             &ir,
         )
@@ -1368,6 +1372,7 @@ fn e2e_malformed_coordination_input_fails_typed_instead_of_defaulting() {
             source_hash: "source",
             ir_hash: "ir",
             compiler_version: "e2e",
+            ir_snapshot: None,
         })
         .expect("program version creates");
     let instance_id = kernel
@@ -1514,6 +1519,7 @@ fn e2e_counter_period_is_timezone_anchored_and_replay_deterministic() {
             source_hash: "source",
             ir_hash: "ir",
             compiler_version: "e2e",
+            ir_snapshot: None,
         })
         .expect("program version creates");
     let instance_id = kernel

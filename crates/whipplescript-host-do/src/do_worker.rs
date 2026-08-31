@@ -272,6 +272,12 @@ impl<Sql: DoSql + 'static> DurableInstance<Sql> {
                     source_hash: &source_hash,
                     ir_hash: &ir_hash,
                     compiler_version,
+                    // No snapshot: this path's `ir_hash` is a synthetic
+                    // identity (`source_hash+compiler_version`, above), not the
+                    // hash of any `.ir` document, so nothing could be stored
+                    // under it and read back by it. Passing the snapshot here
+                    // would file it against an id that does not name it.
+                    ir_snapshot: None,
                 },
                 &ir,
             )

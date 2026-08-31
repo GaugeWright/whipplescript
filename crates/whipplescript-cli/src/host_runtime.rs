@@ -1516,6 +1516,7 @@ impl GovernedHostRuntime {
                 source_hash: &package.source_hash,
                 ir_hash: &package.ir_hash,
                 compiler_version: HOST_PROTOCOL,
+                ir_snapshot: None,
             })
             .map_err(HostRuntimeError::Store)?;
         let metadata = InstanceMetadata {
@@ -1924,6 +1925,7 @@ impl GovernedHostRuntime {
                             source_hash: &package.source_hash,
                             ir_hash: &package.ir_hash,
                             compiler_version: HOST_PROTOCOL,
+                            ir_snapshot: None,
                         },
                     )
                     .map_err(HostRuntimeError::Store)?;

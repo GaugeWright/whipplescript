@@ -12262,6 +12262,7 @@ fn execute_scenario(
                 source_hash: &stable_hash_hex(source),
                 ir_hash: &stable_hash_hex(&snapshot),
                 compiler_version: whipplescript_core::version(),
+                ir_snapshot: Some(&snapshot),
             },
             ir,
         )
@@ -16689,6 +16690,7 @@ fn revise(options: &CliOptions) -> ExitCode {
             source_hash: &source_hash,
             ir_hash: &ir_hash,
             compiler_version: whipplescript_core::version(),
+            ir_snapshot: Some(&snapshot),
         },
         &ir,
     ) {
@@ -18951,6 +18953,7 @@ fn start_workflow_instance(
             source_hash: &stable_hash_hex(&source),
             ir_hash: &stable_hash_hex(&snapshot),
             compiler_version: whipplescript_core::version(),
+            ir_snapshot: Some(&snapshot),
         },
         &ir,
     ) {
@@ -26426,6 +26429,7 @@ fn start_child_workflow_instance_in_package(
             source_hash: &stable_hash_hex(&source),
             ir_hash: &stable_hash_hex(&snapshot),
             compiler_version: whipplescript_core::version(),
+            ir_snapshot: Some(&snapshot),
         },
         &ir,
     )?;
