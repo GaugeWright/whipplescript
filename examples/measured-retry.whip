@@ -1,0 +1,51 @@
+# A retry that states its own bound. The rule advances its trigger behind an
+# `after`, so the loop is paced by the agent turn; the `measure` declaration
+# says what stops it, and the compiler verifies that claim rather than taking
+# it (DR-0081). Change `n a.n + 1` to something that does not advance, or drop
+# the guard, and `whip check` names which half of the declaration broke.
+workflow MeasuredRetry
+
+output result Done
+failure error Failed
+
+class Done { attempts int }
+class Failed { reason string }
+class Attempt { n int }
+
+measure Attempt.n up to 3
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Attempt [
+  { n 0 }
+]
+
+rule attempt
+  when Attempt as a where a.n < 3
+=> {
+  tell worker "attempt {{ a.n }}" as turn
+
+  after turn succeeds as ok {
+    complete result {
+      attempts a.n
+    }
+  }
+
+  after turn fails as problem {
+    done a -> record Attempt {
+      n a.n + 1
+    }
+  }
+}
+
+rule give_up
+  when Attempt as a where a.n >= 3
+=> {
+  fail error {
+    reason "three attempts failed"
+  }
+}

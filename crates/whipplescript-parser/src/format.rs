@@ -252,6 +252,22 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
         Item::Use(use_decl) => {
             push_line(formatted, format!("use {}", use_decl.name.value));
         }
+        Item::Measure(measure) => {
+            let bound = match &measure.bound {
+                crate::MeasureDeclBound::Literal(value) => value.to_string(),
+                crate::MeasureDeclBound::Field(field) => {
+                    format!("{}.{field}", measure.class.name)
+                }
+            };
+            let direction = if measure.rising { "up" } else { "down" };
+            push_line(
+                formatted,
+                format!(
+                    "measure {}.{} {direction} to {bound}",
+                    measure.class.name, measure.field.name
+                ),
+            );
+        }
         Item::Tracker(queue) => {
             push_line(formatted, format!("tracker {} {{", queue.name.name));
             push_line(formatted, format!("  provider {}", queue.provider.name));

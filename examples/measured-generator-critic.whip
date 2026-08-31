@@ -1,0 +1,65 @@
+# Writer drafts, critic reviews, three rounds, then ship. Each hop waits on an
+# agent turn, so the ring is paced by the world; `@bounded` says this workflow
+# settles rather than turning, which is a promise only a measure can keep. The
+# `round` field rises once per round trip — the review hop carries it through
+# unchanged, which is legal, because what must advance is the trip and not every
+# step of it (DR-0081 §2).
+@bounded
+workflow MeasuredGeneratorCritic
+
+output result Draft
+
+class Task { round int }
+class Draft { text string  round int }
+
+measure Task.round up to 3
+
+agent writer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+agent critic {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+table seed as Task [
+  { round 0 }
+]
+
+rule write
+  when Task as t where t.round < 3
+=> {
+  tell writer "draft round {{ t.round }}" as turn
+
+  after turn succeeds as ok {
+    done t -> record Draft {
+      text "draft"
+      round t.round + 1
+    }
+  }
+}
+
+rule review
+  when Draft as d where d.round < 3
+=> {
+  tell critic "review {{ d.text }}" as turn
+
+  after turn succeeds as ok {
+    done d -> record Task {
+      round d.round
+    }
+  }
+}
+
+rule ship
+  when Draft as d where d.round >= 3
+=> {
+  complete result {
+    text d.text
+    round d.round
+  }
+}

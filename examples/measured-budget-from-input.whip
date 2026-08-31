@@ -1,0 +1,54 @@
+# The ceiling is carried in the data, not in the source. This loop terminates —
+# `spent` rises by one each turn toward `budget`, which no hop changes — and the
+# number of turns is whatever the caller asked for. That is the difference
+# DR-0081 exists to draw: the cycle is WELL-FOUNDED without being step-bounded,
+# and `whip check` prints which of the two it proved.
+#
+# A `@tool` workflow may not do this: its caller blocks for as many agent turns
+# as the data says, so a tool needs a literal ceiling over a literal seed.
+workflow MeasuredBudgetFromInput
+
+input request Request
+output result Report
+
+class Request { budget int }
+class Review { spent int  budget int }
+class Report { spent int }
+
+measure Review.spent up to Review.budget
+
+agent worker {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}
+
+rule begin
+  when Request as r
+=> {
+  done r -> record Review {
+    spent 0
+    budget r.budget
+  }
+}
+
+rule review
+  when Review as v where v.spent < v.budget
+=> {
+  tell worker "pass {{ v.spent }}" as turn
+
+  after turn succeeds as ok {
+    done v -> record Review {
+      spent v.spent + 1
+      budget v.budget
+    }
+  }
+}
+
+rule finish
+  when Review as v where v.spent >= v.budget
+=> {
+  complete result {
+    spent v.spent
+  }
+}

@@ -30,6 +30,7 @@ capability.not_granted COVERED
 construct.ambiguous_root_workflow COVERED
 construct.capability_not_declared PROVISIONAL
 construct.cardinality_conflict COVERED
+construct.dead_measure PROVISIONAL
 construct.duplicate_declaration COVERED
 construct.duplicate_field COVERED
 construct.duplicate_include PROVISIONAL
@@ -55,6 +56,7 @@ construct.unknown_clause COVERED
 construct.unknown_option COVERED
 construct.unknown_provider PROVISIONAL
 construct.unknown_provider_kind COVERED
+construct.unknown_reference PROVISIONAL
 effect.ambiguous_outcome_predicate PROVISIONAL
 effect.binding_type_conflict PROVISIONAL
 effect.multiple_leases PROVISIONAL
@@ -92,6 +94,7 @@ expr.untyped_case_scrutinee PROVISIONAL
 expr.untyped_object_literal COVERED
 expr.variant_without_payload PROVISIONAL
 graph.bounded_workflow_effect_cycle COVERED
+graph.declared_measure_unmet PROVISIONAL
 graph.gauge_input_cycle PROVISIONAL
 graph.include_cycle PROVISIONAL
 graph.invoke_awaits_service_workflow COVERED
@@ -112,6 +115,7 @@ package_set.unknown_package PROVISIONAL
 parse.invalid_content_type PROVISIONAL
 parse.invalid_expression COVERED
 parse.invalid_field_assignment PROVISIONAL
+parse.invalid_measure PROVISIONAL
 parse.invalid_name PROVISIONAL
 parse.invalid_selection PROVISIONAL
 parse.malformed_statement PROVISIONAL
@@ -150,6 +154,7 @@ security.unvouched_endorsement PROVISIONAL
 security.unwrap_not_granted PROVISIONAL
 type.duplicate_field COVERED
 type.invalid_literal COVERED
+type.invalid_measure_field PROVISIONAL
 type.mismatch COVERED
 type.missing_payload_value PROVISIONAL
 type.missing_required_field COVERED

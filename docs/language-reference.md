@@ -195,6 +195,7 @@ enum          ::= "enum" TypeName "{" variant* "}"
 event         ::= "event" dotted_name "{" field* "}"
 agent         ::= "agent" Ident ("using" Ident)? "{" agent_field* "}"
 harness       ::= "harness" Ident ":" Ident
+measure       ::= "measure" TypeName "." Ident ("up" | "down") "to" (int | TypeName "." Ident)
 table         ::= "table" Ident "as" TypeName "[" row* "]"
 tracker       ::= "tracker" Ident "{" "provider" Ident "}"
 lease         ::= "lease" Ident "{" "shared"? "key" TypeName "slots" int "ttl" duration "}"
@@ -2418,6 +2419,18 @@ suggestion.
   effect is a check error. The retry pattern keeps compiling, because it records
   inside an `after` block. The one case that stays with the separate check is a
   rule that preserves its own trigger, which the `done` statement escapes.
+- **A `measure` declaration states a bound, and the compiler verifies it.**
+  Write `measure Task.n up to 3` beside the class, or `measure Review.spent up
+  to Review.budget` when the ceiling travels in the data. The compiler proves
+  the claim against the cycle that carries the class. It never takes the claim:
+  a declaration is a request to be held to a bound, not a way to assert one.
+  When the code stops honouring it, the error carries the code
+  `graph.declared_measure_unmet` and names the half that broke — the bound
+  that the cycle actually reaches, or the guard that no longer stops it.
+  A declaration reaches a cycle that waits on the world as well. Such a cycle
+  needs no measure to compile, so the declaration adds a promise that pacing
+  never made: that the loop ends. A declaration that governs no cycle is a
+  warning, because it states a property of code that is no longer there.
 - **A cycle with a measure is not a check error.** A ring terminates when its
   `int` field moves one way on each round trip toward a bound that some rule of
   the ring states, and each rule consumes the fact that it matched. The compiler

@@ -40,6 +40,7 @@ pub(crate) const AGENT_BLOCK_FIELDS: &[&str] = &[
 /// chains this is transcribed from.
 pub(crate) const TOP_LEVEL_DECLARATION_KEYWORDS: &[&str] = &[
     "description",
+    "measure",
     "workflow",
     "pattern",
     "include",
@@ -1021,6 +1022,11 @@ impl Parser<'_> {
             return self.parse_declaration_block(spec);
         }
         // TOP-LEVEL-ARMS-START (2 of 2)
+        if self.at_ident("measure") {
+            self.reject_pending_tags(pending_tags, "measure");
+            self.reject_pending_description(pending_description, "measure");
+            return self.parse_measure().map(Item::Measure);
+        }
         if self.at_ident("include") {
             self.reject_pending_tags(pending_tags, "include");
             self.reject_pending_description(pending_description, "include");
@@ -1745,6 +1751,93 @@ impl Parser<'_> {
             type_args,
             alias,
             body,
+            span,
+        })
+    }
+
+    /// `measure <Class>.<field> up to <bound>` / `down to <bound>` (DR-0081 §6).
+    ///
+    /// One line, because a measure is one claim: which field of which class the
+    /// ring advances, and what stops it. The bound is an integer literal, or a
+    /// field of the same class that the ring must never change — a budget the
+    /// data carries, which terminates without being step-bounded.
+    fn parse_measure(&mut self) -> Option<MeasureDecl> {
+        let keyword = self.expect_keyword("measure")?;
+        let class = self.expect_ident("measured class")?;
+        self.expect_symbol('.')?;
+        let field = self.expect_ident("measured field")?;
+        let direction = self.expect_ident("`up` or `down`")?;
+        let rising = match direction.name.as_str() {
+            "up" => true,
+            "down" => false,
+            other => {
+                self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.invalid_measure"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: direction.span,
+                    message: format!("`measure` takes `up to` or `down to`, not `{other} to`"),
+                    suggestion: Some(
+                        "write `measure <Class>.<field> up to <bound>` when the field rises toward the bound, `down to` when it falls"
+                            .to_owned(),
+                    ),
+                });
+                return None;
+            }
+        };
+        self.expect_keyword("to")?;
+        let bound = if let Some(TokenKind::Number(value)) = self.peek().map(|token| &token.kind) {
+            let literal = value.clone();
+            self.advance();
+            match literal.parse::<i64>() {
+                Ok(parsed) => MeasureDeclBound::Literal(parsed),
+                Err(_) => {
+                    self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.invalid_measure"),
+                    severity: Severity::Error,
+                        related: Vec::new(),
+                        span: keyword.span,
+                        message: format!("`measure` bound `{literal}` is not a whole number"),
+                        suggestion: Some(
+                            "a measure descends over whole numbers; a fractional bound cannot be reached by a whole step"
+                                .to_owned(),
+                        ),
+                    });
+                    return None;
+                }
+            }
+        } else {
+            let bound_class = self.expect_ident("bound class")?;
+            self.expect_symbol('.')?;
+            let bound_field = self.expect_ident("bound field")?;
+            if bound_class.name != class.name {
+                self.diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.invalid_measure"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: bound_class.span,
+                    message: format!(
+                        "`measure` bound names class `{}`, but the measured field is on `{}`",
+                        bound_class.name, class.name
+                    ),
+                    suggestion: Some(
+                        "the bound must be carried by the same fact the ring passes around, so it travels with the measure"
+                            .to_owned(),
+                    ),
+                });
+                return None;
+            }
+            MeasureDeclBound::Field(bound_field.name)
+        };
+        let span = SourceSpan {
+            start: keyword.span.start,
+            end: field.span.end,
+        };
+        Some(MeasureDecl {
+            class,
+            field,
+            rising,
+            bound,
             span,
         })
     }

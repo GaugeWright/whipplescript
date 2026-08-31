@@ -11208,6 +11208,262 @@ rule ship
     assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
 }
 
+/// DR-0081 §6: a `measure` declaration is VERIFIED, not trusted. When it holds,
+/// the cycle is admitted exactly as the inference would have admitted it.
+#[test]
+fn a_declared_measure_that_holds_admits_the_cycle() {
+    let compiled = compile_program(DECLARED_MEASURE);
+    let ir = compiled.ir.expect("a declared measure that holds compiles");
+    assert!(
+        ir.to_snapshot()
+            .contains("t.n rises by 1 toward 10 (step-bounded"),
+        "{}",
+        ir.to_snapshot()
+    );
+}
+
+/// And when it does not hold, the declaration earns its keep: the diagnostic
+/// names which half of the stated claim the code stopped honouring, where the
+/// inference alone can only say it found nothing.
+#[test]
+fn a_declared_measure_that_fails_names_which_half_broke() {
+    // The bound the code proves is not the bound the declaration states.
+    let wrong_bound = compile_program(&DECLARED_MEASURE.replace("up to 10", "up to 25"));
+    assert!(wrong_bound.ir.is_none());
+    assert!(
+        wrong_bound.diagnostics.iter().any(|diagnostic| diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(
+                |text| text.contains("`measure Task.n` states this cycle terminates")
+                    && text
+                        .contains("rises by 1 toward 10, which is not what the declaration states")
+            )),
+        "{:?}",
+        wrong_bound.diagnostics
+    );
+
+    // The guard that bounded it is gone, so nothing stops the turn.
+    let unguarded = compile_program(
+        &DECLARED_MEASURE.replace("when Task as t where t.n < 10", "when Task as t"),
+    );
+    assert!(unguarded.ir.is_none());
+    assert!(
+        unguarded.diagnostics.iter().any(|diagnostic| diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|text| text.contains("no rule on the cycle bounds it"))),
+        "{:?}",
+        unguarded.diagnostics
+    );
+}
+
+/// The declaration must name something real and measurable, or it is a claim
+/// the compiler cannot check — which is the one thing a verified declaration
+/// must never be.
+#[test]
+fn a_measure_declaration_is_itself_checked() {
+    let cases: &[(&str, &str)] = &[
+        ("measure Nope.n up to 10", "unknown class `Nope`"),
+        (
+            "measure Task.zzz up to 10",
+            "which class `Task` does not declare",
+        ),
+        (
+            "measure Task.n up to 10\nmeasure Task.n up to 10",
+            "is declared more than once",
+        ),
+    ];
+    for (declaration, expected) in cases {
+        let compiled =
+            compile_program(&DECLARED_MEASURE.replace("measure Task.n up to 10", declaration));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "{declaration}: {:?}",
+            compiled.diagnostics
+        );
+    }
+
+    // A `float` field cannot carry a measure: it can approach a bound forever
+    // without reaching it.
+    //
+    // Asserted on the refusal's OWN sentence, not on the phrase "is not an
+    // `int`": the unmet-declaration error carries that phrase too, so the looser
+    // assertion passed with this refusal deleted. The mutation sweep caught it,
+    // which is what it is for.
+    let float_field = compile_program(
+        &DECLARED_MEASURE
+            .replace("class Task { n int }", "class Task { n int  ratio float }")
+            .replace("measure Task.n up to 10", "measure Task.ratio up to 10"),
+    );
+    assert!(
+        float_field.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("`measure` names field `Task.ratio`, which is not an `int`")),
+        "{:?}",
+        float_field.diagnostics
+    );
+
+    // The bound travels with the fact, so it must be a whole-number field too.
+    let float_bound = compile_program(
+        &DECLARED_MEASURE
+            .replace(
+                "class Task { n int }",
+                "class Task { n int  ceiling float }",
+            )
+            .replace(
+                "measure Task.n up to 10",
+                "measure Task.n up to Task.ceiling",
+            ),
+    );
+    assert!(
+        float_bound.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("`measure` bound `Task.ceiling` is not an `int` field of the class")),
+        "{:?}",
+        float_bound.diagnostics
+    );
+
+    // A declaration that governs no cycle is intent the code no longer has: a
+    // warning, not an error, because the cycle may be coming.
+    let dead = compile_program(
+        &DECLARED_MEASURE.replace("measure Task.n up to 10", "measure Report.seen up to 10"),
+    );
+    assert!(
+        dead.warnings
+            .iter()
+            .any(|warning| warning.message.contains("governs no cycle")),
+        "{:?}",
+        dead.warnings
+    );
+}
+
+/// The declaration reaches PACED cycles too, which is where most real loops
+/// live. Pacing decides whether a cycle is refused; a measure says whether it
+/// ends, and those are different questions — so a `measure` over a paced ring is
+/// how an author asks to be held to termination that pacing alone never
+/// promised, and an unmet claim is an error even though the ring would
+/// otherwise be legal.
+#[test]
+fn a_declaration_is_verified_over_a_paced_cycle_too() {
+    let source = r#"
+@service
+workflow PacedDeclared
+
+class Attempt { n int }
+
+measure Attempt.n up to 3
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seed as Attempt [ { n 0 } ]
+
+rule attempt
+  when Attempt as a where a.n < 3
+=> {
+  tell worker "try" as turn
+
+  after turn fails as problem {
+    done a -> record Attempt { n a.n + 1 }
+  }
+}
+"#;
+    // The paced ring is legal, and the measure is published as evidence.
+    let honoured = compile_program(source);
+    let ir = honoured
+        .ir
+        .expect("a paced ring with an honoured measure compiles");
+    assert!(
+        ir.to_snapshot()
+            .contains("a.n rises by 1 toward 3 (step-bounded"),
+        "{}",
+        ir.to_snapshot()
+    );
+
+    // The same ring, still paced and still legal by pacing, is refused when the
+    // claim it states is false.
+    let unmet = compile_program(&source.replace("up to 3", "up to 9"));
+    assert!(unmet.ir.is_none(), "an unmet declaration must refuse");
+    assert!(
+        unmet.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_str() == "graph.declared_measure_unmet"
+                && diagnostic
+                    .message
+                    .contains("declared measure is not honoured")
+        }),
+        "{:?}",
+        unmet.diagnostics
+    );
+}
+
+/// The three ways a `measure` line can be malformed. Each is its own refusal and
+/// each is asserted on its own sentence: a declaration the parser accepts
+/// loosely is a claim the compiler cannot check.
+#[test]
+fn a_malformed_measure_declaration_is_refused() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "measure Task.n over to 10",
+            "`measure` takes `up to` or `down to`, not `over to`",
+        ),
+        // A bound past `i64`: the measure descends over whole numbers the
+        // compiler can hold, and one it cannot is not a bound at all. (A
+        // fractional bound never reaches here — `2.5` lexes as three tokens and
+        // the line fails to parse before this.)
+        (
+            "measure Task.n up to 99999999999999999999",
+            "is not a whole number",
+        ),
+        (
+            "measure Task.n up to Other.limit",
+            "`measure` bound names class `Other`, but the measured field is on `Task`",
+        ),
+    ];
+    for (declaration, expected) in cases {
+        let compiled =
+            compile_program(&DECLARED_MEASURE.replace("measure Task.n up to 10", declaration));
+        assert!(
+            compiled
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "{declaration} did not produce `{expected}`: {:?}",
+            compiled.diagnostics
+        );
+    }
+}
+
+const DECLARED_MEASURE: &str = r#"
+workflow DeclaredMeasure
+output result Report
+
+class Task { n int }
+class Report { seen int }
+
+measure Task.n up to 10
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t where t.n < 10
+=> {
+  tell worker "{{ t.n }}"
+
+  done t -> record Task { n t.n + 1 }
+}
+
+rule finish
+  when Task as t where t.n >= 10
+=> {
+  complete result { seen t.n }
+}
+"#;
+
 /// DR-0081: a same-commit loop whose field advances toward a literal ceiling
 /// cannot turn forever, so the refusal has nothing to refuse. Ten turns, and the
 /// number follows from the source — the one program in this area whose length is

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     binding_from_when, BinaryOp, Expr, ExprLiteral, IrPrimitiveType, IrProgram, IrRecordShape,
-    IrSchema, IrType,
+    IrSchema, IrType, MeasureDeclBound,
 };
 
 /// What bounds the measure field: a literal ceiling, or a field the ring never
@@ -58,6 +58,17 @@ impl Measure {
         )
     }
 
+    /// The measure without a binding, for a message that compares it against a
+    /// declaration: `rises by 1 toward 10`.
+    pub fn describe_bare(&self) -> String {
+        let direction = if self.step > 0 { "rises" } else { "falls" };
+        let bound = match &self.bound {
+            MeasureBound::Literal(value) => value.to_string(),
+            MeasureBound::InvariantField(field) => field.clone(),
+        };
+        format!("{direction} by {} toward {bound}", self.step.abs())
+    }
+
     /// The snapshot rendering, which adds what the measure proves and where.
     pub fn to_snapshot(&self, binding: &str) -> String {
         let direction = if self.step > 0 { "rises" } else { "falls" };
@@ -85,6 +96,15 @@ impl Measure {
 pub(crate) enum MeasureMiss {
     /// A field advances on every hop, but no rule on the cycle bounds it.
     Unbounded { field: String, step: i64 },
+    /// A `measure` declaration covers this cycle and the code does not honour
+    /// it. This is what the declaration is FOR: the compiler can say which half
+    /// of a stated claim broke, where an inference can only say it found
+    /// nothing.
+    DeclarationUnmet {
+        class: String,
+        field: String,
+        reason: String,
+    },
 }
 
 pub(crate) enum MeasureOutcome {
@@ -131,6 +151,73 @@ pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> Measur
         });
     }
     let candidates = candidates.unwrap_or_default();
+
+    // A `measure` declaration for a class on this ring is the author's claim
+    // about which field carries it, so the analysis stops searching and checks
+    // that claim: a stated measure that does not hold should say so, not fall
+    // back to a quiet "nothing found".
+    if let Some(declared) = ir
+        .measure_declarations
+        .iter()
+        .find(|declaration| hops.iter().any(|hop| hop.in_schema == declaration.class))
+    {
+        if !candidates.contains(&declared.field) {
+            return MeasureOutcome::Missed(MeasureMiss::DeclarationUnmet {
+                class: declared.class.clone(),
+                field: declared.field.clone(),
+                reason: format!(
+                    "`{}` is not an `int` field on every class the cycle carries",
+                    declared.field
+                ),
+            });
+        }
+        return match prove_field(ir, &hops, &declared.field, component) {
+            MeasureOutcome::Proven(measure) => {
+                let honoured = (measure.step > 0) == declared.rising
+                    && match (&measure.bound, &declared.bound) {
+                        (MeasureBound::Literal(found), MeasureDeclBound::Literal(stated)) => {
+                            found == stated
+                        }
+                        (
+                            MeasureBound::InvariantField(found),
+                            MeasureDeclBound::Field(stated),
+                        ) => found == stated,
+                        _ => false,
+                    };
+                if honoured {
+                    MeasureOutcome::Proven(measure)
+                } else {
+                    MeasureOutcome::Missed(MeasureMiss::DeclarationUnmet {
+                        class: declared.class.clone(),
+                        field: declared.field.clone(),
+                        reason: format!(
+                            "the cycle {}, which is not what the declaration states",
+                            measure.describe_bare()
+                        ),
+                    })
+                }
+            }
+            MeasureOutcome::Missed(MeasureMiss::Unbounded { field, step }) => {
+                MeasureOutcome::Missed(MeasureMiss::DeclarationUnmet {
+                    class: declared.class.clone(),
+                    field: declared.field.clone(),
+                    reason: format!(
+                        "`{field}` {} by {} on every hop, but no rule on the cycle bounds it",
+                        if step > 0 { "rises" } else { "falls" },
+                        step.abs()
+                    ),
+                })
+            }
+            _ => MeasureOutcome::Missed(MeasureMiss::DeclarationUnmet {
+                class: declared.class.clone(),
+                field: declared.field.clone(),
+                reason: format!(
+                    "no hop of the cycle advances `{}` by a whole-number step, or a hop does not consume the fact it matched",
+                    declared.field
+                ),
+            }),
+        };
+    }
 
     let mut missed = None;
     for field in candidates {

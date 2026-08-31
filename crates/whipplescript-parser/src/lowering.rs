@@ -125,6 +125,7 @@ pub(crate) fn lower_program(
         rules: Vec::new(),
         rule_dependencies: Vec::new(),
         measures: Vec::new(),
+        measure_declarations: Vec::new(),
     };
     let workflow_tag_target = ir.workflow.clone();
     lower_source_tags(
@@ -172,6 +173,13 @@ pub(crate) fn lower_program(
     for item in program.items {
         match item {
             Item::Include(include) => lower_include(include, &mut ir),
+            Item::Measure(measure) => ir.measure_declarations.push(IrMeasureDeclaration {
+                class: measure.class.name,
+                field: measure.field.name,
+                rising: measure.rising,
+                bound: measure.bound,
+                span: measure.span,
+            }),
             Item::WorkflowContract(contract) => lower_workflow_contract(
                 contract,
                 &mut ir,
@@ -427,8 +435,9 @@ pub(crate) fn lower_program(
 
     validate_streams(&ir, &mut diagnostics);
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
-    let measures = validate_effectful_rule_recursion(&ir, &mut diagnostics);
+    let (measures, cycle_classes) = validate_effectful_rule_recursion(&ir, &mut diagnostics);
     ir.measures = measures;
+    validate_measure_declarations(&ir, &cycle_classes, &mut diagnostics, &mut warnings);
     validate_turn_access_grant_file_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_memory_operations(&ir, &mut diagnostics);
     validate_turn_access_grant_credential_kinds(&ir, &mut diagnostics);

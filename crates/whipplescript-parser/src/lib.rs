@@ -204,6 +204,7 @@ pub enum Item {
     Lease(LeaseDecl),
     Ledger(LedgerDecl),
     Counter(CounterDecl),
+    Measure(MeasureDecl),
     Class(ClassDecl),
     Table(TableDecl),
     Coerce(CoerceDecl),
@@ -216,6 +217,7 @@ impl Item {
     fn span(&self) -> SourceSpan {
         match self {
             Self::Include(decl) => decl.path.span,
+            Self::Measure(decl) => decl.span,
             Self::Use(decl) => decl.name.span,
             Self::Pattern(decl) => decl.span,
             Self::Apply(decl) => decl.span,
@@ -684,6 +686,31 @@ pub struct LedgerDecl {
     pub retain_seconds: u64,
     pub shared: bool,
     pub span: SourceSpan,
+}
+
+/// `measure <Class>.<field> up to <bound>` (DR-0081 §6): the author states the
+/// measure a cycle carrying `<Class>` turns on, and the compiler VERIFIES it
+/// rather than trusting it.
+///
+/// The inference finds this shape on its own; what the declaration adds is a
+/// name for the intent and a diagnostic that can say which half of the claim the
+/// code stopped honouring, instead of "no measure found". A declaration is never
+/// a way to assert a measure the compiler cannot check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MeasureDecl {
+    pub class: Ident,
+    pub field: Ident,
+    /// `up to` — the field rises toward the bound; `down to` — it falls.
+    pub rising: bool,
+    pub bound: MeasureDeclBound,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MeasureDeclBound {
+    Literal(i64),
+    /// A field of the same class that the ring must never change.
+    Field(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1321,12 +1348,24 @@ pub struct IrProgram {
     pub assertions: Vec<IrAssertion>,
     pub rules: Vec<IrRule>,
     pub rule_dependencies: Vec<IrRuleDependency>,
+    /// The `measure` declarations the program states (DR-0081 §6). Verified, not
+    /// trusted: each one must hold of a cycle that carries its class.
+    pub measure_declarations: Vec<IrMeasureDeclaration>,
     /// The termination measures proven over effect-bearing cycles (DR-0081 §6).
     /// Published rather than kept private: acceptance under a proof should be
     /// visible evidence, and a proof lost to an innocuous edit — `+ 1` becoming
     /// `+ step` — then shows up as a disappearing line in a diff instead of as a
     /// refusal nobody can explain later.
     pub measures: Vec<IrMeasure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrMeasureDeclaration {
+    pub class: String,
+    pub field: String,
+    pub rising: bool,
+    pub bound: MeasureDeclBound,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6538,6 +6577,13 @@ fn expand_pattern_item(
             Item::Include(include),
         )),
         Item::Use(use_decl) => Some((format!("use:{}", use_decl.name.value), Item::Use(use_decl))),
+        // A measure names a class and a field, both of which a pattern may
+        // substitute; expansion carries it through unchanged and the
+        // declaration is keyed by what it measures.
+        Item::Measure(measure) => Some((
+            format!("measure:{}.{}", measure.class.name, measure.field.name),
+            Item::Measure(measure),
+        )),
         Item::Tracker(queue) => {
             Some((format!("tracker:{}", queue.name.name), Item::Tracker(queue)))
         }
@@ -9115,6 +9161,136 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
     }
 }
 
+/// A `measure` declaration must name something real and measurable, and must
+/// govern a cycle (DR-0081 §6).
+///
+/// The declaration is verified, never trusted, so these are the checks that make
+/// verification possible at all: a class that exists, a field on it, and a whole
+/// number to descend over. The last check is the one that keeps the declaration
+/// honest over time — a claim that governs no cycle is intent the code no longer
+/// has, and it warns rather than sitting there reading like a guarantee.
+fn validate_measure_declarations(
+    ir: &IrProgram,
+    cycle_classes: &BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let classes = ir
+        .schemas
+        .iter()
+        .filter_map(|schema| match schema {
+            IrSchema::Class(class) => Some((class.name.as_str(), class)),
+            IrSchema::Enum(_) => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for declaration in &ir.measure_declarations {
+        let Some(class) = classes.get(declaration.class.as_str()) else {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.unknown_reference"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: declaration.span,
+                message: format!("`measure` names unknown class `{}`", declaration.class),
+                suggestion: Some(format!(
+                    "declare `class {}` before measuring a field of it",
+                    declaration.class
+                )),
+            });
+            continue;
+        };
+        let int_field = |name: &str| {
+            class.fields.iter().any(|field| {
+                field.name == name && matches!(field.ty, IrType::Primitive(IrPrimitiveType::Int))
+            })
+        };
+        let has_field = |name: &str| class.fields.iter().any(|field| field.name == name);
+        if !has_field(&declaration.field) {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.unknown_reference"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: declaration.span,
+                message: format!(
+                    "`measure` names field `{}`, which class `{}` does not declare",
+                    declaration.field, declaration.class
+                ),
+                suggestion: Some("measure a field the class carries around the cycle".to_owned()),
+            });
+            continue;
+        }
+        if !int_field(&declaration.field) {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_measure_field"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: declaration.span,
+                message: format!(
+                    "`measure` names field `{}.{}`, which is not an `int`",
+                    declaration.class, declaration.field
+                ),
+                suggestion: Some(
+                    "a measure descends over whole numbers: a `float` field can approach a bound forever without reaching it, and `duration` has no literal in the expression grammar yet"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        }
+        if let MeasureDeclBound::Field(bound) = &declaration.bound {
+            if !int_field(bound) {
+                diagnostics.push(Diagnostic {
+                code: diagnostic_code!("type.invalid_measure_field"),
+                severity: Severity::Error,
+                    related: Vec::new(),
+                    span: declaration.span,
+                    message: format!(
+                        "`measure` bound `{}.{bound}` is not an `int` field of the class",
+                        declaration.class
+                    ),
+                    suggestion: Some(
+                        "the bound travels with the fact, so it must be a whole-number field the class declares"
+                            .to_owned(),
+                    ),
+                });
+                continue;
+            }
+        }
+        if !seen.insert((declaration.class.as_str(), declaration.field.as_str())) {
+            diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.duplicate_declaration"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: declaration.span,
+                message: format!(
+                    "`measure {}.{}` is declared more than once",
+                    declaration.class, declaration.field
+                ),
+                suggestion: Some(
+                    "one measure per class field; two claims about the same field cannot both govern its cycle"
+                        .to_owned(),
+                ),
+            });
+            continue;
+        }
+        if !cycle_classes.contains(&declaration.class) {
+            warnings.push(Diagnostic {
+                code: diagnostic_code!("construct.dead_measure"),
+                severity: Severity::Warning,
+                related: Vec::new(),
+                span: declaration.span,
+                message: format!(
+                    "`measure {}.{}` governs no cycle",
+                    declaration.class, declaration.field
+                ),
+                suggestion: Some(
+                    "no effect-bearing cycle carries this class, so the declaration states nothing the compiler can check — remove it, or keep it if the cycle is coming"
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+}
+
 /// Reject an effect-bearing rule cycle that turns without waiting on the world
 /// (`graph.unbounded_effect_recursion`), and any effect-bearing cycle at all in
 /// a workflow that declares itself `@bounded` (`graph.bounded_workflow_effect_cycle`).
@@ -9170,11 +9346,12 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
 fn validate_effectful_rule_recursion(
     ir: &IrProgram,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<IrMeasure> {
+) -> (Vec<IrMeasure>, BTreeSet<String>) {
     let mut measures = Vec::new();
+    let mut cycle_classes = BTreeSet::new();
     let rules = &ir.rules;
     if rules.len() < 2 {
-        return measures;
+        return (measures, cycle_classes);
     }
     let index_of = rules
         .iter()
@@ -9233,6 +9410,116 @@ fn validate_effectful_rule_recursion(
         adjacency.entry(producer).or_default().insert(consumer);
         reaches[producer][consumer] = true;
     }
+
+    // DR-0081 §6: a measure is information about the program, not only about a
+    // refusal, so it is computed over EVERY cycle — including the paced ones no
+    // refusal would ever look at. Publishing only what a refusal happened to
+    // need would leave the common shape (a ring behind an `after`) with no
+    // measure printed and a `measure` declaration over it reading as governing
+    // nothing.
+    let mut every_reaches = vec![vec![false; rules.len()]; rules.len()];
+    let mut every_adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for dependency in &ir.rule_dependencies {
+        let (Some(producer), Some(consumer)) = (
+            index_of.get(dependency.producer.as_str()),
+            index_of.get(dependency.consumer.as_str()),
+        ) else {
+            continue;
+        };
+        every_reaches[*producer][*consumer] = true;
+        every_adjacency
+            .entry(*producer)
+            .or_default()
+            .insert(*consumer);
+    }
+    for via in 0..rules.len() {
+        for from in 0..rules.len() {
+            if !every_reaches[from][via] {
+                continue;
+            }
+            let through = every_reaches[via].clone();
+            for (to, reachable) in through.into_iter().enumerate() {
+                if reachable {
+                    every_reaches[from][to] = true;
+                }
+            }
+        }
+    }
+    // The report pass. Pacing decides whether a cycle is REFUSED; a measure says
+    // whether it ENDS, and those are different questions, so the measure is
+    // computed over every cycle including the paced ones no refusal looks at.
+    // A `measure` declaration over a paced ring is how an author asks to be held
+    // to termination that pacing alone never promised — so an unmet declaration
+    // is an error even where the cycle would otherwise be legal.
+    let mut measured = vec![false; rules.len()];
+    for start in 0..rules.len() {
+        if measured[start] {
+            continue;
+        }
+        let component = (0..rules.len())
+            .filter(|&other| {
+                other == start || (every_reaches[start][other] && every_reaches[other][start])
+            })
+            .collect::<Vec<_>>();
+        if component.len() < 2 && !every_reaches[start][start] {
+            continue;
+        }
+        for &member in &component {
+            measured[member] = true;
+            for read in &rules[member].metadata.fact_reads {
+                if let Some(schema) = read.strip_prefix("schema:") {
+                    cycle_classes.insert(schema.to_owned());
+                }
+            }
+        }
+        let declared =
+            ir.measure_declarations.iter().find(|declaration| {
+                component.iter().any(|member| {
+                    rules[*member].metadata.fact_reads.iter().any(|read| {
+                        read.strip_prefix("schema:") == Some(declaration.class.as_str())
+                    })
+                })
+            });
+        let binding = measure::measure_binding(ir, &component).unwrap_or_default();
+        // The round trip, named the way the refusal names one, so a measure and
+        // the cycle it governs read alike.
+        let names = shortest_rule_cycle(&every_adjacency, rules, component[0], &component)
+            .unwrap_or_else(|| {
+                component
+                    .iter()
+                    .map(|member| rules[*member].name.clone())
+                    .collect::<Vec<_>>()
+            });
+        match measure::prove_cycle_measure(ir, &component) {
+            measure::MeasureOutcome::Proven(proven) => measures.push(IrMeasure {
+                cycle: names,
+                rendering: proven.to_snapshot(&binding),
+            }),
+            measure::MeasureOutcome::Missed(measure::MeasureMiss::DeclarationUnmet {
+                class,
+                field,
+                reason,
+            }) => diagnostics.push(Diagnostic {
+                code: diagnostic_code!("graph.declared_measure_unmet"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span: declared.map(|declaration| declaration.span).unwrap_or(SourceSpan {
+                    start: 0,
+                    end: 0,
+                }),
+                message: format!(
+                    "declared measure is not honoured: `measure {class}.{field}` states that the cycle {} ends, and {reason}",
+                    names.join(" -> ")
+                ),
+                suggestion: Some(
+                    "a `measure` declaration is verified, not taken: bring the code back to the claim, correct the claim, or remove it"
+                        .to_owned(),
+                ),
+            }),
+            _ => {}
+        }
+    }
+
     // Transitive closure. A rule set is small enough that the plain cubic form
     // is both fast enough and the version a reader can check by eye.
     for via in 0..rules.len() {
@@ -9272,6 +9559,15 @@ fn validate_effectful_rule_recursion(
         for &member in &component {
             reported[member] = true;
         }
+        // Which classes a cycle actually carries, so a `measure` declaration
+        // that governs none of them can be reported as the dead intent it is.
+        for &member in &component {
+            for read in &rules[member].metadata.fact_reads {
+                if let Some(schema) = read.strip_prefix("schema:") {
+                    cycle_classes.insert(schema.to_owned());
+                }
+            }
+        }
         if component
             .iter()
             .any(|&member| external(&rules[member].name))
@@ -9300,15 +9596,21 @@ fn validate_effectful_rule_recursion(
         match measure::prove_cycle_measure(ir, &component) {
             measure::MeasureOutcome::Proven(proven) => {
                 if !tool_workflow || proven.step_bounded {
-                    measures.push(IrMeasure {
-                        cycle: cycle.clone(),
-                        rendering: proven.to_snapshot(&binding),
-                    });
+                    // Published by the report pass above, which sees every cycle.
                     continue;
                 }
                 nearest_miss = Some(format!(
                     "the cycle is well-founded — {} — but a `@tool` workflow needs a step bound, because its caller blocks for as many agent turns as the data says",
                     proven.describe(&binding)
+                ));
+            }
+            measure::MeasureOutcome::Missed(measure::MeasureMiss::DeclarationUnmet {
+                class,
+                field,
+                reason,
+            }) => {
+                nearest_miss = Some(format!(
+                    "`measure {class}.{field}` states this cycle terminates, and it does not: {reason}"
                 ));
             }
             measure::MeasureOutcome::Missed(measure::MeasureMiss::Unbounded { field, step }) => {
@@ -9377,7 +9679,7 @@ fn validate_effectful_rule_recursion(
             });
         }
     }
-    measures
+    (measures, cycle_classes)
 }
 
 /// The shortest produce/consume round trip from `start` back to `start`, staying
