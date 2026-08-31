@@ -1954,79 +1954,90 @@ pub fn analyze_issue_dag(events: &[IssueEvent]) -> IssueConflicts {
     heads.dedup();
     let state_token = sha256_hex(&heads.join("\n"));
 
-    // Transitive-ancestor test over the parent map.
-    let parents: HashMap<&str, &[String]> = events
+    // Which event sets which field. Each event sets at most one, and the
+    // lifecycle events are ALSO status setters — including them means a
+    // `finish` (close) concurrent with a `set status open` on another clone is
+    // detected as a conflict, instead of silently folding to an order-dependent
+    // status and being handed to a worker.
+    let index: HashMap<&str, usize> = events
         .iter()
-        .map(|e| (e.event_id.as_str(), e.parents.as_slice()))
+        .enumerate()
+        .filter(|(_, e)| !e.event_id.is_empty())
+        .map(|(i, e)| (e.event_id.as_str(), i))
         .collect();
-    let is_ancestor = |ancestor: &str, of: &str| -> bool {
-        let mut stack: Vec<&str> = parents
-            .get(of)
-            .map(|ps| ps.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        let mut seen: HashSet<&str> = HashSet::new();
-        while let Some(x) = stack.pop() {
-            if x == ancestor {
-                return true;
+    let sets: Vec<Option<(String, String)>> = events
+        .iter()
+        .map(|e| {
+            if e.event_id.is_empty() {
+                return None;
             }
-            if !seen.insert(x) {
-                continue;
-            }
-            if let Some(ps) = parents.get(x) {
-                stack.extend(ps.iter().map(String::as_str));
-            }
-        }
-        false
-    };
-
-    // Group the field-setting events by field. The lifecycle events
-    // (`issue.closed`/`issue.canceled`/`issue.reopened`) are ALSO status
-    // setters — including them means a `finish` (close) concurrent with a
-    // `set status open` on another clone is detected as a conflict, instead of
-    // silently folding to an order-dependent status and being handed to a worker.
-    let mut setters: BTreeMap<String, Vec<(&str, String)>> = BTreeMap::new();
-    for e in events {
-        if e.event_id.is_empty() {
-            continue;
-        }
-        let (field, value) = match e.kind.as_str() {
-            "issue.field_set" => {
-                let (Some(field), Some(value)) = (
+            match e.kind.as_str() {
+                "issue.field_set" => match (
                     e.payload.get("field").and_then(Value::as_str),
                     e.payload.get("value").and_then(Value::as_str),
-                ) else {
-                    continue;
-                };
-                (field.to_owned(), value.to_owned())
+                ) {
+                    (Some(field), Some(value)) => Some((field.to_owned(), value.to_owned())),
+                    _ => None,
+                },
+                "issue.closed" => Some(("status".to_owned(), "closed".to_owned())),
+                "issue.canceled" => Some(("status".to_owned(), "canceled".to_owned())),
+                "issue.reopened" => Some(("status".to_owned(), "open".to_owned())),
+                _ => None,
             }
-            "issue.closed" => ("status".to_owned(), "closed".to_owned()),
-            "issue.canceled" => ("status".to_owned(), "canceled".to_owned()),
-            "issue.reopened" => ("status".to_owned(), "open".to_owned()),
-            _ => continue,
-        };
-        setters
-            .entry(field)
-            .or_default()
-            .push((e.event_id.as_str(), value));
-    }
+        })
+        .collect();
 
-    let mut field_conflicts = Vec::new();
-    for (field, ss) in &setters {
-        let values: BTreeSet<String> = ss
-            .iter()
-            .filter(|(id, _)| {
-                !ss.iter()
-                    .any(|(other, _)| other != id && is_ancestor(id, other))
-            })
-            .map(|(_, val)| val.clone())
-            .collect();
-        if values.len() > 1 {
-            field_conflicts.push(FieldConflict {
-                field: field.clone(),
-                values: values.into_iter().collect(),
-            });
+    // A setter counts only if NO strict descendant sets the same field — the
+    // bef-maximal test. Computed once by propagating "a descendant sets this
+    // field" up the DAG in reverse topological order, rather than by asking
+    // `is_ancestor` for every PAIR of a field's setters and re-walking the
+    // ancestor set on each ask. That pairwise form was O(n^3) in an issue's
+    // event count (measured at exponent 3.06 over four doublings, 944 ms for one
+    // 400-event issue) on a path `set_field_checked` takes twice per guarded
+    // set. This is linear in events times the handful of distinct fields, and
+    // `topological_event_order` is content-derived, so the traversal order is
+    // identical on every clone.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); events.len()];
+    for (i, event) in events.iter().enumerate() {
+        for parent in &event.parents {
+            if let Some(&pi) = index.get(parent.as_str()) {
+                children[pi].push(i);
+            }
         }
     }
+    let mut covered: Vec<BTreeSet<&str>> = vec![BTreeSet::new(); events.len()];
+    let mut order = topological_event_order(events, |e| e.event_id.as_str(), |e| &e.parents);
+    order.reverse();
+    for &node in &order {
+        let mut below: BTreeSet<&str> = BTreeSet::new();
+        for &child in &children[node] {
+            below.extend(covered[child].iter().copied());
+            if let Some((field, _)) = &sets[child] {
+                below.insert(field.as_str());
+            }
+        }
+        covered[node] = below;
+    }
+
+    let mut maximal: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (i, set) in sets.iter().enumerate() {
+        let Some((field, value)) = set else { continue };
+        if covered[i].contains(field.as_str()) {
+            continue;
+        }
+        maximal
+            .entry(field.as_str())
+            .or_default()
+            .insert(value.clone());
+    }
+    let field_conflicts = maximal
+        .into_iter()
+        .filter(|(_, values)| values.len() > 1)
+        .map(|(field, values)| FieldConflict {
+            field: field.to_owned(),
+            values: values.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
 
     IssueConflicts {
         heads,
