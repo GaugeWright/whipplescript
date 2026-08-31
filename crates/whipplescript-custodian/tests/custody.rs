@@ -1092,3 +1092,77 @@ fn r3_refuses_a_derivation_chain_rather_than_ignoring_it() {
         "the refusal must name what it cannot do: {detail}"
     );
 }
+
+/// `Register` takes material whip already holds into custody (DR-0053 §15
+/// Amendment). The producer that makes `secret<kind>` stop being inert.
+///
+/// It does not breach §2, and the reason is the point: whip holds plaintext for
+/// one admission because the PASTE already put it there. Registration restores
+/// the invariant rather than preserving it — exposure narrows from
+/// indefinitely-as-a-string to one-admission-then-a-handle.
+#[test]
+fn register_takes_ingressed_material_into_custody_and_returns_a_handle() {
+    let custodian = custodian_with(&[]);
+    let target = name("ingress/vendor-key");
+
+    let reply = custodian.handle(&call(CustodyOp::Register {
+        credential: target.clone(),
+        kind: CredentialKind::HmacSha256,
+        material_b64: B64.encode(b"pasted-webhook-secret"),
+    }));
+    let CustodyReply {
+        outcome: Ok(CustodyOk::Registered { credential }),
+        ..
+    } = reply
+    else {
+        panic!("register must succeed: {reply:?}");
+    };
+    assert_eq!(credential, target);
+
+    // The reply is a handle and nothing else. Showing the material arrived
+    // means USING it, which is also the property worth proving.
+    let signed = custodian.handle(&call(CustodyOp::Sign {
+        credential: target,
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"webhook-body"),
+    }));
+    assert!(
+        matches!(signed.outcome, Ok(CustodyOk::Signed { .. })),
+        "registered material must be usable: {signed:?}"
+    );
+}
+
+/// Registering onto a live name would replace a credential with material a
+/// third party supplied — worse than the generate collision, and refused for
+/// the same reason: `Store::register` is an upsert, right for an operator and
+/// wrong for a name arriving from a running program.
+#[test]
+fn register_refuses_to_overwrite_an_existing_credential() {
+    let custodian = custodian_with(&[("live/key", CredentialKind::HmacSha256, b"original")]);
+    let reply = custodian.handle(&call(CustodyOp::Register {
+        credential: name("live/key"),
+        kind: CredentialKind::HmacSha256,
+        material_b64: B64.encode(b"attacker-supplied"),
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("an existing name must not be overwritten: {reply:?}");
+    };
+    assert!(detail.contains("already exists"), "{detail}");
+}
+
+/// Empty material is refused: a handle to nothing would sign and verify as
+/// though it meant something.
+#[test]
+fn register_refuses_material_that_is_not_there() {
+    let custodian = custodian_with(&[]);
+    let reply = custodian.handle(&call(CustodyOp::Register {
+        credential: name("ingress/empty"),
+        kind: CredentialKind::HmacSha256,
+        material_b64: String::new(),
+    }));
+    let Err(CustodyError::Backend { detail }) = &reply.outcome else {
+        panic!("empty material must refuse: {reply:?}");
+    };
+    assert!(detail.contains("no material"), "{detail}");
+}

@@ -275,6 +275,9 @@ impl Custodian {
                 credential: _,
                 kind,
             } => return self.op_generate(&name, *kind),
+            CustodyOp::Register {
+                kind, material_b64, ..
+            } => return self.op_register(&name, *kind, material_b64),
             CustodyOp::Revoke { .. } => return self.op_revoke(&name),
             // `Rotate` deliberately does NOT return here. It needs an entry
             // that exists and is not revoked — exactly the two admissions
@@ -382,7 +385,7 @@ impl Custodian {
             // so a future container op is a compile error here, and
             // `unreachable!` rather than an `Err` because an error nothing can
             // produce is a refusal nothing gates.
-            CustodyOp::Generate { .. } | CustodyOp::Revoke { .. } => {
+            CustodyOp::Generate { .. } | CustodyOp::Register { .. } | CustodyOp::Revoke { .. } => {
                 unreachable!("generate and revoke return before member admission")
             }
             CustodyOp::Mint {
@@ -616,6 +619,49 @@ impl Custodian {
         Ok(CustodyOk::Generated {
             credential: name.clone(),
             kind,
+        })
+    }
+
+    /// Take material whip already holds into custody (DR-0053 §15 Amendment).
+    ///
+    /// Refuses an existing name for the same reason `generate` does:
+    /// `Store::register` is an upsert, which is right for an operator driving
+    /// the admin surface and wrong for a name arriving from a running program.
+    /// Silently replacing a live credential with an ingressed one would be
+    /// worse here than for generate, because the replacement is material a
+    /// third party supplied.
+    ///
+    /// Empty material is refused. A registration that took custody of nothing
+    /// would hand back a handle that signs and verifies as though it meant
+    /// something.
+    fn op_register(
+        &self,
+        name: &CredentialName,
+        kind: CredentialKind,
+        material_b64: &str,
+    ) -> Result<CustodyOk, CustodyError> {
+        let material = Zeroizing::new(decode_b64(material_b64)?);
+        if material.is_empty() {
+            return Err(CustodyError::Backend {
+                detail: format!(
+                    "credential {name} was registered with no material: a handle to nothing \
+                     would sign and verify as though it meant something"
+                ),
+            });
+        }
+        let mut store = lock(&self.store);
+        if store.get(name).is_some() {
+            return Err(CustodyError::Backend {
+                detail: format!("credential {name} already exists"),
+            });
+        }
+        store
+            .register(name.clone(), kind, material, None)
+            .map_err(|e| CustodyError::Backend {
+                detail: e.to_string(),
+            })?;
+        Ok(CustodyOk::Registered {
+            credential: name.clone(),
         })
     }
 

@@ -352,7 +352,9 @@ impl CredentialKind {
             // holds. Returning false is what keeps them out of `allow` lists,
             // where they would be a category error — the vault grants are where
             // they belong (DR-0053 §14 Amendment).
-            Operation::Generate | Operation::Rotate | Operation::Revoke => false,
+            Operation::Generate | Operation::Rotate | Operation::Register | Operation::Revoke => {
+                false
+            }
         }
     }
 }
@@ -458,6 +460,9 @@ pub enum Operation {
     /// operation like `Generate` and `Revoke`: it acts on the entry's identity
     /// rather than exercising the key, so no kind is consulted.
     Rotate,
+    /// Take material whip already holds into custody. A container operation:
+    /// it creates an entry rather than exercising one, so no kind is consulted.
+    Register,
     Revoke,
 }
 
@@ -478,8 +483,12 @@ impl Operation {
     ];
 
     /// The CONTAINER operations, which act on a vault rather than a member.
-    pub const CONTAINER: [Operation; 3] =
-        [Operation::Generate, Operation::Rotate, Operation::Revoke];
+    pub const CONTAINER: [Operation; 4] = [
+        Operation::Generate,
+        Operation::Rotate,
+        Operation::Register,
+        Operation::Revoke,
+    ];
 
     /// Whether this operation acts on a container rather than an existing
     /// credential. Container operations skip kind admission entirely: there is
@@ -500,6 +509,7 @@ impl Operation {
             Operation::Mint => "mint",
             Operation::Generate => "generate",
             Operation::Rotate => "rotate",
+            Operation::Register => "register",
             Operation::Revoke => "revoke",
         }
     }
@@ -515,6 +525,7 @@ impl Operation {
             "mint" => Ok(Operation::Mint),
             "generate" => Ok(Operation::Generate),
             "rotate" => Ok(Operation::Rotate),
+            "register" => Ok(Operation::Register),
             "revoke" => Ok(Operation::Revoke),
             other => Err(format!("unknown custody operation {other:?}")),
         }
@@ -534,7 +545,7 @@ impl Operation {
             }
             // Container grants are named bare on the vault; a glob on one is a
             // check error, exactly as for the non-narrowable member class.
-            Operation::Generate | Operation::Rotate | Operation::Revoke => {
+            Operation::Generate | Operation::Rotate | Operation::Register | Operation::Revoke => {
                 GrantClass::NonNarrowable
             }
         }
@@ -828,6 +839,25 @@ pub enum CustodyOp {
     /// — deliver, verify consumers, cut over, revoke the predecessor — stays
     /// the workflow's, which is what makes rotation resumable and dry-runnable.
     Rotate { credential: CredentialName },
+    /// Take material whip already holds into custody, returning a handle
+    /// (DR-0053 §15 Amendment 2026-08-29).
+    ///
+    /// The producer that makes `secret<kind>` stop being inert: a key pasted
+    /// into a tracker item or an inbound message IS a value, and nothing in the
+    /// design helps until something moves it.
+    ///
+    /// **This does not breach §2, and the reason matters.** Registering means
+    /// whip holds plaintext for the length of one admission — but the paste
+    /// already put it there, in an HTTP body whip parsed. Registration RESTORES
+    /// the invariant rather than preserving it: exposure narrows from
+    /// indefinitely, as a string flowing through prompts, facts and logs, to
+    /// one admission and then a handle. This is the boundary at which
+    /// unmanaged material becomes managed.
+    Register {
+        credential: CredentialName,
+        kind: CredentialKind,
+        material_b64: String,
+    },
     /// End a credential. Not new capability — `register`/`revoke` have been on
     /// the custodian's admin surface since the split, gated by the store
     /// passphrase. What this moves is the gate: from passphrase to governance.
@@ -926,6 +956,7 @@ impl CustodyOp {
     pub fn operation(&self) -> Operation {
         match self {
             CustodyOp::Generate { .. } => Operation::Generate,
+            CustodyOp::Register { .. } => Operation::Register,
             CustodyOp::Rotate { .. } => Operation::Rotate,
             CustodyOp::Revoke { .. } => Operation::Revoke,
             CustodyOp::Request { .. } => Operation::Request,
@@ -948,6 +979,7 @@ impl CustodyOp {
             | CustodyOp::Unwrap { credential, .. }
             | CustodyOp::Mint { credential, .. }
             | CustodyOp::Generate { credential, .. }
+            | CustodyOp::Register { credential, .. }
             | CustodyOp::Rotate { credential }
             | CustodyOp::Revoke { credential } => credential,
         }
@@ -1012,6 +1044,12 @@ pub enum CustodyOk {
     Rotated {
         credential: CredentialName,
         version: u32,
+    },
+    /// The handle for material now in custody. No echo of what was registered:
+    /// the caller supplied it, and repeating it would put the very thing this
+    /// operation exists to move back into a reply that gets logged.
+    Registered {
+        credential: CredentialName,
     },
     /// Whether the revocation changed anything. `false` is a SUCCESSFUL call
     /// whose answer is "there was nothing to revoke" — the same shape
