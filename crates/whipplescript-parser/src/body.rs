@@ -1666,6 +1666,61 @@ impl<'a> BodyParser<'a> {
         }
     }
 
+    /// A credential handle at a use site: `stripe_api`, or a vault member
+    /// written `deploy_keys["ci-2026-08"]`.
+    ///
+    /// The member is a STRING rather than a bare word because a
+    /// `CredentialName` segment admits `-` and digits, which do not lex as an
+    /// identifier — `ci-2026-08` is three tokens and a subtraction. Spelling
+    /// the container as an identifier and the member as a literal keeps the
+    /// slot lexing like every other slot in the language, with no mode that a
+    /// reader has to know about.
+    ///
+    /// The runtime name is the join, `deploy_keys/ci-2026-08`, which is what
+    /// governance, the store and the custodian all say. The mapping is total
+    /// and mechanical — container plus one segment — so the two spellings
+    /// cannot come apart the way a declaration beside a use can (§5's reason
+    /// for refusing a `with credential` modifier).
+    fn credential_handle_text(&mut self, what: &str) -> Option<String> {
+        let container = self.ident_text(what)?;
+        if !matches!(self.peek().map(|t| t.tok.clone()), Some(Tok::Sym('['))) {
+            return Some(container);
+        }
+        self.pos += 1;
+        let Some(Tok::Str(member)) = self.peek().map(|t| t.tok.clone()) else {
+            let span = self.span_here();
+            self.error(
+                diagnostic_code!("parse.unexpected_token"),
+                span,
+                "expected a quoted vault member after `[`",
+                Some("write `deploy_keys[\"ci-2026-08\"]`".to_owned()),
+            );
+            return None;
+        };
+        self.pos += 1;
+        if !matches!(self.peek().map(|t| t.tok.clone()), Some(Tok::Sym(']'))) {
+            let span = self.span_here();
+            self.error(
+                diagnostic_code!("parse.unclosed_delimiter"),
+                span,
+                "expected `]` after the vault member",
+                None,
+            );
+            return None;
+        }
+        self.pos += 1;
+        let joined = format!("{container}/{member}");
+        // Validated HERE, against the same constructor the custodian uses, so a
+        // member that could never name a credential is refused where the author
+        // wrote it rather than at egress with the run already under way.
+        if let Err(reason) = whipplescript_custody::CredentialName::new(&joined) {
+            let span = self.span_here();
+            self.error(diagnostic_code!("parse.invalid_name"), span, reason, None);
+            return None;
+        }
+        Some(joined)
+    }
+
     /// Skip to a safe resync point after an error: the next statement keyword
     /// at the current depth or a closing brace.
     fn recover(&mut self) {
@@ -2777,8 +2832,9 @@ impl<'a> BodyParser<'a> {
                             let presentation =
                                 CredentialPresentation::parse(&word).expect("guarded by the match");
                             self.pos += 1;
-                            let handle =
-                                self.ident_text("credential handle after the presentation")?;
+                            let handle = self.credential_handle_text(
+                                "credential handle after the presentation",
+                            )?;
                             RequestHeaderValue::Credential {
                                 presentation,
                                 handle,
@@ -2978,8 +3034,9 @@ impl<'a> BodyParser<'a> {
                                 let presentation = CredentialPresentation::parse(&word)
                                     .expect("guarded by the match");
                                 self.pos += 1;
-                                let handle =
-                                    self.ident_text("credential handle after the presentation")?;
+                                let handle = self.credential_handle_text(
+                                    "credential handle after the presentation",
+                                )?;
                                 RequestHeaderValue::Credential {
                                     presentation,
                                     handle,
@@ -3036,7 +3093,7 @@ impl<'a> BodyParser<'a> {
                 );
                 return None;
             }
-            Some(self.ident_text("credential handle after `signed with`")?)
+            Some(self.credential_handle_text("credential handle after `signed with`")?)
         } else {
             None
         };
@@ -5997,5 +6054,119 @@ mod tests {
         };
         assert_eq!(record.span.start, 100);
         assert!(record.span.end > 100);
+    }
+}
+
+#[cfg(test)]
+mod vault_member_tests {
+    use super::*;
+
+    fn handle_of(source: &str) -> String {
+        let (ast, diagnostics) = parse_rule_body(source, 0);
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+        for stmt in &ast.statements {
+            if let BodyStmt::Effect(EffectStmt {
+                kind: BodyEffectKind::HttpRequest { headers, .. },
+                ..
+            }) = stmt
+            {
+                for header in headers {
+                    if let RequestHeaderValue::Credential { handle, .. } = &header.value {
+                        return handle.clone();
+                    }
+                }
+            }
+        }
+        panic!("no credential header parsed from {source}")
+    }
+
+    const REQUEST: &str =
+        "request POST \"https://x.test/y\" {\n  header \"Authorization\" bearer HANDLE\n} as r\n";
+
+    #[test]
+    fn a_vault_member_lowers_to_the_name_governance_and_the_store_use() {
+        // The source form is indexed; the runtime name is the join, which is
+        // what `grant sign deploy_keys/ci-2026-08 ...` and the custodian's
+        // store both say.
+        assert_eq!(
+            handle_of(&REQUEST.replace("HANDLE", "deploy_keys[\"ci-2026-08\"]")),
+            "deploy_keys/ci-2026-08"
+        );
+    }
+
+    #[test]
+    fn a_plain_handle_is_unchanged() {
+        // The control: indexing is additive, and a credential that is not a
+        // vault member still parses exactly as it did.
+        assert_eq!(
+            handle_of(&REQUEST.replace("HANDLE", "stripe_api")),
+            "stripe_api"
+        );
+    }
+
+    #[test]
+    fn a_member_that_could_never_name_a_credential_is_refused_where_it_is_written() {
+        // Validated against the custodian's own constructor, so the refusal
+        // arrives at the character the author typed rather than at egress with
+        // the run already under way.
+        let (_, diagnostics) = parse_rule_body(
+            &REQUEST.replace("HANDLE", "deploy_keys[\"Not A Segment\"]"),
+            0,
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid credential name")),
+            "expected a name refusal, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn the_formatter_emits_source_that_parses_again() {
+        // The runtime name carries a `/`, which is not an identifier at a use
+        // site. Printing it raw would make `whip fmt` emit a file that no
+        // longer compiles, so the printer renders the indexed source form and
+        // this asserts the loop closes.
+        let source = REQUEST.replace("HANDLE", "deploy_keys[\"ci-2026-08\"]");
+        let (ast, diagnostics) = parse_rule_body(&source, 0);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut printed = String::new();
+        for statement in &ast.statements {
+            crate::body_print::print_statement_rn(
+                statement,
+                0,
+                &|text: &str| text.to_owned(),
+                &mut printed,
+            );
+        }
+        assert!(
+            printed.contains("bearer deploy_keys[\"ci-2026-08\"]"),
+            "the printer must emit the source form, got:\n{printed}"
+        );
+        assert_eq!(handle_of(&printed), "deploy_keys/ci-2026-08");
+    }
+
+    #[test]
+    fn an_unclosed_index_says_what_was_expected() {
+        let (_, diagnostics) = parse_rule_body(&REQUEST.replace("HANDLE", "deploy_keys[\"ci\""), 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected `]`")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_word_member_is_refused_rather_than_half_parsed() {
+        // `ci-2026-08` is three tokens and a subtraction, which is the whole
+        // reason the member is a string.
+        let (_, diagnostics) = parse_rule_body(&REQUEST.replace("HANDLE", "deploy_keys[ci]"), 0);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("quoted vault member")),
+            "{diagnostics:?}"
+        );
     }
 }

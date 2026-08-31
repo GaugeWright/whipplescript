@@ -4286,6 +4286,24 @@ fn turn_tool_access_from_input(input_json: &str) -> Result<TurnToolAccess, Strin
                         .and_then(|policy| policy.get("kind"))
                         .and_then(Value::as_str);
                     if let (false, Some(kind)) = (vault.is_empty(), kind) {
+                        // A `generate` grant on a kind whose material a third
+                        // party issues can never be honoured: the custodian
+                        // refuses every such call, so the grant is a promise
+                        // the system cannot keep. Refusing it HERE names the
+                        // grant an author can change, while the custodian's
+                        // refusal arrives mid-run and names a call they did not
+                        // write. The two answers come from one predicate in the
+                        // vocabulary crate, so they cannot disagree.
+                        if let Ok(parsed) = whipplescript_custody::CredentialKind::parse(kind) {
+                            if !parsed.is_generatable() {
+                                return Err(format!(
+                                    "access_grants[{grant_index}] grants `generate` on vault \
+                                     `{vault}`, whose kind `{kind}` cannot be generated — its \
+                                     material is issued by a third party, so use \
+                                     `obtain credential` instead"
+                                ));
+                            }
+                        }
                         vaults.grant_create(vault, kind.to_owned());
                     }
                 }
@@ -5359,6 +5377,50 @@ mod tests {
             &[],
         ));
         assert!(!no_read.system_prompt.contains("<available_skills>"));
+    }
+
+    /// A `generate` grant on a vault whose kind a third party issues is a
+    /// promise the system cannot keep, and it is refused where the author can
+    /// act on it.
+    #[test]
+    fn a_generate_grant_on_a_kind_nobody_can_generate_is_refused() {
+        let grant = |kind: &str| {
+            format!(
+                r#"{{"access_grants": [{{"resource": "vault deploy_keys",
+                   "operations": [{{"operation": "generate"}}],
+                   "vault_policy": {{"kind": "{kind}"}}}}]}}"#
+            )
+        };
+
+        // `bearer` is issued TO us: the custodian refuses every generate on it,
+        // so admitting the grant would only move the refusal to run time.
+        let refused = turn_tool_access_from_input(&grant("bearer"))
+            .expect_err("a bearer vault cannot be generated into");
+        assert!(
+            refused.contains("cannot be generated")
+                && refused.contains("obtain credential")
+                && refused.contains("deploy_keys"),
+            "the refusal must name the vault and the way forward: {refused}"
+        );
+
+        // Every non-generatable kind, so a kind added to the enum without a
+        // decision here is caught rather than silently admitted.
+        for kind in ["basic", "aws-sigv4", "jwt-rs256", "mtls-client"] {
+            assert!(
+                turn_tool_access_from_input(&grant(kind)).is_err(),
+                "`{kind}` cannot be generated and its grant must be refused"
+            );
+        }
+
+        // The control: a generatable kind is admitted, so the refusal above is
+        // about the kind rather than about vault grants in general.
+        let admitted = turn_tool_access_from_input(&grant("ed25519"))
+            .expect("an ed25519 vault is generatable");
+        assert_eq!(
+            admitted.vaults.admits_create("deploy_keys"),
+            Ok("ed25519"),
+            "a generatable vault keeps its create grant"
+        );
     }
 
     /// The `credential_generate` handler's refusals. Each is a way the tool can

@@ -5,6 +5,20 @@
 
 use crate::body::{self, BodyEffectKind, BodyStmt, FieldValue, Prompt, RecordStmt, TerminalStmt};
 
+/// Print a credential handle so the result re-parses.
+///
+/// A vault member's runtime name is `deploy_keys/ci-2026-08`, which is what
+/// governance and the custodian say, but `/` is not an identifier at a use site
+/// — the source form is `deploy_keys["ci-2026-08"]`. The formatter has to
+/// render the SOURCE form, or `whip fmt` would emit a file that no longer
+/// compiles.
+fn credential_handle_source(handle: &str) -> String {
+    match handle.split_once('/') {
+        Some((container, member)) => format!("{container}[{member:?}]"),
+        None => handle.to_owned(),
+    }
+}
+
 pub(crate) fn push_stmt_line(out: &mut String, indent: usize, line: &str) {
     for _ in 0..indent {
         out.push_str("  ");
@@ -110,7 +124,11 @@ pub(crate) fn print_effect(
                     body::RequestHeaderValue::Credential {
                         presentation,
                         handle,
-                    } => format!("{} {}", presentation.as_str(), rn(handle)),
+                    } => format!(
+                        "{} {}",
+                        presentation.as_str(),
+                        rn(&credential_handle_source(handle))
+                    ),
                     body::RequestHeaderValue::Expr { source, .. } => rn(source),
                 };
                 lines.push(format!("    header {:?} {value}", header.name));
@@ -125,7 +143,7 @@ pub(crate) fn print_effect(
             };
             let signed = signed_with
                 .as_ref()
-                .map(|handle| format!(" signed with {}", rn(handle)))
+                .map(|handle| format!(" signed with {}", rn(&credential_handle_source(handle))))
                 .unwrap_or_default();
             format!("request {method} {url:?}{block}{signed}")
         }
@@ -144,7 +162,11 @@ pub(crate) fn print_effect(
                     body::RequestHeaderValue::Credential {
                         presentation,
                         handle,
-                    } => format!("{} {}", presentation.as_str(), rn(handle)),
+                    } => format!(
+                        "{} {}",
+                        presentation.as_str(),
+                        rn(&credential_handle_source(handle))
+                    ),
                     body::RequestHeaderValue::Expr { source, .. } => rn(source),
                 };
                 lines.push(format!("    header {:?} {value}", header.name));

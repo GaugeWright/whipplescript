@@ -1200,24 +1200,14 @@ fn hkdf_expand(material: &[u8], info: &[u8]) -> Result<Zeroizing<Vec<u8>>, Custo
 /// but a `basic` credential is a PAIR and the username is not ours to invent,
 /// so generating one would produce a credential that authenticates to nothing.
 fn generatable_key_len(kind: CredentialKind) -> Option<usize> {
-    match kind {
-        // Random bytes, self-contained: both ends are ours.
-        CredentialKind::Raw => Some(32),
-        CredentialKind::HmacSha256 => Some(32),
-        // Ed25519 seeds are 32 bytes; the public half is derived from them and
-        // is what gets handed to a relying party.
-        CredentialKind::Ed25519 => Some(32),
-        CredentialKind::Bearer
-        | CredentialKind::Basic
-        | CredentialKind::AwsSigv4
-        | CredentialKind::JwtRs256
-        // An mTLS client credential is a keypair AND a certificate, and the
-        // certificate is issued by a CA. Generating the keypair alone would
-        // produce something no server accepts, which is the same reason
-        // `bearer` and `aws-sigv4` refuse: the material that makes it mean
-        // anything is a third party's to issue.
-        | CredentialKind::MtlsClient => None,
-    }
+    // WHICH kinds can be generated is `CredentialKind::is_generatable`, in the
+    // vocabulary crate, because the language asks the same question when it
+    // admits a `generate` grant. Only HOW MANY BYTES is decided here: that is
+    // the custodian's business and nothing else needs to know it.
+    //
+    // Ed25519 seeds are 32 bytes and the public half is derived from them;
+    // `raw` and `hmac-sha256` are random bytes with both ends ours.
+    kind.is_generatable().then_some(32)
 }
 
 fn wrapping_key(material: &[u8]) -> Result<LessSafeKey, CustodyError> {

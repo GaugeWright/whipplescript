@@ -262,6 +262,26 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    /// Whether whip can CREATE material of this kind, or whether the material
+    /// that makes it mean anything is a third party's to issue.
+    ///
+    /// This is the vocabulary's answer because two parties need the same one:
+    /// the custodian, which derives its key length from it, and the language,
+    /// which refuses a `generate` grant on a vault whose kind can never be
+    /// generated. Split across the two crates they could disagree, and the
+    /// disagreement would surface as a grant the checker admitted and the
+    /// custodian then refused with the run already under way.
+    ///
+    /// `bearer` is an opaque token a third party issues TO us and `aws-sigv4`'s
+    /// secret comes from IAM, so neither can be conjured; §11's
+    /// `obtain credential` is the path for those. `mtls-client` needs a
+    /// certificate a CA issues, so a keypair alone would be accepted by
+    /// nothing. `basic` is a PAIR whose username is not ours to invent, so a
+    /// generated one would authenticate to nothing.
+    pub fn is_generatable(self) -> bool {
+        matches!(self, Self::Raw | Self::HmacSha256 | Self::Ed25519)
+    }
+
     /// The closed set, in declaration order. `Operation::ALL` has had this
     /// since the protocol landed; the kinds did not, so every site needing to
     /// enumerate them hand-listed all seven — a second table that would drift
