@@ -1,0 +1,74 @@
+# Invalid: a workflow tagged `@private` is invoked from another workflow.
+#
+# The `@private` membrane holds for an `invoke` wherever it sits in the rule: a
+# one-line `record` above it is a statement, not a lid. It used to be read as an
+# open block running to the end of the rule, and `collect_body_statements` —
+# which feeds the invocation membrane, the invoke-cycle graph and every
+# invocation input check — never saw the `invoke` at all. D14,
+# spec/diagnostic-quality-tracker.md.
+#
+# Nothing else about the program is wrong: each workflow declares its own
+# schemas inside its own block, the dispatcher handles both outcomes of the
+# invocation, and with the `@private` tag removed it compiles clean. The sibling
+# `.check-args` names the root deliberately — `whip check` on a rootless
+# two-workflow file falls back to `construct.ambiguous_root_workflow`, so
+# without it a fixture whose refusal had been REMOVED would still exit non-zero
+# and the acceptance guard in scripts/regen-invalid-diagnostics.sh would never
+# fire.
+@private
+workflow InternalReviewer {
+  input request ReviewRequest
+  output result ReviewOutcome
+
+  class ReviewRequest {
+    patchId string
+  }
+
+  class ReviewOutcome {
+    verdict string
+  }
+
+  rule review
+    when ReviewRequest as request
+  => {
+    complete result { verdict request.patchId }
+  }
+}
+
+workflow ReviewDispatcher {
+  input request DispatchRequest
+  output result DispatchOutcome
+  failure error DispatchFailed
+
+  class DispatchRequest {
+    patchId string
+  }
+
+  class DispatchOutcome {
+    verdict string
+  }
+
+  class DispatchFailed {
+    reason string
+  }
+
+  class DispatchProgress {
+    note string
+  }
+
+  rule dispatch
+    when DispatchRequest as request
+  => {
+    record DispatchProgress { note request.patchId }
+
+    invoke InternalReviewer { request { patchId request.patchId } } as review
+
+    after review succeeds as outcome {
+      complete result { verdict outcome.verdict }
+    }
+
+    after review fails as problem {
+      fail error { reason problem.message }
+    }
+  }
+}

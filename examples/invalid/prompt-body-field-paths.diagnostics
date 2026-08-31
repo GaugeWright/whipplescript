@@ -1,0 +1,7 @@
+error[type.unknown_field]: rule `triage` has invalid field path `issue.titel`: schema `Issue` has no field `titel`
+   --> examples/invalid/prompt-body-field-paths.whip:49:12
+   |
+49 |   {{ issue.titel }}
+   |            ^^^^^
+   = note: `Issue` is declared here (examples/invalid/prompt-body-field-paths.whip:26:7)
+   = help: did you mean `title`? otherwise use a field declared on the bound schema or add it to the class declaration

@@ -1,0 +1,6 @@
+error[construct.capability_not_declared]: rule `draft_notes` tells agent `writer` requiring undeclared capability `repo.write`
+   --> examples/invalid/undeclared-capability-after-record.whip:42:3
+   |
+42 |   tell writer requires ["repo.write"] "Draft release notes for {{ change.summary }}." as turn
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: add `repo.write` to agent `writer` capabilities or choose another AgentRef target

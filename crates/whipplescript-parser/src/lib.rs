@@ -8057,24 +8057,32 @@ impl SchemaIndex {
             current = field_ty.clone();
             match schema_name_for_path(&current) {
                 Some(next_schema) => schema = next_schema,
-                // Value equality against the LAST segment, deliberately, and not
-                // the `index + 1 != path.len()` this plainly means. Index
-                // equality refuses strictly more: for `a.b.b`, where a
-                // non-schema intermediate repeats the final segment's name, the
-                // value test reads `field != path.last()` as false and accepts.
-                // That is a refusal hole, and closing it is an ACCEPTANCE change
-                // — a program that compiles today would stop compiling — so it
-                // does not ride along inside a span fix. Recorded as D14 in
-                // spec/diagnostic-quality-tracker.md. The failing segment's
-                // index is carried for the caret either way, which is all a span
-                // change is entitled to move.
-                None if field != path.last().expect("path is non-empty") => {
-                    return Err(FieldPathError::at(
-                        index,
-                        format!("field `{field}` is not a schema value"),
-                    ));
+                None => {
+                    // A value with no fields can only ever END a path, so the
+                    // question is which POSITION this segment holds — not what
+                    // it is called. This was `field != path.last()`, the right
+                    // question asked of the wrong thing: for `a.b.b`, where a
+                    // non-schema intermediate repeats the final segment's name,
+                    // the value test read the intermediate `b` as "the last
+                    // one" and accepted. It then walked on with `schema` never
+                    // advanced, so the tail resolved against the class the path
+                    // had already left — `review.at.inner.at` came back `time`
+                    // off a stale `Review` while the real read was a string, and
+                    // `timer until`, whose whole job is to refuse a non-time
+                    // operand, passed it and queued a durable `timer.wait` whose
+                    // `deadline_at` was the path TEXT. D14,
+                    // spec/diagnostic-quality-tracker.md.
+                    //
+                    // Written as a statement `if` rather than a match guard so
+                    // `scripts/mutation_sweep.py` can falsify it: `neutralise_guard`
+                    // only rewrites a line of the form `if … {`.
+                    if index + 1 != path.len() {
+                        return Err(FieldPathError::at(
+                            index,
+                            format!("field `{field}` is not a schema value"),
+                        ));
+                    }
                 }
-                None => {}
             }
         }
 
@@ -11687,12 +11695,20 @@ fn analyze_rule(
         diagnostics,
     );
     let mut anonymous_effects = 0usize;
-    let mut record_depth = 0i32;
+    let mut record_scan = RecordScan::Outside;
 
     // The last pass over the body text, and the one that overlaps every other:
     // it scans each statement line, so a `record` block, a `case` arm's body and
     // a `case` guard are all walked here a second time.
     let line_scan = diagnostics.len();
+
+    // Which bytes of the body are SOURCE, decided once over the WHOLE text and
+    // then sliced per line — not per line, which cannot work. A line strictly
+    // inside a `"""` prompt body carries no quote character of its own, so
+    // `Do not invent issue.prioirty` (prose) and `{{ issue.prioirty }}` (a
+    // read) are lexically indistinguishable to a scanner that only sees the
+    // line. See `source_scan_text`; D14.
+    let body_scan = source_scan_text(&rule.body.text);
 
     // Offsets, not just text: every diagnostic this loop raises is about a
     // statement, and without knowing where the line starts the only span it
@@ -11703,14 +11719,14 @@ fn analyze_rule(
         if line.is_empty() {
             continue;
         }
-        let statement = BodyAnchor::text(
-            &rule.body,
-            raw_offset + (raw_line.len() - raw_line.trim_start().len()),
-            line,
-        );
+        let line_at = raw_offset + (raw_line.len() - raw_line.trim_start().len());
+        let statement = BodyAnchor::text(&rule.body, line_at, line);
+        // `body_scan` is byte-for-byte as long as the body text, so this is the
+        // masked twin of `line` in `line`'s own coordinates.
+        let line_scan_text = &body_scan[line_at..line_at + line.len()];
 
-        if record_depth > 0 {
-            record_depth += brace_delta(line);
+        if record_scan.inside() {
+            record_scan = record_scan.advance(line);
             continue;
         }
 
@@ -11742,7 +11758,7 @@ fn analyze_rule(
         {
             validate_known_field_paths_scoped(
                 rule,
-                line,
+                line_scan_text,
                 statement,
                 semantic,
                 &binding_types,
@@ -11763,7 +11779,7 @@ fn analyze_rule(
         );
         validate_known_field_paths_scoped(
             rule,
-            line,
+            line_scan_text,
             statement,
             semantic,
             &binding_types,
@@ -11828,8 +11844,11 @@ fn analyze_rule(
             // Both the write and its diagnostics are taken from the parsed body
             // (`validate_recorded_schemas`); this branch keeps only the brace
             // bookkeeping that tells the scanner how far the record's field
-            // block runs.
-            record_depth = brace_delta(line).max(1);
+            // block runs. `RecordScan` answers that from the head line, and for
+            // a one-line `record X { f v }` the answer is "no further" — the
+            // `.max(1)` this replaced said "to the next `}`" and took every
+            // refusal below with it, the block stack included. D14.
+            record_scan = RecordScan::enter(line);
             continue;
         }
 
@@ -13396,7 +13415,9 @@ fn envelope_fields_read_on_payload(
 ) -> Vec<IrEnvelopeFieldOnPayload> {
     let mut fields = BTreeSet::new();
     for text in std::iter::once(body).chain(guard) {
-        for dotted in dotted_paths(text) {
+        // Source-masked: an arm that merely MENTIONS `v.summary` in a prompt
+        // sentence is not reading it (D14).
+        for dotted in source_dotted_paths(text) {
             let (root, path) = dotted.into_pair();
             if root != binding {
                 continue;
@@ -17069,12 +17090,114 @@ fn active_completes_binding_for_case(lines: &[&str], case_index: usize, scrutine
     })
 }
 
+/// How much deeper `line` leaves the block scanner that reads it.
+///
+/// Every block scanner in this file goes through here: the `case` walkers
+/// (`rule_case_branch_sources`, `terminal_case_branch_sources`,
+/// `validate_case_blocks`, `active_completes_binding_for_case`), the block
+/// collectors (`record_blocks`, `workflow_terminal_blocks`), the multi-line
+/// statement joiner (`statement_until_balanced`), and [`RecordScan`].
+///
+/// It used to count every `{` and `}` in the text, string literals included, so
+/// `complete result { note "a } b" }` read as a line that CLOSES a block. Each
+/// of those scanners then ended its block one line early — dropping the arms,
+/// fields or statements below it — or, for a stray `{`, never ended it at all.
+/// This is now one thin call onto the shared counter, which is the same one the
+/// kernel's scanners use; the two crates disagreeing about which braces are
+/// structure was a divergence waiting to be found the hard way. D14,
+/// spec/diagnostic-quality-tracker.md.
+///
+/// One line is all it can see, and two shapes stay outside that: the interior
+/// lines of a `"""` body, which carry no quote of their own, and a `//` comment,
+/// whose braces are not braces. Both were blind here before this change too —
+/// it narrows the counter's blind spot rather than closing it — and both are
+/// measured in D14 rather than assumed harmless.
 fn brace_delta(line: &str) -> i32 {
-    line.chars().fold(0, |depth, ch| match ch {
-        '{' => depth + 1,
-        '}' => depth - 1,
-        _ => depth,
-    })
+    syntax::brace_delta_outside_strings(line)
+}
+
+/// Where a line scanner stands relative to a `record` statement's field block.
+///
+/// Both body scanners — `analyze_rule`'s statement loop and
+/// `collect_body_statements` — must skip a record's FIELD lines, because a field
+/// line looks like a statement (`write "x"`, `emit …`, `call …` all satisfy
+/// `parse_effect_line`, and a field value carrying `{{ binding }}` draws
+/// `effect.output_scope_leak`). Both used to express that as
+/// `record_depth = brace_delta(head).max(1)`, which asserts that a `record` head
+/// line always leaves a block open. It does not:
+///
+/// - `record X { f v }` opens AND closes on its head line (`brace_delta` 0), so
+///   it has no field lines to skip and the NEXT line is the next statement. The
+///   `.max(1)` put both scanners into record mode anyway, and they then skipped
+///   every line up to the next unmatched `}` — in a flat rule body, the rest of
+///   the rule. In `analyze_rule` that silently disabled every refusal the loop
+///   is the only producer of (unknown tell target, undeclared capability,
+///   effect-output scope leak, unknown `done` binding, reserved binding name,
+///   misplaced binding, malformed prompt content type, unresolvable field path),
+///   and the skip also swallowed the `}` that pops the block stack, so an
+///   `after` frame stayed open past its block. In `collect_body_statements` it
+///   took `invoke`, `coerce` and `claim` out of sight, so the `@private`
+///   invocation membrane, the `@service` await refusal, the invoke-cycle graph
+///   and every invocation input check did not run. D14,
+///   spec/diagnostic-quality-tracker.md.
+/// - `record X` with its `{` on the next line leaves the block open but reports
+///   `brace_delta` 0. The `.max(1)` entered record mode at depth 1 and then the
+///   block's own `{` pushed it to 2, so the depth never returned to 0 and the
+///   rest of the rule was swallowed there too.
+///
+/// The head line's brace balance answers the first two cases and the
+/// `AwaitingOpen` state answers the third, so no case needs a floor.
+///
+/// WHICH MAKES THE BALANCE LOAD-BEARING, and it was being read off a counter
+/// that counted braces inside strings. `.max(1)` had been papering over that:
+/// with the floor gone, `record Seen { note "a } b"` — a head whose block IS
+/// open, whose quoted `}` cancels the real `{` — balanced to zero, the scanner
+/// stayed Outside, the record's own field lines were read as statements, and a
+/// valid program was refused. [`brace_delta`] is string-aware now, which is
+/// what this state machine rests on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordScan {
+    /// Not inside a record's field block; the scanner reads statements.
+    Outside,
+    /// A `record` head named its schema but opened no block, so the `{` is on a
+    /// later line and every line up to it belongs to the record.
+    AwaitingOpen,
+    /// Inside a field block, this many brace levels deep.
+    Open(i32),
+}
+
+impl RecordScan {
+    /// The state a `record` head line leaves behind.
+    fn enter(head: &str) -> Self {
+        if head.contains('{') {
+            Self::open(brace_delta(head))
+        } else {
+            Self::AwaitingOpen
+        }
+    }
+
+    /// Advance across a line that belongs to a record's field block.
+    fn advance(self, line: &str) -> Self {
+        match self {
+            Self::Outside => Self::Outside,
+            Self::AwaitingOpen if line.contains('{') => Self::open(brace_delta(line)),
+            Self::AwaitingOpen => Self::AwaitingOpen,
+            Self::Open(depth) => Self::open(depth + brace_delta(line)),
+        }
+    }
+
+    /// Whether the scanner is inside the record rather than reading statements.
+    fn inside(self) -> bool {
+        !matches!(self, Self::Outside)
+    }
+
+    fn open(depth: i32) -> Self {
+        if depth > 0 {
+            Self::Open(depth)
+        } else {
+            Self::Outside
+        }
+    }
 }
 
 fn case_scrutinee(line: &str) -> Option<&str> {
@@ -18017,7 +18140,7 @@ fn collect_body_statements(
     };
     let mut statements = Vec::new();
     let mut index = 0usize;
-    let mut record_depth = 0i32;
+    let mut record_scan = RecordScan::Outside;
     let mut multiline_string = false;
     while index < lines.len() {
         let trimmed = lines[index].trim();
@@ -18032,13 +18155,19 @@ fn collect_body_statements(
             index += 1;
             continue;
         }
-        if record_depth > 0 {
-            record_depth += brace_delta(trimmed);
+        if record_scan.inside() {
+            record_scan = record_scan.advance(trimmed);
             index += 1;
             continue;
         }
         if parse_record_start(trimmed).is_some() {
-            record_depth = brace_delta(trimmed).max(1);
+            // A one-line `record X { f v }` leaves no field block open, so the
+            // next line is the next statement. This was `.max(1)`, which skipped
+            // to the next unmatched `}` and hid every `invoke`, `coerce` and
+            // `claim` below it from this collector — and so from the private
+            // and `@service` invocation membranes, the invoke-cycle graph and
+            // every invocation input check. D14.
+            record_scan = RecordScan::enter(trimmed);
             index += 1;
             continue;
         }
@@ -20133,7 +20262,8 @@ fn check_conditioned_read(
 
 /// Reject reads of a Family B presence-conditioned field in `text` that are not
 /// permitted by `allowed` (the conditioned fields this scope's `case` arm makes
-/// present). `text` is any source fragment that may contain dotted field paths.
+/// present). `text` is any SELF-CONTAINED source fragment that may contain
+/// dotted field paths; only its source positions are read (D14).
 fn check_conditioned_reads_in_text(
     rule: &RuleDecl,
     text: &str,
@@ -20143,7 +20273,7 @@ fn check_conditioned_reads_in_text(
     allowed: &BTreeSet<(String, String)>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for dotted in dotted_paths(text) {
+    for dotted in source_dotted_paths(text) {
         let (root, path) = dotted.into_pair();
         let Some(first) = path.first() else {
             continue;
@@ -21082,7 +21212,12 @@ fn validate_lapse_arm(
         arm_bindings.insert(view.clone(), progress);
     }
 
-    for line in region.arm_content.lines() {
+    // Masked over the whole arm, then walked line by line, for the reason
+    // `analyze_rule`'s loop gives: a line inside a `"""` prompt body carries no
+    // quote of its own. The anchor here is the rule, so no offset in the mask
+    // is a caret — only which bytes are source.
+    let arm_scan = source_scan_text(&region.arm_content);
+    for line in arm_scan.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -21183,9 +21318,12 @@ impl<'a> SchemaScopes<'a> {
     }
 }
 
+/// `validate_known_field_paths_in_index` for a SELF-CONTAINED fragment — a
+/// `when` guard, a `case` guard, a whole `case` arm body — which carries the
+/// delimiters of any string it holds and can therefore be masked on its own.
 fn validate_known_field_paths(
     rule: &RuleDecl,
-    line: &str,
+    fragment: &str,
     anchor: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
@@ -21193,7 +21331,7 @@ fn validate_known_field_paths(
 ) {
     validate_known_field_paths_in_index(
         rule,
-        line,
+        &source_scan_text(fragment),
         anchor,
         SchemaScopes::local(&semantic.schemas),
         binding_types,
@@ -21203,9 +21341,14 @@ fn validate_known_field_paths(
 
 /// `validate_known_field_paths` for a scope that can hold invoke-derived
 /// bindings, whose payload classes may live in the child workflow's index.
+///
+/// Takes the already-masked `scan` rather than masking for itself: its callers
+/// walk a body LINE BY LINE, and a line inside a `"""` prompt body carries no
+/// quote of its own — the mask has to be computed over the whole body and
+/// sliced. See [`source_scan_text`].
 fn validate_known_field_paths_scoped(
     rule: &RuleDecl,
-    line: &str,
+    scan: &str,
     anchor: BodyAnchor,
     semantic: &SemanticContext,
     binding_types: &BTreeMap<String, String>,
@@ -21214,7 +21357,7 @@ fn validate_known_field_paths_scoped(
 ) {
     validate_known_field_paths_in_index(
         rule,
-        line,
+        scan,
         anchor,
         SchemaScopes {
             local: &semantic.schemas,
@@ -21315,15 +21458,19 @@ fn check_field_path(
     FieldPathCheck::Resolved
 }
 
+/// `scan` is the SOURCE-MASKED twin of the fragment `anchor` describes: same
+/// bytes, same length, with string prose and comments blanked and `{{ … }}`
+/// interpolations left standing (see [`source_scan_text`]). Offsets in it are
+/// offsets in the fragment, which is what lets the caret stay on the field.
 fn validate_known_field_paths_in_index(
     rule: &RuleDecl,
-    line: &str,
+    scan: &str,
     anchor: BodyAnchor,
     scopes: SchemaScopes,
     binding_types: &BTreeMap<String, String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for dotted in dotted_paths(line) {
+    for dotted in dotted_paths(scan) {
         check_field_path(
             rule,
             &dotted.root,
@@ -21418,11 +21565,17 @@ fn validate_sealed_effect_inputs(
                         continue;
                     }
                 }
-                let mut sources: Vec<String> = Vec::new();
-                collect_effect_expression_sources(&effect.kind, &mut sources);
-                if let Some(prompt) = &effect.prompt {
-                    sources.push(prompt.text.clone());
-                }
+                // Two kinds of source, and they are read differently. An
+                // EXPRESSION carries its string delimiters, so a scan over it
+                // reads code plus whatever `{{ … }}` a literal holds. A prompt
+                // body is string CONTENT with the delimiters already stripped,
+                // so scanning it whole reads English: `Never ask for
+                // claim.body; it is sealed` was refused as a sealed crossing,
+                // on a prompt that passes no sealed value at all. Only its
+                // interpolations are reads. D14.
+                let mut expressions: Vec<String> = Vec::new();
+                collect_effect_expression_sources(&effect.kind, &mut expressions);
+                let prompt = effect.prompt.as_ref().map(|prompt| prompt.text.clone());
                 let granted: BTreeSet<&str> = effect
                     .kind
                     .access_grants()
@@ -21437,16 +21590,28 @@ fn validate_sealed_effect_inputs(
                 // yields only paths with at least one field, so the second
                 // shape was invisible — which is the gap this closes.
                 let mut found: BTreeSet<(String, String)> = BTreeSet::new();
-                for source in &sources {
+                let sources = expressions
+                    .iter()
+                    .map(|source| (source, false))
+                    .chain(prompt.iter().map(|text| (text, true)));
+                for (source, free_text) in sources {
                     let mut roots = BTreeSet::new();
-                    if let Ok(expr) = parse_expression(source) {
-                        collect_expr_binding_roots(&expr, &mut roots);
-                    } else {
+                    let paths = if free_text {
                         collect_template_binding_roots(source, &mut roots);
-                    }
-                    let targets = dotted_paths(source)
+                        interpolation_paths(source)
+                    } else {
+                        if let Ok(expr) = parse_expression(source) {
+                            collect_expr_binding_roots(&expr, &mut roots);
+                        } else {
+                            collect_template_binding_roots(source, &mut roots);
+                        }
+                        source_dotted_paths(source)
+                            .into_iter()
+                            .map(DottedPath::into_pair)
+                            .collect()
+                    };
+                    let targets = paths
                         .into_iter()
-                        .map(DottedPath::into_pair)
                         .chain(roots.into_iter().map(|root| (root, Vec::new())));
                     for (root, path) in targets {
                         let Some(root_schema) = binding_types.get(&root) else {
@@ -21852,6 +22017,102 @@ fn dotted_paths(line: &str) -> Vec<DottedPath> {
     }
 
     paths
+}
+
+/// The interiors of `text`'s `{{ … }}` interpolations, as byte ranges into it.
+///
+/// The `{{` and `}}` fences are left OUT of the range: neither is an identifier
+/// character, so including them would change nothing, and a range that holds
+/// only what the author wrote between the braces is the honest description.
+fn interpolation_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut at = 0usize;
+    while let Some(open) = text[at..].find("{{") {
+        let start = at + open + 2;
+        let Some(close) = text[start..].find("}}") else {
+            break;
+        };
+        ranges.push(start..start + close);
+        at = start + close + 2;
+    }
+    ranges
+}
+
+/// `text` with every byte that is not SOURCE for an identifier scan blanked to
+/// a space, byte for byte.
+///
+/// The rule it applies, stated once: a token is a field read OUTSIDE a string
+/// literal, or inside a `{{ … }}` interpolation wherever that interpolation is
+/// written — including inside a string. Prose between interpolations is not
+/// source, and neither is a comment. That is the same predicate
+/// `body_print::rename_text` already renames under, asked of the lexer instead
+/// of a hand-rolled `in_string` walk.
+///
+/// Both halves are load-bearing and they pull against each other. Without the
+/// string exclusion, an English sentence in a `"""` prompt body — `Do not
+/// invent issue.prioirty` — is read as a field path and refused, with a precise
+/// caret under the words and a spelling suggestion for the prose; a program
+/// that tells an agent NOT to read a field cannot be written, and naming a
+/// sealed field in a sentence is refused as `security.sealed_value_crossing`.
+/// Without the interpolation add-back, `{{ issue.prioirty }}` in the same
+/// prompt body stops being checked at all — the line scan is its ONLY producer
+/// — which trades a false positive for a refusal hole, the worse of the two.
+/// D14, spec/diagnostic-quality-tracker.md.
+///
+/// Blanking rather than cutting, because every offset in the result is a
+/// position in `text`: `DottedPath` carries the byte offsets a field-path
+/// caret is drawn from, and `examples/invalid/misspelled-field.diagnostics`
+/// pins two of them to the column. Line breaks are kept so the mask stays
+/// line-addressable alongside the text it was cut from.
+fn source_scan_text(text: &str) -> String {
+    let spans = non_code_spans(text);
+    if spans.strings.is_empty() && spans.comments.is_empty() {
+        return text.to_owned();
+    }
+    let original = text.as_bytes();
+    let mut bytes = original.to_vec();
+    let mut blank = |span: &SourceSpan| {
+        for byte in &mut bytes[span.start.min(original.len())..span.end.min(original.len())] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    };
+    for span in spans.comments.iter().chain(spans.strings.iter()) {
+        blank(span);
+    }
+    // Interpolations come back only for STRING spans. One inside a comment is
+    // still commented out.
+    for span in &spans.strings {
+        let end = span.end.min(original.len());
+        if span.start >= end {
+            continue;
+        }
+        for range in interpolation_ranges(&text[span.start..end]) {
+            let at = span.start + range.start;
+            let to = span.start + range.end;
+            bytes[at..to].copy_from_slice(&original[at..to]);
+        }
+    }
+    debug_assert_eq!(
+        bytes.len(),
+        original.len(),
+        "the scan mask must stay offset-for-offset with the text it was cut from"
+    );
+    String::from_utf8(bytes)
+        .expect("blanking whole bytes with ASCII spaces cannot invalidate UTF-8")
+}
+
+/// [`dotted_paths`] over a SELF-CONTAINED fragment, reading only its source
+/// positions (see [`source_scan_text`]).
+///
+/// Self-contained is the precondition: the fragment must carry the delimiters
+/// of any string it contains. A caller walking a body LINE BY LINE cannot use
+/// this — a line strictly inside a `"""` block carries no quote character of
+/// its own, so a per-line mask reads the prose as code — and must mask the
+/// whole body once and slice it.
+fn source_dotted_paths(text: &str) -> Vec<DottedPath> {
+    dotted_paths(&source_scan_text(text))
 }
 
 fn interpolation_roots(line: &str) -> Vec<String> {
@@ -22860,10 +23121,19 @@ fn validate_effect_field_roots(
 /// The single source of truth for value-position root validation: returns the
 /// dangling root of a single-path value expression — a `root.field…` access whose
 /// root is neither a known binding nor a recognized special root — or `None`.
-/// Bare atoms (agents, enum variants, literals) have no path and are ignored; the
-/// `"`-guard skips values whose "path" was mis-extracted from inside a string
-/// literal. Used by every value-position validator (record/terminal/coerce/tell/
-/// invoke/effect payloads/operands).
+/// Bare atoms (agents, enum variants, literals) have no path and are ignored.
+/// Used by every value-position validator (record/terminal/coerce/tell/invoke/
+/// effect payloads/operands).
+///
+/// The `"`-guard is a survivor, not a design. It was the blunt patch for the
+/// prose false positive `expression_dotted_path` now answers properly — a
+/// "path" mis-extracted from inside a string literal — and for that it is
+/// redundant. It also skips anything genuinely INTERPOLATED, though: `fail
+/// error { reason "{{ nosuchbinding.field }}" }` compiles with no diagnostic,
+/// while the same value unquoted draws `type.unknown_binding`. Deleting it is
+/// an acceptance WIDENING, the opposite direction from the scanner fix, so it
+/// is filed rather than dropped in passing. D14,
+/// spec/diagnostic-quality-tracker.md.
 fn dangling_value_root(value: &str, known_roots: &BTreeSet<String>) -> Option<String> {
     let (root, path) = expression_path(value)?;
     if !path.is_empty()
@@ -23252,8 +23522,25 @@ fn expression_path(expr: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// The single dotted path an expression holds, keeping its offsets.
+///
+/// Source-masked (D14): a record or terminal field whose value is the string
+/// `"see item.priority"` holds no path at all, and used to hold exactly one —
+/// which is the condition below, so the prose was reported. `"{{ item.priority
+/// }}"` still holds one, because an interpolation is a read wherever it is
+/// written.
+///
+/// The mask also STRENGTHENS this function, in the other direction, and that is
+/// deliberate rather than incidental. "Exactly one" is a count, and blanking
+/// prose lowers it: `item.priority` next to the string `"see other.thing"` held
+/// two paths, so the `!= 1` below returned `None` and every value-position
+/// validator downstream — `dangling_value_root` and the rest — checked nothing
+/// at all. It now holds one, the one that is really there, and is checked. The
+/// alternative was to count paths BEFORE masking so the answer could not move,
+/// which would mean preserving a hole on purpose to keep a number stable. No
+/// program in the corpus is affected. D14,
+/// spec/diagnostic-quality-tracker.md.
 fn expression_dotted_path(expr: &str) -> Option<DottedPath> {
-    let mut paths = dotted_paths(expr);
+    let mut paths = source_dotted_paths(expr);
     if paths.len() != 1 {
         return None;
     }

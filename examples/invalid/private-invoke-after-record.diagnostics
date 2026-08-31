@@ -1,0 +1,6 @@
+error[graph.invoke_private_workflow]: rule `dispatch` invokes private workflow `InternalReviewer`
+   --> examples/invalid/private-invoke-after-record.whip:64:5
+   |
+64 |     invoke InternalReviewer { request { patchId request.patchId } } as review
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: remove `@private` from the target workflow or expose a public wrapper workflow

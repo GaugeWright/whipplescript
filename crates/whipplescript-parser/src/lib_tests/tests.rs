@@ -6756,6 +6756,450 @@ fn rule_body_refusals_fire() {
     );
 }
 
+/// The refusals of `rule_body_refusals_fire`, one line BELOW a single-line
+/// `record`.
+///
+/// `analyze_rule`'s statement loop tracked a record's field block as
+/// `brace_delta(line).max(1)`, which claims a `record` head always leaves a
+/// block open. `record Seen { note "n" }` opens and closes on its own line, so
+/// the floor invented a level nothing closed, and the loop then skipped every
+/// line up to the next unmatched `}` — in a flat rule body, the rest of the
+/// rule. This loop is the ONLY producer of each message below, so the programs
+/// COMPILED: `whip check` exited 0 and emitted IR for a rule telling an agent
+/// that does not exist. D14, spec/diagnostic-quality-tracker.md.
+///
+/// The last row is the second-order half: the skip also swallowed the `}` that
+/// pops an `after` frame off the scanner's block stack, so an effect output
+/// read outside its `after` block still looked in scope after scanning resumed.
+///
+/// THIRTEEN ROWS, ELEVEN REFUSALS, and the difference is deliberate rather than
+/// sloppy bookkeeping. Two refusals are reached twice, and a row that covers
+/// only one way in leaves the other dead: `construct.reserved_name` has one
+/// `push` and two callers of `validate_binding_name` in this loop — the effect
+/// binding and the `after` alias — and `effect.output_scope_leak` has one
+/// `push` reached both by the record's own skip and by the swallowed `}`. Count
+/// what the compiler HAS by `push` sites; count what a test costs by rows.
+///
+/// Restoring the `.max(1)` floor in `RecordScan::enter` fails every row.
+#[test]
+fn rule_body_refusals_fire_after_a_single_line_record() {
+    const AGENT_PRELUDE: &str = "use std.agent\n\nworkflow W\noutput result R\nclass R { ok bool }\nclass Seen { note string }\nclass T { title string }\nagent worker { provider fixture profile \"p\" capacity 1 capabilities [\"agent.tell\"] }\n";
+    let cases: &[(&str, String)] = &[
+        (
+            "rule `r` tells unknown agent `ghost`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell ghost \"do a thing\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` tells agent `worker` requiring undeclared capability `repo.write`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell worker requires [\"repo.write\"] \"go\" as turn\n  after turn completes {{ complete result {{ ok true }} }}\n}}\n"),
+        ),
+        (
+            "rule `r` uses a string literal as a tell target",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell \"someone\" \"do a thing\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` uses non-AgentRef dynamic tell target `t.title`",
+            format!("{AGENT_PRELUDE}rule r\n  when T as t\n=> {{\n  record Seen {{ note \"n\" }}\n  tell t.title \"go\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` has unknown binding `ghost` in tell target `ghost.field`",
+            format!("{AGENT_PRELUDE}rule r\n  when T as t\n=> {{\n  record Seen {{ note \"n\" }}\n  tell ghost.field \"go\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` consumes unknown fact binding `ghost`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  done ghost\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` binds reserved keyword `case`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell worker \"go\" as case\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        // A second call site of `validate_binding_name`: the `after` ALIAS, not
+        // the effect binding above. Covering one leaves the other dead.
+        (
+            "rule `r` binds reserved keyword `case`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  record Seen {{ note \"n\" }}\n  after turn succeeds as case {{ complete result {{ ok true }} }}\n}}\n"),
+        ),
+        (
+            "rule `r` has malformed multiline prompt content type `text/bogus extra words`",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell worker \"\"\"text/bogus extra words\n  go\n  \"\"\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` places effect binding `turn` after a multiline string delimiter",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"n\" }}\n  tell worker \"\"\"\n  go\n  \"\"\" as turn\n  after turn completes {{ complete result {{ ok true }} }}\n}}\n"),
+        ),
+        (
+            "rule `r` has invalid field path `t.nosuch`: schema `T` has no field `nosuch`",
+            format!("{AGENT_PRELUDE}rule r\n  when T as t\n=> {{\n  record Seen {{ note t.title }}\n  tell worker \"{{{{ t.nosuch }}}}\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        (
+            "rule `r` uses effect output `turn` outside a matching `after turn ...` block",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  record Seen {{ note \"n\" }}\n  tell worker \"{{{{ turn }}}}\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+        // The block-stack half: the record is the LAST statement of the `after`
+        // block, so the skip ate the `}` that pops it and the leak two lines
+        // below still read as in scope.
+        (
+            "rule `r` uses effect output `turn` outside a matching `after turn ...` block",
+            format!("{AGENT_PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  after turn completes {{\n    record Seen {{ note \"n\" }}\n  }}\n  tell worker \"{{{{ turn }}}}\"\n  complete result {{ ok true }}\n}}\n"),
+        ),
+    ];
+
+    let mut missing = Vec::new();
+    for (expected, source) in cases {
+        let compiled = compile_program(source);
+        if !compiled.diagnostics.iter().any(|d| d.message == *expected) {
+            missing.push(format!(
+                "expected `{expected}`\n     got {:?}",
+                compiled
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.message.as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {} rows did not fire below a single-line record:\n  {}",
+        missing.len(),
+        cases.len(),
+        missing.join("\n  ")
+    );
+}
+
+/// A turn may not request a capability its agent was never granted, below a
+/// single-line `record`.
+///
+/// Worth its own test rather than a table row: this is the only producer on the
+/// AGENT-TURN path, so while the scanner was blinded a program could ask for
+/// `repo.write` from an agent granted only `agent.tell` and compile. The CLI
+/// raises the same code for an undeclared `exec` capability, which is a
+/// different path and would not have covered this one — so "no second producer
+/// anywhere", which this comment used to claim, is false and the sole-producer
+/// argument holds only within the turn path. D14.
+#[test]
+fn single_line_record_does_not_hide_an_undeclared_capability() {
+    let source = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+}
+
+agent worker {
+  provider fixture
+  profile "p"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+rule r
+  when started
+=> {
+  record Seen { note "n" }
+  tell worker requires ["repo.write"] "go" as turn
+  after turn completes { complete result { ok true } }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "construct.capability_not_declared"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// Reading an effect's output on a path where the effect has not settled is the
+/// distributed-systems fault this compiler exists to refuse, and a single-line
+/// `record` turned it off for the rest of the rule.
+#[test]
+fn single_line_record_does_not_hide_an_effect_output_scope_leak() {
+    let source = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+}
+
+agent worker {
+  provider fixture
+  profile "p"
+  capacity 1
+}
+
+rule r
+  when started
+=> {
+  tell worker "go" as turn
+  record Seen { note "n" }
+  tell worker "{{ turn }}"
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "effect.output_scope_leak"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The second-order variant, and the reason the fix is not "more lines are
+/// scanned": a single-line `record` as the LAST statement of an `after` block
+/// swallowed the `}` that pops the block frame, so the `after turn` scope stayed
+/// open for the rest of the rule and the leak below it read as in scope even
+/// once scanning resumed.
+#[test]
+fn single_line_record_ending_an_after_block_still_closes_its_scope() {
+    let source = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+}
+
+agent worker {
+  provider fixture
+  profile "p"
+  capacity 1
+}
+
+rule r
+  when started
+=> {
+  tell worker "go" as turn
+  after turn completes {
+    record Seen { note "n" }
+  }
+  tell worker "{{ turn }}"
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "effect.output_scope_leak"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A record's FIELD lines are still not read as statements — the invariant the
+/// `.max(1)` floor was written to hold, and the one thing the fix must not give
+/// back. Both block-opening shapes are pinned: the head that opens the block
+/// (`record Seen {`) and the head whose `{` is on the next line.
+///
+/// `note "{{ turn }}"` is the sharpest probe available: read as a statement it
+/// draws `effect.output_scope_leak`, so a scanner that walked into the field
+/// block would refuse a program that is correct.
+#[test]
+fn record_field_lines_are_not_scanned_as_statements() {
+    const PRELUDE: &str = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+}
+
+agent worker {
+  provider fixture
+  profile "p"
+  capacity 1
+}
+
+"#;
+    let block_on_head = format!(
+        "{PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  record Seen {{\n    note \"{{{{ turn }}}}\"\n  }}\n  after turn completes {{ complete result {{ ok true }} }}\n}}\n"
+    );
+    let block_on_next_line = format!(
+        "{PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  record Seen\n  {{\n    note \"{{{{ turn }}}}\"\n  }}\n  after turn completes {{ complete result {{ ok true }} }}\n}}\n"
+    );
+    for source in [&block_on_head, &block_on_next_line] {
+        let compiled = compile_program(source);
+        assert!(
+            !compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error),
+            "a record's field lines were scanned as statements: {:?}",
+            compiled.diagnostics
+        );
+    }
+}
+
+/// `record Seen` with its `{` on the NEXT line is the third shape the `.max(1)`
+/// floor got wrong, and it got it wrong in its own way: the floor put the
+/// scanner at depth 1, the block's own `{` pushed it to 2, and the closing `}`
+/// only brought it back to 1 — so the depth never returned to 0 and the rest of
+/// the rule was swallowed for good. Scanning must resume after the block's `}`.
+#[test]
+fn a_record_block_opened_on_the_next_line_ends_at_its_closing_brace() {
+    let source = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+}
+
+rule r
+  when started
+=> {
+  record Seen
+  {
+    note "n"
+  }
+  tell ghost "do a thing"
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_agent"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A brace inside a string is content, not structure, and the record scanner
+/// must not move on it.
+///
+/// This is what the `.max(1)` floor was hiding, and it only became visible once
+/// the floor came off: `record Seen { note "a } b"` opens a block that the
+/// quoted `}` cancels, so a counter that reads every brace in the line balances
+/// it to zero and reports NO field block. The record's own field lines are then
+/// read as statements — `other "{{ turn }}"` as an effect-output scope leak —
+/// and a program that compiled before does not compile. Both directions are
+/// asserted here: the head that only LOOKS closed keeps its field lines out of
+/// the statement scan, and the head that really is closed lets the next line
+/// back in. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn a_brace_inside_a_string_does_not_move_the_record_scanner() {
+    const PRELUDE: &str = r#"use std.agent
+
+workflow W
+
+output result R
+
+class R {
+  ok bool
+}
+
+class Seen {
+  note string
+  other string
+}
+
+agent worker {
+  provider fixture
+  profile "p"
+  capacity 1
+}
+
+"#;
+    // The `}` in the field value cancels the head's `{` to a net zero. The
+    // block is open; the next two lines are FIELDS.
+    let looks_closed = format!(
+        "{PRELUDE}rule r\n  when started\n=> {{\n  tell worker \"go\" as turn\n  after turn completes {{\n    complete result {{ ok true }}\n  }}\n  record Seen {{ note \"a }} b\"\n    other \"{{{{ turn }}}}\"\n  }}\n}}\n"
+    );
+    let compiled = compile_program(&looks_closed);
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error),
+        "a `}}` inside a field's string value ended the record's field block: {:?}",
+        compiled.diagnostics
+    );
+
+    // And the scanner has not simply stopped closing records: the same head
+    // with the brace really balanced ends on its own line, and the statement
+    // below it is scanned.
+    let really_closed = format!(
+        "{PRELUDE}rule r\n  when started\n=> {{\n  record Seen {{ note \"a b\"  other \"c\" }}\n  tell ghost \"do a thing\"\n  complete result {{ ok true }}\n}}\n"
+    );
+    let compiled = compile_program(&really_closed);
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_agent"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The counter every block scanner in `lib.rs` reads, asked directly.
+///
+/// A test on the compiler alone would leave this implicit, and the property is
+/// not about records: `brace_delta` is what `record_blocks`, the `case`
+/// walkers, `workflow_terminal_blocks` and the multi-line statement joiner all
+/// use to decide where a block ends. Escapes are in here because they are the
+/// reason `syntax::brace_delta_outside_strings` is the implementation that
+/// survived — a counter that lets `\"` end the literal reads the rest of the
+/// line as code.
+#[test]
+fn a_brace_inside_a_string_is_not_structure() {
+    // The head that started this: net +1, not 0.
+    assert_eq!(brace_delta("record Seen { note \"a } b\""), 1);
+    // Opens and closes on its own line.
+    assert_eq!(brace_delta("record Seen { note \"a } b\" }"), 0);
+    // A quoted `{` is not an opener either.
+    assert_eq!(brace_delta("complete result { note \"a { b\" }"), 0);
+    // An escaped quote does not end the literal, so the braces after it are
+    // still content.
+    assert_eq!(brace_delta("complete result { note \"a \\\" } b\" }"), 0);
+    // Plain structure still counts.
+    assert_eq!(brace_delta("after turn completes {"), 1);
+    assert_eq!(brace_delta("}"), -1);
+    assert_eq!(brace_delta("} on lapse {"), 0);
+}
+
 /// inside its message text, which is what an unasserted message looks like.
 #[test]
 fn declaration_refusals_fire() {
@@ -7230,6 +7674,17 @@ fn expression_type_refusals_fire() {
             ("assertion has unsafe optional path `owner.name`: `owner` must be proven present before accessing `name`", "workflow W\noutput result R\nclass R { ok bool }\nclass Owner { name string }\nclass T { owner Owner? }\nassert count(T where owner.name == \"x\") <= 1\nrule r\n  when started\n=> { complete result { ok true } }\n"),
             ("rule `r` has invalid expression path `t.nofield`: schema `T` has no field `nofield`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where t.nofield == \"x\"\n=> { complete result { ok true } }\n"),
             ("assertion has invalid expression path `title.nested`: field `title` is not a schema value", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nassert count(T where title.nested == \"x\") <= 1\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            // D14, and the reason the two rows above did not already cover it:
+            // they walk through `title` into a segment SPELLED differently, and
+            // the "is this the last segment?" test compared the two spellings.
+            // Repeat the final segment's name and the intermediate read as
+            // final, so both sites accepted. Both are needed for the same
+            // reason the `title.nested` pair is: the binding-rooted path and
+            // the bare fact-query path are separate sites, and the fact-query
+            // form is additionally the two-segment case — a bare `title.title`
+            // is passed whole, so the minimum depth is 2, not 3.
+            ("rule `r` has invalid expression path `t.title.title`: field `title` is not a schema value", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nrule r\n  when T as t where t.title.title == \"x\"\n=> { complete result { ok true } }\n"),
+            ("assertion has invalid expression path `title.title`: field `title` is not a schema value", "workflow W\noutput result R\nclass R { ok bool }\nclass T { title string }\nassert count(T where title.title == \"x\") <= 1\nrule r\n  when started\n=> { complete result { ok true } }\n"),
         ];
 
     let mut missing = Vec::new();
@@ -7271,6 +7726,14 @@ fn well_typed_expressions_are_admitted() {
             // case rejects, made safe by the proof rather than by weakening the
             // rule.
             "workflow W\noutput result R\nclass R { ok bool }\nclass Owner { name string }\nclass T { owner Owner? }\nrule r\n  when T as t where exists t.owner and t.owner.name == \"x\"\n=> { complete result { ok true } }\n",
+            // The legitimate twin of the `t.title.title` refusal (D14): a
+            // non-schema value ENDING a path is the ordinary case, and a class
+            // reference in the middle is what a nested read is for. Naming the
+            // inner field the same as the outer one changes nothing — the
+            // question is the segment's position, never its spelling — so a
+            // fix that refused every repeated name, or every non-schema
+            // segment, fails here rather than in the corpus.
+            "workflow W\noutput result R\nclass R { ok bool }\nclass Inner { title string }\nclass T { title string  inner Inner }\nrule r\n  when T as t where t.title == \"x\" and t.inner.title == \"y\"\n=> { complete result { ok true } }\n",
         ];
 
     let mut rejected = Vec::new();
@@ -7293,6 +7756,64 @@ fn well_typed_expressions_are_admitted() {
         rejected.len(),
         rejected.join("\n  ")
     );
+}
+
+/// What the repeated-segment hole cost beyond a missed error: a FABRICATED
+/// TYPE (D14).
+///
+/// `SchemaIndex::resolve_field_path` decided "is this the last segment?" by
+/// comparing the segment's NAME to the final segment's name. When the test read
+/// false the loop fell through WITHOUT advancing `schema`, so every remaining
+/// segment resolved against the class the path had already left. `Review.at` is
+/// a `string`; `review.at.inner.at` therefore came back `time`, resolved off a
+/// stale `Review`, and `timer until` — whose entire job is to refuse a non-time
+/// operand, and which does refuse the one-segment-shorter `review.at` — passed
+/// it. The program ran and the kernel queued a durable, exactly-once
+/// `timer.wait` whose `deadline_at` was the literal string
+/// `"review.at.inner.at"`: a clock-driven effect that can never fire, on an
+/// instance reporting `failures=0 blocked_effects=0`.
+///
+/// The three rows are one mechanism seen from both sides plus its legitimate
+/// twin, so neither "refuse every repeated name" nor "refuse every non-schema
+/// segment" satisfies it.
+#[test]
+fn a_path_through_a_non_schema_value_cannot_fabricate_a_time() {
+    let program = |until: &str| {
+        format!(
+            "workflow W\noutput result Done\nclass Inner {{ at time }}\nclass Review {{ at string  inner Inner }}\nclass Done {{ state \"done\" }}\nrule r\n  when Review as review\n=> {{\n  timer until {until} as deadline\n  after deadline completes {{ complete result {{ state \"done\" }} }}\n}}\n"
+        )
+    };
+
+    // The hole. `at` is a string, so the path ends at `review.at` — and the
+    // segment that walks past it happens to repeat the final segment's name.
+    let messages = |until: &str| {
+        compile_program(&program(until))
+            .diagnostics
+            .into_iter()
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+    };
+    let repeated = messages("review.at.inner.at");
+    assert!(
+        repeated.iter().any(|message| message
+            == "rule `r` has invalid `timer until` operand `review.at.inner.at`: field `at` is not a schema value"),
+        "a `string` walked through as if it were a schema, and `timer until` took the result for an instant: {repeated:?}"
+    );
+
+    // The control: the same walk one segment shorter, where the names differ
+    // and the refusal has always fired. If this row goes quiet the operand
+    // check itself is gone, not just the path walk.
+    let shorter = messages("review.at");
+    assert!(
+        shorter
+            .iter()
+            .any(|message| message == "rule `r` uses non-time operand `review.at` in `timer until`"),
+        "the `timer until` operand check stopped refusing a plain string: {shorter:?}"
+    );
+
+    // The legitimate twin, which the fix must keep compiling: a genuine nested
+    // read whose inner field is spelled the same as the outer one.
+    assert_eq!(messages("review.inner.at"), Vec::<String>::new());
 }
 
 /// through a shape I had not tried.
@@ -7556,6 +8077,220 @@ workflow Parent {
             .iter()
             .any(|d| d.message.contains("private workflow `Child`")),
         "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The `@private` invocation membrane, one line below a single-line `record`.
+///
+/// `collect_body_statements` carried the same `brace_delta(head).max(1)` as
+/// `analyze_rule`, so a `record` that opened and closed on one line put the
+/// collector into field-block mode with nothing to close it and every `invoke`,
+/// `coerce` and `claim` below it stopped existing as far as the compiler was
+/// concerned. This fixture is `rejects_invoking_private_sibling_workflow` with
+/// one line inserted. D14, spec/diagnostic-quality-tracker.md.
+#[test]
+fn single_line_record_does_not_hide_a_private_workflow_invocation() {
+    let source = r#"
+class Job { id string }
+class Report { id string }
+class Marker { note string }
+
+@private
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    record Marker { note "x" }
+    invoke Child { task t } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(source, Some("Parent"));
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "graph.invoke_private_workflow"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The shadowed `invoke` is an EDGE MISSING FROM THE PROGRAM GRAPH, not just a
+/// line-check skipped: `A -> B -> A` escaped even though B's half of the cycle
+/// was perfectly visible, because A's half sat below a single-line `record`.
+#[test]
+fn single_line_record_does_not_hide_an_invocation_graph_edge() {
+    let source = r#"
+class Job { id string }
+class Report { id string }
+class Marker { note string }
+
+workflow A {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    record Marker { note "x" }
+    invoke B { task t } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+
+workflow B {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    invoke A { task t } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(source, Some("A"));
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|d| d.code.as_str()
+            == "graph.unbounded_workflow_invocation_recursion"
+            && d.message.contains("A -> B -> A")),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// Every input check on the invocation went with the statement: an unknown
+/// target and a missing required input both compiled clean below a single-line
+/// `record`.
+#[test]
+fn single_line_record_does_not_hide_invocation_input_checks() {
+    let unknown_target = r#"
+class Job { id string }
+class Report { id string }
+class Marker { note string }
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    record Marker { note "x" }
+    invoke Nonexistent { task t } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(unknown_target, Some("Parent"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.unknown_workflow"),
+        "{:?}",
+        compiled.diagnostics
+    );
+
+    let missing_input = r#"
+class Job { id string }
+class Report { id string }
+class Marker { note string }
+
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    complete result { id t.id }
+  }
+}
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    record Marker { note "x" }
+    invoke Child { } as child
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(missing_input, Some("Parent"));
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "type.missing_required_field"),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The hole also failed CLOSED, and no assertion on a refusal would catch it:
+/// with the `invoke` invisible, `invoke_binding_workflow` resolved nothing and
+/// a VALID `after child reaches "..."` was refused with `type.unknown_binding`
+/// — the compiler reporting something untrue about a correct program.
+#[test]
+fn single_line_record_does_not_break_a_milestone_binding() {
+    let source = r#"
+class Job { id string }
+class Report { id string }
+class Progress { note string }
+
+workflow Child {
+  input task Job
+  output result Report
+  rule work
+    when Job as t
+  => {
+    emit milestone "halfway" of Progress {
+      note t.id
+    }
+    complete result { id t.id }
+  }
+}
+
+workflow Parent {
+  input task Job
+  output result Report
+  rule go
+    when Job as t
+  => {
+    record Progress { note "x" }
+    invoke Child { task t } as child
+    after child reaches "halfway" as m {
+      record Progress { note m.note }
+    }
+    after child succeeds as r { complete result { id r.id } }
+  }
+}
+"#;
+    let compiled = compile_program_with_root(source, Some("Parent"));
+    assert!(
+        !compiled
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error),
+        "a valid milestone binding was refused: {:?}",
         compiled.diagnostics
     );
 }
@@ -9066,6 +9801,35 @@ fn invalid_fixtures_have_actionable_diagnostics() {
         (
             "write-to-read-only-store",
             include_str!("../../../../examples/invalid/write-to-read-only-store.whip"),
+        ),
+        // D14: both refusals below sit one line under a single-line `record`,
+        // which used to switch the body scanners off for the rest of the rule.
+        (
+            "undeclared-capability-after-record",
+            include_str!("../../../../examples/invalid/undeclared-capability-after-record.whip"),
+        ),
+        (
+            "private-invoke-after-record",
+            include_str!("../../../../examples/invalid/private-invoke-after-record.whip"),
+        ),
+        // D14: a path that walks THROUGH a value with no fields, using a
+        // segment that repeats the FINAL segment's name. The "is this the last
+        // segment?" test compared names rather than positions, read the
+        // repeated one as final, and resolved the tail against the class the
+        // path had already left — so `timer until` took a `string` for an
+        // instant and queued a durable effect that can never fire.
+        (
+            "field-path-repeats-final-segment",
+            include_str!("../../../../examples/invalid/field-path-repeats-final-segment.whip"),
+        ),
+        // D14, and BIDIRECTIONAL: its snapshot holds the read inside the
+        // interpolation and must never hold the misspelling in the prose beside
+        // it. Drop the string exclusion from `source_scan_text` and the prose
+        // error returns; drop the interpolation add-back and the real one
+        // disappears. Either way `regen-invalid-diagnostics.sh --check` fails.
+        (
+            "prompt-body-field-paths",
+            include_str!("../../../../examples/invalid/prompt-body-field-paths.whip"),
         ),
     ];
 
@@ -19602,6 +20366,185 @@ rule triage
             .iter()
             .any(|related| related.span.start == declaration),
         "the unknown field names no declaration: {diagnostic:?}"
+    );
+}
+
+/// The two prompt forms the string-awareness pair below is asked of. Each holds
+/// BOTH edges of the rule: `prioirty` in an English sentence, which is not a
+/// read, and `{{ issue.titel }}`, which is — so a scanner that answered either
+/// question wrongly fails one of the two tests on the same fixture.
+///
+/// The `"""` form is the one nothing else in the repository covers.
+/// `examples/invalid/misspelled-field.whip` pins the single-line form's two
+/// carets to the column; no test, example or golden reached inside a
+/// triple-quoted body before this pair.
+fn prompt_string_forms() -> [(&'static str, String); 2] {
+    let program = |prompt: &str| {
+        format!(
+            r#"
+workflow Triage
+
+class Issue {{
+  title string
+  priority string
+}}
+
+agent worker {{
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}}
+
+rule triage
+  when Issue as issue
+=> {{
+{prompt}
+}}
+"#
+        )
+    };
+    [
+        (
+            "single-line",
+            program(r#"  tell worker "do not invent issue.prioirty; see {{ issue.titel }}""#),
+        ),
+        (
+            "triple-quoted",
+            program(
+                "  tell worker \"\"\"markdown\n  Do not invent issue.prioirty; the class has no \
+                 such field.\n\n  {{ issue.titel }}\n  \"\"\"",
+            ),
+        ),
+    ]
+}
+
+/// THE LOAD-BEARING HALF of D14's string-awareness fix: a `{{ … }}`
+/// interpolation is a read wherever it is written, INCLUDING inside a string,
+/// and inside a `"""` prompt body the rule-body line scan is its ONLY producer.
+///
+/// Measured before this test existed: block that scan from reaching the prompt
+/// and `{{ issue.titel }}` in a `"""` body produces no diagnostic at all, from
+/// anywhere, and the whole suite stays green. So the obvious cure for the prose
+/// false positive — "stop scanning string literals" — silently deletes this
+/// refusal, which is a worse defect than the one it fixes. That is what this
+/// test stands in for; `scripts/check-new-refusals.sh` cannot ask for it,
+/// because the sweep can neutralise a `diagnostics.push` but cannot narrow a
+/// scanned REGION.
+///
+/// The span assertion is not decoration. It is what fails if the mask stops
+/// being offset-for-offset with the text it was cut from, and it is the same
+/// property `examples/invalid/misspelled-field.diagnostics` pins at columns 35
+/// and 60.
+#[test]
+fn an_interpolation_inside_a_string_is_still_a_field_read() {
+    for (form, source) in prompt_string_forms() {
+        let found: Vec<_> = compile_program(&source)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("invalid field path `issue.titel`")
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{form}: the interpolation stopped being a read (or was reported twice)"
+        );
+        assert_eq!(
+            &source[found[0].span.start..found[0].span.end],
+            "titel",
+            "{form}: the caret left the field inside the interpolation"
+        );
+    }
+}
+
+/// The other edge, and the false positive D14 recorded: prose between
+/// interpolations is not source. `dotted_paths` walked raw line text, so an
+/// English sentence naming a field the class does not declare was refused as a
+/// field read — and, once the carets became precise, underlined the words with
+/// a spelling suggestion for the prose. A program that tells an agent NOT to
+/// read a field could not be written.
+#[test]
+fn prose_inside_a_string_is_not_a_field_read() {
+    for (form, source) in prompt_string_forms() {
+        let reported: Vec<_> = compile_program(&source)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.message.contains("issue.prioirty"))
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            reported.is_empty(),
+            "{form}: an English sentence was read as a field path: {reported:?}"
+        );
+    }
+}
+
+/// The same pair at the SECURITY site, which reads a different text and had to
+/// be fixed a different way: a prompt body is string CONTENT with its
+/// delimiters already stripped, so the source mask does not apply to it and
+/// only its interpolations are reads.
+///
+/// Getting that backwards leaves a REFUSAL fired by prose — naming a sealed
+/// field in a sentence that tells the agent not to ask for it was
+/// `security.sealed_value_crossing`, on a prompt passing no sealed value.
+#[test]
+fn a_sealed_field_named_in_prompt_prose_is_not_a_crossing() {
+    let program = |line: &str| {
+        format!(
+            r#"
+workflow Triage
+
+class PatientRecord {{
+  note string
+}}
+
+class Claim {{
+  id string
+  body sealed<PatientRecord>
+}}
+
+agent worker {{
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}}
+
+rule triage
+  when Claim as claim
+=> {{
+  tell worker """markdown
+{line}
+  """
+}}
+"#
+        )
+    };
+    let crossings = |source: &str| {
+        compile_program(source)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code.as_str() == "security.sealed_value_crossing")
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>()
+    };
+
+    let prose = program("  Never ask for claim.body; it is sealed and you may not read it.");
+    assert_eq!(
+        crossings(&prose),
+        Vec::<String>::new(),
+        "an English sentence was refused as a sealed value crossing"
+    );
+
+    // The refusal itself, unchanged: the same field actually interpolated into
+    // the same prompt still reaches the provider as ciphertext.
+    let interpolated = program("  Here it is: {{ claim.body }}");
+    assert_eq!(
+        crossings(&interpolated).len(),
+        1,
+        "a sealed value interpolated into a prompt stopped being refused"
     );
 }
 

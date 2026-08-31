@@ -1,0 +1,48 @@
+# Invalid: a `tell` asks its agent for a capability the agent was never granted.
+#
+# The `record` written on one line above it is a statement like any other. It
+# used to be read as an open block that ran to the end of the rule, and the
+# rule-body line scan — the ONLY producer of `construct.capability_not_declared`
+# — never reached the `tell`. D14, spec/diagnostic-quality-tracker.md.
+#
+# Everything else about this program is well formed: `Change` is seeded from a
+# table, and the rule reaches `complete`.
+workflow ReleaseNotes
+
+output result Notes
+
+class Change {
+  summary string
+}
+
+class DraftProgress {
+  note string
+}
+
+class Notes {
+  note string
+}
+
+table changes as Change [
+  { summary "the collector now waits on retention" }
+]
+
+agent writer {
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+  capabilities ["agent.tell"]
+}
+
+rule draft_notes
+  when Change as change
+=> {
+  record DraftProgress { note change.summary }
+
+  tell writer requires ["repo.write"] "Draft release notes for {{ change.summary }}." as turn
+
+  after turn completes as outcome {
+    done change
+    complete result { note outcome.summary }
+  }
+}

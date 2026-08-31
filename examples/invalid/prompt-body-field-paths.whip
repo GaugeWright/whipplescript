@@ -1,0 +1,57 @@
+// Invalid, for exactly ONE of the two misspellings below.
+//
+// A `"""` prompt body is free text: its `{{ … }}` interpolations are reads and
+// the prose around them is not. `dotted_paths` used to walk raw line text with
+// no idea a string literal was open, so BOTH were reported — a sentence telling
+// the agent not to invent `issue.prioirty` was refused as a field read, with a
+// precise caret under the words and a spelling suggestion for the English.
+//
+// Two different misspellings deliberately, so the two halves can never be
+// confused for one another: this snapshot holds `issue.titel` (a read, inside
+// the interpolation) and must never hold `issue.prioirty` (prose). Drop the
+// string exclusion and the prose error comes back; drop the interpolation
+// add-back and the real error disappears — inside a triple-quoted body the
+// rule-body line scan is its only producer. Nothing else about the program is
+// wrong: `Issue` is seeded from a table and the rule reaches `complete`. D14,
+// spec/diagnostic-quality-tracker.md.
+
+workflow PromptBodyFieldPaths
+
+output result Verdict
+
+class Verdict {
+  note string
+}
+
+class Issue {
+  title string
+  priority string
+}
+
+table issues as Issue [
+  { title "the collector waits on retention"  priority "high" }
+]
+
+agent triager {
+  provider fixture
+  profile "repo-user"
+  capacity 1
+}
+
+rule triage
+  when Issue as issue
+=> {
+  done issue
+
+  tell triager as turn """markdown
+  Do not invent issue.prioirty; the class has no such field.
+
+  {{ issue.titel }}
+  """
+
+  after turn completes as outcome {
+    complete result {
+      note outcome.summary
+    }
+  }
+}

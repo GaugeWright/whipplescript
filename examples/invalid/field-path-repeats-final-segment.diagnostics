@@ -1,0 +1,12 @@
+error[type.unknown_field]: rule `r` has invalid `timer until` operand `review.at.inner.at`: field `at` is not a schema value
+   --> examples/invalid/field-path-repeats-final-segment.whip:38:3
+   |
+38 |   timer until review.at.inner.at as deadline
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: reference a `time`-typed field on a bound fact, or use an ISO-8601 literal
+error[type.unknown_field]: rule `r` has invalid field path `review.at.inner.at`: field `at` is not a schema value
+   --> examples/invalid/field-path-repeats-final-segment.whip:38:22
+   |
+38 |   timer until review.at.inner.at as deadline
+   |                      ^^
+   = help: use a field declared on the bound schema or add it to the class declaration

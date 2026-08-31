@@ -28,7 +28,7 @@ capability.invalid_narrowing PROVISIONAL
 capability.invalid_tool_grant PROVISIONAL
 capability.not_granted COVERED
 construct.ambiguous_root_workflow COVERED
-construct.capability_not_declared PROVISIONAL
+construct.capability_not_declared COVERED
 construct.cardinality_conflict COVERED
 construct.dead_measure PROVISIONAL
 construct.duplicate_declaration COVERED
@@ -102,7 +102,7 @@ graph.declared_measure_unmet PROVISIONAL
 graph.gauge_input_cycle PROVISIONAL
 graph.include_cycle PROVISIONAL
 graph.invoke_awaits_service_workflow COVERED
-graph.invoke_private_workflow PROVISIONAL
+graph.invoke_private_workflow COVERED
 graph.model_search_mismatch PROVISIONAL
 graph.rule_never_fires COVERED
 graph.tool_not_convergent PROVISIONAL

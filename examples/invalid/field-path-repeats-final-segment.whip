@@ -1,0 +1,43 @@
+// Invalid: a field path that walks THROUGH a value that has no fields.
+//
+// `Review.at` is a `string`, so `review.at` ends the path. The segment after it
+// repeats the name `at`, and the compiler used to answer "is this the last
+// segment?" by comparing NAMES rather than positions — so it read the repeated
+// `at` as the final one, accepted the path, and resolved the remainder against
+// the class it had already left. `review.at.inner.at` came back `time` off a
+// stale `Review`, `timer until` accepted it as an instant, and the program ran:
+// a durable `timer.wait` effect was queued with `"deadline_at":
+// "review.at.inner.at"` — the path text where an ISO instant belongs — on an
+// instance reporting no failures and no blocked effects. Recorded as D14 in
+// spec/diagnostic-quality-tracker.md.
+
+workflow FieldPathRepeatsFinalSegment
+
+output result Done
+
+class Inner {
+  at time
+}
+
+class Review {
+  at string
+  inner Inner
+}
+
+class Done {
+  state "done"
+}
+
+table reviews as Review [
+  { at "2026-01-01T00:00:00Z"  inner { at "2030-01-01T00:00:00Z" } }
+]
+
+rule r
+  when Review as review
+=> {
+  timer until review.at.inner.at as deadline
+
+  after deadline completes {
+    complete result { state "done" }
+  }
+}

@@ -287,20 +287,82 @@ pub fn lex_comments(source: &str) -> Vec<Comment> {
     lex(source).comments
 }
 
+/// The byte spans of `source` that are not code, kept apart by kind.
+///
+/// Both kinds are invisible to a scanner looking for identifiers, but they are
+/// not the same thing to one that also reads `{{ … }}` interpolations: an
+/// interpolation inside a string literal is a live read — a prompt body is
+/// written exactly that way — while one inside a comment is still a comment.
+/// A caller that cannot tell the two apart either loses the reads or keeps the
+/// prose.
+///
+/// Answered by the lexer rather than by a hand-rolled `in_string` walk so that
+/// `"""` before `"`, `\"` escapes, and a `#` inside a prompt body are decided
+/// once, in the place that already owns them.
+pub(crate) struct NonCodeSpans {
+    pub(crate) strings: Vec<SourceSpan>,
+    pub(crate) comments: Vec<SourceSpan>,
+}
+
+pub(crate) fn non_code_spans(source: &str) -> NonCodeSpans {
+    let lexed = lex(source);
+    NonCodeSpans {
+        strings: lexed
+            .tokens
+            .iter()
+            .filter(|token| matches!(token.kind, TokenKind::String(_)))
+            .map(|token| token.span)
+            .collect(),
+        comments: lexed.comments.iter().map(|comment| comment.span).collect(),
+    }
+}
+
 /// Byte-span regions of string literals and comments in `source`. A tool that
 /// edits identifier occurrences (e.g. `whip lsp` rename) consults these to avoid
 /// touching text inside a prompt string or a comment — only code identifiers are
 /// real references.
 pub fn string_and_comment_spans(source: &str) -> Vec<SourceSpan> {
-    let lexed = lex(source);
-    let mut spans: Vec<SourceSpan> = lexed
-        .tokens
-        .iter()
-        .filter(|token| matches!(token.kind, TokenKind::String(_)))
-        .map(|token| token.span)
-        .collect();
-    spans.extend(lexed.comments.iter().map(|comment| comment.span));
-    spans
+    let spans = non_code_spans(source);
+    let mut all = spans.strings;
+    all.extend(spans.comments);
+    all
+}
+
+/// The net brace depth `line` adds, counting only braces that are STRUCTURE.
+///
+/// A brace inside a string literal is content — `record Note { body "a } b" }`
+/// holds two block braces, not three — and a line scanner that counts it closes
+/// the block it is tracking one line early, or never closes it at all. The
+/// whipplescript-kernel copy of this counter learned that already; this is the
+/// one implementation the parser's scanners now read, so the crates' answers to
+/// "how deep is this line" cannot drift apart again.
+///
+/// The `\\` arm is why THIS implementation is the survivor of the three that
+/// existed: an escaped quote inside a literal does not end the literal, and a
+/// counter that thinks it does reads the rest of the line — braces included —
+/// as code.
+///
+/// It sees ONE LINE, which is the whole of what it can promise, and the promise
+/// is stated rather than quietly assumed. The interior lines of a `"""` body
+/// carry no quote character of their own, and a `//` comment's braces are not
+/// braces either; this counter reads both as code. Being right about them takes
+/// a mask over the whole text, not a better line reader.
+pub(crate) fn brace_delta_outside_strings(line: &str) -> i32 {
+    let mut delta = 0i32;
+    let mut in_string = false;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_string = !in_string,
+            '\\' if in_string => {
+                let _ = chars.next();
+            }
+            '{' if !in_string => delta += 1,
+            '}' if !in_string => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 pub(crate) fn skip_line(bytes: &[u8], mut index: usize) -> usize {

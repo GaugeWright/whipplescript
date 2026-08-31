@@ -25,6 +25,7 @@
 
 use crate::body::{self, BodyStmt};
 use crate::body_print::{print_effect, push_stmt_line};
+use crate::syntax::brace_delta_outside_strings;
 use crate::{diagnostic_code, Diagnostic, Item, Severity, SourceSpan};
 
 /// The reserved namespace for synthetic `then` effect handles. Author bindings
@@ -215,11 +216,16 @@ fn expand_in_text(
     (out.join("\n"), origins)
 }
 
-/// Brace depth delta ignoring braces inside double-quoted string literals on
-/// the same line (multi-line `"""` blocks are excluded by the caller).
 /// The minimum running brace delta while scanning the line left to right
 /// (0 if the line never dips below its starting depth). Distinguishes a
 /// net-zero joint line like `} on lapse {` from a truly flat line.
+///
+/// String-aware in the same one-line way
+/// [`brace_delta_outside_strings`](crate::syntax::brace_delta_outside_strings)
+/// is: braces inside a literal are skipped, and `"""` interiors are excluded by
+/// the caller. It keeps its own walk because it answers a different question —
+/// the running MINIMUM rather than the net — and folding the two would make one
+/// of them carry a flag to say which answer it wanted.
 fn brace_min_prefix_outside_strings(line: &str) -> i32 {
     let mut delta = 0i32;
     let mut min = 0i32;
@@ -242,24 +248,6 @@ fn brace_min_prefix_outside_strings(line: &str) -> i32 {
         }
     }
     min
-}
-
-fn brace_delta_outside_strings(line: &str) -> i32 {
-    let mut delta = 0i32;
-    let mut in_string = false;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => in_string = !in_string,
-            '\\' if in_string => {
-                let _ = chars.next();
-            }
-            '{' if !in_string => delta += 1,
-            '}' if !in_string => delta -= 1,
-            _ => {}
-        }
-    }
-    delta
 }
 
 fn diag(span: SourceSpan, message: String, suggestion: &str) -> Diagnostic {
