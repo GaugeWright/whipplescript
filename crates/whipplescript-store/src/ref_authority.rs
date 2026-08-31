@@ -246,11 +246,17 @@ mod sqlite {
             // WAL and a busy timeout, exactly as `SqliteStore::open` does, and
             // for a reason the concurrency test found the hard way: without
             // them a contended `advance` fails with SQLITE_BUSY, which is
-            // neither `Advanced` nor `Rejected`. The contract says an advance
-            // either commits or is told what the name holds; a lock error is a
-            // third outcome the caller was never promised and has no sensible
-            // handling for. `Immediate` alone is not enough — it takes the
-            // write lock up front, but still needs to be willing to WAIT for it.
+            // neither `Advanced` nor `Rejected`. `Immediate` alone is not
+            // enough — it takes the write lock up front, but still needs to be
+            // willing to WAIT for it.
+            //
+            // DR-0069 §6 owns the contract this implements: contention is a
+            // WAIT, the outcome space stays two, and exceeding the bound is a
+            // fault rather than a third outcome, because `Advanced` and
+            // `Rejected` describe COMPLETED advances. Until 2026-08-31 that
+            // decision lived here and in a conformance-ledger entry and in no
+            // record — which is why the record now says why a `Busy` variant
+            // and an unbounded wait are both refused.
             crate::establish_wal(&connection)?;
             let store = Self { connection };
             store.ensure_schema()?;
