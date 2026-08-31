@@ -12,6 +12,7 @@ mod body_print;
 mod format;
 mod lowering;
 mod measure;
+pub mod snapshot;
 use format::*;
 pub use format::{format_program, format_program_preserving_comments, FormatOutput};
 use lowering::*;
