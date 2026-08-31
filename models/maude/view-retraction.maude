@@ -1,0 +1,132 @@
+--- What happens to a view when its trigger is retracted, and why a cascade
+--- depends on the answer.
+---
+--- DR-0043 pins a rule firing to its trigger's VALUES: matching gates admission
+--- only, so a firing whose trigger is consumed still completes. That decision
+--- exists to stop a continuation being stranded -- the ch. 15 stall, where
+--- work in flight could never settle because the fact that admitted it had
+--- gone. A view has no continuations: it enqueues nothing and waits for
+--- nothing. So pinning's reason does not reach it, and the opposite rule is
+--- available: a view is a maintained statement about its subject, and when the
+--- subject is withdrawn the statement is withdrawn with it, derivation and all.
+---
+--- THE CASCADE IS WHAT MAKES THIS LOAD-BEARING rather than tidy. A recorded
+--- fact's key is `record_fact_key`, a hash of the whole value except when the
+--- value carries a top-level `number` field. A view's output usually has no
+--- such field, so every re-derivation mints a NEW key, hence a new firing
+--- identity, hence a DISTINCT downstream firing. The downstream firing is
+--- therefore modeled as keyed by the upstream VALUE, which is exactly what the
+--- content-hashed key makes it.
+---
+--- Given that, if a view survived its trigger's retraction, an upstream
+--- supersede would leave the old downstream firing deriving from its stale
+--- pinned value WHILE a new firing derives from the new one. Supersede's "one
+--- current value per firing" would still hold at each firing and yet the
+--- number of firings would grow with every upstream move -- the accumulation
+--- supersede exists to prevent, reappearing one level down. The PINNED module
+--- below is that counterfactual, and it reaches exactly that state.
+---
+--- Properties [models/maude/tests/view-retraction.maude]:
+---   coverage: a retracted trigger ends the view; after an upstream supersede
+---     the downstream derivation is the NEW one; the superseded firing is
+---     recorded as ended rather than silently dropped.
+---   invariants: an ended view never holds a derivation; a cascade never holds
+---     two downstream derivations at once.
+---   bite: the PINNED module keeps the firing alive across the retraction and
+---     reaches two downstream derivations, which is the accumulation the
+---     ruling prevents.
+
+fmod VIEW-RETRACTION-STATE is
+  protecting BOOL .
+
+  sorts Cnt Fid Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+  vars A B : Cnt .
+  eq lt(z, s(A)) = true .
+  eq lt(A, z) = false .
+  eq lt(s(A), s(B)) = lt(A, B) .
+
+  op v1 : -> Fid [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op clk : Cnt -> Cfg [ctor] .
+  op fuel : Cnt -> Cfg [ctor] .
+
+  --- The single-view case: a trigger that may be withdrawn under the view.
+  op trigPresent : Fid -> Cfg [ctor] .
+  op trigRetracted : Fid -> Cfg [ctor] .
+  op viewFresh : Fid -> Cfg [ctor] .
+  op viewLive : Fid -> Cfg [ctor] .
+  op viewEnded : Fid -> Cfg [ctor] .
+  op current : Fid Cnt -> Cfg [ctor] .
+  op qset : Cnt -> Cfg [ctor] .
+
+  --- The cascade: an upstream view's current value, and the downstream firing
+  --- keyed by that value. Keyed by the VALUE because the content-hashed fact
+  --- key makes each upstream derivation a distinct downstream admission.
+  op up : Cnt -> Cfg [ctor] .
+  op downFresh : Cnt -> Cfg [ctor] .
+  op downLive : Cnt -> Cfg [ctor] .
+  op downEnded : Cnt -> Cfg [ctor] .
+  op downCurrent : Cnt Cnt -> Cfg [ctor] .
+
+  op initSingle : -> Cfg .
+  eq initSingle = clk(z) qset(s(z)) trigPresent(v1) viewFresh(v1) .
+
+  op initCascade : -> Cfg .
+  eq initCascade = clk(z) fuel(s(s(z))) up(z) downFresh(z) .
+
+  op initPinned : -> Cfg .
+  eq initPinned = clk(z) fuel(s(s(z))) up(z) downFresh(z) .
+endfm
+
+mod WHIPPLESCRIPT-VIEW-RETRACTION is
+  including VIEW-RETRACTION-STATE .
+
+  vars N K V W : Cnt .
+  var F : Fid .
+
+  rl [derive-first] : clk(N) trigPresent(F) viewFresh(F) qset(V)
+      => clk(s(N)) trigPresent(F) viewLive(F) qset(V) current(F, V) .
+
+  --- THE RULING. The trigger is withdrawn, and the derivation goes with it:
+  --- `current` is consumed, not left standing. A view holds a statement about
+  --- its subject, so a subject that is gone leaves no statement behind.
+  rl [retract] : clk(N) trigPresent(F) viewLive(F) current(F, V)
+      => clk(s(N)) trigRetracted(F) viewEnded(F) .
+
+  --- Retraction before the view ever derived: same end, nothing to withdraw.
+  rl [retract-fresh] : clk(N) trigPresent(F) viewFresh(F)
+      => clk(s(N)) trigRetracted(F) viewEnded(F) .
+
+  --- The downstream firing derives from the upstream value that admitted it.
+  rl [down-derive] : clk(N) downFresh(V)
+      => clk(s(N)) downLive(V) downCurrent(V, V) .
+
+  --- The upstream view supersedes. Its old output is retracted, so under the
+  --- ruling the downstream firing keyed by it ends and its derivation is
+  --- withdrawn; the new output admits a fresh downstream firing.
+  rl [up-supersede] : clk(N) fuel(s(K)) up(V) downLive(V) downCurrent(V, W)
+      => clk(s(N)) fuel(K) up(s(V)) downEnded(V) downFresh(s(V)) .
+endm
+
+mod WHIPPLESCRIPT-VIEW-PINNED is
+  including VIEW-RETRACTION-STATE .
+
+  vars N K V : Cnt .
+
+  rl [down-derive] : clk(N) downFresh(V)
+      => clk(s(N)) downLive(V) downCurrent(V, V) .
+
+  --- The counterfactual: pin the downstream firing to its trigger's values, as
+  --- a rule firing is pinned. The old firing survives the retraction with its
+  --- derivation intact while the new one starts, so two derivations of one
+  --- view stand at once and a third arrives on the next upstream move.
+  rl [up-supersede-pinned] : clk(N) fuel(s(K)) up(V) downLive(V)
+      => clk(s(N)) fuel(K) up(s(V)) downLive(V) downFresh(s(V)) .
+endm

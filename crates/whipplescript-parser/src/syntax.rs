@@ -65,6 +65,7 @@ pub(crate) const TOP_LEVEL_DECLARATION_KEYWORDS: &[&str] = &[
     "coerce",
     "assert",
     "rule",
+    "view",
 ];
 
 /// The calendar recurrence patterns (`every <pattern> at <hh:mm>`). Same reason
@@ -1140,8 +1141,19 @@ impl Parser<'_> {
             self.parse_assert(std::mem::take(pending_tags), pending_description.take())
                 .map(Item::Assert)
         } else if self.at_ident("rule") {
-            self.parse_rule(std::mem::take(pending_tags), pending_description.take())
-                .map(Item::Rule)
+            self.parse_rule(
+                RuleKind::Rule,
+                std::mem::take(pending_tags),
+                pending_description.take(),
+            )
+            .map(Item::Rule)
+        } else if self.at_ident("view") {
+            self.parse_rule(
+                RuleKind::View,
+                std::mem::take(pending_tags),
+                pending_description.take(),
+            )
+            .map(Item::Rule)
         // TOP-LEVEL-ARMS-END (2 of 2)
         } else {
             None
@@ -3847,11 +3859,15 @@ impl Parser<'_> {
 
     fn parse_rule(
         &mut self,
+        kind: RuleKind,
         tags: Vec<TagDecl>,
         description: Option<StringLiteral>,
     ) -> Option<RuleDecl> {
-        let start = self.expect_keyword("rule")?.span.start;
-        let name = self.expect_ident("rule name")?;
+        let start = self.expect_keyword(kind.keyword())?.span.start;
+        let name = self.expect_ident(match kind {
+            RuleKind::Rule => "rule name",
+            RuleKind::View => "view name",
+        })?;
         let mut whens = Vec::new();
 
         while !self.is_at_end() && !self.at_arrow() {
@@ -3885,6 +3901,7 @@ impl Parser<'_> {
         };
         Some(RuleDecl {
             name,
+            kind,
             tags,
             description,
             whens,
@@ -3942,7 +3959,8 @@ impl Parser<'_> {
         while !(self.is_at_end()
             || self.at_arrow()
             || self.at_ident("when")
-            || self.at_ident("rule"))
+            || self.at_ident("rule")
+            || self.at_ident("view"))
         {
             text_end = self.peek()?.span.end;
             self.advance();

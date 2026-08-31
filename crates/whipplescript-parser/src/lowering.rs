@@ -2259,6 +2259,9 @@ fn lower_table(
             name: format!("table_{}", table.name.name),
             span: table.name.span,
         },
+        // A synthesized table seeder records once from `started`; nothing about
+        // it is a maintained derivation.
+        kind: RuleKind::Rule,
         tags: Vec::new(),
         description: None,
         whens: vec![WhenClause {
@@ -2395,6 +2398,7 @@ fn lower_rule(
     rule_bodies.push(rule.body.clone());
     ir.rules.push(IrRule {
         name: rule.name.name,
+        kind: rule.kind,
         whens: rule.whens.into_iter().map(lower_when_clause).collect(),
         body: rule.body.text,
         metadata,

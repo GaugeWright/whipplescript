@@ -1052,7 +1052,10 @@ fn format_coerce(coerce: CoerceDecl, formatted: &mut String) {
 fn format_rule(rule: RuleDecl, formatted: &mut String) {
     format_tags(&rule.tags, formatted);
     format_description(rule.description.as_ref(), formatted);
-    push_line(formatted, format!("rule {}", rule.name.name));
+    push_line(
+        formatted,
+        format!("{} {}", rule.kind.keyword(), rule.name.name),
+    );
     for when in rule.whens {
         push_line(formatted, format!("  when {}", when.text));
     }

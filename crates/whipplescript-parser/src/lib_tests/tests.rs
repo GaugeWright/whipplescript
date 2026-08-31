@@ -8906,6 +8906,14 @@ fn invalid_fixtures_have_actionable_diagnostics() {
             include_str!("../../../../examples/invalid/bad-agent.whip"),
         ),
         (
+            "view-effect-in-view",
+            include_str!("../../../../examples/invalid/view-effect-in-view.whip"),
+        ),
+        (
+            "view-terminal-in-view",
+            include_str!("../../../../examples/invalid/view-terminal-in-view.whip"),
+        ),
+        (
             "bad-record",
             include_str!("../../../../examples/invalid/bad-record.whip"),
         ),
@@ -19974,4 +19982,315 @@ fn keyword_tables_list_every_parsed_arm() {
             "CALENDAR_PATTERNS names `{pattern}`, which no arm parses"
         );
     }
+}
+
+/// DR-0083 Decision 3: a `view` may not create effects. The reason is a
+/// mechanism, not a preference — an effect id does not include its input, so a
+/// re-derived body dedupes against the effect already enqueued and that effect
+/// keeps its FIRST input for good. Modeled in
+/// `models/maude/view-derivation.maude` (the VIEW-WITH-EFFECT module).
+#[test]
+fn a_view_may_not_create_effects() {
+    let source = include_str!("../../../../examples/invalid/view-effect-in-view.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == diagnostic_code!("construct.view_effect")),
+        "expected the effect-in-view refusal, got: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// DR-0083 Decision 3: a view is re-evaluated for as long as its trigger
+/// stands, and a terminal is not something to re-evaluate.
+#[test]
+fn a_view_may_not_complete_or_fail_the_workflow() {
+    let source = include_str!("../../../../examples/invalid/view-terminal-in-view.whip");
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == diagnostic_code!("construct.view_terminal")),
+        "expected the terminal-in-view refusal, got: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// The shared refusal covering the statements that are neither `record` nor
+/// `case`: each would run on the first evaluation and then no-op or mislead on
+/// every one after it.
+#[test]
+fn a_view_may_only_record() {
+    let source = r#"workflow ViewOnlyRecords
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  done q
+
+  record QueueBacklog {
+    queue q.name
+    open 0
+  }
+}
+
+rule finish
+  when QueueBacklog as b
+=> {
+  complete result {
+    note b.queue
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == diagnostic_code!("construct.view_statement")),
+        "expected the statement-not-in-view refusal, got: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A view that stays inside its surface compiles, and the `.ir` snapshot names
+/// it a view rather than a rule — the kind is meaning, not decoration.
+#[test]
+fn a_view_within_its_surface_compiles_and_snapshots_as_a_view() {
+    let source = r#"workflow ViewCompiles
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class Ticket {
+  queue string
+  status string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+  record Ticket {
+    queue "payments"
+    status "open"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  record QueueBacklog {
+    queue q.name
+    open count(Ticket where status == "open")
+  }
+}
+
+rule finish
+  when QueueBacklog as b where b.open > 0
+=> {
+  complete result {
+    note b.queue
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert_eq!(compiled.diagnostics, Vec::new());
+    let ir = compiled.ir.expect("a view within its surface compiles");
+    let view = ir
+        .rules
+        .iter()
+        .find(|rule| rule.name == "backlog_by_queue")
+        .expect("the view is in the IR");
+    assert_eq!(view.kind, crate::RuleKind::View);
+    assert_eq!(
+        ir.rules
+            .iter()
+            .find(|rule| rule.name == "seed")
+            .map(|rule| rule.kind),
+        Some(crate::RuleKind::Rule)
+    );
+    assert!(
+        ir.to_snapshot().contains("view backlog_by_queue"),
+        "the snapshot must name a view a view"
+    );
+}
+
+/// An `after` block waits on an effect, and a view may not create one. The
+/// effect and its `after` are sibling statements, so both refusals fire; this
+/// pins the `after` arm specifically, which the new-refusals sweep found
+/// unexercised.
+#[test]
+fn a_view_may_not_have_an_after_block() {
+    let source = r#"use std.script
+workflow ViewAfterBlock
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  exec "sh -c 'echo hi'" as job
+
+  after job succeeds {
+    record QueueBacklog {
+      queue q.name
+      open 0
+    }
+  }
+}
+
+rule finish
+  when QueueBacklog as b
+=> {
+  complete result {
+    note b.queue
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic.code
+            == diagnostic_code!("construct.view_effect")
+            && diagnostic.message.contains("`after` block")),
+        "expected the after-block refusal, got: {:?}",
+        compiled.diagnostics
+    );
+}
+
+/// A `during`/`until` region paces the effects inside it and lapses when its
+/// condition breaks. A view has no effects to pace, so it may not carry one.
+/// Also found unexercised by the sweep.
+#[test]
+fn a_view_may_not_carry_a_region() {
+    let source = r#"workflow ViewRegion
+
+output result Done
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  during exists(Queue) {
+    record QueueBacklog {
+      queue q.name
+      open 0
+    }
+  } on lapse {
+    record QueueBacklog {
+      queue q.name
+      open 0
+    }
+  }
+}
+
+rule finish
+  when QueueBacklog as b
+=> {
+  complete result {
+    note b.queue
+  }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == diagnostic_code!("construct.view_region")),
+        "expected the region refusal, got: {:?}",
+        compiled.diagnostics
+    );
 }

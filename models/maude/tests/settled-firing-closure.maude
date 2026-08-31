@@ -1,0 +1,37 @@
+load ../settled-firing-closure.maude
+
+--- Coverage: a firing reaches closure.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init =>* closed(f1) RESIDUAL:Cfg .
+
+--- Coverage: the continuation commits STRICTLY BEFORE the closure in log
+--- order. Closure is the consequence of the continuation, not a race with it.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init =>* contAt(f1, M:Cnt) closedAt(f1, N:Cnt) RESIDUAL:Cfg
+  such that lt(M:Cnt, N:Cnt) .
+
+--- Coverage: two firings close independently.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init2 =>* closed(f1) closed(f2) RESIDUAL:Cfg .
+
+--- Invariant: a firing is never closed with an effect still in flight.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init =>* closed(f1) eff(f1, queued) RESIDUAL:Cfg .
+
+--- Invariant [the property]: a firing is never closed while it still owes its
+--- continuation. This is the condition whose removal stalls the chain, and
+--- whose removal fails 38 workspace tests.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init =>* closed(f1) contPending(f1) RESIDUAL:Cfg .
+
+--- Invariant: a firing closes exactly once.
+search [1] in WHIPPLESCRIPT-FIRING-CLOSURE :
+  init =>* closedAt(f1, M:Cnt) closedAt(f1, N:Cnt) RESIDUAL:Cfg
+  such that M:Cnt =/= N:Cnt .
+
+--- Bite: drop the condition and close on settlement alone, and the firing is
+--- closed WITH its continuation still pending -- the `after` block that can
+--- now never run. Unreachable above, reachable here, so the invariant is not
+--- vacuous.
+search [1] in WHIPPLESCRIPT-EAGER-CLOSE :
+  initEager =>* closed(f1) contPending(f1) RESIDUAL:Cfg .

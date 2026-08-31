@@ -154,6 +154,23 @@ termination-measure.maude        DR-0081 §2: a ring that advances in one
                                  its token is admitted; unbounded, preserving,
                                  carry-through-only, and direction-disagreeing
                                  rings are never admitted
+view-derivation.maude            views vs one-shot rules: a `rule` evaluates its
+                                 body once and closes, a `view` re-derives when
+                                 the set it queries moves, and its derived fact
+                                 SUPERSEDES keyed by firing identity while the
+                                 commit log appends; today's semantics reaches
+                                 both states that ruling forbids, and a view
+                                 that could enqueue an effect keeps its first
+                                 input for good, which is why it may not
+view-retraction.maude            a view whose trigger is retracted ends and
+                                 withdraws its derivation; a cascade therefore
+                                 holds ONE downstream value, where pinning the
+                                 downstream firing accumulates two
+settled-firing-closure.maude     closure by completion (DR-0043 Decision 2's
+                                 missing case): a firing may close once its
+                                 effects have settled AND it has committed
+                                 since, and closing on settlement alone strands
+                                 the continuation
 rule-autofail.maude              rule-level unhandled-failure auto-fail (R1): in a
                                  self-terminating workflow an unhandled effect
                                  failure auto-fails the instance; handled failures,

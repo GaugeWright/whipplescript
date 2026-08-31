@@ -36,9 +36,9 @@ credential-wrap-carriage.maude	SSSSNNNNN
 delegated-settings-authority.maude	SSNN
 delegated-wire-lifecycle.maude	SSSNNN
 discriminant-schema.maude	SSSSSNNN
+effect-cycle-pacing.maude	SSSSNNNNNN
 effect-dependencies.maude	NSNSSS
 effect-error.maude	SSSSNNNSN
-effect-cycle-pacing.maude	SSSSNNNNNN
 effect-key.maude	SSSNNSNN
 envelope-composition.maude	SNSSNSSNSNSNSSSNSSNSNSNSNSNNSSNN
 envelope-minting.maude	SSNNSNSNSNNSSS
@@ -63,8 +63,8 @@ infoflow-integrity.maude	SSSSNNNN
 infoflow-output-integrity.maude	SSSNNN
 infoflow-package.maude	SSSNN
 infoflow-reader-sets.maude	SSSSNNNN
-infoflow-redaction.maude	SSNNN
 infoflow-redact-provenance.maude	SSNN
+infoflow-redaction.maude	SSNNN
 infoflow-signal-carriage.maude	SSSSNNNNN
 infoflow-signature.maude	SSNNNSNNN
 infoflow-staging.maude	SSNN
@@ -72,12 +72,12 @@ invoke-result-typing.maude	SSSSNNSSSN
 lowering-class-lifecycle.maude	SSSSSSSSSSSNNNNNNNNNNNNNNN
 lowering-runtime-handoff.maude	SSSSSNNNNNNNNNNNNN
 mcp-admission.maude	SSSSSSNNNNNN
-model-visible-world.maude	SNSSNSSSNSSNSSNS
 merge-confluence.maude	SNSNNN
 merge-slice.maude	SSNSNSNSNS
 messaging-capability-report.maude	SSSSNNNN
 milestone-signal.maude	SSNNN
 model-trust-admissibility.maude	SSSNNNNNNSS
+model-visible-world.maude	SNSSNSSSNSSNSSNS
 native-provider-lifecycle.maude	SSSNN
 op-undo.maude	SNSSSN
 owned-harness-compaction.maude	SN
@@ -104,6 +104,7 @@ script-hard-off.maude	SNNNNNSS
 seam-crossing.maude	SSNNSS
 selective-undo.maude	SNSSN
 settle-stopping.maude	NSSSN
+settled-firing-closure.maude	SSSNNNS
 skills-never-grant.maude	SSNN
 stat-cache.maude	SNSNSSNS
 std-construct-authorization.maude	SSSNNNNSNSNN
@@ -123,10 +124,12 @@ tracker-projection.maude	SSNNN
 tracker-readiness.maude	SSSNNNN
 turn-access-grant.maude	SSNN
 turn-witness.maude	SNNSSS
+view-derivation.maude	SSSSSNNNNSSSN
+view-retraction.maude	SSSNNS
 workflow-authority-attenuation.maude	SSSNNN
 workflow-composition.maude	SNSNSNSNNSSS
 workflow-revision.maude	SSSSNNNNN
 workflow-runtime-marker-reresolution.maude	SSSNNN
 workflow-scoping.maude	SSSSSSNNN
-workstream.maude	SSSNNNNN
 workstream-boundary.maude	SNSNSNSNSNSNSNSNSNSNSNSN
+workstream.maude	SSSNNNNN

@@ -1,0 +1,124 @@
+--- When a committed firing is CLOSED, and why the condition is what it is.
+---
+--- DR-0043 Decision 2 specifies the re-lowering set as live matches union
+--- OPEN firings, and the firing lifecycle as
+--- `admitted -> residue -> closed by completion | lapse | cancel`. Only
+--- "closed by cancel" was ever built: the kernel re-lowers every recorded
+--- firing on every pass, forever. This model is about the missing case,
+--- closure by completion, and specifically about the ONE condition that makes
+--- it safe.
+---
+--- The condition. A firing may close when its effects have settled AND its
+--- continuation has committed since. Settlement alone is not enough, and the
+--- difference is not cosmetic: a firing whose effect has settled but whose
+--- `after` block has not yet run still OWES that block, and closing it there
+--- means the block never runs at all. The chain stalls silently -- no error,
+--- no diagnostic, just a workflow that stops advancing. That was hit live
+--- while prototyping the skip, and removing the condition from the prototype
+--- fails 38 workspace tests.
+---
+--- `contPending` is what makes the property expressible as a positive search
+--- rather than an absence: a firing carries the marker from its commit until
+--- its continuation commits, so "closed while still owing" is a state you can
+--- name, not a negation you have to encode.
+---
+--- Properties [models/maude/tests/settled-firing-closure.maude]:
+---   coverage: a firing closes; its continuation commits strictly BEFORE the
+---     closure in log order; two firings close independently.
+---   invariants: never closed with an effect still in flight; never closed
+---     while owing a continuation [the property]; a firing closes once.
+---   bite: the EAGER-CLOSE module drops the condition and closes on
+---     settlement alone. It reaches `closed` WITH the continuation still
+---     pending -- the stall -- which the guarded module cannot.
+
+fmod FIRING-CLOSURE-STATE is
+  protecting BOOL .
+
+  sorts Cnt Fid EState Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+  vars A B : Cnt .
+  eq lt(z, s(A)) = true .
+  eq lt(A, z) = false .
+  eq lt(s(A), s(B)) = lt(A, B) .
+
+  ops f1 f2 : -> Fid [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The commit-sequence counter: closure order is a reachability search over
+  --- stamps, exactly as in pinned-progressions.maude.
+  op clk : Cnt -> Cfg [ctor] .
+
+  --- The firing's lifecycle, one cell at a time so that each transition is
+  --- at-most-once by construction rather than by a negative condition.
+  op admitted : Fid -> Cfg [ctor] .
+  op committed : Fid -> Cfg [ctor] .
+  op continued : Fid -> Cfg [ctor] .
+  op closed : Fid -> Cfg [ctor] .
+
+  --- The effect the firing enqueued, and the debt its `after` block is.
+  ops queued settled : -> EState [ctor] .
+  op eff : Fid EState -> Cfg [ctor] .
+  op contPending : Fid -> Cfg [ctor] .
+
+  --- Log stamps, so order claims are searchable.
+  op contAt : Fid Cnt -> Cfg [ctor] .
+  op closedAt : Fid Cnt -> Cfg [ctor] .
+
+  op init : -> Cfg .
+  eq init = clk(z) admitted(f1) .
+
+  op init2 : -> Cfg .
+  eq init2 = clk(z) admitted(f1) admitted(f2) .
+
+  op initEager : -> Cfg .
+  eq initEager = clk(z) admitted(f1) .
+endfm
+
+mod WHIPPLESCRIPT-FIRING-CLOSURE is
+  including FIRING-CLOSURE-STATE .
+
+  var N : Cnt .
+  var F : Fid .
+
+  --- The firing commits, enqueuing an effect and taking on the debt of the
+  --- `after` block that effect feeds.
+  rl [commit] : clk(N) admitted(F)
+      => clk(s(N)) committed(F) eff(F, queued) contPending(F) .
+
+  rl [settle] : clk(N) eff(F, queued) => clk(s(N)) eff(F, settled) .
+
+  --- The continuation commits, once, and discharges the debt.
+  rl [continue] : clk(N) committed(F) eff(F, settled) contPending(F)
+      => clk(s(N)) continued(F) eff(F, settled) contAt(F, N) .
+
+  --- Closure requires `continued`, not merely a settled effect. That single
+  --- requirement is the whole safety condition.
+  rl [close] : clk(N) continued(F) eff(F, settled)
+      => clk(s(N)) closed(F) eff(F, settled) closedAt(F, N) .
+endm
+
+mod WHIPPLESCRIPT-EAGER-CLOSE is
+  including FIRING-CLOSURE-STATE .
+
+  var N : Cnt .
+  var F : Fid .
+
+  rl [commit] : clk(N) admitted(F)
+      => clk(s(N)) committed(F) eff(F, queued) contPending(F) .
+
+  rl [settle] : clk(N) eff(F, queued) => clk(s(N)) eff(F, settled) .
+
+  rl [continue] : clk(N) committed(F) eff(F, settled) contPending(F)
+      => clk(s(N)) continued(F) eff(F, settled) contAt(F, N) .
+
+  --- The bite. Closure on settlement ALONE -- the condition dropped. The
+  --- firing's `committed` cell is consumed while its continuation is still
+  --- pending, so the `after` block can never run: the silent stall.
+  rl [close-eager] : clk(N) committed(F) eff(F, settled)
+      => clk(s(N)) closed(F) eff(F, settled) closedAt(F, N) .
+endm

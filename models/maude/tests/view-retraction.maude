@@ -1,0 +1,34 @@
+load ../view-retraction.maude
+
+--- Coverage: a retracted trigger ends the view.
+search [1] in WHIPPLESCRIPT-VIEW-RETRACTION :
+  initSingle =>* viewEnded(v1) trigRetracted(v1) RESIDUAL:Cfg .
+
+--- Coverage: after an upstream supersede the downstream derivation is the NEW
+--- one -- the cascade tracks rather than forking.
+search [1] in WHIPPLESCRIPT-VIEW-RETRACTION :
+  initCascade =>* up(s(z)) downCurrent(s(z), s(z)) RESIDUAL:Cfg .
+
+--- Coverage: the superseded firing is recorded as ENDED, not silently
+--- dropped -- an operator can see that the derivation was withdrawn.
+search [1] in WHIPPLESCRIPT-VIEW-RETRACTION :
+  initCascade =>* downEnded(z) downCurrent(s(z), s(z)) RESIDUAL:Cfg .
+
+--- Invariant: an ended view never holds a derivation. This is the ruling
+--- stated as the thing that cannot happen.
+search [1] in WHIPPLESCRIPT-VIEW-RETRACTION :
+  initSingle =>* viewEnded(v1) current(v1, V:Cnt) RESIDUAL:Cfg .
+
+--- Invariant: a cascade never holds two downstream derivations at once. One
+--- view, one current value, however many times the level above it moves.
+search [1] in WHIPPLESCRIPT-VIEW-RETRACTION :
+  initCascade =>* downCurrent(V:Cnt, X:Cnt) downCurrent(W:Cnt, Y:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+
+--- Bite: pin the downstream firing instead, as a rule firing is pinned, and
+--- two derivations of one view stand at once. Unreachable above, reachable
+--- here, so the invariant is not vacuous -- and this is the accumulation that
+--- makes the ruling necessary rather than merely tidy.
+search [1] in WHIPPLESCRIPT-VIEW-PINNED :
+  initPinned =>* downCurrent(V:Cnt, X:Cnt) downCurrent(W:Cnt, Y:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .

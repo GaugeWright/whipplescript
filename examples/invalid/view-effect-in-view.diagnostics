@@ -1,0 +1,12 @@
+warning[effect.unhandled_failure]: effect `job`'s failure is unhandled in rule `backlog_by_queue`; if it fails or times out, the instance will auto-fail with a generic reason
+   --> examples/invalid/view-effect-in-view.whip:35:3
+   |
+35 |   exec "sh -c 'echo hi'" as job
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: handle it with `after job fails { … }` (typed failure or recovery) or observe every outcome with `after job completes`
+error[construct.view_effect]: `view backlog_by_queue` may not create effects: a view's body is re-evaluated whenever the facts it reads change, but an effect's identity is fixed at its first evaluation, so this effect would keep its original input for good
+   --> examples/invalid/view-effect-in-view.whip:35:3
+   |
+35 |   exec "sh -c 'echo hi'" as job
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: record a fact here and let a `rule` match that fact and act on it — views derive, rules act

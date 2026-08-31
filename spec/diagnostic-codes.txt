@@ -57,6 +57,10 @@ construct.unknown_option COVERED
 construct.unknown_provider PROVISIONAL
 construct.unknown_provider_kind COVERED
 construct.unknown_reference PROVISIONAL
+construct.view_effect COVERED
+construct.view_region PROVISIONAL
+construct.view_statement PROVISIONAL
+construct.view_terminal COVERED
 effect.ambiguous_outcome_predicate PROVISIONAL
 effect.binding_type_conflict PROVISIONAL
 effect.multiple_leases PROVISIONAL

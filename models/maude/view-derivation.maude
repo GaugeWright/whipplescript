@@ -1,0 +1,191 @@
+--- Views and one-shot rules: the live-view ruling on DR-0043's surface.
+---
+--- The semantic under test. A `rule` firing evaluates its body ONCE, against
+--- the fact base as it stands at that moment, and is then CLOSED; nothing
+--- re-evaluates it, so the value it recorded is final. A `view` firing
+--- re-evaluates whenever the set it queries moves, and its derived fact
+--- SUPERSEDES the previous one, keyed by the firing identity -- while the
+--- commit log still APPENDS, because the event log is append-only and the
+--- history of a maintained derivation must stay auditable.
+---
+--- That pairing is the whole decision, and the two halves are modeled
+--- separately for exactly that reason: `recordedAt` is the log, `current` is
+--- the fact base. A search can therefore see two log entries and one current
+--- value in the same state, which is what supersede MEANS.
+---
+--- Why this matters beyond ergonomics: one-shot is what lets a settled firing
+--- be skipped rather than re-lowered. Today every committed firing re-lowers
+--- on every pass and re-derives its whole body, so a plain rule silently
+--- behaves like a view -- measured at 1896 lowerings where 84 were useful,
+--- unbounded for a service workflow. Making `rule` one-shot turns the skip
+--- from an optimisation into the implementation of the semantics, and removes
+--- the query-free restriction that a skip would otherwise have to impose on
+--- rules containing `open`.
+---
+--- Modeling choices worth stating:
+---   * The queried set is one counter, not a fact multiset. Nothing here turns
+---     on WHICH facts joined the set, only that the count a body reads moved,
+---     so the counter is the whole of the observable.
+---   * Growth is fuel-bounded. The state space must be finite for the
+---     No-solution searches to mean anything.
+---   * `viewFresh` becomes `viewLive` on first derivation, and `ruleOpen`
+---     becomes `ruleClosed` on commit. Both encode "at most once" as state
+---     rather than as a negative application condition, which Maude's rl does
+---     not have.
+---
+--- Properties [models/maude/tests/view-derivation.maude]:
+---   coverage: a view tracks the set; a closed rule does NOT track it; two log
+---     entries coexist with one current value [supersede]; two view firings
+---     hold DIVERGENT current values [identity keying]; both semantics live in
+---     one instance at once.
+---   invariants: a rule never logs two different values [one-shot]; a view
+---     never holds two current cells [supersede]; a closed rule never reopens.
+---   bite: the LIVE-RULE module models TODAY's semantics -- every committed
+---     firing re-derives, and a changed value is a NEW content-keyed fact
+---     rather than a replacement -- and reaches both states the module above
+---     forbids. Without it the two invariants would be vacuous.
+
+fmod VIEW-DERIVATION-STATE is
+  protecting BOOL .
+
+  sorts Cnt Fid Cfg .
+
+  op z : -> Cnt [ctor] .
+  op s : Cnt -> Cnt [ctor] .
+  op lt : Cnt Cnt -> Bool .
+  vars A B : Cnt .
+  eq lt(z, s(A)) = true .
+  eq lt(A, z) = false .
+  eq lt(s(A), s(B)) = lt(A, B) .
+
+  --- One rule firing and two view firings. Two views are what show that a
+  --- current value is keyed by FIRING, not by the derived class.
+  ops r1 v1 v2 : -> Fid [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The commit-sequence counter: every world-visible transition stamps the
+  --- next number, so log-order claims are reachability searches over stamps.
+  op clk : Cnt -> Cfg [ctor] .
+
+  --- Fuel: how many more facts may join the queried set, and -- in the bite
+  --- module only -- how many more times a firing may re-derive.
+  op fuel : Cnt -> Cfg [ctor] .
+  op dfuel : Cnt -> Cfg [ctor] .
+
+  --- The size of the set every body counts.
+  op qset : Cnt -> Cfg [ctor] .
+
+  --- A one-shot rule firing, before and after its single evaluation.
+  op ruleOpen : Fid -> Cfg [ctor] .
+  op ruleClosed : Fid -> Cfg [ctor] .
+
+  --- A view firing: before its first derivation, and maintained thereafter.
+  op viewFresh : Fid -> Cfg [ctor] .
+  op viewLive : Fid -> Cfg [ctor] .
+
+  --- The append-only log entry [firing, value, stamp] and the single current
+  --- fact [firing, value]. The split IS the decision.
+  op recordedAt : Fid Cnt Cnt -> Cfg [ctor] .
+  op current : Fid Cnt -> Cfg [ctor] .
+
+  --- One rule and one view over the same set, which may grow twice.
+  --- The input an enqueued effect captured. An effect id derives from
+  --- [instance, version, epoch, rule, node, identity] and NOT from its input,
+  --- so a re-lowered effect dedupes against the one already enqueued: this
+  --- cell is written once and can never be rewritten.
+  op effInput : Fid Cnt -> Cfg [ctor] .
+
+  op init : -> Cfg .
+  eq init = clk(z) fuel(s(s(z))) qset(s(z)) ruleOpen(r1) viewFresh(v1) .
+
+  --- Two view firings over the same set: their current values must be able to
+  --- diverge, which is what keying by firing identity means.
+  op init2 : -> Cfg .
+  eq init2 = clk(z) fuel(s(s(z))) qset(s(z)) viewFresh(v1) viewFresh(v2) .
+
+  --- The bite fixture: today's semantics, with derivation fuel of its own
+  --- because a firing that never closes would otherwise re-derive forever.
+  op initLive : -> Cfg .
+  eq initLive = clk(z) fuel(s(z)) qset(s(z)) dfuel(s(s(z))) ruleOpen(r1) .
+
+  --- The fixture for the refusal below: a view that is ALLOWED to enqueue an
+  --- effect, which the checker rejects.
+  op initEff : -> Cfg .
+  eq initEff = clk(z) fuel(s(s(z))) qset(s(z)) viewFresh(v1) .
+endfm
+
+mod WHIPPLESCRIPT-VIEW-DERIVATION is
+  including VIEW-DERIVATION-STATE .
+
+  vars N K V W : Cnt .
+  var F : Fid .
+
+  --- The queried set grows. This stands for another rule recording a fact,
+  --- and is the only source of change the bodies below can observe.
+  rl [grow] : clk(N) fuel(s(K)) qset(V)
+      => clk(s(N)) fuel(K) qset(s(V)) .
+
+  --- A one-shot rule evaluates its body once, against the set as it stands,
+  --- and closes. No rule rewrites a closed firing: that absence is what makes
+  --- the recorded value final, and it is what a settled-firing skip does in
+  --- the kernel.
+  rl [rule-commit] : clk(N) ruleOpen(F) qset(V)
+      => clk(s(N)) ruleClosed(F) qset(V) recordedAt(F, V, N) current(F, V) .
+
+  --- A view's first derivation. `viewFresh` is consumed, so this fires at
+  --- most once per firing and cannot mint a second current cell.
+  rl [view-first] : clk(N) viewFresh(F) qset(V)
+      => clk(s(N)) viewLive(F) qset(V) recordedAt(F, V, N) current(F, V) .
+
+  --- A view re-derives when the set has moved away from the value it holds.
+  --- The current cell is CONSUMED and replaced -- supersede, keyed by firing
+  --- identity -- while the log entry is appended beside the earlier one.
+  crl [view-derive] : clk(N) viewLive(F) qset(V) current(F, W)
+      => clk(s(N)) viewLive(F) qset(V) recordedAt(F, V, N) current(F, V)
+      if W =/= V .
+endm
+
+mod WHIPPLESCRIPT-LIVE-RULE is
+  including VIEW-DERIVATION-STATE .
+
+  vars N K V : Cnt .
+  var F : Fid .
+
+  rl [grow] : clk(N) fuel(s(K)) qset(V)
+      => clk(s(N)) fuel(K) qset(s(V)) .
+
+  --- Today's semantics, and the bite. A committed firing re-lowers on every
+  --- pass and re-derives its whole body; the derived fact is content-keyed,
+  --- so a CHANGED value is a new fact rather than a replacement, and the
+  --- firing never closes. Both states the module above forbids are reachable
+  --- here, which is what makes those two searches mean something.
+  rl [re-derive] : clk(N) ruleOpen(F) qset(V) dfuel(s(K))
+      => clk(s(N)) ruleOpen(F) qset(V) dfuel(K) recordedAt(F, V, N) current(F, V) .
+endm
+
+mod WHIPPLESCRIPT-VIEW-WITH-EFFECT is
+  including VIEW-DERIVATION-STATE .
+
+  vars N K V W : Cnt .
+  var F : Fid .
+
+  rl [grow] : clk(N) fuel(s(K)) qset(V)
+      => clk(s(N)) fuel(K) qset(s(V)) .
+
+  --- Why a `view` may not create effects. The effect is enqueued on the first
+  --- derivation, capturing the value the body read at that moment.
+  rl [view-first] : clk(N) viewFresh(F) qset(V)
+      => clk(s(N)) viewLive(F) qset(V) recordedAt(F, V, N) current(F, V)
+         effInput(F, V) .
+
+  --- The re-derivation moves the current value and CANNOT move the effect:
+  --- the re-lowered effect derives the same id and dedupes against the one
+  --- already enqueued, so it keeps its original input for good. The view goes
+  --- on maintaining a value the effect will never see, silently. Refusing the
+  --- effect at compile time is cheaper than explaining that.
+  crl [view-derive] : clk(N) viewLive(F) qset(V) current(F, W)
+      => clk(s(N)) viewLive(F) qset(V) recordedAt(F, V, N) current(F, V)
+      if W =/= V .
+endm

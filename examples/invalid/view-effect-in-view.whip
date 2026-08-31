@@ -1,0 +1,49 @@
+use std.script
+workflow ViewEffectInView
+
+output result Done
+
+# DR-0083 Decision 3: a `view` may not create effects. An effect id does not
+# include its input, so a re-derived body dedupes against the effect already
+# enqueued and that effect keeps its FIRST input for good — the view would go
+# on maintaining a value the effect can never see.
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  exec "sh -c 'echo hi'" as job
+
+  record QueueBacklog {
+    queue q.name
+    open 0
+  }
+}
+
+rule finish
+  when QueueBacklog as b
+=> {
+  complete result {
+    note b.queue
+  }
+}

@@ -1,0 +1,83 @@
+load ../view-derivation.maude
+
+--- Coverage: a view TRACKS its set. Grown twice from 1, the view's current
+--- value is 3.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* qset(s(s(s(z)))) current(v1, s(s(s(z)))) RESIDUAL:Cfg .
+
+--- Coverage: a closed rule does NOT track. It committed at 1, the set has
+--- since reached 3, and the rule still reads 1. This is the ruling in one
+--- state -- the value a `record` wrote is the value it wrote.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* ruleClosed(r1) qset(s(s(s(z)))) current(r1, s(z)) RESIDUAL:Cfg .
+
+--- Coverage [supersede]: TWO log entries for one view firing, in stamp order,
+--- coexisting with ONE current value -- the later one. The log appends, the
+--- fact is replaced.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* recordedAt(v1, s(z), M:Cnt) recordedAt(v1, s(s(z)), N:Cnt)
+           current(v1, s(s(z))) RESIDUAL:Cfg
+  such that lt(M:Cnt, N:Cnt) .
+
+--- Coverage [identity keying]: two view firings over the SAME set hold
+--- DIVERGENT current values -- one has re-derived and the other has not.
+--- Reachable only because a current cell is keyed by firing, not by class.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init2 =>* current(v1, s(z)) current(v2, s(s(z))) RESIDUAL:Cfg .
+
+--- Coverage: both semantics in one instance at one moment -- the rule frozen
+--- at what it saw, the view current with the set.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* ruleClosed(r1) current(r1, s(z)) current(v1, s(s(s(z)))) RESIDUAL:Cfg .
+
+--- Invariant [one-shot]: a rule firing never logs two DIFFERENT values. This
+--- is the property the current implementation violates; the bite below
+--- reaches exactly this state under today's semantics.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* recordedAt(r1, V:Cnt, M:Cnt) recordedAt(r1, W:Cnt, N:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+
+--- Invariant [supersede, strong form]: a view firing never holds two current
+--- cells AT ALL, equal ones included. One firing, one current value.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* current(v1, V:Cnt) current(v1, V:Cnt) RESIDUAL:Cfg .
+
+--- Invariant [supersede, divergent form]: and never two DIFFERENT ones, which
+--- is the accumulation the current implementation exhibits.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* current(v1, V:Cnt) current(v1, W:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+
+--- Invariant: a closed rule never reopens. Closure is what a settled-firing
+--- skip relies on, so it must be terminal.
+search [1] in WHIPPLESCRIPT-VIEW-DERIVATION :
+  init =>* ruleClosed(r1) ruleOpen(r1) RESIDUAL:Cfg .
+
+--- Bite: under TODAY's semantics one firing logs two different values -- a
+--- plain rule behaving as a live view. Unreachable above, reachable here, so
+--- the one-shot invariant is not vacuous.
+search [1] in WHIPPLESCRIPT-LIVE-RULE :
+  initLive =>* recordedAt(r1, V:Cnt, M:Cnt) recordedAt(r1, W:Cnt, N:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+
+--- Bite: and its derived facts ACCUMULATE -- two current values for one
+--- firing, the unbounded fact base the ruling removes. This is the state
+--- observed live: one firing of `count_them` leaving both {total:1} and
+--- {total:2} in the fact base.
+search [1] in WHIPPLESCRIPT-LIVE-RULE :
+  initLive =>* current(r1, V:Cnt) current(r1, W:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+
+--- Refusal [why a view may not create effects]: the view's current value has
+--- reached 3 while the effect it enqueued still carries 1. Reachable, and it
+--- is what the compile-time refusal exists to prevent.
+search [1] in WHIPPLESCRIPT-VIEW-WITH-EFFECT :
+  initEff =>* current(v1, s(s(s(z)))) effInput(v1, s(z)) RESIDUAL:Cfg .
+
+--- Refusal [and the effect can never catch up]: two captured inputs for one
+--- effect are unreachable, because the effect id does not depend on the input
+--- and the re-lowered effect dedupes. The staleness above is permanent.
+search [1] in WHIPPLESCRIPT-VIEW-WITH-EFFECT :
+  initEff =>* effInput(v1, V:Cnt) effInput(v1, W:Cnt) RESIDUAL:Cfg
+  such that V:Cnt =/= W:Cnt .
+

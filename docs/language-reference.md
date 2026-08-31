@@ -798,6 +798,12 @@ with a guard. A rule then commits a rewrite atomically. Each fact, each effect,
 each dependency, and each terminal action of the selected rule persists, or
 none of them persists.
 
+**A rule evaluates its body once.** It reads the fact base as it stands at the
+moment it fires, commits, and is then closed: the value it recorded is the value
+it recorded, and it is not revisited when the facts it read change afterwards.
+A `record` is a statement, not a subscription. When you want a derivation that
+keeps up with the facts, that is a [view](#views).
+
 <!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
 ```whip
 rule resolve_incident
@@ -1008,6 +1014,69 @@ discriminator. The design is DR-0032. The failure of an effect is the
 `EffectError` discriminated family. The family is a committed base and extras
 for each kind behind a static narrowing. The extras came from the P3 phase of
 the language-refinement campaign.
+
+### Views
+
+A **view** is a derivation that is maintained rather than recorded once. It
+re-derives whenever the set it queries moves, and the fact it derives
+**supersedes** the one it derived before, so a view firing holds exactly one
+current value. The commit log keeps every derivation, because the log is
+append-only and the history of a maintained value stays auditable; the fact base
+keeps only the current one.
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+view backlog_by_queue
+  when Queue as q
+=> {
+  record QueueBacklog {
+    queue q.name
+    open  count(Ticket where queue == q.name and status == "open")
+  }
+}
+```
+
+The `when` clause parameterises it: this is one maintained derivation per
+`Queue` fact, not one global view.
+
+**A view's body is `when`, `case`, and `record`.** The `case` there matches
+typed alternatives — an enum, a literal union, an optional, a tagged output
+union — as it does anywhere else; a comparison such as `open > 50` belongs in
+the view's `when … where` guard.
+
+**Refused inside a view:** effects, `complete`, `fail`, `done`, and `cancel`.
+The effect refusal has a mechanism behind it rather than a preference: an effect's identity is fixed at its first
+evaluation and does not include its input, so a re-derived body would dedupe
+against the effect already enqueued and that effect would keep its original
+input for good — the view would go on maintaining a value the effect could never
+see. Record a fact instead and let a rule act on it. **Views derive, rules act:**
+
+<!-- check: skip — excerpt; the surrounding program's declarations are not shown -->
+```whip
+rule page_on_backlog
+  when QueueBacklog as b where b.open > 50
+=> {
+  ask Ops to page "backlog critical for {{ b.queue }}" -> paged
+
+  after paged succeeds {
+    record Paged {
+      queue b.queue
+    }
+  }
+}
+```
+
+**A view ends when its trigger is retracted, and its derivation goes with it.**
+A view is a maintained statement about its subject; when the subject is
+withdrawn the statement is withdrawn too. This is the one place a view differs
+from a rule on more than re-derivation: a rule firing is pinned to its trigger's
+values and its record survives the trigger being consumed.
+
+Because a view's derived fact is superseded rather than updated in place, each
+new value is a new fact and therefore a new admission. A rule watching a view
+fires once per distinct derived value — a guard of `b.open > 50` fires on every
+value above 50, not once when it crosses. To act on the crossing, record a
+marker fact and guard on its absence.
 
 ### Unhandled-failure auto-fail (rule-level net)
 

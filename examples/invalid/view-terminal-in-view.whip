@@ -1,0 +1,40 @@
+workflow ViewTerminalInView
+
+output result Done
+
+# DR-0083 Decision 3: a `view` is re-evaluated for as long as its trigger
+# stands, and a terminal is not something to re-evaluate.
+
+class Done {
+  note string
+}
+
+class Queue {
+  name string
+}
+
+class QueueBacklog {
+  queue string
+  open int
+}
+
+rule seed
+  when started
+=> {
+  record Queue {
+    name "payments"
+  }
+}
+
+view backlog_by_queue
+  when Queue as q
+=> {
+  record QueueBacklog {
+    queue q.name
+    open 0
+  }
+
+  complete result {
+    note q.name
+  }
+}

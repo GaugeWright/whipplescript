@@ -1145,11 +1145,37 @@ impl TypeSyntax {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleDecl {
     pub name: Ident,
+    /// DR-0083: `rule` evaluates its body once and closes; `view` re-derives
+    /// while its trigger stands. Both parse identically, so everything
+    /// downstream that does not care about the difference keeps working on one
+    /// shape, and only the behaviours that DO care branch on this.
+    pub kind: RuleKind,
     pub tags: Vec<TagDecl>,
     pub description: Option<StringLiteral>,
     pub whens: Vec<WhenClause>,
     pub body: BlockSource,
     pub span: SourceSpan,
+}
+
+/// DR-0083 Decisions 1 and 2.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuleKind {
+    /// Evaluates its body once, against the fact base as it stands, and closes.
+    #[default]
+    Rule,
+    /// Re-derives whenever the set it queries moves, superseding its previous
+    /// derivation, until its trigger is retracted.
+    View,
+}
+
+impl RuleKind {
+    /// The source keyword, for diagnostics and for the `.ir` snapshot.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            RuleKind::Rule => "rule",
+            RuleKind::View => "view",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1892,6 +1918,10 @@ pub struct IrParam {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrRule {
     pub name: String,
+    /// DR-0083: `rule` (evaluate once, then closed) or `view` (re-derive while
+    /// the trigger stands). The kernel reads this to decide whether a settled
+    /// firing may be skipped and whether a derivation supersedes.
+    pub kind: RuleKind,
     pub whens: Vec<IrWhen>,
     pub body: String,
     pub metadata: IrRuleMetadata,
@@ -4287,7 +4317,10 @@ impl IrProgram {
         if !self.rules.is_empty() {
             push_line(&mut snapshot, "rules");
             for rule in &self.rules {
-                push_line(&mut snapshot, format!("  rule {}", rule.name));
+                push_line(
+                    &mut snapshot,
+                    format!("  {} {}", rule.kind.keyword(), rule.name),
+                );
                 for when in &rule.whens {
                     match &when.guard {
                         Some(guard) => push_line(
@@ -10988,12 +11021,135 @@ fn max_after_depth(statements: &[body::BodyStmt]) -> usize {
         .unwrap_or(0)
 }
 
+/// DR-0083 Decision 3: a `view` body is `when`, `case`, and `record`, and
+/// nothing else.
+///
+/// The effect refusal is the one with a mechanism behind it rather than a
+/// preference. An effect id is
+/// `H(instance, program version, revision epoch, rule, node, identity)` and
+/// does NOT include the effect's input — `spec/admission-and-idempotency.md`
+/// says so outright: resolved outputs feed the materialized input and a
+/// separate execution fingerprint, and "they do not enter the idempotency
+/// key". A view re-derives, so a second evaluation produces the SAME effect id,
+/// dedupes against the effect already enqueued, and that effect keeps its FIRST
+/// input for good. The view would go on maintaining a value the effect can
+/// never see, silently. Modeled as a reachable state in
+/// `models/maude/view-derivation.maude` (the VIEW-WITH-EFFECT module), where
+/// the current value reaches 3 while the effect still carries 1 and no second
+/// captured input is reachable — the staleness is permanent, not a race.
+///
+/// The match is exhaustive with no wildcard arm on purpose: a new `BodyStmt`
+/// must be ruled on here rather than silently becoming legal inside a view.
+fn validate_view_body(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if rule.kind != RuleKind::View {
+        return;
+    }
+    let name = &rule.name.name;
+    for statement in statements {
+        match statement {
+            // The whole of a view's surface. The `case` here matches typed
+            // alternatives, as it does anywhere else — a comparison belongs in
+            // the view's `when … where` guard.
+            body::BodyStmt::Record(_) => {}
+            body::BodyStmt::Case(block) => {
+                for branch in &block.branches {
+                    validate_view_body(rule, &branch.body, diagnostics);
+                }
+            }
+
+            body::BodyStmt::Effect(effect) => diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("construct.view_effect"),
+                    effect.span,
+                    format!(
+                        "`view {name}` may not create effects: a view's body is re-evaluated \
+                         whenever the facts it reads change, but an effect's identity is fixed \
+                         at its first evaluation, so this effect would keep its original input \
+                         for good"
+                    ),
+                )
+                .with_suggestion(
+                    "record a fact here and let a `rule` match that fact and act on it — views \
+                     derive, rules act",
+                ),
+            ),
+            body::BodyStmt::After(after) => diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("construct.view_effect"),
+                    after.span,
+                    format!(
+                        "`view {name}` may not have an `after` block: an `after` block waits on \
+                         an effect, and a view may not create one"
+                    ),
+                )
+                .with_suggestion(
+                    "record a fact here and let a `rule` match that fact and act on it — views \
+                     derive, rules act",
+                ),
+            ),
+            body::BodyStmt::Terminal(terminal) => diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("construct.view_terminal"),
+                    terminal.span,
+                    format!(
+                        "`view {name}` may not complete or fail the workflow: a view is \
+                         re-evaluated for as long as its trigger stands, and a terminal is not \
+                         something to re-evaluate"
+                    ),
+                )
+                .with_suggestion(
+                    "record a fact here and let a `rule` match it and reach the terminal",
+                ),
+            ),
+
+            // One shared refusal, because these are one refusal: a view derives
+            // a value, and none of these derives anything. Each would run on the
+            // first evaluation and then no-op or mislead on every one after it.
+            body::BodyStmt::Done { span, .. }
+            | body::BodyStmt::Cancel { span, .. }
+            | body::BodyStmt::Milestone { span, .. }
+            | body::BodyStmt::Redact { span, .. }
+            | body::BodyStmt::Declassify { span, .. } => diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("construct.view_statement"),
+                    *span,
+                    format!(
+                        "`view {name}` may only `record`: a view's body is `when`, `case`, and \
+                         `record`, because it is a derivation that re-runs, not a sequence of \
+                         actions that happen once"
+                    ),
+                )
+                .with_suggestion("move this into a `rule` that matches the fact this view records"),
+            ),
+            body::BodyStmt::Region(region) => diagnostics.push(
+                Diagnostic::error(
+                    diagnostic_code!("construct.view_region"),
+                    region.span,
+                    format!(
+                        "`view {name}` may not carry a `during`/`until` region: a region paces \
+                         the effects inside it and lapses when its condition breaks, and a view \
+                         has no effects to pace"
+                    ),
+                )
+                .with_suggestion(
+                    "move the region into a `rule` that matches the fact this view records",
+                ),
+            ),
+        }
+    }
+}
+
 fn analyze_rule(
     rule: &RuleDecl,
     body_ast: &body::BodyAst,
     semantic: &SemanticContext,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> IrRuleMetadata {
+    validate_view_body(rule, &body_ast.statements, diagnostics);
     let mut metadata = IrRuleMetadata {
         fact_reads: rule
             .whens

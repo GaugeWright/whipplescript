@@ -1,0 +1,6 @@
+error[construct.view_terminal]: `view backlog_by_queue` may not complete or fail the workflow: a view is re-evaluated for as long as its trigger stands, and a terminal is not something to re-evaluate
+   --> examples/invalid/view-terminal-in-view.whip:37:3
+   |
+37 |   complete result {
+   |   ^^^^^^^^^^^^^^^^^
+   = help: record a fact here and let a `rule` match it and reach the terminal

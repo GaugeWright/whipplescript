@@ -359,6 +359,29 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             chain
         };
         let pass_head_sequence = events.last().map(|event| event.sequence).unwrap_or(0);
+        // DR-0083 Decision 4 (supersede). `recorded_by_context` keeps only a
+        // firing's FIRST commit, which is what the suppression below wants. A
+        // view that has already superseded once needs the other thing: every
+        // fact id this firing has EVER recorded, so the value it currently
+        // holds can be withdrawn whichever derivation produced it.
+        let mut firing_recorded_facts: std::collections::HashMap<
+            (String, Option<String>, Option<String>),
+            std::collections::BTreeSet<String>,
+        > = std::collections::HashMap::new();
+        // DR-0083 Decision 6 (closure by completion). Every effect id a firing
+        // has EVER enqueued — not just its first commit's, because a
+        // continuation may enqueue another — the sequence of its LAST commit,
+        // and the sequence each effect settled at.
+        let mut firing_effect_ids: std::collections::HashMap<
+            (String, Option<String>, Option<String>),
+            std::collections::BTreeSet<String>,
+        > = std::collections::HashMap::new();
+        let mut firing_last_commit: std::collections::HashMap<
+            (String, Option<String>, Option<String>),
+            i64,
+        > = std::collections::HashMap::new();
+        let mut effect_terminal_sequence: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         let (recorded_firings, cancelled_firings): (Vec<RecordedFiring>, Vec<CancelledFiring>) = {
             let mut live: Vec<&EventView> = Vec::new();
             for event in &events {
@@ -418,6 +441,21 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
             }
             let mut recorded = Vec::new();
             for event in live {
+                if event.event_type == "effect.terminal" {
+                    if let Some(effect_id) = serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| {
+                            payload
+                                .get("effect_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                    {
+                        let slot = effect_terminal_sequence.entry(effect_id).or_insert(0);
+                        *slot = (*slot).max(event.sequence);
+                    }
+                    continue;
+                }
                 if event.event_type != "rule.committed" {
                     continue;
                 }
@@ -430,6 +468,25 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 let Some(firing) = committed_firings[&event.event_id].as_ref() else {
                     continue;
                 };
+                let closure_key = (
+                    firing.rule.clone(),
+                    firing.context.identity.clone(),
+                    firing.context.trigger_event_id.clone(),
+                );
+                firing_effect_ids
+                    .entry(closure_key.clone())
+                    .or_default()
+                    .extend(firing.effect_ids.iter().cloned());
+                let last = firing_last_commit.entry(closure_key).or_insert(0);
+                *last = (*last).max(event.sequence);
+                firing_recorded_facts
+                    .entry((
+                        firing.rule.clone(),
+                        firing.context.identity.clone(),
+                        firing.context.trigger_event_id.clone(),
+                    ))
+                    .or_default()
+                    .extend(firing.fact_ids.iter().cloned());
                 let key = (firing.rule.clone(), firing.context.identity.clone());
                 if cancelled.contains(&key) {
                     continue;
@@ -574,6 +631,69 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                 }
                 contexts.push(firing.context.clone());
             }
+            // DR-0083 Decision 6: CLOSURE BY COMPLETION. DR-0043 Decision 2
+            // specifies the re-lowering set as live matches union OPEN firings,
+            // with a lifecycle of `admitted -> residue -> closed by completion |
+            // lapse | cancel`. Only "closed by cancel" was ever built, so every
+            // committed firing re-lowered on every pass forever.
+            //
+            // A `rule` evaluates its body ONCE, so a settled firing must not be
+            // re-lowered at all — re-lowering would re-evaluate its queries
+            // against current facts and break exactly that promise. This is not
+            // an optimisation on top of the semantics; it IS the semantics.
+            //
+            // A `view` is never closed: re-deriving is what it is for. A region
+            // is never closed either — DR-0043 regions ADVANCE by re-lowering,
+            // and `pinned-progressions.maude` proves properties about that.
+            //
+            // The filter covers the whole context set rather than only the
+            // pinned re-entries, because a firing whose trigger fact is still
+            // live comes back through live matching every pass, which is where
+            // nearly all of the cost is. Matching is on the (rule, identity,
+            // admission) triple, so a re-admitted fact — same identity, fresh
+            // admitting event — is a NEW firing and is never closed (DR-0044).
+            //
+            // The commit-since-settlement condition is what makes this safe
+            // rather than merely cheap: a firing whose effect has settled but
+            // whose `after` block has not yet run still OWES that block, and
+            // closing it there means the block never runs and the chain stalls
+            // silently. Modeled in `models/maude/settled-firing-closure.maude`,
+            // whose EAGER-CLOSE module reaches exactly that state.
+            if rule.kind == whipplescript_parser::RuleKind::Rule && rule.metadata.region.is_none() {
+                contexts.retain(|context| {
+                    let key = (
+                        rule.name.clone(),
+                        context.identity.clone(),
+                        context.trigger_event_id.clone(),
+                    );
+                    let Some(&last_commit) = firing_last_commit.get(&key) else {
+                        // Never committed: nothing to close.
+                        return true;
+                    };
+                    let owned = firing_effect_ids.get(&key);
+                    let all_settled = owned.is_none_or(|ids| {
+                        ids.iter().all(|effect_id| {
+                            effects.iter().any(|effect| {
+                                &effect.effect_id == effect_id
+                                    && matches!(
+                                        effect.status.as_str(),
+                                        "completed" | "failed" | "timed_out" | "cancelled"
+                                    )
+                            })
+                        })
+                    });
+                    let last_settlement = owned
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|effect_id| effect_terminal_sequence.get(effect_id))
+                                .copied()
+                                .max()
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    !(all_settled && last_commit > last_settlement)
+                });
+            }
             groups.push(LoweringGroup {
                 ir,
                 rule_name: rule.name.clone(),
@@ -688,6 +808,84 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
                     lowering
                         .facts
                         .retain(|fact| !recorded.fact_ids.contains(&fact.fact_id));
+                }
+                // DR-0083 Decision 4: a view's derived fact SUPERSEDES its
+                // predecessor, keyed by firing identity. Anything surviving the
+                // suppression above is a derivation that MOVED, so the value
+                // this firing currently holds is withdrawn in the same commit
+                // that records the new one. One current value per view firing;
+                // the commit log keeps both, because the log is append-only and
+                // the history of a maintained derivation must stay auditable.
+                //
+                // Nothing happens when the derivation did not move: the
+                // re-derived fact is content-keyed and byte-identical, the
+                // suppression drops it, and there is no new value to supersede
+                // anything with.
+                // DR-0083 Decision 5: a view whose trigger has been retracted ENDS,
+                // and its derivation goes with it. DR-0043 pins a rule firing to
+                // its trigger's values so a consumed trigger cannot strand a
+                // continuation — the ch. 15 stall. A view has no continuations,
+                // so that reason does not reach it, and the opposite rule is
+                // available: a view is a maintained statement about its subject,
+                // and a subject that is gone leaves no statement behind.
+                //
+                // Without this a cascade accumulates. A recorded fact's key is a
+                // hash of its value (`record_fact_key`), so every upstream
+                // supersede mints a new key and admits a DISTINCT downstream
+                // firing; had the old one survived, it would go on deriving from
+                // its stale pinned value beside the new one, and the number of
+                // firings would grow with every upstream move.
+                let view_trigger_retracted = rule.kind == whipplescript_parser::RuleKind::View
+                    && !context.bindings.is_empty()
+                    && context
+                        .bindings
+                        .iter()
+                        .any(|(_, fact)| !active_fact_ids.contains(fact.fact_id.as_str()));
+                if view_trigger_retracted {
+                    lowering.facts.clear();
+                    lowering.effects.clear();
+                    lowering.dependencies.clear();
+                    lowering.terminal = None;
+                    if let Some(previous) = firing_recorded_facts.get(&(
+                        rule.name.clone(),
+                        context.identity.clone(),
+                        context.trigger_event_id.clone(),
+                    )) {
+                        for fact_id in previous {
+                            if active_fact_ids.contains(fact_id.as_str())
+                                && !lowering.consumed_fact_ids.contains(fact_id)
+                            {
+                                lowering.consumed_fact_ids.push(fact_id.clone());
+                            }
+                        }
+                    }
+                }
+                if !view_trigger_retracted
+                    && rule.kind == whipplescript_parser::RuleKind::View
+                    && !lowering.facts.is_empty()
+                {
+                    if let Some(previous) = firing_recorded_facts.get(&(
+                        rule.name.clone(),
+                        context.identity.clone(),
+                        context.trigger_event_id.clone(),
+                    )) {
+                        let fresh: std::collections::BTreeSet<&str> = lowering
+                            .facts
+                            .iter()
+                            .map(|fact| fact.fact_id.as_str())
+                            .collect();
+                        for fact_id in previous {
+                            if fresh.contains(fact_id.as_str()) {
+                                continue;
+                            }
+                            if !active_fact_ids.contains(fact_id.as_str()) {
+                                continue;
+                            }
+                            if !lowering.consumed_fact_ids.contains(fact_id) {
+                                lowering.consumed_fact_ids.push(fact_id.clone());
+                            }
+                        }
+                    }
                 }
                 report
                     .branch_reports
@@ -1256,6 +1454,9 @@ struct RecordedFiring {
     /// suppressed — re-recording a since-consumed fact is a NEW firing's
     /// act (DR-0044 re-admission), never a replay's.
     fact_ids: Vec<String>,
+    /// DR-0083 Decision 6: the effect ids this firing's commit enqueued. A
+    /// firing may not close while any of them is still in flight.
+    effect_ids: Vec<String>,
 }
 
 /// The three per-event payload derivations `step_instance_generic` memoizes
@@ -1291,13 +1492,41 @@ fn recorded_firing_from_payload(payload_json: &str) -> Option<RecordedFiring> {
         .get("revision_epoch")
         .and_then(Value::as_i64)
         .unwrap_or_default();
+    // `rule_commit_payload` writes `facts` as an array of OBJECTS carrying
+    // `fact_id` alongside the fact's name, key, and value. This read used
+    // `Value::as_str` on the elements, which matches none of them, so
+    // `fact_ids` was ALWAYS empty and the re-derivation suppression that
+    // consumes it has never suppressed anything. It went unnoticed because it
+    // is redundant with content-keyed idempotency: a re-lowering re-emits the
+    // byte-identical fact, the commit is byte-identical, and the replay guard
+    // drops it anyway. DR-0083's supersede is the first thing that actually
+    // needs these ids, which is what surfaced it. The string arm stays for a
+    // payload that ever carried bare ids.
     let fact_ids = payload
         .get("facts")
         .and_then(Value::as_array)
         .map(|facts| {
             facts
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|fact| {
+                    fact.as_str()
+                        .or_else(|| fact.get("fact_id").and_then(Value::as_str))
+                })
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let effect_ids = payload
+        .get("effects")
+        .and_then(Value::as_array)
+        .map(|effects| {
+            effects
+                .iter()
+                .filter_map(|effect| {
+                    effect
+                        .as_str()
+                        .or_else(|| effect.get("effect_id").and_then(Value::as_str))
+                })
                 .map(str::to_owned)
                 .collect()
         })
@@ -1308,6 +1537,7 @@ fn recorded_firing_from_payload(payload_json: &str) -> Option<RecordedFiring> {
         version_id,
         epoch,
         fact_ids,
+        effect_ids,
     })
 }
 
@@ -1510,30 +1740,58 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
 }
 
 pub fn lowering_idempotency_key(lowering: &OwnedLowering) -> String {
-    let mut ids = Vec::new();
-    ids.extend(lowering.facts.iter().map(|fact| fact.fact_id.as_str()));
+    let mut ids: Vec<String> = Vec::new();
+    // Each id carries what the lowering DOES with it. Recorded and consumed ids
+    // were concatenated into one flat list, so a lowering that RECORDS fact X
+    // and one that CONSUMES fact X derived the same key — and the commit that
+    // arrived second was rejected as "idempotency key reused with a DIFFERENT
+    // payload", the loud error that names itself a whip bug.
+    //
+    // It was reachable before views (one firing recording X, a later commit of
+    // the same firing consuming X and nothing else) and it is immediate with
+    // them, because a view's withdrawal consumes exactly the fact its
+    // derivation recorded. Marking the role is the whole fix.
+    //
+    // This changes commit keys for any lowering that consumes a fact, so an
+    // instance mid-flight in an existing store could in principle re-lower to a
+    // key that does not match its own earlier commit and append a duplicate
+    // `rule.committed`. MEASURED, and it does not happen in the shape that
+    // looked most at risk: an instance carrying a consumed fact, a settled
+    // effect, and an unrun continuation was driven across the change and
+    // committed exactly what both single-binary controls did (`seed=1 work=2
+    // finish=1`), with no collision diagnostic. Once a fact is consumed it is
+    // inactive, so the re-lowering drops the consume from its set and derives a
+    // different lowering anyway — the duplicate largely prevents itself. Facts
+    // are content-keyed regardless, so the fact base cannot diverge.
+    ids.extend(
+        lowering
+            .facts
+            .iter()
+            .map(|fact| format!("record:{}", fact.fact_id)),
+    );
     ids.extend(
         lowering
             .consumed_fact_ids
             .iter()
-            .map(|fact_id| fact_id.as_str()),
+            .map(|fact_id| format!("consume:{fact_id}")),
     );
     ids.extend(
         lowering
             .effects
             .iter()
-            .map(|effect| effect.effect_id.as_str()),
+            .map(|effect| format!("effect:{}", effect.effect_id)),
     );
     ids.extend(
         lowering
             .dependencies
             .iter()
-            .map(|dependency| dependency.dependency_id.as_str()),
+            .map(|dependency| format!("dependency:{}", dependency.dependency_id)),
     );
     if let Some(terminal) = &lowering.terminal {
-        ids.push(terminal.idempotency_key.as_str());
+        ids.push(format!("terminal:{}", terminal.idempotency_key));
     }
-    idempotency_key(&ids)
+    let parts: Vec<&str> = ids.iter().map(String::as_str).collect();
+    idempotency_key(&parts)
 }
 
 /// Applies `cancel <binding>` operations committed by a rule: pending
