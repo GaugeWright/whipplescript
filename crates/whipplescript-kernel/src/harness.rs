@@ -767,6 +767,39 @@ pub const ANTHROPIC_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
 pub const OPENAI_CREDENTIAL_ENV: &[&str] = &["OPENAI_API_KEY"];
 pub const XAI_CREDENTIAL_ENV: &[&str] = &["XAI_API_KEY"];
 
+/// Point a provider sidecar at whip's local credential proxy, and take its own
+/// family's key away (DR-0053 tracker: retire the `harness.rs` sidecar
+/// concession).
+///
+/// The concession this retires is documented on `CONTROL_PLANE_SECRET_ENV`
+/// above: a sidecar inherits its OWN family's key, because the `codex` and
+/// `claude` CLIs are third-party binaries that cannot be handed a sentinel to
+/// resolve. They do accept a BASE URL, so the sidecar is pointed at a
+/// localhost front-end for `CustodyOp::Request` and given no key at all. The
+/// custodian substitutes at the marked slot and egresses under its own
+/// allow-list, so the key enters neither the sidecar's address space nor
+/// whip's.
+///
+/// Applied ONLY when a proxy is running. With none, the caller leaves the key
+/// inherited and the posture is exactly what it was — stripping it while
+/// pointing nowhere would turn a documented concession into a broken spawn,
+/// which is a worse trade than the concession.
+///
+/// `base_url_var` is the sidecar's own spelling (`ANTHROPIC_BASE_URL`; codex
+/// reads a `base_url` from its config rather than the environment, so its
+/// caller writes that instead of calling this).
+pub fn route_sidecar_through_proxy(
+    command: &mut Command,
+    base_url_var: &str,
+    proxy_base_url: &str,
+    own_family_credential_env: &[&str],
+) {
+    command.env(base_url_var, proxy_base_url);
+    // Order matters only for readability: the key is gone either way, but
+    // setting the route first says what replaces it.
+    strip_env_vars(command, own_family_credential_env);
+}
+
 /// Remove the named env vars from a child command's inherited environment.
 pub fn strip_env_vars(command: &mut Command, names: &[&str]) {
     for name in names {

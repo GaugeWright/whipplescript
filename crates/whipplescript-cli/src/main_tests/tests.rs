@@ -1,6 +1,50 @@
 //! Extracted verbatim from `main.rs` (module path `tests` is unchanged).
 
 use super::*;
+
+/// `whip credential-proxy`'s argument refusals. Parsing is a pure function so
+/// each is a value rather than an exit code and a line on stderr — the same
+/// reason the proxy's own decisions are separated from its socket.
+#[test]
+fn credential_proxy_args_are_refused_by_reason() {
+    let args = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+
+    let ok = parse_credential_proxy_args(&args(&[
+        "--upstream",
+        "https://api.anthropic.com/",
+        "--credential",
+        "providers/anthropic",
+    ]))
+    .expect("a complete invocation parses");
+    // The trailing slash is trimmed: a sidecar's path always begins with `/`,
+    // so keeping it would double the separator.
+    assert_eq!(ok.upstream, "https://api.anthropic.com");
+    assert_eq!(ok.bind, "127.0.0.1:0", "an ephemeral port by default");
+
+    for (list, expected) in [
+        (vec!["--upstream"], "requires a value"),
+        (vec!["--credential", "a/b"], "needs --upstream"),
+        (vec!["--upstream", "https://x"], "needs --upstream"),
+        (
+            vec![
+                "--upstream",
+                "https://x",
+                "--credential",
+                "a/b",
+                "--form",
+                "nonsense",
+            ],
+            "must be bearer, basic or raw",
+        ),
+        (vec!["--nope"], "unknown credential-proxy argument"),
+    ] {
+        let reason = parse_credential_proxy_args(&args(&list))
+            .err()
+            .unwrap_or_else(|| panic!("{list:?} must be refused"));
+        assert!(reason.contains(expected), "{list:?}: {reason}");
+    }
+}
+
 // `NewEffect`/`IrRedaction` are exercised only by tests here (their production
 // users — the lowering `as_*` converters and the rule-lowering closure — moved
 // to `whipplescript_kernel::lowering` / `::rule_lowering`).

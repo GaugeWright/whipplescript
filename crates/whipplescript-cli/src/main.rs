@@ -121,6 +121,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 mod auth;
 mod coerce_runtime;
+mod credential_proxy;
 mod exec_server;
 mod harness_tools;
 mod improve;
@@ -296,6 +297,7 @@ fn main() -> ExitCode {
         Some("provider") => provider_command(&options),
         Some("deploy") => deploy_command(&options),
         Some("executor") => executor_command(&options),
+        Some("credential-proxy") => credential_proxy_command(&options),
         Some("turn-once") => turn_once_command(&options),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
@@ -695,6 +697,140 @@ fn deploy_command(options: &CliOptions) -> ExitCode {
 /// `whip executor` (compute plane P8): the Class-A exec sidecar. Containers
 /// run this as their entrypoint with `--bind 0.0.0.0:8080`; the default bind
 /// is loopback-only for local runs.
+/// `whip credential-proxy` — the localhost front-end for `CustodyOp::Request`
+/// that lets a provider sidecar make authenticated calls without a key.
+///
+/// A separate process rather than something the harness starts, for now: an
+/// operator runs it, sets the sidecar's proxy env var, and the concession
+/// retires for that deployment. Harness-managed lifecycle is the follow-up, and
+/// it is a lifecycle question — when to start, when to stop, what a crashed
+/// proxy does to a turn — rather than more of this.
+/// What `whip credential-proxy` was asked to do, or why the request makes no
+/// sense.
+///
+/// Separated from the command so each refusal is a value rather than an exit
+/// code and a line on stderr — the same reason the proxy's own decisions are
+/// separated from its socket.
+pub struct ProxyArgs {
+    pub bind: String,
+    pub upstream: String,
+    pub credential: whipplescript_custody::CredentialName,
+    pub form: whipplescript_custody::PresentationForm,
+}
+
+fn parse_credential_proxy_args(args: &[String]) -> Result<ProxyArgs, String> {
+    let mut bind = "127.0.0.1:0".to_owned();
+    let (mut upstream, mut credential, mut form) = (None, None, "bearer".to_owned());
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let mut value = |name: &str| {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+        match arg.as_str() {
+            "--bind" => bind = value("--bind")?,
+            "--upstream" => upstream = Some(value("--upstream")?),
+            "--credential" => credential = Some(value("--credential")?),
+            "--form" => form = value("--form")?,
+            other => return Err(format!("unknown credential-proxy argument `{other}`")),
+        }
+    }
+    let (Some(upstream), Some(credential)) = (upstream, credential) else {
+        return Err(
+            "credential-proxy needs --upstream <origin> and --credential <name>".to_owned(),
+        );
+    };
+    let credential = whipplescript_custody::CredentialName::new(&credential)
+        .map_err(|error| format!("--credential: {error}"))?;
+    let form = match form.as_str() {
+        "bearer" => whipplescript_custody::PresentationForm::Bearer,
+        "basic" => whipplescript_custody::PresentationForm::Basic,
+        "raw" => whipplescript_custody::PresentationForm::Raw,
+        other => {
+            return Err(format!(
+                "--form must be bearer, basic or raw (got `{other}`)"
+            ))
+        }
+    };
+    Ok(ProxyArgs {
+        bind,
+        // Trailing slash trimmed here rather than at each use: the path a sidecar
+        // sends always begins with `/`, so a kept slash would double it.
+        upstream: upstream.trim_end_matches('/').to_owned(),
+        credential,
+        form,
+    })
+}
+
+/// `whip credential-proxy` — the localhost front-end for `CustodyOp::Request`
+/// that lets a provider sidecar make authenticated calls without a key.
+///
+/// A separate process rather than something the harness starts, for now: an
+/// operator runs it, sets the sidecar's proxy env var, and the concession
+/// retires for that deployment. Harness-managed lifecycle is the follow-up, and
+/// it is a lifecycle question — when to start, when to stop, what a crashed
+/// proxy does to a turn — rather than more of this.
+fn credential_proxy_command(options: &CliOptions) -> ExitCode {
+    let parsed = match parse_credential_proxy_args(&options.args) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return ExitCode::from(2);
+        }
+    };
+    // The token is minted HERE and printed once, rather than taken as a flag:
+    // a flag would put it in `ps` for every process on the box, which is
+    // exactly the audience the token exists to exclude.
+    let token = match credential_proxy_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("could not mint a proxy token: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listener = match std::net::TcpListener::bind(&parsed.bind) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("credential-proxy could not bind {}: {error}", parsed.bind);
+            return ExitCode::FAILURE;
+        }
+    };
+    let base_url = match listener.local_addr() {
+        Ok(addr) => format!("http://{addr}"),
+        Err(error) => {
+            eprintln!("credential-proxy could not read its own address: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "{}",
+        serde_json::json!({ "base_url": base_url, "token": token })
+    );
+    let binding = credential_proxy::ProxyBinding {
+        upstream: parsed.upstream,
+        credential: parsed.credential,
+        form: parsed.form,
+    };
+    match credential_proxy::serve(listener, binding, token) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("credential-proxy failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A fresh per-spawn proxy token, from the OS.
+fn credential_proxy_token() -> Result<String, String> {
+    use ring::rand::SecureRandom as _;
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "rng failure".to_owned())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn executor_command(options: &CliOptions) -> ExitCode {
     let mut bind = "127.0.0.1:8080".to_owned();
     let mut iter = options.args.iter();
@@ -932,6 +1068,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "provider" => "usage: whip [--json] provider <list | status <name> | pin <name> | attest <name> --custody <class> --signer <who> --until <rfc3339> | operator-run <name> [--off]> [--effect-kind <agent.tell|schema.coerce>]\n  custody classes: unknown (c0) | trains (c1) | retained (c2) | zero-retention (c3) | operator-held (c4), ordered by WHO HOLDS THE TRANSCRIPT\n  evidence lives here; the bar it is judged against lives in the signed envelope as `require custody <class> for <Role>`",
         "deploy" => "usage: whip deploy [--worker-dir <path>] [--config <file>] [--name <worker>] [--dry-run] [--skip-build] [--set-secrets]",
         "executor" => "usage: whip executor [--bind <addr:port>]   (Class-A exec sidecar; default 127.0.0.1:8080)",
+        "credential-proxy" => "usage: whip credential-proxy --upstream <origin> --credential <name> [--form bearer|basic|raw] [--bind <addr:port>]   (localhost front-end for CustodyOp::Request; prints its base_url and token)",
         "message" => "usage: whip message <instance> --channel <name> --text <text> [--markdown <md>] [--by <sender>] [--thread <id>] --program <workflow.whip> [--root <workflow>]",
         "mailbox" => "usage: whip mailbox <outbound [--channel <name>] [--limit <n>] | inbound <channel> [--limit <n>]> (the local messaging provider's delivered/received JSONL files)",
         _ => return None,

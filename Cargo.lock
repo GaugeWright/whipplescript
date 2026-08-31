@@ -2689,6 +2689,7 @@ dependencies = [
  "htmd",
  "prctl",
  "regex",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

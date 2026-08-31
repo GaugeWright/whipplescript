@@ -1029,6 +1029,19 @@ impl StdioClaudeAgentSdkTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         whipplescript_kernel::harness::strip_control_plane_secrets(&mut builder);
+        // When whip is running a credential proxy, the sidecar is pointed at it
+        // and loses its own family's key too — the concession
+        // `CONTROL_PLANE_SECRET_ENV` documents. With no proxy the key stays
+        // inherited: stripping it while pointing nowhere would turn a
+        // documented concession into a broken spawn.
+        if let Ok(proxy) = std::env::var("WHIPPLESCRIPT_CREDENTIAL_PROXY_ANTHROPIC") {
+            whipplescript_kernel::harness::route_sidecar_through_proxy(
+                &mut builder,
+                "ANTHROPIC_BASE_URL",
+                &proxy,
+                whipplescript_kernel::harness::ANTHROPIC_CREDENTIAL_ENV,
+            );
+        }
         // The Claude sidecar is the Anthropic-family backend; strip the other
         // families' keys (OpenAI, xAI).
         whipplescript_kernel::harness::strip_env_vars(
