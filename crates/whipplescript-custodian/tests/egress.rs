@@ -134,6 +134,7 @@ fn request_substitutes_material_into_the_marked_slot_on_the_way_out() {
             CredentialKind::Bearer,
             Zeroizing::new(b"tok-loopback-123".to_vec()),
             None,
+            None,
         )
         .expect("register");
     let custodian = Custodian::new(store, Box::new(UreqEgress::new(vec!["127.0.0.1".into()])));
@@ -186,6 +187,7 @@ fn a_denied_host_never_reaches_the_network_and_is_recorded() {
             name("boxed"),
             CredentialKind::Bearer,
             Zeroizing::new(b"tok".to_vec()),
+            None,
             None,
         )
         .expect("register");
@@ -279,6 +281,7 @@ fn an_echoed_credential_is_redacted_out_of_the_response() {
             name("echo_api"),
             CredentialKind::Bearer,
             Zeroizing::new(b"tok-must-not-return".to_vec()),
+            None,
             None,
         )
         .expect("register");

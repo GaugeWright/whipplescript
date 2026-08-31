@@ -1142,6 +1142,17 @@ pub enum CustodyError {
     BudgetExhausted {
         credential: CredentialName,
     },
+    /// The credential's lease has expired (DR-0053 §9's fifth lease
+    /// mechanism).
+    ///
+    /// Distinct from `Revoked` on purpose. An operator reading a refusal needs
+    /// to know whether someone PULLED this credential or whether it simply ran
+    /// out — the first is an incident and the second is Tuesday, and one error
+    /// covering both would make every expiry look like an incident.
+    LeaseExpired {
+        credential: CredentialName,
+        expired_at: u64,
+    },
     /// AEAD refused the envelope: wrong context, wrong credential, or
     /// tampered ciphertext. Deliberately one variant — AEAD cannot say which.
     EnvelopeRefused,
@@ -1161,6 +1172,13 @@ impl fmt::Display for CustodyError {
             CustodyError::UnknownCredential { credential } => {
                 write!(f, "unknown credential {credential}")
             }
+            CustodyError::LeaseExpired {
+                credential,
+                expired_at,
+            } => write!(
+                f,
+                "credential {credential} lease expired at {expired_at} (epoch seconds)"
+            ),
             CustodyError::KindMismatch {
                 credential,
                 kind,

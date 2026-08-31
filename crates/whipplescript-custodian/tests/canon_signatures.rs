@@ -30,6 +30,7 @@ fn custodian_with(name: &str, kind: CredentialKind, material: &[u8]) -> Custodia
             kind,
             Zeroizing::new(material.to_vec()),
             None,
+            None,
         )
         .expect("register");
     Custodian::new(store, Box::new(DeniedEgress))

@@ -112,7 +112,7 @@ pub struct Custodian {
     rng: SystemRandom,
 }
 
-fn now_epoch_s() -> u64 {
+pub fn now_epoch_s() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -189,8 +189,9 @@ impl Custodian {
         kind: CredentialKind,
         material: Zeroizing<Vec<u8>>,
         budget: Option<u64>,
+        lease_expires_at: Option<u64>,
     ) -> Result<(), StoreError> {
-        lock(&self.store).register(name, kind, material, budget)
+        lock(&self.store).register(name, kind, material, budget, lease_expires_at)
     }
 
     pub fn revoke(&self, name: &CredentialName) -> Result<bool, StoreError> {
@@ -305,6 +306,18 @@ impl Custodian {
                 })?;
             if entry.revoked {
                 return Err(CustodyError::Revoked { credential: name });
+            }
+            // The lease, checked beside revocation because it IS revocation —
+            // the kind nobody had to perform. Before the kind check, so an
+            // expired credential says so rather than complaining about an
+            // operation it would refuse anyway.
+            if let Some(expired_at) = entry.lease_expires_at {
+                if now_epoch_s() >= expired_at {
+                    return Err(CustodyError::LeaseExpired {
+                        credential: name,
+                        expired_at,
+                    });
+                }
             }
             // A container operation acts on the entry's identity rather than
             // exercising its key, so no kind performs it and asking would
@@ -534,7 +547,7 @@ impl Custodian {
             _ => CredentialKind::Raw,
         };
         lock(&self.store)
-            .register(derived_name.clone(), derived_kind, sub, None)
+            .register(derived_name.clone(), derived_kind, sub, None, None)
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
             })?;
@@ -612,7 +625,7 @@ impl Custodian {
             });
         }
         store
-            .register(name.clone(), kind, material, None)
+            .register(name.clone(), kind, material, None, None)
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
             })?;
@@ -656,7 +669,7 @@ impl Custodian {
             });
         }
         store
-            .register(name.clone(), kind, material, None)
+            .register(name.clone(), kind, material, None, None)
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
             })?;
@@ -773,6 +786,12 @@ impl Custodian {
                 CredentialKind::Bearer,
                 Zeroizing::new(token.into_bytes()),
                 None,
+                // A minted token often carries its own expiry in the exchange
+                // response, which §5's amendment deliberately does NOT model:
+                // whip gives up policing a vendor scope it cannot verify. A
+                // lease invented here would be whip asserting a lifetime the
+                // vendor never agreed to.
+                None,
             )
             .map_err(|e| CustodyError::Backend {
                 detail: e.to_string(),
@@ -809,6 +828,7 @@ fn error_tag(e: &CustodyError) -> &'static str {
         CustodyError::RungBelowFloor { .. } => "rung-below-floor",
         CustodyError::Revoked { .. } => "revoked",
         CustodyError::BudgetExhausted { .. } => "budget-exhausted",
+        CustodyError::LeaseExpired { .. } => "lease-expired",
         CustodyError::EnvelopeRefused => "envelope-refused",
         CustodyError::EgressFailed { .. } => "egress-failed",
         CustodyError::Backend { .. } => "backend",

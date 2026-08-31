@@ -44,7 +44,13 @@ fn custodian_with_egress(
     let mut store = SealedStore::create(None, "test-passphrase").expect("create");
     for (n, kind, material) in entries {
         store
-            .register(name(n), *kind, Zeroizing::new(material.to_vec()), None)
+            .register(
+                name(n),
+                *kind,
+                Zeroizing::new(material.to_vec()),
+                None,
+                None,
+            )
             .expect("register");
     }
     Custodian::new(store, egress)
@@ -579,6 +585,7 @@ fn budgets_bound_use() {
             CredentialKind::HmacSha256,
             Zeroizing::new(b"key".to_vec()),
             Some(2),
+            None,
         )
         .expect("register");
     let c = Custodian::new(store, Box::new(DeniedEgress));
@@ -970,6 +977,7 @@ fn rotate_refuses_a_remote_credential_with_no_openbao_connection() {
             CredentialKind::Ed25519,
             "k".into(),
             None,
+            None,
         )
         .expect("register remote");
     let custodian = Custodian::new(store, Box::new(DeniedEgress));
@@ -1000,6 +1008,7 @@ fn a_configured_prefix_bounds_what_a_credential_may_sign() {
             name("acme/github"),
             CredentialKind::HmacSha256,
             Zeroizing::new(b"app-key".to_vec()),
+            None,
             None,
         )
         .expect("register");
@@ -1071,6 +1080,7 @@ fn r3_refuses_a_derivation_chain_rather_than_ignoring_it() {
             name("acme/remote"),
             CredentialKind::HmacSha256,
             "transit-key".into(),
+            None,
             None,
         )
         .expect("register remote");
@@ -1165,4 +1175,119 @@ fn register_refuses_material_that_is_not_there() {
         panic!("empty material must refuse: {reply:?}");
     };
     assert!(detail.contains("no material"), "{detail}");
+}
+
+// ---------------------------------------------------------------------------
+// Credential leases (DR-0053 §9's fifth lease mechanism)
+// ---------------------------------------------------------------------------
+
+/// A lease is revocation nobody had to perform. Past its expiry the credential
+/// refuses, and it refuses by a DISTINCT error: an operator reading a refusal
+/// needs to know whether someone pulled this credential or whether it simply
+/// ran out. The first is an incident, the second is Tuesday.
+#[test]
+fn an_expired_lease_refuses_and_says_so_distinctly() {
+    let mut store = SealedStore::create(None, "test-passphrase").expect("create");
+    let past = whipplescript_custodian::now_epoch_s() - 1;
+    store
+        .register(
+            name("acme/expired"),
+            CredentialKind::HmacSha256,
+            Zeroizing::new(b"key".to_vec()),
+            None,
+            Some(past),
+        )
+        .expect("register");
+    // A live lease on the same store, so the refusal below is about THIS
+    // credential's expiry rather than about leases existing at all.
+    store
+        .register(
+            name("acme/live"),
+            CredentialKind::HmacSha256,
+            Zeroizing::new(b"key".to_vec()),
+            None,
+            Some(whipplescript_custodian::now_epoch_s() + 3600),
+        )
+        .expect("register");
+    let custodian = Custodian::new(store, Box::new(DeniedEgress));
+
+    let sign = |credential: &str| {
+        custodian.handle(&call(CustodyOp::Sign {
+            credential: name(credential),
+            alg: SignatureAlg::HmacSha256,
+            derivation: Vec::new(),
+            payload_b64: B64.encode(b"payload"),
+        }))
+    };
+
+    let reply = sign("acme/expired");
+    let Err(CustodyError::LeaseExpired {
+        credential,
+        expired_at,
+    }) = reply.outcome
+    else {
+        panic!("an expired lease must refuse by name: {reply:?}");
+    };
+    assert_eq!(credential.as_str(), "acme/expired");
+    assert_eq!(expired_at, past);
+
+    assert!(
+        matches!(sign("acme/live").outcome, Ok(CustodyOk::Signed { .. })),
+        "a live lease must not refuse"
+    );
+}
+
+/// A credential with no lease is unbounded in time, as every credential was
+/// before this. Naming one opts it in — the same shape the signing bound and
+/// the egress allow-list take.
+#[test]
+fn a_credential_with_no_lease_is_unbounded() {
+    let custodian = custodian_with(&[("acme/forever", CredentialKind::HmacSha256, b"key")]);
+    let reply = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("acme/forever"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"payload"),
+    }));
+    assert!(
+        matches!(reply.outcome, Ok(CustodyOk::Signed { .. })),
+        "{reply:?}"
+    );
+}
+
+/// The expiry is DURABLE, which is the whole reason it sits beside the budget
+/// rather than replacing it. The budget's counts live in process memory, so a
+/// custodian restart resets them; a lease reopened from the sealed store still
+/// refuses.
+#[test]
+fn a_lease_survives_a_custodian_restart() {
+    let dir = std::env::temp_dir().join(format!("whip-lease-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("store.json");
+    let past = whipplescript_custodian::now_epoch_s() - 1;
+    {
+        let mut store = SealedStore::create(Some(path.clone()), "test-passphrase").expect("create");
+        store
+            .register(
+                name("acme/expired"),
+                CredentialKind::HmacSha256,
+                Zeroizing::new(b"key".to_vec()),
+                None,
+                Some(past),
+            )
+            .expect("register");
+    }
+    let reopened = SealedStore::open(&path, "test-passphrase").expect("reopen");
+    let custodian = Custodian::new(reopened, Box::new(DeniedEgress));
+    let reply = custodian.handle(&call(CustodyOp::Sign {
+        credential: name("acme/expired"),
+        alg: SignatureAlg::HmacSha256,
+        derivation: Vec::new(),
+        payload_b64: B64.encode(b"payload"),
+    }));
+    assert!(
+        matches!(reply.outcome, Err(CustodyError::LeaseExpired { .. })),
+        "an expiry must survive the restart that resets a budget: {reply:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

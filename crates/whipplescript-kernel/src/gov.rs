@@ -1024,6 +1024,7 @@ grant file_store outbox -> file:/srv/outbox public\n";
                 whipplescript_custody::CredentialKind::Ed25519,
                 zeroize::Zeroizing::new(seed()),
                 None,
+                None,
             )
             .expect("register");
         let custodian = Arc::new(Custodian::new(store, Box::new(DeniedEgress)));

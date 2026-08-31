@@ -289,6 +289,7 @@ fn openbao_live_smoke() {
             CredentialKind::HmacSha256,
             hmac_key.clone(),
             None,
+            None,
         )
         .expect("register remote");
     let custodian = Custodian::new(store, Box::new(DeniedEgress)).with_openbao(Arc::clone(&client));

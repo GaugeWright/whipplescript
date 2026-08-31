@@ -23,6 +23,10 @@ use whipplescript_custodian::store::SealedStore;
 // sealed store directly.
 #[cfg(target_family = "unix")]
 use whipplescript_custodian::{Custodian, DeniedEgress};
+// A lease expiry is portable: it lives in the sealed store, which the crate
+// keeps compiled everywhere, and `import` sets one on every platform. Only the
+// running custodian above is unix-only.
+use whipplescript_custodian::now_epoch_s;
 use whipplescript_custody::{CredentialKind, CredentialName};
 
 const USAGE: &str = "usage:
@@ -88,6 +92,29 @@ fn passphrase(args: &Args) -> Result<Zeroizing<String>, String> {
     }
 }
 
+/// `--remote-transit` names a key that stays in OpenBao; the three local
+/// sources hand this box the material itself. Naming both is not a preference
+/// the tool can resolve — it is a contradiction about where the secret lives,
+/// and guessing either way puts material somewhere the operator did not ask
+/// for.
+///
+/// It is a free function on the parsed arguments rather than a check inline in
+/// `run` because inline it sat behind a store path and a passphrase: reaching
+/// it meant arranging an environment, so nothing ever did, and the mutation
+/// sweep found it unexercised. The decision is about arguments alone, and now
+/// needs nothing else to reach.
+fn remote_transit_excludes_local_material(args: &Args) -> Result<(), String> {
+    for local in ["from-env", "from-file"] {
+        if args.flags.contains_key(local) {
+            return Err(format!("--remote-transit conflicts with --{local}"));
+        }
+    }
+    if args.switches.contains("from-stdin") {
+        return Err("--remote-transit conflicts with --from-stdin".to_string());
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some((command, rest)) = argv.split_first() else {
@@ -116,20 +143,33 @@ fn run() -> Result<(), String> {
                 .get("budget")
                 .map(|b| b.parse::<u64>().map_err(|e| format!("bad --budget: {e}")))
                 .transpose()?;
+            // `--lease <seconds>` is a DURATION from now, not an instant: an
+            // operator reasons in "this key is good for an hour", and an
+            // absolute timestamp on a command line is a clock-skew bug waiting
+            // for a reader to make it.
+            let lease_expires_at = args
+                .flags
+                .get("lease")
+                .map(|seconds| {
+                    seconds
+                        .parse::<u64>()
+                        .map_err(|e| format!("bad --lease: {e}"))
+                        .map(|seconds| now_epoch_s() + seconds)
+                })
+                .transpose()?;
             // An r3 remote entry: only a key name is recorded; the material
             // lives in the OpenBao transit engine and never touches this box.
             if let Some(key_name) = args.flags.get("remote-transit") {
-                for local in ["from-env", "from-file"] {
-                    if args.flags.contains_key(local) {
-                        return Err(format!("--remote-transit conflicts with --{local}"));
-                    }
-                }
-                if args.switches.contains("from-stdin") {
-                    return Err("--remote-transit conflicts with --from-stdin".to_string());
-                }
+                remote_transit_excludes_local_material(&args)?;
                 let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
                 store
-                    .register_remote(name.clone(), kind, key_name.clone(), budget)
+                    .register_remote(
+                        name.clone(),
+                        kind,
+                        key_name.clone(),
+                        budget,
+                        lease_expires_at,
+                    )
                     .map_err(|e| e.to_string())?;
                 println!(
                     "imported {} (kind {kind}, remote openbao transit key {key_name:?})",
@@ -162,7 +202,7 @@ fn run() -> Result<(), String> {
             };
             let mut store = SealedStore::open(&store_path, &pass).map_err(|e| e.to_string())?;
             store
-                .register(name.clone(), kind, material, budget)
+                .register(name.clone(), kind, material, budget, lease_expires_at)
                 .map_err(|e| e.to_string())?;
             println!("imported {} (kind {kind})", name.resource_id());
             Ok(())
@@ -325,5 +365,47 @@ fn main() -> ExitCode {
             eprintln!("{message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(argv: &[&str]) -> Args {
+        let owned: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        Args::parse(&owned).expect("arguments parse")
+    }
+
+    #[test]
+    fn remote_transit_refuses_every_local_material_source_by_name() {
+        // Each source is named in the refusal, so an operator who passed two
+        // reads which one to drop rather than being told "conflicting flags".
+        for (argv, expected) in [
+            (
+                vec!["--remote-transit", "signing", "--from-env", "TOKEN"],
+                "--remote-transit conflicts with --from-env",
+            ),
+            (
+                vec!["--remote-transit", "signing", "--from-file", "/k"],
+                "--remote-transit conflicts with --from-file",
+            ),
+            (
+                vec!["--remote-transit", "signing", "--from-stdin"],
+                "--remote-transit conflicts with --from-stdin",
+            ),
+        ] {
+            let err = remote_transit_excludes_local_material(&parsed(&argv))
+                .expect_err("a local source alongside --remote-transit is a contradiction");
+            assert_eq!(err, expected);
+        }
+    }
+
+    #[test]
+    fn a_remote_key_on_its_own_is_admitted() {
+        // The control: without this, the refusals above pass just as well when
+        // the check refuses everything.
+        remote_transit_excludes_local_material(&parsed(&["--remote-transit", "signing"]))
+            .expect("a remote key with no local source is the whole point of r3");
     }
 }

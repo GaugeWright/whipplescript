@@ -3294,6 +3294,7 @@ mod custody_capability_tests {
                 CredentialKind::Raw,
                 zeroize::Zeroizing::new(vec![7u8; 32]),
                 None,
+                None,
             )
             .expect("register");
         InProcessTransport::new(Arc::new(Custodian::new(store, Box::new(DeniedEgress))))

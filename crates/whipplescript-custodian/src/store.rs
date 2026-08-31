@@ -92,6 +92,17 @@ struct SealedEntry {
     /// custodian process lifetime at r0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     budget: Option<u64>,
+    /// Optional lease expiry, epoch seconds (DR-0053 §9's fifth lease
+    /// mechanism). A use at or after this instant is refused.
+    ///
+    /// Durable, unlike the budget beside it. The budget's counts live in
+    /// process memory, so a custodian restart resets them — which is fine for
+    /// a rate bound and useless for a revocation one. An expiry stored in the
+    /// sealed entry survives the restart, so "this credential stops working at
+    /// four o'clock" means it, and that difference is why the two coexist
+    /// rather than one replacing the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_expires_at: Option<u64>,
 }
 
 /// Where a remote entry's material lives. One variant per remote backend.
@@ -120,6 +131,9 @@ pub struct Entry {
     pub material: Material,
     pub revoked: bool,
     pub budget: Option<u64>,
+    /// Epoch seconds after which this credential refuses use. See the sealed
+    /// entry's field for why it is durable where the budget is not.
+    pub lease_expires_at: Option<u64>,
 }
 
 /// The passphrase-sealed store, fully unsealed into custodian memory at open.
@@ -248,6 +262,7 @@ impl SealedStore {
                     material,
                     revoked: sealed.revoked,
                     budget: sealed.budget,
+                    lease_expires_at: sealed.lease_expires_at,
                 },
             );
         }
@@ -277,6 +292,7 @@ impl SealedStore {
         kind: CredentialKind,
         material: Zeroizing<Vec<u8>>,
         budget: Option<u64>,
+        lease_expires_at: Option<u64>,
     ) -> Result<(), StoreError> {
         self.entries.insert(
             name,
@@ -285,6 +301,7 @@ impl SealedStore {
                 material: Material::Local(material),
                 revoked: false,
                 budget,
+                lease_expires_at,
             },
         );
         self.persist()
@@ -299,6 +316,7 @@ impl SealedStore {
         kind: CredentialKind,
         key_name: String,
         budget: Option<u64>,
+        lease_expires_at: Option<u64>,
     ) -> Result<(), StoreError> {
         self.entries.insert(
             name,
@@ -307,6 +325,7 @@ impl SealedStore {
                 material: Material::OpenBaoTransit { key_name },
                 revoked: false,
                 budget,
+                lease_expires_at,
             },
         );
         self.persist()
@@ -351,6 +370,7 @@ impl SealedStore {
                         remote: None,
                         revoked: entry.revoked,
                         budget: entry.budget,
+                        lease_expires_at: entry.lease_expires_at,
                     }
                 }
                 // Remote entries persist as plaintext metadata: no nonce, no
@@ -364,6 +384,7 @@ impl SealedStore {
                     }),
                     revoked: entry.revoked,
                     budget: entry.budget,
+                    lease_expires_at: entry.lease_expires_at,
                 },
             };
             sealed_entries.insert(name.as_str().to_string(), sealed);
@@ -411,6 +432,7 @@ mod tests {
                 CredentialKind::Bearer,
                 Zeroizing::new(b"sk_live_123".to_vec()),
                 Some(10),
+                None,
             )
             .expect("register");
 
@@ -455,6 +477,7 @@ mod tests {
                 CredentialKind::Ed25519,
                 "whip-release".into(),
                 Some(4),
+                None,
             )
             .expect("register remote");
 
@@ -491,6 +514,7 @@ mod tests {
                 name("gone"),
                 CredentialKind::Raw,
                 Zeroizing::new(b"x".to_vec()),
+                None,
                 None,
             )
             .expect("register");
