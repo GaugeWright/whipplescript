@@ -149,6 +149,11 @@ effect-cycle-pacing.maude        effect-bearing rule cycles: a same-commit ring
                                  paced ring (graph.bounded_workflow_effect_cycle);
                                  a preserved self-trigger stays with the per-rule
                                  refusal so one defect earns one diagnostic
+termination-measure.maude        DR-0081 §2: a ring that advances in one
+                                 direction, is bounded somewhere, and consumes
+                                 its token is admitted; unbounded, preserving,
+                                 carry-through-only, and direction-disagreeing
+                                 rings are never admitted
 rule-autofail.maude              rule-level unhandled-failure auto-fail (R1): in a
                                  self-terminating workflow an unhandled effect
                                  failure auto-fails the instance; handled failures,

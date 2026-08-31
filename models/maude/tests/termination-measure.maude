@@ -1,0 +1,32 @@
+load ../termination-measure.maude
+
+--- Coverage: a ring that advances once per round trip, carries the field
+--- through on its other hop, is bounded somewhere, and consumes its token, is
+--- admitted. This is the generator/critic ring.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 1) hop(rb, 0) bounds(ra) analysis(0, 0, false, true) =>! admitted .
+
+--- Coverage: the one-rule ring is admitted on the same terms -- a loop spelled
+--- in one rule is the loop of two rules with fewer names.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 1) bounds(ra) analysis(0, 0, false, true) =>! admitted .
+
+--- Bite: nothing bounds the field, so the ring is never admitted however far it
+--- advances. This is the nearest miss the diagnostic names.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 1) hop(rb, 1) analysis(0, 0, false, true) =>! admitted .
+
+--- Bite: a ring that preserves its trigger is never admitted. Without the
+--- consume there is no single token for a measure to speak about.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 1) bounds(ra) preserves(ra) analysis(0, 0, false, true) =>! admitted .
+
+--- Bite: hops that only carry the field through are never admitted. The round
+--- trip has to advance, not merely be readable.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 0) hop(rb, 0) bounds(ra) analysis(0, 0, false, true) =>! admitted .
+
+--- Bite: hops that disagree in direction are never admitted, even bounded. A
+--- field that can move back as easily as forward descends nowhere.
+search [1] in WHIPPLESCRIPT-TERMINATION-MEASURE :
+  hop(ra, 1) hop(rb, -1) bounds(ra) analysis(0, 0, false, true) =>! admitted .

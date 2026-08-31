@@ -11,6 +11,7 @@ pub mod body;
 mod body_print;
 mod format;
 mod lowering;
+mod measure;
 use format::*;
 pub use format::{format_program, format_program_preserving_comments, FormatOutput};
 use lowering::*;
@@ -1139,6 +1140,19 @@ pub struct IrProgram {
     pub assertions: Vec<IrAssertion>,
     pub rules: Vec<IrRule>,
     pub rule_dependencies: Vec<IrRuleDependency>,
+    /// The termination measures proven over effect-bearing cycles (DR-0081 §6).
+    /// Published rather than kept private: acceptance under a proof should be
+    /// visible evidence, and a proof lost to an innocuous edit — `+ 1` becoming
+    /// `+ step` — then shows up as a disappearing line in a diff instead of as a
+    /// refusal nobody can explain later.
+    pub measures: Vec<IrMeasure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrMeasure {
+    /// The cycle the measure covers, as the rule names of one round trip.
+    pub cycle: Vec<String>,
+    pub rendering: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1719,6 +1733,14 @@ pub struct IrRuleMetadata {
     pub fact_reads: Vec<String>,
     pub projection_reads: Vec<IrProjectionRead>,
     pub fact_writes: Vec<String>,
+    /// Every `record` (and `done … -> record`) in the body, with its field
+    /// expressions and whether it lands in this rule's own commit.
+    ///
+    /// `immediate_fact_writes` is derived from this, and the termination-measure
+    /// analysis (DR-0081) reads the expressions: a measure is a claim about what
+    /// a record ASSIGNS, which a set of schema names cannot answer. Not rendered
+    /// in the `.ir` snapshot.
+    pub record_shapes: Vec<IrRecordShape>,
     /// The subset of `fact_writes` this rule records in its OWN commit: every
     /// `record` (and `done … -> record`) that is not behind an `after` block.
     ///
@@ -1877,6 +1899,17 @@ pub struct IrRedaction {
     /// when the source type is not statically known (the engine then stays
     /// conservative for that redaction).
     pub source_schema: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRecordShape {
+    pub schema: String,
+    /// `(field name, assigned expression)` in source order. A `from` shorthand
+    /// carries no expression and is absent, which the measure analysis treats as
+    /// "not an update it can read".
+    pub fields: Vec<(String, Expr)>,
+    /// The record is in the rule's own commit — not behind an `after` block.
+    pub immediate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4077,6 +4110,15 @@ impl IrProgram {
             }
         }
 
+        if !self.measures.is_empty() {
+            push_line(&mut snapshot, "measures");
+            for measure in &self.measures {
+                push_line(
+                    &mut snapshot,
+                    format!("  {}: {}", measure.cycle.join(" -> "), measure.rendering),
+                );
+            }
+        }
         if !self.rule_dependencies.is_empty() {
             push_line(&mut snapshot, "rule_dependencies");
             for dependency in &self.rule_dependencies {
@@ -8374,10 +8416,14 @@ fn validate_canonical_rule_body_syntax(rule: &RuleDecl, diagnostics: &mut Vec<Di
 /// meaning, that `lint_workflow_liveness` already honours.
 ///
 /// Modeled in `models/maude/effect-cycle-pacing.maude`.
-fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+fn validate_effectful_rule_recursion(
+    ir: &IrProgram,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<IrMeasure> {
+    let mut measures = Vec::new();
     let rules = &ir.rules;
     if rules.len() < 2 {
-        return;
+        return measures;
     }
     let index_of = rules
         .iter()
@@ -8393,7 +8439,8 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
     // `@tool` carries the same promise DR-0025 already extracts from it, so it
     // needs no second tag to mean it.
     let bounded = workflow_tagged("bounded");
-    let bounded_workflow = bounded || workflow_tagged("tool");
+    let tool_workflow = workflow_tagged("tool");
+    let bounded_workflow = bounded || tool_workflow;
 
     // A rule that records the class it matched WITHOUT consuming it is
     // `validate_effectful_self_trigger`'s diagnostic. Its self-edge is dropped
@@ -8491,6 +8538,37 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
         // effectful rule back to itself over the direct edges of the component.
         let cycle = shortest_rule_cycle(&adjacency, rules, effectful, &component)
             .unwrap_or_else(|| vec![rules[effectful].name.clone()]);
+
+        // DR-0081: a cycle with a proven measure cannot turn forever, so this
+        // refusal has nothing left to refuse. `@bounded` accepts
+        // well-foundedness; `@tool` needs the stronger step-bounded form,
+        // because a tool that provably ends after a data-sized number of agent
+        // turns still holds the turn that invoked it.
+        let binding = measure::measure_binding(ir, &component).unwrap_or_default();
+        let mut nearest_miss = None;
+        match measure::prove_cycle_measure(ir, &component) {
+            measure::MeasureOutcome::Proven(proven) => {
+                if !tool_workflow || proven.step_bounded {
+                    measures.push(IrMeasure {
+                        cycle: cycle.clone(),
+                        rendering: proven.to_snapshot(&binding),
+                    });
+                    continue;
+                }
+                nearest_miss = Some(format!(
+                    "the cycle is well-founded — {} — but a `@tool` workflow needs a step bound, because its caller blocks for as many agent turns as the data says",
+                    proven.describe(&binding)
+                ));
+            }
+            measure::MeasureOutcome::Missed(measure::MeasureMiss::Unbounded { field, step }) => {
+                nearest_miss = Some(format!(
+                    "field `{field}` {} by {} on every hop, but no rule on the cycle bounds it, so nothing stops the turn",
+                    if step > 0 { "rises" } else { "falls" },
+                    step.abs()
+                ));
+            }
+            measure::MeasureOutcome::None => {}
+        }
         // The span of the effect that the cycle re-runs: the most useful line to
         // stand on, and the only span an `IrRule` carries.
         let span = rules[effectful]
@@ -8499,6 +8577,14 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
             .first()
             .map(|effect| effect.span)
             .unwrap_or(SourceSpan { start: 0, end: 0 });
+        // DR-0081 §8: when the analysis nearly had a measure, the suggestion
+        // leads with which half was missing rather than restating the rule.
+        let with_miss = |text: &str| {
+            Some(match &nearest_miss {
+                Some(miss) => format!("{miss}; {text}"),
+                None => text.to_owned(),
+            })
+        };
         // One `push` per refusal, each carrying its own message literal:
         // `scripts/mutation_sweep.py` finds a refusal BY that literal at the push
         // site, so folding the two into a computed `message` variable would hide
@@ -8517,9 +8603,8 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                     cycle.join(" -> "),
                     rules[effectful].name
                 ),
-                suggestion: Some(
-                    "a bounded workflow settles instead of turning, so it may not loop with the world at all: break the cycle, or drop `@bounded` if this workflow is meant to keep going (a `@tool` workflow has no such choice — it is invoked inside an agent turn and that turn must end)"
-                        .to_owned(),
+                suggestion: with_miss(
+                    "a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going",
                 ),
             });
         } else {
@@ -8531,13 +8616,13 @@ fn validate_effectful_rule_recursion(ir: &IrProgram, diagnostics: &mut Vec<Diagn
                     cycle.join(" -> "),
                     rules[effectful].name
                 ),
-                suggestion: Some(
-                    "every edge of this cycle records its fact in the same commit that read one, so nothing paces it and each turn enqueues fresh effects at commit speed — put the recurrence behind an effect terminal (`after <effect> succeeds { record ... }`) so each turn waits on the world, or tag a rule `@external` when its facts genuinely arrive from outside the workflow"
-                        .to_owned(),
+                suggestion: with_miss(
+                    "every edge of this cycle records its fact in the same commit that read one, so nothing paces it and each turn enqueues fresh effects at commit speed — put the recurrence behind an effect terminal (`after <effect> succeeds { record ... }`) so each turn waits on the world, give the cycle a measure that bounds it, or tag a rule `@external` when its facts genuinely arrive from outside the workflow",
                 ),
             });
         }
     }
+    measures
 }
 
 /// The shortest produce/consume round trip from `start` back to `start`, staying
@@ -10394,7 +10479,6 @@ fn analyze_rule(
     collect_record_and_consume_facts(
         &body_ast.statements,
         &binding_types,
-        RecordScope::WholeBody,
         &mut metadata.fact_writes,
         &mut metadata.fact_consumes,
     );
@@ -10415,21 +10499,21 @@ fn analyze_rule(
     sort_projection_reads(&mut metadata.projection_reads);
     metadata.fact_writes.sort();
     metadata.fact_writes.dedup();
-    // The same walk stopped at every `after` block: what this rule records
-    // without waiting on the world. `exec … -> each` and `import` writes never
-    // appear here, which is right — they are effect results too.
-    let mut immediate_fact_writes = Vec::new();
-    let mut immediate_consumes = Vec::new();
-    collect_record_and_consume_facts(
-        &body_ast.statements,
-        &binding_types,
-        RecordScope::OwnCommit,
-        &mut immediate_fact_writes,
-        &mut immediate_consumes,
-    );
+    // Every record with its field expressions, and the pacing flag derived from
+    // the same walk: `exec … -> each` and `import` writes never appear here,
+    // which is right — they are effect results too.
+    let mut record_shapes = Vec::new();
+    push_record_shapes(&body_ast.statements, true, &mut record_shapes);
+    let mut immediate_fact_writes = record_shapes
+        .iter()
+        .filter(|shape| shape.immediate)
+        .map(|shape| format!("schema:{}", shape.schema))
+        .collect::<Vec<_>>();
     immediate_fact_writes.sort();
     immediate_fact_writes.dedup();
+    immediate_fact_writes.retain(|fact| metadata.fact_writes.contains(fact));
     metadata.immediate_fact_writes = immediate_fact_writes;
+    metadata.record_shapes = record_shapes;
     metadata.fact_consumes.sort();
     metadata.fact_consumes.dedup();
     metadata.terminal_outputs = terminal_metadata.outputs;
@@ -10477,14 +10561,13 @@ fn analyze_rule(
         // It also left a rule matching what only the arm produces reading as
         // "can never fire: nothing produces `<X>`".
         //
-        // WholeBody scope only, deliberately. `OwnCommit` means "lands in the
-        // same commit as the trigger", and the lapse commit is paced by the
-        // condition breaking — a world event — so the arm is never that.
+        // Writes and consumes only. A lapse commit is paced by the condition
+        // breaking — a world event — so the arm never records in the rule's own
+        // commit, which is why `push_record_shapes` marks it not immediate.
         let (arm_ast, _) = body::parse_rule_body(&region.arm_content, 0);
         collect_record_and_consume_facts(
             &arm_ast.statements,
             &binding_types,
-            RecordScope::WholeBody,
             &mut metadata.fact_writes,
             &mut metadata.fact_consumes,
         );
@@ -17467,22 +17550,56 @@ fn collect_open_payload_types(
     }
 }
 
-/// Collects the schemas an `exec ... -> each` stream records as facts.
-/// How much of a rule body `collect_record_and_consume_facts` counts.
+/// Every `record` in a body, with its field expressions and whether it lands in
+/// the rule's own commit.
 ///
-/// One walk, two questions. `WholeBody` is what a rule records at all, which is
-/// what the dependency graph, the flow checker, and liveness read. `OwnCommit`
-/// stops at an `after` block, so it is what the rule records WITHOUT waiting on
-/// the world — the pacing distinction `validate_effectful_rule_recursion` turns
-/// on. Sharing the walk is deliberate: two copies would drift the first time a
-/// statement kind that can carry a `record` is added to one and not the other,
-/// and the copy that missed it would quietly stop refusing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecordScope {
-    WholeBody,
-    OwnCommit,
+/// `immediate` is false inside an `after` block and stays false below it: those
+/// records wait on an effect terminal, which is the pacing distinction the
+/// effect-cycle refusal turns on. A `case` arm and either arm of a
+/// `during`/`until` region commit with the rule's own firing and inherit the
+/// flag they were reached with.
+fn push_record_shapes(
+    statements: &[body::BodyStmt],
+    immediate: bool,
+    out: &mut Vec<IrRecordShape>,
+) {
+    let shape = |record: &body::RecordStmt| IrRecordShape {
+        schema: record.schema.clone(),
+        fields: record
+            .fields
+            .iter()
+            .filter_map(|field| match &field.value {
+                body::FieldValue::Expr { expr, .. } => Some((field.name.clone(), expr.clone())),
+                _ => None,
+            })
+            .collect(),
+        immediate,
+    };
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Record(record) => out.push(shape(record)),
+            body::BodyStmt::Done {
+                replacement: Some(record),
+                ..
+            } => out.push(shape(record)),
+            body::BodyStmt::After(after) => push_record_shapes(&after.body, false, out),
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    push_record_shapes(&branch.body, immediate, out);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                push_record_shapes(&region.body, immediate, out);
+                // The lapse arm commits when the region's condition breaks,
+                // which is a world event, so it is paced like an `after` body.
+                push_record_shapes(&region.lapse_body, false, out);
+            }
+            _ => {}
+        }
+    }
 }
 
+/// Collects the schemas an `exec ... -> each` stream records as facts.
 /// The facts a rule body RECORDS and CONSUMES, walked over the parsed body.
 ///
 /// `metadata.effects` moved to an AST walk (`collect_effects_from_ast`) and left
@@ -17505,20 +17622,13 @@ enum RecordScope {
 fn collect_record_and_consume_facts(
     statements: &[body::BodyStmt],
     binding_types: &BTreeMap<String, String>,
-    scope: RecordScope,
     fact_writes: &mut Vec<String>,
     fact_consumes: &mut Vec<String>,
 ) {
     let recurse = |statements: &[body::BodyStmt],
                    fact_writes: &mut Vec<String>,
                    fact_consumes: &mut Vec<String>| {
-        collect_record_and_consume_facts(
-            statements,
-            binding_types,
-            scope,
-            fact_writes,
-            fact_consumes,
-        );
+        collect_record_and_consume_facts(statements, binding_types, fact_writes, fact_consumes);
     };
     for statement in statements {
         match statement {
@@ -17539,12 +17649,7 @@ fn collect_record_and_consume_facts(
                     fact_writes.push(format!("schema:{}", record.schema));
                 }
             }
-            // The one branch the scope governs: under `OwnCommit` an `after`
-            // body belongs to another commit, so its records are not this one's
-            // and the arm falls through to the catch-all below.
-            body::BodyStmt::After(after) if scope == RecordScope::WholeBody => {
-                recurse(&after.body, fact_writes, fact_consumes)
-            }
+            body::BodyStmt::After(after) => recurse(&after.body, fact_writes, fact_consumes),
             body::BodyStmt::Case(case) => {
                 for branch in &case.branches {
                     recurse(&branch.body, fact_writes, fact_consumes);

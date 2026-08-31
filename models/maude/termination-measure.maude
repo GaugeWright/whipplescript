@@ -1,0 +1,72 @@
+--- The termination measure over an effect-bearing rule cycle, per DR-0081 §2
+--- and spec/static-analysis.md. Companion to crates/whipplescript-parser/src/measure.rs.
+---
+--- A ranking function proves that the ring cannot turn forever: some int field
+--- moves one way on every round trip toward a bound it cannot pass. That is
+--- WELL-FOUNDEDNESS, and it is a different property from a bound on how many
+--- turns the ring takes -- the step-bounded question, which this model does not
+--- speak about because it is a question about seeds and literals rather than
+--- about the ring.
+---
+--- The ring is abstracted to what the analysis reads:
+---   hop(R, N)     rule R moves the field by N on its hop. N = 0 is a hop that
+---                 carries the field through unchanged, which is legal: what has
+---                 to advance is the round trip, not every step of it.
+---   bounds(R)     R's guard bounds the field from the direction of travel. One
+---                 anywhere on the ring is enough -- that rule stops firing once
+---                 the field passes the bound, and a simple ring cannot turn
+---                 without every rule on it.
+---   preserves(R)  R does not consume its trigger, so the ring carries a growing
+---                 population of facts rather than one token, and no single
+---                 value carries a measure.
+---
+--- Folding consumes each token, so a state where the whole ring has been read is
+--- one with no tokens left. The searches below ask for exactly the token
+--- admitted as the FINAL state (=>!), which is why a premature admission cannot
+--- satisfy them: it would leave unfolded hops beside it.
+---
+--- The model checks that:
+---   * a ring that advances, is bounded, and consumes is admitted;
+---   * a one-rule ring is admitted on the same terms;
+---   * an unbounded ring is NEVER admitted;
+---   * a ring that preserves its trigger is NEVER admitted;
+---   * a ring of carry-through hops alone is NEVER admitted;
+---   * a ring whose hops disagree in direction is NEVER admitted.
+mod WHIPPLESCRIPT-TERMINATION-MEASURE is
+  protecting INT .
+  protecting BOOL .
+
+  sorts Rule Cfg .
+
+  ops ra rb : -> Rule [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op hop : Rule Int -> Cfg [ctor] .
+  op bounds : Rule -> Cfg [ctor] .
+  op preserves : Rule -> Cfg [ctor] .
+
+  --- Accumulated rise, accumulated fall, bound seen, token consumed.
+  op analysis : Int Int Bool Bool -> Cfg [ctor] .
+  op admitted : -> Cfg [ctor] .
+
+  var R : Rule .
+  vars N U D : Int .
+  vars B C : Bool .
+
+  crl [fold-rise] : hop(R, N) analysis(U, D, B, C) => analysis(U + N, D, B, C)
+      if N > 0 .
+  crl [fold-fall] : hop(R, N) analysis(U, D, B, C) => analysis(U, D + N, B, C)
+      if N < 0 .
+  crl [fold-carry] : hop(R, N) analysis(U, D, B, C) => analysis(U, D, B, C)
+      if N == 0 .
+  rl [fold-bound] : bounds(R) analysis(U, D, B, C) => analysis(U, D, true, C) .
+  rl [fold-preserve] : preserves(R) analysis(U, D, B, C) => analysis(U, D, B, false) .
+
+  --- The round trip advances in ONE direction, something bounds it, and the
+  --- token is consumed. Mixed directions are not a measure: the field can move
+  --- back as easily as forward and nothing descends.
+  crl [admit] : analysis(U, D, B, C) => admitted
+      if ((U > 0 and D == 0) or (U == 0 and D < 0)) /\ B = true /\ C = true .
+endm

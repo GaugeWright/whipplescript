@@ -2418,14 +2418,25 @@ suggestion.
   effect is a check error. The retry pattern keeps compiling, because it records
   inside an `after` block. The one case that stays with the separate check is a
   rule that preserves its own trigger, which the `done` statement escapes.
+- **A cycle with a measure is not a check error.** A ring terminates when its
+  `int` field moves one way on each round trip toward a bound that some rule of
+  the ring states, and each rule consumes the fact that it matched. The compiler
+  reads that shape and admits the cycle, and it prints the measure that it found
+  in the compiled IR. A hop may pass the field through unchanged. The bound may
+  be a literal, or a field that the ring never changes, which is a budget that
+  the data carries: such a ring ends, but the number of turns is not in the
+  source.
 - **A `@bounded` workflow may not loop with the world at all.** The `@bounded`
   tag is the opposite of the `@service` tag: it declares that the workflow
   reaches a terminal after a number of steps that the program fixes and the data
   does not. In such a workflow every produce and consume edge counts, so an
   effect-bearing cycle of rules is a check error
   (`graph.bounded_workflow_effect_cycle`) even when each turn waits on the
-  world. A `@tool` workflow carries the same promise with no tag, because an
-  agent invokes it inside a turn and DR-0025 requires the turn to end.
+  world, unless the cycle carries a measure. A `@tool` workflow carries the same
+  promise with no tag, because an agent invokes it inside a turn and DR-0025
+  requires the turn to end; its measure must also be **step-bounded**, with a
+  literal bound over literal seeds, because a caller blocks for as many turns as
+  the measure allows.
 - **The invoke-tool graph must be acyclic.** An agent may call a granted `@tool`
   workflow synchronously, so a cycle of `tools` grants is an unbounded depth of
   recursion (`graph.unbounded_tool_grant_recursion`).

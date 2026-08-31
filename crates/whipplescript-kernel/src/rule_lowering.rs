@@ -737,6 +737,7 @@ pub fn empty_ir_program() -> IrProgram {
         assertions: Vec::new(),
         rules: Vec::new(),
         rule_dependencies: Vec::new(),
+        measures: Vec::new(),
     }
 }
 

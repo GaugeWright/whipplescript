@@ -10507,6 +10507,298 @@ rule ship
     assert!(compiled.ir.is_some(), "{:?}", compiled.diagnostics);
 }
 
+/// DR-0081: a same-commit loop whose field advances toward a literal ceiling
+/// cannot turn forever, so the refusal has nothing to refuse. Ten turns, and the
+/// number follows from the source — the one program in this area whose length is
+/// knowable was the one the compiler used to reject.
+#[test]
+fn a_measured_same_commit_loop_compiles_and_publishes_its_measure() {
+    let source = r#"
+workflow GuardedSameCommit
+output result Report
+
+class Task { n int }
+class Report { seen int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t where t.n < 10
+=> {
+  tell worker "{{ t.n }}"
+
+  done t -> record Task { n t.n + 1 }
+}
+
+rule finish
+  when Task as t where t.n >= 10
+=> {
+  complete result { seen t.n }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("a measured cycle compiles");
+    let snapshot = ir.to_snapshot();
+
+    assert!(
+        snapshot.contains("t.n rises by 1 toward 10 (step-bounded, bounded by rule `turn`)"),
+        "the measure must be published as evidence: {snapshot}"
+    );
+}
+
+/// The same loop with the guard removed keeps its refusal, and the diagnostic
+/// names the half that was missing rather than restating the general rule.
+#[test]
+fn an_unbounded_loop_is_refused_and_names_the_nearest_miss() {
+    let source = r#"
+@service
+workflow Unbounded
+
+class Task { n int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t
+=> {
+  tell worker "{{ t.n }}"
+
+  done t -> record Task { n t.n + 1 }
+}
+"#;
+    let compiled = compile_program(source);
+
+    assert!(compiled.ir.is_none());
+    assert!(
+        compiled.diagnostics.iter().any(|diagnostic| diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains(
+                "field `n` rises by 1 on every hop, but no rule on the cycle bounds it"
+            ))),
+        "{:?}",
+        compiled.diagnostics
+    );
+}
+
+/// Well-founded without being step-bounded — the case the record exists to
+/// admit. The ceiling is carried in the data, every hop passes it through
+/// unchanged, and the loop terminates with no number available at compile time.
+#[test]
+fn a_ceiling_carried_in_the_data_proves_well_founded_but_not_step_bounded() {
+    let source = r#"
+workflow BudgetLoop
+output result Report
+
+class Task { n int  budget int }
+class Report { seen int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0  budget 3 } ]
+
+rule turn
+  when Task as t where t.n < t.budget
+=> {
+  tell worker "{{ t.n }}"
+
+  done t -> record Task { n t.n + 1  budget t.budget }
+}
+
+rule finish
+  when Task as t where t.n >= t.budget
+=> {
+  complete result { seen t.n }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("a measured cycle compiles");
+    let snapshot = ir.to_snapshot();
+
+    assert!(
+        snapshot.contains("t.n rises by 1 toward t.budget (well-founded,"),
+        "{snapshot}"
+    );
+    assert!(
+        !snapshot.contains("step-bounded"),
+        "a ceiling read from the data is not a step bound: {snapshot}"
+    );
+}
+
+/// A hop may carry the field through unchanged; what has to advance is the round
+/// trip. This is the generator/critic ring — writer drafts, critic reviews, the
+/// round rises once per pair — under a declaration that used to forbid it.
+#[test]
+fn a_bounded_workflow_admits_a_measured_paced_ring() {
+    let source = r#"
+@bounded
+workflow BoundedMeasured
+output result Draft
+
+class Task { round int }
+class Draft { round int }
+
+agent writer { provider fixture  profile "repo-writer"  capacity 1 }
+agent critic { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { round 0 } ]
+
+rule write
+  when Task as t where t.round < 3
+=> {
+  tell writer "draft" as turn
+
+  after turn succeeds as x {
+    done t -> record Draft { round t.round + 1 }
+  }
+}
+
+rule review
+  when Draft as d where d.round < 3
+=> {
+  tell critic "review" as turn
+
+  after turn succeeds as x {
+    done d -> record Task { round d.round }
+  }
+}
+
+rule ship
+  when Draft as d where d.round >= 3
+=> {
+  complete result { round d.round }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("{:?}");
+    assert!(
+        ir.to_snapshot()
+            .contains("write -> review -> write: t.round rises by 1 toward 3 (step-bounded"),
+        "{}",
+        ir.to_snapshot()
+    );
+}
+
+/// `@tool` takes the stronger form. A tool that provably ends after a
+/// data-sized number of agent turns still holds the turn that invoked it, so
+/// well-foundedness alone is refused — and the diagnostic says which half it
+/// had.
+#[test]
+fn a_tool_workflow_needs_a_step_bound_not_merely_a_measure() {
+    let program = |ceiling: &str, seed: &str| {
+        format!(
+            r#"
+@tool
+workflow ToolLoop
+output result Report
+
+class Task {{ n int  budget int }}
+class Report {{ seen int }}
+
+agent worker {{ provider fixture  profile "repo-writer"  capacity 1 }}
+
+table seeds as Task [ {{ n {seed}  budget 3 }} ]
+
+rule turn
+  when Task as t where t.n < {ceiling}
+=> {{
+  tell worker "{{{{ t.n }}}}"
+
+  done t -> record Task {{ n t.n + 1  budget t.budget }}
+}}
+
+rule finish
+  when Task as t where t.n >= {ceiling}
+=> {{
+  complete result {{ seen t.n }}
+}}
+"#
+        )
+    };
+
+    // A ceiling from the data: terminates, but the caller cannot plan around it.
+    let data_ceiling = compile_program(&program("t.budget", "0"));
+    assert!(data_ceiling.ir.is_none());
+    assert!(
+        data_ceiling.diagnostics.iter().any(|diagnostic| diagnostic
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("needs a step bound"))),
+        "{:?}",
+        data_ceiling.diagnostics
+    );
+
+    // A literal ceiling over a literal seed: the number of turns is in the source.
+    let step_bounded = compile_program(&program("3", "0"));
+    assert!(step_bounded.ir.is_some(), "{:?}", step_bounded.diagnostics);
+}
+
+/// Bite on the type restriction: `n := n + 1` over a `float` field converges
+/// rather than terminating, so it is not a measure and the cycle keeps its
+/// refusal.
+#[test]
+fn a_float_field_is_not_a_measure() {
+    let source = r#"
+@service
+workflow FloatMeasure
+
+class Task { n float }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0.0 } ]
+
+rule turn
+  when Task as t where t.n < 1
+=> {
+  tell worker "go"
+
+  done t -> record Task { n t.n + 1 }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.ir.is_none(),
+        "a float field must not prove a measure"
+    );
+}
+
+/// Bite on the consumption conjunct: without `done` the ring carries a growing
+/// population of facts rather than one token, and no single value carries the
+/// measure. (The per-rule preserved-trigger refusal owns this shape, which is
+/// what the diagnostic shows.)
+#[test]
+fn a_ring_that_does_not_consume_its_trigger_is_not_measured() {
+    let source = r#"
+@service
+workflow NoConsume
+
+class Task { n int }
+
+agent worker { provider fixture  profile "repo-writer"  capacity 1 }
+
+table seeds as Task [ { n 0 } ]
+
+rule turn
+  when Task as t where t.n < 10
+=> {
+  tell worker "go"
+
+  record Task { n t.n + 1 }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.ir.is_none(),
+        "an unconsumed ring is not measured: {:?}",
+        compiled.diagnostics
+    );
+}
+
 /// A loop spelled in ONE rule is the loop of two rules with fewer names, so the
 /// same-commit refusal reaches it too. Left alone until this was fixed: 804
 /// effects in fifteen seconds from a program `whip check` called clean.
