@@ -182,6 +182,10 @@ fn repair_scope_retargets_and_refuses_excess() {
         panic!("expected produced");
     };
     assert_eq!(value["variant"], "Applied");
+    // DR-0084 O1: the receipt carries the staleness-delta advisory (empty
+    // here — no anchored evidence in this fixture — but always present on
+    // an applied proposal).
+    assert!(value["staleness"].is_array(), "{value}");
     let vcs = open_vcs().expect("vcs");
     assert!(vcs
         .read("stalled-line", "contested.md")
@@ -203,6 +207,363 @@ fn repair_scope_retargets_and_refuses_excess() {
         }
     }
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// DR-0084 K2: the anchor door refuses change-set atoms — and the refusal
+/// has TEETH: were it removed, the anchor would be recorded, so the
+/// empty-anchors assertion fails without it.
+#[test]
+fn anchor_door_refuses_change_set_atoms() {
+    let _guard = crate::env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-anchor-refusal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let previous = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE");
+    std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
+
+    let mut store =
+        whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
+    let issue = store
+        .file_item("q", "anchored", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    let options = CliOptions {
+        command: Some("issue".to_owned()),
+        args: vec![
+            "anchor".to_owned(),
+            issue.id.clone(),
+            "path(src/**) & since(t1)".to_owned(),
+        ],
+        store_path: root.join("store.sqlite"),
+        json: false,
+        input_json: None,
+    };
+    let code = knowledge_subject_verbs(&mut store, &options, "usage");
+    assert_eq!(code, std::process::ExitCode::from(2));
+    assert!(
+        store.anchors(&issue.id).expect("anchors").is_empty(),
+        "the change-set anchor must be refused, not recorded"
+    );
+    // The refusal's TEXT is the contract the door speaks; pin it (this is
+    // what the mutation sweep's message-mutation fallback measures).
+    let error = validated_region("path(src/**) & since(t1)").expect_err("refused");
+    assert!(
+        error.contains("may not appear in an anchor/basis"),
+        "{error}"
+    );
+    assert!(error.contains("`since`"), "{error}");
+    // And the guard's OTHER side has teeth too: a world-denoting region
+    // passes the same door and IS recorded (a falsified guard that refuses
+    // everything fails here).
+    assert!(validated_region("path(src/**) | decl(rule *)").is_ok());
+    let ok_options = CliOptions {
+        command: Some("issue".to_owned()),
+        args: vec![
+            "anchor".to_owned(),
+            issue.id.clone(),
+            "path(src/**) | decl(rule *)".to_owned(),
+        ],
+        store_path: root.join("store.sqlite"),
+        json: false,
+        input_json: None,
+    };
+    let code = knowledge_subject_verbs(&mut store, &ok_options, "usage");
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    assert_eq!(store.anchors(&issue.id).expect("anchors").len(), 1);
+
+    match previous {
+        Some(value) => std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", value),
+        None => std::env::remove_var("WHIPPLESCRIPT_ITEMS_STORE"),
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The agent-door claim join: the harness todo tool holds claims as
+/// `agent:<instance id>` (live turns pass the instance as the holder), and
+/// the intent stamp unions that spelling with the kernel door's bare
+/// instance id — so turn-claimed work mints intent-stamped cuts. Two
+/// claims across the doors is ambiguous and stamps nothing.
+#[test]
+fn agent_door_claims_stamp_cut_intent() {
+    let _guard = crate::env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-claim-join-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let previous: Vec<(&str, Option<std::ffi::OsString>)> = [
+        "WHIPPLESCRIPT_ITEMS_STORE",
+        "WHIPPLESCRIPT_BRANCH_STORE",
+        "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+    ]
+    .into_iter()
+    .map(|key| (key, std::env::var_os(key)))
+    .collect();
+    std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
+    std::env::set_var("WHIPPLESCRIPT_BRANCH_STORE", root.join("branches.sqlite"));
+    std::env::set_var(
+        "WHIPPLESCRIPT_VCS_CONTENT_STORE",
+        root.join("content.sqlite"),
+    );
+
+    let mut items =
+        whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
+    let issue = items
+        .file_item("q", "turn work", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    // The AGENT door's holder spelling, exactly as update_todo claims.
+    items
+        .claim_item(&issue.id, "agent:ins-join", None)
+        .expect("claim");
+    let content_id = items
+        .subject_content_id(&issue.id)
+        .expect("content id")
+        .expect("known");
+    drop(items);
+
+    let mut vcs = open_vcs().expect("vcs");
+    vcs.init("t0").expect("init");
+    stamp_claim_intent(&mut vcs, "ins-join");
+    vcs.write(
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        "src/a.rs",
+        Some("v1"),
+        "cut_join_1",
+        "t1",
+    )
+    .expect("write");
+    let units = vcs
+        .change_units(whipplescript_store::branches::MAINLINE_BRANCH_ID, 10)
+        .expect("units");
+    assert_eq!(units.len(), 1);
+    assert_eq!(
+        units[0].intent.as_deref(),
+        Some(content_id.as_str()),
+        "the todo-claimed issue's content id rides the cut"
+    );
+
+    // A second claim through the KERNEL door makes intent ambiguous:
+    // a fresh handle stamps nothing.
+    let mut items =
+        whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
+    let second = items
+        .file_item("q", "second", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    items
+        .claim_item(&second.id, "ins-join", None)
+        .expect("claim");
+    drop(items);
+    let mut vcs = open_vcs().expect("vcs");
+    stamp_claim_intent(&mut vcs, "ins-join");
+    vcs.write(
+        whipplescript_store::branches::MAINLINE_BRANCH_ID,
+        "src/b.rs",
+        Some("v1"),
+        "cut_join_2",
+        "t2",
+    )
+    .expect("write");
+    let units = vcs
+        .change_units(whipplescript_store::branches::MAINLINE_BRANCH_ID, 10)
+        .expect("units");
+    let second_cut = units
+        .iter()
+        .find(|unit| unit.cut_id == "cut_join_2")
+        .expect("cut");
+    assert_eq!(second_cut.intent, None, "two held claims stamp nothing");
+
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// DR-0084 I1: finishing a subject that was worked under a claim
+/// auto-attests its cut trail — `kind: "cuts"` referencing the
+/// `intent(<content-id>)` selection. With no VCS frontier the evidence is
+/// UNKEYED (degraded and tagged); an unclaimed finish records nothing.
+#[test]
+fn finish_auto_attests_the_cut_trail() {
+    let _guard = crate::env_lock();
+    let root = std::env::temp_dir().join(format!(
+        "whip-auto-attest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let previous = std::env::var_os("WHIPPLESCRIPT_ITEMS_STORE");
+    std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", root.join("items.sqlite"));
+
+    let mut store =
+        whipplescript_store::items::WorkItemStore::open(items_store_path()).expect("items");
+    let claimed = store
+        .file_item("q", "worked", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    let unclaimed = store
+        .file_item("q", "untouched", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    store.claim_item(&claimed.id, "ins-9", None).expect("claim");
+    store.finish_item(&claimed.id, None, None).expect("finish");
+    auto_attest_finish(&mut store, &claimed.id, Some("ins-9"));
+    auto_attest_finish(&mut store, &unclaimed.id, Some("ins-9"));
+
+    let trail = store.evidence(&claimed.id).expect("evidence");
+    assert_eq!(trail.len(), 1);
+    assert_eq!(trail[0].kind.as_deref(), Some("cuts"));
+    let content_id = store
+        .subject_content_id(&claimed.id)
+        .expect("content id")
+        .expect("known");
+    assert_eq!(
+        trail[0].reference.as_deref(),
+        Some(format!("intent({content_id})").as_str())
+    );
+    assert_eq!(trail[0].at_cut, None, "no frontier -> unkeyed");
+    assert!(store.evidence(&unclaimed.id).expect("evidence").is_empty());
+
+    match previous {
+        Some(value) => std::env::set_var("WHIPPLESCRIPT_ITEMS_STORE", value),
+        None => std::env::remove_var("WHIPPLESCRIPT_ITEMS_STORE"),
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// DR-0084 O1: the mediator's classification emits one edge fact per stale
+/// subject — issues under their name, assertions under theirs — with the
+/// mainline branch key and NO volatile fields (the edge key is the payload
+/// content). Fresh and unverified subjects emit nothing.
+#[test]
+fn staleness_facts_classify_stale_subjects_only() {
+    use std::collections::BTreeMap;
+    let mut items = whipplescript_store::items::WorkItemStore::open_in_memory().expect("items");
+    let stale_issue = items
+        .file_item("q", "stale one", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    let fresh_issue = items
+        .file_item("q", "fresh one", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    let unkeyed_issue = items
+        .file_item("q", "unverified one", "", &[], &json!({}), Some("s:a"))
+        .expect("file");
+    let assertion = items
+        .create_assertion("stale claim", "", Some("s:a"))
+        .expect("assert");
+    let fingerprint_stale = r#"{"decl:rule close":"old-hash"}"#;
+    let fingerprint_fresh = r#"{"decl:rule close":"h1"}"#;
+    items
+        .attest(
+            &stale_issue.id,
+            Some("t"),
+            None,
+            None,
+            Some("s:a"),
+            Some("cut_1"),
+            Some("decl(rule close)"),
+            Some(fingerprint_stale),
+        )
+        .expect("attest")
+        .expect("known");
+    items
+        .attest(
+            &fresh_issue.id,
+            Some("t"),
+            None,
+            None,
+            Some("s:a"),
+            Some("cut_1"),
+            Some("decl(rule close)"),
+            Some(fingerprint_fresh),
+        )
+        .expect("attest")
+        .expect("known");
+    items
+        .add_evidence(&unkeyed_issue.id, Some("t"), None, None, Some("s:a"))
+        .expect("evidence");
+    items
+        .attest(
+            &assertion.id,
+            Some("t"),
+            None,
+            None,
+            Some("s:a"),
+            Some("cut_1"),
+            Some("decl(rule close)"),
+            Some(fingerprint_stale),
+        )
+        .expect("attest")
+        .expect("known");
+
+    let frontier = whipplescript_store::freshness::FrontierContent {
+        decls: BTreeMap::from([("rule close".to_owned(), "h1".to_owned())]),
+        decl_renames: BTreeMap::new(),
+        paths: BTreeMap::new(),
+    };
+    let facts = staleness_facts(&items, &(frontier, Vec::new()));
+    let names: Vec<(&str, &str)> = facts
+        .iter()
+        .map(|(name, payload)| {
+            (
+                name.as_str(),
+                payload.get("subject").and_then(Value::as_str).unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("tracker.issue.stale", stale_issue.id.as_str()),
+            ("tracker.assertion.stale", assertion.id.as_str()),
+        ]
+    );
+    // The payload is edge-stable: branch key + no timestamps.
+    let payload = &facts[0].1;
+    assert_eq!(payload["branch"], "main");
+    assert!(payload.get("at").is_none());
+    assert_eq!(payload["verification"]["status"], "stale");
+}
+
+/// DR-0084: an unresolved `region(<name>)` atom reaching the selective-verb
+/// provider is refused BY NAME before any store is opened — literals expand
+/// at effect-input build, so only a dynamic selection naming an undeclared
+/// region gets here, and "matched nothing" must never be the answer.
+#[test]
+fn vcs_selective_provider_refuses_unresolved_region_atoms() {
+    let provider = VcsSelectiveCapabilityProvider {
+        store_path: std::path::PathBuf::from("/nonexistent/store.sqlite"),
+        instance_id: "ins-region".to_owned(),
+    };
+    let effect = ClaimableEffect {
+        effect_id: "e-region".to_owned(),
+        kind: "capability.call".to_owned(),
+        target: Some("vcs.undo".to_owned()),
+        profile: None,
+        input_json: json!({ "selection": "region(ghost) & by(s:)" }).to_string(),
+        required_capabilities_json: "[]".to_owned(),
+        declared_profiles_json: "[]".to_owned(),
+    };
+    let outcome = provider.produce(&effect, &EffectConfig::default());
+    let CapabilityOutcome::Failed { message, .. } = outcome else {
+        panic!("expected refusal");
+    };
+    assert!(
+        message.contains("`region(ghost)` did not resolve"),
+        "{message}"
+    );
 }
 
 #[test]

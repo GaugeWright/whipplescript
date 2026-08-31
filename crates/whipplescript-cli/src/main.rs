@@ -265,6 +265,7 @@ fn main() -> ExitCode {
         Some("ledger") => coordination_list(&options, "ledger"),
         Some("counters") => coordination_list(&options, "counters"),
         Some("issue") => issue(&options),
+        Some("assert") => assert_command(&options),
         Some("memory") => memory_command(&options),
         Some("script") => script_command(&options),
         Some("evidence") => evidence_router(&options),
@@ -1112,6 +1113,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "ledger" => "usage: whip ledger [<ledger>] [--partition <value>]",
         "counters" => "usage: whip counters [<counter>]",
         "issue" => ISSUE_USAGE,
+        "assert" => ASSERT_USAGE,
         "memory" => "usage: whip memory <pools|entries <pool> [--limit <n>]> (the workspace memory store; WHIPPLESCRIPT_MEMORY_STORE overrides the path)",
         "script" => "usage: whip script <list|verify> [--script-manifest <path>] (read-only views over the pinned script-capability manifest; verify re-hashes each pin, exit 1 on any mismatch)",
         "evidence" => "usage: whip [--json] evidence [<gauge>] | whip evidence instance <instance-id>\n  bare/gauge form = the gauge evidence view (estimates + standing-contradiction flags; same as `whip gauges`); `instance` = a run's provider evidence chain",
@@ -23742,6 +23744,14 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
             Ok(expr) => expr,
             Err(error) => return failed(format!("selection does not parse: {error}")),
         };
+        // DR-0084: an unexpanded region atom must never silently match empty
+        // -- refuse it by name (literals expand at effect-input build; only a
+        // dynamic selection naming an undeclared region reaches here).
+        if let Some(name) = whipplescript_store::selection::contains_region_atom(&expr) {
+            return failed(format!(
+                "`region({name})` did not resolve: the program declares no region by that name"
+            ));
+        }
         let mut vcs = match open_vcs() {
             Ok(vcs) => vcs,
             Err(_) => return failed("branch stores unavailable".to_owned()),
@@ -23802,6 +23812,8 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
                     "variant": "Applied",
                     "cut_id": cut_id,
                     "detail": serde_json::to_string(&reverted_paths).unwrap_or_default(),
+                    // DR-0084 O1: what this proposal cut staled (advisory).
+                    "staleness": staleness_deltas(&vcs, &branch_id, &cut_id),
                 })),
                 Ok(whipplescript_store::vcs::UndoSelectionOutcome::WouldStrand { stranded }) => {
                     Ok(json!({
@@ -23850,6 +23862,9 @@ impl whipplescript_kernel::effect_handlers::CapabilityProvider for VcsSelectiveC
                     "variant": "Applied",
                     "cut_id": cut_id,
                     "detail": serde_json::to_string(&moved_paths).unwrap_or_default(),
+                    // DR-0084 O1: what landed content staled on the
+                    // DESTINATION line (advisory).
+                    "staleness": staleness_deltas(&vcs, &onto_line, &cut_id),
                 })),
                 Ok(whipplescript_store::vcs::TransportOutcome::Conflicted { conflicts }) => {
                     Ok(json!({
@@ -25099,6 +25114,7 @@ fn run_exec_effect(
                         match exec_output_to_outcome(output, &parse_contract, &Default::default()) {
                             Ok(ok) => {
                                 match import_branch_exec_scratch(
+                                    instance_id,
                                     &branch_id,
                                     &scratch_root,
                                     &scratch,
@@ -31772,6 +31788,10 @@ dep add <blocked> [depends-on] <blocker> [--kind K]|\
 link <from> <kind> <to>|unlink <from> <kind> <to>|\
 note <id> <text>|comments <id>|\
 evidence <id> [--kind K --ref R --note N]|\
+anchor <id> \"<region>\" [--role subject|intent]|anchor <id> --remove <anchor-id>|\
+anchor <id> \"<region>\" --replace <anchor-id>|\
+anchors <id>|\
+attest <id> [--kind K --ref R --note N] [--basis \"<region>\"]|\
 export [--to DIR]|import <path|->|import --from DIR|sync DIR|\
 rebuild>";
 
@@ -31851,6 +31871,785 @@ fn emit_issue_row(
             ExitCode::FAILURE
         }
         Err(error) => report_store_error("failed to load issue", error),
+    }
+}
+
+/// Region text validated at the anchor/attest door: the world-denoting
+/// subtype only. A `region(<name>)` atom cannot resolve at the CLI (no
+/// program in hand), and `region_position_violations` refuses it together
+/// with the change-set atoms, all by name.
+fn validated_region(text: &str) -> Result<(), String> {
+    let expr = whipplescript_store::selection::parse(text)?;
+    let violations = whipplescript_store::selection::region_position_violations(&expr);
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{}` may not appear in an anchor/basis — it denotes a part of the \
+             artifact world (`path`/`decl` atoms only; a `region(<name>)` cannot \
+             resolve at the CLI, paste its selection)",
+            violations.join("`, `")
+        ))
+    }
+}
+
+/// The knowledge-plane verbs shared by `whip issue` and `whip assert`
+/// (DR-0084 Decision 3): anchors bind a subject to a world-denoting region,
+/// `attest` records evidence with its validity key (at-cut + copied basis +
+/// resolved fingerprint). One implementation, two doors — issues and
+/// assertions share the alias bridge.
+fn knowledge_subject_verbs(
+    store: &mut whipplescript_store::items::WorkItemStore,
+    options: &CliOptions,
+    usage: &str,
+) -> ExitCode {
+    let args = &options.args;
+    let command = args.first().map(String::as_str).unwrap_or_default();
+    match command {
+        "anchor" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            // `--replace <old>` with a region: the recorded two-event act —
+            // remove the old anchor, add the new one (DR-0084 Decision 4:
+            // re-anchoring is always explicit, never automatic).
+            if let Some(old_anchor) = flag_value(args, "--replace") {
+                let Some(region) = args.get(2).filter(|arg| !arg.starts_with("--")) else {
+                    eprintln!("{usage}");
+                    return ExitCode::from(2);
+                };
+                if let Err(error) = validated_region(region) {
+                    eprintln!("anchor region refused: {error}");
+                    return ExitCode::from(2);
+                }
+                let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+                match store.remove_anchor(id, &old_anchor, actor.as_deref()) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("no anchor `{old_anchor}` on `{id}`");
+                        return ExitCode::FAILURE;
+                    }
+                    Err(error) => return report_store_error("failed to remove anchor", error),
+                }
+                let role = flag_value(args, "--role").unwrap_or_else(|| "subject".to_owned());
+                return match store.add_anchor(id, region, &role, actor.as_deref()) {
+                    Ok(Some(anchor_id)) => {
+                        println!("{id} re-anchored: {old_anchor} -> {anchor_id} ({region})");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => {
+                        eprintln!("`{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to add anchor", error),
+                };
+            }
+            if let Some(anchor_id) = flag_value(args, "--remove") {
+                let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+                return match store.remove_anchor(id, &anchor_id, actor.as_deref()) {
+                    Ok(true) => {
+                        println!("anchor {anchor_id} removed from {id}");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(false) => {
+                        eprintln!("no anchor `{anchor_id}` on `{id}`");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to remove anchor", error),
+                };
+            }
+            let Some(region) = args.get(2).filter(|arg| !arg.starts_with("--")) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            if let Err(error) = validated_region(region) {
+                eprintln!("anchor region refused: {error}");
+                return ExitCode::from(2);
+            }
+            let role = flag_value(args, "--role").unwrap_or_else(|| "subject".to_owned());
+            if role != "subject" && role != "intent" {
+                eprintln!("--role is `subject` or `intent`");
+                return ExitCode::from(2);
+            }
+            let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+            match store.add_anchor(id, region, &role, actor.as_deref()) {
+                Ok(Some(anchor_id)) => {
+                    if options.json {
+                        emit_json(json!({ "anchor_id": anchor_id, "subject": id,
+                                          "region": region, "role": role }))
+                    } else {
+                        println!("{id} anchored to {region} [{role}] ({anchor_id})");
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("`{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to add anchor", error),
+            }
+        }
+        "anchors" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let anchors = match store.anchors(id) {
+                Ok(anchors) => anchors,
+                Err(error) => return report_store_error("failed to list anchors", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    anchors
+                        .iter()
+                        .map(|anchor| {
+                            json!({ "anchor_id": anchor.id, "region": anchor.region,
+                                    "role": anchor.role, "added_by": anchor.added_by,
+                                    "created_at": anchor.created_at })
+                        })
+                        .collect(),
+                ));
+            }
+            if anchors.is_empty() {
+                println!("no anchors");
+            }
+            for anchor in anchors {
+                println!("{} [{}] {}", anchor.id, anchor.role, anchor.region);
+            }
+            ExitCode::SUCCESS
+        }
+        "attest" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let kind = flag_value(args, "--kind");
+            let reference = flag_value(args, "--ref");
+            let note = flag_value(args, "--note");
+            let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+            // The basis: `--basis` wins; else the union of the subject's
+            // subject-role anchors, COPIED here (DR-0084: later anchor edits
+            // never rewrite what this evidence claimed to depend on).
+            let basis_text = match flag_value(args, "--basis") {
+                Some(basis) => Some(basis),
+                None => {
+                    let anchors = match store.anchors(id) {
+                        Ok(anchors) => anchors,
+                        Err(error) => return report_store_error("failed to read anchors", error),
+                    };
+                    let subject_regions: Vec<String> = anchors
+                        .into_iter()
+                        .filter(|anchor| anchor.role == "subject")
+                        .map(|anchor| format!("({})", anchor.region))
+                        .collect();
+                    (!subject_regions.is_empty()).then(|| subject_regions.join(" | "))
+                }
+            };
+            let Some(basis_text) = basis_text else {
+                // No basis anywhere: unkeyed evidence, degraded and tagged.
+                return match store.add_evidence(
+                    id,
+                    kind.as_deref(),
+                    reference.as_deref(),
+                    note.as_deref(),
+                    actor.as_deref(),
+                ) {
+                    Ok(Some(evidence_id)) => {
+                        println!("{id} evidence {evidence_id} recorded (unkeyed: no basis)");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(None) => {
+                        eprintln!("`{id}` was not found");
+                        ExitCode::FAILURE
+                    }
+                    Err(error) => report_store_error("failed to record evidence", error),
+                };
+            };
+            if let Err(error) = validated_region(&basis_text) {
+                eprintln!("attest basis refused: {error}");
+                return ExitCode::from(2);
+            }
+            let expr =
+                whipplescript_store::selection::parse(&basis_text).expect("validated basis parses");
+            let vcs = match open_vcs() {
+                Ok(vcs) => vcs,
+                Err(code) => return code,
+            };
+            let frontier =
+                match vcs.frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID) {
+                    Ok(Some(frontier)) => frontier,
+                    Ok(None) => {
+                        eprintln!(
+                            "the workspace VCS has no mainline yet — a first `whip branch \
+                             write main <path> --body ...` creates it; or attest without \
+                             a basis for unkeyed evidence"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(error) => {
+                        eprintln!("frontier unavailable: {error:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            let (at_cut, content) = frontier;
+            let fingerprint = match whipplescript_store::freshness::resolve_basis(&expr, &content) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    eprintln!("attest basis refused: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            if fingerprint.is_empty() {
+                eprintln!(
+                    "note: the basis matched nothing at the frontier — this evidence is \
+                     vacuously fresh and will never go stale"
+                );
+            }
+            let fingerprint_json = match serde_json::to_string(&fingerprint) {
+                Ok(fingerprint_json) => fingerprint_json,
+                Err(error) => {
+                    eprintln!("fingerprint serialization failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match store.attest(
+                id,
+                kind.as_deref(),
+                reference.as_deref(),
+                note.as_deref(),
+                actor.as_deref(),
+                at_cut.as_deref(),
+                Some(&basis_text),
+                Some(&fingerprint_json),
+            ) {
+                Ok(Some(evidence_id)) => {
+                    if options.json {
+                        emit_json(json!({ "evidence_id": evidence_id, "subject": id,
+                                          "at_cut": at_cut, "basis": basis_text,
+                                          "basis_fingerprint": fingerprint }))
+                    } else {
+                        println!(
+                            "{id} attested ({evidence_id}, {} basis entr{})",
+                            fingerprint.len(),
+                            if fingerprint.len() == 1 { "y" } else { "ies" }
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("`{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to attest", error),
+            }
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// DR-0084 I1: stamp the claimed work item into the cuts this VCS handle
+/// is about to record. Exactly ONE active kernel claim held by the
+/// instance is an unambiguous intent and stamps the issue's CONTENT id
+/// (durable, merge-stable — the `intent(<id>)` selection atom's referent);
+/// zero or several claims stamp nothing (ambiguity is never guessed).
+fn stamp_claim_intent(vcs: &mut whipplescript_store::vcs::NativeWorkspaceVcs, instance_id: &str) {
+    let Ok(items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) else {
+        return;
+    };
+    // Two claim doors, one join (the agent-door claim join): kernel-driven
+    // claims hold as the bare instance id; the harness todo tool holds as
+    // `agent:<instance id>` (live turns pass the instance as the holder).
+    // Union both spellings — the exactly-one rule then spans the doors, so
+    // a turn that todo-claimed one issue while its workflow kernel-claimed
+    // another stamps nothing (ambiguity is never guessed).
+    let mut held = match items.active_claim_subjects(instance_id) {
+        Ok(held) => held,
+        Err(_) => return,
+    };
+    if let Ok(agent_held) = items.active_claim_subjects(&format!("agent:{instance_id}")) {
+        held.extend(agent_held);
+    }
+    held.sort();
+    held.dedup();
+    if held.len() == 1 {
+        vcs.set_intent(Some(held.remove(0)));
+    }
+}
+
+/// DR-0084 I1, the finish half: after a finish on a subject that was ever
+/// claimed, auto-attest the work's cut trail — `kind: "cuts"` with the
+/// `intent(<content-id>)` selection as its reference, KEYED over the
+/// subject's anchors when a mainline frontier exists, unkeyed otherwise
+/// (degraded and tagged). Advisory: a failure here never fails the finish.
+fn auto_attest_finish(
+    store: &mut whipplescript_store::items::WorkItemStore,
+    id: &str,
+    actor: Option<&str>,
+) {
+    let Ok(true) = store.was_ever_claimed(id) else {
+        return;
+    };
+    let Ok(Some(content_id)) = store.subject_content_id(id) else {
+        return;
+    };
+    let reference = format!("intent({content_id})");
+    let basis_text = store
+        .anchors(id)
+        .ok()
+        .map(|anchors| {
+            anchors
+                .into_iter()
+                .filter(|anchor| anchor.role == "subject")
+                .map(|anchor| format!("({})", anchor.region))
+                .collect::<Vec<_>>()
+        })
+        .filter(|regions| !regions.is_empty())
+        .map(|regions| regions.join(" | "));
+    let keyed = basis_text.as_ref().and_then(|basis_text| {
+        let expr = whipplescript_store::selection::parse(basis_text).ok()?;
+        let vcs = open_vcs().ok()?;
+        let (at_cut, frontier) = vcs
+            .frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID)
+            .ok()??;
+        let fingerprint = whipplescript_store::freshness::resolve_basis(&expr, &frontier).ok()?;
+        let fingerprint_json = serde_json::to_string(&fingerprint).ok()?;
+        Some((at_cut, fingerprint_json))
+    });
+    match keyed {
+        Some((at_cut, fingerprint_json)) => {
+            let _ = store.attest(
+                id,
+                Some("cuts"),
+                Some(&reference),
+                None,
+                actor,
+                at_cut.as_deref(),
+                basis_text.as_deref(),
+                Some(&fingerprint_json),
+            );
+        }
+        None => {
+            let _ = store.add_evidence(id, Some("cuts"), Some(&reference), None, actor);
+        }
+    }
+}
+
+/// DR-0084 O1, the receipt half: the staleness deltas one proposal cut
+/// caused — every keyed evidence row on the applied branch that is now
+/// stale AND whose witness includes this cut. Reported in the selective
+/// verbs' receipts (report, never refuse) — the out-of-tree analogue of
+/// `Stranded` carrying its stranded units. Empty on any missing
+/// prerequisite (no items store, no frontier): a receipt never fails over
+/// its advisory.
+fn staleness_deltas(
+    vcs: &whipplescript_store::vcs::NativeWorkspaceVcs,
+    branch_id: &str,
+    cut_id: &str,
+) -> Vec<Value> {
+    if cut_id.is_empty() {
+        return Vec::new();
+    }
+    let Ok(items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) else {
+        return Vec::new();
+    };
+    let Ok(Some((_at_cut, frontier))) = vcs.frontier_content(branch_id) else {
+        return Vec::new();
+    };
+    let units = vcs.change_units(branch_id, 10_000).unwrap_or_default();
+    let context = (frontier, units);
+    let mut subjects: Vec<String> = Vec::new();
+    if let Ok(issues) = items.list_items(None, None) {
+        subjects.extend(issues.into_iter().map(|issue| issue.id));
+    }
+    if let Ok(assertions) = items.list_assertions(false) {
+        subjects.extend(assertions.into_iter().map(|assertion| assertion.id));
+    }
+    let mut deltas = Vec::new();
+    for subject in subjects {
+        let Some(verification) = verification_json(&items, &subject, &context) else {
+            continue;
+        };
+        let Some(rows) = verification.get("evidence").and_then(Value::as_array) else {
+            continue;
+        };
+        for row in rows {
+            if row.get("freshness").and_then(Value::as_str) != Some("stale") {
+                continue;
+            }
+            let hit = row
+                .get("witness")
+                .and_then(Value::as_array)
+                .is_some_and(|witness| {
+                    witness
+                        .iter()
+                        .any(|unit| unit.get("cut").and_then(Value::as_str) == Some(cut_id))
+                });
+            if hit {
+                deltas.push(json!({
+                    "subject": subject,
+                    "evidence_id": row.get("evidence_id"),
+                }));
+            }
+        }
+    }
+    deltas
+}
+
+/// DR-0084 O1, the classification half as a pure-over-stores function: the
+/// staleness facts one mediator pass emits — every open issue / active
+/// assertion whose keyed evidence is stale at the given frontier. Payloads
+/// carry NO volatile fields, so route_workspace_facts' content-hash key plus
+/// idempotent derive yields EDGE semantics: one firing per invalidation
+/// state, re-armed only when the state itself changes (new breakage or new
+/// evidence). Staleness reports, never refuses — readiness is untouched.
+fn staleness_facts(
+    items: &whipplescript_store::items::WorkItemStore,
+    context: &(
+        whipplescript_store::freshness::FrontierContent,
+        Vec<whipplescript_store::selection::ChangeUnit>,
+    ),
+) -> Vec<(String, Value)> {
+    let mut subjects: Vec<(String, &str)> = Vec::new();
+    if let Ok(issues) = items.list_items(None, None) {
+        subjects.extend(
+            issues
+                .into_iter()
+                .filter(|issue| issue.status == "open" || issue.status == "in_progress")
+                .map(|issue| (issue.id, "tracker.issue.stale")),
+        );
+    }
+    if let Ok(assertions) = items.list_assertions(false) {
+        subjects.extend(
+            assertions
+                .into_iter()
+                .map(|assertion| (assertion.id, "tracker.assertion.stale")),
+        );
+    }
+    let mut facts = Vec::new();
+    for (subject, fact_name) in subjects {
+        let Some(verification) = verification_json(items, &subject, context) else {
+            continue;
+        };
+        if verification.get("status").and_then(Value::as_str) != Some("stale") {
+            continue;
+        }
+        let status = verification
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("stale")
+            .to_owned();
+        facts.push((
+            fact_name.to_owned(),
+            json!({
+                "branch": whipplescript_store::branches::MAINLINE_BRANCH_ID,
+                "subject": subject,
+                "status": status,
+                "verification": verification,
+            }),
+        ));
+    }
+    facts
+}
+
+/// The frontier context the freshness read surface evaluates against:
+/// mainline's content maps plus its change-unit window for witness scans.
+/// `None` = no workspace VCS mainline — no freshness claims without a
+/// frontier (evidence reads as unkeyed/unverified, never as stale).
+fn freshness_context() -> Option<(
+    whipplescript_store::freshness::FrontierContent,
+    Vec<whipplescript_store::selection::ChangeUnit>,
+)> {
+    let vcs = open_vcs().ok()?;
+    let (_at_cut, frontier) = vcs
+        .frontier_content(whipplescript_store::branches::MAINLINE_BRANCH_ID)
+        .ok()??;
+    let units = vcs
+        .change_units(whipplescript_store::branches::MAINLINE_BRANCH_ID, 10_000)
+        .unwrap_or_default();
+    Some((frontier, units))
+}
+
+/// Witness scan (DR-0084 Decision 3: attribution, never the definition):
+/// the post-at-cut change-units the basis selects — the cuts that broke it,
+/// with their actors and intents. When the at-cut has left the change-unit
+/// window, every matching unit in the window is reported (conservative:
+/// more attribution candidates, never fewer).
+fn witness_units(
+    basis: Option<&str>,
+    at_cut: Option<&str>,
+    units: &[whipplescript_store::selection::ChangeUnit],
+) -> Vec<Value> {
+    let Some(basis) = basis else {
+        return Vec::new();
+    };
+    let Ok(expr) = whipplescript_store::selection::parse(basis) else {
+        return Vec::new();
+    };
+    let boundary = at_cut.and_then(|cut| units.iter().position(|unit| unit.cut_id == cut));
+    whipplescript_store::selection::eval(&expr, units)
+        .into_iter()
+        .filter(|&index| boundary.is_none_or(|b| index > b))
+        .map(|index| {
+            let unit = &units[index];
+            json!({
+                "cut": unit.cut_id, "path": unit.path,
+                "actor": unit.actor, "intent": unit.intent,
+            })
+        })
+        .collect()
+}
+
+/// The derived verification view of a ledger subject (DR-0084, K3):
+/// per-evidence freshness at the mainline frontier — `fresh`, `stale` (with
+/// the mismatched entries, the moved advisories, and the witness cuts), or
+/// `unkeyed` — and the subject's status: `verified` (some keyed evidence is
+/// fresh), `stale` (keyed evidence exists, none fresh), `unverified`
+/// (nothing keyed). Derived, never stored.
+fn verification_json(
+    store: &whipplescript_store::items::WorkItemStore,
+    id: &str,
+    context: &(
+        whipplescript_store::freshness::FrontierContent,
+        Vec<whipplescript_store::selection::ChangeUnit>,
+    ),
+) -> Option<Value> {
+    use whipplescript_store::freshness::{evaluate, Freshness};
+    let (frontier, units) = context;
+    let evidence = store.evidence(id).ok()?;
+    let mut any_fresh = false;
+    let mut any_keyed = false;
+    let mut rows = Vec::new();
+    for row in &evidence {
+        let Some(fingerprint_json) = &row.basis_fingerprint_json else {
+            rows.push(json!({
+                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
+            }));
+            continue;
+        };
+        let Ok(fingerprint) =
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(fingerprint_json)
+        else {
+            rows.push(json!({
+                "evidence_id": row.id, "kind": row.kind, "freshness": "unkeyed",
+                "note": "unreadable fingerprint",
+            }));
+            continue;
+        };
+        any_keyed = true;
+        match evaluate(&fingerprint, frontier) {
+            Freshness::Fresh => {
+                any_fresh = true;
+                rows.push(json!({
+                    "evidence_id": row.id, "kind": row.kind, "freshness": "fresh",
+                    "at_cut": row.at_cut,
+                }));
+            }
+            Freshness::Stale { mismatched, moved } => {
+                rows.push(json!({
+                    "evidence_id": row.id, "kind": row.kind, "freshness": "stale",
+                    "at_cut": row.at_cut,
+                    "mismatched": mismatched,
+                    "moved": moved
+                        .iter()
+                        .map(|(from, to)| json!({ "from": from, "moved_to": to }))
+                        .collect::<Vec<_>>(),
+                    "witness": witness_units(
+                        row.basis.as_deref(),
+                        row.at_cut.as_deref(),
+                        units,
+                    ),
+                }));
+            }
+        }
+    }
+    let status = if any_fresh {
+        "verified"
+    } else if any_keyed {
+        "stale"
+    } else {
+        "unverified"
+    };
+    Some(json!({ "status": status, "evidence": rows }))
+}
+
+const ASSERT_USAGE: &str = "usage: whip assert <\
+new --title T [--body B] [--actor A]|\
+list [--all]|\
+show <id>|\
+retire <id> [--actor A]|\
+anchor <id> \"<region>\" [--role subject|intent]|anchor <id> --remove <anchor-id>|\
+anchor <id> \"<region>\" --replace <anchor-id>|\
+anchors <id>|\
+attest <id> [--kind K --ref R --note N] [--basis \"<region>\"]>";
+
+/// The knowledge plane's CLI door (DR-0084 Decision 2): assertions are
+/// durable statements about the world, the ledger's second vocabulary beside
+/// issues — no readiness, no claim, no finish. CLI-first deliberately: no
+/// grammar or effect kind exists until a workflow consumer forces one.
+fn assert_command(options: &CliOptions) -> ExitCode {
+    use whipplescript_store::items::WorkItemStore;
+    let usage = ASSERT_USAGE;
+    let args = &options.args;
+    let command = args.first().map(String::as_str).unwrap_or("list");
+    let mut store = match WorkItemStore::open(items_store_path()) {
+        Ok(store) => store,
+        Err(error) => return report_store_error("failed to open items store", error),
+    };
+    let assertion_json = |assertion: &whipplescript_store::items::Assertion| {
+        json!({
+            "id": assertion.id,
+            "content_id": assertion.content_id,
+            "title": assertion.title,
+            "body": assertion.body,
+            "status": assertion.status,
+            "created_by": assertion.created_by,
+            "created_at": assertion.created_at,
+            "updated_at": assertion.updated_at,
+        })
+    };
+    match command {
+        "new" => {
+            let mut title = None;
+            let mut body = String::new();
+            let mut actor = None;
+            let mut iter = args.iter().skip(1);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--title" => title = iter.next().cloned(),
+                    "--body" => body = iter.next().cloned().unwrap_or_default(),
+                    "--actor" => actor = iter.next().cloned(),
+                    _ => {
+                        eprintln!("{usage}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let Some(title) = title else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            // Two doors, one stamp: the CLI door records provenance exactly as
+            // the (future) effect door will.
+            let created_by = actor.or_else(run_identity_stamp);
+            match store.create_assertion(&title, &body, created_by.as_deref()) {
+                Ok(assertion) => {
+                    if options.json {
+                        emit_json(assertion_json(&assertion))
+                    } else {
+                        println!("{} asserted", assertion.id);
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(error) => report_store_error("failed to create assertion", error),
+            }
+        }
+        "list" => {
+            let include_retired = args.iter().any(|arg| arg == "--all");
+            let listed = match store.list_assertions(include_retired) {
+                Ok(assertions) => assertions,
+                Err(error) => return report_store_error("failed to list assertions", error),
+            };
+            if options.json {
+                return emit_json(Value::Array(
+                    listed.iter().map(assertion_json).collect::<Vec<_>>(),
+                ));
+            }
+            if listed.is_empty() {
+                println!("no assertions");
+            }
+            let context = freshness_context();
+            for assertion in listed {
+                let verification = context
+                    .as_ref()
+                    .and_then(|context| verification_json(&store, &assertion.id, context))
+                    .and_then(|v| v.get("status").and_then(Value::as_str).map(str::to_owned))
+                    .map(|status| format!(" ({status})"))
+                    .unwrap_or_default();
+                println!(
+                    "{} [{}]{} {}",
+                    assertion.id, assertion.status, verification, assertion.title
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        "show" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            match store.get_assertion(id) {
+                Ok(Some(assertion)) => {
+                    if options.json {
+                        let mut value = assertion_json(&assertion);
+                        if let Some(context) = freshness_context() {
+                            if let (Some(map), Some(verification)) = (
+                                value.as_object_mut(),
+                                verification_json(&store, id, &context),
+                            ) {
+                                map.insert("verification".to_owned(), verification);
+                            }
+                        }
+                        emit_json(value)
+                    } else {
+                        let status = freshness_context()
+                            .and_then(|context| verification_json(&store, id, &context))
+                            .and_then(|v| {
+                                v.get("status").and_then(Value::as_str).map(str::to_owned)
+                            });
+                        println!(
+                            "{} [{}]{} {}\n{}",
+                            assertion.id,
+                            assertion.status,
+                            status
+                                .map(|status| format!(" ({status})"))
+                                .unwrap_or_default(),
+                            assertion.title,
+                            assertion.body
+                        );
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("assertion `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to load assertion", error),
+            }
+        }
+        "anchor" | "anchors" | "attest" => knowledge_subject_verbs(&mut store, options, usage),
+        "retire" => {
+            let Some(id) = args.get(1) else {
+                eprintln!("{usage}");
+                return ExitCode::from(2);
+            };
+            let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+            match store.retire_assertion(id, actor.as_deref()) {
+                Ok(true) => {
+                    if options.json {
+                        match store.get_assertion(id) {
+                            Ok(Some(assertion)) => emit_json(assertion_json(&assertion)),
+                            _ => ExitCode::SUCCESS,
+                        }
+                    } else {
+                        println!("{id} retired");
+                        ExitCode::SUCCESS
+                    }
+                }
+                Ok(false) => {
+                    eprintln!("assertion `{id}` was not found");
+                    ExitCode::FAILURE
+                }
+                Err(error) => report_store_error("failed to retire assertion", error),
+            }
+        }
+        _ => {
+            eprintln!("{usage}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -31992,6 +32791,16 @@ fn issue(options: &CliOptions) -> ExitCode {
                                         .collect(),
                                 ),
                             );
+                        }
+                        // DR-0084 K3: the derived verification view, present
+                        // only when a mainline frontier exists to judge by.
+                        if let Some(context) = freshness_context() {
+                            if let (Some(map), Some(verification)) = (
+                                value.as_object_mut(),
+                                verification_json(&store, id, &context),
+                            ) {
+                                map.insert("verification".to_owned(), verification);
+                            }
                         }
                         emit_json(value)
                     } else {
@@ -32195,7 +33004,12 @@ fn issue(options: &CliOptions) -> ExitCode {
             };
             let summary = flag_value(args, "--summary");
             match store.finish_item(id, summary.as_deref(), None) {
-                Ok(FinishOutcome::Finished) => emit_issue_row(&store, id, "finished", options.json),
+                Ok(FinishOutcome::Finished) => {
+                    // DR-0084 I1: the work's cut trail becomes evidence.
+                    let actor = flag_value(args, "--actor").or_else(run_identity_stamp);
+                    auto_attest_finish(&mut store, id, actor.as_deref());
+                    emit_issue_row(&store, id, "finished", options.json)
+                }
                 Ok(FinishOutcome::NotOpen) => {
                     eprintln!("issue `{id}` is not open (cannot finish)");
                     ExitCode::FAILURE
@@ -32482,6 +33296,7 @@ fn issue(options: &CliOptions) -> ExitCode {
                 Err(error) => report_store_error("failed to read comments", error),
             }
         }
+        "anchor" | "anchors" | "attest" => knowledge_subject_verbs(&mut store, options, usage),
         "evidence" => {
             // `evidence <id> [--kind K] [--ref R] [--note N]`: add evidence if any
             // field flag is given, else list the issue's evidence.
@@ -36046,6 +36861,8 @@ fn file_store_for_instance(
             // deepest observed tier (DR-0052 — `s:<session>` once session
             // carriage lands; the instance until then).
             vcs.set_actor(Some(format!("instance:{instance_id}")));
+            // DR-0084 I1: an unambiguous held claim rides as the intent.
+            stamp_claim_intent(&mut vcs, instance_id);
             Box::new(BranchFileStore::new(
                 vcs,
                 &branch_id,
@@ -36103,6 +36920,7 @@ fn branch_exec_scratch(
 /// blob, commit the diff as ONE cut keyed by the effect id, and return the
 /// summary that rides the effect's terminal metadata.
 fn import_branch_exec_scratch(
+    instance_id: &str,
     branch_id: &str,
     scratch_root: &Path,
     scratch: &whipplescript_store::materialize::MaterializedScratch,
@@ -36112,6 +36930,8 @@ fn import_branch_exec_scratch(
     let mut vcs =
         whipplescript_store::vcs::WorkspaceVcs::open(branch_store_path(), vcs_content_store_path())
             .map_err(|error| format!("branch stores unavailable: {error:?}"))?;
+    // DR-0084 I1: exec cuts carry the held claim as intent, like file cuts.
+    stamp_claim_intent(&mut vcs, instance_id);
     let now_unix_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as i128)
@@ -37671,6 +38491,14 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     ));
                 }
             }
+            // DR-0084 O1: the knowledge plane's classification rides the same
+            // mediator pass — one mainline frontier evaluation, stale
+            // subjects become generated-only facts (edge-keyed by content).
+            if let Ok(items) = whipplescript_store::items::WorkItemStore::open(items_store_path()) {
+                if let Some(context) = freshness_context() {
+                    mediator_facts.extend(staleness_facts(&items, &context));
+                }
+            }
             arm_incidents_from_facts(&mediator_facts, &at);
             // Clearing: a branch that folded or is in sync no longer has
             // a stalled situation — its open stall incidents resolve
@@ -38273,6 +39101,15 @@ fn branch_command(options: &CliOptions) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            // DR-0084: the CLI has no program in hand, so a region atom cannot
+            // resolve here -- refuse it by name instead of matching nothing.
+            if let Some(name) = whipplescript_store::selection::contains_region_atom(&expr) {
+                eprintln!(
+                    "`region({name})` cannot resolve at the CLI: paste the region's \
+                     selection, or drive the verb from a rule body where it expands"
+                );
+                return ExitCode::from(2);
+            }
             let apply = rest.contains(&"--apply");
             match verb {
                 "select" => {

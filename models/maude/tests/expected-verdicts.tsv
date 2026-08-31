@@ -68,7 +68,9 @@ infoflow-redaction.maude	SSNNN
 infoflow-signal-carriage.maude	SSSSNNNNN
 infoflow-signature.maude	SSNNNSNNN
 infoflow-staging.maude	SSNN
+infoflow-tracker-carriage.maude	SSSSNNNNS
 invoke-result-typing.maude	SSSSNNSSSN
+ledger-freshness.maude	SNNSSNNSSNSS
 lowering-class-lifecycle.maude	SSSSSSSSSSSNNNNNNNNNNNNNNN
 lowering-runtime-handoff.maude	SSSSSNNNNNNNNNNNNN
 mcp-admission.maude	SSSSSSNNNNNN

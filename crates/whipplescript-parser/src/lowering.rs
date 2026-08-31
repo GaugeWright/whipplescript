@@ -103,6 +103,7 @@ pub(crate) fn lower_program(
         harnesses: Vec::new(),
         trackers: Vec::new(),
         streams: Vec::new(),
+        regions: Vec::new(),
         channels: Vec::new(),
         credentials: Vec::new(),
         vaults: Vec::new(),
@@ -222,6 +223,7 @@ pub(crate) fn lower_program(
             Item::Channel(channel) => lower_channel(channel, &mut ir, &mut diagnostics),
             Item::Credential(credential) => lower_credential(credential, &mut ir, &mut diagnostics),
             Item::Stream(stream) => lower_stream(stream, &mut ir, &mut diagnostics),
+            Item::Region(region) => lower_region(region, &mut ir, &mut diagnostics),
             Item::Gauge(gauge) => lower_gauge(gauge, &mut ir, &mut diagnostics),
             Item::Mark(mark) => lower_mark(mark, &mut ir, &mut diagnostics),
             Item::Campaign(campaign) => lower_campaign(campaign, &mut ir, &mut diagnostics),
@@ -434,6 +436,7 @@ pub(crate) fn lower_program(
     }
 
     validate_streams(&ir, &mut diagnostics);
+    validate_regions(&ir, &mut diagnostics);
     ir.rule_dependencies = build_rule_dependencies(&ir.rules);
     let (measures, cycle_classes) = validate_effectful_rule_recursion(&ir, &mut diagnostics);
     ir.measures = measures;
@@ -627,6 +630,35 @@ fn lower_tracker(tracker: TrackerDecl, ir: &mut IrProgram, diagnostics: &mut Vec
         name: tracker.name.name,
         provider: tracker.provider.name,
         span: tracker.span,
+    });
+}
+
+fn lower_region(region: RegionDecl, ir: &mut IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    // Two regions with one name would make `region(<name>)` expansion
+    // ambiguous (a region name is a denotational identity).
+    if ir
+        .regions
+        .iter()
+        .any(|other| other.name == region.name.name)
+    {
+        diagnostics.push(Diagnostic {
+            code: diagnostic_code!("construct.duplicate_declaration"),
+            severity: Severity::Error,
+            related: Vec::new(),
+            span: region.name.span,
+            message: format!("duplicate region `{}`", region.name.name),
+            suggestion: Some(
+                "give each region a unique name; compose overlapping regions in the \
+                 selection with `|` instead of redeclaring"
+                    .to_owned(),
+            ),
+        });
+        return;
+    }
+    ir.regions.push(IrRegionDecl {
+        name: region.name.name,
+        select: region.select,
+        span: region.span,
     });
 }
 

@@ -298,6 +298,11 @@ pub(crate) fn format_item(item: Item, formatted: &mut String) {
                 format!("mark {:?} after {}", mark.name.value, mark.site),
             );
         }
+        Item::Region(region) => {
+            push_line(formatted, format!("region {} {{", region.name.name));
+            push_line(formatted, format!("  select {:?}", region.select));
+            push_line(formatted, "}");
+        }
         Item::Gauge(gauge) => {
             let mut header = format!("gauge {}", gauge.name.name);
             if let Some(site) = &gauge.site {

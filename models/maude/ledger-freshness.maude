@@ -1,0 +1,206 @@
+--- Knowledge-plane evidence freshness (DR-0084 Decision 3, M0). Evidence
+--- attests a basis fingerprint: for each declaration identity in its basis,
+--- the canonical content hash observed at attest time. The GOOD definition is
+--- content identity: evidence is FRESH at a frontier iff every fingerprint
+--- entry still matches the frontier's current content, and STALE per entry
+--- otherwise. Nothing else -- in particular, no cut log -- participates in
+--- the verdict. The cut log exists in the model only for attribution: the
+--- WITNESS names post-attest change-units on basis identities, and only for
+--- entries that are actually mismatched at the frontier.
+---
+--- Abstraction: one evidence object per scenario, its fingerprint as
+--- `evd(id, hash)` tokens in an ACU soup inside a `t(_)` wrapper (the
+--- tracker-merge shape: fold rules must see the whole soup). Frontier content
+--- is `cur(id, hash)`; an identity with no `cur` token is absent at the
+--- frontier. `u(cut, id, before, after)` is a change-unit (the DR-0054
+--- DeclUnit row; `nix` = no content on that side, so delete is
+--- `u(c, i, h, nix)` and add is `u(c, i, nix, h)`). `att(c)` is the
+--- evidence's at-cut and `bef(a, b)` the strict cut order, both consumed
+--- ONLY by the witness rule -- purity of the verdict is visible in the rule
+--- set: [fresh], [stale], and [moved] never match a `u`, `att`, or `bef`.
+---
+--- Consequences the tests pin:
+---   * edit-then-undo restores freshness (content round-trip; the verdict is
+---     a function of frontier content, not of the schedule);
+---   * a mismatched entry never reads fresh, and a matched one never stale;
+---   * the witness names only post-attest units on basis identities, and
+---     only when the entry is really mismatched;
+---   * `moved(i, j)` -- the rename advisory riding a stale verdict -- is
+---     minted ONLY from canonical-hash equality at the frontier (identity i
+---     absent, some j carrying i's recorded hash), never from the structural
+---     shape of a delete-plus-add cut;
+---   * merge stability is structural: the state is an ACU set and every
+---     verdict is a function of that set, so two clones holding the same
+---     events and frontier are the same term.
+mod LEDGER-FRESHNESS is
+  protecting BOOL .
+
+  sorts Id Hash CutId Cfg Sys .
+
+  ops d1 d2 : -> Id [ctor] .               --- declaration identities
+  ops h1 h2 h3 : -> Hash [ctor] .          --- canonical content hashes
+  op nix : -> Hash [ctor] .                --- no content on that unit side
+  ops c0 c1 c2 c3 : -> CutId [ctor] .      --- cuts (c0 = the at-cut)
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op evd : Id Hash -> Cfg [ctor] .          --- fingerprint entry: id at hash
+  op att : CutId -> Cfg [ctor] .            --- the evidence's at-cut
+  op cur : Id Hash -> Cfg [ctor] .          --- frontier content of an id
+  op u : CutId Id Hash Hash -> Cfg [ctor] . --- change-unit: before -> after
+  op bef : CutId CutId -> Cfg [ctor] .      --- strict cut order (closed)
+  op fresh : -> Cfg [ctor] .                --- derived: every entry matches
+  op stale : Id -> Cfg [ctor] .             --- derived: this entry mismatches
+  op wit : CutId -> Cfg [ctor] .            --- derived: a breaking cut
+  op moved : Id Id -> Cfg [ctor] .          --- derived: pure-rename advisory
+
+  op t : Cfg -> Sys [ctor] .
+
+  vars I I2 : Id .
+  vars H HB HA : Hash .
+  vars CA CU : CutId .
+  vars C C2 : Cfg .
+
+  --- The frontier carries id I at exactly hash H.
+  op matches : Id Hash Cfg -> Bool .
+  eq matches(I, H, (cur(I, H) C)) = true .
+  eq matches(I, H, C) = false [owise] .
+
+  --- Some fingerprint entry in the first soup mismatches the second (full)
+  --- soup. Recurses entry by entry against the fixed frontier argument.
+  op mismatch : Cfg Cfg -> Bool .
+  eq mismatch((evd(I, H) C), C2) =
+     if matches(I, H, C2) then mismatch(C, C2) else true fi .
+  eq mismatch(C, C2) = false [owise] .
+
+  op hasFresh : Cfg -> Bool .
+  eq hasFresh((fresh C)) = true .
+  eq hasFresh(C) = false [owise] .
+
+  op hasStale : Id Cfg -> Bool .
+  eq hasStale(I, (stale(I) C)) = true .
+  eq hasStale(I, C) = false [owise] .
+
+  op hasCur : Id Cfg -> Bool .
+  eq hasCur(I, (cur(I, H) C)) = true .
+  eq hasCur(I, C) = false [owise] .
+
+  op hasWit : CutId Cfg -> Bool .
+  eq hasWit(CU, (wit(CU) C)) = true .
+  eq hasWit(CU, C) = false [owise] .
+
+  op hasMoved : Id Id Cfg -> Bool .
+  eq hasMoved(I, I2, (moved(I, I2) C)) = true .
+  eq hasMoved(I, I2, C) = false [owise] .
+
+  --- FRESH: no fingerprint entry mismatches the frontier. The guard reads
+  --- only evd/cur tokens -- the cut log cannot influence it.
+  crl [fresh] : t(C) => t(fresh C)
+    if mismatch(C, C) = false
+    /\ hasFresh(C) = false .
+
+  --- STALE: this entry's identity does not carry its recorded hash at the
+  --- frontier (changed content, or the identity is absent).
+  crl [stale] : t(evd(I, H) C) => t(stale(I) evd(I, H) C)
+    if matches(I, H, C) = false
+    /\ hasStale(I, C) = false .
+
+  --- MOVED: the rename advisory. Identity I is absent at the frontier and
+  --- some other identity carries I's RECORDED canonical hash -- hash
+  --- equality at the frontier is the only minting condition.
+  crl [moved] : t(evd(I, H) cur(I2, H) C)
+      => t(moved(I, I2) evd(I, H) cur(I2, H) C)
+    if I =/= I2
+    /\ hasCur(I, C) = false
+    /\ hasMoved(I, I2, C) = false .
+
+  --- WITNESS: attribution for a real mismatch -- a post-attest unit on a
+  --- basis identity whose entry is mismatched at the frontier. A unit on a
+  --- non-basis identity, or on an entry the frontier still matches (the
+  --- round-trip), is never a witness.
+  crl [wit] : t(evd(I, H) att(CA) u(CU, I, HB, HA) bef(CA, CU) C)
+      => t(wit(CU) evd(I, H) att(CA) u(CU, I, HB, HA) bef(CA, CU) C)
+    if matches(I, H, C) = false
+    /\ hasWit(CU, C) = false .
+endm
+
+--- Negative fixture (bite): the SINCE-SCAN definition of freshness -- stale
+--- iff any post-attest unit touched a basis identity, fresh iff none did.
+--- This is the definition DR-0084 rejects: it is path-dependent, so an edit
+--- followed by its undo leaves the evidence stale forever even though the
+--- frontier is bit-identical to what was verified. The round-trip test
+--- proves this module reaches `stale` where the good module cannot.
+mod LEDGER-FRESHNESS-SINCE-SCAN is
+  protecting BOOL .
+
+  sorts Id Hash CutId Cfg Sys .
+  ops d1 d2 : -> Id [ctor] .
+  ops h1 h2 h3 : -> Hash [ctor] .
+  op nix : -> Hash [ctor] .
+  ops c0 c1 c2 c3 : -> CutId [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op evd : Id Hash -> Cfg [ctor] .
+  op att : CutId -> Cfg [ctor] .
+  op cur : Id Hash -> Cfg [ctor] .
+  op u : CutId Id Hash Hash -> Cfg [ctor] .
+  op bef : CutId CutId -> Cfg [ctor] .
+  op fresh : -> Cfg [ctor] .
+  op stale : Id -> Cfg [ctor] .
+  op t : Cfg -> Sys [ctor] .
+
+  vars I : Id .
+  vars H HB HA : Hash .
+  vars CA CU : CutId .
+  var C : Cfg .
+
+  op hasStale : Id Cfg -> Bool .
+  eq hasStale(I, (stale(I) C)) = true .
+  eq hasStale(I, C) = false [owise] .
+
+  --- Bad definition: history alone stales the entry. Content is never read.
+  crl [stale-scan] : t(evd(I, H) att(CA) u(CU, I, HB, HA) bef(CA, CU) C)
+      => t(stale(I) evd(I, H) att(CA) u(CU, I, HB, HA) bef(CA, CU) C)
+    if hasStale(I, C) = false .
+endm
+
+--- Negative fixture (bite): STRUCTURAL move-minting -- a same-cut delete of
+--- one identity plus add of another mints `moved` from the shape of the cut
+--- alone, ignoring whether the added content equals the recorded hash. The
+--- differing-hash rename test proves this module reaches `moved` where the
+--- good module (hash equality only) cannot.
+mod LEDGER-MOVED-STRUCTURAL is
+  protecting BOOL .
+
+  sorts Id Hash CutId Cfg Sys .
+  ops d1 d2 : -> Id [ctor] .
+  ops h1 h2 h3 : -> Hash [ctor] .
+  op nix : -> Hash [ctor] .
+  ops c0 c1 c2 c3 : -> CutId [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op evd : Id Hash -> Cfg [ctor] .
+  op att : CutId -> Cfg [ctor] .
+  op cur : Id Hash -> Cfg [ctor] .
+  op u : CutId Id Hash Hash -> Cfg [ctor] .
+  op bef : CutId CutId -> Cfg [ctor] .
+  op moved : Id Id -> Cfg [ctor] .
+  op t : Cfg -> Sys [ctor] .
+
+  vars I I2 : Id .
+  vars H H2 : Hash .
+  var CU : CutId .
+  var C : Cfg .
+
+  op hasMoved : Id Id Cfg -> Bool .
+  eq hasMoved(I, I2, (moved(I, I2) C)) = true .
+  eq hasMoved(I, I2, C) = false [owise] .
+
+  --- Bad minting: same cut deletes I and adds I2 -- moved, regardless of
+  --- whether H2 equals the recorded H.
+  crl [moved-structural] : t(evd(I, H) u(CU, I, H, nix) u(CU, I2, nix, H2) C)
+      => t(moved(I, I2) evd(I, H) u(CU, I, H, nix) u(CU, I2, nix, H2) C)
+    if I =/= I2
+    /\ hasMoved(I, I2, C) = false .
+endm

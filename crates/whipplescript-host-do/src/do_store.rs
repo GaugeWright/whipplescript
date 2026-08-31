@@ -8103,7 +8103,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
             // an untrusted transport (kept in lockstep with the native store):
             // reject a tampered event whose id != SHA-256 of its own content, or
             // a created event whose id != its issue identity.
-            let expected_id = if event.kind == "issue.created" {
+            let expected_id = if whipplescript_store::items::is_creation_kind(&event.kind) {
                 whipplescript_store::items::event_content_id(
                     &event.kind,
                     None,
@@ -8122,7 +8122,7 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                     &event.created_at,
                 )
             };
-            let created_identity_ok = event.kind != "issue.created"
+            let created_identity_ok = !whipplescript_store::items::is_creation_kind(&event.kind)
                 || event.issue_id.as_deref() == Some(event.event_id.as_str());
             if expected_id != event.event_id || !created_identity_ok {
                 report.rejected += 1;
@@ -8360,6 +8360,12 @@ impl<Sql: DoSql> DoSqliteStore<Sql> {
                 note: as_opt_text(&row[3]),
                 added_by: as_opt_text(&row[4]),
                 created_at: as_text(&row[5]),
+                // DR-0084 validity keys are not projected on the DO yet
+                // (deferred with cause: no DO-side freshness consumer);
+                // the events carry them and transport preserves them.
+                at_cut: None,
+                basis: None,
+                basis_fingerprint_json: None,
             })
             .collect())
     }
@@ -9592,6 +9598,73 @@ pub(crate) mod tests {
     /// (events keyed by opaque content_id, not WS-N), shares the native conflict
     /// analysis, and merges via export/import — two DO clones editing one issue
     /// converge to a surfaced conflict, exactly like native.
+    /// DR-0084 Decision 2 transport parity: `assertion.created` is a ROOT
+    /// kind (shared `is_creation_kind`), so the DO's untrusted-transport
+    /// identity gate admits assertion events instead of rejecting them as
+    /// mis-hashed, preserves them in the log, and re-exports them intact —
+    /// even though the DO projects no assertion rows yet (deferred with
+    /// cause: no DO-side consumer).
+    #[test]
+    fn do_import_accepts_and_reexports_assertion_events() {
+        use whipplescript_store::items::{event_content_id, TrackerEvent};
+        let created_at = "2026-08-31 00:00:00".to_owned();
+        let payload = serde_json::json!({
+            "title": "custody core verified",
+            "body": "",
+            "created_by": "s:a",
+        })
+        .to_string();
+        let created_id = event_content_id(
+            "assertion.created",
+            None,
+            &payload,
+            Some("s:a"),
+            &[],
+            &created_at,
+        );
+        let created = TrackerEvent {
+            event_id: created_id.clone(),
+            parents: Vec::new(),
+            issue_id: Some(created_id.clone()),
+            kind: "assertion.created".to_owned(),
+            payload_json: payload,
+            actor: Some("s:a".to_owned()),
+            created_at,
+        };
+        let retired_at = "2026-08-31 00:00:01".to_owned();
+        let retired_payload = serde_json::json!({ "retired_by": "s:a" }).to_string();
+        let retired_id = event_content_id(
+            "assertion.retired",
+            Some(&created_id),
+            &retired_payload,
+            Some("s:a"),
+            std::slice::from_ref(&created_id),
+            &retired_at,
+        );
+        let retired = TrackerEvent {
+            event_id: retired_id.clone(),
+            parents: vec![created_id.clone()],
+            issue_id: Some(created_id.clone()),
+            kind: "assertion.retired".to_owned(),
+            payload_json: retired_payload,
+            actor: Some("s:a".to_owned()),
+            created_at: retired_at,
+        };
+
+        let mut a = store();
+        let report = a.import_events(&[created, retired]).expect("import");
+        assert_eq!(report.rejected, 0, "root-kind identity admits assertions");
+        assert_eq!(report.imported, 2);
+
+        let exported = a.export_events().expect("export");
+        assert!(exported
+            .iter()
+            .any(|event| event.kind == "assertion.created" && event.event_id == created_id));
+        assert!(exported
+            .iter()
+            .any(|event| event.kind == "assertion.retired" && event.event_id == retired_id));
+    }
+
     #[test]
     fn do_tracker_is_content_addressed_and_merges_to_a_conflict() {
         let mut a = store();

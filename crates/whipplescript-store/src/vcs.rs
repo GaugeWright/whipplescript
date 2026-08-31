@@ -966,6 +966,47 @@ impl<B: Branches, C: ContentBlobs> WorkspaceVcs<B, C> {
         Ok(Some(self.load_manifest(row.head_manifest_hash.as_deref())?))
     }
 
+    /// The frontier's content maps for freshness evaluation (DR-0084
+    /// Decision 3): every manifest path with its content id, and — for
+    /// `.whip` paths when the canonicalizer is installed and the source has
+    /// a canonical form — every declaration identity with its canonical
+    /// hash. Non-canonicalizable paths contribute path entries only (fail
+    /// closed, the DR-0054 posture). Returns the branch's head cut id
+    /// alongside — the at-cut an attest records for witness scans.
+    /// `Ok(None)` = no such branch.
+    pub fn frontier_content(
+        &self,
+        branch_id: &str,
+    ) -> StoreResult<Option<(Option<String>, crate::freshness::FrontierContent)>> {
+        let Some(row) = self.branches.get_branch(branch_id)? else {
+            return Ok(None);
+        };
+        let manifest = self.load_manifest(row.head_manifest_hash.as_deref())?;
+        let mut frontier = crate::freshness::FrontierContent::default();
+        for (path, content_id) in &manifest {
+            frontier.paths.insert(path.clone(), content_id.clone());
+            if !path.ends_with(".whip") {
+                continue;
+            }
+            let Some(canonicalizer) = self.decl_canonicalizer.as_deref() else {
+                continue;
+            };
+            let Some(text) = self.content.get(content_id)? else {
+                continue; // unreadable blob: path entry only, fail closed
+            };
+            let Some(decls) = canonicalizer.canonical_declarations(&text) else {
+                continue; // no canonical form: path entry only, fail closed
+            };
+            for decl in decls {
+                frontier
+                    .decl_renames
+                    .insert(decl.identity.clone(), decl.rename_hash);
+                frontier.decls.insert(decl.identity, decl.canon_hash);
+            }
+        }
+        Ok(Some((row.head_cut_id.clone(), frontier)))
+    }
+
     /// Read a file's body on a branch. `Ok(None)` = no such file there.
     ///
     /// A keyed descent, not a fold: this materialized the branch's whole
@@ -4278,6 +4319,96 @@ mod tests {
         assert_eq!(windowed[0].seq, 0);
         assert_eq!(windowed[0].cut_id, "cut_3");
         assert_eq!(windowed[1].cut_id, "cut_4");
+    }
+
+    /// DR-0084 Decision 3: the frontier content map is the freshness
+    /// evaluator's second argument — every manifest path with its content
+    /// id, plus canonical decl hashes where the canonicalizer applies, and
+    /// PATH-ONLY entries where it does not (fail closed). Together with the
+    /// pure evaluator this is the end-to-end round-trip check: edit, undo
+    /// by writing the original content back, and the attest-time
+    /// fingerprint is fresh again.
+    #[test]
+    fn frontier_content_feeds_content_identity_freshness() {
+        struct StubCanon2;
+        impl DeclCanonicalizer for StubCanon2 {
+            fn canonical_declarations(&self, source: &str) -> Option<Vec<CanonDecl>> {
+                let mut declarations = Vec::new();
+                for line in source.lines() {
+                    if line == "ERR" {
+                        return None;
+                    }
+                    let (name, hash) = line.split_once('=')?;
+                    declarations.push(CanonDecl {
+                        identity: name.to_owned(),
+                        canon_hash: hash.to_owned(),
+                        rename_hash: hash.to_owned(),
+                    });
+                }
+                Some(declarations)
+            }
+        }
+        use whipplescript_core::freshness::{evaluate, resolve_basis, Freshness};
+        let mut vcs = vcs();
+        vcs.init("t0").expect("init");
+        vcs.set_decl_canonicalizer(Box::new(StubCanon2));
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k1\nrule b=k2"),
+            "cut_1",
+            "t1",
+        )
+        .expect("write");
+        vcs.write(MAINLINE_BRANCH_ID, "bad.whip", Some("ERR"), "cut_2", "t2")
+            .expect("write");
+
+        let (at_cut, frontier) = vcs
+            .frontier_content(MAINLINE_BRANCH_ID)
+            .expect("frontier")
+            .expect("branch exists");
+        assert!(at_cut.is_some(), "head cut recorded as the at-cut");
+        assert_eq!(frontier.decls.get("rule a"), Some(&"k1".to_owned()));
+        assert_eq!(frontier.decls.get("rule b"), Some(&"k2".to_owned()));
+        // Non-canonicalizable content: a path entry, no decl entries.
+        assert!(frontier.paths.contains_key("bad.whip"));
+        assert!(!frontier.decls.keys().any(|k| k.contains("ERR")));
+
+        // Attest-time fingerprint over the rule-a declaration.
+        let basis = crate::selection::parse("decl(rule a)").expect("parse");
+        let fingerprint = resolve_basis(&basis, &frontier).expect("resolve");
+        assert_eq!(evaluate(&fingerprint, &frontier), Freshness::Fresh);
+
+        // Edit rule a -> stale; write the original back (the undo) -> fresh.
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k9\nrule b=k2"),
+            "cut_3",
+            "t3",
+        )
+        .expect("write");
+        let (_, edited) = vcs
+            .frontier_content(MAINLINE_BRANCH_ID)
+            .expect("frontier")
+            .expect("branch");
+        assert!(matches!(
+            evaluate(&fingerprint, &edited),
+            Freshness::Stale { .. }
+        ));
+        vcs.write(
+            MAINLINE_BRANCH_ID,
+            "main.whip",
+            Some("rule a=k1\nrule b=k2"),
+            "cut_4",
+            "t4",
+        )
+        .expect("write");
+        let (_, round_trip) = vcs
+            .frontier_content(MAINLINE_BRANCH_ID)
+            .expect("frontier")
+            .expect("branch");
+        assert_eq!(evaluate(&fingerprint, &round_trip), Freshness::Fresh);
     }
 
     /// DR-0054: with a canonicalizer installed, `.whip` units carry

@@ -1,0 +1,61 @@
+load ../infoflow-tracker-carriage.maude
+
+--- ============================ COVERAGE ======================================
+
+--- Coverage: consuming an UNVOUCHED queue into a sink that requires
+--- integrity is an injection (the ready-read carriage).
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  readReady(wfA, trk) trackerVouched(trk, lo) sinkRequires(wfA, hi)
+  =>* C:Cfg injection .
+
+--- Coverage: an unvouched writer filing into a VOUCHED queue is an
+--- injection (file/finish are data sinks).
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  fileInto(wfA, trk) trackerVouched(trk, hi) ruleIntegrity(wfA, lo)
+  =>* C:Cfg injection .
+
+--- Coverage: endorsement out of a vouched queue mints authority.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  endorse(wfB, trk) trackerVouched(trk, hi)
+  =>* C:Cfg endorsedAuthority(wfB) .
+
+--- Coverage: endorsement out of an unvouched queue is refused (the shipped
+--- diagnostic).
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  endorse(wfB, trk) trackerVouched(trk, lo)
+  =>* C:Cfg endorseRefused .
+
+--- ============================ BITE ==========================================
+
+--- Bite: a vouched queue feeding the same integrity-requiring sink never
+--- injects — the carriage is the queue's vouched level, not a blanket taint.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  readReady(wfA, trk) trackerVouched(trk, hi) sinkRequires(wfA, hi)
+  =>* C:Cfg injection .
+
+--- Bite: a vouched writer filing a vouched queue never injects.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  fileInto(wfA, trk) trackerVouched(trk, hi) ruleIntegrity(wfA, hi)
+  =>* C:Cfg injection .
+
+--- Bite (the implicit-flow ruling): a claim carries no rule data — no level
+--- assignment whatsoever makes a claim an injection.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  claimOf(wfA, trk) trackerVouched(trk, hi) ruleIntegrity(wfA, lo)
+  sinkRequires(wfA, hi)
+  =>* C:Cfg injection .
+
+--- Bite (self-laundering closed): filing into an unvouched queue and
+--- endorsing out of it never reaches minted authority — the two-step one
+--- actor controls cannot turn its own output into vouched state.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE :
+  fileInto(wfA, trk) trackerVouched(trk, lo) ruleIntegrity(wfA, lo)
+  endorse(wfA, trk)
+  =>* C:Cfg endorsedAuthority(wfA) .
+
+--- Bite teeth: the LAX module mints authority from exactly that term — the
+--- laundering the good module's No-solution above proves closed.
+search [1] in WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE-LAX :
+  fileInto(wfA, trk) trackerVouched(trk, lo) ruleIntegrity(wfA, lo)
+  endorse(wfA, trk)
+  =>* C:Cfg endorsedAuthority(wfA) .

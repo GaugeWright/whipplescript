@@ -16,6 +16,7 @@
 //!         | by(<prefix>) | intent(<prefix>)
 //!         | in-branch(<id>) | change(<id>) | cut(<id>)
 //!         | since(<stamp>) | until(<stamp>) | dependents-of(expr)
+//!         | region(<name>)
 //! ```
 //!
 //! The unit of selection is one recorded write: (cut, path,
@@ -88,8 +89,9 @@ pub enum SelAtom {
     /// carriage.
     ByActor(String),
     /// Intent prefix: the tracker item / incident that motivated the
-    /// cut. Empty until intent-carrying operations (repair, ingest)
-    /// record it.
+    /// cut. Repair and ingest cuts always carry one; since DR-0084 I1 an
+    /// instance's file/exec cuts carry its unambiguously-held claim's
+    /// subject content id.
     ByIntent(String),
     /// Declaration-identity glob (DR-0054): `decl(rule close)` selects
     /// units that changed that declaration; `decl(rule *)` every unit
@@ -101,6 +103,14 @@ pub enum SelAtom {
     Since(String),
     Until(String),
     DependentsOf(Box<SelExpr>),
+    /// A named `region` declaration (DR-0084 Decision 1). A region atom is
+    /// a compile-time NAME, not a runtime predicate: the kernel expands it
+    /// to the declared region's expression (`expand_regions`) before any
+    /// evaluation, and `eval` on an unexpanded region atom selects NOTHING
+    /// (fail closed). Callers that evaluate operator-supplied selections
+    /// directly must refuse unresolved region atoms first
+    /// (`contains_region_atom`) rather than let them silently match empty.
+    Region(String),
 }
 
 /// Parse a selection expression. Errors carry the offending position's
@@ -231,6 +241,7 @@ impl<'a> Parser<'a> {
             "cut" => SelAtom::Cut(arg),
             "since" => SelAtom::Since(arg),
             "until" => SelAtom::Until(arg),
+            "region" => SelAtom::Region(arg),
             other => return Err(format!("unknown selection atom `{other}`")),
         };
         Ok(SelExpr::Atom(atom))
@@ -332,6 +343,11 @@ fn eval_atom(atom: &SelAtom, universe: &[ChangeUnit]) -> BTreeSet<usize> {
         SelAtom::Cut(cut) => pick(&|unit| unit.cut_id == *cut),
         SelAtom::Since(stamp) => pick(&|unit| unit.recorded_at.as_str() >= stamp.as_str()),
         SelAtom::Until(stamp) => pick(&|unit| unit.recorded_at.as_str() <= stamp.as_str()),
+        // An unexpanded region atom selects nothing (fail closed): regions
+        // are compile-time names, resolved by `expand_regions` before eval.
+        // Seams that evaluate operator-supplied text refuse these first via
+        // `contains_region_atom`.
+        SelAtom::Region(_) => BTreeSet::new(),
         SelAtom::DependentsOf(inner) => {
             // The conservative dependence floor: a later unit on the
             // same path consumed the earlier one's output. Closure over
@@ -367,6 +383,127 @@ pub fn stranded_by_undo(selected: &BTreeSet<usize>, universe: &[ChangeUnit]) -> 
         }
     }
     stranded
+}
+
+/// Render an expression back to selection-grammar text. Fully parenthesized,
+/// so the output re-parses to a structurally identical tree regardless of the
+/// original precedence spelling — the property `expand_regions` callers rely
+/// on when splicing a region's expression into a larger one.
+pub fn render(expr: &SelExpr) -> String {
+    match expr {
+        SelExpr::Union(a, b) => format!("({} | {})", render(a), render(b)),
+        SelExpr::Intersect(a, b) => format!("({} & {})", render(a), render(b)),
+        SelExpr::Difference(a, b) => format!("({} ~ {})", render(a), render(b)),
+        SelExpr::Atom(atom) => match atom {
+            SelAtom::Path(arg) => format!("path({arg})"),
+            SelAtom::ByEffect(arg) => format!("by-effect({arg})"),
+            SelAtom::ByOrigin(arg) => format!("by-origin({arg})"),
+            SelAtom::ByActor(arg) => format!("by({arg})"),
+            SelAtom::ByIntent(arg) => format!("intent({arg})"),
+            SelAtom::Decl(arg) => format!("decl({arg})"),
+            SelAtom::InBranch(arg) => format!("in-branch({arg})"),
+            SelAtom::Change(arg) => format!("change({arg})"),
+            SelAtom::Cut(arg) => format!("cut({arg})"),
+            SelAtom::Since(arg) => format!("since({arg})"),
+            SelAtom::Until(arg) => format!("until({arg})"),
+            SelAtom::Region(arg) => format!("region({arg})"),
+            SelAtom::DependentsOf(inner) => format!("dependents-of({})", render(inner)),
+        },
+    }
+}
+
+/// The first unresolved `region(<name>)` atom in the expression, if any.
+/// Evaluation seams that take operator-supplied selection text call this and
+/// REFUSE rather than evaluate — an unexpanded region atom matches nothing,
+/// and "matched nothing" must never be how an operator learns their region
+/// name did not resolve.
+pub fn contains_region_atom(expr: &SelExpr) -> Option<&str> {
+    match expr {
+        SelExpr::Union(a, b) | SelExpr::Intersect(a, b) | SelExpr::Difference(a, b) => {
+            contains_region_atom(a).or_else(|| contains_region_atom(b))
+        }
+        SelExpr::Atom(SelAtom::Region(name)) => Some(name),
+        SelExpr::Atom(SelAtom::DependentsOf(inner)) => contains_region_atom(inner),
+        SelExpr::Atom(_) => None,
+    }
+}
+
+/// Substitute every `region(<name>)` atom with the expression `lookup`
+/// returns for it. Depth-bounded: a region whose expansion still contains a
+/// region atom (declared regions refuse nested region atoms at check, so
+/// this arises only from an unvalidated lookup) errs instead of recursing
+/// forever.
+pub fn expand_regions(
+    expr: &SelExpr,
+    lookup: &dyn Fn(&str) -> Option<SelExpr>,
+) -> Result<SelExpr, String> {
+    fn walk(
+        expr: &SelExpr,
+        lookup: &dyn Fn(&str) -> Option<SelExpr>,
+        depth: usize,
+    ) -> Result<SelExpr, String> {
+        if depth > 8 {
+            return Err("region expansion is nested too deeply".to_owned());
+        }
+        match expr {
+            SelExpr::Union(a, b) => Ok(SelExpr::Union(
+                Box::new(walk(a, lookup, depth)?),
+                Box::new(walk(b, lookup, depth)?),
+            )),
+            SelExpr::Intersect(a, b) => Ok(SelExpr::Intersect(
+                Box::new(walk(a, lookup, depth)?),
+                Box::new(walk(b, lookup, depth)?),
+            )),
+            SelExpr::Difference(a, b) => Ok(SelExpr::Difference(
+                Box::new(walk(a, lookup, depth)?),
+                Box::new(walk(b, lookup, depth)?),
+            )),
+            SelExpr::Atom(SelAtom::Region(name)) => {
+                let expansion = lookup(name)
+                    .ok_or_else(|| format!("`region({name})` names no declared region"))?;
+                walk(&expansion, lookup, depth + 1)
+            }
+            SelExpr::Atom(SelAtom::DependentsOf(inner)) => Ok(SelExpr::Atom(
+                SelAtom::DependentsOf(Box::new(walk(inner, lookup, depth)?)),
+            )),
+            SelExpr::Atom(atom) => Ok(SelExpr::Atom(atom.clone())),
+        }
+    }
+    walk(expr, lookup, 0)
+}
+
+/// The atoms that may NOT appear in a `region` declaration (DR-0084
+/// Decision 1): a region is world-denoting — `path`/`decl` under the set
+/// operators — while the temporal and attribution atoms denote recorded
+/// change-sets, and `dependents-of` a history closure. Returns the display
+/// name of each violating atom, in order, for diagnostics; empty means the
+/// expression is a well-formed region.
+pub fn region_position_violations(expr: &SelExpr) -> Vec<&'static str> {
+    fn walk(expr: &SelExpr, violations: &mut Vec<&'static str>) {
+        match expr {
+            SelExpr::Union(a, b) | SelExpr::Intersect(a, b) | SelExpr::Difference(a, b) => {
+                walk(a, violations);
+                walk(b, violations);
+            }
+            SelExpr::Atom(atom) => match atom {
+                SelAtom::Path(_) | SelAtom::Decl(_) => {}
+                SelAtom::ByEffect(_) => violations.push("by-effect"),
+                SelAtom::ByOrigin(_) => violations.push("by-origin"),
+                SelAtom::ByActor(_) => violations.push("by"),
+                SelAtom::ByIntent(_) => violations.push("intent"),
+                SelAtom::InBranch(_) => violations.push("in-branch"),
+                SelAtom::Change(_) => violations.push("change"),
+                SelAtom::Cut(_) => violations.push("cut"),
+                SelAtom::Since(_) => violations.push("since"),
+                SelAtom::Until(_) => violations.push("until"),
+                SelAtom::Region(_) => violations.push("region"),
+                SelAtom::DependentsOf(_) => violations.push("dependents-of"),
+            },
+        }
+    }
+    let mut violations = Vec::new();
+    walk(expr, &mut violations);
+    violations
 }
 
 #[cfg(test)]
@@ -592,5 +729,72 @@ mod tests {
         let pattern = "a*".repeat(30) + "Z";
         let value = "a".repeat(60);
         assert!(!glob_matches(&pattern, &value));
+    }
+
+    /// DR-0084 Decision 1: a `region(<name>)` atom is a compile-time name.
+    /// It parses, it renders, expansion substitutes the declared expression
+    /// (re-parenthesized, so precedence cannot leak), an unknown name errs,
+    /// and an UNEXPANDED atom evaluates to the empty set — fail closed, with
+    /// `contains_region_atom` as the refusal hook for seams that evaluate
+    /// operator-supplied text directly.
+    #[test]
+    fn region_atoms_parse_expand_and_fail_closed() {
+        let expr = parse("region(core) & by(s:)").expect("parse");
+        assert_eq!(contains_region_atom(&expr), Some("core"));
+
+        // Unexpanded: matches nothing, even against a matching universe.
+        let universe = vec![unit_by(0, "c1", "src/a.rs", "s:sess-7", "t1")];
+        assert!(eval(&expr, &universe).is_empty());
+
+        // Expansion splices the declared expression; the render round-trips.
+        let lookup = |name: &str| {
+            (name == "core").then(|| parse("path(src/*) | decl(rule close)").expect("parse"))
+        };
+        let expanded = expand_regions(&expr, &lookup).expect("expand");
+        assert_eq!(contains_region_atom(&expanded), None);
+        let reparsed = parse(&render(&expanded)).expect("render reparses");
+        assert_eq!(reparsed, expanded);
+        assert_eq!(eval(&expanded, &universe), BTreeSet::from([0]));
+
+        // Unknown name is an error, never an empty match.
+        let unknown = parse("region(ghost)").expect("parse");
+        assert!(expand_regions(&unknown, &lookup)
+            .expect_err("unknown region")
+            .contains("ghost"));
+
+        // A lookup whose expansion still contains a region atom (an
+        // unvalidated table -- declared regions refuse nesting at check)
+        // errs at the depth bound instead of recursing forever.
+        let cyclic = |_: &str| Some(parse("region(a)").expect("parse"));
+        assert!(expand_regions(&parse("region(a)").expect("parse"), &cyclic)
+            .expect_err("cyclic expansion")
+            .contains("nested too deeply"));
+    }
+
+    /// The atom vocabulary is closed: an unrecognized atom name is a parse
+    /// error naming the offender, never a silently-empty match.
+    #[test]
+    fn unknown_atoms_are_refused_by_name() {
+        let error = parse("bogus(x)").expect_err("unknown atom");
+        assert!(error.contains("unknown selection atom `bogus`"), "{error}");
+    }
+
+    /// DR-0084 Decision 1, the region/change-set type split: a region is
+    /// world-denoting (`path`/`decl` under the set operators); the temporal
+    /// and attribution atoms, `dependents-of`, and nested `region` atoms are
+    /// violations, reported in order for diagnostics.
+    #[test]
+    fn region_position_violations_name_the_offending_atoms() {
+        let ok = parse("path(src/*) & decl(rule *) | (path(a) ~ decl(b))").expect("parse");
+        assert!(region_position_violations(&ok).is_empty());
+
+        let bad = parse("path(src/*) & since(t1) | by(s:) ~ region(other)").expect("parse");
+        assert_eq!(
+            region_position_violations(&bad),
+            vec!["since", "by", "region"]
+        );
+
+        let nested = parse("dependents-of(path(src/*))").expect("parse");
+        assert_eq!(region_position_violations(&nested), vec!["dependents-of"]);
     }
 }

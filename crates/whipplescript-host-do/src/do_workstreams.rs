@@ -976,6 +976,14 @@ impl<Sql: DoSql + Clone> whipplescript_kernel::effect_handlers::CapabilityProvid
             Ok(expr) => expr,
             Err(error) => return failed(format!("selection does not parse: {error}")),
         };
+        // DR-0084: an unexpanded region atom must never silently match empty
+        // -- refuse it by name (literals expand at effect-input build; only a
+        // dynamic selection naming an undeclared region reaches here).
+        if let Some(name) = whipplescript_store::selection::contains_region_atom(&expr) {
+            return failed(format!(
+                "`region({name})` did not resolve: the program declares no region by that name"
+            ));
+        }
         let branches = match crate::do_branches::DoBranches::new(self.sql.clone()) {
             Ok(branches) => branches,
             Err(error) => return failed(format!("branch store unavailable: {error:?}")),

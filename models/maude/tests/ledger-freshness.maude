@@ -1,0 +1,95 @@
+load ../ledger-freshness.maude
+
+--- The round-trip scenario: evidence on d1 at h1, attested at c0; cut c1
+--- edits d1 to h2; cut c2 undoes it back to h1; the frontier carries d1 at
+--- h1 -- bit-identical to what was verified.
+
+--- Coverage (the DR's defining fixture): edit-then-undo RESTORES freshness.
+--- The verdict is a function of frontier content, not of the schedule.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) u(c2, d1, h2, h1)
+    bef(c0, c1) bef(c0, c2) bef(c1, c2) cur(d1, h1))
+  =>* t(fresh C:Cfg) .
+
+--- Bite: the round trip is never stale under content identity.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) u(c2, d1, h2, h1)
+    bef(c0, c1) bef(c0, c2) bef(c1, c2) cur(d1, h1))
+  =>* t(stale(d1) C:Cfg) .
+
+--- Bite: the round trip mints no witness either -- basis units after the
+--- at-cut are not breaking cuts when the frontier still matches.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) u(c2, d1, h2, h1)
+    bef(c0, c1) bef(c0, c2) bef(c1, c2) cur(d1, h1))
+  =>* t(wit(CU:CutId) C:Cfg) .
+
+--- The genuine-edit scenario: cut c1 moves d1 from h1 to h2 and the frontier
+--- carries h2.
+
+--- Coverage: a real content change stales the entry.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) bef(c0, c1) cur(d1, h2))
+  =>* t(stale(d1) C:Cfg) .
+
+--- Coverage (witness soundness, positive half): the stale verdict carries a
+--- witness naming the breaking cut.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) bef(c0, c1) cur(d1, h2))
+  =>* t(stale(d1) wit(c1) C:Cfg) .
+
+--- Bite: a mismatched basis never reads fresh.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) bef(c0, c1) cur(d1, h2))
+  =>* t(fresh C:Cfg) .
+
+--- Bite (witness soundness, negative half): a post-attest unit on a
+--- NON-basis identity (d2 is not in the fingerprint) is never a witness.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) u(c2, d2, h1, h3)
+    bef(c0, c1) bef(c0, c2) cur(d1, h2) cur(d2, h3))
+  =>* t(wit(c2) C:Cfg) .
+
+--- Coverage (purity): the same frontier with NO cut log at all is fresh.
+--- Together with the round-trip search above this pins the purity claim --
+--- same frontier, different histories, same verdict -- and merge stability
+--- is structural: the state is an ACU set and the verdict a function of it,
+--- so clones sharing events and frontier are literally the same term.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) cur(d1, h1))
+  =>* t(fresh C:Cfg) .
+
+--- The pure-rename scenario: cut c1 deletes d1 (which held h1) and adds d2
+--- carrying the SAME canonical hash h1; the frontier has d2 at h1 and no d1.
+
+--- Coverage: the entry is stale (its identity is gone) AND carries the
+--- moved advisory pointing at the identity that now holds its content.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, nix) u(c1, d2, nix, h1)
+    bef(c0, c1) cur(d2, h1))
+  =>* t(stale(d1) moved(d1, d2) C:Cfg) .
+
+--- The impure-rename scenario: same delete-plus-add shape in one cut, but
+--- the added identity carries a DIFFERENT hash h2.
+
+--- Bite: no moved advisory without canonical-hash equality at the frontier.
+search [1] in LEDGER-FRESHNESS :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, nix) u(c1, d2, nix, h2)
+    bef(c0, c1) cur(d2, h2))
+  =>* t(moved(d1, I:Id) C:Cfg) .
+
+--- Bite teeth: the SINCE-SCAN definition stales the round trip -- the exact
+--- path-dependent verdict DR-0084 rejects, proving the good module's
+--- round-trip No-solutions have real content.
+search [1] in LEDGER-FRESHNESS-SINCE-SCAN :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, h2) u(c2, d1, h2, h1)
+    bef(c0, c1) bef(c0, c2) bef(c1, c2) cur(d1, h1))
+  =>* t(stale(d1) C:Cfg) .
+
+--- Bite teeth: STRUCTURAL minting accepts the impure rename -- the same-cut
+--- delete-plus-add shape mints moved despite the differing hash, proving the
+--- good module's moved No-solution has real content.
+search [1] in LEDGER-MOVED-STRUCTURAL :
+  t(evd(d1, h1) att(c0) u(c1, d1, h1, nix) u(c1, d2, nix, h2)
+    bef(c0, c1) cur(d2, h2))
+  =>* t(moved(d1, d2) C:Cfg) .

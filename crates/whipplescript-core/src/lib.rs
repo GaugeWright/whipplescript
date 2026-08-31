@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 mod diagnostic_code_register;
+pub mod freshness;
 pub mod json;
 pub mod selection;
 

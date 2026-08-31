@@ -725,6 +725,7 @@ pub fn empty_ir_program() -> IrProgram {
         harnesses: Vec::new(),
         trackers: Vec::new(),
         streams: Vec::new(),
+        regions: Vec::new(),
         channels: Vec::new(),
         credentials: Vec::new(),
         vaults: Vec::new(),
@@ -5183,11 +5184,14 @@ pub fn parsed_effect_input_json(
         }
         "capability.call" if effect.name.as_deref() == Some("undo") => json!({
             "target": effect.target,
-            "selection": parse_field_value_scoped(
-                effect.args.first().map(String::as_str).unwrap_or_default(),
-                context,
-                live_facts,
-                live_effects,
+            "selection": expand_selection_regions(
+                parse_field_value_scoped(
+                    effect.args.first().map(String::as_str).unwrap_or_default(),
+                    context,
+                    live_facts,
+                    live_effects,
+                    live_ir,
+                ),
                 live_ir,
             ),
             "bindings": context_bindings_json(context),
@@ -5195,11 +5199,14 @@ pub fn parsed_effect_input_json(
         }),
         "capability.call" if effect.name.as_deref() == Some("transport") => json!({
             "target": effect.target,
-            "selection": parse_field_value_scoped(
-                effect.args.first().map(String::as_str).unwrap_or_default(),
-                context,
-                live_facts,
-                live_effects,
+            "selection": expand_selection_regions(
+                parse_field_value_scoped(
+                    effect.args.first().map(String::as_str).unwrap_or_default(),
+                    context,
+                    live_facts,
+                    live_effects,
+                    live_ir,
+                ),
                 live_ir,
             ),
             "onto": effect.args.get(1).cloned().unwrap_or_default(),
@@ -6688,6 +6695,37 @@ pub fn parse_field_value(value: &str, context: &RuleContext) -> Value {
 /// and effect sets, exactly like guards — queries are live reads of the
 /// present, everywhere (DR-0044). Callers without live sets (structural
 /// scanners) use `parse_field_value`, which passes empty sets.
+/// Expand `region(<name>)` atoms in a selective verb's selection value
+/// against the program's region table (DR-0084 Decision 1): regions are
+/// compile-time names, so the effect input carries the expanded expression
+/// (fully parenthesized by the core renderer). A value that is not a string,
+/// does not parse as a selection, or names an unknown region passes through
+/// UNCHANGED — the evaluation seams refuse unresolved region atoms with a
+/// named error rather than letting them match empty, so passing through is
+/// fail-closed, never fail-silent.
+fn expand_selection_regions(value: Value, live_ir: &IrProgram) -> Value {
+    let Value::String(text) = &value else {
+        return value;
+    };
+    let Ok(expr) = whipplescript_core::selection::parse(text) else {
+        return value;
+    };
+    if whipplescript_core::selection::contains_region_atom(&expr).is_none() {
+        return value;
+    }
+    let lookup = |name: &str| {
+        live_ir
+            .regions
+            .iter()
+            .find(|region| region.name == name)
+            .and_then(|region| whipplescript_core::selection::parse(&region.select).ok())
+    };
+    match whipplescript_core::selection::expand_regions(&expr, &lookup) {
+        Ok(expanded) => Value::String(whipplescript_core::selection::render(&expanded)),
+        Err(_) => value,
+    }
+}
+
 pub fn parse_field_value_scoped(
     value: &str,
     context: &RuleContext,
@@ -7538,6 +7576,46 @@ rule r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DR-0084: `region(<name>)` atoms in a selective verb's selection value
+    /// expand against the program's region table at effect-input build (fully
+    /// parenthesized), so the runtime never sees a bare region atom from a
+    /// literal. Unknown names pass through UNCHANGED — the evaluation seams
+    /// refuse them by name — and non-selection strings are untouched.
+    #[test]
+    fn selection_region_atoms_expand_against_the_ir_table() {
+        let mut ir = empty_ir_program();
+        ir.regions.push(whipplescript_parser::IrRegionDecl {
+            name: "core".to_owned(),
+            select: "path(src/**) | decl(rule close)".to_owned(),
+            span: whipplescript_parser::SourceSpan { start: 0, end: 0 },
+        });
+
+        let expanded = expand_selection_regions(
+            serde_json::Value::String("region(core) & by(s:)".to_owned()),
+            &ir,
+        );
+        assert_eq!(
+            expanded,
+            serde_json::Value::String("((path(src/**) | decl(rule close)) & by(s:))".to_owned())
+        );
+
+        // Unknown region: unchanged, so the eval seam can refuse it by name.
+        let unknown =
+            expand_selection_regions(serde_json::Value::String("region(ghost)".to_owned()), &ir);
+        assert_eq!(
+            unknown,
+            serde_json::Value::String("region(ghost)".to_owned())
+        );
+
+        // Not a selection at all: untouched.
+        let prose =
+            expand_selection_regions(serde_json::Value::String("not a selection".to_owned()), &ir);
+        assert_eq!(
+            prose,
+            serde_json::Value::String("not a selection".to_owned())
+        );
+    }
 
     fn fact(name: &str, key: &str, value_json: &str) -> FactView {
         FactView {

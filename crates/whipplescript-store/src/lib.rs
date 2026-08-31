@@ -29,6 +29,7 @@ pub mod ref_authority;
 /// grammar validates statically in the parser and dynamically at the
 /// seams — no mirror to drift). Re-exported here so every existing
 /// `whipplescript_store::selection::…` path keeps working.
+pub use whipplescript_core::freshness;
 pub use whipplescript_core::selection;
 pub mod skill_frontmatter;
 pub mod stat_cache;

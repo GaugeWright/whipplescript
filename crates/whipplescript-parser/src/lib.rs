@@ -188,6 +188,7 @@ pub enum Item {
     Credential(CredentialDecl),
     Vault(VaultDecl),
     Stream(StreamDecl),
+    Region(RegionDecl),
     Gauge(GaugeDecl),
     Mark(MarkDecl),
     Campaign(CampaignDecl),
@@ -227,6 +228,7 @@ impl Item {
             Self::Channel(decl) => decl.span,
             Self::Credential(decl) => decl.span,
             Self::Stream(decl) => decl.span,
+            Self::Region(decl) => decl.span,
             Self::Gauge(decl) => decl.span,
             Self::Mark(decl) => decl.span,
             Self::Campaign(decl) => decl.span,
@@ -412,6 +414,28 @@ pub struct StreamDecl {
     pub name: Ident,
     pub members: Vec<Ident>,
     pub staleness_seconds: Option<u64>,
+    pub span: SourceSpan,
+}
+
+/// `region <name> { select "<selection>" }` (DR-0084 Decision 1): a core
+/// declared term binding a name to the world-denoting subtype of the
+/// selection algebra — `path(...)`/`decl(...)` atoms under the set
+/// operators. A `region(<name>)` atom in a selective verb's slot expands to
+/// this expression at effect-input build. The temporal and attribution
+/// atoms are refused inside a region (they denote change-sets, not
+/// world-regions), as are nested `region` atoms. Block form deliberately:
+/// the declaration's canonical identity is its head line, so editing the
+/// selector reads as a content change, never as a rename — the property the
+/// knowledge plane's own `decl()` anchors depend on. Metadata-only
+/// lowering; core (no `use` requirement), because every plane that
+/// quantifies over the artifact world shares this term.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegionDecl {
+    pub name: Ident,
+    /// The selection-grammar source, unquoted.
+    pub select: String,
+    /// Span of the `select` string literal, for diagnostics.
+    pub select_span: SourceSpan,
     pub span: SourceSpan,
 }
 
@@ -1353,6 +1377,7 @@ pub struct IrProgram {
     pub harnesses: Vec<IrHarness>,
     pub trackers: Vec<IrTracker>,
     pub streams: Vec<IrStream>,
+    pub regions: Vec<IrRegionDecl>,
     pub channels: Vec<IrChannel>,
     pub credentials: Vec<IrCredential>,
     pub vaults: Vec<IrVault>,
@@ -1513,6 +1538,19 @@ pub struct IrStream {
 pub struct IrTracker {
     pub name: String,
     pub provider: String,
+    pub span: SourceSpan,
+}
+
+/// One lowered `region` declaration (DR-0084): a named world-denoting
+/// selection expression. The kernel expands `region(<name>)` atoms in the
+/// selective verbs' slots against this table at effect-input build. (Named
+/// `IrRegionDecl` because `IrRegion` is DR-0043's rule-body during/until
+/// region — an unrelated concept that predates this declaration.)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrRegionDecl {
+    pub name: String,
+    /// The selection-grammar source, unquoted; validated at check time.
+    pub select: String,
     pub span: SourceSpan,
 }
 
@@ -3189,6 +3227,7 @@ pub fn document_symbols(source: &str) -> Vec<DeclSymbol> {
             Item::Gauge(decl) => ("gauge", decl.name.name.clone(), decl.span),
             Item::Campaign(decl) => ("campaign", decl.name.name.clone(), decl.span),
             Item::Mark(decl) => ("mark", decl.name.value.clone(), decl.span),
+            Item::Region(decl) => ("region", decl.name.name.clone(), decl.span),
             _ => continue,
         };
         symbols.push(DeclSymbol {
@@ -4069,6 +4108,16 @@ impl IrProgram {
                             .map(|seconds| format!(" staleness={seconds}s"))
                             .unwrap_or_default()
                     ),
+                );
+            }
+        }
+
+        if !self.regions.is_empty() {
+            push_line(&mut snapshot, "regions");
+            for region in &self.regions {
+                push_line(
+                    &mut snapshot,
+                    format!("  region {} select={:?}", region.name, region.select),
                 );
             }
         }
@@ -6641,6 +6690,9 @@ fn expand_pattern_item(
         Item::Stream(stream) => {
             Some((format!("stream:{}", stream.name.name), Item::Stream(stream)))
         }
+        Item::Region(region) => {
+            Some((format!("region:{}", region.name.name), Item::Region(region)))
+        }
         Item::Channel(channel) => Some((
             format!("channel:{}", channel.name.name),
             Item::Channel(channel),
@@ -7767,6 +7819,19 @@ impl SchemaIndex {
                 ("at", string_ty()),
             ],
         );
+        // Knowledge-plane observer schema (DR-0084 W1): the mediator's
+        // classification pass emits staleness facts; user rules eliminate,
+        // never construct. One schema for both nouns — the fact NAME
+        // (`tracker.issue.stale` / `tracker.assertion.stale`) already
+        // discriminates, and the payload shape is identical.
+        index.insert_class(
+            "TrackerStale",
+            [
+                ("subject", string_ty()),
+                ("branch", string_ty()),
+                ("status", string_ty()),
+            ],
+        );
         index.insert_class(
             "Evidence",
             [
@@ -8256,20 +8321,70 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                 let trimmed = source.trim();
                 if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
                     let literal = &trimmed[1..trimmed.len() - 1];
-                    if let Err(error) = whipplescript_core::selection::parse(literal) {
-                        diagnostics.push(Diagnostic {
-                            code: diagnostic_code!("parse.invalid_selection"),
-                            severity: Severity::Error,
-                            related: Vec::new(),
-                            span: effect.span,
-                            message: format!("the selection does not parse: {error}"),
-                            suggestion: Some(
-                                "selections compose atoms like `path(<glob>)`, `by(<prefix>)`, \
-                                 `intent(<prefix>)`, `cut(<id>)` with `|`, `&`, `~`, and \
-                                 `dependents-of(...)`"
-                                    .to_owned(),
-                            ),
-                        });
+                    match whipplescript_core::selection::parse(literal) {
+                        Err(error) => {
+                            diagnostics.push(Diagnostic {
+                                code: diagnostic_code!("parse.invalid_selection"),
+                                severity: Severity::Error,
+                                related: Vec::new(),
+                                span: effect.span,
+                                message: format!("the selection does not parse: {error}"),
+                                suggestion: Some(
+                                    "selections compose atoms like `path(<glob>)`, `by(<prefix>)`, \
+                                     `intent(<prefix>)`, `cut(<id>)`, `region(<name>)` with `|`, \
+                                     `&`, `~`, and `dependents-of(...)`"
+                                        .to_owned(),
+                                ),
+                            });
+                        }
+                        Ok(expr) => {
+                            // Every `region(<name>)` atom in a literal must
+                            // name a declared region (DR-0084 Decision 1) —
+                            // the kernel expands these at effect-input build,
+                            // and an unknown name must refuse HERE, not
+                            // surface as a runtime expansion failure.
+                            let mut checked: Vec<&str> = Vec::new();
+                            let mut walk_names = vec![&expr];
+                            while let Some(node) = walk_names.pop() {
+                                use whipplescript_core::selection::{SelAtom, SelExpr};
+                                match node {
+                                    SelExpr::Union(a, b)
+                                    | SelExpr::Intersect(a, b)
+                                    | SelExpr::Difference(a, b) => {
+                                        walk_names.push(a);
+                                        walk_names.push(b);
+                                    }
+                                    SelExpr::Atom(SelAtom::Region(name)) => {
+                                        if !checked.contains(&name.as_str()) {
+                                            checked.push(name);
+                                            if !ir.regions.iter().any(|region| region.name == *name)
+                                            {
+                                                diagnostics.push(Diagnostic {
+                                                    code: diagnostic_code!(
+                                                        "construct.unknown_reference"
+                                                    ),
+                                                    severity: Severity::Error,
+                                                    related: Vec::new(),
+                                                    span: effect.span,
+                                                    message: format!(
+                                                        "`region({name})` names no declared region"
+                                                    ),
+                                                    suggestion: Some(
+                                                        "declare it at top level: `region <name> \
+                                                         { select \"<selection>\" }`"
+                                                            .to_owned(),
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    SelExpr::Atom(SelAtom::DependentsOf(inner)) => {
+                                        walk_names.push(inner);
+                                    }
+                                    SelExpr::Atom(_) => {}
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -8365,6 +8480,59 @@ fn validate_streams(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
                         suggestion: Some(
                             "transport targets are the nameable tiers: `onto mainline`, or \
                              `onto <stream>` for a declared stream's line"
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Cross-declaration `region` checks (DR-0084 Decision 1): each region's
+/// selection must parse against the one core grammar, and it must be a
+/// well-formed REGION — the world-denoting subtype. The temporal and
+/// attribution atoms, `dependents-of`, and nested `region` atoms denote
+/// recorded change-sets, not world-regions, and are refused here with the
+/// offending atoms named. Duplicate names are refused at lowering.
+fn validate_regions(ir: &IrProgram, diagnostics: &mut Vec<Diagnostic>) {
+    for region in &ir.regions {
+        match whipplescript_core::selection::parse(&region.select) {
+            Err(error) => {
+                diagnostics.push(Diagnostic {
+                    code: diagnostic_code!("parse.invalid_selection"),
+                    severity: Severity::Error,
+                    related: Vec::new(),
+                    span: region.span,
+                    message: format!(
+                        "region `{}`: the selection does not parse: {error}",
+                        region.name
+                    ),
+                    suggestion: Some(
+                        "a region composes `path(<glob>)` and `decl(<identity-glob>)` atoms \
+                         with `|`, `&`, `~`, and parens"
+                            .to_owned(),
+                    ),
+                });
+            }
+            Ok(expr) => {
+                let violations = whipplescript_core::selection::region_position_violations(&expr);
+                if !violations.is_empty() {
+                    diagnostics.push(Diagnostic {
+                        code: diagnostic_code!("construct.invalid_clause_value"),
+                        severity: Severity::Error,
+                        related: Vec::new(),
+                        span: region.span,
+                        message: format!(
+                            "region `{}` uses change-set atoms ({}), but a region denotes a \
+                             part of the artifact world",
+                            region.name,
+                            violations.join(", ")
+                        ),
+                        suggestion: Some(
+                            "keep only `path(...)`/`decl(...)` atoms in a region; temporal and \
+                             attribution atoms belong in the selective verbs' selections, where \
+                             they can compose with `region(<name>)`"
                                 .to_owned(),
                         ),
                     });
@@ -9149,6 +9317,7 @@ const BUILTIN_SCHEMA_REFS: &[&str] = &[
     "VcsContention",
     "VcsPromotion",
     "VcsStall",
+    "TrackerStale",
     "TerminalFailed",
     "TerminalTimedOut",
     "TerminalCancelled",
@@ -9178,6 +9347,9 @@ fn is_observer_only_schema(name: &str) -> bool {
             | "VcsContention"
             | "VcsPromotion"
             | "VcsStall"
+            // Knowledge-plane observer schema (DR-0084 W1): a rule that
+            // records one forges a staleness observation.
+            | "TrackerStale"
     )
 }
 
@@ -18035,6 +18207,15 @@ pub fn runtime_fact_name_for_pattern(pattern: &str) -> Option<String> {
     if pattern == "reconcile stalled" {
         return Some("vcs.reconcile.stalled".to_owned());
     }
+    // Knowledge-plane staleness sugar (DR-0084 W1), the same defined-
+    // lowering discipline: each phrase abbreviates the dotted general
+    // form over a generated-only fact the mediator emits.
+    if pattern == "issue stale" {
+        return Some("tracker.issue.stale".to_owned());
+    }
+    if pattern == "assertion stale" {
+        return Some("tracker.assertion.stale".to_owned());
+    }
     {
         let words: Vec<&str> = pattern.split_whitespace().collect();
         match words.as_slice() {
@@ -18125,6 +18306,10 @@ fn vcs_sugar_schema(phrase: &str) -> Option<&'static str> {
     }
     if phrase == "reconcile stalled" {
         return Some("VcsStall");
+    }
+    // Knowledge-plane staleness sugar (DR-0084 W1).
+    if phrase == "issue stale" || phrase == "assertion stale" {
+        return Some("TrackerStale");
     }
     let words: Vec<&str> = phrase.split_whitespace().collect();
     match words.as_slice() {

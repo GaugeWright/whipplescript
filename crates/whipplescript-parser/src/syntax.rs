@@ -58,6 +58,7 @@ pub(crate) const TOP_LEVEL_DECLARATION_KEYWORDS: &[&str] = &[
     "gauge",
     "campaign",
     "mark",
+    "region",
     "source",
     "test",
     "class",
@@ -1179,6 +1180,10 @@ impl Parser<'_> {
             self.reject_pending_tags(pending_tags, "mark");
             self.reject_pending_description(pending_description, "mark");
             self.parse_mark().map(Item::Mark)
+        } else if self.at_ident("region") {
+            self.reject_pending_tags(pending_tags, "region");
+            self.reject_pending_description(pending_description, "region");
+            self.parse_region().map(Item::Region)
         } else if self.at_ident("source") {
             self.reject_pending_tags(pending_tags, "source");
             self.reject_pending_description(pending_description, "source");
@@ -2469,6 +2474,54 @@ impl Parser<'_> {
                 start,
                 end: site_span.end,
             },
+        })
+    }
+
+    /// `region <name> { select "<selection>" }` (DR-0084 Decision 1): the
+    /// core world-denoting term. Block form on purpose — the declaration's
+    /// canonical identity is its head line, so a selector edit reads as a
+    /// content change, never a rename.
+    fn parse_region(&mut self) -> Option<RegionDecl> {
+        let start = self.expect_keyword("region")?.span.start;
+        let name = self.expect_ident("region name")?;
+        self.expect_symbol('{')?;
+        let mut select: Option<StringLiteral> = None;
+        while !self.is_at_end() && !self.at_symbol('}') {
+            if self.consume_ident("select") {
+                match self.expect_string("region selection") {
+                    Some(literal) => select = Some(literal),
+                    None => self.synchronize_to_block_item(),
+                }
+            } else {
+                self.expected("`select \"<selection>\"` in the region block");
+                self.synchronize_to_block_item();
+            }
+        }
+        let close = self.expect_symbol('}')?;
+        let span = SourceSpan {
+            start,
+            end: close.span.end,
+        };
+        let Some(select) = select else {
+            self.diagnostics.push(Diagnostic {
+                code: diagnostic_code!("construct.missing_requirement"),
+                severity: Severity::Error,
+                related: Vec::new(),
+                span,
+                message: format!("region `{}` must declare its selection", name.name),
+                suggestion: Some(
+                    "a region is a named part of the artifact world: add \
+                     `select \"<selection>\"` composing `path(...)`/`decl(...)` atoms"
+                        .to_owned(),
+                ),
+            });
+            return None;
+        };
+        Some(RegionDecl {
+            name,
+            select: select.value,
+            select_span: select.span,
+            span,
         })
     }
 

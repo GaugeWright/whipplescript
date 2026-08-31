@@ -7826,6 +7826,11 @@ fn declaration_reference_refusals_fire() {
             ("multiple implicit workflow headers are not supported", "class T { id string }\nclass R { ok bool }\n\nworkflow A\noutput result R\n\nworkflow B\noutput result R\n\nrule r\n  when started\n=> { complete result { ok true } }\n"),
             ("stream `s` must declare its members", "use std.vcs\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nstream s {\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
             ("duplicate stream `s`", "use std.vcs\nuse std.agent\nworkflow W\noutput result R\nclass R { ok bool }\nagent a { provider fixture  profile \"repo-writer\"  capacity 1 }\nstream s {\n  members [a]\n}\nstream s {\n  members [a]\n}\nrule r\n  when started\n=> { complete result { ok true } }\n"),
+            ("region `r` must declare its selection", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nregion r {\n}\nrule x\n  when started\n=> { complete result { ok true } }\n"),
+            ("duplicate region `r`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nregion r {\n  select \"path(a)\"\n}\nregion r {\n  select \"path(b)\"\n}\nrule x\n  when started\n=> { complete result { ok true } }\n"),
+            ("region `r`: the selection does not parse: unterminated `since(`", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nregion r {\n  select \"since(\"\n}\nrule x\n  when started\n=> { complete result { ok true } }\n"),
+            ("region `r` uses change-set atoms (since), but a region denotes a part of the artifact world", "workflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nregion r {\n  select \"path(a) & since(t1)\"\n}\nrule x\n  when started\n=> { complete result { ok true } }\n"),
+            ("`region(ghost)` names no declared region", "use std.vcs\nworkflow W\noutput result R\nclass R { ok bool }\nclass T { id string }\nsignal go.now { x string }\nrule x\n  when go.now as g\n=> {\n  undo \"region(ghost)\" as u\n  after u applied { complete result { ok true } }\n  after u stranded { complete result { ok false } }\n}\n"),
             ("workflow invocation `Child` repeats input `task`", "class T { id string }\nclass R { ok bool }\n\nworkflow Child {\n  input task T\n  output result R\n\n  rule c\n    when T as t\n  => { complete result { ok true } }\n}\n\nworkflow W {\n  output result R\n\n  rule r\n    when started\n  => {\n    invoke Child { task { id \"a\" }  task { id \"b\" } } as ch\n    after ch succeeds { complete result { ok true } }\n  }\n}\n"),
         ];
 
@@ -15460,6 +15465,126 @@ rule j
         .diagnostics
         .iter()
         .any(|d| d.message.contains("undeclared stream")));
+}
+
+/// DR-0084 W1: the staleness sugar family. `when issue stale as s` /
+/// `when assertion stale as s` lower to the generated-only mediator facts
+/// and bind the `TrackerStale` observer schema (typed field access
+/// compiles); a rule that `record`s the schema forges an observation and
+/// is refused.
+#[test]
+fn staleness_sugar_lowers_binds_and_refuses_forgery() {
+    let source = r#"
+@service
+workflow Stale
+
+output result R
+class R { ok bool }
+class Notice { subject string }
+
+rule watch
+  when issue stale as s
+=> {
+  record Notice { subject s.subject }
+}
+
+rule watch_claims
+  when assertion stale as a
+=> {
+  record Notice { subject a.subject }
+}
+"#;
+    let compiled = compile_program(source);
+    // Typed field access (`s.subject`) through the TrackerStale observer
+    // schema compiles; the ir existing at all is the binding proof.
+    compiled.ir.expect("compiles");
+    // The one lowering table maps each phrase to its mediator fact.
+    assert_eq!(
+        runtime_fact_name_for_pattern("issue stale").as_deref(),
+        Some("tracker.issue.stale")
+    );
+    assert_eq!(
+        runtime_fact_name_for_pattern("assertion stale").as_deref(),
+        Some("tracker.assertion.stale")
+    );
+
+    // Forging the observation is refused.
+    let forged = source.replace(
+        "record Notice { subject s.subject }",
+        "record TrackerStale { subject \"WS-1\"  branch \"main\"  status \"stale\" }",
+    );
+    let compiled = compile_program(&forged);
+    assert!(compiled.diagnostics.iter().any(|d| d
+        .message
+        .contains("cannot record kernel-owned terminal schema `TrackerStale`")));
+}
+
+/// DR-0084 Decision 1: `region <name> { select "<selection>" }` is a core
+/// declared term. It parses without any `use`, lowers into `ir.regions`,
+/// appears in the `.ir` snapshot, formats idempotently, and a
+/// `region(<name>)` atom composes inside a selective verb's literal slot —
+/// where an unknown name is refused at check, and a change-set atom inside
+/// the region declaration is refused as a type error.
+#[test]
+fn region_declaration_parses_validates_and_formats() {
+    let source = r#"
+workflow Regions
+use std.vcs
+
+output result R
+class R { ok bool }
+
+region core {
+  select "path(src/**) | decl(rule close)"
+}
+
+signal go.now { x string }
+rule tidy
+  when go.now as g
+=> {
+  undo "region(core) & by(s:)" as u
+  after u applied { complete result { ok true } }
+  after u stranded { complete result { ok false } }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("compiles");
+    assert_eq!(ir.regions.len(), 1);
+    assert_eq!(ir.regions[0].name, "core");
+    assert_eq!(ir.regions[0].select, "path(src/**) | decl(rule close)");
+    let snapshot = ir.to_snapshot();
+    assert!(snapshot.contains("region core select=\"path(src/**) | decl(rule close)\""));
+
+    // The formatter emits the block form and is idempotent over it.
+    let formatted = format_program(source).formatted.expect("formats");
+    assert!(formatted.contains("region core {"), "{formatted}");
+    assert!(
+        formatted.contains("  select \"path(src/**) | decl(rule close)\""),
+        "{formatted}"
+    );
+    assert_eq!(
+        format_program(&formatted).formatted.expect("reformats"),
+        formatted,
+        "fmt must be idempotent over the region block"
+    );
+
+    // A region atom naming an undeclared region is refused at check.
+    let unknown = source.replace("region(core)", "region(ghost)");
+    let compiled = compile_program(&unknown);
+    assert!(compiled
+        .diagnostics
+        .iter()
+        .any(|d| d.message == "`region(ghost)` names no declared region"));
+
+    // A change-set atom inside the region declaration is a type error.
+    let temporal = source.replace(
+        "select \"path(src/**) | decl(rule close)\"",
+        "select \"path(src/**) & since(t1)\"",
+    );
+    let compiled = compile_program(&temporal);
+    assert!(compiled.diagnostics.iter().any(|d| d
+        .message
+        .contains("region `core` uses change-set atoms (since)")));
 }
 
 /// std.vcs `promote <stream> as p` (DR-0052 grammar pass slice 3):

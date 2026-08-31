@@ -1,0 +1,118 @@
+--- Tracker-plane carriage (std-tracker.md deferred item 11's owed witness;
+--- the semantics themselves SHIPPED with DR-0051 in kernel/ifc.rs and this
+--- model pins them, sibling of infoflow-coord-carriage.maude).
+---
+--- The backlog is a cross-workflow carriage plane. The shipped posture:
+---   * a `when <tracker> has ready issue` trigger is a READ of that tracker:
+---     the consumer carries the queue's vouched integrity, and an UNVOUCHED
+---     queue is public bottom — consuming it into a sink that requires
+---     integrity is an injection;
+---   * `file` and `finish` are data SINKS: an unvouched writer cannot write
+---     into a vouched queue;
+---   * `claim`/`renew`/`release` carry NO rule data (holder + TTL only, the
+---     recorded implicit-flow ruling) — no level assignment makes a claim an
+---     injection;
+---   * `claim ... endorsed` draws its authority from the queue it claims out
+---     of, so endorsement is minted ONLY from a vouched queue. The bite is
+---     the self-laundering closure: an actor who can file into an unvouched
+---     queue must not be able to endorse its own filing into authority.
+mod WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE is
+  protecting BOOL .
+
+  sorts Workflow Tracker Level Cfg .
+
+  ops wfA wfB : -> Workflow [ctor] .
+  op trk : -> Tracker [ctor] .
+  ops lo hi : -> Level [ctor] .
+
+  --- Integrity dominance: hi satisfies any requirement; lo satisfies only lo.
+  op meets : Level Level -> Bool .
+  eq meets(hi, R:Level) = true .
+  eq meets(lo, lo) = true .
+  eq meets(lo, hi) = false .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  --- The envelope's word on the queue: hi = somebody vouches who may
+  --- file, the integrity_set is non-empty; lo = unvouched, public bottom.
+  op trackerVouched : Tracker Level -> Cfg [ctor] .
+  op ruleIntegrity : Workflow Level -> Cfg [ctor] .
+  --- The consuming rule writes onward into a sink requiring this level.
+  op sinkRequires : Workflow Level -> Cfg [ctor] .
+
+  op readReady : Workflow Tracker -> Cfg [ctor] .
+  op fileInto : Workflow Tracker -> Cfg [ctor] .
+  op claimOf : Workflow Tracker -> Cfg [ctor] .
+  op endorse : Workflow Tracker -> Cfg [ctor] .
+
+  op injection : -> Cfg [ctor] .
+  op endorseRefused : -> Cfg [ctor] .
+  op endorsedAuthority : Workflow -> Cfg [ctor] .
+
+  vars W : Workflow .
+  var T : Tracker .
+  vars L Req V : Level .
+
+  eq injection injection = injection .
+  eq endorseRefused endorseRefused = endorseRefused .
+  eq endorsedAuthority(W) endorsedAuthority(W) = endorsedAuthority(W) .
+
+  --- Ready-read carriage: the consumer's onward write carries the queue's
+  --- vouched level; an unvouched queue feeding a sink that requires
+  --- integrity is the injection the read classification exists to catch.
+  crl [ready-injection] :
+      readReady(W, T) trackerVouched(T, V) sinkRequires(W, Req)
+    => readReady(W, T) trackerVouched(T, V) sinkRequires(W, Req) injection
+    if meets(V, Req) =/= true .
+
+  --- File/finish sink gate: an unvouched writer cannot write a vouched queue.
+  crl [file-injection] :
+      fileInto(W, T) trackerVouched(T, V) ruleIntegrity(W, L)
+    => fileInto(W, T) trackerVouched(T, V) ruleIntegrity(W, L) injection
+    if meets(L, V) =/= true .
+
+  --- A claim carries no rule data: deliberately NO rule reads `claimOf`
+  --- into `injection` — the bite search proves the absence.
+
+  --- Endorsement authority is minted only from a vouched queue; an
+  --- unvouched one refuses (the shipped diagnostic).
+  rl [endorse-vouched] :
+      endorse(W, T) trackerVouched(T, hi)
+    => endorse(W, T) trackerVouched(T, hi) endorsedAuthority(W) .
+
+  rl [endorse-unvouched] :
+      endorse(W, T) trackerVouched(T, lo)
+    => endorse(W, T) trackerVouched(T, lo) endorseRefused .
+endm
+
+--- Negative fixture (bite teeth): the LAX endorsement that honours the
+--- marker without asking who vouches the queue — exactly the self-laundering
+--- DR-0051 SS3 closes: file your own issue, claim it endorsed, and untrusted
+--- output becomes vouched authority through a two-step one actor controls.
+mod WHIPPLESCRIPT-INFOFLOW-TRACKER-CARRIAGE-LAX is
+  protecting BOOL .
+
+  sorts Workflow Tracker Level Cfg .
+  ops wfA wfB : -> Workflow [ctor] .
+  op trk : -> Tracker [ctor] .
+  ops lo hi : -> Level [ctor] .
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+  op trackerVouched : Tracker Level -> Cfg [ctor] .
+  op ruleIntegrity : Workflow Level -> Cfg [ctor] .
+  op fileInto : Workflow Tracker -> Cfg [ctor] .
+  op endorse : Workflow Tracker -> Cfg [ctor] .
+  op endorsedAuthority : Workflow -> Cfg [ctor] .
+
+  var W : Workflow .
+  var T : Tracker .
+  var V : Level .
+
+  eq endorsedAuthority(W) endorsedAuthority(W) = endorsedAuthority(W) .
+
+  --- Bad minting: the marker alone is enough, whoever vouches be damned.
+  rl [endorse-lax] :
+      endorse(W, T) trackerVouched(T, V)
+    => endorse(W, T) trackerVouched(T, V) endorsedAuthority(W) .
+endm

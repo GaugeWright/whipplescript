@@ -122,6 +122,46 @@ pub struct Evidence {
     pub note: Option<String>,
     pub added_by: Option<String>,
     pub created_at: String,
+    /// The branch head cut when this evidence was attested (DR-0084):
+    /// attribution anchor for witness scans. `None` = unkeyed evidence.
+    pub at_cut: Option<String>,
+    /// The world-denoting basis region, COPIED at attest time.
+    pub basis: Option<String>,
+    /// The resolved basis fingerprint (JSON map, `decl:`/`path:` keys →
+    /// hashes) — the freshness evaluator's first argument.
+    pub basis_fingerprint_json: Option<String>,
+}
+
+/// One anchor (DR-0084 Decision 3): a binding from a ledger object (issue or
+/// assertion, by alias) to a world-denoting region. `role` is `subject`
+/// (what the object is about — drives staleness) or `intent` (what it plans
+/// to touch). Keyed by its own event hash, so a merge folds each exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Anchor {
+    pub id: String,
+    pub subject: String,
+    pub region: String,
+    pub role: String,
+    pub added_by: Option<String>,
+    pub created_at: String,
+}
+
+/// One knowledge-plane assertion (DR-0084 Decision 2): a durable statement
+/// about the world, the ledger's second vocabulary beside `issue`. No
+/// readiness, no claim, no finish — an assertion is knowledge, not work. Its
+/// durable identity is the content hash of its `assertion.created` event;
+/// `id` is the clone-local `AS-N` alias bridged through `tracker_aliases`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Assertion {
+    pub id: String,
+    pub content_id: String,
+    pub title: String,
+    pub body: String,
+    /// `active` | `retired`.
+    pub status: String,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// One field whose value is disputed: its `bef`-maximal setters in the event
@@ -191,6 +231,8 @@ pub struct ImportReport {
     pub imported: usize,
     pub skipped: usize,
     pub new_issues: usize,
+    /// Newly-seen assertions re-aliased on this clone (DR-0084 Decision 2).
+    pub new_assertions: usize,
     pub duplicate_submissions: Vec<String>,
     /// Events refused because their `event_id` did not equal the SHA-256 of
     /// their own content (tamper / corruption), or a created event whose id did
@@ -248,6 +290,18 @@ impl WorkItemStore {
         tx_ensure_column(&connection, "tracker_issues", "assigned_to", "TEXT")?;
         // Self-heal a tracker written before write-attribution (G3).
         tx_ensure_column(&connection, "tracker_events", "effect_id", "TEXT")?;
+        // Self-heal a tracker written before the knowledge plane's validity
+        // keys (DR-0084 Decision 3): keyed evidence carries its at-cut, its
+        // basis region text, and the resolved basis fingerprint. Absent on
+        // old rows = unkeyed evidence, which makes no freshness claim.
+        tx_ensure_column(&connection, "tracker_evidence", "at_cut", "TEXT")?;
+        tx_ensure_column(&connection, "tracker_evidence", "basis", "TEXT")?;
+        tx_ensure_column(
+            &connection,
+            "tracker_evidence",
+            "basis_fingerprint_json",
+            "TEXT",
+        )?;
         connection.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_events_id ON tracker_events(event_id);",
         )?;
@@ -1024,10 +1078,220 @@ impl WorkItemStore {
         Ok(Some(evidence_id))
     }
 
+    /// The opaque content id an issue or assertion alias resolves to, if any.
+    pub fn subject_content_id(&self, id: &str) -> StoreResult<Option<String>> {
+        content_id_of(&self.connection, id)
+    }
+
+    /// The content ids of the subjects `actor` currently holds active claims
+    /// on (DR-0084 I1: the intent stamp's lookup — exactly one active claim
+    /// is an unambiguous intent; zero or several stamp nothing).
+    pub fn active_claim_subjects(&self, actor: &str) -> StoreResult<Vec<String>> {
+        let now: String = self
+            .connection
+            .query_row("SELECT datetime('now')", [], |row| row.get(0))?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT a.content_id FROM tracker_leases l \
+             JOIN tracker_aliases a ON a.alias = l.issue_id \
+             WHERE l.actor = ?1 AND {ACTIVE_LEASE} \
+             ORDER BY l.acquired_at, l.lease_id"
+        ))?;
+        let rows = statement
+            .query_map(params![actor, now], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Whether any claim (active or released) was ever taken on this subject
+    /// — the cheap "was this worked under a claim" gate the finish
+    /// auto-attest uses (DR-0084 I1).
+    pub fn was_ever_claimed(&self, id: &str) -> StoreResult<bool> {
+        let claimed: bool = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM tracker_leases WHERE issue_id = ?1 LIMIT 1",
+                [id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        Ok(claimed)
+    }
+
+    /// Attach KEYED evidence (DR-0084 Decision 3): `add_evidence` plus the
+    /// validity key — at-cut, copied basis, resolved fingerprint. The caller
+    /// (CLI, mediator) resolves the fingerprint against a frontier; this
+    /// store stays VCS-free. Works for issues and assertions alike (one
+    /// alias bridge).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attest(
+        &mut self,
+        item_id: &str,
+        kind: Option<&str>,
+        reference: Option<&str>,
+        note: Option<&str>,
+        added_by: Option<&str>,
+        at_cut: Option<&str>,
+        basis: Option<&str>,
+        basis_fingerprint_json: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({
+            "kind": kind, "reference": reference, "note": note, "added_by": added_by,
+            "at_cut": at_cut, "basis": basis,
+            "basis_fingerprint": basis_fingerprint_json
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
+        });
+        let evidence_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "evidence.added",
+            &payload.to_string(),
+            added_by,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_evidence \
+             (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
+              at_cut, basis, basis_fingerprint_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                evidence_id,
+                item_id,
+                kind,
+                reference,
+                note,
+                added_by,
+                now,
+                at_cut,
+                basis,
+                basis_fingerprint_json,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(evidence_id))
+    }
+
+    /// Bind an anchor to an issue or assertion (DR-0084 Decision 3). The
+    /// region text is data here — validation (world-denoting subtype, parse)
+    /// happens at the doors; transported anchors from other clones fold as
+    /// data exactly like every other event.
+    pub fn add_anchor(
+        &mut self,
+        item_id: &str,
+        region: &str,
+        role: &str,
+        added_by: Option<&str>,
+    ) -> StoreResult<Option<String>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let payload = json!({ "region": region, "role": role, "added_by": added_by });
+        let anchor_id = tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "anchor.added",
+            &payload.to_string(),
+            added_by,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tracker_anchors \
+             (anchor_id, subject, region, role, added_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![anchor_id, item_id, region, role, added_by, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(anchor_id))
+    }
+
+    /// Remove an anchor by its id — a recorded act (an `anchor.removed`
+    /// event), never a silent delete; the projection row goes, the history
+    /// stays. `Ok(false)` = no such anchor on that subject.
+    pub fn remove_anchor(
+        &mut self,
+        item_id: &str,
+        anchor_id: &str,
+        removed_by: Option<&str>,
+    ) -> StoreResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let Some(content_id) = content_id_of(&tx, item_id)? else {
+            return Ok(false);
+        };
+        let known: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_anchors WHERE anchor_id = ?1 AND subject = ?2",
+                params![anchor_id, item_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !known {
+            return Ok(false);
+        }
+        tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "anchor.removed",
+            &json!({ "anchor_id": anchor_id, "removed_by": removed_by }).to_string(),
+            removed_by,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "DELETE FROM tracker_anchors WHERE anchor_id = ?1",
+            params![anchor_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A subject's current anchors, in creation order.
+    pub fn anchors(&self, item_id: &str) -> StoreResult<Vec<Anchor>> {
+        let mut statement = self.connection.prepare(
+            "SELECT anchor_id, subject, region, role, added_by, created_at \
+             FROM tracker_anchors WHERE subject = ?1 ORDER BY created_at, anchor_id",
+        )?;
+        let rows = statement
+            .query_map([item_id], |row| {
+                Ok(Anchor {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    region: row.get(2)?,
+                    role: row.get(3)?,
+                    added_by: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// An issue's attached evidence in chronological order.
     pub fn evidence(&self, item_id: &str) -> StoreResult<Vec<Evidence>> {
         let mut statement = self.connection.prepare(
-            "SELECT evidence_id, kind, reference, note, added_by, created_at \
+            "SELECT evidence_id, kind, reference, note, added_by, created_at, \
+                    at_cut, basis, basis_fingerprint_json \
              FROM tracker_evidence WHERE issue_id = ?1 ORDER BY created_at, evidence_id",
         )?;
         let rows = statement
@@ -1039,6 +1303,9 @@ impl WorkItemStore {
                     note: row.get(3)?,
                     added_by: row.get(4)?,
                     created_at: row.get(5)?,
+                    at_cut: row.get(6)?,
+                    basis: row.get(7)?,
+                    basis_fingerprint_json: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1155,13 +1422,211 @@ impl WorkItemStore {
     /// log from empty (`tracker-projection.maude` determinism). A rebuild
     /// reproduces the live projection exactly, because live writes and the fold
     /// derive every field — including timestamps — from the same event rows.
+    /// Create a knowledge-plane assertion (DR-0084 Decision 2). Identity =
+    /// the content hash of its `assertion.created` event; `AS-N` is minted as
+    /// the clone-local alias, exactly the issue pattern.
+    pub fn create_assertion(
+        &mut self,
+        title: &str,
+        body: &str,
+        created_by: Option<&str>,
+    ) -> StoreResult<Assertion> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let next: i64 = tx.query_row(
+            "UPDATE tracker_assertion_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let alias = format!("AS-{next}");
+        let payload = json!({
+            "title": title,
+            "body": body,
+            "created_by": created_by,
+        });
+        let payload_json = payload.to_string();
+        let content_id = event_content_id(
+            "assertion.created",
+            None,
+            &payload_json,
+            created_by,
+            &[],
+            &now,
+        );
+        tx.execute(
+            "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+            params![content_id, alias],
+        )?;
+        tx_append_raw(
+            &tx,
+            Some(&content_id),
+            Some(&content_id),
+            "assertion.created",
+            &payload_json,
+            created_by,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "INSERT INTO tracker_assertions \
+             (assertion_id, title, body, status, created_by, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+            params![alias, title, body, created_by, now],
+        )?;
+        tx.commit()?;
+        // Constructed from what was just written — no re-fetch, so there is
+        // no unreachable "row missing" branch to defend.
+        Ok(Assertion {
+            id: alias,
+            content_id,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            status: "active".to_owned(),
+            created_by: created_by.map(str::to_owned),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// Look an assertion up by `AS-N` alias or by its opaque content id.
+    pub fn get_assertion(&self, id: &str) -> StoreResult<Option<Assertion>> {
+        let alias = if id.starts_with("AS-") {
+            Some(id.to_owned())
+        } else {
+            self.connection
+                .query_row(
+                    "SELECT alias FROM tracker_aliases WHERE content_id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        let Some(alias) = alias else {
+            return Ok(None);
+        };
+        let row = self
+            .connection
+            .query_row(
+                "SELECT a.assertion_id, l.content_id, a.title, a.body, a.status, \
+                        a.created_by, a.created_at, a.updated_at \
+                 FROM tracker_assertions a JOIN tracker_aliases l ON l.alias = a.assertion_id \
+                 WHERE a.assertion_id = ?1",
+                [&alias],
+                |row| {
+                    Ok(Assertion {
+                        id: row.get(0)?,
+                        content_id: row.get(1)?,
+                        title: row.get(2)?,
+                        body: row.get(3)?,
+                        status: row.get(4)?,
+                        created_by: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every assertion, newest first; retired ones only when asked for —
+    /// retirement changes current visibility, never history (the events
+    /// remain, replay reproduces the projection).
+    pub fn list_assertions(&self, include_retired: bool) -> StoreResult<Vec<Assertion>> {
+        let filter = if include_retired {
+            ""
+        } else {
+            "WHERE a.status = 'active'"
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT a.assertion_id, l.content_id, a.title, a.body, a.status, \
+                    a.created_by, a.created_at, a.updated_at \
+             FROM tracker_assertions a JOIN tracker_aliases l ON l.alias = a.assertion_id \
+             {filter} ORDER BY a.created_at DESC, a.assertion_id DESC"
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(Assertion {
+                    id: row.get(0)?,
+                    content_id: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    status: row.get(4)?,
+                    created_by: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Retire an assertion: an append (parented on the assertion's current
+    /// heads) plus the projection update. Retired, not deleted — staleness
+    /// and audit read history; retirement only ends current standing.
+    pub fn retire_assertion(&mut self, id: &str, actor: Option<&str>) -> StoreResult<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = tx_now(&tx)?;
+        let alias = if id.starts_with("AS-") {
+            id.to_owned()
+        } else {
+            match tx
+                .query_row(
+                    "SELECT alias FROM tracker_aliases WHERE content_id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                Some(alias) => alias,
+                None => return Ok(false),
+            }
+        };
+        let Some(content_id) = content_id_of(&tx, &alias)? else {
+            return Ok(false);
+        };
+        let known: bool = tx
+            .query_row(
+                "SELECT 1 FROM tracker_assertions WHERE assertion_id = ?1",
+                [&alias],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !known {
+            return Ok(false);
+        }
+        tx_append_raw(
+            &tx,
+            Some(&content_id),
+            None,
+            "assertion.retired",
+            &json!({ "retired_by": actor }).to_string(),
+            actor,
+            self.event_effect_id.as_deref(),
+            &now,
+        )?;
+        tx.execute(
+            "UPDATE tracker_assertions SET status = 'retired', updated_at = ?2 \
+             WHERE assertion_id = ?1",
+            params![alias, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn rebuild_projection(&mut self) -> StoreResult<()> {
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "DELETE FROM tracker_issues; DELETE FROM tracker_relations; DELETE FROM tracker_leases; \
-             DELETE FROM tracker_comments; DELETE FROM tracker_evidence;",
+             DELETE FROM tracker_comments; DELETE FROM tracker_evidence; \
+             DELETE FROM tracker_assertions; DELETE FROM tracker_anchors;",
         )?;
         // The event log is keyed by opaque content_id; the projections are
         // alias-keyed. `tracker_aliases` (durable, NOT wiped) is the bridge.
@@ -1288,7 +1753,7 @@ impl WorkItemStore {
                 // SUPPRESS the honest one via `INSERT OR IGNORE`. A created
                 // event is hashed with no issue_id and no parents, and its id IS
                 // the issue identity.
-                let expected_id = if event.kind == "issue.created" {
+                let expected_id = if is_creation_kind(&event.kind) {
                     event_content_id(
                         &event.kind,
                         None,
@@ -1307,7 +1772,7 @@ impl WorkItemStore {
                         &event.created_at,
                     )
                 };
-                let created_identity_ok = event.kind != "issue.created"
+                let created_identity_ok = !is_creation_kind(&event.kind)
                     || event.issue_id.as_deref() == Some(event.event_id.as_str());
                 if expected_id != event.event_id || !created_identity_ok {
                     report.rejected += 1;
@@ -1365,6 +1830,31 @@ impl WorkItemStore {
                 )?;
                 new_alias.insert(content_id.clone(), alias);
                 report.new_issues += 1;
+            }
+            // Re-alias every newly-seen assertion the same way, minting AS-N
+            // from the assertion counter. No duplicate-submission advisory for
+            // assertions in v1 (that heuristic keys on queue+title, and
+            // assertions have no queue).
+            let unaliased_assertions: Vec<String> = tx
+                .prepare(
+                    "SELECT issue_id FROM tracker_events \
+                     WHERE kind = 'assertion.created' AND issue_id IS NOT NULL \
+                       AND issue_id NOT IN (SELECT content_id FROM tracker_aliases) \
+                     GROUP BY issue_id ORDER BY MIN(event_seq)",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for content_id in &unaliased_assertions {
+                let next: i64 = tx.query_row(
+                    "UPDATE tracker_assertion_counter SET next_id = next_id + 1 WHERE singleton = 1 RETURNING next_id - 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO tracker_aliases (content_id, alias) VALUES (?1, ?2)",
+                    params![content_id, format!("AS-{next}")],
+                )?;
+                report.new_assertions += 1;
             }
             // Genuine duplicate submission: a newly-seen creation that describes
             // the SAME issue (same queue + title) as a DISTINCT issue already in
@@ -1617,6 +2107,28 @@ CREATE TABLE IF NOT EXISTS tracker_evidence (
     added_by TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS tracker_anchors (
+    anchor_id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    region TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'subject',
+    added_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracker_assertions (
+    assertion_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracker_assertion_counter (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    next_id INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO tracker_assertion_counter (singleton, next_id) VALUES (1, 1);
 CREATE TABLE IF NOT EXISTS tracker_subscriptions (
     subscriber TEXT NOT NULL,
     queue TEXT NOT NULL,
@@ -1673,6 +2185,16 @@ fn tx_now(tx: &Transaction<'_>) -> StoreResult<String> {
 ///
 /// Backend-agnostic (shared by the native rusqlite store and the durable-object
 /// `DoSql` store — DO parity) so both mint identical ids for identical events.
+/// The event kinds that ROOT a ledger object's history: their event id IS the
+/// object's durable identity (hashed with no issue_id and no parents), and a
+/// transported creation event must carry its own id as its object identity.
+/// One predicate shared by the native and DO import paths, so the two
+/// admission doors cannot drift on which kinds are roots (DR-0084 Decision 2:
+/// `issue` and `assertion` are two vocabularies over one ledger substrate).
+pub fn is_creation_kind(kind: &str) -> bool {
+    matches!(kind, "issue.created" | "assertion.created")
+}
+
 pub fn event_content_id(
     kind: &str,
     issue_id: Option<&str>,
@@ -2358,10 +2880,17 @@ fn fold_event(
         }
         "evidence.added" => {
             if let (Some(evidence_id), Some(issue)) = (event_id, issue_id) {
+                // DR-0084: keyed evidence carries its validity key; the
+                // fingerprint folds verbatim (it is data, evaluated later).
+                let fingerprint_json = payload
+                    .get("basis_fingerprint")
+                    .filter(|value| !value.is_null())
+                    .map(std::string::ToString::to_string);
                 tx.execute(
                     "INSERT OR IGNORE INTO tracker_evidence \
-                     (evidence_id, issue_id, kind, reference, note, added_by, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (evidence_id, issue_id, kind, reference, note, added_by, created_at, \
+                      at_cut, basis, basis_fingerprint_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         evidence_id,
                         issue,
@@ -2370,7 +2899,62 @@ fn fold_event(
                         str_of("note"),
                         str_of("added_by"),
                         created_at,
+                        str_of("at_cut"),
+                        str_of("basis"),
+                        fingerprint_json,
                     ],
+                )?;
+            }
+        }
+        "anchor.added" => {
+            if let (Some(anchor_id), Some(subject)) = (event_id, issue_id) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_anchors \
+                     (anchor_id, subject, region, role, added_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        anchor_id,
+                        subject,
+                        str_of("region").unwrap_or_default(),
+                        str_of("role").unwrap_or_else(|| "subject".to_owned()),
+                        str_of("added_by"),
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+        "anchor.removed" => {
+            if let Some(anchor_id) = str_of("anchor_id") {
+                tx.execute(
+                    "DELETE FROM tracker_anchors WHERE anchor_id = ?1",
+                    params![anchor_id],
+                )?;
+            }
+        }
+        "assertion.created" => {
+            // `issue_id` here is the assertion's resolved AS-N alias (the fold
+            // resolves every subject through the shared alias bridge).
+            if let Some(alias) = issue_id {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tracker_assertions \
+                     (assertion_id, title, body, status, created_by, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+                    params![
+                        alias,
+                        str_of("title").unwrap_or_default(),
+                        str_of("body").unwrap_or_default(),
+                        str_of("created_by"),
+                        created_at,
+                    ],
+                )?;
+            }
+        }
+        "assertion.retired" => {
+            if let Some(alias) = issue_id {
+                tx.execute(
+                    "UPDATE tracker_assertions SET status = 'retired', updated_at = ?2 \
+                     WHERE assertion_id = ?1",
+                    params![alias, created_at],
                 )?;
             }
         }
@@ -2838,6 +3422,236 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DR-0084 Decision 2: an assertion's durable identity is the content
+    /// hash of its `assertion.created` event; `AS-N` is only a clone-local
+    /// alias, and no event is ever keyed by it.
+    #[test]
+    fn assertion_identity_is_the_creation_event_hash() {
+        let mut store = WorkItemStore::open_in_memory().expect("store");
+        let assertion = store
+            .create_assertion("custody core verified", "model + sweep", Some("s:sess-1"))
+            .expect("create");
+        assert_eq!(assertion.id, "AS-1");
+        assert_eq!(assertion.content_id.len(), 64, "content id is a SHA-256");
+        assert_eq!(assertion.status, "active");
+
+        // No event keyed by the alias; the log speaks content ids only.
+        let by_alias: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM tracker_events WHERE issue_id = 'AS-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(by_alias, 0);
+
+        // Lookup resolves through either handle.
+        let by_content = store
+            .get_assertion(&assertion.content_id)
+            .expect("get")
+            .expect("found");
+        assert_eq!(by_content.id, "AS-1");
+    }
+
+    /// Assertions ride the same content-addressed transport as issues: a
+    /// second clone imports them (identity re-verified — `assertion.created`
+    /// is a root kind), re-aliases locally, folds the retirement, stays
+    /// quiet on re-import, and a projection rebuild reproduces the rows.
+    #[test]
+    fn assertions_merge_across_clones_and_rebuild() {
+        let mut a = WorkItemStore::open_in_memory().expect("store a");
+        let kept = a
+            .create_assertion("kept", "", Some("s:a"))
+            .expect("create kept");
+        let retired = a
+            .create_assertion("retired", "", Some("s:a"))
+            .expect("create retired");
+        assert!(a
+            .retire_assertion(&retired.id, Some("s:a"))
+            .expect("retire"));
+
+        let mut b = WorkItemStore::open_in_memory().expect("store b");
+        let report = b
+            .import_events(&a.export_events().expect("export"))
+            .expect("import");
+        assert_eq!(report.new_assertions, 2);
+        assert_eq!(report.rejected, 0);
+
+        // B's aliases are its own; identity is shared.
+        let b_kept = b
+            .get_assertion(&kept.content_id)
+            .expect("get")
+            .expect("found");
+        assert_eq!(b_kept.title, "kept");
+        assert_eq!(b_kept.status, "active");
+        let b_retired = b
+            .get_assertion(&retired.content_id)
+            .expect("get")
+            .expect("found");
+        assert_eq!(b_retired.status, "retired");
+
+        // Re-import is an idempotent resync: nothing new, nothing rejected.
+        let again = b
+            .import_events(&a.export_events().expect("export"))
+            .expect("reimport");
+        assert_eq!(again.imported, 0);
+        assert_eq!(again.new_assertions, 0);
+        assert_eq!(again.rejected, 0);
+
+        // Replay reproduces the projection.
+        b.rebuild_projection().expect("rebuild");
+        assert_eq!(
+            b.get_assertion(&retired.content_id)
+                .expect("get")
+                .expect("found")
+                .status,
+            "retired"
+        );
+        // Default listing hides retired; --all shows both.
+        assert_eq!(b.list_assertions(false).expect("list").len(), 1);
+        assert_eq!(b.list_assertions(true).expect("list").len(), 2);
+    }
+
+    /// DR-0084 I1: the intent-stamp lookup — active claims by actor resolve
+    /// to content ids; released and expired leases drop out; the
+    /// ever-claimed gate sees history.
+    #[test]
+    fn active_claim_subjects_track_the_holder() {
+        let mut store = WorkItemStore::open_in_memory().expect("store");
+        let issue = store
+            .file_item("q", "work", "", &[], &json!({}), Some("s:a"))
+            .expect("file");
+        assert!(!store.was_ever_claimed(&issue.id).expect("gate"));
+        assert!(matches!(
+            store.claim_item(&issue.id, "ins-7", None).expect("claim"),
+            ClaimOutcome::Claimed
+        ));
+        let held = store.active_claim_subjects("ins-7").expect("held");
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            Some(held[0].clone()),
+            store.subject_content_id(&issue.id).expect("content id")
+        );
+        assert!(store.was_ever_claimed(&issue.id).expect("gate"));
+        assert!(matches!(
+            store
+                .release_item(&issue.id, Some("ins-7"))
+                .expect("release"),
+            ReleaseOutcome::Released
+        ));
+        assert!(store
+            .active_claim_subjects("ins-7")
+            .expect("held")
+            .is_empty());
+        assert!(store.was_ever_claimed(&issue.id).expect("gate"));
+    }
+
+    /// DR-0084 Decision 3: anchors bind ledger objects (issues AND
+    /// assertions, one alias bridge) to world-denoting regions; removal is
+    /// a recorded act; both fold through merge and rebuild.
+    #[test]
+    fn anchors_bind_merge_and_remove_as_recorded_acts() {
+        let mut a = WorkItemStore::open_in_memory().expect("store a");
+        let issue = a
+            .file_item("q", "close the loop", "", &[], &json!({}), Some("s:a"))
+            .expect("file");
+        let assertion = a
+            .create_assertion("custody verified", "", Some("s:a"))
+            .expect("assert");
+        let kept = a
+            .add_anchor(&issue.id, "decl(rule close)", "subject", Some("s:a"))
+            .expect("anchor")
+            .expect("issue known");
+        let dropped = a
+            .add_anchor(&issue.id, "path(scratch/**)", "intent", Some("s:a"))
+            .expect("anchor")
+            .expect("issue known");
+        a.add_anchor(&assertion.id, "path(crates/**)", "subject", Some("s:a"))
+            .expect("anchor")
+            .expect("assertion known");
+        assert!(a
+            .remove_anchor(&issue.id, &dropped, Some("s:a"))
+            .expect("remove"));
+        let current = a.anchors(&issue.id).expect("anchors");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, kept);
+        assert_eq!(current[0].role, "subject");
+        assert_eq!(a.anchors(&assertion.id).expect("anchors").len(), 1);
+
+        // A second clone folds add + remove to the same current set, and a
+        // rebuild reproduces it.
+        let mut b = WorkItemStore::open_in_memory().expect("store b");
+        b.import_events(&a.export_events().expect("export"))
+            .expect("import");
+        // B's issue alias is WS-1 (first re-aliased issue).
+        let b_anchors = b.anchors("WS-1").expect("anchors");
+        assert_eq!(b_anchors.len(), 1);
+        assert_eq!(b_anchors[0].region, "decl(rule close)");
+        b.rebuild_projection().expect("rebuild");
+        assert_eq!(b.anchors("WS-1").expect("anchors").len(), 1);
+    }
+
+    /// DR-0084 Decision 3: `attest` records the validity key (at-cut, copied
+    /// basis, resolved fingerprint) beside the evidence; unkeyed
+    /// `add_evidence` rows stay unkeyed; both merge intact.
+    #[test]
+    fn attest_records_the_validity_key_and_merges() {
+        let mut a = WorkItemStore::open_in_memory().expect("store a");
+        let issue = a
+            .file_item("q", "verify", "", &[], &json!({}), Some("s:a"))
+            .expect("file");
+        a.add_evidence(&issue.id, Some("note"), None, Some("unkeyed"), Some("s:a"))
+            .expect("evidence");
+        let fingerprint = r#"{"decl:rule close":"ab12"}"#;
+        a.attest(
+            &issue.id,
+            Some("test-run"),
+            Some("check.sh#123"),
+            None,
+            Some("s:a"),
+            Some("cut_7"),
+            Some("decl(rule close)"),
+            Some(fingerprint),
+        )
+        .expect("attest")
+        .expect("issue known");
+
+        let rows = a.evidence(&issue.id).expect("evidence");
+        assert_eq!(rows.len(), 2);
+        let unkeyed = rows
+            .iter()
+            .find(|row| row.note.as_deref() == Some("unkeyed"))
+            .expect("row");
+        assert_eq!(unkeyed.at_cut, None);
+        let keyed = rows
+            .iter()
+            .find(|row| row.kind.as_deref() == Some("test-run"))
+            .expect("row");
+        assert_eq!(keyed.at_cut.as_deref(), Some("cut_7"));
+        assert_eq!(keyed.basis.as_deref(), Some("decl(rule close)"));
+        assert_eq!(
+            keyed
+                .basis_fingerprint_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok()),
+            serde_json::from_str::<Value>(fingerprint).ok()
+        );
+
+        // The key survives transport and rebuild on a second clone.
+        let mut b = WorkItemStore::open_in_memory().expect("store b");
+        b.import_events(&a.export_events().expect("export"))
+            .expect("import");
+        b.rebuild_projection().expect("rebuild");
+        let b_rows = b.evidence("WS-1").expect("evidence");
+        let b_keyed = b_rows
+            .iter()
+            .find(|row| row.kind.as_deref() == Some("test-run"))
+            .expect("row");
+        assert_eq!(b_keyed.at_cut.as_deref(), Some("cut_7"));
+        assert!(b_keyed.basis_fingerprint_json.is_some());
+    }
 
     /// `sha256_hex` produces durable content ids: an issue's identity is the
     /// hash of its `issue.created` event, carried in every later event and in

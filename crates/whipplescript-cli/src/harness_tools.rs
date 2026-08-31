@@ -2748,7 +2748,12 @@ impl FileToolExecutor {
                 .finish_item(id, None, Some(&holder))
                 .map_err(|error| format!("finish: {error:?}"))?
             {
-                FinishOutcome::Finished => {}
+                FinishOutcome::Finished => {
+                    // DR-0084 I1: the agent door auto-attests the cut trail
+                    // exactly as the CLI door does (advisory, never fails
+                    // the finish).
+                    crate::auto_attest_finish(&mut store, id, Some(&holder));
+                }
                 FinishOutcome::NotOpen => {
                     return Err(format!("`{id}` is not open (missing, or already closed)"));
                 }

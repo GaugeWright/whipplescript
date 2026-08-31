@@ -232,11 +232,11 @@ fn lsp_completion_kind(kind: &str) -> i32 {
 /// typed prefix; context-aware filtering is future work.
 pub(crate) const LSP_KEYWORDS: &[&str] = &[
     "workflow", "class", "enum", "agent", "rule", "coerce", "flow", "action", "signal", "source",
-    "table", "tracker", "channel", "lease", "ledger", "counter", "output", "failure", "input",
-    "when", "record", "done", "tell", "decide", "exec", "call", "invoke", "with", "access", "to",
-    "read", "write", "import", "export", "recall", "learn", "emit", "after", "case", "complete",
-    "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire", "renew", "append",
-    "consume",
+    "table", "tracker", "channel", "lease", "ledger", "counter", "region", "output", "failure",
+    "input", "when", "record", "done", "tell", "decide", "exec", "call", "invoke", "with",
+    "access", "to", "read", "write", "import", "export", "recall", "learn", "emit", "after",
+    "case", "complete", "fail", "timer", "cancel", "claim", "release", "finish", "file", "acquire",
+    "renew", "append", "consume",
 ];
 
 /// Compile `text` and publish its diagnostics (errors + warnings) for `uri`. This
