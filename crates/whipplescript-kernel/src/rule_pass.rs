@@ -85,6 +85,111 @@ fn max_fixpoint_rounds() -> u64 {
 /// handle instead of re-opening per operation. `S` unifies the runtime,
 /// coordination, and work-items surfaces — natively `NativeStores`, on the DO the
 /// one `DoSqliteStore`.
+/// The default window of world crossings an instance may take before it parks
+/// (DR-0082).
+///
+/// A step is one `effect.run_started` — an effect that actually ran. Derivation
+/// is not charged: a program that commits a thousand facts to send one message
+/// has taken one step, which is the unit an operator cares about, and the
+/// per-pass derivation loop has its own bound in `DEFAULT_MAX_FIXPOINT_ROUNDS`.
+///
+/// Every program in the repository runs far below this. Raising
+/// `WHIPPLESCRIPT_STEP_BUDGET` widens the window without stopping the instance.
+pub const DEFAULT_STEP_BUDGET: u64 = 1_000;
+
+fn step_budget() -> u64 {
+    std::env::var("WHIPPLESCRIPT_STEP_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_STEP_BUDGET)
+}
+
+/// Park the instance when it has spent its window (DR-0082).
+///
+/// The count is taken since the instance's most recent transition to `running` —
+/// its start, or its last resume — so `whip resume` grants a fresh window rather
+/// than returning to an instance that re-parks on its next step. A lifetime
+/// ceiling would make resume meaningless.
+///
+/// Parking is `running -> paused`, the transition the lifecycle already has, and
+/// it reaches no terminal: facts, effects, held resources, and position are
+/// exactly as they were. A workflow that runs long is not a workflow that is
+/// wrong, and this is not entitled to decide it is.
+fn park_if_step_budget_spent<S: RuntimeStore + Coordination + WorkItems>(
+    kernel: &mut RuntimeKernel<S>,
+    instance_id: &str,
+) -> Result<bool, StoreError> {
+    let budget = step_budget();
+    let events = kernel.store().list_events(instance_id)?;
+    let window_start = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "instance.transitioned"
+                && serde_json::from_str::<Value>(&event.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(|status| status == "running")
+                    })
+                    .unwrap_or(false)
+        })
+        .map(|event| event.sequence)
+        .unwrap_or(0);
+    let spent = events
+        .iter()
+        .filter(|event| event.sequence > window_start && event.event_type == "effect.run_started")
+        .count() as u64;
+    if spent < budget {
+        return Ok(false);
+    }
+
+    let message = format!(
+        "instance parked after {spent} world crossings in this window (budget \
+         {budget}); nothing was truncated — its facts, effects, held resources, \
+         and position are intact. Continue it with `whip resume {instance_id}`, \
+         which grants a fresh window, or raise WHIPPLESCRIPT_STEP_BUDGET if this \
+         program legitimately runs longer."
+    );
+    kernel.store().record_diagnostic(DiagnosticRecord {
+        instance_id: Some(instance_id),
+        program_id: None,
+        program_version_id: None,
+        severity: Severity::Warning,
+        code: Some("instance.step_budget.parked"),
+        message: &message,
+        source_span_json: None,
+        subject_type: Some("instance"),
+        subject_id: Some(instance_id),
+        event_id: None,
+        effect_id: None,
+        run_id: None,
+        assertion_id: None,
+        evidence_ids_json: "[]",
+        artifact_ids_json: "[]",
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Some(&idempotency_key(&[
+            instance_id,
+            "step-budget-parked",
+            &window_start.to_string(),
+        ])),
+    })?;
+    kernel.pause_instance(
+        instance_id,
+        Some("step budget spent"),
+        Some(&idempotency_key(&[
+            instance_id,
+            "step-budget",
+            &window_start.to_string(),
+        ])),
+    )?;
+    Ok(true)
+}
+
 pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
     kernel: &mut RuntimeKernel<S>,
     instance_id: &str,
@@ -96,6 +201,12 @@ pub fn step_instance_generic<S: RuntimeStore + Coordination + WorkItems>(
         instance_id: instance_id.to_owned(),
         ..StepReport::default()
     };
+    // DR-0082: before doing more work, ask whether this instance has already
+    // spent its window of world crossings. A parked instance is not stepped, so
+    // the question is asked once per pass rather than per effect.
+    if park_if_step_budget_spent(kernel, instance_id)? {
+        return Ok(report);
+    }
     // Each round of the fixpoint below commits at most one rule and then
     // re-reads the whole event log, so the per-event payload derivations were
     // re-parsed once per commit. Event payloads are immutable — the store only

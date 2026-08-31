@@ -150,6 +150,19 @@ is a pause. It is never a silently smaller evaluation.
 *Carried by:* the cap accounting of the campaign. Refer to
 [Precedents, spend & estimators](manual/29-precedents.md).
 
+**A step budget parks an instance. A step budget never truncates one.**
+The same promise at the scope of one run. An instance may take a number of
+crossings to the world in each window of its life. On the last of them it moves
+to `paused`, and it records a diagnostic that names the count, the budget, and
+the two ways to continue. It reaches no terminal. Its facts, its effects, the
+resources that it holds, and its place in the program are what they were. The
+`whip resume` command continues it with a fresh window. Thus a run that is long
+is a run that pauses. It is never a run that the runtime decided was wrong.
+*Carried by:* the step budget of the instance, in the rule pass of the kernel,
+so a hosted run and a local run answer alike. Refer to
+[DR-0082](../spec/decision-records/0082-the-instance-step-budget.md). The
+fixture is `crates/whipplescript-cli/tests/step_budget.rs`.
+
 ## Typing
 
 **Each outcome settles.**
