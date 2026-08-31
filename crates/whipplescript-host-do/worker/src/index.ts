@@ -28,6 +28,11 @@ import {
 } from "../pkg/whipplescript_host_do_bg.js";
 import { Container, getRandom } from "@cloudflare/containers";
 import {
+  PRIORITY_HEADER,
+  WorkspaceBroker,
+  executorPoolSize,
+} from "./executor-broker";
+import {
   canonicalArtifact,
   sealArtifact,
   selectWorkspace,
@@ -222,6 +227,17 @@ export interface Env {
   WHIP_PROJECT_CONTEXT_JSON?: string;
   WHIP_SCRIPT_CAPABILITIES_JSON?: string;
   EXECUTOR: DurableObjectNamespace<ExecutorContainer>;
+  // The workspace-DO broker owning Class-A placement (compute plane note §3):
+  // when bound, exec rounds flow through it for workspace-wide priority
+  // admission (production > working > counterfactual) and least-loaded
+  // placement. Unbound = the documented v1 fallback, location-blind getRandom.
+  // Unbranded namespace type: executor-broker.ts stays free of ambient
+  // Cloudflare types so its unit tests run under plain node.
+  WORKSPACE_BROKER?: DurableObjectNamespace;
+  // Manual pool-size knob (design note §3: manual until platform autoscaling
+  // ships). Keep in step with the wrangler config's `[[containers]]`
+  // max_instances. Unset = the zero-config default of 4.
+  WHIP_EXECUTOR_POOL_SIZE?: string;
 }
 
 // One Class-A executor instance (compute plane P8): a container running
@@ -234,9 +250,10 @@ export class ExecutorContainer extends Container {
   sleepAfter = "10m";
 }
 
-// Fixed pool size until platform autoscaling ships (manual knob, working
-// zero-config default). `getRandom` is location-blind today — accepted.
-const EXECUTOR_POOL_SIZE = 4;
+// The workspace DO that owns this pool's placement (executor-broker.ts).
+// Re-exported so wrangler configs can bind the class from this entry module.
+export { WorkspaceBroker };
+
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 
 // The instance's next due timer, kept as a stored fact rather than written
@@ -700,8 +717,10 @@ async function readJsonCapped(resp: Response, maxBytes: number): Promise<unknown
 }
 
 // Perform one suspended HTTP round and marshal the result back for `step`.
-// Requests targeting the executor sentinel host are routed to a
-// getRandom-picked container in the EXECUTOR pool instead of the network.
+// Requests targeting the executor sentinel host are routed into the EXECUTOR
+// container pool instead of the network — through the workspace-DO broker
+// when it is bound (workspace-wide priority admission + placement), else by
+// location-blind getRandom (the documented v1 fallback).
 async function performFetch(
   req: {
     url: string;
@@ -727,7 +746,18 @@ async function performFetch(
       const container = env.EXECUTOR.get(env.EXECUTOR.idFromName(`turn-${turnId}`));
       resp = await container.fetch(req.url, init);
     } else if (executorHost && isSentinelRoute(req.url, executorHost, "/exec")) {
-      resp = await (await getRandom(env.EXECUTOR, EXECUTOR_POOL_SIZE)).fetch(req.url, init);
+      const broker = env.WORKSPACE_BROKER;
+      if (broker) {
+        // Postures ride the protocol: the admission header is derived from
+        // the whip-executor/1 body's `priority` field (unlabeled = live
+        // traffic), so the broker never re-parses the script-carrying body.
+        const priority = (req.body as { priority?: unknown })?.priority;
+        init.headers[PRIORITY_HEADER] = typeof priority === "string" ? priority : "production";
+        resp = await broker.get(broker.idFromName("workspace")).fetch(req.url, init);
+      } else {
+        const poolSize = executorPoolSize(env.WHIP_EXECUTOR_POOL_SIZE);
+        resp = await (await getRandom(env.EXECUTOR, poolSize)).fetch(req.url, init);
+      }
     } else {
       resp = await fetch(req.url, init);
     }

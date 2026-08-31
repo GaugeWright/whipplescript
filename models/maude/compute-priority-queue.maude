@@ -9,6 +9,11 @@
 --- rule matches a WRAPPED whole state -- with a bare AC soup, extension
 --- matching would let the rule rewrite a fragment with the rest bound to
 --- none, silently bypassing the guard (verified: that variant is unsound).
+--- The [serve] guard is transcribed at two sites: per-executor in
+--- crates/whipplescript-cli/src/exec_server.rs as AdmissionGate, and
+--- workspace-wide in the workspace-DO broker,
+--- crates/whipplescript-host-do/worker/src/executor-broker.ts, as
+--- BrokerScheduler, whose slot tokens are per-container.
 
 mod COMPUTE-PRIORITY-QUEUE is
   protecting NAT .

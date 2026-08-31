@@ -8,7 +8,7 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ["src/session.integration.test.ts"],
+    include: ["src/session.integration.test.ts", "src/executor-broker.integration.test.ts"],
     // Restore `vi.stubGlobal` globals before every test. The suite stubs
     // `fetch` in nine tests and unstubbed it by hand in seven; the two that
     // were missed leaked a mock provider into every test that followed, which

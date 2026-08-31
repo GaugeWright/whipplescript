@@ -50,6 +50,30 @@ export class TestDeployment implements DurableObject {
   }
 }
 
+// Stand-in for a Class-A ExecutorContainer instance: echoes which pool
+// instance served the round and threads the whip-executor/1 body back, so the
+// broker integration test can assert real-runtime routing without Docker.
+export class TestExecutor implements DurableObject {
+  constructor(private readonly state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method !== "POST" || new URL(request.url).pathname !== "/exec") {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+    const body = await request.json<{ delay_ms?: number }>();
+    // Hold the round open on request so a test can observe two rounds
+    // genuinely overlapping (and therefore placed on distinct instances).
+    if (typeof body.delay_ms === "number" && body.delay_ms > 0) {
+      await new Promise((resolve) => setTimeout(resolve, body.delay_ms));
+    }
+    return Response.json({
+      served_by: this.state.id.name ?? "<anonymous>",
+      priority_header: request.headers.get("x-whip-priority"),
+      body,
+    });
+  }
+}
+
 export class TestCredentialRegistry implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     if (

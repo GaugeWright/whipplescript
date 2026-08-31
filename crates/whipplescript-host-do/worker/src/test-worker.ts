@@ -1,6 +1,6 @@
-import worker, { WorkflowInstance } from "./index";
+import worker, { WorkflowInstance, WorkspaceBroker } from "./index";
 
-export { TestDeployment, TestCredentialRegistry } from "./test-doubles";
+export { TestDeployment, TestCredentialRegistry, TestExecutor } from "./test-doubles";
 
-export { WorkflowInstance };
+export { WorkflowInstance, WorkspaceBroker };
 export default worker;

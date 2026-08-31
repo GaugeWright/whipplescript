@@ -43,17 +43,27 @@ script_name = "gaugewright-edge-runtime"
 
 # The Class-A executor pool (compute plane P8): `whip executor` containers,
 # each paired 1:1 with an ExecutorContainer DO; the workflow DO routes
-# whip-executor/1 rounds to a getRandom-picked instance. Pool size is the
+# whip-executor/1 rounds through the workspace broker below. Pool size is the
 # manual knob until platform autoscaling ships.
 [[durable_objects.bindings]]
 name = "EXECUTOR"
 class_name = "ExecutorContainer"
+
+# The workspace-DO broker owning Class-A placement (compute plane note §3):
+# one object per deployment; exec rounds are admitted workspace-wide under
+# the priority discipline (production > working > counterfactual) and placed
+# on the least-loaded container.
+[[durable_objects.bindings]]
+name = "WORKSPACE_BROKER"
+class_name = "WorkspaceBroker"
 
 # Scaled to zero on 2026-08-11. The pool was provisioned on 2026-07-28 and has
 # been carrying four instances since, on a worker whose only consumer is an
 # opt-in developer harness — nothing in any repository points a product path at
 # it. Raise this deliberately when the harness needs the Class-A pool again;
 # leaving it at four so the capacity is "there" is how it went unnoticed.
+# Raise WHIP_EXECUTOR_POOL_SIZE below in the same change — the broker sizes
+# its slot bound from that knob.
 [[containers]]
 class_name = "ExecutorContainer"
 image = "./executor/Dockerfile"
@@ -68,10 +78,18 @@ new_sqlite_classes = ["WorkflowInstance"]
 tag = "v2"
 new_sqlite_classes = ["ExecutorContainer"]
 
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["WorkspaceBroker"]
+
 [vars]
 # Sentinel host for the executor pool: exec NeedsHttp rounds whose URL
 # targets this host are routed to a container stub, not the public network.
 WHIP_EXECUTOR_URL = "http://executor"
+# Class-A pool size, kept in step with `[[containers]] max_instances` above.
+# While the pool is scaled to zero the broker refuses exec rounds with an
+# explicit error instead of dispatching to containers that cannot start.
+WHIP_EXECUTOR_POOL_SIZE = "0"
 # Sentinel host for Class-B turn containers: agent turns run whole in a
 # per-turn container (idFromName over the turn id) over whip-turn/1.
 WHIP_TURN_URL = "http://turn"

@@ -16,9 +16,23 @@ class_name = "TestDeployment"
 name = "PUBLIC_CREDENTIALS"
 class_name = "TestCredentialRegistry"
 
+# The workspace-DO broker under test, with TestExecutor standing in for the
+# container pool (containers do not run under the vitest workers pool).
+[[durable_objects.bindings]]
+name = "WORKSPACE_BROKER"
+class_name = "WorkspaceBroker"
+
+[[durable_objects.bindings]]
+name = "EXECUTOR"
+class_name = "TestExecutor"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["WorkflowInstance", "TestDeployment", "TestCredentialRegistry"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["WorkspaceBroker", "TestExecutor"]
 
 [vars]
 WHIP_SESSION_TOKEN = "session-token"
