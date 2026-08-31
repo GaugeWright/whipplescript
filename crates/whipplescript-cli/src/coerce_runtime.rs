@@ -29,6 +29,7 @@ use whipplescript_kernel::coerce_native::{
     CoerceProvider, CoerceTransport, CoerceTransportError, HttpRequest, HttpResponse,
     ResolvedCoercionConfig, DEFAULT_COERCE_MAX_TOKENS, DEFAULT_COERCE_TIMEOUT_SECS,
 };
+use whipplescript_kernel::harness_model::assemble_codex_responses_sse as assemble_responses_sse;
 
 use crate::model_auth::{
     anthropic_oauth_rejection, codex_account_id, codex_config_model, env_nonempty,
@@ -537,69 +538,6 @@ fn read_response(response: ureq::Response, expect_sse: bool) -> HttpResponse {
     }
     let body = response.into_json::<Value>().unwrap_or(Value::Null);
     HttpResponse { status, body }
-}
-
-/// Collapse a Responses-API SSE stream into a `response`-shaped object the
-/// kernel's OpenAI parser can read. The structured output is carried by the
-/// `response.output_text.delta` events (the codex `response.completed` payload's
-/// `output[]` does not always include the assembled text), so prefer the
-/// concatenated deltas and attach usage from the completed event.
-fn assemble_responses_sse(raw: &str) -> Value {
-    let mut completed: Option<Value> = None;
-    let mut deltas = String::new();
-    let mut done_items: Vec<Value> = Vec::new();
-    for line in raw.lines() {
-        let Some(payload) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(payload) else {
-            continue;
-        };
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.completed") => completed = event.get("response").cloned(),
-            Some("response.output_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    deltas.push_str(delta);
-                }
-            }
-            // The codex backend's `response.completed` payload often carries an
-            // EMPTY `output[]`; the real items — function calls included — are
-            // delivered only as per-item `response.output_item.done` events.
-            // Collect them so a tool-calling turn survives assembly.
-            Some("response.output_item.done") => {
-                if let Some(item) = event.get("item") {
-                    done_items.push(item.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut completed = completed.unwrap_or(Value::Null);
-    let output_missing = completed
-        .get("output")
-        .and_then(Value::as_array)
-        .map(|output| output.is_empty())
-        .unwrap_or(true);
-    if output_missing && !done_items.is_empty() {
-        completed["output"] = Value::Array(done_items);
-    }
-    if !deltas.is_empty() {
-        let usage = completed.get("usage").cloned().unwrap_or(Value::Null);
-        let mut assembled = serde_json::json!({ "output_text": deltas, "usage": usage });
-        // Keep any collected items alongside the text: a turn may carry both
-        // an assistant message and tool calls.
-        if let Some(output) = completed.get("output") {
-            assembled["output"] = output.clone();
-        }
-        return assembled;
-    }
-    // No text deltas: fall back to the completed response object (the kernel
-    // parser walks output[].content[].text).
-    completed
 }
 
 #[cfg(test)]

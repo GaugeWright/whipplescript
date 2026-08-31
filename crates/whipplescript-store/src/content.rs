@@ -61,11 +61,10 @@ pub enum BlobStatus {
 }
 
 /// Outcome of a `purge_unreachable` sweep: how many orphaned plain blob
-/// rows were reclaimed and how many rows remain.
+/// rows were reclaimed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PurgeOutcome {
     pub purged: usize,
-    pub retained: usize,
 }
 
 /// Outcome of a per-blob erasure request.
@@ -332,15 +331,9 @@ impl ContentStore {
              AND id NOT IN (SELECT pack_id FROM content_pack_entries)",
             [],
         )?;
-        let retained: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))?;
         self.connection
             .execute_batch("DROP TABLE IF EXISTS gc_roots;")?;
-        Ok(PurgeOutcome {
-            purged,
-            retained: retained as usize,
-        })
+        Ok(PurgeOutcome { purged })
     }
 
     /// Read the full stored bytes for a content id, or `None` if unknown.

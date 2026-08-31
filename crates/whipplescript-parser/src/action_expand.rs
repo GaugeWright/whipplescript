@@ -1,5 +1,5 @@
 //! Action-call expansion (DR-0023): inlines `action` effect-chain templates at
-//! their rule-body call sites before analysis, the sibling of `flow`/`pattern`
+//! their rule-body call sites before analysis, the sibling of `pattern`
 //! expansion. A call `run_task(reviewer, task, "codex")` is replaced by the
 //! action's body with parameters substituted for arguments and the action's
 //! internal bindings uniquified per call site (hygiene), so two calls in one

@@ -3143,7 +3143,7 @@ pub fn parse_effect_statements(
                 prompt_template: None,
                 // v0: the `file store` declaration's `root` is the scope boundary;
                 // a `files.read` capability-grant layer is a documented follow-up
-                // (spec/std-library/files.md). Requiring it here without a grantor
+                // (spec/std-files.md). Requiring it here without a grantor
                 // would policy-block every read, so v0 reads are store-root scoped.
                 required_capabilities: Vec::new(),
                 after: current_after,

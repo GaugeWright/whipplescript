@@ -499,7 +499,6 @@ impl Parser<'_> {
         let mut workflow = None;
         let mut workflow_tags = Vec::new();
         let mut workflow_description = None;
-        let mut explicit_workflow_body = false;
         let mut workflows = Vec::new();
         let mut patterns = Vec::new();
         let mut items = Vec::new();
@@ -539,7 +538,6 @@ impl Parser<'_> {
                         // those are top-level for a single-workflow program.
                         items.extend(parsed_workflow.decl.items);
                         workflow = Some(parsed_workflow.decl.name);
-                        explicit_workflow_body = false;
                     }
                 }
             } else if self.at_ident("pattern") {
@@ -577,7 +575,6 @@ impl Parser<'_> {
             workflow,
             workflow_tags,
             workflow_description,
-            explicit_workflow_body,
             workflows,
             patterns,
             items,
@@ -2061,7 +2058,6 @@ impl Parser<'_> {
         Some(MarkDecl {
             name,
             site,
-            site_span,
             span: SourceSpan {
                 start,
                 end: site_span.end,
@@ -2074,11 +2070,10 @@ impl Parser<'_> {
     fn parse_gauge(&mut self) -> Option<GaugeDecl> {
         let start = self.expect_keyword("gauge")?.span.start;
         let name = self.expect_ident("gauge name")?;
-        let (site, site_span) = if self.consume_ident("on") {
-            let (site, span) = self.parse_dotted_name_spanned("gauge site")?;
-            (Some(site), Some(span))
+        let site = if self.consume_ident("on") {
+            Some(self.parse_dotted_name_spanned("gauge site")?.0)
         } else {
-            (None, None)
+            None
         };
         let open = self.expect_symbol('{')?;
         let mut judge: Option<GaugeJudge> = None;
@@ -2251,7 +2246,6 @@ impl Parser<'_> {
         Some(GaugeDecl {
             name,
             site,
-            site_span,
             judge,
             expect,
             inputs,
@@ -3183,7 +3177,7 @@ impl Parser<'_> {
                 continue;
             };
             // `@key`: mark this field as the class's natural key (import per-row
-            // idempotency, spec/std-library/files.md).
+            // idempotency, spec/files.md).
             let mut is_key = false;
             if self.at_symbol('@') {
                 if let Some(tag) = self.parse_tag() {

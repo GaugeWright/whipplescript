@@ -234,7 +234,7 @@ pub(crate) fn print_effect(
                 .map(|arg| rn(arg))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // preserve the source-crossing markers through flow expansion (trailing).
+            // preserve the source-crossing markers through re-serialization (trailing).
             let endorsed = if *endorsed { " endorsed" } else { "" };
             let declassified = if *declassified { " declassified" } else { "" };
             push_stmt_line(

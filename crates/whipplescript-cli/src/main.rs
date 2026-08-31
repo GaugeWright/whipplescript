@@ -29,11 +29,13 @@ use whipplescript_kernel::package_registry::*;
 use whipplescript_kernel::rule_correspondence::{RuleCarry, RuleCorrespondence};
 use whipplescript_kernel::{
     coerce::{CoerceRequest, FakeCoerceClient},
+    contains_secret_token_pattern,
     effect_config::EffectConfig,
     effect_handlers::*,
     harness::{CommandAgentHarness, CommandLaunchPlan},
     idempotency_key,
     instance_machine::{EffectStep, InstanceDriver},
+    is_sensitive_key,
     lowering::{BranchReport, BranchStatus},
     program_analysis_summary_json,
     provider::{
@@ -2230,9 +2232,8 @@ fn source_token_frequency(source: &str) -> std::collections::HashMap<String, usi
 /// program-internal (there is no external reference to a type by name), so a
 /// user-declared name occurring exactly once — only at its own declaration — is
 /// dead. The count must be EXACTLY one: a synthetic type generated during lowering
-/// (e.g. a flow's `FlowAwait_*` state class) never appears in the source at all
-/// (count 0), so requiring the one declaration occurrence excludes it. Zero
-/// false-positive risk.
+/// never appears in the source at all (count 0), so requiring the one declaration
+/// occurrence excludes it. Zero false-positive risk.
 fn lint_unused_types(source: &str, ir: &IrProgram) -> Vec<LintFinding> {
     let freq = source_token_frequency(source);
     ir.schemas
@@ -2281,7 +2282,7 @@ fn lint_broad_file_grants(ir: &IrProgram) -> Vec<LintFinding> {
 }
 
 /// Rules whose `after` blocks nest deeply (≥ `DEEP_AFTER_THRESHOLD` levels). A long
-/// `after`-chain is exactly what a `flow` exists to express more clearly, so this is a
+/// `after`-chain is what `then` sugar expresses more clearly, so this is a
 /// maintainability hint (severity `info`), not a correctness issue. The depth is
 /// computed from the body AST (`metadata.max_after_depth`), so it never miscounts on
 /// braces inside prompt strings — zero false positives.
@@ -10102,25 +10103,21 @@ fn construct_graph_validation_facts(
 
     facts.push(construct_graph_fact(
         format!("validator.graph.node_ids_unique:{graph_id}"),
-        "construct_graph_validator",
         node_ids.clone(),
         construct_graph_empty_span(),
     ));
     facts.push(construct_graph_fact(
         format!("validator.graph.port_ids_unique:{graph_id}"),
-        "construct_graph_validator",
         port_ids.clone(),
         construct_graph_empty_span(),
     ));
     facts.push(construct_graph_fact(
         format!("validator.graph.edge_refs_unique:{graph_id}"),
-        "construct_graph_validator",
         edge_refs.clone(),
         construct_graph_empty_span(),
     ));
     facts.push(construct_graph_fact(
         format!("validator.graph.effect_dependency_refs_unique:{graph_id}"),
-        "construct_graph_validator",
         dependency_refs.clone(),
         construct_graph_empty_span(),
     ));
@@ -10131,19 +10128,16 @@ fn construct_graph_validation_facts(
         };
         facts.push(construct_graph_fact(
             format!("validator.node.profile:{node_id}"),
-            "construct_graph_validator",
             construct_graph_node_profile_refs(node),
             construct_graph_span_from(node),
         ));
         facts.push(construct_graph_fact(
             format!("validator.node.interfaces:{node_id}"),
-            "construct_graph_validator",
             construct_graph_node_interface_refs(node),
             construct_graph_span_from(node),
         ));
         facts.push(construct_graph_fact(
             format!("validator.node.capabilities:{node_id}"),
-            "construct_graph_validator",
             construct_graph_node_capability_refs(node),
             construct_graph_span_from(node),
         ));
@@ -10153,7 +10147,6 @@ fn construct_graph_validation_facts(
                 node_id,
                 json_str(node, "lowering_output_kind").unwrap_or("unknown")
             ),
-            "construct_graph_validator",
             construct_graph_node_output_refs(node),
             construct_graph_span_from(node),
         ));
@@ -10162,7 +10155,6 @@ fn construct_graph_validation_facts(
         refs.extend(construct_graph_string_array(node, "produced_ports"));
         facts.push(construct_graph_fact(
             format!("validator.node.ports_consistent:{node_id}"),
-            "construct_graph_validator",
             refs,
             construct_graph_span_from(node),
         ));
@@ -10175,13 +10167,11 @@ fn construct_graph_validation_facts(
         let owner_node_id = json_str(port, "owner_node_id").unwrap_or("unknown");
         facts.push(construct_graph_fact(
             format!("validator.port.profile:{port_id}"),
-            "construct_graph_validator",
             construct_graph_port_profile_refs(port),
             construct_graph_span_from(port),
         ));
         facts.push(construct_graph_fact(
             format!("validator.port.owner_consistent:{port_id}"),
-            "construct_graph_validator",
             vec![port_id.to_owned(), owner_node_id.to_owned()],
             construct_graph_span_from(port),
         ));
@@ -10213,7 +10203,6 @@ fn construct_graph_validation_facts(
         ] {
             facts.push(construct_graph_fact(
                 format!("{predicate}:{edge_ref}"),
-                "construct_graph_validator",
                 refs.clone(),
                 construct_graph_empty_span(),
             ));
@@ -10237,7 +10226,6 @@ fn construct_graph_validation_facts(
         );
         facts.push(construct_graph_fact(
             format!("validator.cardinality.{cardinality}.satisfied:{port_id}"),
-            "construct_graph_validator",
             refs,
             construct_graph_span_from(port),
         ));
@@ -10261,7 +10249,6 @@ fn construct_graph_validation_facts(
         ] {
             facts.push(construct_graph_fact(
                 format!("{fact}:{dependency_ref}"),
-                "construct_graph_validator",
                 refs.clone(),
                 construct_graph_span_from(dependency),
             ));
@@ -10275,14 +10262,12 @@ fn construct_graph_validation_facts(
     accepted_refs.extend(dependency_refs);
     facts.push(construct_graph_fact(
         format!("validator.graph.accepted:{graph_id}"),
-        "construct_graph_validator",
         accepted_refs,
         construct_graph_empty_span(),
     ));
     for (fact_id, _) in CONSTRUCT_GRAPH_ADEQUACY_FACTS {
         facts.push(construct_graph_fact(
             format!("validator.graph.adequacy.{fact_id}:{graph_id}"),
-            "construct_graph_validator",
             construct_graph_adequacy_refs(graph, fact_id),
             construct_graph_empty_span(),
         ));
@@ -10535,13 +10520,12 @@ fn construct_graph_error_diagnostics(graph: &Value) -> Vec<Value> {
 
 fn construct_graph_fact(
     predicate: impl Into<String>,
-    owner_subsystem: impl Into<String>,
     input_refs: Vec<String>,
     diagnostic_span: Value,
 ) -> Value {
     json!({
         "predicate": predicate.into(),
-        "owner_subsystem": owner_subsystem.into(),
+        "owner_subsystem": "construct_graph_validator",
         "input_refs": canonical_input_refs(input_refs),
         "diagnostic_span": diagnostic_span,
     })
@@ -42344,10 +42328,10 @@ fn redact_cli_metadata(value: &str) -> String {
     value
         .split_whitespace()
         .map(|token| {
-            if token_has_secret_pattern(token) {
+            if contains_secret_token_pattern(token) {
                 "[REDACTED]".to_owned()
             } else if let Some((key, _)) = token.split_once('=') {
-                if key_is_sensitive(key) {
+                if is_sensitive_key(key) {
                     format!("{key}=[REDACTED]")
                 } else {
                     token.to_owned()
@@ -42358,37 +42342,6 @@ fn redact_cli_metadata(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn key_is_sensitive(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    [
-        "authorization",
-        "api_key",
-        "apikey",
-        "credential",
-        "password",
-        "secret",
-        "token",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
-}
-
-fn token_has_secret_pattern(token: &str) -> bool {
-    let token = token.trim_matches(|ch: char| {
-        matches!(ch, '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
-    });
-    token.contains("github_pat_")
-        || token
-            .find("sk-")
-            .is_some_and(|start| token[start..].len() >= 20)
-        || token
-            .find("ghp_")
-            .is_some_and(|start| token[start..].len() >= 20)
-        || token
-            .find("AKIA")
-            .is_some_and(|start| token[start..].len() >= 20)
 }
 
 fn evidence_link_to_json(link: &EvidenceLinkView) -> Value {

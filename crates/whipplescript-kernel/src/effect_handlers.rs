@@ -315,6 +315,24 @@ pub fn context_from_input_bindings(input: &Value) -> RuleContext {
 /// declares an `allow read/write [...]` list — the path must match one of the
 /// globs. An empty allow list means any path inside the root. Returns the
 /// failure reason, or `None` when the path is permitted.
+/// The write-mode policy shared by `write` and `export` (spec/files.md): no
+/// silent overwrite. `create` refuses a path that is already there and `replace`
+/// refuses one that is not, so an author who meant to add a file cannot quietly
+/// clobber one — and an unknown mode is refused rather than defaulted. `exists`
+/// is the store's answer for the resolved path.
+pub fn write_mode_policy(mode: &str, path: &str, exists: bool) -> Result<(), String> {
+    match mode {
+        "create" if exists => Err(format!(
+            "write mode `create` requires `{path}` to not already exist"
+        )),
+        "replace" if !exists => Err(format!(
+            "write mode `replace` requires `{path}` to already exist"
+        )),
+        "create" | "replace" | "upsert" | "append" => Ok(()),
+        other => Err(format!("unknown write mode `{other}`")),
+    }
+}
+
 pub fn file_path_policy_error(
     path: &str,
     store_name: &str,
@@ -449,7 +467,7 @@ pub fn run_file_effect_generic<S: RuntimeStore>(
     let terminal_key = idempotency_key(&[instance_id, &effect.effect_id, "terminal"]);
     let fact_key = idempotency_key(&[instance_id, &effect.effect_id, "file-fact"]);
     // The `file store` root + `allow read` policy is the scope boundary
-    // (spec/std-library/files.md), checked before any disk access.
+    // (spec/files.md), checked before any disk access.
     let allow = effect_allow_globs(&input);
     let read_outcome = match file_path_policy_error(path, store_name, &allow, "read")
         .or_else(|| files.path_policy_error(Path::new(root), Path::new(path), store_name, "read"))
@@ -575,18 +593,7 @@ pub fn run_file_write_effect_generic<S: RuntimeStore>(
         Err(reason)
     } else {
         let exists = files.exists(&full);
-        // Mode policy (spec/std-library/files.md): no silent overwrite.
-        let mode_ok = match mode.as_str() {
-            "create" if exists => Err(format!(
-                "write mode `create` requires `{path}` to not already exist"
-            )),
-            "replace" if !exists => Err(format!(
-                "write mode `replace` requires `{path}` to already exist"
-            )),
-            "create" | "replace" | "upsert" | "append" => Ok(()),
-            other => Err(format!("unknown write mode `{other}`")),
-        };
-        mode_ok.and_then(|()| {
+        write_mode_policy(&mode, path, exists).and_then(|()| {
             if let Some(parent) = full.parent() {
                 files
                     .create_dir_all(parent)
@@ -1128,20 +1135,7 @@ pub fn run_file_export_effect_generic<S: RuntimeStore>(
             }
         }
         let exists = files.exists(&full);
-        match mode.as_str() {
-            "create" if exists => {
-                return Err(format!(
-                    "write mode `create` requires `{path}` to not already exist"
-                ))
-            }
-            "replace" if !exists => {
-                return Err(format!(
-                    "write mode `replace` requires `{path}` to already exist"
-                ))
-            }
-            "create" | "replace" | "upsert" | "append" => {}
-            other => return Err(format!("unknown write mode `{other}`")),
-        }
+        write_mode_policy(&mode, path, exists)?;
         let serialized = encode_export_rows(&format, &rows, &fields)?;
         if let Some(parent) = full.parent() {
             files
@@ -3030,6 +3024,65 @@ pub fn run_capability_effect_generic<S: RuntimeStore>(
         }
     };
     Ok(terminal)
+}
+
+#[cfg(test)]
+mod write_mode_policy_tests {
+    use super::write_mode_policy;
+
+    /// `write_mode_policy` is the no-silent-overwrite refusal (spec/files.md:250:
+    /// "The mode is **required** — omitting it is a check error"). It is the only
+    /// thing standing between an author who meant `create` and a file they
+    /// silently clobbered.
+    ///
+    /// The `new-refusals` sweep found it unexercised: every path that reached it
+    /// in the whole workspace suite fed it a mode/exists pair it accepted, so
+    /// deleting either rejection changed nothing observable. These cases assert
+    /// each rejection by its message, and the accept cases keep them from passing
+    /// by refusing everything.
+    #[test]
+    fn create_refuses_a_path_that_is_already_there() {
+        assert_eq!(
+            write_mode_policy("create", "notes/a.txt", true),
+            Err("write mode `create` requires `notes/a.txt` to not already exist".to_owned())
+        );
+    }
+
+    #[test]
+    fn replace_refuses_a_path_that_is_not_there() {
+        assert_eq!(
+            write_mode_policy("replace", "notes/a.txt", false),
+            Err("write mode `replace` requires `notes/a.txt` to already exist".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_defaulted() {
+        assert_eq!(
+            write_mode_policy("clobber", "notes/a.txt", false),
+            Err("unknown write mode `clobber`".to_owned())
+        );
+    }
+
+    /// The accepting half. Without these a policy that refused everything would
+    /// pass the three cases above.
+    #[test]
+    fn every_mode_is_admitted_on_the_existence_it_declares() {
+        for (mode, exists) in [
+            ("create", false),
+            ("replace", true),
+            ("upsert", false),
+            ("upsert", true),
+            ("append", false),
+            ("append", true),
+        ] {
+            assert_eq!(
+                write_mode_policy(mode, "notes/a.txt", exists),
+                Ok(()),
+                "mode `{mode}` with exists={exists}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

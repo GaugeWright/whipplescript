@@ -2299,7 +2299,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             provider_effect_status(&ProviderRunStatus::Failed),
             summary,
-            Some("runtime.recovery_uncertain"),
+            "runtime.recovery_uncertain",
             &terminal_metadata,
             &provider_evidence,
         );
@@ -2376,11 +2376,11 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             execution.provider,
             coerce_effect_status(&result.status),
             &safe_summary,
-            Some(match result.status {
+            match result.status {
                 CoerceStatus::Succeeded => "schema.coerce.succeeded",
                 CoerceStatus::Failed => "schema.coerce.failed",
                 CoerceStatus::TimedOut => "schema.coerce.timed_out",
-            }),
+            },
             &metadata_json,
             &evidence,
         );
@@ -2726,7 +2726,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     execution.provider,
                     EffectStatus::Failed,
                     &summary,
-                    Some("native_provider_failed"),
+                    "native_provider_failed",
                     &metadata,
                     evidence,
                 );
@@ -2740,7 +2740,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
                     execution.provider,
                     EffectStatus::TimedOut,
                     &summary,
-                    Some("native_provider_timed_out"),
+                    "native_provider_timed_out",
                     &metadata,
                     evidence,
                 );
@@ -3126,7 +3126,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
         provider: &str,
         status: EffectStatus,
         summary: &str,
-        code: Option<&str>,
+        code: &str,
         diagnostics_json: &str,
         evidence: &ProviderEvidence,
     ) -> Option<TerminalDiagnosticRecord> {
@@ -3151,7 +3151,7 @@ impl<S: RuntimeStore> RuntimeKernel<S> {
             program_id: None,
             program_version_id: None,
             severity: Severity::Error,
-            code: code.map(str::to_owned),
+            code: Some(code.to_owned()),
             message,
             source_span_json,
             subject_type: Some("effect".to_owned()),
@@ -3696,7 +3696,10 @@ fn sanitized_provider_artifact_metadata(
     }
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+/// One secret-redaction vocabulary for both planes: the CLI's artifact-metadata
+/// scrubber shares this predicate so a needle cannot be added to one list and
+/// left leaking on the other.
+pub fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     [
         "authorization",
@@ -3767,7 +3770,10 @@ fn looks_like_secret_token(token: &str) -> bool {
         || (token.starts_with("AKIA") && token.len() >= 20)
 }
 
-fn contains_secret_token_pattern(token: &str) -> bool {
+/// Shared with the CLI's artifact-metadata scrubber for the same reason as
+/// [`is_sensitive_key`]. The prefix-anchored `looks_like_secret_token` stays
+/// private: only `redact_log_text` applies it.
+pub fn contains_secret_token_pattern(token: &str) -> bool {
     let token = token.trim_matches(|ch: char| {
         matches!(ch, '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
     });
@@ -4056,10 +4062,10 @@ fn provider_failure_from_json(value: &Value) -> Option<ProviderFailure> {
 fn provider_failure_code<'a>(
     failure: Option<&'a ProviderFailure>,
     fallback_status: &'static str,
-) -> Option<&'a str> {
+) -> &'a str {
     failure
         .map(|failure| failure.error_kind.as_str())
-        .or(Some(fallback_status))
+        .unwrap_or(fallback_status)
 }
 
 fn provider_effect_status(status: &ProviderRunStatus) -> EffectStatus {

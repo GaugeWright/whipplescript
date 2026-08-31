@@ -549,7 +549,7 @@ impl TurnCredentialAccess {
         // a wildcard. Treating it as "everything" would be the over-promise
         // that rule exists to prevent.
         let parsed = whipplescript_custody::egress::parse_scope(&entries.join(","))?;
-        if whipplescript_custody::egress::admits(&parsed, &target.clone()) {
+        if whipplescript_custody::egress::admits(&parsed, target) {
             return Ok(());
         }
         Err(format!(

@@ -9,8 +9,9 @@
 //! transport and resolved credentials (live calls are credential-gated).
 //!
 //! Slice-1 scope: OpenAI Responses and Anthropic Messages (non-streaming). The
-//! Codex OAuth SSE backend (function-call items over an event stream) is a
-//! follow-on; `coerce_native`'s `assemble_responses_sse` is the starting point.
+//! Codex OAuth SSE backend (function-call items over an event stream) rides the
+//! same seam: [`assemble_codex_responses_sse`] collapses its stream into a
+//! response-shaped value before the shared mapping runs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -1661,6 +1662,10 @@ pub fn assemble_codex_responses_sse(raw: &str) -> Value {
                     deltas.push_str(delta);
                 }
             }
+            // The codex backend's `response.completed` payload often carries an
+            // EMPTY `output[]`; the real items — function calls included — are
+            // delivered only as per-item `response.output_item.done` events.
+            // Collect them so a tool-calling turn survives assembly.
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
                     done_items.push(item.clone());

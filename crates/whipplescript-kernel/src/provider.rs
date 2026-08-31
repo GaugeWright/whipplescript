@@ -6,20 +6,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 // Provider-kind and adapter-surface identifiers. The registry is OPEN
-// (DR-0024, provider-crate split): the kernel names only its own builtins as
-// string constants here; external providers (codex, claude, and any third
-// party) live in their own crates, own their identifier strings, and register a
-// `ProviderCapability` into the effective catalog at the composition root. The
-// kernel therefore has zero compile-time knowledge of any external provider —
-// `provider_kind` / `surface` are opaque strings validated against whatever
-// capability set the host assembles, not a closed enum.
-pub const PROVIDER_FIXTURE: &str = "fixture";
-pub const PROVIDER_COMMAND: &str = "command";
+// (DR-0024, provider-crate split): the kernel names one of its own builtins as a
+// string constant here and compares the rest as inline literals; external
+// providers (codex, claude, and any third party) live in their own crates, own
+// their identifier strings, and register a `ProviderCapability` into the
+// effective catalog at the composition root. The kernel therefore has zero
+// compile-time knowledge of any external provider — `provider_kind` / `surface`
+// are opaque strings validated against whatever capability set the host
+// assembles, not a closed enum.
 pub const PROVIDER_SCHEMA_COERCE: &str = "schema_coercer";
-
-pub const SURFACE_FIXTURE: &str = "fixture";
-pub const SURFACE_COMMAND: &str = "command";
-pub const SURFACE_COERCE_HTTP: &str = "coerce_http";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CancellationDepth {

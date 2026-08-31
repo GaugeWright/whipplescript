@@ -2,11 +2,13 @@
 //! synchronous SQLite (`DoSql`), instead of native rusqlite. This is DR-0033
 //! Phase 5's core store binding.
 //!
-//! STATUS: **all 87 `RuntimeStore` methods are ported and verified against real
+//! STATUS: **every `RuntimeStore` method is ported and verified against real
 //! SQLite** — every method's SQL runs against an actual engine because the tests
-//! back `DoSql` with rusqlite. This covers the whole surface: the read/query
-//! family (`list_*`/`get_*`/`status`), registration + manifest fan-out, skills,
-//! inbox, evidence/diagnostic/artifact records, clock/time-obligation + dependency
+//! back `DoSql` with rusqlite. The count is deliberately not written down here;
+//! the compiler already refuses a partial impl, so a number could only drift.
+//! This covers the whole surface: the read/query family
+//! (`list_*`/`get_*`/`status`), registration + manifest fan-out, skills,
+//! evidence/diagnostic/artifact records, clock/time-obligation + dependency
 //! queries, leases, fact derivation + batch admission, program-version + revision
 //! management, the capability/profile policy + capacity engine (`claimable_effects`),
 //! the transactional write-path core (`commit_rule`(+guard), the `complete_effect`

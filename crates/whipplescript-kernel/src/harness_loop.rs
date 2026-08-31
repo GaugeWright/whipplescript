@@ -1933,8 +1933,6 @@ fn message_size_bytes(message: &ChatMessage) -> usize {
     chat_message_to_json(message).to_string().len()
 }
 
-/// How many times a single turn may front-trim on repeated context-window errors
-/// before giving up and failing (Lb-5 overflow fallback).
 /// Bound on transient-provider-error retries per turn (pi-conformance §2:
 /// pi's session auto-retry runs 3 attempts). The sans-IO machine re-issues the
 /// same request immediately — backoff delay, if any, belongs to the host.
@@ -1970,6 +1968,8 @@ fn is_retryable_provider_error(error: &HarnessModelError) -> bool {
     }
 }
 
+/// How many times a single turn may front-trim on repeated context-window errors
+/// before giving up and failing (Lb-5 overflow fallback).
 const MAX_OVERFLOW_TRIMS: u32 = 3;
 
 /// Whether a model error is a provider context-window overflow (the prompt is too

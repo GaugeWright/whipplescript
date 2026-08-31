@@ -30,7 +30,7 @@ pub fn format_program(source: &str) -> FormatOutput {
 /// top-level **leading** comments (a `# …` or `// …` line above a declaration, or
 /// a file-header block) and **trailing** comments on a single-line top-level
 /// declaration (`workflow Demo  # …`, attached to that element's line); comments
-/// inside raw-body declarations (`rule`/`apply`/`coerce`/`table`/`flow`, carried by
+/// inside raw-body declarations (`rule`/`apply`/`coerce`/`table`, carried by
 /// the body substring); and comments inside `class`/`agent`/`enum` bodies, including a
 /// data-carrying `enum` variant's nested field block — both own-line (interleaved
 /// by source position) and trailing comments on a field/variant line (appended to

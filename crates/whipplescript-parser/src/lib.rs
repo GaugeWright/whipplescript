@@ -116,7 +116,6 @@ pub struct Program {
     pub workflow: Option<Ident>,
     pub workflow_tags: Vec<TagDecl>,
     pub workflow_description: Option<StringLiteral>,
-    pub explicit_workflow_body: bool,
     pub workflows: Vec<WorkflowDecl>,
     pub patterns: Vec<PatternDecl>,
     pub items: Vec<Item>,
@@ -343,7 +342,6 @@ pub struct MarkDecl {
     /// The committing site the cut rides: a rule name (dotted for
     /// flow-generated segments).
     pub site: String,
-    pub site_span: SourceSpan,
     pub span: SourceSpan,
 }
 
@@ -362,7 +360,6 @@ pub struct GaugeDecl {
     /// forward-compat with site-scoped judging); ambient scoring judges the
     /// run's terminal view.
     pub site: Option<String>,
-    pub site_span: Option<SourceSpan>,
     pub judge: GaugeJudge,
     pub expect: Option<GaugeBar>,
     /// Derived gauges: other gauges whose scores feed this gauge's exec
@@ -634,7 +631,7 @@ pub struct ClassField {
     pub name: Ident,
     pub ty: TypeSyntax,
     /// `@key`: this field is the class's natural key (used for import per-row
-    /// idempotency, spec/std-library/files.md). At most one per class in v0.
+    /// idempotency, spec/files.md). At most one per class in v0.
     pub is_key: bool,
     /// Family B (discriminant-string schemas): `<field> <Type> when <disc> == "<lit>"`
     /// — this field is present only when the literal-union discriminant field `disc`
@@ -3269,7 +3266,6 @@ fn select_root_workflow(
         workflow: Some(selected.name),
         workflow_tags,
         workflow_description,
-        explicit_workflow_body: true,
         workflows: Vec::new(),
         patterns: program.patterns,
         items,
@@ -17349,7 +17345,7 @@ fn push_ingest_fact_writes(statements: &[body::BodyStmt], fact_writes: &mut Vec<
                         fact_writes.push(format!("schema:{}", parse.schema));
                     }
                     // `import <fmt> <Schema>` admits one `<Schema>` fact per row
-                    // (spec/std-library/files.md), so a `when <Schema>` rule has a
+                    // (spec/files.md), so a `when <Schema>` rule has a
                     // producer for liveness/effect-graph analysis.
                     body::BodyEffectKind::FileImport { schema, .. } => {
                         fact_writes.push(format!("schema:{schema}"));

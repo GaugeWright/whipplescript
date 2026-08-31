@@ -13,7 +13,8 @@
 //! "combined claim/status write" cure): a plain `claim` appends only a
 //! `claim.acquired` event and changes readiness through a lease OVERLAY, not a
 //! durable `in_progress` write. Durable issue status is only `open` / `closed`
-//! / `canceled`; `in_progress` is purely the active-lease overlay.
+//! / `canceled`; `in_progress` is purely the active-lease overlay, and `ready`
+//! is a derived predicate (open, unblocked, unleased).
 //!
 //! The three invariant models under `models/maude/` are the spec this storage
 //! realizes: exclusivity + expiry + holder-only renew + terminal-release
@@ -36,11 +37,6 @@ use serde_json::Value;
 #[cfg(feature = "native")]
 use crate::StoreError;
 use crate::StoreResult;
-
-/// Core status categories. Durable status is one of `open` / `closed` /
-/// `canceled`; `in_progress` is the active-lease overlay, never a durable
-/// write, and `ready` is a derived predicate (open, unblocked, unleased).
-pub const ITEM_STATUSES: &[&str] = &["open", "in_progress", "closed", "canceled", "archived"];
 
 /// The active-lease predicate, shared by every readiness/overlay query: a lease
 /// is active while it has not been released and has not expired. A NULL

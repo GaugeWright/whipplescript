@@ -425,7 +425,7 @@ table tasks as Task [
     let _ = fs::remove_file(source_path);
 }
 
-/// std.files `read` (spec/std-library/files.md): a `file store` declaration
+/// std.files `read` (spec/files.md): a `file store` declaration
 /// scopes a root directory; `read text from <store> at <path>` settles to a
 /// `file.read.completed` fact carrying the file content, which `after <binding>
 /// succeeds` reacts to. Exercises the full vertical: parse -> lower -> claim ->
@@ -1445,7 +1445,7 @@ rule record_deploy
     let _ = fs::remove_file(tampered);
 }
 
-/// std.files `write` (spec/std-library/files.md): `write text to <store> at
+/// std.files `write` (spec/files.md): `write text to <store> at
 /// <path> { body <expr> mode <mode> }` renders a body to disk through the real
 /// worker, settling `file.write.completed`. The mode is enforced ("no silent
 /// overwrite"): `create` on an existing file is an ordinary failure routed to
@@ -2004,7 +2004,7 @@ rule pick
     let _ = fs::remove_dir_all(root);
 }
 
-/// std.files `import jsonl` (spec/std-library/files.md): decode a structured file
+/// std.files `import jsonl` (spec/files.md): decode a structured file
 /// into typed `<Schema>` facts via the fact-batch admission primitive — each row
 /// becomes a fact that `when <Schema>` rules fan out over. The admission is
 /// all-or-nothing: a row missing a required field fails the effect and admits no

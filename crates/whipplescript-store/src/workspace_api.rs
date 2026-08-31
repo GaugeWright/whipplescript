@@ -365,10 +365,6 @@ fn refused(reason: String) -> WorkspaceOpOutcome {
     WorkspaceOpOutcome::Refused { reason }
 }
 
-/// `BranchStatus` is re-exported so protocol consumers can decode the
-/// status strings in `BranchRow` without a second import path.
-pub use crate::branches::BranchStatus as WorkspaceBranchStatus;
-
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;

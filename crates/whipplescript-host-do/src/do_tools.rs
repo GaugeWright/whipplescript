@@ -506,7 +506,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     /// given path, or all keys when none is given. Sorted, capped.
     fn ls(&self, args: &Value) -> Result<String, String> {
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(Some(&admitted));
+        let prefix = directory_prefix(&admitted);
         let limit = usize_arg(args, "limit").unwrap_or(500);
         let mut entries = BTreeSet::new();
         for key in self.all_keys()? {
@@ -537,7 +537,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     fn find(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(Some(&admitted));
+        let prefix = directory_prefix(&admitted);
         let limit = usize_arg(args, "limit").unwrap_or(1000);
         let mut hits: Vec<String> = self
             .all_keys()?
@@ -560,7 +560,7 @@ impl<Sql: DoSql> DoToolExecutor<Sql> {
     fn grep(&self, args: &Value) -> Result<String, String> {
         let pattern = str_arg(args, "pattern")?;
         let admitted = self.path_access(optional_str_arg(args, "path").unwrap_or("."), false)?;
-        let prefix = directory_prefix(Some(&admitted));
+        let prefix = directory_prefix(&admitted);
         let ignore_case = args
             .get("ignoreCase")
             .and_then(Value::as_bool)
@@ -831,8 +831,8 @@ fn path_is_within(path: &str, root: &str) -> bool {
 
 /// Convert an optional directory argument into an unambiguous flat-key prefix.
 /// The trailing slash prevents `references` from also selecting `references2`.
-fn directory_prefix(path: Option<&str>) -> String {
-    let path = path.unwrap_or(".").trim();
+fn directory_prefix(path: &str) -> String {
+    let path = path.trim();
     if path.is_empty() || path == "." {
         String::new()
     } else {
