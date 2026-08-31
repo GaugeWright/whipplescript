@@ -708,6 +708,91 @@ fn deploy_command(options: &CliOptions) -> ExitCode {
 /// retires for that deployment. Harness-managed lifecycle is the follow-up, and
 /// it is a lifecycle question — when to start, when to stop, what a crashed
 /// proxy does to a turn — rather than more of this.
+/// Start this turn's credential proxy for `family`, if the operator asked for
+/// one.
+///
+/// Opting in names a CREDENTIAL —
+/// `WHIPPLESCRIPT_CREDENTIAL_PROXY_ANTHROPIC_CREDENTIAL` — rather than a URL,
+/// because the URL is whip's to choose: the listener binds an ephemeral
+/// loopback port that does not exist until the turn starts. The operator says
+/// which credential the sidecar may spend; whip says where.
+///
+/// Naming nothing keeps the documented concession: the sidecar inherits its own
+/// family's key, exactly as before. That is the ONLY path that still inherits —
+/// a turn that asked for a proxy and could not have one is refused rather than
+/// quietly demoted to it.
+///
+/// The older `WHIPPLESCRIPT_CREDENTIAL_PROXY_<FAMILY>` variable, carrying a URL
+/// for a proxy the operator runs themselves, still works and is read by the
+/// provider crate. Both exist because they answer different questions: that one
+/// is "point at the proxy I am running", this one is "run one for me".
+fn turn_credential_proxy(
+    family: &str,
+) -> Result<Option<crate::credential_proxy::TurnProxy>, String> {
+    let upper = family.to_uppercase();
+    let Ok(name) = env::var(format!("WHIPPLESCRIPT_CREDENTIAL_PROXY_{upper}_CREDENTIAL")) else {
+        return Ok(None);
+    };
+    let credential = whipplescript_custody::CredentialName::new(&name)
+        .map_err(|error| format!("WHIPPLESCRIPT_CREDENTIAL_PROXY_{upper}_CREDENTIAL: {error}"))?;
+    let upstream = proxy_upstream_for(family)?;
+    let binding = crate::credential_proxy::ProxyBinding {
+        upstream: upstream.to_owned(),
+        credential,
+        form: whipplescript_custody::PresentationForm::Bearer,
+    };
+    // Minted here and never printed: the token exists so that other processes
+    // on this box — one of which runs the model's own tool loop — cannot spend
+    // the credential through a port they can all reach.
+    let token = proxy_turn_token();
+    crate::credential_proxy::TurnProxy::start(binding, token)
+        .map(Some)
+        .map_err(|error| format!("could not start this turn's credential proxy: {error}"))
+}
+
+/// The origin a family's sidecar is proxied to.
+///
+/// A separate function from `turn_credential_proxy` because that one reads the
+/// environment before reaching here, so this refusal was reachable only by
+/// setting a variable mid-suite — which races every other test in the binary.
+/// Which origin a family uses is a decision, and it needs no environment to
+/// make.
+///
+/// Deliberately a closed match rather than an operator-supplied URL: the point
+/// of the proxy is that the sidecar cannot choose where the credential is
+/// spent, and reading the destination from the same environment the sidecar can
+/// influence would hand that choice back.
+fn proxy_upstream_for(family: &str) -> Result<&'static str, String> {
+    match family {
+        "anthropic" => Ok("https://api.anthropic.com"),
+        other => Err(format!(
+            "no credential proxy upstream is known for `{other}`"
+        )),
+    }
+}
+
+/// A fresh proxy token for one turn.
+fn proxy_turn_token() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_le_bytes())
+            .unwrap_or_default(),
+    );
+    // The address of a fresh allocation, so two turns starting in the same
+    // nanosecond in the same process still differ.
+    let anchor = Box::new(0u8);
+    hasher.update((Box::as_ref(&anchor) as *const u8 as usize).to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// What `whip credential-proxy` was asked to do, or why the request makes no
 /// sense.
 ///
@@ -21030,7 +21115,42 @@ fn run_agent_effect(
                 provider_selection.provider_config.as_ref(),
                 agent_settings.as_deref(),
             )?;
-            let mut adapter = match claude_agent_sdk_adapter(&provider_selection.provider_id) {
+            // The proxy is bound to THIS turn: the adapter and its sidecar
+            // are built here and dropped when the turn returns, so the
+            // listener's lifetime is the same scope rather than a cleanup step
+            // an early return can skip. `_turn_proxy` is held, not dropped —
+            // binding it to `_` would stop the listener before the sidecar it
+            // was started for had made a single call.
+            let _turn_proxy = match turn_credential_proxy("anthropic") {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    return kernel.block_effect_binding(
+                        instance_id,
+                        &effect.effect_id,
+                        "provider_health",
+                        &error,
+                    );
+                }
+            };
+            // A proxy that was asked for and cannot serve BLOCKS the turn. The
+            // alternative is to spawn the sidecar with its own key, which would
+            // make the property hold on every day it was not tested.
+            let proxy_base_url = match _turn_proxy.as_ref().map(|proxy| proxy.base_url()) {
+                Some(Ok(url)) => Some(url.to_owned()),
+                Some(Err(reason)) => {
+                    return kernel.block_effect_binding(
+                        instance_id,
+                        &effect.effect_id,
+                        "provider_health",
+                        &reason,
+                    );
+                }
+                None => None,
+            };
+            let mut adapter = match claude_agent_sdk_adapter(
+                &provider_selection.provider_id,
+                proxy_base_url.as_deref(),
+            ) {
                 Ok(healthy_adapter) => healthy_adapter,
                 Err(error) => {
                     return kernel.block_effect_binding(
@@ -21694,6 +21814,7 @@ fn default_claude_sidecar_path() -> Option<std::path::PathBuf> {
 #[cfg(feature = "claude")]
 fn claude_agent_sdk_adapter(
     provider: &str,
+    proxy_base_url: Option<&str>,
 ) -> Result<ClaudeAgentSdkAdapter<StdioClaudeAgentSdkTransport>, StoreError> {
     // The default sidecar must NOT be resolved against the current working
     // directory: running whip inside a hostile repo that ships its own
@@ -21715,12 +21836,16 @@ fn claude_agent_sdk_adapter(
     let command =
         env::var("WHIPPLESCRIPT_CLAUDE_AGENT_SDK_COMMAND").unwrap_or_else(|_| "node".to_owned());
     let sidecar_arg = sidecar.to_string_lossy().into_owned();
-    let transport = StdioClaudeAgentSdkTransport::spawn(&command, &[sidecar_arg.as_str()])
-        .map_err(|error| {
-            StoreError::Conflict(format!(
-                "failed to launch Claude Agent SDK sidecar: {error:?}"
-            ))
-        })?;
+    let transport = StdioClaudeAgentSdkTransport::spawn_routed(
+        &command,
+        &[sidecar_arg.as_str()],
+        proxy_base_url,
+    )
+    .map_err(|error| {
+        StoreError::Conflict(format!(
+            "failed to launch Claude Agent SDK sidecar: {error:?}"
+        ))
+    })?;
     let capability = whipplescript_provider_claude::capability();
     let mut client = ClaudeAgentSdkClient::new(transport);
     // Version exchange (DR-0035 Decision 7): a sidecar that ANSWERS with a

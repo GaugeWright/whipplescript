@@ -622,3 +622,287 @@ mod tests {
         assert_eq!(request.body_b64, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Turn lifecycle
+// ---------------------------------------------------------------------------
+
+/// A proxy whip runs for the duration of ONE turn.
+///
+/// The tracker left three questions when the proxy itself landed, and they are
+/// answered here rather than left to an operator's shell.
+///
+/// **Minted per turn, never shared.** The token is the only thing standing
+/// between this listener and every other process on the box — loopback is not
+/// an authorization boundary, and one of the processes on that box is the
+/// model's own tool loop. A token that outlived its turn would be a standing
+/// capability to spend the credential; one that dies with the turn is a
+/// capability bounded by the work it was minted for. Sharing across turns
+/// would buy a few milliseconds of setup and pay for it in blast radius.
+///
+/// **Started lazily and stopped on drop.** A turn that never spawns a sidecar
+/// never opens a socket. Dropping the handle stops the listener, so the
+/// lifetime is the scope rather than a cleanup step someone can forget on an
+/// early return.
+///
+/// **A proxy that cannot serve fails the turn.** See `base_url`.
+pub struct TurnProxy {
+    base_url: String,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    serving: Option<std::thread::JoinHandle<()>>,
+    port: u16,
+}
+
+impl TurnProxy {
+    /// Bind a listener on an ephemeral loopback port and start serving.
+    ///
+    /// `127.0.0.1` explicitly, never `0.0.0.0`: this is reachable by design
+    /// only from the box whip runs on, and binding a wildcard would put a
+    /// credential-spending endpoint on the network for the sake of a default.
+    pub fn start(binding: ProxyBinding, token: String) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stopping);
+        let serving = std::thread::spawn(move || {
+            serve_until_stopped(listener, binding, token, &flag);
+        });
+        Ok(Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            stopping,
+            serving: Some(serving),
+            port,
+        })
+    }
+
+    /// The base URL to hand a sidecar, or an error if the proxy is not serving.
+    ///
+    /// **This is the trap the tracker named.** The tempting failure behaviour
+    /// is to fall back to the inherited key so the turn keeps running. That
+    /// would make the guarantee conditional on nothing having gone wrong — the
+    /// property would hold on every day it was not tested and lapse silently on
+    /// the day it mattered, with no record that it had. So a dead proxy is an
+    /// error the caller must handle, and the caller's only correct handling is
+    /// to fail the turn.
+    ///
+    /// The distinction that survives: a turn that asks for NO proxy still
+    /// inherits the key, which is the documented concession and unchanged. A
+    /// turn that asked for one and cannot have it does not quietly become that
+    /// turn.
+    pub fn base_url(&self) -> Result<&str, String> {
+        if !self.is_live() {
+            return Err(format!(
+                "the credential proxy for this turn is not serving on port {} — refusing to spawn \
+                 a sidecar with its own key instead, because that would silently drop the \
+                 property the proxy exists to provide",
+                self.port
+            ));
+        }
+        Ok(&self.base_url)
+    }
+
+    /// Whether the serving thread is still up.
+    ///
+    /// A panicked thread is indistinguishable from a stopped one here, and
+    /// deliberately so: both mean nothing is answering, and the answer to
+    /// "nothing is answering" is the same either way.
+    pub fn is_live(&self) -> bool {
+        !self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .serving
+                .as_ref()
+                .map(|handle| !handle.is_finished())
+                .unwrap_or(false)
+    }
+
+    fn stop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.serving.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for TurnProxy {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// How long the accept loop sleeps between polls when no connection is waiting.
+///
+/// A non-blocking accept with a short sleep, rather than a blocking accept woken
+/// by a self-connection: the wake-up trick needs the shutdown path to make a
+/// TCP connection to itself, which fails in exactly the circumstances shutdown
+/// matters. This costs one wake per interval on an idle turn and cannot wedge.
+const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+fn serve_until_stopped(
+    listener: TcpListener,
+    binding: ProxyBinding,
+    token: String,
+    stopping: &std::sync::atomic::AtomicBool,
+) {
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if live.load(std::sync::atomic::Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    continue;
+                }
+                live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let binding = binding.clone();
+                let token = token.clone();
+                let live = std::sync::Arc::clone(&live);
+                std::thread::spawn(move || {
+                    // Blocking reads inside the handler, so the connection is
+                    // served the same way the long-running server serves it.
+                    let _ = stream.set_nonblocking(false);
+                    let _ = handle(stream, &binding, &token);
+                    live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_lifecycle_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn binding() -> ProxyBinding {
+        ProxyBinding {
+            upstream: "https://api.anthropic.com".to_owned(),
+            credential: CredentialName::new("providers/anthropic").expect("name"),
+            form: PresentationForm::Bearer,
+        }
+    }
+
+    #[test]
+    fn a_turn_proxy_listens_on_loopback_only() {
+        let proxy = TurnProxy::start(binding(), "tok".to_owned()).expect("starts");
+        let url = proxy
+            .base_url()
+            .expect("a fresh proxy is serving")
+            .to_owned();
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "a credential-spending endpoint must not be bound to a wildcard: {url}"
+        );
+        // It really accepts: binding a port is not the same as serving one.
+        let port: u16 = url.rsplit(':').next().expect("port").parse().expect("u16");
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("the proxy accepts");
+    }
+
+    #[test]
+    fn stopping_the_turn_stops_the_listener() {
+        let port = {
+            let proxy = TurnProxy::start(binding(), "tok".to_owned()).expect("starts");
+            let url = proxy.base_url().expect("serving").to_owned();
+            url.rsplit(':')
+                .next()
+                .expect("port")
+                .parse::<u16>()
+                .expect("u16")
+            // dropped here: the turn is over
+        };
+        // The socket is released with the turn rather than left for the next
+        // one. Retried briefly because the close is another thread's work.
+        let mut refused = false;
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(refused, "the listener outlived the turn that minted it");
+    }
+
+    #[test]
+    fn a_dead_proxy_refuses_instead_of_letting_the_turn_continue() {
+        // THE trap. A fallback to the inherited key here would make the
+        // property hold on every day it was not tested and lapse on the day it
+        // mattered, with no record that it had.
+        let mut proxy = TurnProxy::start(binding(), "tok".to_owned()).expect("starts");
+        proxy.stop();
+        let error = proxy
+            .base_url()
+            .expect_err("a stopped proxy must not hand out a base URL");
+        assert!(
+            error.contains("refusing to spawn"),
+            "the refusal must say what it is protecting: {error}"
+        );
+        assert!(!proxy.is_live());
+    }
+
+    #[test]
+    fn a_family_with_no_known_upstream_is_refused() {
+        // The proxy exists so the sidecar cannot choose where the credential is
+        // spent. A family whose origin nobody decided has no safe default, and
+        // guessing one would spend a credential at an address no one chose.
+        let error = crate::proxy_upstream_for("wolfram")
+            .expect_err("an unknown family has no upstream to proxy to");
+        assert_eq!(error, "no credential proxy upstream is known for `wolfram`");
+
+        // The control: the family that IS known resolves, so the refusal is
+        // about the family rather than about the function refusing everything.
+        assert_eq!(
+            crate::proxy_upstream_for("anthropic"),
+            Ok("https://api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn two_turns_get_different_tokens() {
+        // The token is what stops every other process on the box from spending
+        // the credential; reusing one across turns would make it a standing
+        // capability rather than one bounded by the work it was minted for.
+        let first = crate::proxy_turn_token();
+        let second = crate::proxy_turn_token();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64, "a full sha256, not a truncated one");
+    }
+
+    #[test]
+    fn each_turn_gets_its_own_port_so_a_token_cannot_outlive_its_turn() {
+        let first = TurnProxy::start(binding(), "tok-1".to_owned()).expect("starts");
+        let second = TurnProxy::start(binding(), "tok-2".to_owned()).expect("starts");
+        assert_ne!(
+            first.base_url().expect("serving"),
+            second.base_url().expect("serving"),
+            "two turns sharing a listener would share a token"
+        );
+    }
+
+    #[test]
+    fn a_request_without_the_turns_token_is_refused_by_the_running_proxy() {
+        // End to end through the real listener: authentication is not something
+        // the translation layer does on its own behalf, it is what stops every
+        // other process on this box from spending the credential.
+        let proxy = TurnProxy::start(binding(), "the-turn-token".to_owned()).expect("starts");
+        let url = proxy.base_url().expect("serving").to_owned();
+        let port: u16 = url.rsplit(':').next().expect("port").parse().expect("u16");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .write_all(b"GET /v1/messages HTTP/1.1\r\nhost: x\r\nx-whip-proxy-token: wrong\r\n\r\n")
+            .expect("writes");
+        let mut response = String::new();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        use std::io::Read;
+        let _ = stream.read_to_string(&mut response);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "an unauthorized peer must be turned away: {response}"
+        );
+    }
+}

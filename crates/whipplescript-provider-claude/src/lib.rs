@@ -1022,6 +1022,25 @@ pub struct StdioClaudeAgentSdkTransport {
 
 impl StdioClaudeAgentSdkTransport {
     pub fn spawn(command: &str, args: &[&str]) -> Result<Self, ClaudeAgentSdkError> {
+        Self::spawn_routed(command, args, None)
+    }
+
+    /// Spawn with the proxy chosen by the CALLER rather than read from the
+    /// environment.
+    ///
+    /// A harness-managed proxy lives for one turn and binds an ephemeral port,
+    /// so its URL cannot be an environment variable: whip's environment is
+    /// process-global and turns are not. The caller that owns the proxy passes
+    /// the URL it got from it.
+    ///
+    /// `None` keeps the operator-managed path exactly as it was — the env var
+    /// below — and with neither, the sidecar inherits its own family's key,
+    /// which is the documented concession.
+    pub fn spawn_routed(
+        command: &str,
+        args: &[&str],
+        proxy_base_url: Option<&str>,
+    ) -> Result<Self, ClaudeAgentSdkError> {
         let mut builder = Command::new(command);
         builder
             .args(args)
@@ -1034,7 +1053,10 @@ impl StdioClaudeAgentSdkTransport {
         // `CONTROL_PLANE_SECRET_ENV` documents. With no proxy the key stays
         // inherited: stripping it while pointing nowhere would turn a
         // documented concession into a broken spawn.
-        if let Ok(proxy) = std::env::var("WHIPPLESCRIPT_CREDENTIAL_PROXY_ANTHROPIC") {
+        let proxy = proxy_base_url
+            .map(str::to_owned)
+            .or_else(|| std::env::var("WHIPPLESCRIPT_CREDENTIAL_PROXY_ANTHROPIC").ok());
+        if let Some(proxy) = proxy {
             whipplescript_kernel::harness::route_sidecar_through_proxy(
                 &mut builder,
                 "ANTHROPIC_BASE_URL",
