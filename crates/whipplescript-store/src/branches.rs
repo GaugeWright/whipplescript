@@ -340,6 +340,20 @@ impl ConflictRow {
     }
 }
 
+/// What a holder's closure pin is doing (DR-0068 §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClosurePinState {
+    /// The lease is current: the closure is held and the run may proceed.
+    Held { expires_at: String },
+    /// The lease ran out while the pin was still recorded. The run must be
+    /// refused rather than silently continued or silently re-fetched.
+    Lapsed { expired_at: String },
+    /// No pin for this `(cut, holder)`. Either it was released — a finished run
+    /// — or one was never taken. Distinct from `Lapsed`, which is a claim that
+    /// existed and ran out.
+    Absent,
+}
+
 /// Object-safe branch-tier seam, mirroring `Coordination`/`WorkItems`: the
 /// DO host supplies its own implementation over `DoSql`.
 pub trait Branches {
@@ -444,6 +458,36 @@ pub trait Branches {
     /// # Errors
     /// Propagates store failures.
     fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>>;
+
+    /// DR-0068 §5: what happened to one holder's pin — held, lapsed, or gone.
+    ///
+    /// **Why a holder can ask at all.** [`Branches::pinned_cuts`] applies expiry
+    /// and returns what is still held, which is the right answer for a
+    /// collector and no answer at all for the run whose lease ran out: the pin
+    /// simply stops being in the set, so a run cannot tell "my lease lapsed"
+    /// from "I never had one". DR-0068 §5 says the honest resolution is
+    /// "refusal on resume, not silent re-fetch", and a refusal needs something
+    /// to refuse on.
+    ///
+    /// `models/tla/PinnedResolution.tla` had no expiry action at all until
+    /// 2026-08-30, so it proved `NamedCutIsPinned` of a mechanism that holds a
+    /// pin forever while this one holds it for a lease. Adding expiry falsified
+    /// that invariant in two steps. The model's repair is that a lapse is
+    /// RECORDED and the run stops; this is the recording.
+    ///
+    /// `Lapsed` and `Absent` are deliberately distinct. A released pin is a
+    /// finished run and its row is gone; a lapsed pin is a run that must be
+    /// refused. Collapsing them would re-create the silent third state the
+    /// model rules out.
+    ///
+    /// # Errors
+    /// Propagates store failures.
+    fn closure_pin_state(
+        &self,
+        cut_id: &str,
+        holder: &str,
+        now: &str,
+    ) -> StoreResult<ClosurePinState>;
 
     /// DR-0068 §2: record the log half of a cut — every in-scope instance's
     /// `(sequence, head_digest)` at the moment it was taken.
@@ -1192,6 +1236,27 @@ impl Branches for BranchStore {
         Ok(released)
     }
 
+    fn closure_pin_state(
+        &self,
+        cut_id: &str,
+        holder: &str,
+        now: &str,
+    ) -> StoreResult<ClosurePinState> {
+        let expires_at: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT expires_at FROM closure_pins WHERE cut_id = ?1 AND holder = ?2",
+                params![cut_id, holder],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match expires_at {
+            None => ClosurePinState::Absent,
+            Some(expires_at) if expires_at.as_str() > now => ClosurePinState::Held { expires_at },
+            Some(expired_at) => ClosurePinState::Lapsed { expired_at },
+        })
+    }
+
     fn pinned_cuts(&self, now: &str) -> StoreResult<BTreeSet<String>> {
         let mut statement = self
             .connection
@@ -1826,6 +1891,62 @@ mod tests {
     /// DR-0068 §5: a pin holds until it expires, and expiry is applied at read
     /// time rather than by a sweeper — a pin nobody swept must not read as
     /// still held.
+    /// DR-0068 §5: a lapsed pin and an absent one are different answers.
+    ///
+    /// `pinned_cuts` applies expiry and returns what is still held — the right
+    /// answer for a collector, and no answer at all for the run whose lease ran
+    /// out, which cannot tell "my lease lapsed" from "I never had one". The
+    /// refusal the record asks for needs something to refuse on.
+    ///
+    /// `models/tla/PinnedResolution.tla` had no expiry action until 2026-08-30,
+    /// so it proved `NamedCutIsPinned` of a mechanism holding a pin forever
+    /// while this one holds it for a lease; adding expiry falsified that
+    /// invariant in two steps. The model's repair is that a lapse is RECORDED
+    /// and the run stops. This is the recording.
+    #[test]
+    fn a_lapsed_pin_is_distinguishable_from_one_that_was_never_taken() {
+        let mut store = store();
+        store
+            .pin_closure("cut_1", "run-a", "2026-08-24T12:00:00Z")
+            .expect("pin");
+
+        assert_eq!(
+            store
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T11:59:59Z")
+                .expect("state"),
+            ClosurePinState::Held {
+                expires_at: "2026-08-24T12:00:00Z".to_owned()
+            }
+        );
+        assert_eq!(
+            store
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T12:00:01Z")
+                .expect("state"),
+            ClosurePinState::Lapsed {
+                expired_at: "2026-08-24T12:00:00Z".to_owned()
+            },
+            "a run past its lease must be told its pin lapsed, not that it never had one"
+        );
+        assert_eq!(
+            store
+                .closure_pin_state("cut_1", "someone-else", "2026-08-24T11:59:59Z")
+                .expect("state"),
+            ClosurePinState::Absent,
+            "a pin belongs to its holder"
+        );
+
+        // A RELEASED pin is absent, not lapsed: a finished run made no claim
+        // that ran out. Collapsing the two would re-create the silent state the
+        // model rules out.
+        store.release_closure_pins("run-a").expect("release");
+        assert_eq!(
+            store
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T11:59:59Z")
+                .expect("state"),
+            ClosurePinState::Absent
+        );
+    }
+
     #[test]
     fn a_pin_holds_until_it_expires() {
         let mut store = store();

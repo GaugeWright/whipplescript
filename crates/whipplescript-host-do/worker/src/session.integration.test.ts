@@ -737,10 +737,32 @@ describe("real WorkflowInstance hibernation", () => {
     };
     socket.send(JSON.stringify(compact));
     socket.send(JSON.stringify(compact));
-    // Let the hibernatable-socket handler durably enqueue both deliveries
-    // before the blocked provider round is released. The runtime boundary is
-    // the behavior under test, not a race between two test callbacks.
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // The hibernatable-socket handler must have durably enqueued the delivery
+    // before the blocked provider round is released: that boundary is the
+    // behaviour under test, not a race between two test callbacks.
+    //
+    // Waited on the object's OWN row rather than on a wall-clock margin. The
+    // previous `setTimeout(…, 25)` was a guess that held on a developer machine
+    // and failed on a loaded CI runner, where the queue had not been written
+    // when the round was released, so no `turn_command_applied` ever arrived and
+    // the assertion below saw an empty list. Shortening the margin to 0
+    // reproduces that failure exactly, which is what identifies it as the
+    // mechanism.
+    //
+    // The duplicate delivery needs no ordering guarantee of its own: the insert
+    // is `ON CONFLICT(command_id) DO NOTHING`, so the second send is deduped at
+    // the table whenever it lands. One row is the whole precondition.
+    await vi.waitFor(async () => {
+      const queued = await runInDurableObject(stub, async (_instance, state) =>
+        state.storage.sql
+          .exec(
+            "SELECT command_id FROM public_compaction_commands WHERE command_id = ?1",
+            "compact-1",
+          )
+          .toArray(),
+      );
+      expect(queued).toHaveLength(1);
+    });
     releaseFirst();
 
     const observed: Record<string, unknown>[] = [];

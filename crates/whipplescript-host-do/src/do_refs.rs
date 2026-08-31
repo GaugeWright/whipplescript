@@ -202,6 +202,44 @@ mod tests {
         );
     }
 
+    /// DR-0068 §5 parity: this host must distinguish a LAPSED pin from an
+    /// absent one too, or the refusal-on-lapse the model requires exists on one
+    /// host and not the other.
+    #[test]
+    fn a_lapsed_pin_is_distinguishable_from_an_absent_one_on_this_host_too() {
+        use whipplescript_store::branches::{Branches, ClosurePinState};
+
+        let mut branches =
+            crate::do_branches::DoBranches::new(RusqliteDoSql::in_memory()).expect("branches open");
+        branches
+            .pin_closure("cut_1", "run-a", "2026-08-24T12:00:00Z")
+            .expect("pin");
+
+        assert_eq!(
+            branches
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T11:59:59Z")
+                .expect("state"),
+            ClosurePinState::Held {
+                expires_at: "2026-08-24T12:00:00Z".to_owned()
+            }
+        );
+        assert_eq!(
+            branches
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T12:00:01Z")
+                .expect("state"),
+            ClosurePinState::Lapsed {
+                expired_at: "2026-08-24T12:00:00Z".to_owned()
+            }
+        );
+        branches.release_closure_pins("run-a").expect("release");
+        assert_eq!(
+            branches
+                .closure_pin_state("cut_1", "run-a", "2026-08-24T11:59:59Z")
+                .expect("state"),
+            ClosurePinState::Absent
+        );
+    }
+
     fn head(
         instance: &str,
         sequence: i64,

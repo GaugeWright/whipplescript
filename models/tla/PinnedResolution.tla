@@ -50,9 +50,19 @@ VARIABLES
   pinned,
   \* Cut ids whose closure has been reclaimed.
   \* @type: Set(Int);
-  collected
+  collected,
+  \* Cut ids whose pin LAPSED — the lease ran out while the cut was still
+  \* named. Recorded rather than merely un-pinned, and that distinction is the
+  \* whole repair: see `ExpirePin`.
+  \* @type: Set(Int);
+  lapsed,
+  \* Runners currently executing. A runner enters when it resolves and LEAVES
+  \* when its lease lapses — the refusal DR-0068 §5 asks for, modeled as the
+  \* thing it actually is: the run stops.
+  \* @type: Set(Str);
+  running
 
-vars == << ref, triggerCut, resolved, pinned, collected >>
+vars == << ref, triggerCut, resolved, pinned, collected, lapsed, running >>
 
 TypeOK ==
   /\ ref \in 0..MaxCut
@@ -60,6 +70,8 @@ TypeOK ==
   /\ resolved \in [Runners -> 0..MaxCut]
   /\ pinned \subseteq 0..MaxCut
   /\ collected \subseteq 0..MaxCut
+  /\ lapsed \subseteq 0..MaxCut
+  /\ running \subseteq Runners
 
 Init ==
   /\ ref = 1
@@ -67,13 +79,15 @@ Init ==
   /\ resolved = [r \in Runners |-> 0]
   /\ pinned = {}
   /\ collected = {}
+  /\ lapsed = {}
+  /\ running = {}
 
 \* Mainline moves. Perfectly legitimate, and precisely what makes late
 \* resolution dangerous: nothing about this step is a fault.
 AdvanceRef ==
   /\ ref < MaxCut
   /\ ref' = ref + 1
-  /\ UNCHANGED << triggerCut, resolved, pinned, collected >>
+  /\ UNCHANGED << triggerCut, resolved, pinned, collected, lapsed, running >>
 
 \* Dispatch resolves the ref ONCE, stamps the cut id into the trigger, AND takes
 \* the pin in the same step. After this the run names an immutable object and
@@ -91,15 +105,17 @@ FireTrigger ==
   /\ triggerCut = 0
   /\ triggerCut' = ref
   /\ pinned' = pinned \cup {ref}                       \* PIN AT DISPATCH
-  /\ UNCHANGED << ref, resolved, collected >>
+  /\ UNCHANGED << ref, resolved, collected, lapsed, running >>
 
 \* A runner takes its cut FROM THE TRIGGER. It does not consult the ref, which
 \* is the whole of DR-0068 §1.
 Resolve(r) ==
   /\ triggerCut # 0
+  /\ triggerCut \notin lapsed                          \* REFUSE A LAPSED CUT
   /\ resolved[r] = 0
   /\ resolved' = [resolved EXCEPT ![r] = triggerCut]   \* RESOLVE FROM THE TRIGGER
-  /\ UNCHANGED << ref, triggerCut, pinned, collected >>
+  /\ running' = running \cup {r}
+  /\ UNCHANGED << ref, triggerCut, pinned, collected, lapsed >>
 
 \* Reclamation. Two guards, because two different things make a cut reachable:
 \* a run holding it, and the mutable name still pointing at it. DR-0066's fifth
@@ -113,13 +129,30 @@ Collect(c) ==
   /\ c \notin pinned                                   \* COLLECT ONLY UNPINNED
   /\ c < ref                                           \* EXISTS, AND NOT THE LIVE REF
   /\ collected' = collected \cup {c}
-  /\ UNCHANGED << ref, triggerCut, resolved, pinned >>
+  /\ UNCHANGED << ref, triggerCut, resolved, pinned, lapsed, running >>
+
+\* A pin LAPSES. This is not a fault injected to see what breaks: `branches.rs`
+\* implements pins with an `expires_at`, and `pinned_cuts(now)` silently drops
+\* the expired ones from the collector's root set. The model had no such action,
+\* so every invariant below was proved of a mechanism that holds a pin forever
+\* while the shipped mechanism holds it for a lease.
+\*
+\* DR-0068 §5 recorded that divergence on 2026-08-25 and said the resolution is
+\* "refusal on resume, not silent re-fetch". This is the model finding out
+\* whether that is enough.
+ExpirePin(c) ==
+  /\ c \in pinned
+  /\ pinned' = pinned \ {c}
+  /\ lapsed' = lapsed \cup {c}                         \* RECORDED, NOT SILENT
+  /\ running' = running \ {r \in Runners : resolved[r] = c}  \* AND THE RUN STOPS
+  /\ UNCHANGED << ref, triggerCut, resolved, collected >>
 
 Next ==
   \/ AdvanceRef
   \/ FireTrigger
   \/ \E r \in Runners : Resolve(r)
   \/ \E c \in 1..MaxCut : Collect(c)
+  \/ \E c \in 1..MaxCut : ExpirePin(c)
 
 \* Every runner fired by one trigger resolved the SAME cut. This is the whole
 \* claim of DR-0068 §1, and it is why a trigger carries a cut id rather than a
@@ -128,29 +161,47 @@ RunnersFiredTogetherAgree ==
   \A r1 \in Runners : \A r2 \in Runners :
     (resolved[r1] # 0 /\ resolved[r2] # 0) => (resolved[r1] = resolved[r2])
 
-\* No runner's inputs were reclaimed out from under it. A run that started valid
-\* stays valid.
-NoPinnedCutCollected ==
-  \A r \in Runners : (resolved[r] # 0) => (resolved[r] \notin collected)
+\* `NoPinnedCutCollected` and `ResolvedImpliesPinned` stood here until
+\* 2026-08-30 and are GONE rather than weakened, because both said "a run that
+\* started valid stays valid" — which a lease-based pin does not provide, and
+\* which this model could only prove because it had no expiry. Their honest
+\* successors are below. Recorded rather than silently dropped: an invariant
+\* that disappears from a model is a claim someone may still believe.
 
-\* A resolved runner always holds its pin, so the two guards above compose
-\* rather than merely coexisting. With the pin taken at dispatch this is what
-\* rules out the window: there is no state in which a cut has been named by a
-\* trigger and is not yet held.
-ResolvedImpliesPinned ==
-  \A r \in Runners : (resolved[r] # 0) => (resolved[r] \in pinned)
+\* The honest replacement for `NamedCutIsPinned`, which a lease cannot satisfy.
+\*
+\* A named cut is held, OR its lease visibly lapsed. What is ruled out is the
+\* silent third state — unheld, with nothing recording that it ever was held —
+\* because that is the state in which a run cannot be told to stop. A pin that
+\* merely disappears at expiry leaves exactly that state.
+NamedCutIsHeldOrVisiblyLapsed ==
+  (triggerCut # 0) => (triggerCut \in pinned \/ triggerCut \in lapsed)
 
-\* The stronger form of the same claim, and the one that actually closes the
-\* gap: a NAMED cut is held, whether or not any runner has picked it up yet.
-NamedCutIsPinned ==
-  (triggerCut # 0) => (triggerCut \in pinned)
+\* **The load-bearing one.** A RUNNING runner's cut is held, always. Not "was
+\* held when it started" — held now.
+\*
+\* This is what both guards exist for, and it fails without either of them: let
+\* `Resolve` take a lapsed cut and a runner starts on a closure nothing holds;
+\* let `ExpirePin` drop the pin without stopping the run and a live run
+\* continues over one. Weaker than the old `ResolvedImpliesPinned` in exactly
+\* the right place — it says nothing about a runner that has already been
+\* stopped, which is what a lease permits.
+NoRunnerRunsOnAnUnheldCut ==
+  \A r \in running : resolved[r] \in pinned
+
+\* And therefore no running runner's inputs were reclaimed under it. Follows
+\* from the above and `Collect`'s pinned guard, and is stated because it is the
+\* property DR-0068 §5 is about; deriving it silently would leave a reader to
+\* work out whether it still holds.
+NoRunningRunnerLostItsWorld ==
+  \A r \in running : resolved[r] \notin collected
 
 SafetyInvariants ==
   /\ TypeOK
   /\ RunnersFiredTogetherAgree
-  /\ NoPinnedCutCollected
-  /\ ResolvedImpliesPinned
-  /\ NamedCutIsPinned
+  /\ NoRunnerRunsOnAnUnheldCut
+  /\ NoRunningRunnerLostItsWorld
+  /\ NamedCutIsHeldOrVisiblyLapsed
 
 ConstInit ==
   /\ Runners = {"r1", "r2"}

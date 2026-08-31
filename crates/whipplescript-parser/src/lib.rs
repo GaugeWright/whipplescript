@@ -10114,24 +10114,12 @@ fn analyze_rule(
                 validate_binding_name(rule, &alias, rule.body.span, diagnostics);
             }
             match parse_after_line(line) {
+                // The unknown-binding half is `validate_after_bindings`, over the
+                // parsed body: this scanner cannot see an effect that shares a
+                // line with the block enclosing it, and reported a binding
+                // unknown that was defined one line above. The predicate half
+                // stays here — an unsupported predicate does not reach the AST.
                 Some((binding, predicate)) => {
-                    if !seen_bindings.contains(&binding) {
-                        let suggestion = if misplaced_effect_bindings.contains(&binding) {
-                            format!(
-                                "move `as {binding}` onto the effect line before the multiline string"
-                            )
-                        } else {
-                            format!("create an effect with `as {binding}` before the `after` block")
-                        };
-                        diagnostics.push(Diagnostic { related: Vec::new(),
-                            span: rule.body.span,
-                            message: format!(
-                                "rule `{}` has `after` block for unknown effect binding `{binding}`",
-                                rule.name.name
-                            ),
-                            suggestion: Some(suggestion),
-                        });
-                    }
                     block_stack.push(BlockFrame::After { binding, predicate });
                 }
                 None => {
@@ -10243,6 +10231,16 @@ fn analyze_rule(
         &mut metadata.fact_consumes,
     );
     validate_recorded_schemas(rule, &body_ast.statements, semantic, diagnostics);
+    // After the scan, because the misplaced-binding set it consults is built
+    // during it: the suggestion changes when a binding was written after a
+    // multiline string delimiter.
+    validate_after_bindings(
+        rule,
+        &body_ast.statements,
+        &misplaced_effect_bindings,
+        &mut BTreeSet::new(),
+        diagnostics,
+    );
 
     metadata.fact_reads.sort();
     metadata.fact_reads.dedup();
@@ -10303,6 +10301,26 @@ fn analyze_rule(
             &effect_payload_types,
             diagnostics,
         );
+        // The arm's RECORDS, for the same reason and from the same text. The
+        // splice that hides the arm from the body pass hid it from the write set
+        // too, and the write set is what makes a `record` a governed IFC sink:
+        // an arm recording confidential data into an unlabelled fact drew ZERO
+        // violations while the identical record in the region BODY was denied.
+        // It also left a rule matching what only the arm produces reading as
+        // "can never fire: nothing produces `<X>`".
+        //
+        // WholeBody scope only, deliberately. `OwnCommit` means "lands in the
+        // same commit as the trigger", and the lapse commit is paced by the
+        // condition breaking — a world event — so the arm is never that.
+        let (arm_ast, _) = body::parse_rule_body(&region.arm_content, 0);
+        collect_record_and_consume_facts(
+            &arm_ast.statements,
+            &binding_types,
+            RecordScope::WholeBody,
+            &mut metadata.fact_writes,
+            &mut metadata.fact_consumes,
+        );
+        validate_recorded_schemas(rule, &arm_ast.statements, semantic, diagnostics);
     }
     collect_terminal_complete_bindings(&body_ast.statements, &mut metadata.terminal_completes);
     metadata.terminal_completes.sort();
@@ -12547,6 +12565,73 @@ fn is_ast_only_effect_kind(kind: &body::BodyEffectKind) -> bool {
 /// Bindings introduced by AST-only effect kinds are unknown to the
 /// line-based scanner; seed them so sequence checks and `after` blocks see
 /// them. Binding types for typed outputs are registered where known.
+/// Every `after <binding>` names an effect the body already introduced.
+///
+/// The refusal is USE-BEFORE-DEFINITION, not merely "unknown", so the walk keeps
+/// document order and grows one flat set as it goes — the same shape the line
+/// scanner maintained, and the reason a binding introduced inside one `case` arm
+/// stays visible to a later arm exactly as it did before.
+///
+/// It walks the parsed body because the scanner could not see an effect that
+/// shares a line with the block enclosing it. `after a completes { tell worker
+/// "b" as b` followed by `after b completes { … }` reported `b` unknown while
+/// defining it one line above — a refusal firing on a correct program, which is
+/// the fail-closed twin of the escapes fixed in #301 and #308.
+fn validate_after_bindings(
+    rule: &RuleDecl,
+    statements: &[body::BodyStmt],
+    misplaced: &BTreeSet<String>,
+    defined: &mut BTreeSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            body::BodyStmt::Effect(effect) => {
+                if let Some(binding) = &effect.binding {
+                    defined.insert(binding.clone());
+                }
+            }
+            body::BodyStmt::After(after) => {
+                if !defined.contains(&after.binding) {
+                    let binding = &after.binding;
+                    let suggestion = if misplaced.contains(binding) {
+                        format!(
+                            "move `as {binding}` onto the effect line before the multiline string"
+                        )
+                    } else {
+                        format!("create an effect with `as {binding}` before the `after` block")
+                    };
+                    diagnostics.push(Diagnostic {
+                        related: Vec::new(),
+                        span: rule.body.span,
+                        message: format!(
+                            "rule `{}` has `after` block for unknown effect binding `{binding}`",
+                            rule.name.name
+                        ),
+                        suggestion: Some(suggestion),
+                    });
+                }
+                // An `after … as <alias>` introduces the alias for the block's
+                // own statements, and the scanner treated it as a binding too.
+                if let Some(alias) = &after.alias {
+                    defined.insert(alias.clone());
+                }
+                validate_after_bindings(rule, &after.body, misplaced, defined, diagnostics);
+            }
+            body::BodyStmt::Case(case) => {
+                for branch in &case.branches {
+                    validate_after_bindings(rule, &branch.body, misplaced, defined, diagnostics);
+                }
+            }
+            body::BodyStmt::Region(region) => {
+                validate_after_bindings(rule, &region.body, misplaced, defined, diagnostics);
+                validate_after_bindings(rule, &region.lapse_body, misplaced, defined, diagnostics);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn seed_ast_only_effect_bindings(
     statements: &[body::BodyStmt],
     seen_bindings: &mut BTreeSet<String>,

@@ -5791,6 +5791,92 @@ rule work
         );
     }
 
+    /// The same sink could also hide in an `on lapse` arm.
+    ///
+    /// `extract_rule_regions` makes the canonical rule body the HOLDS variant —
+    /// the region replaced by its BODY — so the arm survives only as
+    /// `IrRegion::arm_content`, and one pass read it back. The write set was not
+    /// that pass, so a `record` in an arm was no sink at all: confidential data
+    /// into an unlabelled fact drew zero violations, while the identical record
+    /// in the region body was denied.
+    #[test]
+    fn a_record_in_an_on_lapse_arm_is_a_governed_sink_too() {
+        let program = |body: &str, arm: &str| {
+            format!(
+                r#"@service
+workflow LapseSink
+
+output result R
+failure error Halted
+class R {{ ok bool }}
+class Halted {{ reason string }}
+class Ticket {{ id string  status "open" }}
+class Incident {{ sev string }}
+class Leaked {{ blob string }}
+
+file store ledger {{ root "./ledger"  allow read ["**"] }}
+
+table seed as Ticket [ {{ id "T1"  status "open" }} ]
+
+rule triage
+  when Ticket as ticket
+=> {{
+  read text from ledger at "customer.json" as rec
+  after rec succeeds as customer {{
+    until exists(Incident where sev == "sev1") {{
+      timer 1s as t
+      after t completes {{
+{body}
+      }}
+    }} on lapse as got {{
+{arm}
+      fail error {{ reason "x" }}
+    }}
+  }}
+}}
+"#
+            )
+        };
+        let envelope = || {
+            Envelope::from_json(r#"{ "resources": { "ledger": { "confidential": true } } }"#)
+                .expect("valid envelope")
+        };
+        let denied = |source: &str, label: &str| {
+            let compiled = compile_program(source);
+            let ir = compiled.ir.unwrap_or_else(|| {
+                panic!(
+                    "{label} fixture should compile, diagnostics: {:?}",
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .map(|d| &d.message)
+                        .collect::<Vec<_>>()
+                )
+            });
+            let diagnostics = check_with_envelope(&ir, &VerifiedEnvelope::for_test(envelope()));
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("denied flow in rule")
+                        && d.message.contains("fact:Leaked")),
+                "{label}: expected the record sink to be governed, got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        };
+
+        denied(
+            &program("        record Leaked { blob customer.content }", "      "),
+            "in the region body",
+        );
+        denied(
+            &program(
+                "        complete result { ok true }",
+                "      record Leaked { blob customer.content }",
+            ),
+            "in the on-lapse arm",
+        );
+    }
+
     /// `record` is a governed sink (`fact:<Schema>`), and until 2026-08-30 a
     /// record could hide from the checker behind a line break.
     ///

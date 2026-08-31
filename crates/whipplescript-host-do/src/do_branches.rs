@@ -17,9 +17,9 @@
 use std::collections::BTreeSet;
 
 use whipplescript_store::branches::{
-    AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ConflictRow, CreateBranch,
-    CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome, StatusOutcome,
-    MAINLINE_BRANCH_ID,
+    AdvanceOutcome, BindOutcome, BranchRow, BranchStatus, Branches, ClosurePinState, ConflictRow,
+    CreateBranch, CreateBranchOutcome, CutRecord, CutRow, OpBranchDelta, OpRow, RetargetOutcome,
+    StatusOutcome, MAINLINE_BRANCH_ID,
 };
 use whipplescript_store::content::{BlobStatus, ContentBlobs, EraseOutcome};
 use whipplescript_store::event_chain;
@@ -640,6 +640,33 @@ impl<S: DoSql> Branches for DoBranches<S> {
             )
             .map_err(sql_err)?;
         Ok(rows.iter().map(|row| as_text(&row[0])).collect())
+    }
+
+    /// Native parity for DR-0068 §5's refusal-on-lapse. See the trait.
+    fn closure_pin_state(
+        &self,
+        cut_id: &str,
+        holder: &str,
+        now: &str,
+    ) -> StoreResult<ClosurePinState> {
+        let rows = self
+            .sql
+            .query(
+                "SELECT expires_at FROM closure_pins WHERE cut_id = ?1 AND holder = ?2",
+                &[text(cut_id), text(holder)],
+            )
+            .map_err(sql_err)?;
+        let Some(row) = rows.first() else {
+            return Ok(ClosurePinState::Absent);
+        };
+        let expires_at = as_text(&row[0]);
+        Ok(if expires_at.as_str() > now {
+            ClosurePinState::Held { expires_at }
+        } else {
+            ClosurePinState::Lapsed {
+                expired_at: expires_at,
+            }
+        })
     }
 
     fn attach_cut_log_heads(

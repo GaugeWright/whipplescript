@@ -9914,6 +9914,149 @@ fn rejects_effectful_self_trigger_loop() {
         .contains("preserves trigger fact `schema:WorkItem`"));
 }
 
+/// A record in an `on lapse` arm produces its fact like any other.
+///
+/// `extract_rule_regions` rewrites the rule body to the HOLDS variant — the
+/// region replaced by its BODY — so the arm lives only in `IrRegion::arm_content`
+/// and one pass read it back. The write set was not that pass, so a rule matching
+/// what only the arm produces read as "can never fire", and (worse, in ifc.rs) an
+/// arm record was no governed sink at all.
+#[test]
+fn a_record_in_an_on_lapse_arm_produces_its_fact() {
+    let source = r#"
+workflow LapseWrites
+
+output result Done
+failure error Halted
+class Done { ok bool }
+class Halted { reason string }
+class Incident { sev string }
+class FromLapse { b string }
+
+rule ship
+  when started
+=> {
+  until exists(Incident where sev == "sev1") {
+    timer 1s as t
+    after t completes {
+      complete result { ok true }
+    }
+  } on lapse as got {
+    record FromLapse { b "lapsed" }
+    fail error { reason "halted" }
+  }
+}
+
+rule observe
+  when FromLapse as f
+=> {
+  complete result { ok true }
+}
+"#;
+    let compiled = compile_program(source);
+    assert!(
+        compiled.diagnostics.is_empty(),
+        "the arm's producer must satisfy the consumer: {:?}",
+        compiled.diagnostics
+    );
+    let ir = compiled.ir.expect("ir");
+    let ship = ir
+        .rules
+        .iter()
+        .find(|rule| rule.name == "ship")
+        .expect("ship");
+    assert!(
+        ship.metadata
+            .fact_writes
+            .contains(&"schema:FromLapse".to_owned()),
+        "the arm's record is a write: {:?}",
+        ship.metadata.fact_writes
+    );
+    // But not an OWN-COMMIT write: the lapse commit is paced by the condition
+    // breaking, which is a world event, never the trigger's own commit.
+    assert!(
+        !ship
+            .metadata
+            .immediate_fact_writes
+            .contains(&"schema:FromLapse".to_owned()),
+        "the arm is world-paced: {:?}",
+        ship.metadata.immediate_fact_writes
+    );
+}
+
+/// The fail-closed twin of the inline escapes: a REFUSAL firing on a correct
+/// program. The line scanner could not see an effect sharing a line with the
+/// block that encloses it, so `after a completes { tell worker "b" as b` followed
+/// by `after b …` reported `b` unknown while defining it one line above.
+///
+/// The property that must survive the move is that this is a
+/// USE-BEFORE-DEFINITION refusal, not merely an "unknown name" one — so the walk
+/// keeps document order, and both negative cases below still bite.
+#[test]
+fn an_after_binding_defined_inline_is_not_unknown() {
+    let program = |body: &str| {
+        format!(
+            r#"
+workflow AfterBindings
+
+output result Done
+class Done {{ ok bool }}
+class Job {{ id string }}
+
+agent worker {{
+  provider fixture
+  profile "repo-writer"
+  capacity 1
+}}
+
+table seed as Job [ {{ id "J1" }} ]
+
+rule go
+  when Job as j
+=> {{
+{body}
+}}
+"#
+        )
+    };
+    let unknown_binding = |compiled: &CompileOutput| {
+        compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unknown effect binding"))
+    };
+
+    // The effect is introduced on the same line as the block that encloses it.
+    let inline = compile_program(&program(
+        "  tell worker \"a\" as a\n  after a completes { tell worker \"b\" as b\n    after b completes { complete result { ok true } } }",
+    ));
+    assert!(
+        !unknown_binding(&inline),
+        "a binding defined inline is defined: {:?}",
+        inline.diagnostics
+    );
+
+    // Use before definition stays refused: the set grows in document order.
+    let before = compile_program(&program(
+        "  after b completes {\n    complete result { ok true }\n  }\n  tell worker \"b\" as b",
+    ));
+    assert!(
+        unknown_binding(&before),
+        "use-before-definition must still be refused: {:?}",
+        before.diagnostics
+    );
+
+    // A name no effect ever introduces stays refused.
+    let ghost = compile_program(&program(
+        "  tell worker \"a\" as a\n  after ghost completes {\n    complete result { ok true }\n  }",
+    ));
+    assert!(
+        unknown_binding(&ghost),
+        "an unknown binding must still be refused: {:?}",
+        ghost.diagnostics
+    );
+}
+
 /// A terminal written inside the block that opens on its own line escaped every
 /// check the workflow contract has. `validate_workflow_terminal_actions` scanned
 /// for `complete `/`fail ` at the start of a TRIMMED LINE, so
