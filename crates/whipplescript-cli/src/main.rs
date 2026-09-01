@@ -128,6 +128,7 @@ mod exec_server;
 mod harness_tools;
 mod improve;
 mod injected_secrets;
+mod instance_view;
 mod lsp_server;
 mod maude_model;
 mod mcp_cli;
@@ -250,6 +251,7 @@ fn main() -> ExitCode {
         Some("log") => log(&options),
         Some("facts") => facts(&options),
         Some("effects") => effects(&options),
+        Some("view") => view(&options),
         Some("progressions") => progressions(&options),
         Some("progression") => progression_command(&options),
         Some("runs") => runs(&options),
@@ -1100,6 +1102,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "log" => "usage: whip log <instance>",
         "facts" => "usage: whip facts <instance>",
         "effects" => "usage: whip effects <instance>",
+        "view" => "usage: whip [--json] view <instance>\n  the instance view model: each firing's effects joined to the program structure the\n  version stores, including the static effects a firing never REQUESTED (a `case` arm\n  not taken), which the event log cannot distinguish from an arm that does not exist.\n  Carries identifiers, statuses and reasons only — never fact values or effect input",
         "progressions" => "usage: whip progressions <instance>",
         "progression" => "usage: whip progression cancel <instance> <firing-id> [--reason <text>]",
         "runs" => "usage: whip runs <instance>",
@@ -31154,6 +31157,125 @@ fn facts(options: &CliOptions) -> ExitCode {
         }
         ExitCode::SUCCESS
     }
+}
+
+/// `whip view <instance>` — the instance view model
+/// (spec/instance-view-model-research-note.md).
+///
+/// Joins the program structure a version stores under its `ir_hash` to the
+/// instance's runtime state, per firing. The line worth reading is the absent
+/// one: a static effect with no runtime row, which `whip log` and `whip effects`
+/// cannot show because a path never requested leaves nothing behind.
+fn view(options: &CliOptions) -> ExitCode {
+    let Some(instance_id) = single_arg(options, "usage: whip [--json] view <instance>") else {
+        return ExitCode::from(2);
+    };
+    let store = match open_store_or_exit(options) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let instance = match store.get_instance(instance_id) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            eprintln!("instance {instance_id} does not exist");
+            return ExitCode::from(1);
+        }
+        Err(error) => return report_store_error("failed to load instance", error),
+    };
+    let version = match store.get_program_version(&instance.version_id) {
+        Ok(version) => version,
+        Err(error) => return report_store_error("failed to load program version", error),
+    };
+    let ir_hash = version.map(|version| version.ir_hash).unwrap_or_default();
+    // The snapshot rides under the version's own `ir_hash` (the view-model
+    // note's G1), so there is no second pointer to follow.
+    let snapshot = match store.get_content(&ir_hash) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return report_store_error("failed to load the program snapshot", error),
+    };
+    let events = match store.list_events(instance_id) {
+        Ok(events) => events,
+        Err(error) => return report_store_error("failed to load events", error),
+    };
+    let effects = match store.list_effects(instance_id) {
+        Ok(effects) => effects,
+        Err(error) => return report_store_error("failed to load effects", error),
+    };
+    let runs = match store.list_runs(instance_id) {
+        Ok(runs) => runs,
+        Err(error) => return report_store_error("failed to load runs", error),
+    };
+
+    let view = instance_view::project(
+        &instance,
+        &ir_hash,
+        snapshot.as_deref(),
+        &events,
+        &effects,
+        &runs,
+    );
+
+    if options.json {
+        return emit_json(view);
+    }
+
+    println!(
+        "{} {} version={} epoch={}",
+        instance.instance_id, instance.status, instance.version_id, instance.revision_epoch
+    );
+    if view["structure"]["available"] == serde_json::Value::Bool(false) {
+        println!(
+            "  structure unavailable: {}",
+            view["structure"]["reason"].as_str().unwrap_or("unknown")
+        );
+    }
+    for firing in view["firings"].as_array().into_iter().flatten() {
+        let commits = firing["commits"].as_array().map(Vec::len).unwrap_or(0);
+        println!(
+            "\n  {} [{}] {} commit{}",
+            firing["rule"].as_str().unwrap_or("?"),
+            firing["identity"].as_str().unwrap_or("?"),
+            commits,
+            if commits == 1 { "" } else { "s" }
+        );
+        for slot in firing["effects"].as_array().into_iter().flatten() {
+            let node = slot["node"].as_str().unwrap_or("?");
+            let kind = slot["kind"].as_str().unwrap_or("?");
+            let arm = slot["arm"]
+                .as_str()
+                .map(|arm| format!(" after {arm}"))
+                .unwrap_or_default();
+            if slot["absent"] == serde_json::Value::Bool(true) {
+                // Not a status: there is no row. That distinction is the view.
+                println!("    {node:<14} {kind:<18} not requested{arm}");
+            } else {
+                let reason = slot["block_reason"]
+                    .as_str()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default();
+                println!(
+                    "    {node:<14} {kind:<18} {}{reason}{arm}",
+                    slot["status"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+    let absent = view["absent_total"].as_u64().unwrap_or(0);
+    println!("\n  {absent} static effect(s) never requested");
+    let unattributed = view["unattributed_effects"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    if unattributed > 0 {
+        // Loud on purpose: the absences above are not trustworthy.
+        println!(
+            "  WARNING: {unattributed} effect(s) this instance created match no static node.\n\
+               The view is keyed differently than the run was (a branched or restored\n\
+               instance, or a snapshot that does not describe this version), so the\n\
+               \"not requested\" lines above cannot be relied on."
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn effects(options: &CliOptions) -> ExitCode {

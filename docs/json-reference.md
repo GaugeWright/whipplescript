@@ -219,6 +219,47 @@ The `whip --json trace <instance> --check` command needs these fields:
 
 ## Inspection Shapes
 
+### Instance View
+
+The `whip --json view <instance>` command returns the instance view model: the
+program's static structure joined to this instance's runtime state, per firing.
+
+```json
+{
+  "schema": "whipplescript.instance_view.v0",
+  "instance": {"instance_id": "ins_...", "status": "running", "program_version_id": "ver_...", "revision_epoch": 0, "ir_hash": "..."},
+  "structure": {"available": true, "workflow": "...", "rules": [], "rule_edges": []},
+  "firings": [],
+  "absent_total": 0,
+  "unattributed_effects": []
+}
+```
+
+A **firing** is keyed by `identity`, not by an event: one firing emits a
+`rule.committed` per `after` continuation, all sharing that identity, so its
+`commits` array usually holds several.
+
+Each entry in a firing's `effects` is a **static** effect of the rule. One that
+ran carries `effect_id`, `status`, `block_reason`, `block_category` and `runs`.
+One that did not carries `"absent": true` and the `predicted_effect_id` it would
+have had. That distinction is the reason this command exists: a `case` arm never
+requested leaves no record at all, so the event log cannot tell it apart from an
+arm that does not exist in the program.
+
+`unattributed_effects` is the view's own self-check. It lists effects the
+instance created that no static node accounts for, which means the projection is
+keyed differently than the run was — a branched or restored instance, or a
+snapshot that does not describe this version. **When it is non-empty the
+`absent` entries cannot be relied on**, and the human-readable output says so.
+
+`structure.available` is `false` when no `.ir` snapshot is stored under the
+version's `ir_hash`. Absence is not computable then, and firings carry no
+effect entries rather than an invented set.
+
+The view carries identifiers, statuses, reasons and spans only. Fact values,
+effect inputs and turn outputs never cross it.
+
+
 ### Event
 
 ```json
