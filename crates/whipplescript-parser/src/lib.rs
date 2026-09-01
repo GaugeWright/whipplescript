@@ -2270,7 +2270,7 @@ pub struct IrEffectNode {
     pub id: String,
     pub kind: IrEffectKind,
     pub binding: Option<String>,
-    /// DR-0088: the innermost enclosing `after` arm, as
+    /// DR-0090: the innermost enclosing `after` arm, as
     /// `(binding, arm predicate)`, or `None` for an effect at the rule's top
     /// level.
     ///
@@ -2684,7 +2684,7 @@ enum BlockFrame {
     After {
         binding: String,
         predicate: DependencyPredicate,
-        /// DR-0088: the arm predicate in the effect key's spelling.
+        /// DR-0090: the arm predicate in the effect key's spelling.
         arm: String,
     },
 }
@@ -2696,7 +2696,7 @@ enum LiteralExpr<'a> {
     Bool,
     Null,
     Ident(&'a str),
-    /// `<integer><unit>`, as its whole number of seconds (DR-0088 §1).
+    /// `<integer><unit>`, as its whole number of seconds (DR-0087 §1).
     Duration(i64),
 }
 
@@ -2779,7 +2779,7 @@ pub enum ExprLiteral {
     Bool(bool),
     Null,
     Ident(String),
-    /// A `<integer><unit>` literal as its whole number of seconds (DR-0088 §1).
+    /// A `<integer><unit>` literal as its whole number of seconds (DR-0087 §1).
     /// It renders canonically wherever it is written down, so the value and its
     /// stored form cannot disagree.
     Duration(i64),
@@ -2893,7 +2893,7 @@ impl ExprLiteral {
             Self::Bool(value) => value.to_string(),
             Self::Null => "null".to_owned(),
             // The canonical spelling, so a snapshot shows the value rather than
-            // the way it happened to be typed (DR-0088 §2).
+            // the way it happened to be typed (DR-0087 §2).
             Self::Duration(seconds) => canonical_duration(*seconds),
         }
     }
@@ -4522,7 +4522,7 @@ impl IrProgram {
                         } else {
                             format!(" skills={}", effect.turn_skills.join(","))
                         };
-                        // DR-0088: the arm this effect sits in, appended only
+                        // DR-0090: the arm this effect sits in, appended only
                         // when there is one, so a top-level effect keeps its
                         // existing snapshot shape.
                         let arm = effect
@@ -15370,7 +15370,7 @@ fn walk_effects(
                     // metadata only.
                     body::AfterPredicate::Reaches => DependencyPredicate::Completes,
                 };
-                // DR-0088: the arm the key is built from, alongside the
+                // DR-0090: the arm the key is built from, alongside the
                 // completion-shaped dependency predicate.
                 let arm = match (&after.predicate, &after.milestone) {
                     (body::AfterPredicate::Reaches, Some(name)) => format!("reaches:{name}"),
@@ -17032,7 +17032,7 @@ fn infer_binary_type(
             ExprType::Bool
         }
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-            // DR-0088 §3: a duration is a length. Two lengths add and subtract,
+            // DR-0087 §3: a duration is a length. Two lengths add and subtract,
             // and a length scales by a count; anything else — dividing one, or
             // adding a number to one — is unit confusion the record rules out.
             match (op, &left_ty, &right_ty) {
@@ -25003,7 +25003,7 @@ fn parse_literal_expr(expr: &str) -> Option<LiteralExpr<'_>> {
     }
     // `30s` in a table row or a record body is the same literal the expression
     // lexer reads, so a seed and a computed value cannot disagree about what a
-    // duration is (DR-0088 §1).
+    // duration is (DR-0087 §1).
     if let Some(unit) = expr.chars().last() {
         if matches!(unit, 's' | 'm' | 'h' | 'd') {
             let digits = &expr[..expr.len() - unit.len_utf8()];
@@ -25050,7 +25050,7 @@ enum ExprTokenKind {
     String(String),
     Number(String),
     /// `<integer><unit>` with units `s`, `m`, `h`, `d` (spec/time.md), as its
-    /// whole number of seconds (DR-0088 §1).
+    /// whole number of seconds (DR-0087 §1).
     Duration(i64),
     Symbol(char),
     Op(&'static str),
@@ -25281,7 +25281,7 @@ impl<'a> ExprParser<'a> {
                 // only welds WHOLE digits to a unit. Saying so beats the generic
                 // parse error a stranded `s` would otherwise produce: a duration
                 // is a whole number of seconds, and rounding the value someone
-                // wrote is not the compiler's decision to make (DR-0088 §1).
+                // wrote is not the compiler's decision to make (DR-0087 §1).
                 if value.contains('.') {
                     if let Some(ExprTokenKind::Ident(unit)) = self.peek().map(|t| t.kind.clone()) {
                         if matches!(unit.as_str(), "s" | "m" | "h" | "d") {
@@ -25515,7 +25515,7 @@ fn lex_expr(source: &str) -> Vec<ExprToken> {
             let digits = &source[start..index];
             // A duration literal is the number with its unit welded on, and the
             // unit must not run into an identifier: `30s` is thirty seconds,
-            // `30slots` is not a duration at all (spec/time.md, DR-0088 §1).
+            // `30slots` is not a duration at all (spec/time.md, DR-0087 §1).
             let unit = bytes.get(index).copied();
             let unit_ends_token = bytes
                 .get(index + 1)
@@ -25931,7 +25931,7 @@ pub fn binding_after_as(line: &str) -> Option<String> {
 
 /// The `(binding, dependency predicate, arm predicate)` of an `after` header.
 ///
-/// The third value is DR-0088's addition and is not a synonym for the second.
+/// The third value is DR-0090's addition and is not a synonym for the second.
 /// The dependency predicate is completion-shaped — `held`, `contended`, `ok`,
 /// `over` and their siblings all collapse to `Completes`, because the runtime
 /// gates them all on a terminal arriving. The ARM predicate is the token the
@@ -26049,7 +26049,7 @@ pub(crate) fn stable_hash(value: &str) -> String {
 /// `<integer><unit>` as its whole number of seconds, or `None` when the digits
 /// carry a fraction.
 ///
-/// A duration is a whole number of seconds (DR-0088 §1), so `1.5s` is not a
+/// A duration is a whole number of seconds (DR-0087 §1), so `1.5s` is not a
 /// duration this language can hold — it is refused as a literal rather than
 /// rounded, because rounding a value the author wrote is a decision the compiler
 /// has no business making quietly.
@@ -26065,7 +26065,7 @@ pub fn duration_literal_seconds(digits: &str, unit: char) -> Option<i64> {
     count.checked_mul(multiplier)
 }
 
-/// The one spelling of a duration (DR-0088 §2): `PT<n>S`, so two ways of writing
+/// The one spelling of a duration (DR-0087 §2): `PT<n>S`, so two ways of writing
 /// the same length are one value, and therefore one fact under content
 /// addressing.
 pub fn canonical_duration(seconds: i64) -> String {

@@ -853,14 +853,14 @@ pub fn eval_expr_literal(literal: &ExprLiteral) -> Value {
         ExprLiteral::Bool(value) => Value::Bool(*value),
         ExprLiteral::Null => Value::Null,
         // Canonical from the moment it is written: the literal `5m` and the
-        // literal `300s` are one value and one stored form (DR-0088 §2).
+        // literal `300s` are one value and one stored form (DR-0087 §2).
         ExprLiteral::Duration(seconds) => {
             Value::String(whipplescript_parser::canonical_duration(*seconds))
         }
     }
 }
 
-/// Duration arithmetic (DR-0088 §3): two lengths add and subtract, a length
+/// Duration arithmetic (DR-0087 §3): two lengths add and subtract, a length
 /// scales by a count, and the result is canonical.
 ///
 /// Subtraction SATURATES at zero. A duration is positive, and the alternative to
@@ -3489,7 +3489,7 @@ pub fn parse_effect_statements(
             });
         } else if let Some(rest) = trimmed.strip_prefix("timer ") {
             let duration = rest.split_whitespace().next().unwrap_or_default();
-            // A literal, or a duration the firing fact carries (DR-0088): the
+            // A literal, or a duration the firing fact carries (DR-0087): the
             // path is resolved here, where the binding exists, exactly as the
             // absolute `timer until` form resolves its deadline.
             let duration_seconds =
@@ -7637,7 +7637,7 @@ rule r
 mod tests {
     use super::*;
 
-    /// DR-0088: the arm the SNAPSHOT records must be the arm the effect KEY is
+    /// DR-0090: the arm the SNAPSHOT records must be the arm the effect KEY is
     /// built from. This is the check that lets a reader holding only a stored
     /// `.ir` recompute a continuation effect id.
     ///

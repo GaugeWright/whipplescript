@@ -37,7 +37,7 @@ pub struct SnapshotEffect {
     /// The derived effect key. Static per program version; a firing's actual
     /// effect id is not this.
     pub key: String,
-    /// DR-0088: the enclosing `after` arm as `(binding, predicate)`, or `None`
+    /// DR-0090: the enclosing `after` arm as `(binding, predicate)`, or `None`
     /// for an effect at the rule's top level.
     ///
     /// This is what makes a continuation effect id recomputable from the stored
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(unbound.binding, None);
         assert_eq!(unbound.kind, "tracker.finish");
 
-        // DR-0088: the arm the effect key is built from. The dependency edge
+        // DR-0090: the arm the effect key is built from. The dependency edge
         // for this pair says `completes`; the key says `held`, and only one of
         // those reproduces the id.
         assert_eq!(
