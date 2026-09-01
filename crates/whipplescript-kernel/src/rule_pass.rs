@@ -1709,6 +1709,7 @@ pub fn project_tracker_issues<S: RuntimeStore + WorkItems>(
                 "body": item.body,
                 "status": item.status,
                 "labels": item.labels,
+                "releases": item.releases,
                 "metadata": item.metadata,
             })
             .to_string();

@@ -124,3 +124,51 @@ mod WHIPPLESCRIPT-DOMAIN-MEASURE is
   --- reports as No solution.
   rl [returns] : reaches(step(A, A) ; ES) => reaches(step(A, A) ; ES) returns .
 endm
+
+--- The measure over a ring carried by a RESOURCE rather than a fact (DR-0088).
+--- The well-foundedness argument is the counter one above and is not restated;
+--- what is new is which rings may use it, because the step comes from the VERB
+--- rather than from an expression the author wrote.
+---
+--- `release` returns the item the rule matched, and the tracker advances that
+--- item's count by one. `file` also returns work to the queue -- the dependency
+--- edge is the same edge -- but the item that comes back is a NEW one whose
+--- count starts at zero, so nothing descends. The model therefore tracks a
+--- `carried` flag, exactly parallel to the consume flag above: a spawning hop
+--- clears it, and admission requires it.
+---
+--- The model checks that:
+---   * a bounded ring of releases is admitted;
+---   * an unbounded ring of releases is NEVER admitted;
+---   * a ring fed by `file` is NEVER admitted, however bounded its guard;
+---   * one spawning hop is enough to lose the ring, even beside a release.
+mod WHIPPLESCRIPT-RELEASE-MEASURE is
+  protecting INT .
+  protecting BOOL .
+
+  sorts Rule Cfg .
+
+  ops ra rb : -> Rule [ctor] .
+
+  op none : -> Cfg [ctor] .
+  op __ : Cfg Cfg -> Cfg [ctor assoc comm id: none] .
+
+  op releases : Rule -> Cfg [ctor] .   --- R returns the item it matched
+  op spawns : Rule -> Cfg [ctor] .     --- R files a new item instead
+  op bounds : Rule -> Cfg [ctor] .
+
+  --- Turns folded, bound seen, one item carried round.
+  op analysis : Int Bool Bool -> Cfg [ctor] .
+  op admitted : -> Cfg [ctor] .
+
+  var R : Rule .
+  var U : Int .
+  vars B C : Bool .
+
+  rl [fold-release] : releases(R) analysis(U, B, C) => analysis(U + 1, B, C) .
+  rl [fold-spawn] : spawns(R) analysis(U, B, C) => analysis(U, B, false) .
+  rl [fold-bound] : bounds(R) analysis(U, B, C) => analysis(U, true, C) .
+
+  crl [admit] : analysis(U, B, C) => admitted
+      if U > 0 /\ B = true /\ C = true .
+endm

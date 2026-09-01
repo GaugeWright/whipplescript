@@ -272,7 +272,8 @@
             CREATE TABLE tracker_issues (
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
-                labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
+                labels_json TEXT NOT NULL DEFAULT '[]', releases INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 claim_summary TEXT, assigned_to TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

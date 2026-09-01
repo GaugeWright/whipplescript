@@ -355,10 +355,9 @@ A review loop returns work to the tracker. The rule claims a ready issue, asks
 an agent, and on a verdict of `"revise"` it releases the issue. The issue is
 ready again, the rule matches it again, and the loop continues.
 
-Such a loop has no end of its own. The `release` statement returns an issue in
-the state that the issue left, so the issue carries no count of the turns. The
-only thing that stops the loop is a verdict of `"merge"`, and nothing in the
-program requires one to arrive. The compiler says so:
+Such a loop has no end of its own. The only thing that stops it is a verdict of
+`"merge"`, and nothing in the program requires one to arrive. The compiler says
+so:
 
 ```text
 warning: rule cycle review -> review returns work to `backlog` and nothing bounds it
@@ -369,10 +368,81 @@ the shape of a service, and the compiler cannot tell that shape from a review
 loop that never settles. It tells you which one you wrote, and leaves the choice
 to you.
 
-**To bound the loop, carry the count in a fact beside the item.** The tracker
-holds the work. A fact holds the number of turns that the work has taken.
+**To bound the loop, guard on the count that the tracker keeps.** Every item
+carries `releases`: the number of times the tracker has handed that item back.
+It is zero when the item is filed, and one higher after every `release`.
 
-```whipplescript
+The rules below read these declarations:
+
+<!-- check: context loop -->
+```whip
+use std.tracker
+
+tracker backlog
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+class Attempt { id string  n int }
+```
+
+<!-- check: in loop -->
+```whip
+rule review
+  when backlog has ready issue as issue where issue.releases < 3
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+    }
+  }
+}
+```
+
+That one clause is the bound, and the compiler proves the loop terminates:
+
+```text
+measures
+  review -> review: issue.releases rises by 1 toward 3 (step-bounded, bounded by rule `review`)
+```
+
+The count belongs to the item, so each ticket gets its own three turns rather
+than three turns for the queue. Nothing advances it in the rule body, because
+the provider advances it — there is no bookkeeping statement to forget.
+
+Note what the bound does *not* do: it stops the rule from matching, which leaves
+the issue sitting ready and unclaimed. Write a second rule for the exhausted
+case — `when backlog has ready issue as issue where issue.releases >= 3` — to
+escalate it, close it, or move it to another queue.
+
+One narrowing is worth knowing, because the diagnostic is silent about it. The
+proof depends on the loop returning *the item it matched*. A rule that `file`s a
+new issue instead also returns work to the queue, but the new issue starts at
+zero releases, so the loop does not descend and the warning stays:
+
+<!-- check: skip — a rule-body fragment; `issue` and `turn` are bound by the rule around it -->
+```whip
+after turn completes {
+  file issue into backlog {          # a NEW item, counted from zero
+    title "follow-up"
+    body "spawned"
+  }
+
+  finish issue { summary "done" }
+}
+```
+
+### When the count belongs elsewhere
+
+`releases` counts turns of one item. When the number you want to bound is not
+that — a budget shared across a run, or a fan-out over several items — carry it
+in a fact beside the work instead:
+
+<!-- check: in loop -->
+```whip
 rule review
   when backlog has ready issue as issue
   when Attempt as a where a.n < 3 and a.id == issue.id
@@ -394,26 +464,18 @@ rule review
 }
 ```
 
-The guard of the second `when` clause is the bound. The `done` statement
-advances it. The rule is the retry of chapter 13 with the tracker in place of
-the effect, and the compiler proves it in the same way:
+The guard of the second `when` clause is the bound and the `done` statement
+advances it, which the compiler proves the same way — `a.n rises by 1 toward 3`.
+The `a.id == issue.id` part is what makes the bound belong to the ticket rather
+than to the rule.
 
-```text
-measures
-  review -> review: a.n rises by 1 toward 3 (step-bounded, bounded by rule `review`)
-```
-
-The `a.id == issue.id` part of the guard is what makes the bound belong to the
-ticket. Without it, one `Attempt` fact bounds the rule as a whole, and three
-turns of any ticket stop the work of every other. With it, each ticket carries
-its own three turns.
-
-Two properties of the pattern deserve a note. A rule needs both of its `when`
-clauses, so an issue that reaches the tracker with no `Attempt` fact beside it
-is never worked. File the fact where you file the issue. And the compiler cannot
-check that the count you carry is the count of anything: a rule that reads the
-fact and forgets to advance it compiles, and loops. What the compiler proves is
-that the fact descends, not that it counts what you meant.
+This shape costs more than the guard above, and the cost is worth stating. A
+rule needs both of its `when` clauses, so an issue that reaches the tracker with
+no `Attempt` fact beside it is never worked at all; file the fact where you file
+the issue. And the compiler cannot check that the count you carry counts
+anything: a rule that reads the fact and forgets to advance it compiles, and
+loops. What the compiler proves is that the fact descends, not that it counts
+what you meant.
 
 ## Where next
 

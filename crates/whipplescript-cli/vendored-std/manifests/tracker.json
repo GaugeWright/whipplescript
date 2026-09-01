@@ -131,6 +131,10 @@
       "description": "Release a claimed issue back to ready without finishing it."
     },
     {
+      "id": "tracker.release_count",
+      "description": "Maintain, per item, a count of the times this provider has returned that item to ready, exposed as `WorkItem.releases` on the readiness projection rather than as the output of any effect, which is why no effect contract requires it: zero when the item is filed, one more on every return, never falling and never reset. A workflow bounds a rework loop with `where issue.releases < 3`, and the compiler reads that guard as a termination measure, so a provider that reset the count would falsify a proof the compiler had already published. The builtin provider is the reference semantics; a github/linear/jira binding may not be admitted without this capability unless the compiler refuses `.releases` for it."
+    },
+    {
       "id": "tracker.finish",
       "description": "Close a claimed issue with a completion summary."
     }
@@ -165,6 +169,13 @@
       "config": {}
     },
     {
+      "id": "builtin-tracker-release-count",
+      "provider_kind": "builtin-tracker",
+      "capability": "tracker.release_count",
+      "effect_kind": "tracker.release",
+      "config": {}
+    },
+    {
       "id": "builtin-tracker-finish",
       "provider_kind": "builtin-tracker",
       "capability": "tracker.finish",
@@ -183,6 +194,7 @@
         "tracker.claim",
         "tracker.renew",
         "tracker.release",
+        "tracker.release_count",
         "tracker.finish"
       ],
       "config": {}
@@ -214,6 +226,13 @@
       "id": "binding-tracker-release",
       "program_id": null,
       "capability": "tracker.release",
+      "provider": "builtin-tracker",
+      "config": {}
+    },
+    {
+      "id": "binding-tracker-release-count",
+      "program_id": null,
+      "capability": "tracker.release_count",
       "provider": "builtin-tracker",
       "config": {}
     },

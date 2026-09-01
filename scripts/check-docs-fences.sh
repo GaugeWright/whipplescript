@@ -128,7 +128,7 @@ EXPECTED = {
     "docs/manual/11-agents.md": 4,
     "docs/manual/13-agent-patterns.md": 3,
     "docs/manual/14-coordination.md": 3,
-    "docs/manual/15-trackers.md": 4,
+    "docs/manual/15-trackers.md": 7,
     "docs/manual/16-progressions.md": 2,
     "docs/manual/17-messaging.md": 5,
     "docs/manual/18-composition.md": 2,

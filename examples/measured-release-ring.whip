@@ -1,0 +1,44 @@
+# A rework loop bounded by the tracker's own count of the times it has handed
+# an item back (DR-0088). Nothing in the rule body advances the count: the
+# provider does, on every `release`, so there is no bookkeeping to forget.
+#
+# The ring carries no fact at all — its only edge is `review --tracker:backlog-->
+# review` — which is the case a measure could not reach until `WorkItem.releases`
+# existed. Drop the `where` clause and `whip check` warns that nothing bounds
+# the loop; change `release` to `file` and the warning comes back for a subtler
+# reason, because a NEW item starts its count at zero.
+@service
+workflow MeasuredReleaseRing
+use std.tracker
+
+tracker backlog { provider builtin }
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+# The loop. Three turns per item, counted by the tracker.
+rule review
+  when backlog has ready issue as issue where issue.releases < 3
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "review {{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+    }
+  }
+}
+
+# The bound stops the rule above from MATCHING, which would leave an exhausted
+# item sitting ready and unclaimed forever. The second rule is what makes the
+# ring settle rather than merely stop turning.
+rule escalate
+  when backlog has ready issue as issue where issue.releases >= 3
+=> {
+  claim issue as held
+
+  after held completes {
+    finish issue { summary "three reviews without a verdict; escalated" }
+  }
+}

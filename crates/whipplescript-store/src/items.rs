@@ -54,6 +54,17 @@ pub struct WorkItem {
     pub body: String,
     pub status: String,
     pub labels: Vec<String>,
+    /// How many times this item has been returned to ready (DR-0088).
+    ///
+    /// The tracker maintains it, which is the whole point: an author who wants
+    /// a rework loop to stop cannot forget to advance a number the provider
+    /// advances for them, and the compiler can read `issue.releases < 3` as a
+    /// termination measure over a ring that carries no fact at all.
+    ///
+    /// Every path that stops an item being held counts, expiry included. A turn
+    /// of the ring always goes through `release`, so extra counts can only make
+    /// the loop stop sooner than the measure promises — never later.
+    pub releases: i64,
     pub metadata: Value,
     pub claimed_by: Option<String>,
     /// Who the issue is *directed at*, if anyone (0.2.2).
@@ -288,6 +299,16 @@ impl WorkItemStore {
         )?;
         // Self-heal a pre-0.2.2 `tracker_issues`, which had no assignment.
         tx_ensure_column(&connection, "tracker_issues", "assigned_to", "TEXT")?;
+        // Existing stores start every item at zero rather than replaying
+        // `claim.released` out of the event log. A count that begins now is
+        // still monotone, which is all the measure needs; a replay would be
+        // reconstructing history the projection never claimed to hold.
+        tx_ensure_column(
+            &connection,
+            "tracker_issues",
+            "releases",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // Self-heal a tracker written before write-attribution (G3).
         tx_ensure_column(&connection, "tracker_events", "effect_id", "TEXT")?;
         // Self-heal a tracker written before the knowledge plane's validity
@@ -2060,6 +2081,7 @@ CREATE TABLE IF NOT EXISTS tracker_issues (
     body TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'open',
     labels_json TEXT NOT NULL DEFAULT '[]',
+    releases INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     claim_summary TEXT,
     assigned_to TEXT,
@@ -2162,8 +2184,8 @@ fn tx_ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) ->
 
 /// Projection columns in `WorkItem` order (see `row_to_item`).
 #[cfg(feature = "native")]
-const ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, metadata_json, \
-     assigned_to, filed_by, created_at, updated_at";
+const ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, releases, \
+     metadata_json, assigned_to, filed_by, created_at, updated_at";
 
 /// Capture a single now-timestamp for one mutating op; every event + projection
 /// field derived from this op uses it, so a rebuild reproduces the same values.
@@ -2474,6 +2496,12 @@ fn tx_mark_lease_released(
     tx.execute(
         "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
         params![lease_id, now],
+    )?;
+    // The one choke point where an item stops being held, so the count cannot
+    // miss a return the way a per-caller increment could.
+    tx.execute(
+        "UPDATE tracker_issues SET releases = releases + 1 WHERE issue_id = ?1",
+        params![item_id],
     )?;
     Ok(())
 }
@@ -2994,6 +3022,15 @@ fn fold_event(
                     str_of("released_at").unwrap_or_else(|| created_at.to_owned())
                 ],
             )?;
+            // The live path counts in `tx_mark_lease_released`; a rebuild
+            // replays the same events into a fresh projection, so the count has
+            // to be derivable from the log or it would come back as zero.
+            if let Some(issue_id) = issue_id {
+                tx.execute(
+                    "UPDATE tracker_issues SET releases = releases + 1 WHERE issue_id = ?1",
+                    params![issue_id],
+                )?;
+            }
         }
         _ => {}
     }
@@ -3485,7 +3522,7 @@ pub enum FinishOutcome {
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
     // Column order = ISSUE_COLS.
     let labels_json: String = row.get(5)?;
-    let metadata_json: String = row.get(6)?;
+    let metadata_json: String = row.get(7)?;
     Ok(WorkItem {
         id: row.get(0)?,
         queue: row.get(1)?,
@@ -3493,13 +3530,14 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         body: row.get(3)?,
         status: row.get(4)?,
         labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        releases: row.get(6)?,
         metadata: serde_json::from_str(&metadata_json).unwrap_or_else(|_| json!({})),
         // Durable projection carries no holder; the overlay supplies it.
         claimed_by: None,
-        assigned_to: row.get(7)?,
-        filed_by: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        assigned_to: row.get(8)?,
+        filed_by: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -5152,6 +5190,47 @@ mod tests {
             ReleaseOutcome::Released
         );
         assert_eq!(store.ready_items("backlog").expect("ready").len(), 1);
+    }
+
+    /// DR-0088: the count a rework loop's termination measure rests on. The
+    /// compiler reads `where issue.releases < 3` as a proof that the ring stops,
+    /// so three properties are load-bearing rather than cosmetic: it starts at
+    /// zero, it rises by exactly one per return, and it survives a rebuild —
+    /// the projection is disposable, so a count only the projection knew would
+    /// come back as zero and the loop would run again from the top.
+    #[test]
+    fn releases_counts_every_return_to_ready_and_survives_a_rebuild() {
+        let mut store = open_memory();
+        let item = store
+            .file_item("backlog", "a", "", &[], &json!({}), None)
+            .expect("files");
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().releases,
+            0,
+            "a filed item has not been handed back"
+        );
+
+        for expected in 1..=3 {
+            store.claim_item(&item.id, "w", None).expect("claims");
+            store.release_item(&item.id, None).expect("releases");
+            assert_eq!(
+                store.get_item(&item.id).expect("gets").unwrap().releases,
+                expected
+            );
+        }
+
+        // A claim that is never released does not count: the measure advances on
+        // the return, and an item still held has not come back.
+        store.claim_item(&item.id, "w", None).expect("claims");
+        assert_eq!(store.get_item(&item.id).expect("gets").unwrap().releases, 3);
+        store.release_item(&item.id, None).expect("releases");
+
+        store.rebuild_projection().expect("rebuilds");
+        assert_eq!(
+            store.get_item(&item.id).expect("gets").unwrap().releases,
+            4,
+            "the count is derived from the event log, not held only in the projection"
+        );
     }
 
     /// Claim atomicity (`tracker-lease.maude` I1, exclusivity, deterministic

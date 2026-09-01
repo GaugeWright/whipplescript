@@ -33409,6 +33409,7 @@ fn work_item_to_json(item: &whipplescript_store::items::WorkItem) -> Value {
         "body": item.body,
         "status": item.status,
         "labels": item.labels,
+        "releases": item.releases,
         "metadata": item.metadata,
         "claimed_by": item.claimed_by,
         "assigned_to": item.assigned_to,

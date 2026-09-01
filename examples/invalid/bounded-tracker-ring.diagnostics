@@ -3,4 +3,4 @@ error[graph.bounded_workflow_effect_cycle]: effect cycle in a bounded workflow i
    |
 39 |   claim issue as claimed
    |   ^^^^^^^^^^^^^^^^^^^^^^
-   = help: a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going
+   = help: field `releases` rises by 1 on every hop, but no rule on the cycle bounds it, so nothing stops the turn; a bounded workflow settles instead of turning, so it may not loop with the world without a proof: give the cycle a measure — an `int` field every hop advances by a literal step, with a rule on the cycle bounding it — or break the cycle, or drop `@bounded` if this workflow is meant to keep going

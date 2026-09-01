@@ -210,8 +210,38 @@ struct Hop<'a> {
     /// The class it records, which the next rule matches.
     out_schema: String,
     guard: Vec<&'a Expr>,
-    records: Vec<&'a IrRecordShape>,
+    advance: HopAdvance<'a>,
 }
+
+/// Where a hop's step comes from.
+///
+/// A fact ring writes its own successor, so the step is an expression the author
+/// wrote and the analysis reads it. A resource ring writes nothing: the item
+/// goes back to the tracker in the state it left, and the only thing that moves
+/// is the count the TRACKER keeps. The step is then a property of the verb, not
+/// of the program text — which is exactly why a resource ring could carry no
+/// measure until the tracker kept that count.
+enum HopAdvance<'a> {
+    /// Read the step out of the record this rule writes for the next hop.
+    Recorded(Vec<&'a IrRecordShape>),
+    /// The ring edge is `release <binding>`, which advances the item's release
+    /// count by one and moves nothing else.
+    Released,
+}
+
+impl<'a> HopAdvance<'a> {
+    /// The records this hop writes, or none when the tracker carries the ring.
+    fn records(&self) -> &[&'a IrRecordShape] {
+        match self {
+            Self::Recorded(records) => records,
+            Self::Released => &[],
+        }
+    }
+}
+
+/// The one field a resource ring can descend: the count the tracker keeps of how
+/// many times it has handed an item back.
+pub(crate) const RELEASE_COUNT_FIELD: &str = "releases";
 
 /// Attempt DR-0081 §2 over one strongly connected component.
 pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> MeasureOutcome {
@@ -225,6 +255,17 @@ pub(crate) fn prove_cycle_measure(ir: &IrProgram, component: &[usize]) -> Measur
     // well-founded; `duration` and `time` are integer-backed and deferred.
     let mut candidates: Option<BTreeSet<String>> = None;
     for hop in &hops {
+        if matches!(hop.advance, HopAdvance::Released) {
+            // `WorkItem` is a builtin, so it is not in `ir.schemas` — and it
+            // does not need to be. A released item moves exactly one field, so
+            // there is nothing to search for.
+            let only = BTreeSet::from([RELEASE_COUNT_FIELD.to_owned()]);
+            candidates = Some(match candidates {
+                Some(previous) => previous.intersection(&only).cloned().collect(),
+                None => only,
+            });
+            continue;
+        }
         let Some(fields) = classes.get(hop.in_schema.as_str()) else {
             return MeasureOutcome::None;
         };
@@ -355,20 +396,31 @@ fn prove_field(
     // direction.
     let mut steps = Vec::new();
     for hop in hops {
-        let mut records = hop
-            .records
-            .iter()
-            .filter(|shape| shape.schema == hop.out_schema);
-        let (Some(record), None) = (records.next(), records.next()) else {
-            // Two records of the same class in one rule: which one continues the
-            // ring is not a question this analysis answers.
-            return MeasureOutcome::None;
-        };
-        let Some((_, assigned)) = record.fields.iter().find(|(name, _)| name == field) else {
-            return MeasureOutcome::None;
-        };
-        let Some(step) = advance_step(assigned, &hop.binding, field) else {
-            return MeasureOutcome::None;
+        let step = match &hop.advance {
+            HopAdvance::Released => {
+                // `release` moves the count and nothing else, so it can carry a
+                // measure for that field alone.
+                if field != RELEASE_COUNT_FIELD {
+                    return MeasureOutcome::None;
+                }
+                1
+            }
+            HopAdvance::Recorded(shapes) => {
+                let mut records = shapes.iter().filter(|shape| shape.schema == hop.out_schema);
+                let (Some(record), None) = (records.next(), records.next()) else {
+                    // Two records of the same class in one rule: which one
+                    // continues the ring is not a question this analysis answers.
+                    return MeasureOutcome::None;
+                };
+                let Some((_, assigned)) = record.fields.iter().find(|(name, _)| name == field)
+                else {
+                    return MeasureOutcome::None;
+                };
+                let Some(step) = advance_step(assigned, &hop.binding, field) else {
+                    return MeasureOutcome::None;
+                };
+                step
+            }
         };
         steps.push(step);
     }
@@ -380,7 +432,15 @@ fn prove_field(
     if rising == falling {
         return MeasureOutcome::None;
     }
-    let step: i64 = steps.iter().sum();
+    // A fact token visits every rule on the ring, so one turn is the sum of the
+    // hops. An ITEM does not: every rule on a resource ring reads the same
+    // queue, and a released item is picked up by exactly one of them. Summing
+    // there would claim an advance per turn that no single turn makes, so the
+    // step is what one firing does — which is one release.
+    let released_ring = hops
+        .iter()
+        .all(|hop| matches!(hop.advance, HopAdvance::Released));
+    let step: i64 = if released_ring { 1 } else { steps.iter().sum() };
     if (step > 0) != rising {
         return MeasureOutcome::None;
     }
@@ -503,7 +563,8 @@ fn prove_domain(ir: &IrProgram, hops: &[Hop<'_>]) -> Option<DomainMeasure> {
                 break;
             };
             let mut records = hop
-                .records
+                .advance
+                .records()
                 .iter()
                 .filter(|shape| shape.schema == hop.out_schema);
             let (Some(record), None) = (records.next(), records.next()) else {
@@ -646,7 +707,13 @@ fn guard_bound(expr: &Expr, binding: &str, field: &str, rising: bool) -> Option<
 /// stated against it holds on every turn.
 fn field_is_invariant(hops: &[Hop<'_>], field: &str) -> bool {
     hops.iter().all(|hop| {
-        hop.records
+        // A released item comes back in the state it left, so every field but
+        // the release count is carried through untouched.
+        if matches!(hop.advance, HopAdvance::Released) {
+            return field != RELEASE_COUNT_FIELD;
+        }
+        hop.advance
+            .records()
             .iter()
             .filter(|shape| shape.schema == hop.out_schema)
             .all(|shape| {
@@ -745,6 +812,85 @@ fn class_index(ir: &IrProgram) -> BTreeMap<&str, Vec<(String, IrType)>> {
 /// ring — a member with two ways in or out, or one that does not consume its
 /// trigger, is not a shape this analysis reads.
 fn build_hops<'a>(ir: &'a IrProgram, component: &[usize]) -> Option<Vec<Hop<'a>>> {
+    // A ring that carries a fact is read as a fact ring even when a tracker
+    // turns beside it: the paired-fact shape has both edges, and the fact is the
+    // one the author wrote a measure into.
+    build_fact_hops(ir, component).or_else(|| build_release_hops(ir, component))
+}
+
+/// The ring as a sequence of `release`d items rather than recorded facts
+/// (DR-0088).
+///
+/// Every rule on the ring must take an item out of one queue and put THAT item
+/// back into the same queue. A rule that files a new item instead is excluded by
+/// `resource_releases`, and a ring that crosses two queues cannot be carried by
+/// `release` at all, because an item belongs to the queue it was filed in.
+fn build_release_hops<'a>(ir: &'a IrProgram, component: &[usize]) -> Option<Vec<Hop<'a>>> {
+    let mut hops = Vec::new();
+    for &index in component {
+        let rule = &ir.rules[index];
+        let others = component
+            .iter()
+            .copied()
+            .filter(|other| *other != index || component.len() == 1)
+            .collect::<Vec<_>>();
+        let reads_from_ring = rule
+            .metadata
+            .resource_reads
+            .iter()
+            .filter(|resource| {
+                others.iter().any(|other| {
+                    ir.rules[*other]
+                        .metadata
+                        .resource_writes
+                        .contains(*resource)
+                })
+            })
+            .collect::<Vec<_>>();
+        let [resource] = reads_from_ring.as_slice() else {
+            return None;
+        };
+        let queue = resource.strip_prefix("tracker:")?;
+        // The rule must return the item it matched, not file a fresh one: a new
+        // item's count starts at zero and the ring would never descend.
+        let release = rule
+            .metadata
+            .resource_releases
+            .iter()
+            .find(|release| release.queue == queue)?;
+        // The binding the `when` matched has to be the one released, or the
+        // count that advances is not the count the guard reads.
+        let mut hop = None;
+        for when in &rule.whens {
+            let Some((binding, schema)) = binding_from_when(&when.source) else {
+                continue;
+            };
+            if schema != "WorkItem"
+                || binding != release.binding
+                || when.pattern.split_whitespace().next() != Some(queue)
+            {
+                continue;
+            }
+            let mut guard = Vec::new();
+            if let Some(expression) = &when.guard {
+                collect_conjuncts(&expression.expr, &mut guard);
+            }
+            hop = Some(Hop {
+                rule: rule.name.as_str(),
+                in_schema: "WorkItem".to_owned(),
+                binding,
+                out_schema: "WorkItem".to_owned(),
+                guard,
+                advance: HopAdvance::Released,
+            });
+            break;
+        }
+        hops.push(hop?);
+    }
+    Some(hops)
+}
+
+fn build_fact_hops<'a>(ir: &'a IrProgram, component: &[usize]) -> Option<Vec<Hop<'a>>> {
     let mut hops = Vec::new();
     for &index in component {
         let rule = &ir.rules[index];
@@ -802,7 +948,7 @@ fn build_hops<'a>(ir: &'a IrProgram, component: &[usize]) -> Option<Vec<Hop<'a>>
             binding: binding?,
             out_schema,
             guard,
-            records: rule.metadata.record_shapes.iter().collect(),
+            advance: HopAdvance::Recorded(rule.metadata.record_shapes.iter().collect()),
         });
     }
     Some(hops)

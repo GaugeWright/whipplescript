@@ -12450,12 +12450,14 @@ rule poll
     );
 }
 
-/// A ring that turns through a tracker and no fact at all has no token a measure
-/// can speak about — an item comes back from `release` in the state it left. The
-/// loop is legal, because a worker that runs as long as work arrives is the
-/// point, and it is also how a review loop runs forever. The compiler cannot
-/// tell those apart, so it says which shape was written and names the pattern
-/// that bounds it.
+/// A ring that turns through a tracker with nothing bounding it. The loop is
+/// legal, because a worker that runs as long as work arrives is the point, and
+/// it is also how a review loop runs forever. The compiler cannot tell those
+/// apart, so it says which shape was written and names the guard that bounds it.
+///
+/// Since DR-0088 the item does carry a count, so the analysis reaches this ring
+/// and reports it UNBOUNDED rather than unreadable. The warning has to survive
+/// that change of outcome, which is the half of it this test pins.
 #[test]
 fn an_unbounded_resource_cycle_is_named() {
     let release_loop = r#"
@@ -12558,6 +12560,121 @@ rule review
             .iter()
             .any(|warning| warning.code.as_str() == "graph.unmeasured_resource_cycle"),
         "a bounded loop must not be nudged: {:?}",
+        compiled.warnings
+    );
+}
+
+/// DR-0088: the shorter answer to the same question. The tracker counts the
+/// times it has handed an item back, so one clause on the `when` bounds the ring
+/// — no second schema, no correlation predicate, and no way to forget to advance
+/// a number the provider advances.
+#[test]
+fn the_trackers_own_count_bounds_a_pure_resource_ring() {
+    let source = r#"
+@service
+workflow BoundedRework
+use std.tracker
+
+tracker backlog { provider builtin }
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+rule review
+  when backlog has ready issue as issue where issue.releases < 3
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      release issue
+    }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("a counted rework loop compiles");
+    assert!(
+        ir.to_snapshot().contains(
+            "issue.releases rises by 1 toward 3 (step-bounded, bounded by rule `review`)"
+        ),
+        "{}",
+        ir.to_snapshot()
+    );
+    assert!(
+        !compiled
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "graph.unmeasured_resource_cycle"),
+        "a bounded loop must not be nudged: {:?}",
+        compiled.warnings
+    );
+
+    // The ring is well-founded, so the workflow may promise to settle. Before
+    // the count existed this shape was refused outright under `@bounded`.
+    let bounded = compile_program(&source.replace("@service", "@bounded").replace(
+        "workflow BoundedRework",
+        "workflow BoundedRework\noutput done { count int }",
+    ));
+    assert!(
+        !bounded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "graph.bounded_workflow_effect_cycle"),
+        "a measured release ring settles: {:?}",
+        bounded.diagnostics
+    );
+}
+
+/// The narrowing that keeps the proof honest. A rule that FILES rather than
+/// releases also returns work to the queue, and the dependency edge is the same
+/// one — but the item that comes back is a new item whose count starts at zero,
+/// so the ring never descends. The guard here reads exactly like the proven
+/// case above; only the verb differs, and it must not be proven.
+#[test]
+fn a_ring_fed_by_file_is_not_bounded_by_the_release_count() {
+    let source = r#"
+@service
+workflow FileFedRing
+use std.tracker
+
+tracker backlog { provider builtin }
+
+agent reviewer { provider fixture  profile "repo-writer"  capacity 1 }
+
+rule spawn
+  when backlog has ready issue as issue where issue.releases < 3
+=> {
+  claim issue as claimed
+
+  after claimed completes {
+    tell reviewer "{{ issue.title }}" as turn
+
+    after turn completes {
+      file issue into backlog {
+        title "follow-up"
+        body "spawned"
+      }
+
+      finish issue { summary "done" }
+    }
+  }
+}
+"#;
+    let compiled = compile_program(source);
+    let ir = compiled.ir.expect("the file-fed ring compiles");
+    assert!(
+        !ir.to_snapshot().contains("issue.releases rises"),
+        "a new item carries no advanced count: {}",
+        ir.to_snapshot()
+    );
+    assert!(
+        compiled
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "graph.unmeasured_resource_cycle"),
+        "an unmeasured ring is still named: {:?}",
         compiled.warnings
     );
 }

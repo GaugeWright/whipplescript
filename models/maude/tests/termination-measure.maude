@@ -51,3 +51,24 @@ search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
 search [1] in WHIPPLESCRIPT-DOMAIN-MEASURE :
   walk(queued, routed) walk(routed, shipped) walk(shipped, queued) reaches(mtEdges)
   =>* returns RESIDUAL:Cfg .
+
+--- Coverage: a bounded ring of releases is admitted. The item that comes round
+--- is the item whose count advanced, which is what the guard reads.
+search [1] in WHIPPLESCRIPT-RELEASE-MEASURE :
+  releases(ra) bounds(ra) analysis(0, false, true) =>! admitted .
+
+--- Bite: nothing bounds the count, so the ring is never admitted. This is the
+--- service loop the compiler warns about rather than refuses.
+search [1] in WHIPPLESCRIPT-RELEASE-MEASURE :
+  releases(ra) analysis(0, false, true) =>! admitted .
+
+--- Bite: a ring fed by `file` is never admitted however bounded its guard. The
+--- guard reads a count on an item that a new item does not inherit.
+search [1] in WHIPPLESCRIPT-RELEASE-MEASURE :
+  spawns(ra) bounds(ra) analysis(0, false, true) =>! admitted .
+
+--- Bite: one spawning hop loses the ring even beside a releasing one. The
+--- measure speaks about ONE item going round, and a ring that also mints items
+--- is not that.
+search [1] in WHIPPLESCRIPT-RELEASE-MEASURE :
+  releases(ra) spawns(rb) bounds(ra) analysis(0, false, true) =>! admitted .

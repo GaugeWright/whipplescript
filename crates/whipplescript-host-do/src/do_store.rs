@@ -7017,7 +7017,7 @@ impl<Sql: DoSql> RuntimeStore for DoSqliteStore<Sql> {
 // claim is exclusive without an explicit transaction — the same argument as the
 // RuntimeStore port.
 
-const DO_ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, \
+const DO_ISSUE_COLS: &str = "issue_id, queue, title, body, status, labels_json, releases, \
      metadata_json, assigned_to, filed_by, created_at, updated_at";
 
 /// The active-lease predicate over `tracker_leases`, with the clock inlined as
@@ -7036,12 +7036,13 @@ fn do_issue_row(row: &[SqlValue]) -> WorkItem {
         body: as_text(&row[3]),
         status: as_text(&row[4]),
         labels: serde_json::from_str(&as_text(&row[5])).unwrap_or_default(),
-        metadata: serde_json::from_str(&as_text(&row[6])).unwrap_or_else(|_| serde_json::json!({})),
+        releases: as_opt_i64(&row[6]).unwrap_or_default(),
+        metadata: serde_json::from_str(&as_text(&row[7])).unwrap_or_else(|_| serde_json::json!({})),
         claimed_by: None,
-        assigned_to: as_opt_text(&row[7]),
-        filed_by: as_opt_text(&row[8]),
-        created_at: as_text(&row[9]),
-        updated_at: as_text(&row[10]),
+        assigned_to: as_opt_text(&row[8]),
+        filed_by: as_opt_text(&row[9]),
+        created_at: as_text(&row[10]),
+        updated_at: as_text(&row[11]),
     }
 }
 
@@ -7335,6 +7336,13 @@ fn do_mark_lease_released(
     sql.execute(
         "UPDATE tracker_leases SET released_at = ?2 WHERE lease_id = ?1",
         &[text(lease_id), text(now)],
+    )
+    .map_err(sql_err)?;
+    // Parity with the native `tx_mark_lease_released`: one choke point where an
+    // item stops being held, so the count cannot miss a return.
+    sql.execute(
+        "UPDATE tracker_issues SET releases = releases + 1 WHERE issue_id = ?1",
+        &[text(item_id)],
     )
     .map_err(sql_err)?;
     Ok(())
@@ -8759,6 +8767,15 @@ fn do_fold_tracker_event(
                 ],
             )
             .map_err(sql_err)?;
+            // Parity with the native fold: a rebuild replays into a fresh
+            // projection, so the count has to come back out of the log.
+            if let Some(issue_id) = issue_id {
+                sql.execute(
+                    "UPDATE tracker_issues SET releases = releases + 1 WHERE issue_id = ?1",
+                    &[text(issue_id)],
+                )
+                .map_err(sql_err)?;
+            }
         }
         _ => {}
     }
@@ -9403,7 +9420,8 @@ pub(crate) mod test_support {
             CREATE TABLE tracker_issues (
                 issue_id TEXT PRIMARY KEY, queue TEXT NOT NULL, title TEXT NOT NULL,
                 body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open',
-                labels_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
+                labels_json TEXT NOT NULL DEFAULT '[]', releases INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
                 claim_summary TEXT, assigned_to TEXT, filed_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

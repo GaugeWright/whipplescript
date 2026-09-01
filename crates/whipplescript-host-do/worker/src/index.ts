@@ -346,6 +346,16 @@ function ensureSchema(sql: SqlStorage): void {
   if (hasAssignedTo.length === 0) {
     sql.exec(`ALTER TABLE tracker_issues ADD COLUMN assigned_to TEXT`);
   }
+  // The release count (DR-0088) is additive on the same terms. Existing items
+  // start at zero rather than replaying `claim.released` out of the event log: a
+  // count that begins now is still monotone, which is all a termination measure
+  // needs, and a replay would reconstruct history the projection never held.
+  const hasReleases = sql
+    .exec(`SELECT name FROM pragma_table_info('tracker_issues') WHERE name = 'releases'`)
+    .toArray();
+  if (hasReleases.length === 0) {
+    sql.exec(`ALTER TABLE tracker_issues ADD COLUMN releases INTEGER NOT NULL DEFAULT 0`);
+  }
   // The tracker's alias/comment/evidence tables and the content-addressed
   // event-id columns (ADR-0002 phase B1) shipped after objects existed, and the
   // first-touch branch above never revisits an existing object. The production

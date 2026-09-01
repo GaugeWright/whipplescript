@@ -1974,6 +1974,13 @@ pub struct IrWhen {
     pub span: SourceSpan,
 }
 
+/// One `release <binding>` of an item this rule matched out of `queue`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrResourceRelease {
+    pub queue: String,
+    pub binding: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrRuleDependency {
     pub producer: String,
@@ -2060,6 +2067,18 @@ pub struct IrRuleMetadata {
     /// deliberately NOT rendered in the `.ir` snapshot. The edges they produce
     /// ARE rendered, in `rule_dependencies`, which is the point.
     pub resource_writes: Vec<String>,
+    /// The tracker items this rule returns to ready by releasing the VERY item
+    /// it matched, as (queue, binding).
+    ///
+    /// `resource_writes` above answers "does work become available here", which
+    /// is what a dependency edge needs. A termination measure needs the
+    /// narrower question: is the thing going round the SAME item, so that the
+    /// count the tracker keeps on it advances every turn? A `file` makes work
+    /// available too, but it makes a NEW item whose count starts at zero, and a
+    /// ring fed by `file` never terminates for that reason.
+    ///
+    /// Analysis-only, like the two fields above, and not in the `.ir` snapshot.
+    pub resource_releases: Vec<IrResourceRelease>,
     pub record_sources: Vec<IrRecordSource>,
     pub fact_consumes: Vec<String>,
     pub effects: Vec<IrEffectNode>,
@@ -7783,6 +7802,11 @@ impl SchemaIndex {
                 ("queue", string_ty()),
                 ("status", string_ty()),
                 ("labels", array_ty(string_ty())),
+                // How many times the tracker has returned this item to ready.
+                // Provider-maintained, which is what lets it bound a rework
+                // loop: `where issue.releases < 3` is a termination measure the
+                // author cannot forget to advance.
+                ("releases", int_ty()),
             ],
         );
         // std.vcs observer schemas (DR-0052 grammar pass): the readiness
@@ -9799,10 +9823,23 @@ fn validate_effectful_rule_recursion(
             //
             // A warning rather than a refusal, because the two are
             // indistinguishable here and only one is a mistake. It names the
-            // pattern that bounds it, because the pattern is not discoverable:
-            // an item comes back from `release` in the state it left and carries
-            // no count of its own, so the count has to live in a fact beside it.
-            measure::MeasureOutcome::None => {
+            // guard that bounds it, which is one clause: the tracker counts the
+            // times it has handed an item back, so the loop's own count is
+            // already on the item and needs no bookkeeping beside it.
+            //
+            // BOTH no-measure outcomes land here, and the second is the common
+            // one now: a ring whose rules release but whose guard says nothing
+            // about the count reads as `Unbounded` — the analysis found the
+            // field and found nothing stopping it — where before the release
+            // count existed it could only read as `None`. Matching just `None`
+            // silently dropped the warning for exactly the loop it is for.
+            //
+            // No catch-all arm: the match is exhaustive so that a new
+            // `MeasureOutcome` has to be decided here rather than silently
+            // joining the no-diagnostic case, which is how widening this arm
+            // came to be needed in the first place.
+            measure::MeasureOutcome::None
+            | measure::MeasureOutcome::Missed(measure::MeasureMiss::Unbounded { .. }) => {
                 // Not under `@bounded`, where the ring is already an error. The
                 // nudge's advice — that a loop running as long as work arrives
                 // is fine — is the opposite of what that declaration says, and
@@ -9824,13 +9861,12 @@ fn validate_effectful_rule_recursion(
                             names.join(" -> ")
                         ),
                         suggestion: Some(
-                            "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop, carry the count in a fact beside the item — `when Attempt as a where a.n < 3 and a.id == issue.id`, advanced with `done a -> record Attempt { n a.n + 1 }` on each turn — because an item returns from `release` in the state it left and carries no count of its own"
+                            "if it is meant to run for as long as work arrives, nothing is wrong. If it is meant to stop after a fixed number of tries, bound the tracker's own count of them — `where issue.releases < 3` on the `when` that matches the item"
                                 .to_owned(),
                         ),
                     });
                 }
             }
-            _ => {}
         }
     }
 
@@ -10160,6 +10196,37 @@ fn tracker_resource_writes(
         }
     });
     writes.into_iter().collect()
+}
+
+/// The items a rule returns to ready by releasing what it matched.
+///
+/// Deliberately narrower than `tracker_resource_writes`: `file` is excluded,
+/// because a filed item is a new one whose release count starts at zero, and
+/// only the item that came round carries a count that has advanced.
+fn tracker_resource_releases(
+    rule: &RuleDecl,
+    body_ast: &body::BodyAst,
+    semantic: &SemanticContext,
+) -> Vec<IrResourceRelease> {
+    let bindings = binding_resources(rule, &body_ast.statements, &semantic.trackers);
+    let mut releases = BTreeSet::new();
+    for_each_body(&body_ast.statements, &mut |stmt| {
+        let body::BodyStmt::Effect(effect) = stmt else {
+            return;
+        };
+        let body::BodyEffectKind::TrackerRelease { item } = &effect.kind else {
+            return;
+        };
+        if let Some(queue) = bindings.get(item) {
+            if semantic.trackers.contains(queue) {
+                releases.insert((queue.clone(), item.clone()));
+            }
+        }
+    });
+    releases
+        .into_iter()
+        .map(|(queue, binding)| IrResourceRelease { queue, binding })
+        .collect()
 }
 
 fn build_rule_dependencies(rules: &[IrRule]) -> Vec<IrRuleDependency> {
@@ -11537,6 +11604,7 @@ fn analyze_rule(
             .collect(),
         resource_reads: tracker_resource_reads(rule, semantic),
         resource_writes: tracker_resource_writes(rule, body_ast, semantic),
+        resource_releases: tracker_resource_releases(rule, body_ast, semantic),
         max_after_depth: max_after_depth(&body_ast.statements),
         ..IrRuleMetadata::default()
     };
