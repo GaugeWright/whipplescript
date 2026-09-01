@@ -185,6 +185,37 @@ fn a_custodian_without_the_feature_refuses_a_tpm_signature_by_name() {
         error.contains("--features tpm"),
         "and the way forward: {error}"
     );
+
+    // VERIFY takes the same path and must say the same thing. Answering
+    // `valid: false` here would report a bad signature when the truth is that
+    // this binary cannot check it — the worst available answer, because it
+    // reads as evidence about the signature.
+    let verified = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-1".to_owned(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Verify {
+            credential: name("release_signing"),
+            alg: SignatureAlg::HmacSha256,
+            payload_b64: "cGF5bG9hZA==".to_owned(),
+            signature_b64: "c2ln".to_owned(),
+            key_version: None,
+        },
+    ));
+    let refused = verified
+        .outcome
+        .expect_err("no feature, no verdict")
+        .to_string();
+    assert!(
+        refused.contains("built without the `tpm` feature"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("--features tpm"),
+        "and the way forward: {refused}"
+    );
 }
 
 /// The whole of r2 through the custodian, against the real chip.
@@ -229,6 +260,124 @@ fn a_signature_from_the_chip_comes_back_through_the_custodian() {
         }
         other => panic!("expected a signature, got {other:?}"),
     }
+}
+
+/// Sign then verify, both inside the chip, with the key that never left it.
+///
+/// The round trip is the point: a `verify` that always answered true would pass
+/// half of this, so a tampered signature and a tampered payload are checked
+/// too.
+#[cfg(feature = "tpm")]
+#[test]
+fn the_chip_verifies_what_the_chip_signed() {
+    let mut context = match whipplescript_custodian::tpm_device::context() {
+        Ok(context) => context,
+        Err(reason) => {
+            eprintln!("SKIP: no reachable TPM ({reason})");
+            return;
+        }
+    };
+    let binding = whipplescript_custodian::tpm_device::read_binding(&mut context, &[0, 7])
+        .expect("PCRs read");
+    drop(context);
+
+    let mut store = SealedStore::create(None, "pass").expect("store");
+    store
+        .register_tpm(
+            name("release_signing"),
+            CredentialKind::HmacSha256,
+            binding,
+            None,
+            None,
+        )
+        .expect("registered");
+    let custodian = Custodian::new(store, Box::new(whipplescript_custodian::DeniedEgress));
+
+    let signature = match custodian
+        .handle(&call("release_signing", "cGF5bG9hZA=="))
+        .outcome
+        .expect("the chip signed")
+    {
+        whipplescript_custody::CustodyOk::Signed { signature_b64, .. } => signature_b64,
+        other => panic!("expected a signature, got {other:?}"),
+    };
+
+    let verify = |payload: &str, sig: &str| -> bool {
+        let reply = custodian.handle(&CustodyCall::new(
+            UseAttribution {
+                run_id: "run-1".to_owned(),
+                actor: None,
+                effect_key: None,
+            },
+            CustodyOp::Verify {
+                credential: name("release_signing"),
+                alg: SignatureAlg::HmacSha256,
+                payload_b64: payload.to_owned(),
+                signature_b64: sig.to_owned(),
+                key_version: None,
+            },
+        ));
+        match reply.outcome.expect("the chip answered") {
+            whipplescript_custody::CustodyOk::Verified { valid } => valid,
+            other => panic!("expected a verdict, got {other:?}"),
+        }
+    };
+
+    assert!(
+        verify("cGF5bG9hZA==", &signature),
+        "its own signature verifies"
+    );
+    // A different payload under the same signature.
+    assert!(
+        !verify("b3RoZXI=", &signature),
+        "a different payload must not"
+    );
+    // The signature with one byte changed, base64-safe: flip the first char.
+    let mut tampered = signature.clone();
+    let first = tampered.remove(0);
+    tampered.insert(0, if first == 'A' { 'B' } else { 'A' });
+    assert!(
+        !verify("cGF5bG9hZA==", &tampered),
+        "a tampered signature must not"
+    );
+}
+
+/// An asymmetric algorithm is refused by name rather than answered `false`.
+///
+/// Needs no chip: the rule is about the algorithm. A `valid: false` here would
+/// say the signature was wrong when the truth is that this credential cannot
+/// check that kind of signature at all.
+#[test]
+fn a_tpm_credential_refuses_an_asymmetric_verify_by_name() {
+    let mut store = SealedStore::create(None, "pass").expect("store");
+    store
+        .register_tpm(
+            name("release_signing"),
+            CredentialKind::HmacSha256,
+            a_binding(),
+            None,
+            None,
+        )
+        .expect("registered");
+    let custodian = Custodian::new(store, Box::new(whipplescript_custodian::DeniedEgress));
+
+    let reply = custodian.handle(&CustodyCall::new(
+        UseAttribution {
+            run_id: "run-1".to_owned(),
+            actor: None,
+            effect_key: None,
+        },
+        CustodyOp::Verify {
+            credential: name("release_signing"),
+            alg: SignatureAlg::Ed25519,
+            payload_b64: "cGF5bG9hZA==".to_owned(),
+            signature_b64: "c2ln".to_owned(),
+            key_version: None,
+        },
+    ));
+    let error = reply.outcome.expect_err("not a keyed hash").to_string();
+    assert!(error.contains("ed25519"), "names the algorithm: {error}");
+    assert!(error.contains("hmac-sha256"), "and what it can do: {error}");
 }
 
 /// A binding the platform has moved past refuses, and says what to do.

@@ -209,15 +209,30 @@ impl Custodian {
         binding: &crate::tpm::PcrBinding,
         op: &CustodyOp,
     ) -> Result<CustodyOk, CustodyError> {
-        let _ = (kind, binding);
+        let _ = kind;
         match op {
             CustodyOp::Sign { payload_b64, .. } => {
                 self.admits_sign(name, payload_b64)?;
                 self.tpm_sign(name, binding, payload_b64)
             }
+            // Verification recomputes the MAC with the SAME key, which is in
+            // the chip, so it belongs here rather than on the local path — the
+            // local path has no material to verify against. No signing bound is
+            // consulted: `grant sign ... for prefix` limits what a key may
+            // PRODUCE, and checking a signature produces nothing.
+            CustodyOp::Verify {
+                alg,
+                payload_b64,
+                signature_b64,
+                ..
+            } => {
+                crate::tpm::verifiable_alg(*alg)
+                    .map_err(|detail| CustodyError::Backend { detail })?;
+                self.tpm_verify(name, binding, payload_b64, signature_b64)
+            }
             other => Err(CustodyError::Backend {
                 detail: format!(
-                    "credential {name} is held in a TPM, which performs `sign` and nothing else here: `{}` needs material this box does not have",
+                    "credential {name} is held in a TPM, which performs `sign` and `verify` and nothing else here: `{}` needs material this box does not have",
                     other.operation().as_str()
                 ),
             }),
@@ -243,6 +258,48 @@ impl Custodian {
         Ok(CustodyOk::Signed {
             signature_b64: B64.encode(signature),
             key_version: None,
+        })
+    }
+
+    #[cfg(feature = "tpm")]
+    fn tpm_verify(
+        &self,
+        name: &CredentialName,
+        binding: &crate::tpm::PcrBinding,
+        payload_b64: &str,
+        signature_b64: &str,
+    ) -> Result<CustodyOk, CustodyError> {
+        let payload = decode_b64(payload_b64)?;
+        let presented = decode_b64(signature_b64)?;
+        let mut context =
+            crate::tpm_device::context().map_err(|detail| CustodyError::Backend { detail })?;
+        let current = crate::tpm_device::read_binding(&mut context, &binding.slots)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        // Freshness gates verification too. A platform that moved cannot
+        // recompute the same MAC anyway — the key derives from a seed bound to
+        // it — so reporting `valid: false` would blame the signature for a
+        // platform change, which is the most misleading answer available.
+        crate::tpm::ensure_fresh(name.as_str(), binding, &current)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        let computed = crate::tpm_device::hmac_sha256(&mut context, name.as_str(), &payload)
+            .map_err(|detail| CustodyError::Backend { detail })?;
+        Ok(CustodyOk::Verified {
+            valid: crate::tpm::mac_matches(&computed, &presented),
+        })
+    }
+
+    #[cfg(not(feature = "tpm"))]
+    fn tpm_verify(
+        &self,
+        name: &CredentialName,
+        _binding: &crate::tpm::PcrBinding,
+        _payload_b64: &str,
+        _signature_b64: &str,
+    ) -> Result<CustodyOk, CustodyError> {
+        Err(CustodyError::Backend {
+            detail: format!(
+                "credential {name} is held in a TPM, and this custodian was built without the `tpm` feature: rebuild with `--features tpm` on a host that has the tss2 stack"
+            ),
         })
     }
 

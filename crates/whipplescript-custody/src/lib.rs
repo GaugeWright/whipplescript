@@ -790,6 +790,28 @@ pub enum SignatureAlg {
     RsaSha256,
 }
 
+impl SignatureAlg {
+    /// The wire spelling, which is also what a refusal names.
+    ///
+    /// The same strings serde derives above, so an operator reading a message
+    /// and an operator reading a recorded call see one vocabulary rather than
+    /// two. `CredentialKind`, `Operation` and `Rung` each carry the same pair
+    /// for the same reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignatureAlg::HmacSha256 => "hmac-sha256",
+            SignatureAlg::Ed25519 => "ed25519",
+            SignatureAlg::RsaSha256 => "rsa-sha256",
+        }
+    }
+}
+
+impl fmt::Display for SignatureAlg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A label-carrying envelope (DR-0053 §13). The envelope records the caller's
 /// IFC label and `unwrap` restores it, so the wrap → store → unwrap roundtrip
 /// cannot launder; AEAD associated data binds the ciphertext to
@@ -1624,6 +1646,28 @@ mod tests {
         assert!(Rung::Process < Rung::OsKeyring);
         assert!(Rung::OsKeyring < Rung::Hardware);
         assert!(Rung::Hardware < Rung::Remote);
+    }
+
+    /// `as_str` and the serde spelling are one vocabulary, not two.
+    ///
+    /// Asserted over every variant, so adding one without a spelling fails here
+    /// rather than printing a refusal that names an algorithm no recorded call
+    /// ever carries.
+    #[test]
+    fn signature_alg_prints_what_it_serializes() {
+        for alg in [
+            SignatureAlg::HmacSha256,
+            SignatureAlg::Ed25519,
+            SignatureAlg::RsaSha256,
+        ] {
+            let wire = serde_json::to_string(&alg).expect("serialize");
+            assert_eq!(
+                wire.trim_matches('"'),
+                alg.as_str(),
+                "{alg:?} prints differently from how it serializes"
+            );
+            assert_eq!(alg.to_string(), alg.as_str());
+        }
     }
 
     #[test]

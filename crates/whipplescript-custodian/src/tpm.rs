@@ -142,6 +142,49 @@ pub fn ensure_fresh(
     Ok(())
 }
 
+/// Whether a TPM-held credential can verify under `alg`.
+///
+/// The chip holds a keyed-hash key, so it can recompute an HMAC and nothing
+/// else. An asymmetric algorithm is refused BY NAME rather than falling through
+/// to a local path, because there is no local material to fall through to — the
+/// refusal that says "this credential cannot do that" is more use than one that
+/// says the material is missing.
+pub fn verifiable_alg(alg: whipplescript_custody::SignatureAlg) -> Result<(), String> {
+    use whipplescript_custody::SignatureAlg;
+    match alg {
+        SignatureAlg::HmacSha256 => Ok(()),
+        other => Err(format!(
+            "a TPM-held credential verifies `hmac-sha256` and nothing else here: `{}` is an \
+             asymmetric algorithm, whose public half is verified by whip rather than by the chip",
+            other.as_str()
+        )),
+    }
+}
+
+/// Constant-time comparison of a recomputed MAC against a presented one.
+///
+/// DR-0053 §6 puts the comparison in the custodian precisely so it can be
+/// constant-time; `==` on two byte slices returns early on the first differing
+/// byte, which leaks how much of a forged MAC was right. A length mismatch is
+/// still an early return, and that is fine — the length is not secret.
+///
+/// Hand-rolled rather than `ring::constant_time::verify_slices_are_equal`,
+/// which ring has deprecated with the note that it is "not intended for
+/// external use with no promises regarding side channels". A withdrawn
+/// guarantee is worse than none, because the name still reads like one. This is
+/// the same XOR-accumulate the credential proxy's token check uses: every byte
+/// is read, and only the accumulator decides.
+pub fn mac_matches(computed: &[u8], presented: &[u8]) -> bool {
+    if computed.len() != presented.len() {
+        return false;
+    }
+    computed
+        .iter()
+        .zip(presented.iter())
+        .fold(0u8, |differing, (a, b)| differing | (a ^ b))
+        == 0
+}
+
 /// Which PCR slots whip will bind to.
 ///
 /// A rule rather than a device fact, so it lives with the other rules and is
@@ -188,6 +231,34 @@ mod tests {
         let said = stale.to_string();
         assert!(said.contains("firmware or kernel update"), "{said}");
         assert!(said.contains("re-bind"), "{said}");
+    }
+
+    #[test]
+    fn only_the_keyed_hash_algorithm_verifies_in_the_chip() {
+        use whipplescript_custody::SignatureAlg;
+        assert_eq!(verifiable_alg(SignatureAlg::HmacSha256), Ok(()));
+        for asymmetric in [SignatureAlg::Ed25519, SignatureAlg::RsaSha256] {
+            let refused = verifiable_alg(asymmetric).expect_err("not a keyed hash");
+            assert!(
+                refused.contains(asymmetric.as_str()),
+                "the refusal names the algorithm: {refused}"
+            );
+            assert!(
+                refused.contains("hmac-sha256"),
+                "and what it can do: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mac_comparison_admits_only_an_exact_match() {
+        assert!(mac_matches(b"0123456789abcdef", b"0123456789abcdef"));
+        assert!(!mac_matches(b"0123456789abcdef", b"0123456789abcdee"));
+        // A prefix is not a match: a comparison that stopped at the shorter
+        // length would admit anyone who guessed one byte.
+        assert!(!mac_matches(b"0123456789abcdef", b"0123"));
+        assert!(!mac_matches(b"0123", b"0123456789abcdef"));
+        assert!(!mac_matches(b"", b"x"));
     }
 
     #[test]
