@@ -86,6 +86,11 @@ struct SealedEntry {
     /// a secret, and sealing it would only pretend otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<RemoteRef>,
+    /// r2 PKCS#11: where the key is, and what it was admitted on. Plaintext
+    /// metadata for the reason the others are: a module path, a token label and
+    /// a set of boolean attributes are not secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pkcs11: Option<SealedPkcs11>,
     /// r2 TPM binding: `{"tpm": {"slots": [0, 7], "digest_hex": "..."}}`.
     /// Plaintext metadata by design, for the same reason the remote key name
     /// is: a PCR digest is a measurement of the platform, not a secret, and
@@ -118,6 +123,13 @@ struct RemoteRef {
     openbao_transit: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct SealedPkcs11 {
+    #[serde(flatten)]
+    reference: Pkcs11Ref,
+    admitted: crate::pkcs11::KeyAttributes,
+}
+
 /// Where an entry's material is (DR-0053 §4): held locally under seal, or
 /// resident in a remote backend that performs the operations itself.
 #[derive(Clone)]
@@ -134,6 +146,29 @@ pub enum Material {
     TpmHmac {
         binding: crate::tpm::PcrBinding,
     },
+    /// r2 over PKCS#11: the key is resident on a token and signs there.
+    ///
+    /// Carries the attributes the key was ADMITTED on, not just where to find
+    /// it. The TPM variant can report r2 from what it is — a key the chip made
+    /// cannot leave whatever the PCRs say — but a PKCS#11 key is r2 only if the
+    /// token says it never left, so the evidence has to travel with the entry
+    /// and be re-checked at every use.
+    Pkcs11 {
+        reference: crate::store::Pkcs11Ref,
+        admitted: crate::pkcs11::KeyAttributes,
+    },
+}
+
+/// Where a PKCS#11 key lives: which module, which token, which object.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Pkcs11Ref {
+    /// The vendor module, an operator path. whip does not guess it.
+    pub module: String,
+    /// The token's LABEL rather than its slot number, which the module assigns
+    /// in an order nothing promises to keep across reboots.
+    pub token: String,
+    /// The key object's label on that token.
+    pub key: String,
 }
 
 /// One unsealed entry held in custodian memory. Local material zeroizes on
@@ -239,6 +274,22 @@ impl SealedStore {
             // neither ciphertext nor a remote name, so leaving it to the
             // catch-all below would read a perfectly good hardware credential
             // as a malformed one.
+            if let Some(token) = &sealed.pkcs11 {
+                entries.insert(
+                    name,
+                    Entry {
+                        kind: sealed.kind,
+                        material: Material::Pkcs11 {
+                            reference: token.reference.clone(),
+                            admitted: token.admitted,
+                        },
+                        revoked: sealed.revoked,
+                        budget: sealed.budget,
+                        lease_expires_at: sealed.lease_expires_at,
+                    },
+                );
+                continue;
+            }
             if let Some(binding) = &sealed.tpm {
                 entries.insert(
                     name,
@@ -281,7 +332,7 @@ impl SealedStore {
                 }
                 _ => {
                     return Err(StoreError::Format(format!(
-                        "entry {} must carry sealed material, a remote reference, or a TPM binding",
+                        "entry {} must carry sealed material, a remote reference, a TPM binding, or a PKCS#11 key",
                         name.resource_id()
                     )))
                 }
@@ -386,6 +437,34 @@ impl SealedStore {
         self.persist()
     }
 
+    /// Register an r2 PKCS#11 credential. No material crosses: the key stays
+    /// on the token, and this records where it is plus the attributes it was
+    /// admitted on.
+    pub fn register_pkcs11(
+        &mut self,
+        name: CredentialName,
+        kind: CredentialKind,
+        reference: Pkcs11Ref,
+        admitted: crate::pkcs11::KeyAttributes,
+        budget: Option<u64>,
+        lease_expires_at: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.entries.insert(
+            name,
+            Entry {
+                kind,
+                material: Material::Pkcs11 {
+                    reference,
+                    admitted,
+                },
+                revoked: false,
+                budget,
+                lease_expires_at,
+            },
+        );
+        self.persist()
+    }
+
     pub fn revoke(&mut self, name: &CredentialName) -> Result<bool, StoreError> {
         match self.entries.get_mut(name) {
             Some(e) => {
@@ -423,6 +502,7 @@ impl SealedStore {
                         nonce_b64: Some(B64.encode(nonce_bytes)),
                         sealed_b64: Some(B64.encode(&buf)),
                         remote: None,
+                        pkcs11: None,
                         tpm: None,
                         revoked: entry.revoked,
                         budget: entry.budget,
@@ -438,6 +518,7 @@ impl SealedStore {
                     remote: Some(RemoteRef {
                         openbao_transit: key_name.clone(),
                     }),
+                    pkcs11: None,
                     tpm: None,
                     revoked: entry.revoked,
                     budget: entry.budget,
@@ -451,7 +532,27 @@ impl SealedStore {
                     nonce_b64: None,
                     sealed_b64: None,
                     remote: None,
+                    pkcs11: None,
                     tpm: Some(binding.clone()),
+                    revoked: entry.revoked,
+                    budget: entry.budget,
+                    lease_expires_at: entry.lease_expires_at,
+                },
+                // Same shape again: no secret on this box, only where the key
+                // is and what admitted it.
+                Material::Pkcs11 {
+                    reference,
+                    admitted,
+                } => SealedEntry {
+                    kind: entry.kind,
+                    nonce_b64: None,
+                    sealed_b64: None,
+                    remote: None,
+                    pkcs11: Some(SealedPkcs11 {
+                        reference: reference.clone(),
+                        admitted: *admitted,
+                    }),
+                    tpm: None,
                     revoked: entry.revoked,
                     budget: entry.budget,
                     lease_expires_at: entry.lease_expires_at,

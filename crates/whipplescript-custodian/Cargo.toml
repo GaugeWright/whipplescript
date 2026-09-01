@@ -31,6 +31,12 @@ default = []
 # turns on — compiles and tests unconditionally, so the ordinary green bar
 # checks the property on a machine with no TPM.
 tpm = ["dep:tss-esapi"]
+# r2 `hardware` over a PKCS#11 token. OFF by default for the same reasons as
+# `tpm`: it loads a vendor module at runtime and the DR puts r2/r3 backends at
+# the enterprise-readiness seam. Only the DEVICE half is behind it —
+# `pkcs11.rs`, which decides what evidences the rung, compiles and tests
+# unconditionally.
+pkcs11 = ["dep:cryptoki"]
 
 [dependencies]
 whipplescript-custody = { version = "0.5.5", path = "../whipplescript-custody" }
@@ -45,6 +51,7 @@ ureq = { version = "2", features = ["json", "native-certs"] }
 url = "2"
 # The stable line; 8.x is an alpha. Optional — see [features].
 tss-esapi = { version = "7.7", optional = true }
+cryptoki = { version = "0.12", optional = true }
 
 [[bin]]
 name = "whip-custodian"

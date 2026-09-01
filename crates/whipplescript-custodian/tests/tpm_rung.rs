@@ -458,10 +458,20 @@ fn a_store_entry_with_no_material_and_no_reference_is_refused() {
         .err()
         .expect("a malformed entry is not openable")
         .to_string();
-    assert!(
-        error.contains("must carry sealed material, a remote reference, or a TPM binding"),
-        "the refusal must name the three shapes: {error}"
-    );
+    // Each shape named separately rather than as one phrase: adding a backend
+    // should make this fail loudly and be updated deliberately, not silently
+    // pass because the sentence still contains an old fragment.
+    for shape in [
+        "sealed material",
+        "a remote reference",
+        "a TPM binding",
+        "a PKCS#11 key",
+    ] {
+        assert!(
+            error.contains(shape),
+            "the refusal must name {shape}: {error}"
+        );
+    }
     assert!(
         error.contains("release/signing") || error.contains("release_signing"),
         "and which entry: {error}"

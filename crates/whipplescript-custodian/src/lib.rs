@@ -20,6 +20,9 @@ pub mod openbao;
 // it compiles only where that transport exists, exactly as the protocol
 // crate's client half does. Sealing, the operation vocabulary, and the store
 // are portable and stay compiled everywhere.
+pub mod pkcs11;
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11_device;
 #[cfg(target_family = "unix")]
 pub mod serve;
 pub mod store;
@@ -185,8 +188,107 @@ impl Custodian {
             // because this answers "what rung is this entry" and a moved
             // platform makes the operation refuse, not the rung shrink.
             Some(Material::TpmHmac { .. }) => (Rung::Hardware, false),
+            // r2 as well, and for the same reason the TPM entry is: nothing was
+            // admitted here that the token did not say never left. Registration
+            // refuses a key whose attributes fall short, so an entry that
+            // exists has already cleared the bar — and every use re-asks, in
+            // case the token's answer changed.
+            Some(Material::Pkcs11 { .. }) => (Rung::Hardware, false),
             _ => self.rung(),
         }
+    }
+
+    /// r2 over PKCS#11: route a keyed operation to the token, re-checking that
+    /// its key still evidences the rung.
+    ///
+    /// The attributes are re-read at every use rather than trusted from
+    /// registration. A token can be re-provisioned under a custodian that is
+    /// still running, and an entry recorded when the key was resident should
+    /// not keep claiming r2 for a key that has since been made extractable.
+    /// That is the same question the TPM path asks of the platform state, in
+    /// the terms this backend has.
+    fn dispatch_pkcs11(
+        &self,
+        name: &CredentialName,
+        reference: &crate::store::Pkcs11Ref,
+        admitted: &crate::pkcs11::KeyAttributes,
+        op: &CustodyOp,
+    ) -> Result<CustodyOk, CustodyError> {
+        match op {
+            CustodyOp::Sign { payload_b64, .. } => {
+                self.admits_sign(name, payload_b64)?;
+                let mac = self.pkcs11_mac(name, reference, admitted, payload_b64)?;
+                Ok(CustodyOk::Signed {
+                    signature_b64: B64.encode(mac),
+                    key_version: None,
+                })
+            }
+            CustodyOp::Verify {
+                alg,
+                payload_b64,
+                signature_b64,
+                ..
+            } => {
+                crate::tpm::verifiable_alg(*alg)
+                    .map_err(|detail| CustodyError::Backend { detail })?;
+                // The MAC helper returns BYTES rather than an outcome, so
+                // verification has no "the token answered a sign with something
+                // else" branch to write — an error nothing can produce is a
+                // refusal nothing gates.
+                let computed = self.pkcs11_mac(name, reference, admitted, payload_b64)?;
+                let presented = decode_b64(signature_b64)?;
+                Ok(CustodyOk::Verified {
+                    valid: crate::tpm::mac_matches(&computed, &presented),
+                })
+            }
+            other => Err(CustodyError::Backend {
+                detail: format!(
+                    "credential {name} is held on a PKCS#11 token, which performs `sign` and `verify` and nothing else here: `{}` needs material this box does not have",
+                    other.operation().as_str()
+                ),
+            }),
+        }
+    }
+
+    #[cfg(feature = "pkcs11")]
+    fn pkcs11_mac(
+        &self,
+        name: &CredentialName,
+        reference: &crate::store::Pkcs11Ref,
+        admitted: &crate::pkcs11::KeyAttributes,
+        payload_b64: &str,
+    ) -> Result<Vec<u8>, CustodyError> {
+        let payload = decode_b64(payload_b64)?;
+        let backend = |detail: String| CustodyError::Backend { detail };
+        let module = crate::pkcs11_device::module(&reference.module).map_err(backend)?;
+        let slot =
+            crate::pkcs11_device::slot_with_token(&module, &reference.token).map_err(backend)?;
+        let pin = std::env::var(crate::pkcs11::PIN_ENV).map_err(|_| CustodyError::Backend {
+            detail: format!(
+                "credential {name} is on a PKCS#11 token and {} is not set, so the custodian cannot log in",
+                crate::pkcs11::PIN_ENV
+            ),
+        })?;
+        let session = crate::pkcs11_device::session(&module, slot, &pin).map_err(backend)?;
+        let (key, current) =
+            crate::pkcs11_device::admitted_key(&session, &reference.key).map_err(backend)?;
+        crate::pkcs11::still_admitted(name.as_str(), admitted, &current).map_err(backend)?;
+        crate::pkcs11_device::hmac_sha256(&session, key, &payload).map_err(backend)
+    }
+
+    #[cfg(not(feature = "pkcs11"))]
+    fn pkcs11_mac(
+        &self,
+        name: &CredentialName,
+        _reference: &crate::store::Pkcs11Ref,
+        _admitted: &crate::pkcs11::KeyAttributes,
+        _payload_b64: &str,
+    ) -> Result<Vec<u8>, CustodyError> {
+        Err(CustodyError::Backend {
+            detail: format!(
+                "credential {name} is held on a PKCS#11 token, and this custodian was built without the `pkcs11` feature: rebuild with `--features pkcs11` on a host that has the vendor module"
+            ),
+        })
     }
 
     /// r2: route a keyed operation to the TPM, after checking the rung still
@@ -492,6 +594,10 @@ impl Custodian {
             // local path for the same reason r3 is — there is no material in
             // this process to hand the local operations.
             Material::TpmHmac { binding } => return self.dispatch_tpm(&name, kind, binding, op),
+            Material::Pkcs11 {
+                reference,
+                admitted,
+            } => return self.dispatch_pkcs11(&name, reference, admitted, op),
             Material::Local(material) => Zeroizing::new(material.to_vec()),
         };
 

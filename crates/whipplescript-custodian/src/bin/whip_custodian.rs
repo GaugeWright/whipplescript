@@ -31,7 +31,7 @@ use whipplescript_custody::{CredentialKind, CredentialName};
 
 const USAGE: &str = "usage:
   whip-custodian init   --store <path>
-  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name> | --tpm-pcr <0,7>]
+  whip-custodian import --store <path> --name <credential> --kind <kind> [--budget <n>] [--from-env <VAR> | --from-file <path> | --from-stdin | --remote-transit <key_name> | --tpm-pcr <0,7> | --pkcs11-module <so> --pkcs11-token <label> --pkcs11-key <label>]
   whip-custodian list   --store <path>
   whip-custodian revoke --store <path> --name <credential>
   whip-custodian serve  --store <path> --socket <path> [--egress-allow <host,host,*.suffix>]
@@ -90,6 +90,69 @@ fn passphrase(args: &Args) -> Result<Zeroizing<String>, String> {
                 .to_string(),
         ),
     }
+}
+
+#[cfg(feature = "pkcs11")]
+fn import_pkcs11(
+    store_path: &std::path::Path,
+    pass: &str,
+    name: CredentialName,
+    kind: CredentialKind,
+    reference: whipplescript_custodian::store::Pkcs11Ref,
+    budget: Option<u64>,
+    lease_expires_at: Option<u64>,
+) -> Result<(), String> {
+    let pin = std::env::var(whipplescript_custodian::pkcs11::PIN_ENV).map_err(|_| {
+        format!(
+            "set {} to the token's user PIN",
+            whipplescript_custodian::pkcs11::PIN_ENV
+        )
+    })?;
+    let module = whipplescript_custodian::pkcs11_device::module(&reference.module)?;
+    let slot = whipplescript_custodian::pkcs11_device::slot_with_token(&module, &reference.token)?;
+    let session = whipplescript_custodian::pkcs11_device::session(&module, slot, &pin)?;
+    // Admission happens HERE, against the token, so a key that cannot evidence
+    // the rung is refused where the operator can act on it rather than at the
+    // first signature.
+    let (_key, admitted) =
+        whipplescript_custodian::pkcs11_device::admitted_key(&session, &reference.key)?;
+
+    let mut store = SealedStore::open(store_path, pass).map_err(|e| e.to_string())?;
+    let where_it_is = format!("{}:{}", reference.token, reference.key);
+    store
+        .register_pkcs11(
+            name.clone(),
+            kind,
+            reference,
+            admitted,
+            budget,
+            lease_expires_at,
+        )
+        .map_err(|e| e.to_string())?;
+    println!(
+        "imported {} (kind {kind}, r2 hardware, PKCS#11 key {where_it_is})",
+        name.resource_id()
+    );
+    Ok(())
+}
+
+/// The same command in a custodian built without the `pkcs11` feature.
+///
+/// Refused rather than recorded, for the reason the TPM sibling is: writing the
+/// entry would leave a credential nothing on this host can use, and the
+/// operator would find out at the first signature instead of here.
+#[cfg(not(feature = "pkcs11"))]
+fn import_pkcs11(
+    _store_path: &std::path::Path,
+    _pass: &str,
+    _name: CredentialName,
+    _kind: CredentialKind,
+    _reference: whipplescript_custodian::store::Pkcs11Ref,
+    _budget: Option<u64>,
+    _lease_expires_at: Option<u64>,
+) -> Result<(), String> {
+    Err("this custodian was built without the `pkcs11` feature, so it cannot bind a credential to a token: rebuild with `--features pkcs11` on a host that has the vendor module"
+        .to_owned())
 }
 
 /// Parse `--tpm-pcr 0,7` into slot numbers.
@@ -231,6 +294,25 @@ fn run() -> Result<(), String> {
                         .map(|seconds| now_epoch_s() + seconds)
                 })
                 .transpose()?;
+            // An r2 PKCS#11 entry: the key stays on the token, and what is
+            // recorded is where it is plus the attributes that admitted it.
+            if let Some(module) = args.flags.get("pkcs11-module") {
+                let token = args.need("pkcs11-token")?.to_owned();
+                let key = args.need("pkcs11-key")?.to_owned();
+                return import_pkcs11(
+                    &store_path,
+                    &pass,
+                    name,
+                    kind,
+                    whipplescript_custodian::store::Pkcs11Ref {
+                        module: module.clone(),
+                        token,
+                        key,
+                    },
+                    budget,
+                    lease_expires_at,
+                );
+            }
             // An r2 hardware entry: nothing is recorded but the platform state
             // the credential is bound to. The key is derived inside the TPM and
             // never existed on this box to begin with.
@@ -464,6 +546,38 @@ mod tests {
     fn parsed(argv: &[&str]) -> Args {
         let owned: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
         Args::parse(&owned).expect("arguments parse")
+    }
+
+    /// The PKCS#11 sibling of the TPM refusal below, and for the same reason:
+    /// recording the entry would leave a credential nothing on this host can
+    /// use, and the operator would find out at the first signature.
+    #[cfg(not(feature = "pkcs11"))]
+    #[test]
+    fn a_custodian_without_the_pkcs11_feature_refuses_to_bind_rather_than_recording() {
+        let refused = import_pkcs11(
+            std::path::Path::new("/nonexistent/store.json"),
+            "pass",
+            CredentialName::new("release/signing").expect("name"),
+            CredentialKind::HmacSha256,
+            whipplescript_custodian::store::Pkcs11Ref {
+                module: "/usr/lib/softhsm/libsofthsm2.so".to_owned(),
+                token: "whip-smoke".to_owned(),
+                key: "release-signing".to_owned(),
+            },
+            None,
+            None,
+        )
+        .expect_err("this build cannot reach a token");
+        assert!(
+            refused.contains("built without the `pkcs11` feature"),
+            "the refusal must name the cause: {refused}"
+        );
+        assert!(
+            refused.contains("--features pkcs11"),
+            "and the way forward: {refused}"
+        );
+        // It refuses BEFORE touching the store: the path above does not exist,
+        // so a run that got as far as opening it would have failed differently.
     }
 
     /// A custodian built without the `tpm` feature says so, rather than writing
